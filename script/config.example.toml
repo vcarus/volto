@@ -125,13 +125,14 @@ users = [
 #
 # Seeds the handshake retransmission timers: until the first ACK arrives there
 # is no RTT sample, and a lost handshake packet waits roughly three times this
-# value before it is resent. The default (333, RFC 9002) is deliberately
-# conservative. On a known path, set 1.5–2x the RTT that volto's connection
-# logs report as rtt_ms — e.g. a measured ~90 ms path wants 150 — to cut the
-# worst-case handshake stall from ~1 s to a few hundred ms. Keep the margin:
-# a value below the real RTT retransmits packets that were never lost.
-# Range 10..10000. Default: 333
-#initial_rtt_ms = 333
+# value before it is resent. This file ships 150, sized with margin for the
+# ~60–100 ms long-haul paths a fronted deployment typically serves; it cuts the
+# worst-case handshake stall from ~1 s to a few hundred ms. When the key is
+# absent volto falls back to 333 (RFC 9002's conservative kInitialRtt). Tune to
+# 1.5–2x the RTT that volto's connection logs report as rtt_ms, and keep the
+# margin: a value below the real RTT retransmits packets that were never lost.
+# Range 10..10000. Server default when unset: 333
+initial_rtt_ms = 150
 
 [security]
 # Allow tunnels to loopback, RFC 1918, link-local and ULA addresses.

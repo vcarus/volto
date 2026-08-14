@@ -120,6 +120,21 @@ fn the_example_comment_does_not_become_a_user() {
     );
 }
 
+/// The shipped config seeds the handshake timers for a long-haul path.
+///
+/// Decision D43: an install derived from the example ships `initial_rtt_ms =
+/// 150`, sized for the ~60-100 ms paths a fronted deployment typically serves,
+/// while the compiled-in fallback stays RFC 9002's conservative 333. The pin is
+/// here because the installer derives every install from the example file.
+#[test]
+fn the_shipped_config_seeds_a_long_haul_initial_rtt() {
+    let config: Config = toml::from_str(&generated_config(&[])).expect("parses");
+    assert_eq!(config.limits.initial_rtt_ms, 150);
+
+    // The server-side default is deliberately not changed with it.
+    assert_eq!(volto::config::DEFAULT_INITIAL_RTT_MS, 333);
+}
+
 /// `-h` must work and describe the safety-relevant flags.
 #[test]
 fn the_script_documents_itself() {
