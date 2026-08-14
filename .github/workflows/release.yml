@@ -76,9 +76,7 @@ jobs:
           body: |
             Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
 
-            Each archive carries the binary, `LICENSE`, `README.md` and the
-            `script/` directory, so the self-signed installer runs straight out
-            of it:
+            Each archive carries the binary, `LICENSE`, `README.md` and the `script/` directory, so the self-signed installer runs straight out of it:
 
             ```sh
             tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz
