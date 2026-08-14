@@ -50,7 +50,7 @@ cargo build --release      # target/release/volto
 
 The fastest way to a working server is the self-signed installer, which creates
 the system user, generates a certificate, writes `/etc/volto/config.toml` with a
-random password, installs the systemd unit and starts it:
+generated 144-bit password, installs the systemd unit and starts it:
 
 ```sh
 sudo script/install-selfsigned.sh
@@ -68,14 +68,14 @@ see [docs/deployment.md](docs/deployment.md#deploying-from-releases).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
-  sudo bash -s -- --enable-timer --username surge --password 'choose-a-password'
+  sudo bash -s -- --enable-timer --username yourname
 ```
 
 It finishes by printing the certificate fingerprint and a ready-to-paste Surge
 policy line:
 
 ```
-volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=surge, password=…
+volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=yourname, password=…
 ```
 
 The fingerprint *is* the trust anchor in that mode: carry it to the client over a

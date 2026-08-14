@@ -92,7 +92,7 @@ a default:
 sudo script/install-selfsigned.sh \
   --sni volto.internal \
   --port 443 \
-  --username surge \
+  --username yourname \
   --password 'or let it generate one'
 ```
 
@@ -171,11 +171,13 @@ accept their defaults:
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
   sudo bash -s -- --enable-timer --sni volto.internal --port 443 \
-       --username surge --password 'choose-a-password'
+       --username yourname --password 'or let it generate one'
 ```
 
-Omitting `--password` is also fine: the installer generates a random one and
-prints it in the final Surge policy line.
+Omitting `--password` is also fine, and usually better: the installer generates
+18 random bytes — 144 bits, 24 characters — and prints the result in the final
+Surge policy line. `--username` is independent, so naming the user still leaves
+the password generated.
 
 The no-op path is what makes it safe to run on a schedule:
 
@@ -281,6 +283,13 @@ applies it to connections accepted from then on: a renewed certificate, a change
 user list, changed transport parameters. Established connections keep the
 configuration they were accepted with — a tunnel's rules must not change
 mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
+
+That matters when the change is meant to revoke access: a client that still holds
+an established connection keeps working on the old credentials, and keep-alives
+routinely hold one open across long idle periods. Use `systemctl restart volto`
+rather than `reload` when the old credentials must stop working — a restart
+closes those connections after the shutdown grace period (see
+[Graceful shutdown](#graceful-shutdown)) instead of leaving them running.
 
 A reload is all-or-nothing. Parsing, validation and certificate loading all
 happen before anything is swapped in, so there is no state where a new
