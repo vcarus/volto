@@ -202,3 +202,15 @@ leaks by shrinking the quota until a leak turns into an observable 503.
 
 Test infrastructure lives in `tests/common/mod.rs`: an in-process server plus
 self-signed certificates from `rcgen`, so no test needs a fixture on disk.
+
+One thing that suite cannot do is disagree with itself: its client is built from
+the same pinned `h3` revision as the server, so both ends share any
+misunderstanding of the specification. The `interop` CI job closes that gap by
+starting a real `volto` process and driving it with Go's
+[masque-go](https://github.com/quic-go/masque-go) on quic-go — an independent
+implementation — over the RFC 9298 default URI template, with authentication on
+and the server's certificate trusted rather than skipped. It asserts multi-round
+CONNECT-UDP echo on one session, three concurrent sessions on a single QUIC
+connection receiving only their own traffic, `Proxy-Status` on a refusal, and a
+407 when credentials are omitted. The client lives in `tests/interop/`, which is
+a Go module rather than a Rust test, so `cargo test` neither sees nor needs it.

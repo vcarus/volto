@@ -51,3 +51,119 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+
+  interop:
+    # Cross-implementation check. `cargo test` has volto on both ends — its
+    # client is built from the same pinned `h3` revision as the server, so the
+    # two agree by construction even where both are wrong. Here a real volto
+    # process is driven by Go's quic-go/masque-go instead, which shares no code
+    # and no reading of the RFCs with it.
+    #
+    # Linux only: this is about the protocol on the wire, not about the host, and
+    # the platform matrix is already covered by the `test` job above.
+    name: interop (masque-go)
+    runs-on: ubuntu-latest
+    env:
+      # Loopback, so nothing outside the runner can reach this server for the
+      # minute it lives. The port is arbitrary and unprivileged.
+      VOLTO_ADDR: 127.0.0.1:14443
+      # The name in the generated certificate. The client validates against it.
+      VOLTO_SNI: localhost
+      # Authentication is on, exactly as in a real deployment: masque-go can set
+      # `Proxy-Authorization`, so the credentialed path — the one Surge uses on
+      # every CONNECT — is what gets exercised, and the suite also asserts that
+      # omitting credentials draws a 407. These are not secrets: they exist for
+      # the lifetime of one job, on a loopback socket.
+      VOLTO_USER: interop
+      VOLTO_PASSWORD: interop-password-not-a-secret
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-go@v7
+        with:
+          # Single source of truth for the Go version: the module's own go.mod.
+          go-version-file: tests/interop/go.mod
+          cache-dependency-path: tests/interop/go.sum
+      - run: cargo build --locked
+
+      # A helper binary would be one more thing to keep compiling; openssl is
+      # already on the runner and is what `script/install-selfsigned.sh` uses.
+      - name: Generate a self-signed certificate
+        run: |
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout interop-key.pem -out interop-cert.pem \
+            -days 1 -nodes -subj "/CN=$VOLTO_SNI" \
+            -addext "subjectAltName=DNS:$VOLTO_SNI"
+
+      - name: Write the server configuration
+        run: |
+          cat > interop-config.toml <<EOF
+          [server]
+          listen = "$VOLTO_ADDR"
+          cert = "$PWD/interop-cert.pem"
+          key = "$PWD/interop-key.pem"
+
+          [auth]
+          users = [{ username = "$VOLTO_USER", password = "$VOLTO_PASSWORD" }]
+
+          [security]
+          # The interop targets are UDP echo servers on loopback, which the
+          # default policy refuses — as it must in production. Port 25 stays
+          # denied by default, which is what the refusal test drives.
+          allow_private_networks = true
+
+          [log]
+          # Every inbound request is logged with its headers, so a failure in the
+          # Go client can be read off the server side too.
+          level = "debug"
+          EOF
+
+      - name: Start the server
+        run: |
+          nohup ./target/debug/volto --config interop-config.toml \
+            > interop-server.log 2>&1 &
+          echo $! > interop-server.pid
+
+          # Poll for the line the accept loop logs once it is bound, rather than
+          # sleeping: a fixed sleep is either flaky or slow, and QUIC listens on
+          # UDP so there is no TCP connect to probe with.
+          for _ in $(seq 1 60); do
+            if grep -q "accepting QUIC connections" interop-server.log; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat interop-server.pid)" 2>/dev/null; then
+              echo "the server exited during startup"
+              cat interop-server.log
+              exit 1
+            fi
+            sleep 0.5
+          done
+          echo "the server did not become ready within 30s"
+          cat interop-server.log
+          exit 1
+
+      - name: Drive it with masque-go
+        working-directory: tests/interop
+        env:
+          VOLTO_CERT: ${{ github.workspace }}/interop-cert.pem
+        # `-count=1` defeats Go's test result cache, which keys on the binary and
+        # the environment and knows nothing about the server on the other end —
+        # a restored cache entry would let this job pass without a single packet
+        # being sent. The timeout is the backstop for a tunnel that hangs instead
+        # of failing: `go test` then panics and the job fails.
+        run: go test -v -count=1 -timeout 120s ./...
+
+      # Runs even when an earlier step failed, including before the server was
+      # started, so neither file is assumed to exist. The log is the half of a
+      # failure the Go client cannot see: it says which request was refused and
+      # why, where the client only knows a packet never came back.
+      - name: Stop the server and show its log
+        if: always()
+        run: |
+          if [ -f interop-server.pid ]; then
+            kill "$(cat interop-server.pid)" 2>/dev/null || true
+          fi
+          if [ -f interop-server.log ]; then
+            cat interop-server.log
+          fi

@@ -114,6 +114,12 @@ cargo test --test it_stress -- --ignored     # heavy load tier
 Integration tests assert on-wire behaviour — status codes, response headers, the
 actual bytes on the control stream — rather than internal state.
 
+Because that suite has volto on both ends, CI also runs a cross-implementation
+job that drives a real server with Go's
+[masque-go](https://github.com/quic-go/masque-go) client. The client lives in
+[tests/interop](tests/interop) and needs a Go toolchain plus a running server;
+see [docs/architecture.md](docs/architecture.md#testing).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

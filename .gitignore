@@ -13,3 +13,7 @@ CLAUDE.md
 # Local debugging artifacts
 *.qlog
 *.sslkeylog
+
+# Scratch files the interop job writes into the workspace (certificate, key,
+# config, server log), in case the same steps are run by hand.
+/interop-*
