@@ -98,9 +98,13 @@ async fn an_oversized_header_section_is_refused() {
     // One ordinary round trip first. SETTINGS arrives on the control stream after
     // the handshake, so without this the client may not have processed the limit
     // yet -- the same ordering trap that decision D5 records on the server side.
+    //
+    // Port 25 is on the default deny list, and the port rule is checked before the
+    // resolver runs, so the 403 arrives without touching the network. CONNECT to a
+    // TEST-NET address would instead hang on hosts that blackhole the SYN.
     let mut warm_up = client
         .send
-        .send_request(connect_request("192.0.2.1:443"))
+        .send_request(connect_request("192.0.2.1:25"))
         .await
         .expect("send CONNECT");
     let _ = tokio::time::timeout(TIMEOUT, warm_up.recv_response())
@@ -109,7 +113,7 @@ async fn an_oversized_header_section_is_refused() {
         .expect("response");
 
     // Comfortably past the 64 KiB limit, well under any flow-control window.
-    let mut request = connect_request("192.0.2.1:443");
+    let mut request = connect_request("192.0.2.1:25");
     request.headers_mut().insert(
         "x-volto-oversized",
         "A".repeat(128 * 1024).parse().expect("header value"),
@@ -125,7 +129,7 @@ async fn an_oversized_header_section_is_refused() {
     // problem, not a reason to drop everything else on the connection.
     let mut ok = client
         .send
-        .send_request(connect_request("192.0.2.1:443"))
+        .send_request(connect_request("192.0.2.1:25"))
         .await
         .expect("the connection must still be usable");
     let response = tokio::time::timeout(TIMEOUT, ok.recv_response())
