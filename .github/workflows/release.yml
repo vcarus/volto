@@ -60,6 +60,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The changelog lives in the tag's annotation. Check the repository out
+      # before anything else: checkout cleans the workspace, so the artifacts
+      # have to land after it.
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -72,25 +77,40 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          # actions/checkout can leave the tag as a lightweight copy; fetch the
+          # real object so its annotation is readable. An unannotated tag makes
+          # the changelog section empty and the notes fall back to boilerplate.
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents:body)' "${GITHUB_REF_NAME}" > notes.md
+          cat >> notes.md <<'BOILERPLATE'
+
+          ---
+
+          Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
+
+          Each archive carries the binary, `LICENSE`, `README.md` and the `script/` directory, so the self-signed installer runs straight out of it:
+
+          ```sh
+          tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz
+          cd volto-*-x86_64-unknown-linux-musl
+          sudo script/install-selfsigned.sh --binary ./volto
+          ```
+
+          Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — with `--enable-timer` it keeps the host on the latest release with a daily systemd timer. It bootstraps a bare host in one line:
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh | sudo bash -s -- --enable-timer
+          ```
+          BOILERPLATE
+          cat notes.md
+
       - uses: softprops/action-gh-release@v3
         with:
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS
           generate_release_notes: true
-          body: |
-            Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
-
-            Each archive carries the binary, `LICENSE`, `README.md` and the `script/` directory, so the self-signed installer runs straight out of it:
-
-            ```sh
-            tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz
-            cd volto-*-x86_64-unknown-linux-musl
-            sudo script/install-selfsigned.sh --binary ./volto
-            ```
-
-            Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — with `--enable-timer` it keeps the host on the latest release with a daily systemd timer. It bootstraps a bare host in one line:
-
-            ```sh
-            curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh | sudo bash -s -- --enable-timer
-            ```
+          body_path: notes.md
