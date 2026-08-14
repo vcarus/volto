@@ -1,0 +1,15 @@
+# Rust
+/target
+
+# macOS
+.DS_Store
+
+# Project doc policy: public documentation (README.md, docs/) lives in the
+# repository and is tracked; development notes live in dev_docs/ and are NOT
+# tracked; CLAUDE.md is NOT tracked.
+CLAUDE.md
+/dev_docs/
+
+# Local debugging artifacts
+*.qlog
+*.sslkeylog

@@ -1,0 +1,191 @@
+# volto — example configuration.
+#
+# Only the [server] section is required; every other section and key has a
+# default, shown after each key below. Unknown keys are rejected at startup, so a
+# typo fails loudly rather than being silently ignored.
+#
+# Reload with `systemctl reload volto` (SIGHUP) after changing this file. A file
+# that fails to parse or validate is rejected whole and the running configuration
+# is kept, so a mistake here cannot take the service down.
+
+[server]
+# UDP address to listen on. QUIC is UDP; there is no TCP listener.
+listen = "0.0.0.0:443"
+
+# Certificate chain (leaf first) and its private key, both PEM.
+#
+# These must be the *domain* certificate even when clients connect to a relay's
+# IP: TLS terminates only here. Issue with ACME DNS-01 — HTTP-01 and TLS-ALPN-01
+# cannot validate when the domain's A record points at the relay.
+cert = "/etc/volto/fullchain.pem"
+key = "/etc/volto/privkey.pem"
+
+# ALPN identifiers to advertise, in preference order.
+# Default: ["h3"], which is what Surge speaks. Change only for interop debugging.
+#alpn = ["h3"]
+
+# Seconds to let established tunnels finish after SIGTERM before closing anyway.
+# Keep systemd's TimeoutStopSec above this value.
+# Default: 30
+#shutdown_grace = 30
+
+[auth]
+# Credentials accepted on every CONNECT request, as HTTP Basic.
+#
+# An EMPTY OR ABSENT list disables authentication entirely, which makes this an
+# open proxy — anyone who can reach the port can use it. volto logs a warning at
+# startup when that is the case. Never expose it to the internet that way.
+#
+# The username may not contain a colon (RFC 7617). Comparison is constant-time.
+# Both `Proxy-Authorization` and `Authorization` are accepted, since Surge's
+# manual does not say which it sends.
+users = [
+  { username = "user1", password = "replace-me-with-something-long" },
+  # { username = "user2", password = "..." },
+]
+
+[limits]
+# Seconds a UDP session may sit idle before it is closed.
+# RFC 9298 §3.5 says a proxy SHOULD NOT go below 120; volto warns if you do.
+# Default: 180
+#udp_session_timeout = 180
+
+# Concurrent tunnels allowed on ONE QUIC connection, TCP and UDP together.
+# Each costs one file descriptor, so this and systemd's LimitNOFILE are two halves
+# of the same budget: volto warns at startup if RLIMIT_NOFILE leaves no margin.
+# Requests beyond it get 503 with `Proxy-Status: volto; error=connection_limit_reached`.
+# Default: 256
+#max_targets_per_conn = 256
+
+# Simultaneously open QUIC connections; 0 removes the limit.
+#
+# Beyond this, new connections are refused during the handshake -- before any
+# per-connection state exists on this side. The default lines up with the rest of
+# the budget: 256 connections x 256 tunnels = 65536, the LimitNOFILE the shipped
+# systemd unit grants.
+# Default: 256
+#max_connections = 256
+
+# --- QUIC transport parameters ----------------------------------------------
+# All five apply to connections accepted from now on. A reload (SIGHUP) carries
+# them to new connections; connections already open keep what they negotiated at
+# handshake time, because QUIC cannot renegotiate transport parameters.
+
+# Concurrent bidirectional streams one QUIC connection may open — one per tunnel.
+# quinn's own default of 100 runs out during ordinary browsing, since Surge
+# multiplexes every proxied TCP connection onto a single QUIC connection.
+# Default: 1024
+#max_streams_bidi = 1024
+
+# Seconds a connection may go without traffic before it is closed.
+#
+# Deliberately longer than a relay's UDP conntrack entry (30s by default), so that
+# the keep-alive below — not this timeout — decides whether a connection is alive.
+# Accepted range: 1..3600.
+# Default: 60
+#max_idle_timeout = 60
+
+# Seconds between keep-alive packets; 0 switches them off.
+#
+# This is what keeps the relay's NAT mapping alive while a tunnel is idle. It MUST
+# be less than half of max_idle_timeout, and volto refuses to start otherwise: at
+# exactly half, losing a single keep-alive packet is enough for the connection to
+# time out.
+#
+# If your relay's nf_conntrack_udp_timeout is shorter than 20s, lower this to
+# comfortably under it (and lower max_idle_timeout to keep the ratio), then reload.
+# Default: 20
+#keep_alive_interval = 20
+
+# Size of the first QUIC packets, in bytes. Must be at least 1200 (RFC 9000 §14);
+# volto refuses to start below that rather than silently rounding up.
+# Default: 1200
+#initial_mtu = 1200
+
+# Probe for a path MTU larger than initial_mtu (RFC 8899 DPLPMTUD).
+#
+# Leave it on unless the path black-holes large packets — the symptom is a
+# handshake that succeeds while large transfers stall. Turning it off pins the
+# packet size at initial_mtu for good: slower, but deterministic.
+# Default: true
+#mtu_discovery = true
+
+# QUIC congestion controller: "bbr", "cubic" or "newreno".
+#
+# BBR by default, and it should usually stay that way. Over a long, lossy
+# international path a loss-based controller (cubic/newreno) treats every dropped
+# packet as congestion and collapses the window — downloads stall to near-zero
+# while a co-located TCP proxy (which the kernel runs on BBR) is unaffected. BBR
+# models bandwidth and RTT instead, so it holds throughput on exactly these
+# paths. Switch to cubic only on a clean path, or as a fallback.
+# Default: "bbr"
+#congestion_control = "bbr"
+
+# Round-trip time assumed before the first measurement, in milliseconds.
+#
+# Seeds the handshake retransmission timers: until the first ACK arrives there
+# is no RTT sample, and a lost handshake packet waits roughly three times this
+# value before it is resent. The default (333, RFC 9002) is deliberately
+# conservative. On a known path, set 1.5–2x the RTT that volto's connection
+# logs report as rtt_ms — e.g. a measured ~90 ms path wants 150 — to cut the
+# worst-case handshake stall from ~1 s to a few hundred ms. Keep the margin:
+# a value below the real RTT retransmits packets that were never lost.
+# Range 10..10000. Default: 333
+#initial_rtt_ms = 333
+
+[security]
+# Allow tunnels to loopback, RFC 1918, link-local and ULA addresses.
+#
+# Off by default, and it should stay off on a public deployment: the proxy's own
+# source address is inside your perimeter, and plenty of services trust
+# 127.0.0.1 or a private range without further authentication. IPv4-mapped
+# addresses (`::ffff:127.0.0.1`) are normalized before matching, so turning this
+# off cannot be worked around that way.
+#
+# Multicast, broadcast and the unspecified address are refused regardless of this
+# setting — they are amplification primitives, not destinations.
+# Default: false
+#allow_private_networks = false
+
+# Target ports refused regardless of address, answered with 403.
+#
+# 25 is the classic open-relay abuse vector. Note that 53 must stay reachable:
+# Surge's UDP availability test is a DNS query through the tunnel, so denying it
+# makes Surge report the policy as broken. volto warns if 53 is on this list.
+# Default: [25]
+#denied_ports = [25]
+
+# Packets a UDP session may send before its target has answered (RFC 9298 §7).
+#
+# Stops a client using the proxy as a reflector or a port scanner. The first reply
+# from the target lifts the limit for the rest of the session, so this only ever
+# bites on one-way floods. 0 disables the mitigation entirely (warned about).
+# Default: 64
+#unanswered_packet_budget = 64
+
+# Authentication failures tolerated on one connection before it is dropped.
+#
+# Not a rate limit and not a ban: it raises the cost of guessing from "one
+# handshake, then unlimited attempts" to "one handshake per N attempts", without
+# any cross-connection state to keep or evict. Pair it with fail2ban on the
+# "authentication failed" log lines for actual banning. 0 disables it.
+# Default: 5
+#max_auth_failures = 5
+
+[log]
+# A tracing filter: a bare level (trace/debug/info/warn/error) or a directive list
+# such as "volto=debug,quinn=info". RUST_LOG overrides this without editing the
+# file. `debug` logs every inbound request, including its header lines — the
+# credential values are redacted, the header names are not.
+# Default: "info"
+level = "info"
+
+# Write TLS secrets to the file named by the SSLKEYLOGFILE environment variable.
+#
+# This is how a real Surge session gets read at frame level: with the secrets,
+# Wireshark decrypts the QUIC and HTTP/3 frames, which is the only way to diagnose
+# "handshake succeeded but nothing flows". It also lets anyone who can read that
+# file decrypt every session through the proxy, so it is off by default and warned
+# about when on. Debugging only, never production.
+# Default: false
+#keylog = false

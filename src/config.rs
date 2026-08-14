@@ -1,0 +1,1283 @@
+//! Configuration file loading and validation.
+//!
+//! The configuration is TOML. Unknown keys are rejected so typos surface at
+//! startup instead of being silently ignored:
+//!
+//! ```toml
+//! [server]
+//! listen = "0.0.0.0:443"
+//! cert   = "/etc/volto/fullchain.pem"
+//! key    = "/etc/volto/privkey.pem"
+//! alpn   = ["h3"]      # optional, this is the default
+//! shutdown_grace = 30  # seconds to let tunnels finish after SIGTERM
+//!
+//! [auth]
+//! users = [{ username = "user1", password = "..." }]
+//!
+//! [limits]
+//! udp_session_timeout  = 180   # seconds
+//! max_targets_per_conn = 256
+//! max_connections      = 256
+//! max_streams_bidi     = 1024
+//! max_idle_timeout     = 60    # seconds
+//! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
+//! initial_mtu          = 1200  # bytes, at least 1200
+//! mtu_discovery        = true
+//! congestion_control   = "bbr" # bbr | cubic | newreno
+//! initial_rtt_ms       = 333   # milliseconds, 10..10000
+//!
+//! [security]
+//! allow_private_networks   = false
+//! denied_ports             = [25]
+//! unanswered_packet_budget = 64
+//! max_auth_failures        = 5
+//!
+//! [log]
+//! level  = "info"      # optional, this is the default
+//! keylog = false       # write TLS secrets to $SSLKEYLOGFILE (debug only)
+//! ```
+//!
+//! Every section except `[server]` is optional, and every key within them has a
+//! default, so a minimal file is four lines. Two consequences of that are worth
+//! stating explicitly, because they are the difference between a safe and an
+//! unsafe deployment:
+//!
+//! * an absent or empty `[auth].users` **disables authentication**, and
+//! * `[security]` defaults deny private address space but nothing else.
+//!
+//! [`Config::warnings`] reports the first of those at startup.
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+
+/// ALPN protocol identifiers advertised when the config does not say otherwise.
+///
+/// Surge speaks HTTP/3, so `h3` is the only default. It stays configurable
+/// because interop debugging occasionally needs a draft identifier.
+pub const DEFAULT_ALPN: &[&str] = &["h3"];
+
+/// Log level used when `[log].level` is absent.
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Default grace period for a graceful shutdown, in seconds.
+///
+/// Long enough for an in-flight page load or API call to finish, short enough
+/// that a service manager's own kill timeout (systemd's default `TimeoutStopSec`
+/// is 90s) does not overtake it.
+pub const DEFAULT_SHUTDOWN_GRACE: u64 = 30;
+
+/// Default UDP session idle timeout, in seconds.
+///
+/// RFC 9298 §3.5 says a proxy SHOULD NOT use a timeout below two minutes, since
+/// UDP has no close signal and a short timeout breaks long-lived flows.
+pub const DEFAULT_UDP_SESSION_TIMEOUT: u64 = 180;
+
+/// Default cap on simultaneously open QUIC connections.
+///
+/// Chosen to line up with the rest of the budget rather than picked at random:
+/// `max_connections * max_targets_per_conn` is 256 * 256 = 65536, which is the
+/// `LimitNOFILE` the shipped systemd unit sets.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
+
+/// Default number of authentication failures tolerated on one connection.
+pub const DEFAULT_MAX_AUTH_FAILURES: u32 = 5;
+
+/// Default concurrent client-initiated bidirectional streams per connection.
+///
+/// One stream per tunnel: Surge multiplexes every proxied TCP connection onto one
+/// QUIC connection, so quinn's default of 100 runs out during ordinary browsing.
+pub const DEFAULT_MAX_STREAMS_BIDI: u32 = 1024;
+
+/// Default QUIC idle timeout, in seconds.
+///
+/// Deliberately longer than a typical relay's 30s UDP conntrack entry, so that the
+/// keep-alive below — not the timeout — decides connection liveness.
+pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 60;
+
+/// Default keep-alive interval, in seconds.
+///
+/// Well under the 30s UDP conntrack default on a relay, so the NAT mapping is
+/// refreshed even when the tunnel is idle. Must stay below half the idle timeout,
+/// which [`Config::validate`] enforces: at exactly half, a single lost keep-alive
+/// packet is enough to let the connection time out.
+pub const DEFAULT_KEEP_ALIVE_INTERVAL: u64 = 20;
+
+/// Default initial QUIC packet size, in bytes.
+///
+/// 1200 is the floor QUIC guarantees (RFC 9000 §14) and the conservative choice on
+/// a tunnelled path, where anything larger risks a PMTU black hole. Path MTU
+/// discovery raises it from here unless `mtu_discovery` is off.
+pub const DEFAULT_INITIAL_MTU: u16 = 1200;
+
+/// The smallest `initial_mtu` QUIC permits (RFC 9000 §14).
+pub const MIN_INITIAL_MTU: u16 = 1200;
+
+/// Default round-trip time assumed before the first measurement, in milliseconds.
+///
+/// quinn's own default, straight from RFC 9002's `kInitialRtt`. It seeds the
+/// loss-recovery timers during the handshake, when no RTT sample exists yet: a
+/// lost handshake packet waits roughly three times this value before it is
+/// resent. On a path whose RTT is known (the `rtt_ms` field in the connection
+/// logs), 1.5–2x that measurement recovers a lost handshake in a fraction of
+/// the default wait. The margin is not optional: a value below the real RTT
+/// makes the timer fire early and retransmit packets that were never lost.
+pub const DEFAULT_INITIAL_RTT_MS: u64 = 333;
+
+/// Accepted range for `initial_rtt_ms`.
+///
+/// Below 10 ms the timer is tighter than ordinary scheduling jitter even on a
+/// LAN; past 10 s the seed is slower than any real path and only delays
+/// handshake recovery beyond what the default already risks.
+const INITIAL_RTT_RANGE_MS: std::ops::RangeInclusive<u64> = 10..=10_000;
+
+/// Largest accepted `max_idle_timeout`, in seconds.
+///
+/// Not a protocol limit. Past an hour the value stops meaning anything: any relay's
+/// conntrack entry will have expired long before, so a larger timeout only delays
+/// noticing a peer that is already unreachable.
+const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
+
+/// Default number of concurrent tunnels allowed on one QUIC connection.
+///
+/// Every tunnel costs one file descriptor, so this is also the per-connection
+/// share of the process fd budget (see [`crate::net::fd_soft_limit`]).
+pub const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
+
+/// Ports no target may be reached on unless the operator says otherwise.
+///
+/// 25 is the classic open-relay abuse vector. Note that 53 is deliberately *not*
+/// here: Surge's UDP availability test is a DNS query through the tunnel.
+pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
+
+/// Default number of packets a UDP session may send before the target answers.
+///
+/// RFC 9298 §7 asks a proxy to limit what an unanswered session can emit, so it
+/// cannot be used as a reflector or a port scanner. The default is deliberately
+/// generous: handshakes that legitimately need several packets before the first
+/// reply (QUIC retransmits, some game protocols) must not break.
+pub const DEFAULT_UNANSWERED_PACKET_BUDGET: u32 = 64;
+
+/// The complete server configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Listener, certificate and ALPN settings.
+    pub server: Server,
+    /// Credentials accepted on CONNECT requests.
+    #[serde(default)]
+    pub auth: Auth,
+    /// Resource limits.
+    #[serde(default)]
+    pub limits: Limits,
+    /// Destination policy and abuse mitigations.
+    #[serde(default)]
+    pub security: Security,
+    /// Logging settings.
+    #[serde(default)]
+    pub log: Log,
+}
+
+/// `[auth]` — the accepted credentials.
+///
+/// An empty user list disables authentication entirely, which makes this an open
+/// proxy; [`Config::warnings`] says so at startup.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Auth {
+    /// Users allowed to open tunnels, as HTTP Basic credentials.
+    #[serde(default)]
+    pub users: Vec<User>,
+}
+
+/// One set of HTTP Basic credentials.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct User {
+    /// The user-id, which RFC 7617 §2 forbids from containing a colon.
+    pub username: String,
+    /// The password, compared in constant time and never logged.
+    pub password: String,
+}
+
+/// Redacts the password.
+///
+/// `Config` is `Debug`, and a `Debug`-formatted config is exactly the kind of
+/// thing that ends up in a log line or a panic message.
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// QUIC congestion controller, selected by `[limits].congestion_control`.
+///
+/// The default is BBR, deliberately. This proxy exists to carry traffic over
+/// long, often lossy international paths, and a loss-based controller reads the
+/// non-congestive packet loss of those paths as congestion and keeps the window
+/// from ever opening — the download direction collapses to near-zero. BBR models
+/// bottleneck bandwidth and RTT instead of reacting to loss, so it holds
+/// throughput where CUBIC and NewReno stall, matching what the Linux kernel does
+/// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
+///
+/// The loss-based controllers are kept as an escape hatch: quinn's BBR is a
+/// port marked "experimental", so an operator who hits trouble after a
+/// dependency bump can fall back without recompiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CongestionControl {
+    /// BBR (quinn's experimental port of BBRv1). The default; best on lossy
+    /// long-haul paths.
+    Bbr,
+    /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
+    Cubic,
+    /// NewReno. Loss-based and the most conservative; mainly of interest for
+    /// interop testing.
+    NewReno,
+}
+
+/// `[limits]` — resource and lifetime limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    /// Seconds a UDP session may sit idle before it is closed.
+    #[serde(default = "default_udp_session_timeout")]
+    pub udp_session_timeout: u64,
+    /// Concurrent tunnels allowed on one QUIC connection.
+    #[serde(default = "default_max_targets_per_conn")]
+    pub max_targets_per_conn: u32,
+    /// Simultaneously open QUIC connections. Zero means no limit.
+    ///
+    /// Beyond this, new connections are refused at the QUIC layer, before a
+    /// handshake completes and before any per-connection state is built.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+    /// Concurrent client-initiated bidirectional streams per QUIC connection.
+    #[serde(default = "default_max_streams_bidi")]
+    pub max_streams_bidi: u32,
+    /// Seconds a QUIC connection may go without traffic before it is closed.
+    #[serde(default = "default_max_idle_timeout")]
+    pub max_idle_timeout: u64,
+    /// Seconds between keep-alive packets. Zero disables them.
+    ///
+    /// Must be below half of [`Limits::max_idle_timeout`]; see
+    /// [`DEFAULT_KEEP_ALIVE_INTERVAL`] for why.
+    #[serde(default = "default_keep_alive_interval")]
+    pub keep_alive_interval: u64,
+    /// Size of the first QUIC packets, in bytes. At least 1200.
+    #[serde(default = "default_initial_mtu")]
+    pub initial_mtu: u16,
+    /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
+    ///
+    /// On by default. Turning it off pins the packet size at `initial_mtu`, trading
+    /// throughput for determinism on a path that black-holes large packets.
+    #[serde(default = "default_mtu_discovery")]
+    pub mtu_discovery: bool,
+    /// QUIC congestion controller. Defaults to BBR; see [`CongestionControl`].
+    #[serde(default = "default_congestion_control")]
+    pub congestion_control: CongestionControl,
+    /// Milliseconds of round-trip time assumed before the first measurement.
+    ///
+    /// Seeds the handshake retransmission timers; see [`DEFAULT_INITIAL_RTT_MS`]
+    /// for the trade-off and how to pick a value from the connection logs.
+    #[serde(default = "default_initial_rtt_ms")]
+    pub initial_rtt_ms: u64,
+}
+
+/// `[security]` — destination policy and abuse mitigations.
+///
+/// The defaults are the ones RFC 9298 §7 asks for: private address space is out
+/// of reach, the classic relay port is closed, and a session that has not heard
+/// from its target cannot be used as an amplifier.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Security {
+    /// Allow tunnels to loopback, RFC 1918, link-local and ULA addresses.
+    ///
+    /// Off by default: the proxy's own source address often carries privileges a
+    /// remote client must not borrow.
+    #[serde(default)]
+    pub allow_private_networks: bool,
+    /// Target ports that are refused regardless of address.
+    #[serde(default = "default_denied_ports")]
+    pub denied_ports: Vec<u16>,
+    /// Packets a UDP session may send before its target has answered.
+    ///
+    /// Zero disables the mitigation.
+    #[serde(default = "default_unanswered_packet_budget")]
+    pub unanswered_packet_budget: u32,
+    /// Authentication failures tolerated on one connection before it is closed.
+    ///
+    /// Not a rate limit: it raises the cost of guessing from "one handshake, then
+    /// unlimited attempts" to "one handshake per N attempts". Zero disables it.
+    #[serde(default = "default_max_auth_failures")]
+    pub max_auth_failures: u32,
+}
+
+/// `[server]` — the QUIC listener and its TLS identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Server {
+    /// UDP socket address to listen on, e.g. `"0.0.0.0:443"`.
+    pub listen: SocketAddr,
+    /// PEM file holding the certificate chain (leaf first).
+    pub cert: PathBuf,
+    /// PEM file holding the private key (PKCS#8, PKCS#1 or SEC1).
+    pub key: PathBuf,
+    /// ALPN identifiers to advertise, in preference order.
+    #[serde(default = "default_alpn")]
+    pub alpn: Vec<String>,
+    /// Seconds to let existing tunnels finish after SIGTERM.
+    ///
+    /// Zero closes everything at once. The wait ends early if all tunnels finish
+    /// sooner, so a generous value costs nothing in the common case.
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace: u64,
+}
+
+/// `[log]` — logging settings.
+///
+/// `RUST_LOG` takes precedence over [`Log::level`] when set, so an operator can
+/// raise verbosity without editing the config file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Log {
+    /// A `tracing_subscriber` filter directive, e.g. `"info"` or
+    /// `"volto=debug,quinn=info"`.
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Write TLS secrets to the file named by `SSLKEYLOGFILE`.
+    ///
+    /// This is the debugging tool that makes the wire readable: with the secrets,
+    /// Wireshark decrypts the QUIC and HTTP/3 frames of a real Surge session, so
+    /// "handshake fine, nothing flows" can be diagnosed at frame level. It also
+    /// hands anyone who can read that file the plaintext of every session, so it
+    /// is off by default and warned about when on.
+    #[serde(default)]
+    pub keylog: bool,
+}
+
+fn default_alpn() -> Vec<String> {
+    DEFAULT_ALPN.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn default_shutdown_grace() -> u64 {
+    DEFAULT_SHUTDOWN_GRACE
+}
+
+fn default_log_level() -> String {
+    DEFAULT_LOG_LEVEL.to_owned()
+}
+
+fn default_udp_session_timeout() -> u64 {
+    DEFAULT_UDP_SESSION_TIMEOUT
+}
+
+fn default_max_targets_per_conn() -> u32 {
+    DEFAULT_MAX_TARGETS_PER_CONN
+}
+
+fn default_max_connections() -> u32 {
+    DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_max_auth_failures() -> u32 {
+    DEFAULT_MAX_AUTH_FAILURES
+}
+
+fn default_max_streams_bidi() -> u32 {
+    DEFAULT_MAX_STREAMS_BIDI
+}
+
+fn default_max_idle_timeout() -> u64 {
+    DEFAULT_MAX_IDLE_TIMEOUT
+}
+
+fn default_keep_alive_interval() -> u64 {
+    DEFAULT_KEEP_ALIVE_INTERVAL
+}
+
+fn default_initial_mtu() -> u16 {
+    DEFAULT_INITIAL_MTU
+}
+
+fn default_mtu_discovery() -> bool {
+    true
+}
+
+fn default_congestion_control() -> CongestionControl {
+    CongestionControl::Bbr
+}
+
+fn default_initial_rtt_ms() -> u64 {
+    DEFAULT_INITIAL_RTT_MS
+}
+
+fn default_denied_ports() -> Vec<u16> {
+    DEFAULT_DENIED_PORTS.to_vec()
+}
+
+fn default_unanswered_packet_budget() -> u32 {
+    DEFAULT_UNANSWERED_PACKET_BUDGET
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            udp_session_timeout: default_udp_session_timeout(),
+            max_targets_per_conn: default_max_targets_per_conn(),
+            max_connections: default_max_connections(),
+            max_streams_bidi: default_max_streams_bidi(),
+            max_idle_timeout: default_max_idle_timeout(),
+            keep_alive_interval: default_keep_alive_interval(),
+            initial_mtu: default_initial_mtu(),
+            mtu_discovery: default_mtu_discovery(),
+            congestion_control: default_congestion_control(),
+            initial_rtt_ms: default_initial_rtt_ms(),
+        }
+    }
+}
+
+impl Default for Security {
+    fn default() -> Self {
+        Self {
+            allow_private_networks: false,
+            denied_ports: default_denied_ports(),
+            unanswered_packet_budget: default_unanswered_packet_budget(),
+            max_auth_failures: default_max_auth_failures(),
+        }
+    }
+}
+
+impl Limits {
+    /// The UDP session idle timeout as a duration.
+    pub fn udp_session_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.udp_session_timeout)
+    }
+
+    /// The QUIC idle timeout as a duration.
+    pub fn max_idle_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_idle_timeout)
+    }
+
+    /// `initial_rtt_ms` as a [`Duration`](std::time::Duration).
+    pub fn initial_rtt(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.initial_rtt_ms)
+    }
+
+    /// The keep-alive interval, or `None` when keep-alives are disabled.
+    pub fn keep_alive_interval(&self) -> Option<std::time::Duration> {
+        match self.keep_alive_interval {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
+    }
+}
+
+impl Default for Log {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            keylog: false,
+        }
+    }
+}
+
+impl Config {
+    /// Reads and validates the configuration at `path`.
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read config file {}", path.display()))?;
+        let config: Config = toml::from_str(&text)
+            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        config
+            .validate()
+            .with_context(|| format!("invalid config file {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Checks everything that TOML deserialization cannot express.
+    ///
+    /// Every error names the offending field so the operator does not have to
+    /// guess which key is wrong.
+    /// Checks are ordered cheapest first, so a syntactic mistake is reported
+    /// without touching the filesystem.
+    pub fn validate(&self) -> Result<()> {
+        validate_log_level(&self.log.level)?;
+
+        if self.server.alpn.is_empty() {
+            bail!("server.alpn must list at least one protocol identifier");
+        }
+        for (i, id) in self.server.alpn.iter().enumerate() {
+            if id.is_empty() {
+                bail!("server.alpn[{i}] is empty");
+            }
+            // An ALPN identifier is length-prefixed with a single byte on the
+            // wire, so it cannot exceed 255 bytes.
+            if id.len() > 255 {
+                bail!(
+                    "server.alpn[{i}] is {} bytes, the wire format allows at most 255",
+                    id.len()
+                );
+            }
+        }
+
+        if self.limits.udp_session_timeout == 0 {
+            bail!("limits.udp_session_timeout must be greater than zero");
+        }
+        if self.limits.max_targets_per_conn == 0 {
+            bail!("limits.max_targets_per_conn must be greater than zero");
+        }
+        if self.limits.max_targets_per_conn > MAX_TARGETS_PER_CONN_CEILING {
+            bail!(
+                "limits.max_targets_per_conn = {} exceeds the {MAX_TARGETS_PER_CONN_CEILING} \
+                 this server allows; every tunnel costs a file descriptor",
+                self.limits.max_targets_per_conn
+            );
+        }
+
+        if self.limits.max_streams_bidi == 0 {
+            bail!(
+                "limits.max_streams_bidi must be greater than zero, or no tunnel could \
+                 ever be opened"
+            );
+        }
+
+        if self.limits.max_idle_timeout == 0
+            || self.limits.max_idle_timeout > MAX_IDLE_TIMEOUT_CEILING
+        {
+            bail!(
+                "limits.max_idle_timeout = {} must be between 1 and \
+                 {MAX_IDLE_TIMEOUT_CEILING} seconds",
+                self.limits.max_idle_timeout
+            );
+        }
+
+        // Strictly below half, not at it: at exactly half, losing a single
+        // keep-alive packet is enough for the connection to time out. The relay in
+        // front of this server is the reason keep-alives exist at all — its UDP
+        // conntrack entry expires on its own schedule (30s by default), and only a
+        // keep-alive that comfortably beats both timeouts keeps the NAT mapping
+        // alive.
+        if self.limits.keep_alive_interval > 0
+            && self.limits.keep_alive_interval * 2 >= self.limits.max_idle_timeout
+        {
+            bail!(
+                "limits.keep_alive_interval = {} must be less than half of \
+                 limits.max_idle_timeout = {} (i.e. below {}), so that a lost keep-alive \
+                 packet cannot let the connection time out",
+                self.limits.keep_alive_interval,
+                self.limits.max_idle_timeout,
+                self.limits.max_idle_timeout as f64 / 2.0
+            );
+        }
+
+        if self.limits.initial_mtu < MIN_INITIAL_MTU {
+            bail!(
+                "limits.initial_mtu = {} is below the {MIN_INITIAL_MTU} bytes QUIC \
+                 requires (RFC 9000 §14); a smaller value cannot carry a QUIC \
+                 handshake packet",
+                self.limits.initial_mtu
+            );
+        }
+
+        if !INITIAL_RTT_RANGE_MS.contains(&self.limits.initial_rtt_ms) {
+            bail!(
+                "limits.initial_rtt_ms = {} must be between {} and {}; it seeds the \
+                 handshake retransmission timers, and a value below the real path \
+                 RTT retransmits packets that were never lost",
+                self.limits.initial_rtt_ms,
+                INITIAL_RTT_RANGE_MS.start(),
+                INITIAL_RTT_RANGE_MS.end()
+            );
+        }
+
+        for (i, user) in self.auth.users.iter().enumerate() {
+            if user.username.is_empty() {
+                bail!("auth.users[{i}].username is empty");
+            }
+            if user.username.contains(':') {
+                // RFC 7617 §2: the colon separates user-id from password inside
+                // the credentials, so a user-id containing one is unusable.
+                bail!(
+                    "auth.users[{i}].username contains a colon, which RFC 7617 §2 does not allow \
+                     in HTTP Basic credentials"
+                );
+            }
+            if user.password.is_empty() {
+                bail!("auth.users[{i}].password is empty");
+            }
+            if let Some(first) = self.auth.users[..i]
+                .iter()
+                .position(|other| other.username == user.username)
+            {
+                bail!(
+                    "auth.users[{i}].username duplicates auth.users[{first}].username = {:?}",
+                    user.username
+                );
+            }
+        }
+
+        if let Some(i) = self
+            .security
+            .denied_ports
+            .iter()
+            .position(|port| *port == 0)
+        {
+            bail!("security.denied_ports[{i}] is 0, which is not a usable port");
+        }
+
+        if !self.server.cert.is_file() {
+            bail!(
+                "server.cert = {} is not a readable file",
+                self.server.cert.display()
+            );
+        }
+        if !self.server.key.is_file() {
+            bail!(
+                "server.key = {} is not a readable file",
+                self.server.key.display()
+            );
+        }
+
+        Ok(())
+    }
+}
+
+impl Config {
+    /// Settings that are legal but that an operator should be told about.
+    ///
+    /// Returned rather than logged so the caller can emit them *after* the
+    /// tracing subscriber exists — a warning logged during `load()` would be
+    /// written to a subscriber that has not been installed yet, i.e. nowhere —
+    /// and so they can be asserted on in tests.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        if self.auth.users.is_empty() {
+            warnings.push(
+                "[auth].users is empty, so authentication is DISABLED: this is an open proxy and \
+                 anyone who can reach the port can use it. Add users before exposing it."
+                    .to_owned(),
+            );
+        }
+
+        if self.limits.udp_session_timeout < 120 {
+            warnings.push(format!(
+                "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.5 \
+                 recommends; long-lived UDP flows may be cut off",
+                self.limits.udp_session_timeout
+            ));
+        }
+
+        if self.security.allow_private_networks {
+            warnings.push(
+                "security.allow_private_networks is on: clients can reach loopback, RFC 1918 and \
+                 link-local addresses through this proxy, including services that trust \
+                 127.0.0.1"
+                    .to_owned(),
+            );
+        }
+
+        if self.security.denied_ports.contains(&53) {
+            warnings.push(
+                "security.denied_ports contains 53: Surge's UDP availability test is a DNS query \
+                 through the proxy, so it will report the policy as broken"
+                    .to_owned(),
+            );
+        }
+
+        if self.limits.max_connections == 0 {
+            warnings.push(
+                "limits.max_connections = 0 removes the cap on simultaneous connections: \
+                 an unauthenticated peer can open as many as it likes, each with its own \
+                 receive buffers"
+                    .to_owned(),
+            );
+        }
+
+        if self.security.max_auth_failures == 0 && !self.auth.users.is_empty() {
+            warnings.push(
+                "security.max_auth_failures = 0 lets one connection retry credentials \
+                 without limit; guessing then costs a single QUIC handshake"
+                    .to_owned(),
+            );
+        }
+
+        if self.limits.keep_alive_interval == 0 {
+            warnings.push(format!(
+                "limits.keep_alive_interval = 0 disables QUIC keep-alives: behind a relay \
+                 doing UDP DNAT, an idle connection will be dropped when the relay's \
+                 conntrack entry expires (30s by default) even though both ends still \
+                 believe it is alive, since limits.max_idle_timeout is {}s",
+                self.limits.max_idle_timeout
+            ));
+        }
+
+        if !self.limits.mtu_discovery {
+            warnings.push(format!(
+                "limits.mtu_discovery is off: the packet size is pinned at \
+                 limits.initial_mtu = {} bytes and will never adapt. Deliberate on a path \
+                 that black-holes large packets, a throughput loss anywhere else",
+                self.limits.initial_mtu
+            ));
+        }
+
+        if self.log.keylog {
+            warnings.push(
+                "log.keylog is on: TLS secrets are being written to the file named by \
+                 SSLKEYLOGFILE, which lets anyone holding that file decrypt every session \
+                 through this proxy. Never leave this on in production."
+                    .to_owned(),
+            );
+        }
+
+        if self.security.unanswered_packet_budget == 0 {
+            warnings.push(
+                "security.unanswered_packet_budget = 0 disables the RFC 9298 §7 amplification \
+                 mitigation: a client can make this proxy flood a target that never answers"
+                    .to_owned(),
+            );
+        }
+
+        warnings
+    }
+}
+
+/// Upper bound on `limits.max_targets_per_conn`.
+///
+/// Not a protocol limit — a sanity limit. A value beyond this cannot be backed by
+/// file descriptors on any realistic host, so it is more likely a typo.
+const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
+
+/// Levels accepted as a bare `log.level`.
+const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
+/// Validates `log.level`.
+///
+/// A plain word must name a level. This extra strictness matters because
+/// `EnvFilter` would otherwise read a typo like `"warning"` as a *target* name,
+/// accept it, and then log nothing at all. Anything containing filter syntax is
+/// handed to `EnvFilter` as-is.
+fn validate_log_level(level: &str) -> Result<()> {
+    if level.contains([',', '=', '[']) {
+        tracing_subscriber::EnvFilter::try_new(level)
+            .with_context(|| format!("log.level = {level:?} is not a valid filter"))?;
+        return Ok(());
+    }
+
+    if !LOG_LEVELS.iter().any(|l| level.eq_ignore_ascii_case(l)) {
+        bail!(
+            "log.level = {level:?} is not one of {LOG_LEVELS:?}; for anything more \
+             specific use a filter directive such as \"volto=debug,quinn=info\""
+        );
+    }
+
+    Ok(())
+}
+
+impl Server {
+    /// The ALPN identifiers in the byte-vector form rustls expects.
+    pub fn alpn_wire(&self) -> Vec<Vec<u8>> {
+        self.alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    /// The shutdown grace period as a duration.
+    pub fn shutdown_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.shutdown_grace)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_applied() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            "#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.server.alpn, vec!["h3".to_string()]);
+        assert_eq!(cfg.log.level, "info");
+        assert!(!cfg.log.keylog, "keylog must be opt-in");
+        assert_eq!(cfg.limits.udp_session_timeout, 180);
+        assert_eq!(cfg.limits.max_targets_per_conn, 256);
+        assert_eq!(cfg.limits.max_connections, 256);
+        assert_eq!(cfg.limits.max_streams_bidi, 1024);
+        assert_eq!(cfg.security.max_auth_failures, 5);
+        // The connection cap and the tunnel quota multiply out to the fd budget
+        // the shipped systemd unit grants.
+        assert_eq!(
+            cfg.limits.max_connections as u64 * cfg.limits.max_targets_per_conn as u64,
+            65536
+        );
+        assert_eq!(cfg.limits.max_idle_timeout, 60);
+        assert_eq!(cfg.limits.keep_alive_interval, 20);
+        assert_eq!(cfg.limits.initial_mtu, 1200);
+        assert!(cfg.limits.mtu_discovery);
+        // BBR by default: the point of the proxy is lossy long-haul paths.
+        assert_eq!(cfg.limits.congestion_control, CongestionControl::Bbr);
+        // The defaults must themselves satisfy the keep-alive rule.
+        assert!(cfg.limits.keep_alive_interval * 2 < cfg.limits.max_idle_timeout);
+        assert_eq!(cfg.server.shutdown_grace, 30);
+        assert_eq!(cfg.server.alpn_wire(), vec![b"h3".to_vec()]);
+
+        // Security defaults: private space closed, port 25 closed, port 53 open
+        // because Surge tests UDP with a DNS query.
+        assert!(!cfg.security.allow_private_networks);
+        assert_eq!(cfg.security.denied_ports, vec![25]);
+        assert!(!cfg.security.denied_ports.contains(&53));
+        assert_eq!(cfg.security.unanswered_packet_budget, 64);
+
+        // No users at all is legal and means "no authentication".
+        assert!(cfg.auth.users.is_empty());
+    }
+
+    /// A minimal helper: the parsed config for `body`, with cert paths that exist
+    /// left out (so only `body` is under test).
+    fn parse(body: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            {body}
+            "#
+        ))
+        .expect("parses")
+    }
+
+    /// Asserts that everything about `cfg` is valid *except* its certificate paths,
+    /// which `parse` deliberately points at files that do not exist.
+    ///
+    /// The certificate check is the last thing `validate` does, so any other
+    /// complaint surfaces first and fails this.
+    fn assert_valid_apart_from_certs(cfg: &Config, context: &str) {
+        if let Err(error) = cfg.validate() {
+            let msg = error.to_string();
+            assert!(
+                msg.contains("server.cert") || msg.contains("server.key"),
+                "{context} should be valid, but: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn users_are_parsed() {
+        let cfg = parse(
+            r#"
+            [auth]
+            users = [
+              { username = "user1", password = "s3cret" },
+              { username = "user2", password = "other" },
+            ]
+            "#,
+        );
+        assert_eq!(cfg.auth.users.len(), 2);
+        assert_eq!(cfg.auth.users[0].username, "user1");
+        assert_eq!(cfg.auth.users[0].password, "s3cret");
+    }
+
+    /// A `Debug`-formatted config must not leak passwords: it is one panic
+    /// message or one stray log line away from being written down.
+    #[test]
+    fn debug_output_redacts_passwords() {
+        let cfg = parse(
+            r#"
+            [auth]
+            users = [{ username = "user1", password = "s3cret" }]
+            "#,
+        );
+
+        let rendered = format!("{cfg:?}");
+        assert!(
+            !rendered.contains("s3cret"),
+            "the password must be redacted; got:\n{rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        // The username is not a secret and stays visible for diagnosis.
+        assert!(rendered.contains("user1"), "{rendered}");
+    }
+
+    #[test]
+    fn malformed_users_are_rejected_with_their_index() {
+        let cases = [
+            (
+                r#"[auth]
+                   users = [{ username = "", password = "p" }]"#,
+                "auth.users[0].username",
+            ),
+            (
+                r#"[auth]
+                   users = [{ username = "a:b", password = "p" }]"#,
+                "auth.users[0].username",
+            ),
+            (
+                r#"[auth]
+                   users = [{ username = "u", password = "" }]"#,
+                "auth.users[0].password",
+            ),
+            (
+                r#"[auth]
+                   users = [
+                     { username = "u", password = "p" },
+                     { username = "u", password = "q" },
+                   ]"#,
+                "auth.users[1].username",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let err = parse(body).validate().expect_err("must be rejected");
+            assert!(err.to_string().contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_zero_or_oversized_target_quota_is_rejected() {
+        for value in ["0", "70000"] {
+            let err = parse(&format!("[limits]\nmax_targets_per_conn = {value}"))
+                .validate()
+                .expect_err("must be rejected");
+            assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
+        }
+    }
+
+    /// The rule that exists because of the relay: a keep-alive at or above half the
+    /// idle timeout cannot survive losing a single packet.
+    #[test]
+    fn a_keep_alive_at_or_above_half_the_idle_timeout_is_rejected() {
+        // Exactly half, and above it.
+        for (idle, keepalive) in [(40, 20), (60, 30), (60, 45), (10, 5)] {
+            let err = parse(&format!(
+                "[limits]\nmax_idle_timeout = {idle}\nkeep_alive_interval = {keepalive}"
+            ))
+            .validate()
+            .expect_err("must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("keep_alive_interval"), "{msg}");
+            // The message has to say what to compare against, not just complain.
+            assert!(msg.contains("max_idle_timeout"), "{msg}");
+        }
+
+        // Just below half is fine.
+        for (idle, keepalive) in [(41, 20), (60, 20), (60, 29), (1, 0)] {
+            let cfg = parse(&format!(
+                "[limits]\nmax_idle_timeout = {idle}\nkeep_alive_interval = {keepalive}"
+            ));
+            assert_valid_apart_from_certs(&cfg, &format!("idle={idle} keepalive={keepalive}"));
+        }
+    }
+
+    /// Zero disables keep-alives rather than failing the ratio check — but it is
+    /// warned about, because behind a relay it is how idle connections die.
+    #[test]
+    fn disabling_keep_alives_is_allowed_but_warned_about() {
+        let cfg = parse("[limits]\nkeep_alive_interval = 0");
+        assert_valid_apart_from_certs(&cfg, "keep_alive_interval = 0");
+        assert_eq!(cfg.limits.keep_alive_interval(), None);
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.contains("keep_alive_interval") && w.contains("conntrack")),
+            "{:?}",
+            cfg.warnings()
+        );
+    }
+
+    #[test]
+    fn an_initial_mtu_below_the_quic_floor_is_rejected() {
+        for value in [0, 1, 576, 1199] {
+            let err = parse(&format!("[limits]\ninitial_mtu = {value}"))
+                .validate()
+                .expect_err("must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("initial_mtu"), "{msg}");
+            assert!(msg.contains("1200"), "the floor must be named: {msg}");
+        }
+
+        // The floor itself and above it are accepted.
+        for value in [1200, 1500, 9000] {
+            let cfg = parse(&format!("[limits]\ninitial_mtu = {value}"));
+            assert_valid_apart_from_certs(&cfg, &format!("initial_mtu = {value}"));
+        }
+    }
+
+    #[test]
+    fn an_initial_rtt_outside_the_sane_range_is_rejected() {
+        for value in [0, 9, 10_001] {
+            let err = parse(&format!("[limits]\ninitial_rtt_ms = {value}"))
+                .validate()
+                .expect_err("must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("initial_rtt_ms"), "{msg}");
+        }
+
+        // Both ends of the range, the default, and a tuned long-haul value.
+        for value in [10, 150, 333, 10_000] {
+            let cfg = parse(&format!("[limits]\ninitial_rtt_ms = {value}"));
+            assert_valid_apart_from_certs(&cfg, &format!("initial_rtt_ms = {value}"));
+        }
+    }
+
+    #[test]
+    fn a_zero_stream_limit_or_idle_timeout_is_rejected() {
+        for (body, field) in [
+            ("[limits]\nmax_streams_bidi = 0", "max_streams_bidi"),
+            ("[limits]\nmax_idle_timeout = 0", "max_idle_timeout"),
+            ("[limits]\nmax_idle_timeout = 4000", "max_idle_timeout"),
+        ] {
+            let err = parse(body).validate().expect_err("must be rejected");
+            assert!(err.to_string().contains(field), "{err}");
+        }
+    }
+
+    #[test]
+    fn pinning_the_mtu_is_allowed_but_warned_about() {
+        let cfg = parse("[limits]\nmtu_discovery = false\ninitial_mtu = 1350");
+        assert_valid_apart_from_certs(&cfg, "mtu_discovery = false");
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.contains("mtu_discovery") && w.contains("1350")),
+            "{:?}",
+            cfg.warnings()
+        );
+    }
+
+    #[test]
+    fn congestion_control_is_selectable_and_defaults_to_bbr() {
+        assert_eq!(
+            parse("").limits.congestion_control,
+            CongestionControl::Bbr,
+            "the default must be BBR"
+        );
+        for (value, expected) in [
+            ("bbr", CongestionControl::Bbr),
+            ("cubic", CongestionControl::Cubic),
+            ("newreno", CongestionControl::NewReno),
+        ] {
+            let cfg = parse(&format!("[limits]\ncongestion_control = \"{value}\""));
+            assert_eq!(cfg.limits.congestion_control, expected, "{value}");
+            assert_valid_apart_from_certs(&cfg, value);
+        }
+    }
+
+    #[test]
+    fn an_unknown_congestion_controller_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            [limits]
+            congestion_control = "reno"
+            "#,
+        )
+        .expect_err("an unknown controller must be rejected");
+        assert!(err.to_string().contains("congestion_control"), "{err}");
+    }
+
+    #[test]
+    fn port_zero_cannot_be_denied() {
+        let err = parse("[security]\ndenied_ports = [25, 0]")
+            .validate()
+            .expect_err("must be rejected");
+        assert!(
+            err.to_string().contains("security.denied_ports[1]"),
+            "{err}"
+        );
+    }
+
+    /// The open-proxy warning is the single most important thing an operator can
+    /// be told at startup, so it is asserted rather than assumed.
+    #[test]
+    fn an_empty_user_list_warns_about_being_an_open_proxy() {
+        let warnings = parse("").warnings();
+        assert!(
+            warnings.iter().any(|w| w.contains("open proxy")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn configured_users_produce_no_open_proxy_warning() {
+        let warnings = parse(
+            r#"
+            [auth]
+            users = [{ username = "u", password = "p" }]
+            "#,
+        )
+        .warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("open proxy")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn risky_but_legal_settings_are_warned_about() {
+        let cfg = parse(
+            r#"
+            [auth]
+            users = [{ username = "u", password = "p" }]
+
+            [limits]
+            udp_session_timeout = 30
+
+            [security]
+            allow_private_networks = true
+            denied_ports = [25, 53]
+            unanswered_packet_budget = 0
+
+            [log]
+            keylog = true
+            "#,
+        );
+
+        let warnings = cfg.warnings();
+        // One per risky setting, and nothing else.
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        for expected in [
+            "udp_session_timeout",
+            "allow_private_networks",
+            "denied_ports contains 53",
+            "unanswered_packet_budget",
+            "log.keylog",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(expected)),
+                "missing a warning about {expected}: {warnings:?}"
+            );
+        }
+    }
+
+    /// The shipped example configuration must stay in step with the code.
+    ///
+    /// `deny_unknown_fields` makes this a real test: a key renamed here without
+    /// updating `script/config.example.toml`, or a typo introduced in the example,
+    /// fails the build rather than the operator's first startup.
+    #[test]
+    fn the_shipped_example_configuration_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/script/config.example.toml");
+        let text = std::fs::read_to_string(path).expect("the example config must exist");
+
+        let cfg: Config = toml::from_str(&text).expect("the example config must parse");
+        assert_eq!(cfg.server.listen.port(), 443);
+        assert_eq!(cfg.auth.users.len(), 1, "the example must show a user");
+        assert_eq!(cfg.log.level, "info");
+
+        // Everything except the certificate paths, which do not exist in a checkout,
+        // must pass validation.
+        let error = cfg
+            .validate()
+            .expect_err("the example points at paths that do not exist here")
+            .to_string();
+        assert!(
+            error.contains("server.cert"),
+            "the example must be valid apart from its certificate paths, got: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            lisen = "typo"
+            "#,
+        )
+        .expect_err("must reject unknown keys");
+        assert!(err.to_string().contains("lisen"), "{err}");
+    }
+
+    #[test]
+    fn bad_listen_address_names_the_field() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "not-an-address"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            "#,
+        )
+        .expect_err("must reject a malformed listen address");
+        assert!(err.to_string().contains("listen"), "{err}");
+    }
+
+    #[test]
+    fn empty_alpn_is_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            alpn = []
+            "#,
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("empty alpn must be rejected");
+        assert!(err.to_string().contains("server.alpn"), "{err}");
+    }
+
+    #[test]
+    fn missing_cert_file_is_reported_with_the_path() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/nonexistent/volto/cert.pem"
+            key = "/nonexistent/volto/key.pem"
+            "#,
+        )
+        .expect("parses");
+        let err = cfg.validate().expect_err("missing cert must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("server.cert"), "{msg}");
+        assert!(msg.contains("/nonexistent/volto/cert.pem"), "{msg}");
+    }
+
+    #[test]
+    fn plain_log_levels_are_accepted() {
+        for level in ["trace", "debug", "info", "warn", "error", "INFO"] {
+            validate_log_level(level).unwrap_or_else(|e| panic!("{level} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn filter_directives_are_accepted() {
+        validate_log_level("volto=debug,quinn=info").expect("directive list is valid");
+    }
+
+    #[test]
+    fn a_level_typo_is_rejected_rather_than_silently_disabling_logs() {
+        // EnvFilter would accept these as target names and then log nothing.
+        for level in ["warning", "verbose", "definitely not a level"] {
+            let err = validate_log_level(level).expect_err("{level} must be rejected");
+            assert!(err.to_string().contains("log.level"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_filter_directive_is_rejected() {
+        let err = validate_log_level("volto=notalevel").expect_err("must be rejected");
+        assert!(err.to_string().contains("log.level"), "{err}");
+    }
+}

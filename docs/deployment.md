@@ -1,0 +1,272 @@
+# Deployment
+
+Target platform is a Linux host with systemd; the development host is macOS and
+the test suite is expected to pass on both.
+
+## Building
+
+Rust 1.85 or newer. `Cargo.lock` is committed and `h3`/`h3-quinn` are pinned to a
+git revision (the published releases carry proxy-fatal bugs — see
+[architecture.md](architecture.md#why-h3-is-pinned)), so build with the lockfile
+and do **not** run `cargo update`:
+
+```sh
+cargo build --release --locked      # target/release/volto
+```
+
+On Debian or Ubuntu that needs `build-essential` and `pkg-config`. Compiling on
+the server itself is the simplest route; the dependency stack is pure Rust apart
+from ring's build, so cross-compiling works as well:
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+cargo build --release --locked --target x86_64-unknown-linux-musl
+```
+
+Cross-compiling to musl needs a C toolchain for ring (`musl-tools` for the
+x86_64 target, a cross toolchain for aarch64). The release workflow builds both
+targets with [`cross`](https://github.com/cross-rs/cross); the resulting static
+binaries are attached to each tagged release together with a `SHA256SUMS` file
+and the contents of `script/`.
+
+## Certificates
+
+Two paths. Pick one.
+
+### ACME with DNS-01
+
+The right choice when you own a domain and want clients to need no extra
+configuration. When the domain's A record points at a UDP relay rather than at
+the server, HTTP-01 and TLS-ALPN-01 cannot validate — they are answered at the
+address the record names — so DNS-01 is the only usable challenge:
+
+```sh
+sudo apt install -y certbot python3-certbot-dns-cloudflare   # or your provider's plugin
+sudo certbot certonly \
+  --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+  --key-type ecdsa \
+  -d example.com
+```
+
+`--key-type ecdsa` is not only a performance preference. Until a client's address
+is validated, QUIC lets a server send at most three times the bytes it received
+(RFC 9000 §8.1, roughly a 3600-byte budget). An RSA chain can exceed that and
+cost the handshake an extra round trip; an ECDSA chain fits comfortably.
+
+The symlinks under `/etc/letsencrypt/live/` are readable by root only, so rather
+than pointing volto at them, have the renewal hook copy the files into
+`/etc/volto` and reload:
+
+```sh
+sudo tee /etc/letsencrypt/renewal-hooks/deploy/volto.sh >/dev/null <<'EOF'
+#!/bin/sh
+set -e
+install -o volto -g volto -m 0644 /etc/letsencrypt/live/example.com/fullchain.pem /etc/volto/fullchain.pem
+install -o volto -g volto -m 0640 /etc/letsencrypt/live/example.com/privkey.pem   /etc/volto/privkey.pem
+systemctl reload volto
+EOF
+sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/volto.sh
+sudo /etc/letsencrypt/renewal-hooks/deploy/volto.sh   # run it once by hand
+```
+
+### Self-signed with fingerprint pinning
+
+The right choice for a handful of your own devices when maintaining a domain and
+DNS-01 credentials is not worth it. The client verifies one specific certificate
+by its SHA-256 fingerprint instead of a chain.
+
+```sh
+cargo build --release --locked
+sudo script/install-selfsigned.sh
+```
+
+The installer creates the `volto` system user, installs the binary, generates an
+EC P-256 certificate valid for ten years, derives `/etc/volto/config.toml` from
+the shipped example with a random password, installs and starts the systemd unit,
+opens the port in ufw if it is active, and prints the fingerprint, the expiry
+date and a pasteable Surge policy line. It asks for the certificate name when
+neither `--sni` nor `$SNI` is set and a terminal is attached; everything else has
+a default:
+
+```sh
+sudo script/install-selfsigned.sh \
+  --sni volto.internal \
+  --port 443 \
+  --username surge \
+  --password 'or let it generate one'
+```
+
+Re-running is safe: an existing config file, certificate or user is kept.
+`--force` regenerates the certificate only — it never rewrites `config.toml`, so
+hand edits survive. Regenerating changes the fingerprint, and every client then
+has to be updated.
+
+Generating the certificate by hand instead:
+
+```sh
+sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout /etc/volto/key.pem -out /etc/volto/cert.pem \
+  -days 3650 -nodes \
+  -subj "/CN=volto.internal" \
+  -addext "subjectAltName=DNS:volto.internal" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"
+
+sudo chown volto:volto /etc/volto/cert.pem /etc/volto/key.pem
+sudo chmod 0644 /etc/volto/cert.pem
+sudo chmod 0640 /etc/volto/key.pem
+
+openssl x509 -in /etc/volto/cert.pem -noout -fingerprint -sha256   # for the client
+openssl x509 -in /etc/volto/cert.pem -noout -enddate               # note the expiry
+```
+
+The SAN is what gets matched — a bare CN has not been accepted for years — so it
+must be present even though the name is fictional. The name need not resolve:
+the client connects to an address and uses this only as the SNI and the name to
+match.
+
+What pinning changes, and why each point matters:
+
+- **The fingerprint is the trust anchor.** Generate it on the server, and carry
+  it to each client yourself. If it arrives over a channel someone else can
+  rewrite, pinning buys nothing — an attacker supplies their own fingerprint.
+- **The private key never leaves the machine.** Not into backups, not into chat.
+- **There is no revocation.** If the key may have leaked, the only remedy is
+  regenerating (`--force`) and updating the fingerprint on every client by hand.
+- **Track the expiry date yourself.** A pinning client usually skips validity and
+  hostname checks, so an expired certificate may fail silently and only surface
+  after a client update. The installer prints the date; put it in a calendar.
+- **Never use `skip-cert-verify` instead of pinning.** It disables server
+  identity entirely, and Basic credentials are sent on *every* request — a man in
+  the middle collects the username and password on first use.
+
+## systemd
+
+The shipped unit is [`script/masque.service`](../script/masque.service). Manual
+installation:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin volto
+sudo install -m 0755 target/release/volto /usr/local/bin/volto
+sudo install -d -o volto -g volto -m 0750 /etc/volto
+sudo install -o volto -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
+sudo install -m 0644 script/masque.service /etc/systemd/system/volto.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now volto
+```
+
+Then edit `/etc/volto/config.toml`: set the `cert`/`key` paths and **set
+`[auth].users`**. An empty user list means no authentication at all.
+
+The unit runs as a fixed system user rather than with `DynamicUser=yes` on
+purpose: the private key must be readable by this service and nothing else,
+which needs a stable owner to grant it to (`chown volto:volto`, mode 0640).
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` is what allows binding a low port
+without root, and the rest of the unit is standard systemd hardening —
+`ProtectSystem=strict` with `ReadOnlyPaths=/etc/volto`, a `@system-service`
+syscall filter, no new privileges.
+
+`RUST_LOG` overrides the configured log level without editing the config:
+
+```ini
+# /etc/systemd/system/volto.service.d/debug.conf
+[Service]
+Environment=RUST_LOG=volto=debug,quinn=info
+```
+
+## Firewall
+
+QUIC is UDP. This is the single most common reason for "it works locally but the
+client cannot connect":
+
+```sh
+sudo ufw allow 443/udp
+sudo ss -lunp | grep 443     # confirm volto is actually listening on UDP
+```
+
+A cloud provider's security group needs the same rule, on UDP.
+
+## File-descriptor budget
+
+Each tunnel — TCP or UDP — costs one descriptor, and one client multiplexes many
+onto a single QUIC connection. `limits.max_targets_per_conn` and the unit's
+`LimitNOFILE` are therefore two halves of one budget, and the shipped defaults
+line up: 256 connections × 256 tunnels = 65536 = `LimitNOFILE`. volto checks
+`RLIMIT_NOFILE` at startup and warns when the margin is thin, which is worth
+heeding rather than silencing.
+
+On a high-bandwidth path the kernel's default UDP socket buffers become the
+packet-loss point. quinn does not change system values for you:
+
+```sh
+sudo sysctl -w net.core.rmem_max=8388608
+sudo sysctl -w net.core.wmem_max=8388608
+```
+
+## Reloading
+
+`systemctl reload volto` sends SIGHUP. volto re-reads the configuration file and
+applies it to connections accepted from then on: a renewed certificate, a changed
+user list, changed transport parameters. Established connections keep the
+configuration they were accepted with — a tunnel's rules must not change
+mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
+
+A reload is all-or-nothing. Parsing, validation and certificate loading all
+happen before anything is swapped in, so there is no state where a new
+certificate is paired with an old user list. If the file is broken, volto logs
+the error and **keeps running on the previous configuration**; it never exits.
+That property is the point: the process sending this signal is usually a renewal
+hook running unattended, and a typo must not become an outage.
+
+## Graceful shutdown
+
+SIGTERM stops the endpoint from accepting new connections, sends GOAWAY on the
+established ones and waits for their tunnels to finish, up to
+`server.shutdown_grace` (default 30 s). Keep systemd's `TimeoutStopSec`
+comfortably above that value — the shipped unit uses 45 — so systemd does not
+send SIGKILL mid-drain.
+
+## fail2ban
+
+A failed authentication logs one stable `WARN` line carrying the source address:
+
+```
+WARN ... authentication failed ... remote=203.0.113.7:5678 username=Some("user1") reason="credentials rejected"
+```
+
+`/etc/fail2ban/filter.d/volto.conf`:
+
+```ini
+[Definition]
+failregex = ^.*authentication failed.*remote=<HOST>:\d+.*$
+ignoreregex =
+```
+
+`/etc/fail2ban/jail.d/volto.conf`:
+
+```ini
+[volto]
+enabled  = true
+backend  = systemd
+journalmatch = _SYSTEMD_UNIT=volto.service
+filter   = volto
+maxretry = 10
+findtime = 10m
+bantime  = 1h
+# QUIC is UDP: the action has to ban the UDP port.
+action   = iptables[name=volto, port=443, protocol=udp]
+```
+
+**Check first that the logged address actually distinguishes clients.** Any NAT
+in the path rewrites it: behind a UDP relay every client appears with the relay's
+address, and a server behind carrier-grade NAT can see all inbound traffic
+rewritten to one gateway address. Verify by connecting yourself and comparing
+`remote=` against your own public address. If they do not match, or if every
+connection shares one address, banning by IP bans everyone — drop fail2ban and
+rely on the connection-level limit instead, or run the ban on the machine
+closest to the internet that still sees real client addresses.
+
+That connection-level limit needs no configuration and is unaffected by topology:
+after `security.max_auth_failures` failures (default 5) the whole QUIC connection
+is closed, so an attacker pays for a full QUIC and TLS handshake every N guesses.

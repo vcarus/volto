@@ -1,0 +1,734 @@
+//! CONNECT-UDP tunnels (RFC 9298) over HTTP Datagrams (RFC 9297).
+//!
+//! # Shape of a session
+//!
+//! A CONNECT-UDP request opens a *session*: one request stream plus one
+//! connected UDP socket. Unlike a TCP tunnel, the payload does not travel on the
+//! request stream — it travels in QUIC DATAGRAM frames shared by every session
+//! on the connection, each tagged with the Quarter Stream ID of its request
+//! stream. So a session needs three things pumped at once:
+//!
+//! * inbound datagrams, delivered by the connection-wide router via a channel;
+//! * outbound packets read from the UDP socket;
+//! * the request stream itself, which carries capsules and the close signal.
+//!
+//! # Deliberate asymmetries
+//!
+//! * The 2xx is sent **immediately** after the socket is ready (RFC 9298 §3.2):
+//!   UDP has no handshake, so waiting for the target to answer would hang.
+//! * Name resolution happens **before** the 2xx, so an unresolvable target is
+//!   refused rather than becoming a silent black hole.
+//! * An oversized outbound packet is **dropped**, never downgraded to a capsule
+//!   (RFC 9298 §6.1).
+//! * Closing the socket also closes the request stream, and vice versa
+//!   (RFC 9298 §3.5) — a half-open UDP session has no meaning.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use percent_encoding::percent_decode_str;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+use crate::capsule::{self, Capsule, CapsuleDecoder};
+use crate::datagram::{self, MAX_UDP_PAYLOAD};
+use crate::h3api::{self, Reader, Stream, Writer};
+use crate::tunnel::{Context, ProxyError};
+use crate::{net, tunnel};
+
+/// Path prefix of the RFC 9298 §2 default URI template.
+pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
+
+/// Inbound datagrams buffered per session before packets start being dropped.
+///
+/// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
+/// slow target turn into unbounded memory growth.
+const INBOUND_QUEUE_DEPTH: usize = 64;
+
+/// Routes inbound HTTP datagrams to the session that owns them.
+///
+/// Keyed by Quarter Stream ID, which is how RFC 9297 §2.1 names a session on the
+/// wire. Owned by the connection and shared with every session on it.
+#[derive(Default)]
+pub struct SessionRegistry {
+    sessions: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
+}
+
+impl SessionRegistry {
+    /// Registers a session, returning a guard that deregisters it on drop.
+    ///
+    /// The guard is what keeps the table from leaking entries: a session can end
+    /// through any of half a dozen paths, and all of them drop it.
+    fn register(
+        self: &Arc<Self>,
+        quarter_stream_id: u64,
+        inbound: mpsc::Sender<Bytes>,
+    ) -> SessionGuard {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(quarter_stream_id, inbound);
+
+        SessionGuard {
+            registry: Arc::clone(self),
+            quarter_stream_id,
+        }
+    }
+
+    /// The inbound sink for a Quarter Stream ID, if a session owns it.
+    fn get(&self, quarter_stream_id: u64) -> Option<mpsc::Sender<Bytes>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&quarter_stream_id)
+            .cloned()
+    }
+
+    /// Number of live sessions. Used by tests and future accounting.
+    pub fn len(&self) -> usize {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    /// Whether any session is live.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Deregisters a session when dropped.
+struct SessionGuard {
+    registry: Arc<SessionRegistry>,
+    quarter_stream_id: u64,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        self.registry
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.quarter_stream_id);
+    }
+}
+
+/// Delivers inbound QUIC datagrams to their sessions until the connection ends.
+///
+/// One task per connection. Decoding failures and datagrams for unknown sessions
+/// are dropped rather than treated as connection errors: RFC 9297 §2.1 permits
+/// discarding a datagram whose Quarter Stream ID has no live request stream,
+/// which happens routinely when a session closes with packets in flight.
+pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegistry>) {
+    loop {
+        let datagram = match quic.read_datagram().await {
+            Ok(datagram) => datagram,
+            // The connection is gone; so is every session on it.
+            Err(error) => {
+                debug!(%error, "stopped reading QUIC datagrams");
+                return;
+            }
+        };
+
+        let decoded = match datagram::decode(datagram) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                debug!(%error, "malformed HTTP datagram");
+                continue;
+            }
+        };
+
+        if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
+            // RFC 9298 §4: an unknown context must be dropped silently, never
+            // treated as an error.
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                context_id = decoded.context_id,
+                "dropping datagram with an unknown context id"
+            );
+            continue;
+        }
+
+        let Some(inbound) = sessions.get(decoded.quarter_stream_id) else {
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                "dropping datagram for an unknown session"
+            );
+            continue;
+        };
+
+        // Never block the router on one slow session: dropping a UDP packet is
+        // legitimate, stalling every other session is not.
+        if inbound.try_send(decoded.payload).is_err() {
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                "inbound queue full or closed, dropping datagram"
+            );
+        }
+    }
+}
+
+/// Establishes a UDP tunnel for a `connect-udp` request and runs it.
+pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Context) {
+    let (host, port) = match parse_target(req.uri().path(), req.uri().query()) {
+        Ok(target) => target,
+        Err(reason) => {
+            debug!(stream_id, path = %req.uri().path(), reason, "malformed connect-udp request");
+            tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+            return;
+        }
+    };
+
+    // Cheapest check first, and one that needs no resolver.
+    if !ctx.policy.allows_port(port) {
+        debug!(stream_id, host, port, "target port denied by policy");
+        tunnel::refuse_because(
+            &mut stream,
+            StatusCode::FORBIDDEN,
+            ProxyError::HttpRequestDenied,
+            stream_id,
+        )
+        .await;
+        return;
+    }
+
+    // RFC 9298 §3.2: resolution must complete before the 2xx, so a bad name is
+    // refused instead of silently swallowing every packet.
+    //
+    // Decision D9: a resolver failure is a 502, not a 400. A transient DNS
+    // failure is not something the client did wrong, and the RFC 9209 reason
+    // tells it which of the two happened.
+    let addresses = match net::resolve(&host, port).await {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            debug!(stream_id, host, port, %error, "failed to resolve connect-udp target");
+            tunnel::refuse_because(
+                &mut stream,
+                StatusCode::BAD_GATEWAY,
+                ProxyError::DnsError,
+                stream_id,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let allowed = ctx.policy.allowed_addresses(&addresses);
+    if allowed.is_empty() {
+        warn!(
+            stream_id,
+            host,
+            port,
+            ?addresses,
+            "every address of the target is prohibited by policy"
+        );
+        tunnel::refuse_because(
+            &mut stream,
+            StatusCode::FORBIDDEN,
+            ProxyError::DestinationIpProhibited,
+            stream_id,
+        )
+        .await;
+        return;
+    }
+
+    let socket = match bind_any(&allowed).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            debug!(stream_id, ?allowed, %error, "failed to open target UDP socket");
+            tunnel::refuse_because(
+                &mut stream,
+                StatusCode::BAD_GATEWAY,
+                ProxyError::from_connect_error(&error),
+                stream_id,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let quarter_stream_id = datagram::quarter_stream_id(stream_id);
+    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+
+    // Registered before the 2xx so datagrams the client sends the instant it
+    // sees the response have somewhere to go.
+    let _guard = ctx.sessions.register(quarter_stream_id, inbound_tx);
+
+    if let Err(error) = stream.respond_with(StatusCode::OK, capsule_headers()).await {
+        debug!(stream_id, %error, "failed to send 200 for connect-udp");
+        return;
+    }
+
+    let target = socket.peer_addr().ok();
+    info!(
+        stream_id,
+        quarter_stream_id,
+        host,
+        port,
+        ?target,
+        datagrams = ctx.datagrams_allowed(),
+        "udp session established"
+    );
+
+    let (writer, reader) = stream.split();
+    let mut session = Session {
+        quarter_stream_id,
+        socket,
+        inbound: inbound_rx,
+        reader,
+        writer,
+        decoder: CapsuleDecoder::new(),
+        // Zero is the operator's way of switching the mitigation off, so it means
+        // "uncapped" rather than "nothing may be sent".
+        unanswered_budget: match ctx.unanswered_packet_budget {
+            0 => None,
+            budget => Some(budget),
+        },
+        ctx,
+    };
+
+    session.run(stream_id).await;
+
+    debug!(stream_id, quarter_stream_id, "udp session closed");
+}
+
+/// A running UDP session.
+struct Session {
+    quarter_stream_id: u64,
+    socket: UdpSocket,
+    /// Payloads the connection router decoded for this session.
+    inbound: mpsc::Receiver<Bytes>,
+    reader: Reader,
+    writer: Writer,
+    /// The request stream body is a capsule sequence (RFC 9297 §3.4).
+    decoder: CapsuleDecoder,
+    /// Packets still allowed towards a target that has never answered.
+    ///
+    /// RFC 9298 §7: until the target says something, this session might be an
+    /// attempt to use the proxy as a reflector or a port scanner, so what it can
+    /// emit is capped. `None` means uncapped — either the target has answered,
+    /// which lifts the cap for good because the target has consented to the
+    /// conversation, or the operator disabled the mitigation.
+    unanswered_budget: Option<u32>,
+    ctx: Context,
+}
+
+/// What a single step of the session loop decided.
+enum Step {
+    /// Keep going, and treat this as activity for the idle timer.
+    Continue,
+    /// The session is over.
+    Stop,
+}
+
+impl Session {
+    /// Pumps the session until it closes, one direction at a time.
+    async fn run(&mut self, stream_id: u64) {
+        // A UDP datagram can be at most this big, so one buffer serves forever.
+        let mut packet = vec![0u8; MAX_UDP_PAYLOAD];
+
+        loop {
+            // Wrapping the whole step measures idleness directly: any branch
+            // firing resets the clock. Every branch below is cancel-safe.
+            let step = tokio::time::timeout(self.ctx.idle_timeout, async {
+                tokio::select! {
+                    payload = self.inbound.recv() => match payload {
+                        Some(payload) => self.forward_to_target(payload).await,
+                        // Only happens if the registry dropped our sender.
+                        None => Step::Stop,
+                    },
+                    received = self.socket.recv(&mut packet) => match received {
+                        Ok(length) => self.forward_to_client(&packet[..length]).await,
+                        Err(error) => {
+                            // ICMP errors surface here on a connected socket.
+                            // RFC 9298 §3.4: the request stream must be closed.
+                            debug!(stream_id, %error, "target socket failed");
+                            Step::Stop
+                        }
+                    },
+                    chunk = self.reader.recv_data() => {
+                        self.handle_stream_chunk(stream_id, chunk).await
+                    }
+                }
+            })
+            .await;
+
+            match step {
+                Ok(Step::Continue) => {}
+                Ok(Step::Stop) => break,
+                Err(_elapsed) => {
+                    debug!(
+                        stream_id,
+                        timeout_secs = self.ctx.idle_timeout.as_secs(),
+                        "udp session idle timeout"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // RFC 9298 §3.5: closing the UDP socket and closing the request stream
+        // go together. The socket closes when `self` drops; the stream needs
+        // saying explicitly.
+        self.reader.stop_receiving(h3api::NO_ERROR);
+        if let Err(error) = self.writer.finish().await {
+            debug!(stream_id, %error, "failed to finish the connect-udp stream");
+        }
+    }
+
+    /// Forwards a payload received from the client to the target.
+    async fn forward_to_target(&mut self, payload: Bytes) -> Step {
+        // RFC 9298 §5: a context-0 payload larger than this cannot be a UDP
+        // datagram, so the stream is aborted rather than truncating it.
+        if payload.len() > MAX_UDP_PAYLOAD {
+            warn!(
+                quarter_stream_id = self.quarter_stream_id,
+                length = payload.len(),
+                "client sent an oversized UDP payload, aborting the session"
+            );
+            self.writer.reset(h3api::MESSAGE_ERROR);
+            return Step::Stop;
+        }
+
+        // RFC 9298 §7. The packet is dropped rather than the session closed: a
+        // legitimate flow whose target is merely slow to answer must be able to
+        // recover once a reply arrives, and UDP loss is not an error condition.
+        if let Some(remaining) = self.unanswered_budget.as_mut() {
+            if *remaining == 0 {
+                debug!(
+                    quarter_stream_id = self.quarter_stream_id,
+                    "unanswered packet budget exhausted, dropping outbound packet"
+                );
+                return Step::Continue;
+            }
+            *remaining -= 1;
+        }
+
+        match self.socket.send(&payload).await {
+            Ok(_) => Step::Continue,
+            Err(error) => {
+                // The target is unreachable (ICMP) or the socket is broken.
+                debug!(%error, "failed to send to the target");
+                Step::Stop
+            }
+        }
+    }
+
+    /// Forwards a packet received from the target to the client.
+    async fn forward_to_client(&mut self, packet: &[u8]) -> Step {
+        // The socket is connected, so anything arriving here really is from the
+        // target: the conversation is two-way and the amplification cap is done.
+        self.unanswered_budget = None;
+
+        let encoded_len = datagram::encoded_len(
+            self.quarter_stream_id,
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            packet.len(),
+        );
+
+        if self.ctx.datagrams_allowed() {
+            // The QUIC datagram path. If the packet does not fit, it is dropped:
+            // RFC 9298 §6.1 says SHOULD NOT fall back to a capsule, because
+            // doing so silently converts a lossy flow into a head-of-line
+            // blocked one.
+            let limit = self.ctx.datagrams.max_datagram_size().unwrap_or(0);
+            if encoded_len > limit {
+                debug!(
+                    quarter_stream_id = self.quarter_stream_id,
+                    encoded_len, limit, "target packet too large for a QUIC datagram, dropping"
+                );
+                return Step::Continue;
+            }
+
+            let encoded = datagram::encode_udp_payload(self.quarter_stream_id, packet);
+            if let Err(error) = self.ctx.datagrams.send_datagram(encoded) {
+                debug!(%error, "failed to send a QUIC datagram");
+            }
+            return Step::Continue;
+        }
+
+        // The peer never advertised SETTINGS_H3_DATAGRAM, so RFC 9297 §2.1.1
+        // forbids the datagram path entirely and the request stream is the only
+        // way out. This is not the same situation as the oversize case above:
+        // there a datagram path exists and RFC 9298 §6.1 says not to bypass it,
+        // whereas here there is none, so capsules are the correct channel.
+        let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packet);
+        if let Err(error) = self.writer.send_data(encoded).await {
+            debug!(%error, "failed to send a DATAGRAM capsule");
+            return Step::Stop;
+        }
+
+        Step::Continue
+    }
+
+    /// Handles bytes, EOF or an error on the request stream.
+    ///
+    /// The body is a capsule sequence. A DATAGRAM capsule carries a UDP payload
+    /// the client chose to send reliably instead of in a QUIC datagram, and is
+    /// forwarded exactly the same way.
+    async fn handle_stream_chunk(
+        &mut self,
+        stream_id: u64,
+        chunk: Result<Option<Bytes>, h3api::StreamError>,
+    ) -> Step {
+        match chunk {
+            Ok(Some(data)) => {
+                self.decoder.push(data);
+
+                loop {
+                    match self.decoder.next_capsule() {
+                        Ok(Some(Capsule::Datagram {
+                            context_id,
+                            payload,
+                        })) => {
+                            if context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
+                                // RFC 9298 §4, as for datagrams: drop silently.
+                                debug!(
+                                    stream_id,
+                                    context_id, "dropping capsule with an unknown context id"
+                                );
+                                continue;
+                            }
+                            if matches!(self.forward_to_target(payload).await, Step::Stop) {
+                                return Step::Stop;
+                            }
+                        }
+                        // More bytes needed.
+                        Ok(None) => return Step::Continue,
+                        Err(error) => {
+                            debug!(stream_id, %error, "malformed capsule");
+                            self.writer.reset(h3api::MESSAGE_ERROR);
+                            return Step::Stop;
+                        }
+                    }
+                }
+            }
+            // RFC 9298 §3.5: the client closing the stream ends the session.
+            Ok(None) => {
+                if self.decoder.at_capsule_boundary() {
+                    debug!(stream_id, "client closed the connect-udp stream");
+                } else {
+                    // RFC 9297 §3.1: a body ending mid-capsule is malformed.
+                    debug!(
+                        stream_id,
+                        error = %capsule::Error::Truncated,
+                        "connect-udp stream ended mid-capsule"
+                    );
+                    self.writer.reset(h3api::MESSAGE_ERROR);
+                }
+                Step::Stop
+            }
+            Err(error) => {
+                match h3api::peer_reset_code(&error) {
+                    Some(code) => debug!(stream_id, code, "client reset the connect-udp stream"),
+                    None => debug!(stream_id, %error, "connect-udp stream failed"),
+                }
+                Step::Stop
+            }
+        }
+    }
+}
+
+/// The response headers of a CONNECT-UDP 2xx.
+///
+/// RFC 9297 §3.4 requires `Capsule-Protocol: ?1` and forbids Content-Length and
+/// Content-Type, since the body is a capsule sequence rather than a
+/// representation.
+fn capsule_headers() -> HeaderMap {
+    let mut headers = HeaderMap::with_capacity(1);
+    headers.insert(
+        HeaderName::from_static("capsule-protocol"),
+        HeaderValue::from_static("?1"),
+    );
+    headers
+}
+
+/// Opens a connected UDP socket to the first address that works.
+async fn bind_any(addresses: &[std::net::SocketAddr]) -> std::io::Result<UdpSocket> {
+    let mut last = None;
+
+    for address in addresses {
+        match net::connected_udp_socket(*address).await {
+            Ok(socket) => return Ok(socket),
+            Err(error) => {
+                debug!(%address, %error, "could not open a socket to the target");
+                last = Some(error);
+            }
+        }
+    }
+
+    Err(last.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind to")
+    }))
+}
+
+/// Parses the RFC 9298 §2 default URI template.
+///
+/// ```text
+/// /.well-known/masque/udp/{target_host}/{target_port}/
+/// ```
+///
+/// Parsing is deliberately lenient about the things clients disagree on — the
+/// trailing slash is optional, and an IPv6 literal is accepted both in the
+/// RFC 9298 §3.1 form (bare, only the colons escaped) and bracketed — while
+/// staying strict about anything ambiguous.
+pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'static str> {
+    // A query string would make the URI something other than the template.
+    if query.is_some_and(|query| !query.is_empty()) {
+        return Err("the connect-udp template accepts no query");
+    }
+
+    let rest = path
+        .strip_prefix(WELL_KNOWN_PREFIX)
+        .ok_or("path is not the connect-udp template")?;
+    let rest = rest.strip_suffix('/').unwrap_or(rest);
+
+    // Split before decoding: a percent-encoded slash inside a segment must not
+    // create a segment boundary.
+    let mut segments = rest.split('/');
+    let host = segments.next().unwrap_or_default();
+    let port = segments.next().ok_or("missing target_port")?;
+    if segments.next().is_some() {
+        return Err("too many path segments for the connect-udp template");
+    }
+
+    let host = percent_decode_str(host)
+        .decode_utf8()
+        .map_err(|_| "target_host is not valid UTF-8")?;
+    if host.is_empty() {
+        return Err("empty target_host");
+    }
+
+    let port = percent_decode_str(port)
+        .decode_utf8()
+        .map_err(|_| "target_port is not valid UTF-8")?;
+    let port: u16 = port.parse().map_err(|_| "invalid target_port")?;
+    if port == 0 {
+        return Err("target_port must not be zero");
+    }
+
+    Ok((host.into_owned(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(path: &str) -> Result<(String, u16), &'static str> {
+        parse_target(path, None)
+    }
+
+    #[test]
+    fn parses_the_default_template() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/192.0.2.1/53/"),
+            Ok(("192.0.2.1".to_owned(), 53))
+        );
+    }
+
+    #[test]
+    fn the_trailing_slash_is_optional() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/example.com/443"),
+            Ok(("example.com".to_owned(), 443))
+        );
+        assert_eq!(
+            parse("/.well-known/masque/udp/example.com/443/"),
+            Ok(("example.com".to_owned(), 443))
+        );
+    }
+
+    #[test]
+    fn percent_encoded_hosts_are_decoded() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/dns.example%2Ecom/53"),
+            Ok(("dns.example.com".to_owned(), 53))
+        );
+    }
+
+    /// RFC 9298 §3.1: an IPv6 literal appears with its colons escaped and no
+    /// brackets.
+    #[test]
+    fn parses_bare_ipv6_literals() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/"),
+            Ok(("2001:db8::1".to_owned(), 53))
+        );
+    }
+
+    /// Not the standard form, but cheap to accept and some clients send it.
+    #[test]
+    fn tolerates_bracketed_ipv6_literals() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/%5B2001%3Adb8%3A%3A1%5D/53/"),
+            Ok(("[2001:db8::1]".to_owned(), 53))
+        );
+    }
+
+    #[test]
+    fn rejects_a_foreign_path() {
+        assert!(parse("/").is_err());
+        assert!(parse("/.well-known/masque/ip/192.0.2.1/53/").is_err());
+        assert!(parse("/masque/udp/192.0.2.1/53/").is_err());
+    }
+
+    #[test]
+    fn rejects_a_missing_or_invalid_port() {
+        assert!(parse("/.well-known/masque/udp/192.0.2.1").is_err());
+        assert!(parse("/.well-known/masque/udp/192.0.2.1/").is_err());
+        assert!(parse("/.well-known/masque/udp/192.0.2.1/0").is_err());
+        assert!(parse("/.well-known/masque/udp/192.0.2.1/65536").is_err());
+        assert!(parse("/.well-known/masque/udp/192.0.2.1/domain").is_err());
+    }
+
+    #[test]
+    fn rejects_an_empty_host() {
+        assert!(parse("/.well-known/masque/udp//53").is_err());
+    }
+
+    #[test]
+    fn rejects_extra_segments() {
+        assert!(parse("/.well-known/masque/udp/192.0.2.1/53/extra").is_err());
+    }
+
+    #[test]
+    fn rejects_a_query_string() {
+        assert!(parse_target("/.well-known/masque/udp/192.0.2.1/53/", Some("x=1")).is_err());
+        // An empty query is indistinguishable from none.
+        assert!(parse_target("/.well-known/masque/udp/192.0.2.1/53/", Some("")).is_ok());
+    }
+
+    /// A percent-encoded slash must stay inside its segment.
+    #[test]
+    fn an_encoded_slash_does_not_split_segments() {
+        assert_eq!(
+            parse("/.well-known/masque/udp/a%2Fb/53"),
+            Ok(("a/b".to_owned(), 53))
+        );
+    }
+
+    #[test]
+    fn registry_routes_by_quarter_stream_id() {
+        let registry = Arc::new(SessionRegistry::default());
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (tx_b, _rx_b) = mpsc::channel(1);
+
+        let guard_a = registry.register(1, tx_a);
+        let guard_b = registry.register(2, tx_b);
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get(1).is_some());
+        assert!(registry.get(2).is_some());
+        assert!(registry.get(3).is_none());
+
+        drop(guard_a);
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(1).is_none(), "the guard must deregister");
+
+        drop(guard_b);
+        assert!(registry.is_empty());
+    }
+}

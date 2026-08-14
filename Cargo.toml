@@ -1,0 +1,75 @@
+[package]
+name = "volto"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
+repository = "https://github.com/vcarus/volto"
+license = "MIT"
+# The h3/h3-quinn git pins below cannot be expressed on crates.io, and this is a
+# server rather than a library anyone would depend on.
+publish = false
+
+[dependencies]
+# `h3`/`h3-quinn` are pinned to a git revision on purpose: the published 0.0.x
+# releases lack the fixes in #331 (h3-quinn panic), #340 (datagram Quarter Stream
+# ID), #344 (unbounded memory on slow consumers) and #357. Keep this rev and
+# `Cargo.lock` in sync; bump both deliberately.
+#
+# NOTE: `h3-datagram` is intentionally *not* a dependency. Its 0.0.2 release
+# encodes the Quarter Stream ID as zero, which misroutes every UDP session after
+# the first on a connection. CONNECT-UDP (M2) will use quinn's native datagram
+# API with our own varint codec instead.
+# The `i-implement-...` feature is enabled only to read the peer's SETTINGS
+# (RFC 9297 §2.1.1 forbids sending datagrams before the peer advertises
+# SETTINGS_H3_DATAGRAM). It exposes no extra behaviour, only extra visibility,
+# and the rev is pinned, so its instability is frozen.
+h3 = { git = "https://github.com/hyperium/h3", rev = "b986a537ddb1ccdd1eca3685b883cf7549ff7698", features = [
+    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
+] }
+h3-quinn = { git = "https://github.com/hyperium/h3", rev = "b986a537ddb1ccdd1eca3685b883cf7549ff7698" }
+
+quinn = { version = "0.11", default-features = false, features = [
+    "runtime-tokio",
+    "rustls-ring",
+    "bloom",
+    "log",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "logging",
+] }
+rustls-pemfile = "2"
+
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "macros",
+    "signal",
+    "time",
+    "sync",
+] }
+
+bytes = "1"
+http = "1"
+percent-encoding = "2"
+# Constant-time credential comparison (RFC 7617 secrets must not be compared with
+# a short-circuiting `==`). Already in the tree via rustls; `ConstantTimeEq` is
+# the only item used.
+subtle = "2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
+
+# Raw syscalls with no portable equivalent in std: getrlimit(RLIMIT_NOFILE) for
+# the startup fd-budget check (POSIX, both hosts) and IP_MTU_DISCOVER for the DF
+# bit (Linux only, behind cfg in net.rs).
+libc = "0.2"
+
+[dev-dependencies]
+rcgen = "0.14"

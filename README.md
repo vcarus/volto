@@ -1,0 +1,129 @@
+# volto
+
+A MASQUE proxy server in Rust: HTTP/3 CONNECT tunnels (RFC 9114 §4.4) and
+CONNECT-UDP tunnels (RFC 9298) carried over HTTP Datagrams (RFC 9297). It is
+built to be reached directly by [Surge](https://nssurge.com)'s `masque` policy,
+and to run unattended.
+
+One QUIC connection multiplexes every tunnel. TCP traffic goes through classic
+CONNECT, UDP through CONNECT-UDP, and both paths are implemented — a server that
+only speaks CONNECT-UDP carries almost none of an ordinary client's traffic.
+
+## Features
+
+- **Both tunnel types.** Classic CONNECT for TCP, CONNECT-UDP for UDP, dispatched
+  by the `:protocol` pseudo-header on one connection.
+- **Full RFC 9114 §4.4 half-close.** A client FIN shuts down only the write side
+  of the target socket; a target EOF finishes only the response side. Protocols
+  that depend on half-close survive the proxy.
+- **RFC 9297 Capsule Protocol.** The request stream body is a capsule sequence,
+  not an empty stream. Unknown capsule types are skipped; the DATAGRAM capsule is
+  the fallback channel when QUIC datagrams are unavailable.
+- **Authentication.** HTTP Basic on every CONNECT, compared in constant time.
+  Both `Proxy-Authorization` and `Authorization` are accepted.
+- **Open-proxy defences.** Private and loopback ranges are refused by default
+  (including IPv4-mapped bypasses such as `::ffff:127.0.0.1`), port 25 is denied,
+  tunnels are capped per connection, and an unanswered UDP session may only send
+  a bounded number of packets before its target replies.
+- **Configurable QUIC transport.** Stream limits, idle timeout, keep-alive
+  interval, initial MTU, PMTU probing, congestion controller and initial RTT are
+  all configuration, not constants.
+- **SIGHUP reload.** Certificates and credentials are re-read in place. A
+  configuration that fails to validate is rejected whole and the running one
+  keeps serving — a renewal hook cannot cause an outage.
+- **Graceful shutdown.** SIGTERM stops accepting, sends GOAWAY on established
+  connections and waits out a configurable grace period.
+- **Self-sufficient diagnostics.** Per-request debug logging with redacted
+  credentials, plus an `SSLKEYLOGFILE` switch for frame-level analysis.
+
+Explicit non-goals: CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin
+panel.
+
+## Quickstart
+
+Grab a static binary from the [releases page](https://github.com/vcarus/volto/releases)
+(`x86_64` and `aarch64` musl builds), or build from source with Rust 1.85+:
+
+```sh
+cargo build --release      # target/release/volto
+```
+
+The fastest way to a working server is the self-signed installer, which creates
+the system user, generates a certificate, writes `/etc/volto/config.toml` with a
+random password, installs the systemd unit and starts it:
+
+```sh
+sudo script/install-selfsigned.sh
+```
+
+It finishes by printing the certificate fingerprint and a ready-to-paste Surge
+policy line:
+
+```
+volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=surge, password=…
+```
+
+The fingerprint *is* the trust anchor in that mode: carry it to the client over a
+channel you trust, and never substitute `skip-cert-verify` for it — Basic
+credentials are sent on every request, so a man in the middle collects them
+immediately. For a domain certificate from a public CA instead, see
+[docs/deployment.md](docs/deployment.md).
+
+Run it by hand during development:
+
+```sh
+cargo run -- --config config.toml
+```
+
+## Documentation
+
+- [docs/configuration.md](docs/configuration.md) — every configuration key, its
+  default and what it costs to change.
+- [docs/deployment.md](docs/deployment.md) — building, certificates, systemd,
+  firewall, file-descriptor budget, reloads and fail2ban.
+- [docs/architecture.md](docs/architecture.md) — how a request becomes a tunnel,
+  why the h3 dependency is pinned, and what the tests assert.
+
+A commented example configuration ships in
+[script/config.example.toml](script/config.example.toml).
+
+## Testing
+
+```sh
+cargo test                                   # unit + integration
+cargo test --test it_policy                  # authentication / ACL / quotas
+cargo test --test it_stress -- --ignored     # heavy load tier
+```
+
+Integration tests assert on-wire behaviour — status codes, response headers, the
+actual bytes on the control stream — rather than internal state.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+### Tips: running behind a UDP relay
+
+volto needs no special configuration to sit behind a plain layer-4 UDP forwarder,
+because TLS terminates only at volto itself. The relay moves opaque UDP packets
+and holds no key material. Three things are worth knowing:
+
+- **Keep the relay's UDP conntrack timeout above the keep-alive interval.** On
+  Linux `nf_conntrack_udp_timeout` defaults to 30 seconds. volto sends keep-alives
+  every 20 seconds by default, which refreshes the mapping in time; if your relay
+  expires entries faster, lower `keep_alive_interval` well under that value and
+  lower `max_idle_timeout` with it (the keep-alive must stay below half the idle
+  timeout, and volto refuses to start otherwise).
+- **Issue certificates with ACME DNS-01** when the domain's A record points at the
+  relay: HTTP-01 and TLS-ALPN-01 both validate against that address and cannot
+  reach volto.
+- **Point the client at the relay's address, and the certificate name at the
+  domain.** In Surge that is `sni=` plus `server-cert-verify-name=`:
+
+  ```
+  volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, username=user1, password=…
+  ```
+
+One consequence to plan for: every client then reaches volto from the relay's
+address, so per-IP banning at the server cannot distinguish them. See the
+fail2ban section in [docs/deployment.md](docs/deployment.md).

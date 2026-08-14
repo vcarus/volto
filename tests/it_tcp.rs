@@ -1,0 +1,269 @@
+//! M1: TCP CONNECT tunnels (RFC 9114 §4.4) and request dispatch.
+
+mod common;
+
+use bytes::Bytes;
+use common::{
+    closed_address, connect_request, read_at_least, read_to_end, spawn_close_reporting_target,
+    spawn_drain_then_reply_target, spawn_echo_target, spawn_reset_after_read_target, H3Client,
+    TestServer, TIMEOUT,
+};
+use http::{Method, Request, StatusCode};
+
+#[tokio::test]
+async fn tunnels_bytes_to_an_echo_target() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    stream
+        .send_data(Bytes::from_static(b"hello volto"))
+        .await
+        .expect("send payload");
+
+    let echoed = read_at_least(&mut stream, b"hello volto".len()).await;
+    assert_eq!(&echoed, b"hello volto");
+
+    // The tunnel stays usable for a second exchange on the same stream.
+    stream
+        .send_data(Bytes::from_static(b"again"))
+        .await
+        .expect("send again");
+    let echoed = read_at_least(&mut stream, b"again".len()).await;
+    assert_eq!(&echoed, b"again");
+}
+
+/// The half-close case: the client finishes its sending side first and must
+/// still receive everything the target sends afterwards.
+///
+/// The target deliberately replies only after it has seen EOF, so it can answer
+/// at all only if the client's stream FIN was translated into a shutdown of the
+/// *write* side of the target socket rather than a full close.
+#[tokio::test]
+async fn client_half_close_still_receives_remaining_target_data() {
+    let server = TestServer::start().await;
+    let target = spawn_drain_then_reply_target("+TAIL").await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    stream
+        .send_data(Bytes::from_static(b"ping"))
+        .await
+        .expect("send payload");
+
+    // Client FIN. The target must see EOF, not a reset.
+    stream.finish().await.expect("finish the sending side");
+
+    // The target's remaining data must arrive, followed by a clean stream end
+    // once the target closes (target EOF -> we finish our sending side).
+    let received = read_to_end(&mut stream).await;
+    assert_eq!(
+        &received, b"ping+TAIL",
+        "expected the target's post-EOF reply to survive the client's half-close"
+    );
+}
+
+/// A target that resets after the tunnel is up must surface as a stream reset
+/// with H3_CONNECT_ERROR, not as a clean end of stream.
+#[tokio::test]
+async fn target_reset_becomes_h3_connect_error() {
+    /// H3_CONNECT_ERROR (RFC 9114 §8.1).
+    const H3_CONNECT_ERROR: u64 = 0x010f;
+
+    let server = TestServer::start().await;
+    let target = spawn_reset_after_read_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    // The 200 goes out as soon as the TCP connection is established. The target
+    // resets only after it has read, so this cannot be overtaken by the reset.
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Triggers the target's reset.
+    stream
+        .send_data(Bytes::from_static(b"go"))
+        .await
+        .expect("send payload");
+
+    // `recv_data` yields an opaque `Buf` that is not `Debug`, so `expect_err`
+    // is unavailable here.
+    let error = match tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .expect("the reset arrived")
+    {
+        Ok(_) => panic!("a target reset must not look like a clean end of stream"),
+        Err(error) => error,
+    };
+
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+            code.value(),
+            H3_CONNECT_ERROR,
+            "expected H3_CONNECT_ERROR, got {code:?}"
+        ),
+        other => panic!("expected a remote stream reset, got {other:?}"),
+    }
+}
+
+/// When the client resets the request stream, the target socket must be closed
+/// rather than left dangling.
+#[tokio::test]
+async fn client_reset_closes_the_target_connection() {
+    let server = TestServer::start().await;
+    let (target, mut closed) = spawn_close_reporting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Abruptly reset the request stream instead of finishing it.
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    drop(stream);
+
+    tokio::time::timeout(TIMEOUT, closed.recv())
+        .await
+        .expect("the target connection must be closed after a client reset")
+        .expect("close notification");
+}
+
+#[tokio::test]
+async fn refuses_a_target_that_is_not_listening() {
+    let server = TestServer::start().await;
+    let target = closed_address().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+
+    // RFC 9114 §4.4: failure to establish the connection is reported with a
+    // non-2xx status, not a stream reset.
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn refuses_an_authority_without_a_port() {
+    let server = TestServer::start().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request("example.com"))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A proxy is not an origin server: ordinary requests are refused, not panicked
+/// on.
+#[tokio::test]
+async fn plain_get_is_not_implemented() {
+    let server = TestServer::start().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("https://{}/", server.addr))
+        .body(())
+        .expect("GET request");
+
+    let mut stream = client.send.send_request(req).await.expect("send GET");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+/// Several tunnels multiplexed on one QUIC connection must stay independent.
+#[tokio::test]
+async fn concurrent_tunnels_on_one_connection_stay_independent() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let mut streams = Vec::new();
+    for i in 0..5u8 {
+        let mut send = client.send.clone();
+        let mut stream = send
+            .send_request(connect_request(&target.to_string()))
+            .await
+            .expect("send CONNECT");
+
+        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+            .await
+            .expect("response arrived")
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        streams.push((i, stream));
+    }
+
+    // Write a distinct payload per tunnel, then check each one got its own back.
+    for (i, stream) in &mut streams {
+        stream
+            .send_data(Bytes::from(vec![*i; 8]))
+            .await
+            .expect("send payload");
+    }
+    for (i, stream) in &mut streams {
+        let echoed = read_at_least(stream, 8).await;
+        assert_eq!(echoed, vec![*i; 8], "tunnel {i} received another's bytes");
+    }
+}
