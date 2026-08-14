@@ -67,7 +67,8 @@ renegotiate transport parameters.
 **`keep_alive_interval` is validated as strictly below half the idle timeout,
 not at most half.** At exactly half, losing a single keep-alive packet is enough
 for the connection to time out. This pairing is what keeps a NAT mapping alive
-across an idle period; see the relay tips in the [README](../README.md).
+across an idle period; see
+[running behind a UDP relay](deployment.md#running-behind-a-udp-relay).
 
 **`congestion_control` should usually stay on BBR.** Over a long, lossy path a
 loss-based controller (cubic, newreno) reads every dropped packet as congestion

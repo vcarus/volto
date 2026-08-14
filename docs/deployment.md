@@ -170,8 +170,12 @@ accept their defaults:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
-  sudo bash -s -- --enable-timer --sni volto.internal --port 443
+  sudo bash -s -- --enable-timer --sni volto.internal --port 443 \
+       --username surge --password 'choose-a-password'
 ```
+
+Omitting `--password` is also fine: the installer generates a random one and
+prints it in the final Surge policy line.
 
 The no-op path is what makes it safe to run on a schedule:
 
@@ -285,6 +289,32 @@ established ones and waits for their tunnels to finish, up to
 `server.shutdown_grace` (default 30 s). Keep systemd's `TimeoutStopSec`
 comfortably above that value — the shipped unit uses 45 — so systemd does not
 send SIGKILL mid-drain.
+
+## Running behind a UDP relay
+
+volto needs no special configuration to sit behind a plain layer-4 UDP
+forwarder, because TLS terminates only at volto itself. The relay moves opaque
+UDP packets and holds no key material. Three things are worth knowing:
+
+- **Keep the relay's UDP conntrack timeout above the keep-alive interval.** On
+  Linux `nf_conntrack_udp_timeout` defaults to 30 seconds. volto sends
+  keep-alives every 20 seconds by default, which refreshes the mapping in time;
+  if your relay expires entries faster, lower `keep_alive_interval` well under
+  that value and lower `max_idle_timeout` with it (the keep-alive must stay
+  below half the idle timeout, and volto refuses to start otherwise).
+- **Issue certificates with DNS-01** when the domain's A record points at the
+  relay — the other challenge types validate against that address and cannot
+  reach volto; see [ACME with DNS-01](#acme-with-dns-01) above.
+- **Point the client at the relay's address, and the certificate name at the
+  domain.** In Surge that is `sni=` plus `server-cert-verify-name=`:
+
+  ```
+  volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, username=user1, password=…
+  ```
+
+One consequence to plan for: every client then reaches volto from the relay's
+address, so per-IP banning at the server cannot distinguish them — see
+[fail2ban](#fail2ban) below.
 
 ## fail2ban
 

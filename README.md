@@ -68,7 +68,7 @@ see [docs/deployment.md](docs/deployment.md#deploying-from-releases).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
-  sudo bash -s -- --enable-timer
+  sudo bash -s -- --enable-timer --username surge --password 'choose-a-password'
 ```
 
 It finishes by printing the certificate fingerprint and a ready-to-paste Surge
@@ -95,7 +95,8 @@ cargo run -- --config config.toml
 - [docs/configuration.md](docs/configuration.md) — every configuration key, its
   default and what it costs to change.
 - [docs/deployment.md](docs/deployment.md) — building, certificates, systemd,
-  firewall, file-descriptor budget, reloads and fail2ban.
+  firewall, file-descriptor budget, reloads, running behind a UDP relay and
+  fail2ban.
 - [docs/architecture.md](docs/architecture.md) — how a request becomes a tunnel,
   why the h3 dependency is pinned, and what the tests assert.
 
@@ -116,29 +117,3 @@ actual bytes on the control stream — rather than internal state.
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
-### Tips: running behind a UDP relay
-
-volto needs no special configuration to sit behind a plain layer-4 UDP forwarder,
-because TLS terminates only at volto itself. The relay moves opaque UDP packets
-and holds no key material. Three things are worth knowing:
-
-- **Keep the relay's UDP conntrack timeout above the keep-alive interval.** On
-  Linux `nf_conntrack_udp_timeout` defaults to 30 seconds. volto sends keep-alives
-  every 20 seconds by default, which refreshes the mapping in time; if your relay
-  expires entries faster, lower `keep_alive_interval` well under that value and
-  lower `max_idle_timeout` with it (the keep-alive must stay below half the idle
-  timeout, and volto refuses to start otherwise).
-- **Issue certificates with ACME DNS-01** when the domain's A record points at the
-  relay: HTTP-01 and TLS-ALPN-01 both validate against that address and cannot
-  reach volto.
-- **Point the client at the relay's address, and the certificate name at the
-  domain.** In Surge that is `sni=` plus `server-cert-verify-name=`:
-
-  ```
-  volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, username=user1, password=…
-  ```
-
-One consequence to plan for: every client then reaches volto from the relay's
-address, so per-IP banning at the server cannot distinguish them. See the
-fail2ban section in [docs/deployment.md](docs/deployment.md).
