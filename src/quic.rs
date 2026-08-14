@@ -83,16 +83,51 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     // The bound on what an *unauthenticated* peer can make this process hold.
     //
     // quinn's default is `VarInt::MAX` — no aggregate limit at all — and the
-    // per-stream default is 1.25 MB. With our raised stream limit that is
-    // 1024 x 1.25 MB, so a single connection could pin about 1.28 GB of receive
-    // buffer before we ever see a request to authenticate: open the streams,
-    // fill each window, stop. On a 1 GB VPS one connection is enough to end the
-    // process.
+    // per-stream window is 1.25 MB (quinn's default too, pinned just below).
+    // With our raised stream limit that is 1024 x 1.25 MB, so a single
+    // connection could pin about 1.28 GB of receive buffer before we ever see a
+    // request to authenticate: open the streams, fill each window, stop. On a
+    // 1 GB VPS one connection is enough to end the process.
     //
     // The cap only constrains data that has arrived and not yet been read, and
     // both tunnel pumps read continuously, so it binds exactly when the target is
     // slower than the client — which is the case that should be bounded.
     transport.receive_window(CONNECTION_RECEIVE_WINDOW);
+
+    // The next two are set to exactly what quinn already defaults to, so neither
+    // changes a byte on the wire today. They are pinned because upstream derives
+    // both from `STREAM_RWND`, a private constant inside
+    // `TransportConfig::default` with no stability guarantee, while every memory
+    // figure written down in this module — the 1.28 GB above, the 16 MiB against
+    // 1.25 MB at `CONNECTION_RECEIVE_WINDOW` — is quoted against it. Dependabot
+    // proposes cargo bumps weekly; a patch release that moved that constant would
+    // leave the documented threat model quietly false. Setting the values here
+    // makes those numbers true by construction instead of by inheritance.
+    //
+    // Pinned, deliberately not raised. `receive_window` above is the real memory
+    // bound: the invariant is that (the sum of the highest offsets received)
+    // minus (the bytes read) stays within it, so a larger per-stream window
+    // cannot raise the per-connection worst case. What this value actually
+    // decides is how few simultaneously saturated tunnels it takes to spend the
+    // whole connection's credit — 16 MiB / 1.25 MB, so about 13 — which is a
+    // fairness property rather than a memory one, and the reason there was
+    // nothing to gain by raising it. The per-tunnel ceiling in the download
+    // direction is whatever the client advertises to us and is not settable here.
+    transport.stream_receive_window(STREAM_RECEIVE_WINDOW);
+
+    // The mirror image, and the only bound on what this process buffers for a
+    // client that stops reading: a per-connection aggregate cap on unacknowledged
+    // outbound stream data. 10 MB over the ~90 ms path RTT is about 889 Mbps
+    // against a measured peak of 177 Mbps, so it is nowhere near a throughput
+    // constraint.
+    //
+    // Note the asymmetry it leaves: 16 MiB of inbound credit granted against a
+    // 10 MB outbound cap, on a proxy whose traffic is mostly outbound. That is an
+    // accepted decision, not an oversight — lifting the outbound cap to match
+    // would add roughly 1.6 GiB of theoretical worst case across `max_connections`
+    // (256 by default) in exchange for throughput we cannot measure a need for.
+    transport.send_window(SEND_WINDOW);
+
     transport.max_idle_timeout(Some(
         IdleTimeout::try_from(limits.max_idle_timeout())
             .context("limits.max_idle_timeout is out of range for QUIC")?,
@@ -504,10 +539,29 @@ fn fd_budget_is_tight(limit: u64, max_targets_per_conn: u32) -> bool {
 
 /// Aggregate flow-control window for one connection, in bytes.
 ///
-/// 16 MiB against a per-stream window of 1.25 MB: a handful of simultaneously
-/// saturated tunnels still get their full stream windows, while the worst case
-/// stops being a function of `max_streams_bidi`.
+/// 16 MiB against the 1.25 MB [`STREAM_RECEIVE_WINDOW`]: a handful of
+/// simultaneously saturated tunnels still get their full stream windows, while
+/// the worst case stops being a function of `max_streams_bidi`.
 const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
+
+/// Per-stream flow-control window, in bytes.
+///
+/// quinn's own default, restated here rather than inherited: upstream computes it
+/// from a private constant in `TransportConfig::default`, and the memory
+/// arithmetic in this module is quoted in terms of it. Owning the number keeps
+/// those comments true across a dependency bump.
+///
+/// Not a memory bound — [`CONNECTION_RECEIVE_WINDOW`] is. This only sets how few
+/// saturated tunnels can spend a connection's whole credit.
+const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(1_250_000);
+
+/// Aggregate unacknowledged outbound stream data per connection, in bytes.
+///
+/// quinn's own default, restated for the same reason, and the only bound on what
+/// this process buffers for a client that has stopped reading. 10 MB is about
+/// 889 Mbps at the production path's RTT, so the cap costs no measurable
+/// throughput.
+const SEND_WINDOW: u64 = 10_000_000;
 
 /// Descriptors assumed to be needed beyond one connection's full tunnel quota:
 /// the endpoint socket, the request streams, stdio, and the start of a second
@@ -521,9 +575,6 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 mod tests {
     use super::*;
 
-    /// The check has to fire on the configuration that actually bites: a macOS
-    /// default limit of 256 with the default quota of 256, where one connection
-    /// at its quota consumes every descriptor the process has.
     /// Renders the built transport parameters for inspection.
     ///
     /// `TransportConfig` has no getters, but its `Debug` prints every field, and
@@ -542,13 +593,63 @@ mod tests {
     fn the_connection_receive_window_is_bounded() {
         let rendered = transport_debug(&crate::config::Limits::default());
 
+        // Anchored on the separator: `stream_receive_window: 16777216` ends in
+        // the same characters, so the bare substring could pass on the wrong
+        // field.
         assert!(
-            rendered.contains("receive_window: 16777216"),
+            rendered.contains(", receive_window: 16777216"),
             "the aggregate receive window must be capped at 16 MiB: {rendered}"
         );
         assert!(
             !rendered.contains(&format!("receive_window: {}", u64::from(VarInt::MAX))),
             "the unbounded quinn default must not survive: {rendered}"
+        );
+    }
+
+    /// The two windows we pin at quinn's defaults really reach the transport
+    /// parameters, so an edit here cannot silently drop them.
+    #[test]
+    fn the_stream_and_send_windows_are_pinned() {
+        let rendered = transport_debug(&crate::config::Limits::default());
+
+        assert!(
+            rendered.contains("stream_receive_window: 1250000"),
+            "the per-stream receive window must stay at 1.25 MB, which every memory \
+             figure in this module is quoted against: {rendered}"
+        );
+        assert!(
+            rendered.contains("send_window: 10000000"),
+            "the outbound send window must stay at 10 MB, the only bound on what we \
+             buffer for a client that stops reading: {rendered}"
+        );
+    }
+
+    /// quinn's own defaults still agree with the values we pin.
+    ///
+    /// This is the drift alarm the pinning exists for. Upstream derives both from
+    /// `STREAM_RWND`, a private constant in `TransportConfig::default` with no
+    /// stability guarantee, and Dependabot proposes cargo bumps weekly. Because
+    /// we now set the values ourselves a changed default cannot alter behaviour —
+    /// it would instead make the comments describing quinn's defaults wrong, and
+    /// this is what catches that.
+    #[test]
+    fn quinn_has_not_moved_the_defaults_we_pin() {
+        let rendered = format!("{:?}", quinn::TransportConfig::default());
+
+        assert!(
+            rendered.contains(&format!(
+                "stream_receive_window: {}",
+                u64::from(STREAM_RECEIVE_WINDOW)
+            )),
+            "a quinn bump changed the default per-stream receive window: our pin is \
+             unaffected, but the comments in this module that call it quinn's default \
+             need re-checking: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("send_window: {SEND_WINDOW}")),
+            "a quinn bump changed the default send window: our pin is unaffected, but \
+             the comments in this module that call it quinn's default need \
+             re-checking: {rendered}"
         );
     }
 
@@ -577,6 +678,9 @@ mod tests {
         );
     }
 
+    /// The check has to fire on the configuration that actually bites: a macOS
+    /// default limit of 256 with the default quota of 256, where one connection
+    /// at its quota consumes every descriptor the process has.
     #[test]
     fn a_tight_fd_budget_is_recognised() {
         assert!(fd_budget_is_tight(256, 256), "the macOS default pairing");
