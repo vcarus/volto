@@ -156,7 +156,11 @@ host needs:
   `/usr/local/bin/volto.prev`, swaps in the new one, refreshes the systemd
   unit and restarts. If the service is not running a few seconds later, the
   previous binary is restored and restarted, and the script fails loudly.
-- **Already on that version**: it exits without touching anything.
+- **Already on that version**, with the config and the unit in place: it exits
+  without touching anything. The presence checks are part of the deal —
+  deleting `/etc/volto/config.toml` and re-running is the supported way to
+  regenerate it (the certificate and the system user survive, so the
+  fingerprint does not change).
 
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of

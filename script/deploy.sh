@@ -8,7 +8,8 @@
 # already runs volto it swaps the binary, refreshes the systemd unit and
 # restarts the service -- after keeping the previous binary, so a release that
 # fails to start is rolled back automatically. When the installed version
-# already matches the release, nothing is touched at all.
+# already matches the release and config and unit are in place, nothing is
+# touched at all.
 #
 # That no-op path is what makes the script safe to run on a schedule:
 # --enable-timer installs a systemd timer that re-runs it daily.
@@ -41,7 +42,8 @@ a host without an existing install this runs the bundled self-signed installer
 (install-selfsigned.sh) for the full first-time setup; on a host that already
 runs volto only the binary and the systemd unit are refreshed and the service
 is restarted, keeping the previous binary for automatic rollback. When the
-installed version already matches the release, nothing is touched.
+installed version already matches the release and the config and unit are in
+place, nothing is touched.
 
 Options:
   -t, --tag vX.Y.Z     deploy this release instead of the latest one (this is
@@ -134,8 +136,11 @@ fi
 # fresher copy and overrides this below.
 SELF_SOURCE="$0"
 
-if [ "$INSTALLED" = "$VERSION" ]; then
-    note "volto $INSTALLED is already the deployed release ($TAG), nothing to download"
+# Converging means the whole install, not just the binary: a deleted config or
+# unit must be regenerated even when the version already matches, and doing so
+# needs the tarball (it carries the installer and the example config).
+if [ "$INSTALLED" = "$VERSION" ] && [ -f "$CONF" ] && [ -f "$UNIT" ]; then
+    note "volto $INSTALLED is already deployed and intact ($TAG), nothing to do"
 else
     NAME="volto-${VERSION}-${TARGET}"
     BASE="https://github.com/$REPO/releases/download/$TAG"
