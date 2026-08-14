@@ -34,12 +34,17 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
+          # deploy.sh decides "already deployed" by comparing `volto --version`
+          # against the release tag; a tag that does not match the crate version
+          # would make every timered host reinstall and restart daily, forever.
+          grep -q "^version = \"${version}\"\$" Cargo.toml ||
+            { echo "tag ${GITHUB_REF_NAME} does not match the version in Cargo.toml" >&2; exit 1; }
           name="volto-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}/script"
           cp "target/${{ matrix.target }}/release/volto" "dist/${name}/"
           cp LICENSE README.md "dist/${name}/"
-          cp script/install-selfsigned.sh script/config.example.toml \
-             script/masque.service "dist/${name}/script/"
+          cp script/install-selfsigned.sh script/deploy.sh \
+             script/config.example.toml script/masque.service "dist/${name}/script/"
           tar -C dist -czf "${name}.tar.gz" "${name}"
 
       - uses: actions/upload-artifact@v7
@@ -83,3 +88,5 @@ jobs:
             cd volto-*-x86_64-unknown-linux-musl
             sudo script/install-selfsigned.sh --binary ./volto
             ```
+
+            Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — `sudo script/deploy.sh --enable-timer` keeps the host on the latest release with a daily systemd timer.

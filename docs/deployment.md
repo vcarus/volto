@@ -141,6 +141,50 @@ What pinning changes, and why each point matters:
   identity entirely, and Basic credentials are sent on *every* request — a man in
   the middle collects the username and password on first use.
 
+## Deploying from releases
+
+[`script/deploy.sh`](../script/deploy.sh) turns the release page into the
+deployment mechanism: it resolves the newest release (or the one given with
+`--tag`), downloads the tarball for the host's architecture, verifies it
+against the release's `SHA256SUMS`, and then does whichever of three things the
+host needs:
+
+- **No install yet** (`/etc/volto/config.toml` absent): it runs the bundled
+  `install-selfsigned.sh` for the full first-time setup, so the same flags and
+  environment variables apply (`--sni`, `--port`, `--username`, `--password`).
+- **Older version installed**: it keeps the current binary at
+  `/usr/local/bin/volto.prev`, swaps in the new one, refreshes the systemd
+  unit and restarts. If the service is not running a few seconds later, the
+  previous binary is restored and restarted, and the script fails loudly.
+- **Already on that version**: it exits without touching anything.
+
+The no-op path is what makes it safe to run on a schedule:
+
+```sh
+sudo script/deploy.sh --enable-timer
+```
+
+installs the script as `/usr/local/sbin/volto-deploy` plus a systemd timer that
+re-runs it daily (`OnCalendar=daily`, randomized by up to an hour, `Persistent=`
+so a powered-off day is caught up). Every later deploy refreshes the installed
+copy of the script from the release it just verified, so the timer keeps pace
+with the repository. `journalctl -u volto-deploy.service` shows what each run
+did; a failed update leaves the timer unit in a failed state, which is the
+signal to go look.
+
+Rolling back is the same flow pinned to an older release:
+
+```sh
+sudo volto-deploy --tag v0.1.0
+```
+
+Two properties worth knowing: the script never rewrites
+`/etc/volto/config.toml` or the certificate (both belong to
+`install-selfsigned.sh`'s first run and to you afterwards), and it carries no
+version pin of its own — it converges on whatever the newest *published*
+release is, in either direction. Deleting a bad release from the releases page
+therefore rolls every host back on its next timer tick.
+
 ## systemd
 
 The shipped unit is [`script/masque.service`](../script/masque.service). Manual

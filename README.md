@@ -56,6 +56,17 @@ random password, installs the systemd unit and starts it:
 sudo script/install-selfsigned.sh
 ```
 
+Or let `script/deploy.sh` do the downloading too: it fetches the newest release,
+verifies it against `SHA256SUMS` and installs it — running the installer above on
+a fresh host, or swapping the binary in place (with automatic rollback if the new
+version fails to start) on a host that already has one. With `--enable-timer` it
+keeps doing that on a daily systemd timer, so deploy and update become the same
+command; see [docs/deployment.md](docs/deployment.md#deploying-from-releases).
+
+```sh
+sudo script/deploy.sh --enable-timer
+```
+
 It finishes by printing the certificate fingerprint and a ready-to-paste Surge
 policy line:
 
