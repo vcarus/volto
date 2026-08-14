@@ -701,6 +701,48 @@ pub async fn spawn_close_reporting_target() -> (SocketAddr, tokio::sync::mpsc::R
     (addr, rx)
 }
 
+/// How a target connection ended, as seen by the target.
+///
+/// `Eof` is a clean FIN; `Failed(kind)` is the error a read failed with, which is
+/// `ConnectionReset` when the peer aborted the connection with an RST. Telling
+/// the two apart from outside the proxy is the only way to observe RFC 9114
+/// §4.4's "SHOULD send a TCP segment with the RST bit set".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    Eof,
+    Failed(std::io::ErrorKind),
+}
+
+/// A TCP target that reports **how** its connection ended.
+///
+/// Like [`spawn_close_reporting_target`], but the report distinguishes a clean
+/// end of stream from an abortive one instead of collapsing both into "closed".
+pub async fn spawn_end_reporting_target() -> (SocketAddr, tokio::sync::mpsc::Receiver<ConnectionEnd>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let end = loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break ConnectionEnd::Eof,
+                        Ok(_) => {}
+                        Err(error) => break ConnectionEnd::Failed(error.kind()),
+                    }
+                };
+                let _ = tx.send(end).await;
+            });
+        }
+    });
+
+    (addr, rx)
+}
+
 /// A UDP address with nothing bound to it.
 ///
 /// Sending here draws an ICMP port-unreachable, which a connected socket reports

@@ -191,6 +191,19 @@ pub enum ProxyError {
     HttpRequestDenied,
 }
 
+/// A target that could not be reached, and the address the attempt failed on.
+///
+/// The address is what RFC 9209 §2.1.2 calls the `next-hop`: "the intermediary or
+/// origin server selected (and used, if contacted) to obtain this response".
+/// Carried out of the connect helpers rather than recomputed, because with
+/// several resolved addresses only they know which one was tried last.
+pub(crate) struct Unreachable {
+    /// The last address attempted, or `None` if there was nothing to attempt.
+    pub(crate) next_hop: Option<std::net::SocketAddr>,
+    /// Why that attempt failed.
+    pub(crate) error: std::io::Error,
+}
+
 impl ProxyError {
     /// The complete `Proxy-Status` field value.
     ///
@@ -228,6 +241,60 @@ impl ProxyError {
         headers
     }
 
+    /// Whether this error may name the address it happened on.
+    ///
+    /// Only the three failures that are *about reaching a specific hop* qualify.
+    /// RFC 9209 §2.1.2 allows the parameter anywhere, so this list is a privacy
+    /// judgement rather than a syntactic one, and every exclusion is deliberate:
+    ///
+    /// * `dns_error` — there is no hop to name. The lookup is what failed, so any
+    ///   address in the response would be invented.
+    /// * `destination_ip_prohibited` and `http_request_denied` — the request was
+    ///   refused *by this proxy*, and echoing the resolved address would turn
+    ///   every refusal into a lookup oracle: a client that cannot reach an
+    ///   internal resolver could read this server's view of a name straight out
+    ///   of the refusal. The policy exists to keep exactly that reachable-only-
+    ///   from-here information in, so the refusal must not carry it out.
+    /// * `connection_limit_reached`, and the 407 path, say nothing about a
+    ///   target: they are verdicts on the client.
+    fn discloses_next_hop(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionRefused | Self::ConnectionTimeout | Self::DestinationUnavailable
+        )
+    }
+
+    /// This error as a response header map, naming the hop it happened on.
+    ///
+    /// The address is dropped unless [`Self::discloses_next_hop`] allows it, so a
+    /// caller cannot leak one by passing it to the wrong error type.
+    pub fn headers_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> HeaderMap {
+        let Some(address) = next_hop.filter(|_| self.discloses_next_hop()) else {
+            return self.headers();
+        };
+
+        // `<identifier>; error=<type>; next-hop="<address>"`. RFC 9209 §2.1.2
+        // accepts a String or a Token; an IPv6 address needs its brackets, which
+        // no Token may contain, so the String form is used for both families.
+        let value = format!(
+            "{}; next-hop={}",
+            self.field_value(),
+            sf_string(&address.to_string())
+        );
+
+        let mut headers = HeaderMap::with_capacity(1);
+        headers.insert(
+            HeaderName::from_static("proxy-status"),
+            // A rendered socket address is printable ASCII, so this cannot fail;
+            // falling back to the parameterless value keeps that from being a
+            // panic if it ever somehow did, which is the property the whole
+            // refusal path is built on: refusing must never itself fail.
+            HeaderValue::from_str(&value)
+                .unwrap_or_else(|_| HeaderValue::from_static(self.field_value())),
+        );
+        headers
+    }
+
     /// The error type that best describes a failure to reach a target.
     pub fn from_connect_error(error: &std::io::Error) -> Self {
         match error.kind() {
@@ -261,6 +328,26 @@ impl ProxyError {
     }
 }
 
+/// Renders `value` as a structured field String (RFC 8941 §3.3.3).
+///
+/// A String is DQUOTE-delimited, and inside it only DQUOTE and backslash are
+/// escaped. A rendered socket address contains neither, so this never actually
+/// escapes anything today — it exists so that the one field value this server
+/// builds at runtime is correct by construction rather than by argument about its
+/// inputs.
+fn sf_string(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for character in value.chars() {
+        if character == '"' || character == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(character);
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// Answers a request we will not serve, then closes the stream tidily.
 ///
 /// Any request body is unwanted, so the client is told to stop sending before
@@ -277,6 +364,23 @@ pub(crate) async fn refuse_because(
     stream_id: u64,
 ) {
     refuse_with(stream, status, error.headers(), stream_id).await;
+}
+
+/// Refuses a request whose target could not be reached, naming the failed hop.
+///
+/// Both tunnel types end up here from their connect step, so the mapping from an
+/// `io::Error` to a status and an RFC 9209 field is written once: the type
+/// decides the status (`recommended_status`) and whether the address may be
+/// disclosed (`discloses_next_hop`).
+pub(crate) async fn refuse_unreachable(stream: &mut Stream, failure: &Unreachable, stream_id: u64) {
+    let error = ProxyError::from_connect_error(&failure.error);
+    refuse_with(
+        stream,
+        error.recommended_status(),
+        error.headers_with_next_hop(failure.next_hop),
+        stream_id,
+    )
+    .await;
 }
 
 /// Refuses a request with an explicit set of response headers.
@@ -400,6 +504,102 @@ mod tests {
             ProxyError::from_connect_error(&Error::from(ErrorKind::PermissionDenied)),
             ProxyError::DestinationUnavailable
         );
+    }
+
+    /// Reads the `Proxy-Status` field out of a header map.
+    fn proxy_status(headers: &HeaderMap) -> String {
+        headers
+            .get("proxy-status")
+            .and_then(|value| value.to_str().ok())
+            .expect("every refusal carries a Proxy-Status field")
+            .to_owned()
+    }
+
+    /// RFC 9209 §2.1.2's `next-hop` "identifies the intermediary or origin server
+    /// selected (and used, if contacted) to obtain this response" — so it belongs
+    /// on the failures that are about reaching one, and nowhere else.
+    #[test]
+    fn only_failures_to_reach_a_hop_name_it() {
+        let hop: std::net::SocketAddr = "192.0.2.7:443".parse().expect("address");
+
+        for error in [
+            ProxyError::ConnectionRefused,
+            ProxyError::ConnectionTimeout,
+            ProxyError::DestinationUnavailable,
+        ] {
+            assert_eq!(
+                proxy_status(&error.headers_with_next_hop(Some(hop))),
+                format!(
+                    "volto; error={}; next-hop=\"192.0.2.7:443\"",
+                    error.as_str()
+                )
+            );
+        }
+    }
+
+    /// The exclusions, and the reason for the middle two: a policy refusal that
+    /// echoed the resolved address would hand the client this server's view of a
+    /// name it is not allowed to reach — an internal DNS mapping, read straight
+    /// out of the refusal. `dns_error` has no hop to name at all.
+    #[test]
+    fn refusals_that_are_not_about_a_hop_never_echo_an_address() {
+        let hop: std::net::SocketAddr = "10.1.2.3:53".parse().expect("address");
+
+        for error in [
+            ProxyError::DnsError,
+            ProxyError::DestinationIpProhibited,
+            ProxyError::HttpRequestDenied,
+            ProxyError::ConnectionLimitReached,
+        ] {
+            let value = proxy_status(&error.headers_with_next_hop(Some(hop)));
+            assert_eq!(
+                value,
+                error.field_value(),
+                "{} must stay exactly as it is without a next-hop",
+                error.as_str()
+            );
+            assert!(
+                !value.contains("10.1.2.3") && !value.contains("next-hop"),
+                "{} leaked an address: {value}",
+                error.as_str()
+            );
+        }
+    }
+
+    /// No address to report — an empty candidate list — leaves the field as the
+    /// plain one, byte for byte.
+    #[test]
+    fn a_missing_address_leaves_the_field_untouched() {
+        for error in [
+            ProxyError::ConnectionRefused,
+            ProxyError::ConnectionTimeout,
+            ProxyError::DestinationUnavailable,
+        ] {
+            assert_eq!(
+                error.headers_with_next_hop(None).get("proxy-status"),
+                error.headers().get("proxy-status")
+            );
+        }
+    }
+
+    /// RFC 9209 §2.1.2 accepts a String or a Token, and RFC 8941 §3.3.3 defines
+    /// the String: DQUOTE-delimited, with DQUOTE and backslash escaped. An IPv6
+    /// hop is the case that decides it — its brackets are not Token characters.
+    #[test]
+    fn a_next_hop_is_a_quoted_structured_field_string() {
+        let ipv6: std::net::SocketAddr = "[2001:db8::1]:53".parse().expect("address");
+        assert_eq!(
+            proxy_status(&ProxyError::ConnectionRefused.headers_with_next_hop(Some(ipv6))),
+            "volto; error=connection_refused; next-hop=\"[2001:db8::1]:53\""
+        );
+
+        // The escaping rule itself, on inputs a socket address cannot produce but
+        // the encoder must still handle.
+        assert_eq!(sf_string("192.0.2.7:443"), "\"192.0.2.7:443\"");
+        assert_eq!(sf_string("[2001:db8::1]:53"), "\"[2001:db8::1]:53\"");
+        assert_eq!(sf_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(sf_string(r"a\b"), r#""a\\b""#);
+        assert_eq!(sf_string(""), "\"\"");
     }
 
     #[tokio::test]

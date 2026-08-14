@@ -11,14 +11,18 @@
 //! | client finishes its sending side (FIN) | shut down **only** the write side of the TCP socket, keep reading from the target |
 //! | target reaches EOF | finish our sending side, keep reading from the client |
 //! | target resets or errors | reset the request stream with `H3_CONNECT_ERROR` |
-//! | client resets the request stream | close the TCP connection |
+//! | client resets the request stream, or stops reading it | close the TCP connection with a reset |
 //!
 //! The two directions therefore run as independent pumps that are joined, plus a
 //! sticky teardown signal for the abnormal cases where one direction failing
 //! must stop the other.
+//!
+//! Only the last row aborts the TCP connection; see [`abort_target`] for why the
+//! other three keep their FIN semantics.
 
 use std::io;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use http::StatusCode;
@@ -29,7 +33,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::h3api::{self, Buffer, Reader, Stream, Writer};
-use crate::tunnel::{Context, ProxyError};
+use crate::tunnel::{Context, ProxyError, Unreachable};
 use crate::{net, policy, tunnel};
 
 /// Bytes read from the target per relay iteration.
@@ -116,20 +120,20 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     let tcp = match connect_any(&allowed).await {
         Ok(tcp) => tcp,
-        Err(error) => {
+        Err(failure) => {
             // RFC 9114 §4.4: a proxy that cannot establish the connection
             // answers with a non-2xx status rather than resetting the stream.
             // Which non-2xx follows from the RFC 9209 type, so a timeout is a
-            // 504 and an unreachable target a 503 rather than all of them 502.
-            debug!(stream_id, authority, ?allowed, %error, "failed to connect to target");
-            let refusal = ProxyError::from_connect_error(&error);
-            tunnel::refuse_because(
-                &mut stream,
-                refusal.recommended_status(),
-                refusal,
+            // 504 and an unreachable target a 503 rather than all of them 502,
+            // and the answer names the address that failed.
+            debug!(
                 stream_id,
-            )
-            .await;
+                authority,
+                ?allowed,
+                error = %failure.error,
+                "failed to connect to target"
+            );
+            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
             return;
         }
     };
@@ -164,11 +168,12 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     debug!(stream_id, authority, "tcp tunnel closed");
 }
 
-/// Connects to the first address that accepts, reporting the last error.
+/// Connects to the first address that accepts, reporting the last failure.
 ///
 /// Trying every address matters for dual-stack targets, where the AAAA record
-/// may be unreachable while the A record works.
-async fn connect_any(addresses: &[SocketAddr]) -> io::Result<TcpStream> {
+/// may be unreachable while the A record works. The address of the last attempt
+/// travels with the error, since that is the hop the client is told about.
+async fn connect_any(addresses: &[SocketAddr]) -> Result<TcpStream, Unreachable> {
     let mut last = None;
 
     for address in addresses {
@@ -176,13 +181,19 @@ async fn connect_any(addresses: &[SocketAddr]) -> io::Result<TcpStream> {
             Ok(tcp) => return Ok(tcp),
             Err(error) => {
                 debug!(%address, %error, "target address unreachable, trying the next");
-                last = Some(error);
+                last = Some(Unreachable {
+                    next_hop: Some(*address),
+                    error,
+                });
             }
         }
     }
 
-    Err(last.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to")
+    // Callers only ever pass a non-empty list, so the fallback is the empty-list
+    // arm written out rather than asserted: there is no hop to name in it.
+    Err(last.unwrap_or_else(|| Unreachable {
+        next_hop: None,
+        error: io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to"),
     }))
 }
 
@@ -196,7 +207,14 @@ async fn client_to_target(
     loop {
         let chunk = tokio::select! {
             biased;
-            () = torn_down(&mut teardown_rx) => return,
+            // The other direction ended the tunnel abnormally. Shutting the
+            // write side down on the way out would put a FIN on the wire, which
+            // is the wrong signal for every path that gets here — and would
+            // overtake the reset when the other pump armed one.
+            () = torn_down(&mut teardown_rx) => {
+                tcp_write.forget();
+                return;
+            }
             chunk = reader.recv_data() => chunk,
         };
 
@@ -225,7 +243,11 @@ async fn client_to_target(
                     None => debug!(%error, "reading from the client failed"),
                 }
                 // The request stream is unusable: close the TCP connection by
-                // stopping the other pump, which drops the read half.
+                // stopping the other pump, which drops the read half. The client
+                // aborted the tunnel, so that close is a reset (RFC 9114 §4.4)
+                // rather than the FIN a natural drop would produce.
+                abort_target(tcp_write.as_ref());
+                tcp_write.forget();
                 let _ = teardown.send(true);
                 return;
             }
@@ -270,6 +292,11 @@ async fn target_to_client(
                         Some(code) => debug!(code, "client reset the tunnel"),
                         None => debug!(%error, "sending to the client failed"),
                     }
+                    // RFC 9114 §4.4's other client-side abort: the client has
+                    // stopped reading the tunnel, so what is left of the target
+                    // connection is closed with a reset. The other pump does the
+                    // dropping; this only decides how the socket closes.
+                    abort_target(tcp_read.as_ref());
                     let _ = teardown.send(true);
                     return;
                 }
@@ -283,6 +310,38 @@ async fn target_to_client(
                 return;
             }
         }
+    }
+}
+
+/// Arms an abortive close on the target connection (RFC 9114 §4.4).
+///
+/// §4.4 requires the TCP connection to be closed when the proxy "detects that
+/// the client has reset the stream or aborted reading from the stream", and adds
+/// that "in all these cases, if the underlying TCP implementation permits it,
+/// the proxy SHOULD send a TCP segment with the RST bit set". `SO_LINGER` at
+/// zero is how that is asked for: the next close of the socket aborts instead of
+/// draining, so the target learns the tunnel was cut rather than politely
+/// finished, and stops holding a half-open connection until its own timeout.
+///
+/// Setting the option has no effect until the socket is closed, so arming it on
+/// the way out cannot disturb anything still in flight.
+///
+/// **This is only ever called on the two client-abort paths.** A clean client
+/// FIN, a target EOF, and a target that resets or errors all keep their existing
+/// FIN semantics — the half-close table at the top of this module is the
+/// behaviour this proxy exists to get right, and a reset is not a substitute for
+/// any of it.
+///
+/// `set_linger` is deprecated in tokio because `SO_LINGER` can make a close block
+/// the thread while the send buffer drains. That is the *non-zero* timeout; at
+/// zero the close is by definition immediate, which is exactly why this is the
+/// one safe use of it.
+fn abort_target(tcp: &TcpStream) {
+    #[allow(deprecated)]
+    if let Err(error) = tcp.set_linger(Some(Duration::ZERO)) {
+        // The connection still closes, just with a FIN: a SHOULD unmet, not a
+        // tunnel broken.
+        debug!(%error, "failed to arm a TCP reset on the target socket");
     }
 }
 

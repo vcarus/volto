@@ -18,6 +18,10 @@
 //!   UDP has no handshake, so waiting for the target to answer would hang.
 //! * Name resolution happens **before** the 2xx, so an unresolvable target is
 //!   refused rather than becoming a silent black hole.
+//! * The session is registered for datagram delivery **before** that resolution,
+//!   so the packets a client is allowed to send optimistically (RFC 9298 §5) are
+//!   buffered instead of dropped, and discarded with the session if the request
+//!   is refused.
 //! * An oversized outbound packet is **dropped**, never downgraded to a capsule
 //!   (RFC 9298 §6.1).
 //! * Closing the socket also closes the request stream, and vice versa
@@ -36,7 +40,7 @@ use tracing::{debug, info, warn};
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{self, Reader, Stream, Writer};
-use crate::tunnel::{Context, ProxyError};
+use crate::tunnel::{Context, ProxyError, Unreachable};
 use crate::{net, policy, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
@@ -45,7 +49,29 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 /// Inbound datagrams buffered per session before packets start being dropped.
 ///
 /// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
-/// slow target turn into unbounded memory growth.
+/// slow target turn into unbounded memory growth. The same queue serves both
+/// phases of a session — the one before the target socket exists, where it holds
+/// what RFC 9298 §5 calls optimistically sent packets, and the running one — so
+/// this constant is the whole per-session bound rather than one of two.
+///
+/// # What this costs at the configured limits
+///
+/// Worst case is `depth x payload x max_targets_per_conn x max_connections`.
+/// Only the payload needs care: a QUIC DATAGRAM frame cannot be fragmented, so a
+/// datagram never exceeds the `max_udp_payload_size` this server advertises
+/// (quinn's default, 1472 bytes) even though RFC 9298 §5 permits a 65527-byte UDP
+/// payload in principle. With the shipped defaults (`INBOUND_QUEUE_DEPTH` = 64,
+/// `max_targets_per_conn` = 256, `max_connections` = 256) that is ~92 KiB per
+/// session, ~23 MiB per connection and ~5.8 GiB across a server saturated at both
+/// limits — an operator lowering either limit lowers it proportionally.
+///
+/// Registering a session before its target socket exists does **not** raise that
+/// ceiling: the queue is the same size in both phases, sessions are still capped
+/// by the per-connection tunnel quota, and a full queue is already reachable on a
+/// running session whenever a client sends faster than the proxy forwards. What
+/// it changes is how long a full queue can sit undrained — no longer than name
+/// resolution takes, after which the session either starts draining or is refused
+/// and the queue is discarded with it.
 const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// Routes inbound HTTP datagrams to the session that owns them.
@@ -209,6 +235,26 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
         }
     };
 
+    // The Quarter Stream ID follows from the stream id alone, so the session can
+    // start collecting datagrams as soon as the request is known to be a
+    // well-formed CONNECT-UDP one — before the resolver is asked anything.
+    //
+    // RFC 9298 §5: "A client MAY optimistically start sending UDP packets in
+    // HTTP Datagrams before receiving the response to its UDP proxying request",
+    // and a proxy receiving them early "SHALL either drop that HTTP Datagram
+    // silently or buffer it temporarily (on the order of a round trip)".
+    // Registering here takes the second option: the packets land in the queue the
+    // session is about to read from, so a client that opens a tunnel and sends
+    // immediately does not lose its first packets to name resolution.
+    //
+    // Every refusal below returns, dropping the guard and with it the queue —
+    // which is the discard the same paragraph calls for when the request the
+    // datagrams were waiting on never succeeds. [`INBOUND_QUEUE_DEPTH`] carries
+    // what that buffer costs.
+    let quarter_stream_id = datagram::quarter_stream_id(stream_id);
+    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+    let _guard = ctx.sessions.register(quarter_stream_id, inbound_tx);
+
     // Cheapest check first, and one that needs no resolver.
     if !ctx.policy.allows_port(port) {
         debug!(stream_id, host, port, "target port denied by policy");
@@ -277,28 +323,20 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
 
     let socket = match bind_any(&allowed).await {
         Ok(socket) => socket,
-        Err(error) => {
+        Err(failure) => {
             // As on the TCP path, the status follows from the RFC 9209 type
-            // rather than collapsing every failure into one 502.
-            debug!(stream_id, ?allowed, %error, "failed to open target UDP socket");
-            let refusal = ProxyError::from_connect_error(&error);
-            tunnel::refuse_because(
-                &mut stream,
-                refusal.recommended_status(),
-                refusal,
+            // rather than collapsing every failure into one 502, and the answer
+            // names the address that failed.
+            debug!(
                 stream_id,
-            )
-            .await;
+                ?allowed,
+                error = %failure.error,
+                "failed to open target UDP socket"
+            );
+            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
             return;
         }
     };
-
-    let quarter_stream_id = datagram::quarter_stream_id(stream_id);
-    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-
-    // Registered before the 2xx so datagrams the client sends the instant it
-    // sees the response have somewhere to go.
-    let _guard = ctx.sessions.register(quarter_stream_id, inbound_tx);
 
     if let Err(error) = stream.respond_with(StatusCode::OK, capsule_headers()).await {
         debug!(stream_id, %error, "failed to send 200 for connect-udp");
@@ -578,7 +616,23 @@ impl Session {
                     debug!(stream_id, "client closed the connect-udp stream");
                     Step::Stop
                 } else {
-                    // RFC 9297 §3.3: a body ending mid-capsule is malformed.
+                    // RFC 9297 §3.3: a stream carrying capsules that "is
+                    // terminated cleanly [...] and the last Capsule on the
+                    // stream was truncated [...] MUST be treated as if it were a
+                    // malformed or incomplete message", and the same section
+                    // sends HTTP/3 to RFC 9114 §4.1.2, where a malformed message
+                    // "MUST be treated as a stream error of type
+                    // H3_MESSAGE_ERROR".
+                    //
+                    // Deliberately *not* the 0x33 used for the parse failures
+                    // above, even though both arrive through the capsule
+                    // decoder. 0x33 is registered as a "Datagram or Capsule
+                    // Protocol parse error", and nothing failed to parse here:
+                    // every capsule received was well formed, and the message
+                    // simply ended somewhere other than a capsule boundary. The
+                    // two codes cover different faults and this one is the
+                    // message's, so the code the RFC names for a malformed
+                    // message is the right one to send.
                     debug!(
                         stream_id,
                         error = %capsule::Error::Truncated,
@@ -643,7 +697,10 @@ fn capsule_headers() -> HeaderMap {
 }
 
 /// Opens a connected UDP socket to the first address that works.
-async fn bind_any(addresses: &[std::net::SocketAddr]) -> std::io::Result<UdpSocket> {
+///
+/// As on the TCP path, the address of the last attempt travels with the error:
+/// it is the hop an RFC 9209 `next-hop` parameter names.
+async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unreachable> {
     let mut last = None;
 
     for address in addresses {
@@ -651,13 +708,17 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> std::io::Result<UdpSock
             Ok(socket) => return Ok(socket),
             Err(error) => {
                 debug!(%address, %error, "could not open a socket to the target");
-                last = Some(error);
+                last = Some(Unreachable {
+                    next_hop: Some(*address),
+                    error,
+                });
             }
         }
     }
 
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind to")
+    Err(last.unwrap_or_else(|| Unreachable {
+        next_hop: None,
+        error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind to"),
     }))
 }
 
@@ -973,6 +1034,67 @@ mod tests {
         assert!(!is_per_packet_send_error(&std::io::Error::other(
             "synthetic"
         )));
+    }
+
+    /// RFC 9298 §5 lets a client send UDP payloads before the response arrives,
+    /// and lets the proxy buffer them. Registering the session before the target
+    /// socket exists is what turns that permission into behaviour: a datagram the
+    /// router delivers while the session loop has not started yet must still be
+    /// there when it does — once, in order, and without a consumer running.
+    ///
+    /// Deterministic on purpose: forcing that ordering through a live server
+    /// would mean racing the resolver, so the guarantee is asserted where it
+    /// actually lives, on the registry and its queue.
+    #[tokio::test]
+    async fn datagrams_delivered_before_the_session_starts_are_kept() {
+        let registry = Arc::new(SessionRegistry::default());
+        let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+        let _guard = registry.register(9, inbound_tx);
+
+        // Exactly what `route_datagrams` does, with nothing reading the far end.
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            let sink = registry.get(9).expect("the session is registered");
+            sink.try_send(Bytes::copy_from_slice(payload))
+                .expect("an early datagram must be buffered, not refused");
+        }
+
+        // The session loop starts only now.
+        assert_eq!(inbound.recv().await.as_deref(), Some(b"first".as_slice()));
+        assert_eq!(inbound.recv().await.as_deref(), Some(b"second".as_slice()));
+        assert!(
+            inbound.try_recv().is_err(),
+            "a buffered datagram must be delivered once, not replayed"
+        );
+    }
+
+    /// The other half of the same design: the buffer is bounded by
+    /// [`INBOUND_QUEUE_DEPTH`], and a request that never reaches its target
+    /// discards whatever it had accumulated.
+    #[tokio::test]
+    async fn the_early_buffer_is_bounded_and_dies_with_the_session() {
+        let registry = Arc::new(SessionRegistry::default());
+        let (inbound_tx, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+        let guard = registry.register(9, inbound_tx);
+
+        let sink = registry.get(9).expect("the session is registered");
+        for _ in 0..INBOUND_QUEUE_DEPTH {
+            sink.try_send(Bytes::from_static(b"x"))
+                .expect("within the queue depth");
+        }
+        assert!(
+            sink.try_send(Bytes::from_static(b"x")).is_err(),
+            "the queue must stop accepting at its depth rather than grow"
+        );
+
+        // A refusal path returns before the session runs: the guard drops, the
+        // Quarter Stream ID stops routing, and the buffer goes with the receiver.
+        drop(guard);
+        drop(inbound);
+        assert!(registry.get(9).is_none());
+        assert!(
+            sink.try_send(Bytes::from_static(b"x")).is_err(),
+            "nothing may be handed to a session that was refused"
+        );
     }
 
     #[test]

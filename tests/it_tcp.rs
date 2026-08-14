@@ -5,8 +5,8 @@ mod common;
 use bytes::Bytes;
 use common::{
     closed_address, connect_request, read_at_least, read_to_end, spawn_close_reporting_target,
-    spawn_drain_then_reply_target, spawn_echo_target, spawn_reset_after_read_target, H3Client,
-    TestServer, TIMEOUT,
+    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    spawn_reset_after_read_target, ConnectionEnd, H3Client, TestServer, TIMEOUT,
 };
 use http::{Method, Request, StatusCode};
 
@@ -167,6 +167,84 @@ async fn client_reset_closes_the_target_connection() {
         .expect("close notification");
 }
 
+/// RFC 9114 §4.4: "if the underlying TCP implementation permits it, the proxy
+/// SHOULD send a TCP segment with the RST bit set" when the client resets the
+/// tunnel. Observable at the target as `ECONNRESET` on a read that would have
+/// returned a clean EOF had the proxy closed with a FIN.
+#[tokio::test]
+async fn client_reset_aborts_the_target_connection() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Abruptly reset the request stream instead of finishing it.
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    drop(stream);
+
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target connection must be closed after a client reset")
+        .expect("close notification");
+
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "an aborted tunnel must reach the target as a reset, not as a clean EOF"
+    );
+}
+
+/// The counterpart, and the regression that stops the reset above from leaking
+/// into the normal path: a client that finishes its sending side cleanly must
+/// still reach the target as a FIN, i.e. as a clean EOF.
+#[tokio::test]
+async fn a_clean_client_close_still_reaches_the_target_as_eof() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    stream
+        .send_data(Bytes::from_static(b"hello"))
+        .await
+        .expect("send payload");
+    stream.finish().await.expect("finish the sending side");
+
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target must see the client's FIN")
+        .expect("close notification");
+
+    assert_eq!(
+        end,
+        ConnectionEnd::Eof,
+        "a clean half-close must stay a FIN: RFC 9114 §4.4 half-close semantics \
+         depend on the target seeing an ordinary end of stream"
+    );
+}
+
 #[tokio::test]
 async fn refuses_a_target_that_is_not_listening() {
     let server = TestServer::start().await;
@@ -187,6 +265,17 @@ async fn refuses_a_target_that_is_not_listening() {
     // RFC 9114 §4.4: failure to establish the connection is reported with a
     // non-2xx status, not a stream reset.
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    // RFC 9209 §2.1.2: the refusal names the hop that refused it, as a
+    // structured field String. Only failures to reach a target carry it.
+    assert_eq!(
+        response
+            .headers()
+            .get("proxy-status")
+            .map(|value| value.to_str().expect("proxy-status is ASCII")),
+        Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
+        "the refusal must name the address that refused the connection"
+    );
 }
 
 #[tokio::test]
