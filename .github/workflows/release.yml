@@ -18,7 +18,7 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Static musl binaries, so a release runs on any glibc vintage. ring needs
       # a working cross C toolchain for aarch64, which is what `cross` provides;
