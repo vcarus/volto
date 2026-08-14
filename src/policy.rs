@@ -86,6 +86,37 @@ impl Policy {
     }
 }
 
+/// Whether every resolved address is the unspecified address (`0.0.0.0` / `::`).
+///
+/// This is the shape a filtering resolver uses to say "no": ad and telemetry
+/// blockers answer a blocked name with the unspecified address rather than with
+/// NXDOMAIN. Those answers are refused by [`Policy::allows_address`] like any
+/// other unroutable target, but the refusal is routine housekeeping rather than
+/// evidence of anything — on a host whose resolver filters, it is the bulk of all
+/// refusals. Callers use this to log such a refusal quietly. It changes no
+/// decision: the response is identical either way.
+///
+/// The test is deliberately all-or-nothing, and deliberately narrow to the
+/// unspecified address:
+///
+/// * **All**, because a name resolving to `0.0.0.0` *and* `10.0.0.1` is not a
+///   blackhole. The private address is a real target that the policy just
+///   refused, which is exactly the SSRF-shaped evidence worth keeping loud.
+/// * **Unspecified only**, because loopback, RFC 1918 and the rest of the private
+///   space are what an attacker aims at, and a probe of them must stay visible.
+///   The unspecified address is the one entry in the deny list that reaches
+///   nothing at all.
+///
+/// An empty list is not a blackhole. It cannot arise on the paths that call this
+/// (resolution either fails or yields addresses), and "no addresses at all" is no
+/// reason to quieten a warning.
+pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
+    !addresses.is_empty()
+        && addresses
+            .iter()
+            .all(|address| canonical(address.ip()).is_unspecified())
+}
+
 /// Normalizes an address into the form the kernel will actually route.
 ///
 /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) becomes the IPv4 address it stands for.
@@ -354,6 +385,65 @@ mod tests {
                 "[2001:db8::1]:443".parse().unwrap()
             ]
         );
+    }
+
+    fn addresses(literals: &[&str]) -> Vec<SocketAddr> {
+        literals
+            .iter()
+            .map(|a| a.parse().expect("socket address"))
+            .collect()
+    }
+
+    /// The answer a filtering resolver gives, in every spelling it gives it in.
+    #[test]
+    fn an_all_unspecified_answer_is_a_blackhole() {
+        for literals in [
+            &["0.0.0.0:443"][..],
+            &["0.0.0.0:53", "0.0.0.0:53"][..],
+            &["[::]:443"][..],
+            // IPv4-mapped: unspecified once canonicalized, like everywhere else.
+            &["[::ffff:0.0.0.0]:443"][..],
+            &["0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"][..],
+        ] {
+            assert!(
+                is_dns_blackhole(&addresses(literals)),
+                "{literals:?} is a filtered answer and must be recognised as one"
+            );
+        }
+    }
+
+    /// The half of the rule that keeps SSRF probes loud: anything that is not
+    /// *only* the unspecified address stays an ordinary policy refusal.
+    #[test]
+    fn private_and_mixed_answers_are_not_blackholes() {
+        for literals in [
+            // A private address alongside the blackhole is still a private
+            // address, and reaching for it is the thing worth warning about.
+            &["0.0.0.0:443", "10.0.0.1:443"][..],
+            &["[::]:443", "[::1]:443"][..],
+            // Pure loopback / RFC 1918 / link-local: refused, never quietly.
+            &["127.0.0.1:443"][..],
+            &["10.0.0.1:443", "192.168.1.1:443"][..],
+            &["169.254.169.254:80"][..],
+            &["[::1]:443"][..],
+            // Broadcast and multicast are refused for their own reasons.
+            &["255.255.255.255:443"][..],
+            &["224.0.0.1:443"][..],
+            // A public address is not a blackhole either, mixed in or alone.
+            &["0.0.0.0:443", "8.8.8.8:443"][..],
+        ] {
+            assert!(
+                !is_dns_blackhole(&addresses(literals)),
+                "{literals:?} must stay an ordinary policy refusal"
+            );
+        }
+    }
+
+    /// Unreachable on the calling paths, but "nothing resolved" is not evidence
+    /// of filtering, so it takes the loud branch.
+    #[test]
+    fn no_addresses_is_not_a_blackhole() {
+        assert!(!is_dns_blackhole(&[]));
     }
 
     #[test]

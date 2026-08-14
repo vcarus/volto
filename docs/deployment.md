@@ -238,6 +238,13 @@ syscall filter, no new privileges.
 Environment=RUST_LOG=volto=debug,quinn=info
 ```
 
+Log lines carry a syslog priority when systemd is reading them, so journald's own
+severity filter works rather than needing a text search:
+
+```sh
+journalctl -u volto -p warning --since -24h
+```
+
 ## Firewall
 
 QUIC is UDP. This is the single most common reason for "it works locally but the

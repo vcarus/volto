@@ -37,7 +37,7 @@ use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{self, Reader, Stream, Writer};
 use crate::tunnel::{Context, ProxyError};
-use crate::{net, tunnel};
+use crate::{net, policy, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
@@ -245,13 +245,26 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
 
     let allowed = ctx.policy.allowed_addresses(&addresses);
     if allowed.is_empty() {
-        warn!(
-            stream_id,
-            host,
-            port,
-            ?addresses,
-            "every address of the target is prohibited by policy"
-        );
+        // As on the TCP path: a resolver that answers only the unspecified
+        // address has filtered the name, which is routine. Anything else — a
+        // private address among the answers above all — stays a warning.
+        if policy::is_dns_blackhole(&addresses) {
+            info!(
+                stream_id,
+                host,
+                port,
+                ?addresses,
+                "every address of the target is a DNS blackhole"
+            );
+        } else {
+            warn!(
+                stream_id,
+                host,
+                port,
+                ?addresses,
+                "every address of the target is prohibited by policy"
+            );
+        }
         tunnel::refuse_because(
             &mut stream,
             StatusCode::FORBIDDEN,

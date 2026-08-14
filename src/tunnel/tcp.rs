@@ -30,7 +30,7 @@ use tracing::{debug, info, warn};
 
 use crate::h3api::{self, Buffer, Reader, Stream, Writer};
 use crate::tunnel::{Context, ProxyError};
-use crate::{net, tunnel};
+use crate::{net, policy, tunnel};
 
 /// Bytes read from the target per relay iteration.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
@@ -84,12 +84,26 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // public ones, so DNS rebinding onto loopback gains nothing.
     let allowed = ctx.policy.allowed_addresses(&addresses);
     if allowed.is_empty() {
-        warn!(
-            stream_id,
-            authority,
-            ?addresses,
-            "every address of the target is prohibited by policy"
-        );
+        // Same refusal either way; only the volume differs. A name that resolves
+        // to nothing but the unspecified address was blocked by a filtering
+        // resolver upstream, which is neither this proxy's business nor worth a
+        // warning. Every other refusal — loopback, RFC 1918, a mix — stays loud
+        // because that is what an SSRF probe looks like from here.
+        if policy::is_dns_blackhole(&addresses) {
+            info!(
+                stream_id,
+                authority,
+                ?addresses,
+                "every address of the target is a DNS blackhole"
+            );
+        } else {
+            warn!(
+                stream_id,
+                authority,
+                ?addresses,
+                "every address of the target is prohibited by policy"
+            );
+        }
         tunnel::refuse_because(
             &mut stream,
             StatusCode::FORBIDDEN,

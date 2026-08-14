@@ -1,11 +1,16 @@
 //! `volto` — MASQUE proxy server binary: CLI, logging, assembly.
 
+use std::ffi::OsStr;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Event, Level, Subscriber};
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 use volto::config::Config;
 use volto::quic::Server;
 use volto::shutdown::Trigger;
@@ -136,10 +141,19 @@ async fn watch_for_signals(trigger: Trigger) {
     trigger.fire();
 }
 
+/// The variable systemd sets when a service's standard streams go to the journal.
+///
+/// Its value is the `device:inode` of that connection (`systemd.exec(5)`); only
+/// its presence is used here, see [`logs_to_journal`].
+const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
+
 /// Installs the tracing subscriber.
 ///
 /// `RUST_LOG` wins over `log.level` so verbosity can be raised without touching
 /// the config file.
+///
+/// Under systemd each line additionally carries a syslog priority prefix; see
+/// [`JournalPriority`]. In a terminal the output is unchanged.
 fn init_tracing(level: &str) -> Result<()> {
     let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
@@ -147,7 +161,214 @@ fn init_tracing(level: &str) -> Result<()> {
             .with_context(|| format!("log.level = {level:?} is not a valid filter"))?,
     };
 
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+
+    if logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref()) {
+        builder
+            // The journal stores whatever bytes arrive, and the default ANSI
+            // detection only consults NO_COLOR — without this, colour escapes
+            // end up inside journald and the forwarded syslog files.
+            .with_ansi(false)
+            .event_format(JournalPriority(
+                tracing_subscriber::fmt::format::Format::default(),
+            ))
+            .init();
+    } else {
+        builder.init();
+    }
 
     Ok(())
+}
+
+/// Whether this process's log output is being read by journald.
+///
+/// Deliberately a presence test rather than an `fstat` of stdout compared against
+/// the `device:inode` in the value: the shipped unit sends both standard streams
+/// to the journal, so anything that sets the variable is a journal, and a wrong
+/// answer here costs a cosmetic prefix rather than a log line. Taking the value as
+/// an argument keeps it testable without mutating the environment of a running
+/// test binary.
+fn logs_to_journal(journal_stream: Option<&OsStr>) -> bool {
+    journal_stream.is_some_and(|value| !value.is_empty())
+}
+
+/// The syslog severity for a tracing level, formatted as a `printk` prefix.
+///
+/// Syslog has eight severities and tracing has five, so the mapping is not onto:
+/// ERROR/WARN/INFO land on their namesakes (3/4/6), while DEBUG and TRACE share
+/// 7 — debug, the least severe thing syslog can say.
+fn syslog_prefix(level: &Level) -> &'static str {
+    match *level {
+        Level::ERROR => "<3>",
+        Level::WARN => "<4>",
+        Level::INFO => "<6>",
+        // DEBUG and TRACE.
+        _ => "<7>",
+    }
+}
+
+/// Wraps an event formatter so each line starts with its syslog priority.
+///
+/// volto writes plain text to stdout, and journald files plain text as PRIORITY=6
+/// (info) whatever the line says — so `journalctl -u volto -p warning` used to
+/// return nothing and an operator had to grep for the word "WARN". A leading
+/// `<N>` fixes that: journald parses it, strips it, and files the record with that
+/// priority. `SyslogLevelPrefix=` defaults to true, so the shipped unit needs no
+/// change for this to take effect.
+///
+/// Only the prefix is ours; everything after it is the wrapped formatter's
+/// output, so the log format does not fork into two. The default formatter emits
+/// exactly one line per event, which is what makes writing the prefix once per
+/// event the same thing as writing it at the start of the line — the only place
+/// systemd looks for it.
+struct JournalPriority<F>(F);
+
+impl<S, N, F> FormatEvent<S, N> for JournalPriority<F>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    F: FormatEvent<S, N>,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        writer.write_str(syslog_prefix(event.metadata().level()))?;
+        self.0.format_event(ctx, writer, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::fmt::format::{DefaultFields, Format};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::Registry;
+
+    use super::*;
+
+    /// Collects everything a subscriber writes, so the formatted bytes can be
+    /// asserted on directly.
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl SharedBuffer {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedBuffer {
+        type Writer = SharedBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// One event per level, captured with the given formatter, newest last.
+    fn capture<E>(format: E) -> String
+    where
+        E: FormatEvent<Registry, DefaultFields> + Send + Sync + 'static,
+    {
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("trace")
+            .with_ansi(false)
+            .with_writer(buffer.clone())
+            .event_format(format)
+            .finish();
+
+        // A scoped subscriber rather than the global one: this binary's tests all
+        // share a process, and a global default can only be installed once.
+        tracing::subscriber::with_default(subscriber, || {
+            error!("an error");
+            warn!("a warning");
+            info!("some information");
+            tracing::debug!("a debug note");
+            tracing::trace!("a trace note");
+        });
+
+        buffer.contents()
+    }
+
+    #[test]
+    fn every_level_maps_to_its_syslog_severity() {
+        assert_eq!(syslog_prefix(&Level::ERROR), "<3>");
+        assert_eq!(syslog_prefix(&Level::WARN), "<4>");
+        assert_eq!(syslog_prefix(&Level::INFO), "<6>");
+        assert_eq!(syslog_prefix(&Level::DEBUG), "<7>");
+        assert_eq!(syslog_prefix(&Level::TRACE), "<7>");
+    }
+
+    /// systemd sets the variable to `device:inode`; nothing else sets it.
+    #[test]
+    fn the_journal_is_detected_from_the_environment() {
+        assert!(logs_to_journal(Some(OsStr::new("8:12345"))));
+        // Not set: an interactive `cargo run`, which must be left alone.
+        assert!(!logs_to_journal(None));
+        // Set but empty is not a journal either.
+        assert!(!logs_to_journal(Some(OsStr::new(""))));
+    }
+
+    /// The prefix has to be the *first* thing on the line, or journald files the
+    /// line verbatim at PRIORITY=6 and prints the `<N>` to the operator.
+    #[test]
+    fn each_line_starts_with_its_priority() {
+        let logged = capture(JournalPriority(Format::default()));
+        let lines: Vec<&str> = logged.lines().collect();
+
+        // `with_ansi(false)` on the builder must reach the wrapped formatter:
+        // these bytes end up inside journald and the forwarded syslog otherwise.
+        assert!(
+            !logged.contains('\u{1b}'),
+            "no ANSI escapes may reach the journal; log was:\n{logged}"
+        );
+        assert_eq!(lines.len(), 5, "one line per event; log was:\n{logged}");
+        for (line, (prefix, message)) in lines.iter().zip([
+            ("<3>", "an error"),
+            ("<4>", "a warning"),
+            ("<6>", "some information"),
+            ("<7>", "a debug note"),
+            ("<7>", "a trace note"),
+        ]) {
+            assert!(
+                line.starts_with(prefix),
+                "{line:?} must start with {prefix}"
+            );
+            // Everything after the prefix is still the default rendering: the
+            // prefix is added to the format, it does not replace it.
+            assert!(line.contains(message), "{line:?} must carry its message");
+        }
+        assert!(lines[0].contains("ERROR"), "log was:\n{logged}");
+        assert!(lines[1].contains("WARN"), "log was:\n{logged}");
+    }
+
+    /// Off the journal the output is byte-for-byte what it always was.
+    #[test]
+    fn without_the_wrapper_no_prefix_is_written() {
+        let logged = capture(Format::default());
+
+        for line in logged.lines() {
+            assert!(
+                !line.starts_with('<'),
+                "a terminal must not see a priority prefix: {line:?}"
+            );
+        }
+        assert!(logged.contains("a warning"), "log was:\n{logged}");
+    }
 }

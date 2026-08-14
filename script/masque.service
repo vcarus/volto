@@ -96,6 +96,12 @@ StandardError=journal
 # volto writes plain lines to stdout; the level comes from the config file, and
 # RUST_LOG overrides it without editing the config:
 #   Environment=RUST_LOG=volto=debug,quinn=info
+#
+# When systemd hands stdout to the journal it also sets $JOURNAL_STREAM, which
+# volto takes as the cue to prefix each line with a kernel-style "<N>" priority.
+# journald strips that prefix and files the record with the real PRIORITY, so
+# `journalctl -u volto -p warning` works. This needs no setting here:
+# SyslogLevelPrefix= already defaults to true.
 
 [Install]
 WantedBy=multi-user.target

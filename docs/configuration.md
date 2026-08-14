@@ -126,6 +126,20 @@ the log usable for confirming which authorization header a client actually sends
 A keylog file decrypts **every** session through the proxy, including sessions
 already recorded. Turn it off and delete the file when you are done.
 
+Under systemd, volto prefixes each line with a syslog priority (`<3>` for ERROR,
+`<4>` for WARN, `<6>` for INFO, `<7>` for DEBUG and TRACE). journald parses that
+prefix, strips it, and files the record with the matching `PRIORITY`, so
+`journalctl -u volto -p warning` selects what it says it does instead of matching
+everything. The prefix appears only when systemd sets `JOURNAL_STREAM`, so
+running volto in a terminal prints the same lines it always did, and the shipped
+unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true).
+
+One refusal is deliberately quieter than its neighbours. A target whose every
+resolved address is `0.0.0.0` or `::` is a name a filtering resolver has
+blackholed, so it is logged at INFO; the response is the same 403 either way. A
+target that resolves to loopback, private or mixed addresses stays a WARN,
+because that is what a probe for internal services looks like from here.
+
 ## A minimal file
 
 ```toml
