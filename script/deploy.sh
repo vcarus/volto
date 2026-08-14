@@ -201,6 +201,10 @@ fi
 refresh_self() {
     local resolved
     resolved="$(readlink -f "$SELF_SOURCE" 2>/dev/null || echo "$SELF_SOURCE")"
+    # Piped from curl, $0 is not a file; the release download normally overrides
+    # SELF_SOURCE with the tarball copy, but on an already-current host there is
+    # nothing to copy from -- and nothing that needs refreshing either.
+    [ -f "$resolved" ] || return 0
     [ "$resolved" != "$SELF_INSTALLED" ] || return 0
     ! cmp -s "$resolved" "$SELF_INSTALLED" 2>/dev/null || return 0
     install -m 0755 "$resolved" "$SELF_INSTALLED.new"

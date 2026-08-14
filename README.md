@@ -61,10 +61,14 @@ verifies it against `SHA256SUMS` and installs it — running the installer above
 a fresh host, or swapping the binary in place (with automatic rollback if the new
 version fails to start) on a host that already has one. With `--enable-timer` it
 keeps doing that on a daily systemd timer, so deploy and update become the same
-command; see [docs/deployment.md](docs/deployment.md#deploying-from-releases).
+command. Run it from a checkout or a release tarball (`sudo script/deploy.sh
+--enable-timer`), or bootstrap a bare host in one line — everything it installs
+comes out of the checksum-verified release tarball, the piped copy only steers;
+see [docs/deployment.md](docs/deployment.md#deploying-from-releases).
 
 ```sh
-sudo script/deploy.sh --enable-timer
+curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
+  sudo bash -s -- --enable-timer
 ```
 
 It finishes by printing the certificate fingerprint and a ready-to-paste Surge

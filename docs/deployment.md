@@ -158,6 +158,17 @@ host needs:
   previous binary is restored and restarted, and the script fails loudly.
 - **Already on that version**: it exits without touching anything.
 
+The script is also its own bootstrap. On a bare host, pipe it straight from the
+repository and let it do the downloading — everything it installs comes out of
+the checksum-verified release tarball, the piped copy only steers. With stdin
+being a pipe it never prompts, so give `--sni` (and friends) explicitly or
+accept their defaults:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
+  sudo bash -s -- --enable-timer --sni volto.internal --port 443
+```
+
 The no-op path is what makes it safe to run on a schedule:
 
 ```sh

@@ -89,4 +89,8 @@ jobs:
             sudo script/install-selfsigned.sh --binary ./volto
             ```
 
-            Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — `sudo script/deploy.sh --enable-timer` keeps the host on the latest release with a daily systemd timer.
+            Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — with `--enable-timer` it keeps the host on the latest release with a daily systemd timer. It bootstraps a bare host in one line:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh | sudo bash -s -- --enable-timer
+            ```
