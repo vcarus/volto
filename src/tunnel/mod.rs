@@ -236,6 +236,29 @@ impl ProxyError {
             _ => Self::DestinationUnavailable,
         }
     }
+
+    /// The HTTP status code RFC 9209 §2.3.2 recommends for this error type.
+    ///
+    /// The registry pairs each type with a status, and following it costs
+    /// nothing while telling an operator reading a log which failure it was: a
+    /// 504 is a target that never answered, a 503 is one that could not be
+    /// reached at all, and a 502 is one that actively refused.
+    ///
+    /// One deliberate departure: `destination_ip_prohibited` is recommended as
+    /// 502, and this server answers 403. Decision D11 made both policy refusals
+    /// — denied port and denied address — a 403, because they are refusals by
+    /// this proxy rather than reports about an upstream hop, and a client that
+    /// sees 502 would reasonably retry.
+    pub fn recommended_status(self) -> StatusCode {
+        match self {
+            Self::DnsError | Self::ConnectionRefused => StatusCode::BAD_GATEWAY,
+            Self::ConnectionTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::DestinationUnavailable | Self::ConnectionLimitReached => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            Self::DestinationIpProhibited | Self::HttpRequestDenied => StatusCode::FORBIDDEN,
+        }
+    }
 }
 
 /// Answers a request we will not serve, then closes the stream tidily.
@@ -305,6 +328,60 @@ mod tests {
                 Some(value)
             );
         }
+    }
+
+    /// RFC 9209 §2.3.2 pairs each registered type with a recommended status.
+    /// Every pairing here is the registry's, except the documented D11 choice of
+    /// 403 for a destination the policy refuses.
+    #[test]
+    fn every_error_type_carries_its_recommended_status() {
+        for (error, expected) in [
+            (ProxyError::DnsError, StatusCode::BAD_GATEWAY),
+            (ProxyError::ConnectionRefused, StatusCode::BAD_GATEWAY),
+            (ProxyError::ConnectionTimeout, StatusCode::GATEWAY_TIMEOUT),
+            (
+                ProxyError::DestinationUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                ProxyError::ConnectionLimitReached,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (ProxyError::HttpRequestDenied, StatusCode::FORBIDDEN),
+            (ProxyError::DestinationIpProhibited, StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(
+                error.recommended_status(),
+                expected,
+                "{} must answer {expected}",
+                error.as_str()
+            );
+        }
+    }
+
+    /// The three failures `from_connect_error` distinguishes must stay
+    /// distinguishable in the response, which is the point of computing them.
+    #[test]
+    fn connect_failures_do_not_collapse_onto_one_status() {
+        use std::io::{Error, ErrorKind};
+
+        let statuses: Vec<StatusCode> = [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::PermissionDenied,
+        ]
+        .into_iter()
+        .map(|kind| ProxyError::from_connect_error(&Error::from(kind)).recommended_status())
+        .collect();
+
+        assert_eq!(
+            statuses,
+            vec![
+                StatusCode::BAD_GATEWAY,
+                StatusCode::GATEWAY_TIMEOUT,
+                StatusCode::SERVICE_UNAVAILABLE
+            ]
+        );
     }
 
     #[test]

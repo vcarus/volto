@@ -4,7 +4,7 @@
 //! `TcpStream::connect`'s implicit lookup. Two later requirements depend on
 //! seeing the resolved addresses:
 //!
-//! * RFC 9298 §3.2 requires a CONNECT-UDP request to be resolved *before* the
+//! * RFC 9298 §3.1 requires a CONNECT-UDP request to be resolved *before* the
 //!   2xx response is sent.
 //! * The destination ACL (M4) can only filter what it can see.
 
@@ -66,7 +66,7 @@ pub fn fd_soft_limit() -> Option<u64> {
 /// Binds a UDP socket and connects it to `target`.
 ///
 /// Connecting the socket makes the kernel drop any packet that does not come
-/// from `target`, which is the source validation RFC 9298 §3.3 calls for.
+/// from `target`, which is the source validation RFC 9298 §3.1 calls for.
 pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
     // Bind a wildcard address of the same family as the target.
     let bind: SocketAddr = if target.is_ipv4() {
@@ -80,7 +80,7 @@ pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
     socket.connect(target).await?;
 
     // ECN is left alone: an unset codepoint is Not-ECT (RFC 3168), which is what
-    // RFC 9298 §3.4 asks a proxy to send.
+    // RFC 9298 §6.2 asks a proxy to send.
 
     Ok(socket)
 }

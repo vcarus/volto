@@ -224,7 +224,7 @@ func exchange(t *testing.T, session *masque.Conn, payload []byte) []byte {
 	return buf[:n]
 }
 
-// checkCapsuleResponse asserts the response fields RFC 9297 §3.4 requires of a
+// checkCapsuleResponse asserts the response fields RFC 9297 §3.2 and §3.4 require of a
 // message whose body is a capsule sequence.
 func checkCapsuleResponse(t *testing.T, rsp *http.Response) {
 	t.Helper()
@@ -232,7 +232,7 @@ func checkCapsuleResponse(t *testing.T, rsp *http.Response) {
 	if got := rsp.Header.Get("Capsule-Protocol"); got != "?1" {
 		t.Errorf("Capsule-Protocol = %q, want %q", got, "?1")
 	}
-	// RFC 9297 §3.4: a capsule-carrying message must not frame a body length.
+	// RFC 9297 §3.2: a capsule-carrying message must not frame a body length.
 	for _, name := range []string{"Content-Length", "Content-Type", "Transfer-Encoding"} {
 		if got := rsp.Header.Get(name); got != "" {
 			t.Errorf("%s = %q, want it absent", name, got)

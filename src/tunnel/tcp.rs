@@ -105,11 +105,14 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         Err(error) => {
             // RFC 9114 §4.4: a proxy that cannot establish the connection
             // answers with a non-2xx status rather than resetting the stream.
+            // Which non-2xx follows from the RFC 9209 type, so a timeout is a
+            // 504 and an unreachable target a 503 rather than all of them 502.
             debug!(stream_id, authority, ?allowed, %error, "failed to connect to target");
+            let refusal = ProxyError::from_connect_error(&error);
             tunnel::refuse_because(
                 &mut stream,
-                StatusCode::BAD_GATEWAY,
-                ProxyError::from_connect_error(&error),
+                refusal.recommended_status(),
+                refusal,
                 stream_id,
             )
             .await;

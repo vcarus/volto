@@ -50,6 +50,21 @@ pub const CONNECT_ERROR: Code = Code::H3_CONNECT_ERROR;
 /// The peer sent something malformed (RFC 9114 §8.1).
 pub const MESSAGE_ERROR: Code = Code::H3_MESSAGE_ERROR;
 
+/// A datagram or capsule could not be parsed (RFC 9297 §5.2).
+///
+/// The registry entry for 0x33 is literally "Datagram or Capsule Protocol parse
+/// error", which is more precise than H3_MESSAGE_ERROR for anything that went
+/// wrong inside the payload rather than in the HTTP message itself.
+pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
+
+/// The same code as a QUIC application error, for closing the whole connection.
+///
+/// RFC 9297 §2.1 states two receiver obligations as *connection* errors of type
+/// H3_DATAGRAM_ERROR, which a stream reset cannot express. Derived from
+/// [`DATAGRAM_ERROR`] so the two cannot drift apart.
+pub const DATAGRAM_ERROR_CLOSE: quinn::VarInt =
+    quinn::VarInt::from_u32(DATAGRAM_ERROR.value() as u32);
+
 /// Connection close code used when a peer exhausts its authentication attempts.
 ///
 /// A QUIC application error code rather than an HTTP/3 one, because it closes the
@@ -196,7 +211,7 @@ impl Stream {
     /// Sends a response with `headers` and no body.
     ///
     /// Only the field lines given are sent — nothing synthesises a
-    /// Content-Length or Content-Type, both of which RFC 9297 §3.4 forbids on a
+    /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
     /// capsule-carrying response.
     pub async fn respond_with(
         &mut self,

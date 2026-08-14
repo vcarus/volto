@@ -13,6 +13,24 @@ use common::{
 use http::StatusCode;
 use volto::datagram;
 
+/// H3_DATAGRAM_ERROR, the code RFC 9297 §2.1 names for an unusable datagram.
+const H3_DATAGRAM_ERROR: u64 = 0x33;
+
+/// Waits for the server to close the QUIC connection, returning its error code.
+///
+/// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
+/// frame carrying this code is exactly what the RFC requires the peer to see.
+async fn close_code(quic: &quinn::Connection) -> u64 {
+    let error = tokio::time::timeout(TIMEOUT, quic.closed())
+        .await
+        .expect("the server must close the connection");
+
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => close.error_code.into_inner(),
+        other => panic!("expected an application close, got {other:?}"),
+    }
+}
+
 /// Reads datagrams until one arrives for `quarter_stream_id`, returning its
 /// payload.
 ///
@@ -72,8 +90,8 @@ async fn open_session(
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
-    // RFC 9297 §3.4: the response must announce the capsule protocol and must
-    // not describe a body.
+    // RFC 9297 §3.4: the response should announce the capsule protocol, and
+    // §3.2 forbids it from describing a body.
     assert_eq!(
         response
             .headers()
@@ -231,6 +249,122 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
     assert_eq!(&echoed[..], b"somewhere");
 }
 
+/// RFC 9297 §2.1: "The largest legal QUIC stream ID value is 2^62-1, so the
+/// largest legal value of the Quarter Stream ID field is 2^60-1. Receipt of an
+/// HTTP/3 Datagram that includes a larger value MUST be treated as an HTTP/3
+/// connection error of type H3_DATAGRAM_ERROR (0x33)."
+///
+/// Not the same condition as the test above: a value in range that no session
+/// owns is a legitimate drop, while one out of range cannot name a stream at
+/// all. Both the first illegal value and the largest a varint can carry are
+/// tried, since only the boundary distinguishes the two rules.
+#[tokio::test]
+async fn an_out_of_range_quarter_stream_id_closes_the_connection() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+
+    for quarter_stream_id in [datagram::MAX_QUARTER_STREAM_ID + 1, datagram::VARINT_MAX] {
+        let mut client = H3Client::connect(&server).await;
+
+        // With a live session on the connection: the datagram must take the
+        // whole connection down regardless of what else is running on it.
+        let (qsid, _stream) = open_session(
+            &mut client,
+            &server,
+            &target.ip().to_string(),
+            target.port(),
+        )
+        .await;
+        assert!(qsid <= datagram::MAX_QUARTER_STREAM_ID, "a real session id");
+
+        client
+            .quic
+            .send_datagram(datagram::encode(quarter_stream_id, 0, b"out of range"))
+            .expect("send datagram");
+
+        assert_eq!(
+            close_code(&client.quic).await,
+            H3_DATAGRAM_ERROR,
+            "quarter stream id {quarter_stream_id} must close the connection"
+        );
+    }
+}
+
+/// RFC 9297 §2.1: "Receipt of a QUIC DATAGRAM frame whose payload is too short
+/// to allow parsing the Quarter Stream ID field MUST be treated as an HTTP/3
+/// connection error of type H3_DATAGRAM_ERROR (0x33)."
+///
+/// Two shapes of "too short": nothing at all, and a first byte announcing an
+/// eight-byte varint that never arrives.
+#[tokio::test]
+async fn a_datagram_without_a_quarter_stream_id_closes_the_connection() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+
+    for payload in [Bytes::new(), Bytes::from_static(&[0xc0])] {
+        let mut client = H3Client::connect(&server).await;
+        let (_qsid, _stream) = open_session(
+            &mut client,
+            &server,
+            &target.ip().to_string(),
+            target.port(),
+        )
+        .await;
+
+        client
+            .quic
+            .send_datagram(payload.clone())
+            .expect("send datagram");
+
+        assert_eq!(
+            close_code(&client.quic).await,
+            H3_DATAGRAM_ERROR,
+            "a {}-byte datagram must close the connection",
+            payload.len()
+        );
+    }
+}
+
+/// The other side of the same coin: a datagram whose Quarter Stream ID parses
+/// but whose Context ID does not is **dropped**, and the session survives.
+///
+/// RFC 9297 §2.1 states its two connection errors about the Quarter Stream ID
+/// field only, and RFC 9298 §5 says nothing about a truncated Context ID — so
+/// escalating this one would let any peer kill every session on a connection
+/// with a single one-byte datagram.
+#[tokio::test]
+async fn a_truncated_context_id_is_dropped_without_closing_the_connection() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, _stream) = open_session(
+        &mut client,
+        &server,
+        &target.ip().to_string(),
+        target.port(),
+    )
+    .await;
+
+    // A well-formed Quarter Stream ID and nothing after it.
+    let mut truncated = bytes::BytesMut::new();
+    datagram::put_varint(&mut truncated, qsid);
+    client
+        .quic
+        .send_datagram(truncated.freeze())
+        .expect("send datagram");
+
+    // The connection is still usable and so is the session.
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(qsid, b"still routed"))
+        .expect("send datagram");
+
+    let mut pending = HashMap::new();
+    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    assert_eq!(&echoed[..], b"still routed");
+}
+
 #[tokio::test]
 async fn refuses_a_path_that_is_not_the_connect_udp_template() {
     let server = TestServer::start().await;
@@ -279,7 +413,7 @@ async fn refuses_an_invalid_port_in_the_template() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// A session ends when the client closes the request stream (RFC 9298 §3.5).
+/// A session ends when the client closes the request stream (RFC 9298 §3.1).
 ///
 /// Observable from outside: once the session is gone its Quarter Stream ID no
 /// longer routes, so packets sent afterwards get no reply.
@@ -576,7 +710,7 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
 
 /// An idle session must close both its socket and its request stream.
 ///
-/// RFC 9298 §3.5: UDP has no close signal, so the timeout is the only thing that
+/// RFC 9298 §3.1: UDP has no close signal, so the timeout is the only thing that
 /// reclaims the socket, and leaving the request stream open afterwards would
 /// leave the client believing the session still exists.
 #[tokio::test]
@@ -626,7 +760,7 @@ async fn an_idle_session_closes_the_request_stream() {
 /// An unreachable target must close the session, not leave it hanging.
 ///
 /// Sending to a port with nothing bound draws an ICMP port-unreachable, which the
-/// kernel reports on the *connected* socket as `ECONNREFUSED`. RFC 9298 §3.5 says
+/// kernel reports on the *connected* socket as `ECONNREFUSED`. RFC 9298 §3.1 says
 /// that when the OS reports the socket unusable, the request stream must be closed
 /// — so the client learns the target is gone instead of waiting out the 180s idle
 /// timeout. Implemented in M2 as part of the socket error paths; this is its
@@ -635,7 +769,7 @@ async fn an_idle_session_closes_the_request_stream() {
 async fn an_unreachable_target_closes_the_session() {
     let server = TestServer::start().await;
     // Nothing is bound here, but a *connected* UDP socket still opens, so the
-    // session is established and answered with a 200 as RFC 9298 §3.2 requires.
+    // session is established and answered with a 200 as RFC 9298 §3.1 requires.
     let closed = closed_udp_address().await;
     let mut client = H3Client::connect(&server).await;
 

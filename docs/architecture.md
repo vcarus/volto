@@ -92,22 +92,27 @@ Two ordering rules that are easy to get wrong:
   waiting for the target", not "without resolving".
 
 The target socket is connected, so packets from anywhere else are dropped by the
-kernel. Sessions have their own idle timeout (default 180 s; RFC 9298 §3.5 asks
+kernel. Sessions have their own idle timeout (default 180 s; RFC 9298 §3.1 asks
 for at least 120), and closing the socket must also close the request stream.
 
 ## Datagram routing
 
 Each connection runs one `read_datagram` task, in `conn.rs`, that routes inbound
 datagrams to per-session channels. Two fields decide where a packet goes, and
-both are silent when wrong:
+getting either subtly wrong is silent:
 
 - **Quarter Stream ID = stream ID ÷ 4** (RFC 9297 §2.1), not the stream ID.
   Client-initiated bidirectional stream IDs are always multiples of four, so the
   low two bits carry no information and dividing saves encoding space. The old
   draft term "Flow Identifier" is gone, and there is no separate mapping table.
-- **Context ID**, a varint at the head of the payload (RFC 9298 §4). `0` means a
+  A value no session owns is dropped, since a session can close with packets
+  still in flight — but a value that cannot be a stream ID at all (above 2⁶⁰-1,
+  or a datagram too short to parse one) closes the whole QUIC connection with
+  H3_DATAGRAM_ERROR (0x33), which RFC 9297 §2.1 states as a MUST.
+- **Context ID**, a varint at the head of the payload (RFC 9298 §5). `0` means a
   raw UDP payload; anything else is an extension. An unknown Context ID is
-  dropped silently — never a connection error.
+  dropped silently — never a connection error — and so is a truncated one, which
+  no requirement covers.
 
 Get either wrong and the symptom is "the handshake succeeds, the tunnel is
 established, and not one packet gets through", with no error anywhere. The

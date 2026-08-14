@@ -14,14 +14,14 @@
 //!
 //! # Deliberate asymmetries
 //!
-//! * The 2xx is sent **immediately** after the socket is ready (RFC 9298 §3.2):
+//! * The 2xx is sent **immediately** after the socket is ready (RFC 9298 §3.1):
 //!   UDP has no handshake, so waiting for the target to answer would hang.
 //! * Name resolution happens **before** the 2xx, so an unresolvable target is
 //!   refused rather than becoming a silent black hole.
 //! * An oversized outbound packet is **dropped**, never downgraded to a capsule
 //!   (RFC 9298 §6.1).
 //! * Closing the socket also closes the request stream, and vice versa
-//!   (RFC 9298 §3.5) — a half-open UDP session has no meaning.
+//!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -119,10 +119,24 @@ impl Drop for SessionGuard {
 
 /// Delivers inbound QUIC datagrams to their sessions until the connection ends.
 ///
-/// One task per connection. Decoding failures and datagrams for unknown sessions
-/// are dropped rather than treated as connection errors: RFC 9297 §2.1 permits
-/// discarding a datagram whose Quarter Stream ID has no live request stream,
-/// which happens routinely when a session closes with packets in flight.
+/// One task per connection. What happens to a datagram that cannot be delivered
+/// depends on *why*, and RFC 9297 §2.1 draws the lines:
+///
+/// * a Quarter Stream ID that cannot be parsed, or one above 2^60-1, is a
+///   **connection error** of type H3_DATAGRAM_ERROR — neither can name a QUIC
+///   stream, so there is nothing to drop it *for*;
+/// * a Quarter Stream ID with no live session is **dropped**. The RFC permits
+///   discarding a datagram whose request stream does not exist, which happens
+///   routinely when a session closes with packets still in flight;
+/// * a datagram whose Context ID is truncated or unknown is likewise dropped.
+///
+/// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
+/// stream "that cannot be created due to the peer's stream limits" SHOULD draw
+/// H3_ID_ERROR. RFC 9297 §2.1 grants the exemption this router relies on —
+/// "Generating an error is not mandatory because the QUIC stream limit might be
+/// unknown to the HTTP/3 layer" — and this router sits outside the HTTP/3 layer
+/// altogether, so it cannot tell that case apart from a session that has already
+/// closed.
 pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegistry>) {
     loop {
         let datagram = match quic.read_datagram().await {
@@ -136,6 +150,12 @@ pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegis
 
         let decoded = match datagram::decode(datagram) {
             Ok(decoded) => decoded,
+            // The two conditions RFC 9297 §2.1 states as MUST-close.
+            Err(error) if error.is_connection_error() => {
+                warn!(%error, "closing the connection after an unusable HTTP datagram");
+                quic.close(h3api::DATAGRAM_ERROR_CLOSE, b"invalid HTTP datagram");
+                return;
+            }
             Err(error) => {
                 debug!(%error, "malformed HTTP datagram");
                 continue;
@@ -143,7 +163,7 @@ pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegis
         };
 
         if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
-            // RFC 9298 §4: an unknown context must be dropped silently, never
+            // RFC 9298 §5: an unknown context must be dropped silently, never
             // treated as an error.
             debug!(
                 quarter_stream_id = decoded.quarter_stream_id,
@@ -202,7 +222,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
         return;
     }
 
-    // RFC 9298 §3.2: resolution must complete before the 2xx, so a bad name is
+    // RFC 9298 §3.1: resolution must complete before the 2xx, so a bad name is
     // refused instead of silently swallowing every packet.
     //
     // Decision D9: a resolver failure is a 502, not a 400. A transient DNS
@@ -245,11 +265,14 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     let socket = match bind_any(&allowed).await {
         Ok(socket) => socket,
         Err(error) => {
+            // As on the TCP path, the status follows from the RFC 9209 type
+            // rather than collapsing every failure into one 502.
             debug!(stream_id, ?allowed, %error, "failed to open target UDP socket");
+            let refusal = ProxyError::from_connect_error(&error);
             tunnel::refuse_because(
                 &mut stream,
-                StatusCode::BAD_GATEWAY,
-                ProxyError::from_connect_error(&error),
+                refusal.recommended_status(),
+                refusal,
                 stream_id,
             )
             .await;
@@ -310,7 +333,7 @@ struct Session {
     inbound: mpsc::Receiver<Bytes>,
     reader: Reader,
     writer: Writer,
-    /// The request stream body is a capsule sequence (RFC 9297 §3.4).
+    /// The request stream body is a capsule sequence (RFC 9297 §3.2).
     decoder: CapsuleDecoder,
     /// Packets still allowed towards a target that has never answered.
     ///
@@ -324,11 +347,18 @@ struct Session {
 }
 
 /// What a single step of the session loop decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     /// Keep going, and treat this as activity for the idle timer.
     Continue,
-    /// The session is over.
+    /// The session is over; close the request stream tidily.
     Stop,
+    /// The session is over and the request stream has **already been reset**.
+    ///
+    /// Distinct from [`Step::Stop`] because the tidy close would contradict the
+    /// reset: telling the peer "no error" on a stream we just aborted leaves it
+    /// to guess which signal to believe.
+    Aborted,
 }
 
 impl Session {
@@ -351,7 +381,7 @@ impl Session {
                         Ok(length) => self.forward_to_client(&packet[..length]).await,
                         Err(error) => {
                             // ICMP errors surface here on a connected socket.
-                            // RFC 9298 §3.4: the request stream must be closed.
+                            // RFC 9298 §3.1: the request stream must be closed.
                             debug!(stream_id, %error, "target socket failed");
                             Step::Stop
                         }
@@ -366,6 +396,10 @@ impl Session {
             match step {
                 Ok(Step::Continue) => {}
                 Ok(Step::Stop) => break,
+                // The stream carries its own error signal already; anything
+                // added here would only muddy it. The socket still closes, with
+                // `self`.
+                Ok(Step::Aborted) => return,
                 Err(_elapsed) => {
                     debug!(
                         stream_id,
@@ -377,7 +411,7 @@ impl Session {
             }
         }
 
-        // RFC 9298 §3.5: closing the UDP socket and closing the request stream
+        // RFC 9298 §3.1: closing the UDP socket and closing the request stream
         // go together. The socket closes when `self` drops; the stream needs
         // saying explicitly.
         self.reader.stop_receiving(h3api::NO_ERROR);
@@ -396,8 +430,8 @@ impl Session {
                 length = payload.len(),
                 "client sent an oversized UDP payload, aborting the session"
             );
-            self.writer.reset(h3api::MESSAGE_ERROR);
-            return Step::Stop;
+            self.writer.reset(h3api::DATAGRAM_ERROR);
+            return Step::Aborted;
         }
 
         // RFC 9298 §7. The packet is dropped rather than the session closed: a
@@ -416,6 +450,15 @@ impl Session {
 
         match self.socket.send(&payload).await {
             Ok(_) => Step::Continue,
+            Err(error) if is_per_packet_send_error(&error) => {
+                debug!(
+                    quarter_stream_id = self.quarter_stream_id,
+                    length = payload.len(),
+                    %error,
+                    "target socket refused this packet, dropping it"
+                );
+                Step::Continue
+            }
             Err(error) => {
                 // The target is unreachable (ICMP) or the socket is broken.
                 debug!(%error, "failed to send to the target");
@@ -492,41 +535,45 @@ impl Session {
                             payload,
                         })) => {
                             if context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
-                                // RFC 9298 §4, as for datagrams: drop silently.
+                                // RFC 9298 §5, as for datagrams: drop silently.
                                 debug!(
                                     stream_id,
                                     context_id, "dropping capsule with an unknown context id"
                                 );
                                 continue;
                             }
-                            if matches!(self.forward_to_target(payload).await, Step::Stop) {
-                                return Step::Stop;
+                            match self.forward_to_target(payload).await {
+                                Step::Continue => {}
+                                over => return over,
                             }
                         }
                         // More bytes needed.
                         Ok(None) => return Step::Continue,
                         Err(error) => {
+                            // RFC 9297 §5.2 registers 0x33 as exactly this: a
+                            // "Datagram or Capsule Protocol parse error".
                             debug!(stream_id, %error, "malformed capsule");
-                            self.writer.reset(h3api::MESSAGE_ERROR);
-                            return Step::Stop;
+                            self.writer.reset(h3api::DATAGRAM_ERROR);
+                            return Step::Aborted;
                         }
                     }
                 }
             }
-            // RFC 9298 §3.5: the client closing the stream ends the session.
+            // RFC 9298 §3.1: the client closing the stream ends the session.
             Ok(None) => {
                 if self.decoder.at_capsule_boundary() {
                     debug!(stream_id, "client closed the connect-udp stream");
+                    Step::Stop
                 } else {
-                    // RFC 9297 §3.1: a body ending mid-capsule is malformed.
+                    // RFC 9297 §3.3: a body ending mid-capsule is malformed.
                     debug!(
                         stream_id,
                         error = %capsule::Error::Truncated,
                         "connect-udp stream ended mid-capsule"
                     );
                     self.writer.reset(h3api::MESSAGE_ERROR);
+                    Step::Aborted
                 }
-                Step::Stop
             }
             Err(error) => {
                 match h3api::peer_reset_code(&error) {
@@ -539,11 +586,40 @@ impl Session {
     }
 }
 
+/// Whether a target-socket `send` failure affects only this packet.
+///
+/// RFC 9298 draws the line in two places. §3.1 requires the request stream to be
+/// closed when "a UDP proxy is notified by its operating system that its socket
+/// is no longer usable" — ECONNREFUSED from an ICMP port-unreachable is that
+/// case. §5, on the other hand, says a proxy that "can only send out UDP packets
+/// of a certain length due to its underlying link MTU [...] has no choice but to
+/// discard incoming HTTP Datagrams" longer than that. Discard means discard: the
+/// session survives.
+///
+/// The errors below are per-packet verdicts, not verdicts on the socket:
+///
+/// * `EMSGSIZE` — the direct consequence of the DF bit [`crate::net`] sets on
+///   Linux (`IP_PMTUDISC_DO`), raised for every payload above the path MTU. This
+///   is the one that matters in production: a client is entitled to send a 4 KiB
+///   UDP packet, and tearing its tunnel down for it would be a bug the dev host
+///   cannot reproduce, since macOS has no equivalent socket option.
+/// * `EPERM` / `EACCES` — a local firewall rejecting individual packets.
+///
+/// Kept as a plain function over the OS error number because `std` maps none of
+/// these onto a stable `ErrorKind`.
+fn is_per_packet_send_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMSGSIZE) | Some(libc::EPERM) | Some(libc::EACCES)
+    )
+}
+
 /// The response headers of a CONNECT-UDP 2xx.
 ///
-/// RFC 9297 §3.4 requires `Capsule-Protocol: ?1` and forbids Content-Length and
-/// Content-Type, since the body is a capsule sequence rather than a
-/// representation.
+/// RFC 9297 §3.4 says a response that uses the Capsule Protocol SHOULD carry
+/// `Capsule-Protocol: ?1`, and §3.2 forbids Content-Length, Content-Type and
+/// Transfer-Encoding on it, since the body is a capsule sequence rather than a
+/// representation. Sending only the one field satisfies both.
 fn capsule_headers() -> HeaderMap {
     let mut headers = HeaderMap::with_capacity(1);
     headers.insert(
@@ -847,6 +923,43 @@ mod tests {
 
         // Absent entirely: only a SHOULD in RFC 9297 §3.4.
         assert_eq!(validate(&connect_udp_request()), Ok(()));
+    }
+
+    /// RFC 9298 §5: a payload the link cannot carry is discarded, not a reason
+    /// to end the session.
+    ///
+    /// Tested as a pure function because the condition cannot be produced on
+    /// loopback: `EMSGSIZE` needs the DF bit, which is a no-op on macOS, and a
+    /// Linux loopback MTU is far larger than anything a test would send. The
+    /// three codes below are POSIX and present in `libc` on both hosts.
+    #[test]
+    fn per_packet_send_errors_do_not_end_the_session() {
+        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(
+                is_per_packet_send_error(&error),
+                "errno {code} ({error}) must only cost one packet"
+            );
+        }
+    }
+
+    /// The other half of the rule: RFC 9298 §3.1 requires the request stream to
+    /// be closed when the socket itself is reported unusable, which is what
+    /// `ECONNREFUSED` from an ICMP port-unreachable means.
+    #[test]
+    fn socket_failures_still_end_the_session() {
+        for code in [libc::ECONNREFUSED, libc::ENETUNREACH, libc::EHOSTUNREACH] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert!(
+                !is_per_packet_send_error(&error),
+                "errno {code} ({error}) must end the session"
+            );
+        }
+
+        // An error with no OS number at all is not a per-packet verdict either.
+        assert!(!is_per_packet_send_error(&std::io::Error::other(
+            "synthetic"
+        )));
     }
 
     #[test]

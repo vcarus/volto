@@ -27,13 +27,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 
-/// DATAGRAM capsule type (RFC 9297 §4).
+/// DATAGRAM capsule type (RFC 9297 §3.5).
 pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 
 /// Largest DATAGRAM capsule value accepted.
 ///
 /// A DATAGRAM capsule value is a Context ID varint followed by the payload
-/// (RFC 9297 §4). Beyond this the payload could not be a UDP datagram, so
+/// (RFC 9297 §3.5). Beyond this the payload could not be a UDP datagram, so
 /// RFC 9298 §5 requires the stream to be aborted rather than the value buffered.
 pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + MAX_UDP_PAYLOAD as u64;
 
@@ -74,7 +74,7 @@ impl std::error::Error for Error {}
 /// inside the decoder and never surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capsule {
-    /// A DATAGRAM capsule (RFC 9297 §4).
+    /// A DATAGRAM capsule (RFC 9297 §3.5).
     Datagram {
         /// Payload interpretation; 0 is a raw UDP payload.
         context_id: u64,
@@ -133,7 +133,7 @@ impl CapsuleDecoder {
     /// Whether the sequence is currently between capsules.
     ///
     /// False at end of stream means the peer stopped mid-capsule, which
-    /// RFC 9297 §3.1 makes a malformed message.
+    /// RFC 9297 §3.3 makes a malformed message.
     pub fn at_capsule_boundary(&self) -> bool {
         match self.state {
             State::Header => self.buffer.is_empty(),
@@ -200,7 +200,7 @@ impl CapsuleDecoder {
                     self.state = State::Header;
 
                     let context_id =
-                        datagram::take_varint(&mut value).map_err(|_| Error::MalformedDatagram)?;
+                        datagram::take_varint(&mut value).ok_or(Error::MalformedDatagram)?;
 
                     return Ok(Some(Capsule::Datagram {
                         context_id,
@@ -212,7 +212,7 @@ impl CapsuleDecoder {
     }
 }
 
-/// Encodes a DATAGRAM capsule (RFC 9297 §4).
+/// Encodes a DATAGRAM capsule (RFC 9297 §3.5).
 ///
 /// Used only when the peer has not enabled QUIC datagrams; see
 /// `tunnel::udp::Session::forward_to_client`.

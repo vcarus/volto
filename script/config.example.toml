@@ -46,7 +46,7 @@ users = [
 
 [limits]
 # Seconds a UDP session may sit idle before it is closed.
-# RFC 9298 §3.5 says a proxy SHOULD NOT go below 120; volto warns if you do.
+# RFC 9298 §3.1 says a proxy SHOULD NOT go below 120; volto warns if you do.
 # Default: 180
 #udp_session_timeout = 180
 

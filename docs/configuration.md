@@ -40,7 +40,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `udp_session_timeout` | seconds | `180` | Idle timeout for a UDP session. RFC 9298 §3.5 says a proxy SHOULD NOT go below 120; volto warns if you do |
+| `udp_session_timeout` | seconds | `180` | Idle timeout for a UDP session. RFC 9298 §3.1 says a proxy SHOULD NOT go below 120; volto warns if you do |
 | `max_targets_per_conn` | integer | `256` | Concurrent tunnels on one QUIC connection, TCP and UDP sharing the budget. Beyond it, requests get 503 with `Proxy-Status: volto; error=connection_limit_reached` |
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit. Excess connections are refused during the handshake, before any per-connection state exists here |
 | `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel. quinn's own default of 100 runs out during ordinary browsing |

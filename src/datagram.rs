@@ -29,17 +29,59 @@ pub const MAX_UDP_PAYLOAD: usize = 65527;
 /// Largest value a QUIC varint can hold (RFC 9000 §16).
 pub const VARINT_MAX: u64 = (1 << 62) - 1;
 
+/// Largest legal Quarter Stream ID (RFC 9297 §2.1).
+///
+/// "The largest legal QUIC stream ID value is 2^62-1, so the largest legal value
+/// of the Quarter Stream ID field is 2^60-1." A varint can carry more than that,
+/// so the excess has to be rejected here rather than assumed away.
+pub const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
+
 /// Why a datagram could not be decoded.
+///
+/// The three cases are kept apart because RFC 9297 §2.1 treats them differently:
+/// the two that are about the Quarter Stream ID field are connection errors,
+/// while a Context ID that does not parse is not covered by any such rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeError {
-    /// The buffer ended in the middle of a varint or before the payload.
-    Truncated,
+    /// The payload was too short to hold a Quarter Stream ID.
+    MissingQuarterStreamId,
+    /// The Quarter Stream ID is larger than [`MAX_QUARTER_STREAM_ID`].
+    QuarterStreamIdTooLarge(u64),
+    /// The Quarter Stream ID parsed, but the Context ID varint did not.
+    MissingContextId,
+}
+
+impl DecodeError {
+    /// Whether RFC 9297 §2.1 requires the whole connection to be closed.
+    ///
+    /// Two MUSTs, both about the Quarter Stream ID field: a datagram carrying a
+    /// value above 2^60-1, and one "whose payload is too short to allow parsing
+    /// the Quarter Stream ID field", must each "be treated as an HTTP/3
+    /// connection error of type H3_DATAGRAM_ERROR (0x33)".
+    ///
+    /// A truncated Context ID is deliberately *not* one of them. Nothing in
+    /// RFC 9298 §5 says what to do with it, so dropping the datagram is
+    /// legitimate, and escalating a droppable condition into a connection error
+    /// would hand the peer a way to kill every session at once.
+    pub fn is_connection_error(self) -> bool {
+        matches!(
+            self,
+            Self::MissingQuarterStreamId | Self::QuarterStreamIdTooLarge(_)
+        )
+    }
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Truncated => write!(f, "datagram ended mid-field"),
+            Self::MissingQuarterStreamId => {
+                write!(f, "datagram ended before its quarter stream id")
+            }
+            Self::QuarterStreamIdTooLarge(value) => write!(
+                f,
+                "quarter stream id {value} exceeds the legal maximum {MAX_QUARTER_STREAM_ID}"
+            ),
+            Self::MissingContextId => write!(f, "datagram ended before its context id"),
         }
     }
 }
@@ -90,9 +132,18 @@ pub fn encoded_len(quarter_stream_id: u64, context_id: u64, payload_len: usize) 
 }
 
 /// Decodes an HTTP/3 datagram, sharing the payload buffer rather than copying.
+///
+/// The Quarter Stream ID is validated here rather than by the caller: RFC 9297
+/// §2.1 makes an out-of-range value a connection error, which is only
+/// distinguishable from "no session owns this id" if decoding says so.
 pub fn decode(mut datagram: Bytes) -> Result<Datagram, DecodeError> {
-    let quarter_stream_id = take_varint(&mut datagram)?;
-    let context_id = take_varint(&mut datagram)?;
+    let quarter_stream_id =
+        take_varint(&mut datagram).ok_or(DecodeError::MissingQuarterStreamId)?;
+    if quarter_stream_id > MAX_QUARTER_STREAM_ID {
+        return Err(DecodeError::QuarterStreamIdTooLarge(quarter_stream_id));
+    }
+
+    let context_id = take_varint(&mut datagram).ok_or(DecodeError::MissingContextId)?;
 
     Ok(Datagram {
         quarter_stream_id,
@@ -132,10 +183,13 @@ pub fn put_varint(buf: &mut BytesMut, value: u64) {
 }
 
 /// Reads a QUIC varint from the front of `buf`, consuming it.
-pub fn take_varint(buf: &mut Bytes) -> Result<u64, DecodeError> {
-    let (value, length) = peek_varint(buf).ok_or(DecodeError::Truncated)?;
+///
+/// `None` means the buffer does not hold a whole varint. Which error that is
+/// depends on which field was being read, so the caller names it.
+pub fn take_varint(buf: &mut Bytes) -> Option<u64> {
+    let (value, length) = peek_varint(buf)?;
     let _ = buf.split_to(length);
-    Ok(value)
+    Some(value)
 }
 
 /// Decodes the varint at the start of `buf`, returning it and its byte length.
@@ -252,14 +306,59 @@ mod tests {
         assert_eq!(peek_varint(&[0xc2; 7]), None, "8-byte varint");
     }
 
+    /// The two truncations are different conditions, and RFC 9297 §2.1 only
+    /// makes the first of them a connection error.
     #[test]
     fn truncated_datagrams_are_rejected() {
-        assert_eq!(decode(Bytes::new()), Err(DecodeError::Truncated));
+        assert_eq!(
+            decode(Bytes::new()),
+            Err(DecodeError::MissingQuarterStreamId)
+        );
+        // A first byte announcing an 8-byte varint, with one byte present.
+        assert_eq!(
+            decode(Bytes::from_static(&[0xc0])),
+            Err(DecodeError::MissingQuarterStreamId)
+        );
         // A Quarter Stream ID but no Context ID.
         assert_eq!(
             decode(Bytes::from_static(&[0x04])),
-            Err(DecodeError::Truncated)
+            Err(DecodeError::MissingContextId)
         );
+    }
+
+    /// RFC 9297 §2.1: a Quarter Stream ID above 2^60-1 could not name a QUIC
+    /// stream, and is a connection error rather than an unknown session.
+    #[test]
+    fn quarter_stream_ids_above_the_legal_maximum_are_rejected() {
+        let legal = decode(encode(MAX_QUARTER_STREAM_ID, 0, b"fits")).expect("decodes");
+        assert_eq!(legal.quarter_stream_id, MAX_QUARTER_STREAM_ID);
+
+        for value in [MAX_QUARTER_STREAM_ID + 1, VARINT_MAX] {
+            assert_eq!(
+                decode(encode(value, 0, b"too big")),
+                Err(DecodeError::QuarterStreamIdTooLarge(value)),
+                "quarter stream id {value}"
+            );
+        }
+    }
+
+    /// Which failures close the connection is the whole point of splitting the
+    /// error, so it gets pinned here rather than left to the router.
+    #[test]
+    fn only_quarter_stream_id_failures_are_connection_errors() {
+        assert!(DecodeError::MissingQuarterStreamId.is_connection_error());
+        assert!(DecodeError::QuarterStreamIdTooLarge(1 << 60).is_connection_error());
+        assert!(
+            !DecodeError::MissingContextId.is_connection_error(),
+            "a droppable datagram must not take the connection down"
+        );
+    }
+
+    /// The Quarter Stream ID of the highest client-initiated bidirectional
+    /// stream id is exactly the limit, so nothing legitimate is refused.
+    #[test]
+    fn the_largest_usable_stream_id_maps_onto_the_legal_maximum() {
+        assert_eq!(quarter_stream_id(VARINT_MAX), MAX_QUARTER_STREAM_ID);
     }
 
     #[test]

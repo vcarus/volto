@@ -71,7 +71,7 @@ pub const DEFAULT_SHUTDOWN_GRACE: u64 = 30;
 
 /// Default UDP session idle timeout, in seconds.
 ///
-/// RFC 9298 §3.5 says a proxy SHOULD NOT use a timeout below two minutes, since
+/// RFC 9298 §3.1 says a proxy SHOULD NOT use a timeout below two minutes, since
 /// UDP has no close signal and a short timeout breaks long-lived flows.
 pub const DEFAULT_UDP_SESSION_TIMEOUT: u64 = 180;
 
@@ -669,7 +669,7 @@ impl Config {
 
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
-                "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.5 \
+                "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
                  recommends; long-lived UDP flows may be cut off",
                 self.limits.udp_session_timeout
             ));

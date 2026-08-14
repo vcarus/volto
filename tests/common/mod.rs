@@ -99,7 +99,7 @@ impl TestServer {
 
     /// Starts a server whose UDP sessions time out after `seconds`.
     ///
-    /// Well below the RFC 9298 §3.5 recommendation, which the config layer warns
+    /// Well below the RFC 9298 §3.1 recommendation, which the config layer warns
     /// about; tests cannot wait out a realistic timeout.
     pub async fn start_with_udp_timeout(seconds: u64) -> Self {
         Self::start_with(&format!(
@@ -704,7 +704,7 @@ pub async fn spawn_close_reporting_target() -> (SocketAddr, tokio::sync::mpsc::R
 /// A UDP address with nothing bound to it.
 ///
 /// Sending here draws an ICMP port-unreachable, which a connected socket reports
-/// as `ECONNREFUSED` — the OS-level "socket is unusable" that RFC 9298 §3.5
+/// as `ECONNREFUSED` — the OS-level "socket is unusable" that RFC 9298 §3.1
 /// requires the request stream to be closed for.
 pub async fn closed_udp_address() -> SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
