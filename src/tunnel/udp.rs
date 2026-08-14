@@ -368,6 +368,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
             0 => None,
             budget => Some(budget),
         },
+        oversize_reported: false,
         ctx,
     };
 
@@ -394,6 +395,13 @@ struct Session {
     /// which lifts the cap for good because the target has consented to the
     /// conversation, or the operator disabled the mitigation.
     unanswered_budget: Option<u32>,
+    /// Whether this session has already reported an oversized drop.
+    ///
+    /// The drops themselves are per packet and can arrive at line rate, so only
+    /// the first is worth an operator's attention; see [`oversize_verdict`]. A
+    /// plain `bool` because the session loop is the only thing that touches it,
+    /// one step at a time.
+    oversize_reported: bool,
     ctx: Context,
 }
 
@@ -536,12 +544,25 @@ impl Session {
             // doing so silently converts a lossy flow into a head-of-line
             // blocked one.
             let limit = self.ctx.datagrams.max_datagram_size().unwrap_or(0);
-            if encoded_len > limit {
-                debug!(
-                    quarter_stream_id = self.quarter_stream_id,
-                    encoded_len, limit, "target packet too large for a QUIC datagram, dropping"
-                );
-                return Step::Continue;
+            match oversize_verdict(encoded_len, limit, &mut self.oversize_reported) {
+                Oversize::Fits => {}
+                Oversize::DropAndReport => {
+                    info!(
+                        quarter_stream_id = self.quarter_stream_id,
+                        encoded_len,
+                        limit,
+                        "target packet too large for a QUIC datagram, dropping; further \
+                         drops on this session are logged at debug level"
+                    );
+                    return Step::Continue;
+                }
+                Oversize::DropQuietly => {
+                    debug!(
+                        quarter_stream_id = self.quarter_stream_id,
+                        encoded_len, limit, "target packet too large for a QUIC datagram, dropping"
+                    );
+                    return Step::Continue;
+                }
             }
 
             let encoded = datagram::encode_udp_payload(self.quarter_stream_id, packet);
@@ -650,6 +671,46 @@ impl Session {
                 Step::Stop
             }
         }
+    }
+}
+
+/// What to do with a packet the target sent, on the QUIC datagram path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Oversize {
+    /// Within the negotiated datagram size; send it unchanged.
+    Fits,
+    /// Too large, and the first such drop on this session: worth an `info!`.
+    DropAndReport,
+    /// Too large, and not the first: `debug!` only.
+    DropQuietly,
+}
+
+/// Decides whether an outbound packet fits, and whether a drop is worth reporting.
+///
+/// The drop itself is not negotiable — RFC 9298 §6.1 rules out falling back to a
+/// capsule, so an oversized packet is lost the way a UDP packet on a too-small
+/// link would be. What is negotiable is how loudly it is said. At `debug!` it was
+/// invisible in production, and the condition is not hypothetical: Surge
+/// advertises `max_datagram_frame_size = 1300`, which a large EDNS0 or DNSSEC
+/// answer and any QUIC-in-QUIC flow through the tunnel clear routinely. So the
+/// first drop of a session is raised to `info!` — one line naming the length and
+/// the limit, enough for an operator to recognise what is happening — and the
+/// rest stay at `debug!`, because these arrive per packet and a flood of one
+/// benign message is what buries the warnings that matter.
+///
+/// `reported` is the session's flag and is flipped here, which is the whole state
+/// this costs: no allocation, no lock, one branch on the forwarding path. A
+/// packet that fits leaves it untouched, so the first *real* drop is always the
+/// one that gets reported.
+fn oversize_verdict(encoded_len: usize, limit: usize, reported: &mut bool) -> Oversize {
+    if encoded_len <= limit {
+        return Oversize::Fits;
+    }
+
+    if std::mem::replace(reported, true) {
+        Oversize::DropQuietly
+    } else {
+        Oversize::DropAndReport
     }
 }
 
@@ -1034,6 +1095,78 @@ mod tests {
         assert!(!is_per_packet_send_error(&std::io::Error::other(
             "synthetic"
         )));
+    }
+
+    /// What Surge advertises as `max_datagram_frame_size`, and therefore the
+    /// limit the oversize path actually meets in production.
+    const SURGE_MAX_DATAGRAM_FRAME_SIZE: usize = 1300;
+
+    /// One `info!` per session, then silence.
+    ///
+    /// RFC 9298 §6.1 fixes the behaviour — the packet is dropped, never downgraded
+    /// to a capsule — so only its visibility is in question here. At `debug!`
+    /// alone the condition could not be seen at all in production, and a line per
+    /// dropped packet would be the flood D44 removed elsewhere.
+    ///
+    /// A pure function for the same reason as the errno rule above: a live session
+    /// needs a real QUIC connection, while the decision being asserted lives
+    /// entirely in the arithmetic and the flag.
+    #[test]
+    fn only_the_first_oversize_drop_of_a_session_is_reported() {
+        // A 4 KiB answer — an EDNS0/DNSSEC response is routinely this size.
+        let oversize = datagram::encoded_len(9, datagram::CONTEXT_ID_UDP_PAYLOAD, 4096);
+        assert!(oversize > SURGE_MAX_DATAGRAM_FRAME_SIZE);
+
+        let mut reported = false;
+        assert_eq!(
+            oversize_verdict(oversize, SURGE_MAX_DATAGRAM_FRAME_SIZE, &mut reported),
+            Oversize::DropAndReport,
+            "an operator must be told once that this is happening"
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                oversize_verdict(oversize, SURGE_MAX_DATAGRAM_FRAME_SIZE, &mut reported),
+                Oversize::DropQuietly,
+                "every later drop in the same session stays at debug level"
+            );
+        }
+    }
+
+    /// The other half: an ordinary packet is sent untouched and does not spend the
+    /// one report a session gets.
+    #[test]
+    fn a_packet_within_the_limit_is_sent_and_costs_no_report() {
+        let fits = datagram::encoded_len(9, datagram::CONTEXT_ID_UDP_PAYLOAD, 512);
+        assert!(fits <= SURGE_MAX_DATAGRAM_FRAME_SIZE);
+
+        let mut reported = false;
+        for _ in 0..3 {
+            assert_eq!(
+                oversize_verdict(fits, SURGE_MAX_DATAGRAM_FRAME_SIZE, &mut reported),
+                Oversize::Fits
+            );
+        }
+        assert!(!reported, "a packet that fits is not a drop");
+
+        // Exactly the limit still fits; one byte past it does not, and that is the
+        // drop the session reports.
+        assert_eq!(
+            oversize_verdict(
+                SURGE_MAX_DATAGRAM_FRAME_SIZE,
+                SURGE_MAX_DATAGRAM_FRAME_SIZE,
+                &mut reported
+            ),
+            Oversize::Fits
+        );
+        assert_eq!(
+            oversize_verdict(
+                SURGE_MAX_DATAGRAM_FRAME_SIZE + 1,
+                SURGE_MAX_DATAGRAM_FRAME_SIZE,
+                &mut reported
+            ),
+            Oversize::DropAndReport
+        );
     }
 
     /// RFC 9298 §5 lets a client send UDP payloads before the response arrives,

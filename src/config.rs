@@ -95,6 +95,11 @@ pub const DEFAULT_MAX_STREAMS_BIDI: u32 = 1024;
 ///
 /// Deliberately longer than a typical relay's 30s UDP conntrack entry, so that the
 /// keep-alive below — not the timeout — decides connection liveness.
+///
+/// Not the value in force on its own: RFC 9000 §10.1 makes the effective idle
+/// timeout the minimum of what the two endpoints advertise, and Surge advertises
+/// `max_idle_timeout` = 30,000 ms. So the production link times out at 30s
+/// however high this is set, which is still comfortably above the keep-alive.
 pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 60;
 
 /// Default keep-alive interval, in seconds.
@@ -103,6 +108,14 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT: u64 = 60;
 /// refreshed even when the tunnel is idle. Must stay below half the idle timeout,
 /// which [`Config::validate`] enforces: at exactly half, a single lost keep-alive
 /// packet is enough to let the connection time out.
+///
+/// That rule is checked against the configured `max_idle_timeout` rather than the
+/// effective one. Against the 30s Surge advertises (see
+/// [`DEFAULT_MAX_IDLE_TIMEOUT`]) 20s is past half, leaving one interval of margin
+/// instead of two. Left as it is deliberately: the keep-alive is an ack-eliciting
+/// server-to-client PING, so a lost one is retransmitted by the PTO timer well
+/// inside 30s, whereas halving the interval would double the radio wakeups it
+/// costs a mobile client.
 pub const DEFAULT_KEEP_ALIVE_INTERVAL: u64 = 20;
 
 /// Default initial QUIC packet size, in bytes.
@@ -261,6 +274,10 @@ pub struct Limits {
     #[serde(default = "default_max_streams_bidi")]
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
+    ///
+    /// Only half of what decides that: RFC 9000 §10.1 takes the minimum of both
+    /// endpoints' advertisements, so a client advertising less wins. See
+    /// [`DEFAULT_MAX_IDLE_TIMEOUT`].
     #[serde(default = "default_max_idle_timeout")]
     pub max_idle_timeout: u64,
     /// Seconds between keep-alive packets. Zero disables them.
