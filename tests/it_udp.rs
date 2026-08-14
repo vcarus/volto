@@ -665,3 +665,103 @@ async fn an_unreachable_target_closes_the_session() {
         Err(_) => panic!("the request stream was left open after ECONNREFUSED"),
     }
 }
+
+/// RFC 9297 §3.2: the body of a CONNECT-UDP request stream is a capsule
+/// sequence, so a field that frames HTTP content describes something that cannot
+/// be there — "a receiver that observes a violation of these requirements MUST
+/// treat the HTTP message as malformed".
+///
+/// The target is a working echo server and the same request without the offending
+/// field is accepted at the end, so the refusals cannot be coming from anything
+/// else about the request.
+#[tokio::test]
+async fn refuses_content_framing_fields_on_the_capsule_stream() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for (name, value) in [
+        ("content-length", "0"),
+        ("content-length", "42"),
+        ("content-type", "application/octet-stream"),
+        ("transfer-encoding", "chunked"),
+    ] {
+        let mut request = connect_udp_request(server.addr, "127.0.0.1", target.port());
+        request.headers_mut().insert(
+            http::HeaderName::from_static(name),
+            http::HeaderValue::from_static(value),
+        );
+
+        let mut stream = client
+            .send
+            .send_request(request)
+            .await
+            .expect("send CONNECT-UDP");
+        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+            .await
+            .expect("response arrived")
+            .expect("response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{name}: {value} must be refused"
+        );
+    }
+
+    let mut stream = client
+        .send
+        .send_request(connect_udp_request(server.addr, "127.0.0.1", target.port()))
+        .await
+        .expect("send CONNECT-UDP");
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the same request without a framing field must be accepted"
+    );
+}
+
+/// RFC 9297 §3.4: a `Capsule-Protocol` value that is not a Boolean "MUST be
+/// handled as if the field were not present", and a false value "has the same
+/// semantics as when the header is not present". None of that is a reason to
+/// refuse a tunnel: the `connect-udp` upgrade token is what puts the capsule
+/// protocol in use, and this server is the endpoint rather than an intermediary
+/// that has to infer it.
+///
+/// This is a deliberate difference from proxies that reject `?0`, so it gets a
+/// test of its own rather than a comment.
+#[tokio::test]
+async fn any_capsule_protocol_value_still_opens_a_tunnel() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for value in ["?1", "?0", "not-a-boolean"] {
+        let mut request = connect_udp_request(server.addr, "127.0.0.1", target.port());
+        request.headers_mut().insert(
+            http::HeaderName::from_static("capsule-protocol"),
+            http::HeaderValue::from_str(value).expect("header value"),
+        );
+
+        let mut stream = client
+            .send
+            .send_request(request)
+            .await
+            .expect("send CONNECT-UDP");
+        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+            .await
+            .expect("response arrived")
+            .expect("response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "capsule-protocol: {value} must not change the outcome"
+        );
+    }
+}

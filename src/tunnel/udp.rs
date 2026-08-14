@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
+use http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use percent_encoding::percent_decode_str;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -174,6 +174,12 @@ pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegis
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Context) {
+    if let Err(reason) = validate(req) {
+        debug!(stream_id, reason, "malformed connect-udp request");
+        tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+        return;
+    }
+
     let (host, port) = match parse_target(req.uri().path(), req.uri().query()) {
         Ok(target) => target,
         Err(reason) => {
@@ -566,6 +572,59 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> std::io::Result<UdpSock
     }))
 }
 
+/// Checks a CONNECT-UDP request against the rules that are about the message
+/// rather than the target.
+///
+/// Two of them, both stated as requirements on the receiver:
+///
+/// * RFC 9298 §3.4 — "The :path and :scheme pseudo-header fields SHALL NOT be
+///   empty", and "a UDP proxying request that does not conform to these
+///   restrictions is malformed". RFC 9220 says the same in the other direction:
+///   an extended CONNECT request must carry both. `:path` needs no check here
+///   because [`parse_target`] already refuses anything that is not the template.
+/// * RFC 9297 §3.2 — "The Capsule Protocol MUST NOT be used with messages that
+///   contain Content-Length, Content-Type, or Transfer-Encoding header fields
+///   [...] A receiver that observes a violation of these requirements MUST treat
+///   the HTTP message as malformed." The body of this request stream is a
+///   capsule sequence, so all three describe a framing that cannot exist here.
+///
+/// Two rules deliberately *not* enforced, both of which some proxies do enforce:
+///
+/// * the `:scheme` value is not required to be `https`. RFC 9298 derives it from
+///   whatever URI template the client was configured with rather than fixing it,
+///   and this server only ever listens under TLS, so the value decides nothing.
+///   Rejecting `http` would be stricter than the specification for no gain.
+/// * `Capsule-Protocol: ?0`, or a value that is not a Boolean, is not rejected.
+///   RFC 9297 §3.4 says a non-Boolean value "MUST be handled as if the field
+///   were not present" and that a false value "has the same semantics as when
+///   the header is not present" — so the conformant reaction to both is to
+///   ignore the field, which is what this server does by never reading it. The
+///   field tells an *intermediary* that capsules are in flight; an endpoint that
+///   knows the `connect-udp` upgrade token knows it already (RFC 9297 §3).
+///
+/// A violation is answered with 400 and a clean stream close rather than a
+/// RESET_STREAM. RFC 9114 §4.1.2 allows a server to send a response before
+/// closing the stream, and resetting instead would discard the buffered
+/// response, leaving the client to guess why its tunnel was refused.
+fn validate(req: &Request<()>) -> Result<(), &'static str> {
+    if req.uri().scheme_str().is_none_or(str::is_empty) {
+        return Err("connect-udp requires a non-empty :scheme");
+    }
+
+    // Named one at a time so the log says which field was the problem.
+    if req.headers().contains_key(header::CONTENT_LENGTH) {
+        return Err("content-length is forbidden on a capsule stream");
+    }
+    if req.headers().contains_key(header::CONTENT_TYPE) {
+        return Err("content-type is forbidden on a capsule stream");
+    }
+    if req.headers().contains_key(header::TRANSFER_ENCODING) {
+        return Err("transfer-encoding is forbidden on a capsule stream");
+    }
+
+    Ok(())
+}
+
 /// Parses the RFC 9298 §2 default URI template.
 ///
 /// ```text
@@ -709,6 +768,85 @@ mod tests {
             parse("/.well-known/masque/udp/a%2Fb/53"),
             Ok(("a/b".to_owned(), 53))
         );
+    }
+
+    /// Builds a well-formed CONNECT-UDP request, which the caller then spoils.
+    fn connect_udp_request() -> Request<()> {
+        Request::builder()
+            .method(http::Method::CONNECT)
+            .uri("https://proxy.example/.well-known/masque/udp/192.0.2.1/53/")
+            .body(())
+            .expect("request")
+    }
+
+    #[test]
+    fn accepts_a_well_formed_request() {
+        assert_eq!(validate(&connect_udp_request()), Ok(()));
+    }
+
+    /// RFC 9298 §3.4: `:scheme` must be there and must not be empty. Only a
+    /// hand-rolled client can get this wrong — `h3` fills the field in — which
+    /// is exactly why the server cannot assume it.
+    #[test]
+    fn rejects_a_request_without_a_scheme() {
+        let mut request = connect_udp_request();
+        *request.uri_mut() = "/.well-known/masque/udp/192.0.2.1/53/"
+            .parse()
+            .expect("origin-form uri");
+
+        assert!(validate(&request).is_err());
+    }
+
+    /// RFC 9298 §3.4 does not fix the scheme to `https`, so neither does this.
+    #[test]
+    fn accepts_any_non_empty_scheme() {
+        let mut request = connect_udp_request();
+        *request.uri_mut() = "http://proxy.example/.well-known/masque/udp/192.0.2.1/53/"
+            .parse()
+            .expect("uri");
+
+        assert_eq!(validate(&request), Ok(()));
+    }
+
+    /// RFC 9297 §3.2: none of these can describe the body of a capsule stream,
+    /// and a receiver that sees one must treat the message as malformed.
+    #[test]
+    fn rejects_content_framing_headers() {
+        for (name, value) in [
+            ("content-length", "0"),
+            ("content-length", "42"),
+            ("content-type", "application/octet-stream"),
+            ("transfer-encoding", "chunked"),
+        ] {
+            let mut request = connect_udp_request();
+            request.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+
+            assert!(
+                validate(&request).is_err(),
+                "{name}: {value} must be refused"
+            );
+        }
+    }
+
+    /// The capsule protocol is in use because the upgrade token says so, so the
+    /// header is advisory and none of its values change what happens here.
+    #[test]
+    fn the_capsule_protocol_header_is_never_a_reason_to_refuse() {
+        for value in ["?1", "?0", "1", "not-a-boolean", ""] {
+            let mut request = connect_udp_request();
+            request.headers_mut().insert(
+                HeaderName::from_static("capsule-protocol"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+
+            assert_eq!(validate(&request), Ok(()), "capsule-protocol: {value:?}");
+        }
+
+        // Absent entirely: only a SHOULD in RFC 9297 §3.4.
+        assert_eq!(validate(&connect_udp_request()), Ok(()));
     }
 
     #[test]
