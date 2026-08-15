@@ -316,6 +316,14 @@ impl ProxyError {
     /// — denied port and denied address — a 403, because they are refusals by
     /// this proxy rather than reports about an upstream hop, and a client that
     /// sees 502 would reasonably retry.
+    ///
+    /// One address refusal never arrives here at all (decision D49, a carve-out
+    /// from D11 rather than a revision of it): a target whose every resolved
+    /// address is the unspecified one is a name the upstream resolver filtered,
+    /// so it is answered with a 200 that closes on the spot — see
+    /// [`accept_then_close`] — and carries no `Proxy-Status` field, because
+    /// nothing about it is this proxy's verdict. Every refusal that is actually
+    /// sent still follows the table below.
     pub fn recommended_status(self) -> StatusCode {
         match self {
             Self::DnsError | Self::ConnectionRefused => StatusCode::BAD_GATEWAY,
@@ -398,6 +406,43 @@ pub(crate) async fn refuse_with(
     }
     if let Err(error) = stream.finish().await {
         debug!(stream_id, %error, "failed to finish error response");
+    }
+}
+
+/// Accepts a request with a 200 and closes the tunnel again immediately.
+///
+/// **Not a refusal, and deliberately not named like one.** The response carries
+/// no `Proxy-Status` field and says nothing about a failure; `headers` is
+/// whatever an accepted response of that tunnel type has to carry — nothing for
+/// a TCP tunnel, the RFC 9297 `Capsule-Protocol` field for CONNECT-UDP.
+///
+/// Exactly one case uses it (decision D49): a target whose every resolved
+/// address is the unspecified one, which is how a filtering resolver upstream
+/// says "this name is blocked". That block is not this proxy's verdict, and an
+/// error status makes the client attribute it here; a tunnel that opens and
+/// closes at once is instead what every transport without an in-band refusal
+/// channel shows for such a name, and what a target that accepts a connection
+/// and hangs up immediately looks like on the wire.
+///
+/// Mechanically the close is the tidy one, and it is the same one an
+/// established session ends with: STOP_SENDING with H3_NO_ERROR for anything
+/// the client is still sending, then a FIN on the response stream. **Never a
+/// reset** — RFC 9114 §4.4 reserves an abruptly terminated stream for a failure
+/// of the target connection (H3_CONNECT_ERROR), which this is not, and a reset
+/// would also be the one signal a client is entitled to read as "the proxy
+/// broke". A clean FIN is what RFC 9297 §3.3 treats as the normal end of a
+/// capsule stream, and on the CONNECT-UDP path it also settles RFC 9298 §3.1's
+/// pairing of socket and request stream in the only way available here: there
+/// is no socket, so no request stream is left open waiting for one.
+pub(crate) async fn accept_then_close(stream: &mut Stream, headers: HeaderMap, stream_id: u64) {
+    stream.stop_receiving(h3api::NO_ERROR);
+
+    if let Err(error) = stream.respond_with(StatusCode::OK, headers).await {
+        debug!(stream_id, %error, "failed to send 200 for a tunnel closed on the spot");
+        return;
+    }
+    if let Err(error) = stream.finish().await {
+        debug!(stream_id, %error, "failed to close a tunnel after its 200");
     }
 }
 

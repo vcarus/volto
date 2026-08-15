@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use http::StatusCode;
+use http::{HeaderMap, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
@@ -88,11 +88,20 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // public ones, so DNS rebinding onto loopback gains nothing.
     let allowed = ctx.policy.allowed_addresses(&addresses);
     if allowed.is_empty() {
-        // Same refusal either way; only the volume differs. A name that resolves
-        // to nothing but the unspecified address was blocked by a filtering
-        // resolver upstream, which is neither this proxy's business nor worth a
-        // warning. Every other refusal — loopback, RFC 1918, a mix — stays loud
-        // because that is what an SSRF probe looks like from here.
+        // Two different things end up here, and they get different answers
+        // (decision D49). A name that resolves to nothing but the unspecified
+        // address was blocked by a filtering resolver upstream: that is not this
+        // proxy's verdict, so it must not look like one. Answering 403 makes the
+        // client attribute an ad blocker's decision to the proxy — and this is
+        // the only protocol in the client's stable with an in-band channel to
+        // say anything at all, so it is the only one that gets blamed. The
+        // tunnel is therefore accepted and closed on the spot, which is what a
+        // target that accepts and hangs up immediately looks like on the wire,
+        // and what every other transport shows for a blackholed name.
+        //
+        // Every other refusal — loopback, RFC 1918, a mix — keeps its loud 403
+        // with the RFC 9209 reason, because that is what an SSRF probe looks
+        // like from here and the client really is being refused by this proxy.
         if policy::is_dns_blackhole(&addresses) {
             info!(
                 stream_id,
@@ -100,14 +109,16 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
                 ?addresses,
                 "every address of the target is a DNS blackhole"
             );
-        } else {
-            warn!(
-                stream_id,
-                authority,
-                ?addresses,
-                "every address of the target is prohibited by policy"
-            );
+            tunnel::accept_then_close(&mut stream, HeaderMap::new(), stream_id).await;
+            return;
         }
+
+        warn!(
+            stream_id,
+            authority,
+            ?addresses,
+            "every address of the target is prohibited by policy"
+        );
         tunnel::refuse_because(
             &mut stream,
             StatusCode::FORBIDDEN,

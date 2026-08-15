@@ -291,9 +291,19 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
 
     let allowed = ctx.policy.allowed_addresses(&addresses);
     if allowed.is_empty() {
-        // As on the TCP path: a resolver that answers only the unspecified
-        // address has filtered the name, which is routine. Anything else — a
-        // private address among the answers above all — stays a warning.
+        // The same split as the TCP path, for the same reason (decision D49). A
+        // resolver that answers only the unspecified address has filtered the
+        // name; that block belongs to the resolver, not to this proxy, so the
+        // session is accepted and closed at once rather than refused. The 200
+        // still carries the RFC 9297 `Capsule-Protocol` field, because it is a
+        // real successful response to a CONNECT-UDP request and the field is
+        // what makes it one. Anything else — a private address among the
+        // answers above all — stays a warning and a 403.
+        //
+        // Returning here drops `_guard`, which unregisters the Quarter Stream ID
+        // and discards whatever the client sent optimistically; the router then
+        // drops later datagrams for that id silently, exactly as it does for a
+        // session that has just closed.
         if policy::is_dns_blackhole(&addresses) {
             info!(
                 stream_id,
@@ -302,15 +312,17 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
                 ?addresses,
                 "every address of the target is a DNS blackhole"
             );
-        } else {
-            warn!(
-                stream_id,
-                host,
-                port,
-                ?addresses,
-                "every address of the target is prohibited by policy"
-            );
+            tunnel::accept_then_close(&mut stream, capsule_headers(), stream_id).await;
+            return;
         }
+
+        warn!(
+            stream_id,
+            host,
+            port,
+            ?addresses,
+            "every address of the target is prohibited by policy"
+        );
         tunnel::refuse_because(
             &mut stream,
             StatusCode::FORBIDDEN,

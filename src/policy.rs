@@ -93,8 +93,16 @@ impl Policy {
 /// NXDOMAIN. Those answers are refused by [`Policy::allows_address`] like any
 /// other unroutable target, but the refusal is routine housekeeping rather than
 /// evidence of anything — on a host whose resolver filters, it is the bulk of all
-/// refusals. Callers use this to log such a refusal quietly. It changes no
-/// decision: the response is identical either way.
+/// refusals.
+///
+/// Callers use this to decide two things (decision D49). It picks the log level:
+/// a blackhole is an INFO, every other refusal a WARN. And it picks the answer:
+/// a blackholed name gets a 200 whose stream closes immediately, so the client
+/// sees a tunnel that opened and died — the same thing a transport without an
+/// in-band refusal channel shows it — while every other refusal keeps its 403
+/// and its RFC 9209 `destination_ip_prohibited` reason. The split exists because
+/// the blackhole decision was made by the resolver upstream, not by this proxy,
+/// and a refusal from this proxy would misattribute it.
 ///
 /// The test is deliberately all-or-nothing, and deliberately narrow to the
 /// unspecified address:

@@ -306,6 +306,67 @@ async fn connect_udp_to_a_prohibited_address_is_refused() {
     }
 }
 
+/// A name whose every address is the unspecified one was blackholed by the
+/// resolver upstream, not refused by this proxy, so it is not answered like a
+/// refusal (decision D49): the tunnel is accepted and closed at once, which is
+/// what a target that accepts and immediately hangs up looks like on the wire.
+///
+/// The address is in the never-allowed bucket, so `allow_private_networks` makes
+/// no difference to it — it is on here to show that.
+#[tokio::test]
+async fn a_blackholed_tcp_target_is_accepted_then_closed() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        proxy_status(&response).is_none(),
+        "an accepted request carries no refusal reason"
+    );
+
+    // Reading must reach end of stream rather than fail: the server finished its
+    // sending side, and never reset the stream.
+    let payload = common::read_to_end(&mut stream).await;
+    assert!(
+        payload.is_empty(),
+        "nothing may be sent through a tunnel with no target"
+    );
+}
+
+/// The same on the UDP path, where the 200 also has to keep the RFC 9297
+/// `Capsule-Protocol` field that makes it a well-formed CONNECT-UDP response.
+#[tokio::test]
+async fn a_blackholed_udp_target_is_accepted_then_closed() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (response, mut stream) = open_tunnel(
+        &mut client,
+        connect_udp_request(server.addr, "0.0.0.0", 443),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("capsule-protocol")
+            .and_then(|value| value.to_str().ok()),
+        Some("?1"),
+        "a 2xx to connect-udp must still carry the capsule protocol field"
+    );
+    assert!(
+        proxy_status(&response).is_none(),
+        "an accepted request carries no refusal reason"
+    );
+
+    let capsules = common::read_to_end(&mut stream).await;
+    assert!(
+        capsules.is_empty(),
+        "no capsule may precede the close of a session with no socket"
+    );
+}
+
 /// Private space can be opened up deliberately — the deployments where reaching a
 /// private network is the whole point.
 #[tokio::test]

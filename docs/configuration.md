@@ -96,8 +96,10 @@ timer fire early and retransmit packets that were never lost.
 
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
   `::127.0.0.1` gets past `allow_private_networks = false`.
-- Multicast, broadcast and the unspecified address are refused **regardless** of
-  that setting. They are amplification primitives, not destinations.
+- Multicast, broadcast and the unspecified address are never dialled,
+  **regardless** of that setting. They are amplification primitives, not
+  destinations. What the client is *told* about the unspecified address is a
+  separate question — see the note on blackholed names under [`[log]`](#log).
 - **UDP/53 must stay reachable.** Surge's UDP availability test is a DNS query
   through the tunnel, so denying port 53 makes Surge report the policy as broken.
   volto warns if 53 appears in `denied_ports`.
@@ -134,11 +136,17 @@ everything. The prefix appears only when systemd sets `JOURNAL_STREAM`, so
 running volto in a terminal prints the same lines it always did, and the shipped
 unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true).
 
-One refusal is deliberately quieter than its neighbours. A target whose every
-resolved address is `0.0.0.0` or `::` is a name a filtering resolver has
-blackholed, so it is logged at INFO; the response is the same 403 either way. A
-target that resolves to loopback, private or mixed addresses stays a WARN,
-because that is what a probe for internal services looks like from here.
+One refusal is deliberately quieter than its neighbours, in the log and on the
+wire. A target whose every resolved address is `0.0.0.0` or `::` is a name a
+filtering resolver has blackholed: that decision belongs to the resolver, not to
+volto, so it is logged at INFO and answered with a 200 whose stream is closed
+immediately — the client sees a tunnel that opened and died, which is what a
+blocked name looks like through a transport that has no way to explain itself.
+Answering 403 instead would invite the client to blame the proxy for an ad
+blocker's decision. A target that resolves to loopback, private or mixed
+addresses is a refusal volto really did make: it stays a WARN and a 403 with
+`Proxy-Status: …; error=destination_ip_prohibited`, because that is what a probe
+for internal services looks like from here.
 
 ## A minimal file
 
