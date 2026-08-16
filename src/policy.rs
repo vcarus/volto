@@ -35,7 +35,7 @@
 //! routes them reaches exactly that address. `64:ff9b::7f00:1` is therefore
 //! 127.0.0.1 with three extra steps, and letting it past because it is
 //! syntactically a global IPv6 address would undo the whole IPv4 half of this
-//! module. [`embedded_ipv4`] unwraps them before any rule is applied.
+//! module. `embedded_ipv4` unwraps them before any rule is applied.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -145,7 +145,7 @@ pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
 ///
 /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) becomes the IPv4 address it stands for.
 /// The deprecated IPv4-compatible range (`::a.b.c.d`, RFC 4291 §2.5.5.1) is left
-/// as IPv6 on purpose and handled by [`is_private`], because mapping it to IPv4
+/// as IPv6 on purpose and handled by `is_private`, because mapping it to IPv4
 /// would turn `::1` into `0.0.0.1` and quietly lose the loopback meaning.
 pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {

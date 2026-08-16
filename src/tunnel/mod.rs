@@ -345,7 +345,7 @@ impl ProxyError {
 
     /// This error as a response header map, naming the hop it happened on.
     ///
-    /// The address is dropped unless [`Self::discloses_next_hop`] allows it, so a
+    /// The address is dropped unless `Self::discloses_next_hop` allows it, so a
     /// caller cannot leak one by passing it to the wrong error type.
     pub fn headers_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> HeaderMap {
         let Some(address) = next_hop.filter(|_| self.discloses_next_hop()) else {
@@ -400,7 +400,7 @@ impl ProxyError {
     /// from D11 rather than a revision of it): a target whose every resolved
     /// address is the unspecified one is a name the upstream resolver filtered,
     /// so it is answered with a 200 that closes on the spot — see
-    /// [`accept_then_close`] — and carries no `Proxy-Status` field, because
+    /// `accept_then_close` — and carries no `Proxy-Status` field, because
     /// nothing about it is this proxy's verdict. Every refusal that is actually
     /// sent still follows the table below.
     pub fn recommended_status(self) -> StatusCode {

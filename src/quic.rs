@@ -516,7 +516,7 @@ impl ReloadHandle {
     ///
     /// Returns the newly applied configuration, or an error describing why the old
     /// one is still in force. Existing connections are deliberately unaffected —
-    /// they keep the configuration they were accepted with (see [`Server::serve`]).
+    /// they keep the configuration they were accepted with (see `Server::serve`).
     pub fn reload(&self, path: &Path) -> Result<Arc<Config>> {
         // Parses, validates, and checks that the certificate files are readable.
         let config = Arc::new(Config::load(path)?);

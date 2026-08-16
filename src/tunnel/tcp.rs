@@ -17,7 +17,7 @@
 //! sticky teardown signal for the abnormal cases where one direction failing
 //! must stop the other.
 //!
-//! Only the last row aborts the TCP connection; see [`abort_target`] for why the
+//! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
 
 use std::io;

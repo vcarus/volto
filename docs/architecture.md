@@ -144,10 +144,18 @@ Treating the stream bytes as opaque is a worse trap than the Quarter Stream ID:
 the decoder desynchronizes on the first capsule that arrives.
 
 RFC 9297 §2.1.1 also forbids sending QUIC datagrams before the peer has
-advertised `SETTINGS_H3_DATAGRAM`. volto tracks this per connection and refreshes
-it on every request rather than snapshotting it at handshake time, because the
-peer's SETTINGS frame usually arrives after the handshake completes — a snapshot
-would silently drop the first session's packets.
+advertised `SETTINGS_H3_DATAGRAM`. volto tracks this per connection rather than
+snapshotting it at handshake time, because the peer's SETTINGS frame usually
+arrives after the handshake completes — a snapshot would silently drop the first
+session's packets. The flag is re-read on every request and, until it is set,
+every 100 ms for the first ten seconds of the connection as well: a request can
+be accepted before the control stream carrying the SETTINGS has been read, and
+without the timer a connection whose only session was opened that early would
+stay on the capsule fallback for its whole life. Sessions already open switch to
+QUIC datagrams the moment the flag is seen. After ten seconds the timer retires —
+SETTINGS are the first frame on the control stream (RFC 9114 §6.2.1) and a
+setting cannot be revoked (§7.2.4), so a peer that has not enabled datagrams by
+then never will.
 
 ## Why h3 is pinned
 
