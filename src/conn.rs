@@ -45,7 +45,7 @@ pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
     mut shutdown: Shutdown,
-) -> anyhow::Result<()> {
+) -> Result<(), h3api::ConnectionError> {
     // Cloned before the handshake: `h3` takes ownership of the connection, but
     // HTTP Datagrams bypass `h3` entirely and need the QUIC connection directly.
     let datagrams = quic.clone();
@@ -101,7 +101,7 @@ pub async fn handle(
                 }
                 // The peer will send no further requests.
                 Ok(None) => break Ok(()),
-                Err(error) => break Err(error.into()),
+                Err(error) => break Err(error),
             },
         }
     };

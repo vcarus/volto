@@ -113,6 +113,49 @@ pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
     }
 }
 
+/// How a connection ended, when it ended with an error not worth a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenignClose {
+    /// The peer went silent and the idle timeout expired.
+    Idle,
+    /// The peer closed the connection cleanly, without an error code.
+    PeerClosed,
+}
+
+/// Classifies a connection-level error that is an ordinary goodbye rather than a
+/// failure, or `None` if it deserves a warning.
+///
+/// The judgement is made on the error *value* on purpose. The obvious
+/// alternative — asking `quinn::Connection::close_reason()` afterwards — cannot
+/// work: dropping the `h3` connection closes the QUIC connection with
+/// H3_NO_ERROR, and quinn's close path unconditionally overwrites whatever
+/// reason was stored with `LocallyClosed`. By the time a caller could ask, the
+/// real reason is gone. An error value, by contrast, is immutable and independent
+/// of drop order.
+pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
+    use h3::quic::ConnectionErrorIncoming;
+
+    match error {
+        // `h3-quinn` maps `quinn::ConnectionError::TimedOut` onto this variant
+        // one-to-one, so it means exactly "the idle timeout expired". Clients
+        // that abandon a connection without a CONNECTION_CLOSE — Surge does this
+        // on a network switch or app exit — all end up here.
+        ConnectionError::Timeout { .. } => Some(BenignClose::Idle),
+
+        // 0x0 is the application error code Surge actually sends when it closes
+        // a connection cleanly; H3_NO_ERROR (0x100) is what RFC 9114 §8.1
+        // defines for the same intent. Both mean the peer simply left. Any other
+        // code is the peer reporting a problem and stays a warning.
+        ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code }, ..)
+            if *error_code == 0 || *error_code == NO_ERROR.value() =>
+        {
+            Some(BenignClose::PeerClosed)
+        }
+
+        _ => None,
+    }
+}
+
 /// An accepted HTTP/3 connection.
 pub struct Connection {
     inner: h3::server::Connection<QuicConnection, Buffer>,

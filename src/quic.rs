@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{Config, CongestionControl};
 use crate::shutdown::{self, Shutdown, Trigger};
-use crate::{conn, tls};
+use crate::{conn, h3api, tls};
 
 /// What the handshake revealed about a peer, for logging.
 #[derive(Debug, Clone)]
@@ -379,32 +379,47 @@ impl Server {
             // NAT rebind during the connection's life.
             let rtt_probe = quic.clone();
 
-            match conn::handle(quic, config, shutdown).await {
-                // An expired idle timeout is not worth a warning: Surge never
-                // sends CONNECTION_CLOSE when it abandons a connection (network
-                // switch, app exit), so letting it idle out is the everyday
-                // goodbye, not a failure.
-                Err(error)
-                    if !matches!(
-                        rtt_probe.close_reason(),
-                        Some(quinn::ConnectionError::TimedOut)
-                    ) =>
-                {
+            // Which of the two log levels this connection deserves is decided
+            // from the error value `conn::handle` returned, and never from
+            // `rtt_probe.close_reason()`. Returning from `conn::handle` drops
+            // the `h3` connection, whose `Drop` closes the QUIC connection with
+            // H3_NO_ERROR; quinn's close path then unconditionally overwrites
+            // the stored reason with `LocallyClosed`. So by the time control is
+            // back here, `close_reason()` reports that drop rather than whatever
+            // actually ended the connection — which is precisely how the idle
+            // timeout ended up logged as an error for a whole release cycle.
+            let closed = match conn::handle(quic, config, shutdown).await {
+                // The accept loop ended on its own terms: the peer said it would
+                // send no further requests, or the GOAWAY drain completed.
+                Ok(()) => Ok("drained"),
+                Err(error) => match h3api::benign_close(&error) {
+                    // Surge abandons connections without a CONNECTION_CLOSE
+                    // (network switch, app exit), so letting one idle out is the
+                    // everyday goodbye, not a failure.
+                    Some(h3api::BenignClose::Idle) => Ok("idle"),
+                    // A peer that closed cleanly is equally routine.
+                    Some(h3api::BenignClose::PeerClosed) => Ok("peer_close"),
+                    None => Err(error),
+                },
+            };
+
+            match closed {
+                Ok(reason) => {
+                    info!(
+                        remote = %peer.remote,
+                        remote_now = %rtt_probe.remote_address(),
+                        reason,
+                        rtt_ms = rtt_probe.rtt().as_millis(),
+                        "connection closed"
+                    );
+                }
+                Err(error) => {
                     warn!(
                         remote = %peer.remote,
                         remote_now = %rtt_probe.remote_address(),
                         %error,
                         rtt_ms = rtt_probe.rtt().as_millis(),
                         "connection closed with error"
-                    );
-                }
-                result => {
-                    info!(
-                        remote = %peer.remote,
-                        remote_now = %rtt_probe.remote_address(),
-                        idle = result.is_err(),
-                        rtt_ms = rtt_probe.rtt().as_millis(),
-                        "connection closed"
                     );
                 }
             }
