@@ -37,6 +37,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --locked -- -D warnings
 
+  audit:
+    # RustSec advisories against the committed `Cargo.lock`. Dependabot already
+    # proposes version bumps, but a Dependabot PR is only a suggestion: nothing
+    # goes red while it sits unmerged, so a published vulnerability in a
+    # transitive dependency would keep shipping until somebody happened to look.
+    # This turns it into a failing build instead.
+    #
+    # A job of its own, and a cheap one: cargo-audit reads the lockfile and never
+    # builds the crate, so it needs no toolchain, shares no cache with the test
+    # matrix, and cannot slow it down.
+    #
+    # The blind spot is worth naming. cargo-audit skips every lockfile entry whose
+    # source is not the default registry -- it does not fall back to the version a
+    # git dependency declares -- so the `h3` / `h3-quinn` git-rev pins are invisible
+    # to this job. They stay covered by the manual review a rev bump already
+    # requires (see .github/dependabot.yml).
+    name: audit (RustSec)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # All the action writes: one check run carrying the report. It only opens
+      # issues on a `schedule` trigger, which this workflow does not have.
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+      # Fails the check on a vulnerability. Informational advisories -- an
+      # unmaintained or yanked crate -- are reported without failing, which is the
+      # behaviour we want: `rustls-pemfile` is already unmaintained
+      # (RUSTSEC-2025-0134) with no drop-in replacement, and an advisory nobody can
+      # act on should not block every merge. Should a real vulnerability ever have
+      # to be accepted, add its RUSTSEC id to `ignore:` with the reason rather than
+      # deleting this job.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     # macOS is the development host and Linux the deployment target; both have to
     # stay green, so the suite runs on both rather than on one of them.
