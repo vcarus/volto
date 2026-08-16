@@ -17,3 +17,6 @@ CLAUDE.md
 # Scratch files the interop job writes into the workspace (certificate, key,
 # config, server log), in case the same steps are run by hand.
 /interop-*
+
+# Claude Code local settings and subagent worktrees
+/.claude/

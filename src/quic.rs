@@ -784,12 +784,13 @@ mod tests {
     /// The default really is BBR, all the way to the built controller.
     ///
     /// The one assertion in this module with a production incident behind it. quinn
-    /// defaults to CUBIC, so every way of losing this mapping — a mis-edited match
-    /// arm, a refactor that drops the `congestion_controller_factory` call, a
+    /// defaults to CUBIC, so losing this mapping — a mis-edited match arm, a
     /// default that stops being BBR — lands on a loss-based controller, and a
     /// loss-based controller collapses the download direction of the production
     /// path to near-zero while leaving upload, CPU and every log line looking
-    /// normal. Nothing else in the suite can tell the two apart.
+    /// normal. Nothing else in the suite can tell the two apart. (What this cannot
+    /// see is `transport_config` ceasing to call `congestion_factory` at all; that
+    /// call is one line away and reviewed with it.)
     #[test]
     fn the_default_congestion_controller_is_bbr() {
         let limits = crate::config::Limits::default();
