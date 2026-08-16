@@ -69,7 +69,10 @@ attacker is needed for that. A reload carries a new value to connections
 accepted from then on, and each request those connections make gets the budget
 afresh; connections already open keep the value they were accepted with, like
 the rest of the per-connection policy. Set it to `0` only to hand the wait back
-to the operating system.
+to the operating system — and know what that hands back: a client that resets a
+request stream while its target is still being dialled does not cancel the dial,
+so with the budget off the slot stays spent until the kernel gives up. volto
+warns at startup when the budget is off.
 
 **The last six keys are QUIC transport parameters and apply to new connections
 only.** A reload carries them to connections accepted from then on; connections

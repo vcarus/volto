@@ -80,7 +80,10 @@ users = [
 # with 504 and `error=connection_timeout`. Unlike the transport parameters below,
 # this is a per-request budget rather than something negotiated at handshake
 # time: a reload applies it to connections accepted after it, and every request
-# such a connection makes gets the whole budget afresh.
+# such a connection makes gets the whole budget afresh. `0` disables the budget
+# and is warned about: a black-holed target then holds its slot until the kernel
+# gives up on the connect, and a client resetting the request stream in the
+# meantime does not shorten that.
 # Default: 10
 #connect_timeout = 10
 

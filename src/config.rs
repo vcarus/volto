@@ -801,6 +801,17 @@ impl Config {
             );
         }
 
+        if self.limits.connect_timeout == 0 {
+            warnings.push(
+                "limits.connect_timeout = 0 hands the connect wait back to the operating \
+                 system: a request for a target that drops SYNs holds its tunnel slot until \
+                 the kernel gives up (about two minutes on Linux), and a client that resets \
+                 the request stream in the meantime does not shorten that, so a burst of \
+                 black-holed targets can spend a connection's whole max_targets_per_conn"
+                    .to_owned(),
+            );
+        }
+
         warnings
     }
 }
@@ -1236,6 +1247,7 @@ mod tests {
 
             [limits]
             udp_session_timeout = 30
+            connect_timeout = 0
 
             [security]
             allow_private_networks = true
@@ -1249,9 +1261,10 @@ mod tests {
 
         let warnings = cfg.warnings();
         // One per risky setting, and nothing else.
-        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        assert_eq!(warnings.len(), 6, "{warnings:?}");
         for expected in [
             "udp_session_timeout",
+            "connect_timeout = 0",
             "allow_private_networks",
             "denied_ports contains 53",
             "unanswered_packet_budget",
