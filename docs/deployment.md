@@ -162,6 +162,11 @@ host needs:
   regenerate it (the certificate and the system user survive, so the
   fingerprint does not change).
 
+`--dry-run` prints which of the three a run would pick and stops before doing
+anything about it. It needs an explicit `--tag`, since resolving "latest" is a
+network call, and it is how `tests/it_deploy.rs` exercises the decision without
+root, systemd or a download.
+
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of
 the checksum-verified release tarball, the piped copy only steers. With stdin

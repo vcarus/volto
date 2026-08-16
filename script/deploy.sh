@@ -16,6 +16,14 @@
 #
 # Rolling back by hand is the same flow pinned to an older release:
 #   sudo volto-deploy --tag v0.1.0
+#
+# --dry-run is the test seam, in the spirit of install-selfsigned.sh's
+# --print-config: it skips the preflight, prints the convergence decision it
+# would act on and stops before touching anything. Together with
+# VOLTO_DEPLOY_ROOT, which prefixes every install path, that puts the two
+# branches which have broken in production -- the convergence check and
+# refresh_self under a piped bootstrap -- inside reach of tests/it_deploy.rs,
+# with no root, no systemd and no network.
 
 set -euo pipefail
 
@@ -24,13 +32,20 @@ set -euo pipefail
 REPO="${REPO:-vcarus/volto}"
 TAG="${TAG:-}" # empty means: resolve the latest release
 
-BIN=/usr/local/bin/volto
-SELF_INSTALLED=/usr/local/sbin/volto-deploy
-CONF=/etc/volto/config.toml
+# Empty in every real run, so the paths below are the absolute ones; a test sets
+# it to a temporary directory to relocate the whole install.
+ROOT="${VOLTO_DEPLOY_ROOT:-}"
+
+BIN="$ROOT/usr/local/bin/volto"
+SELF_INSTALLED="$ROOT/usr/local/sbin/volto-deploy"
+CONF="$ROOT/etc/volto/config.toml"
 SERVICE_NAME=volto
-UNIT="/etc/systemd/system/$SERVICE_NAME.service"
+UNIT="$ROOT/etc/systemd/system/$SERVICE_NAME.service"
 TIMER_NAME=volto-deploy
+TIMER_SERVICE="$ROOT/etc/systemd/system/$TIMER_NAME.service"
+TIMER_UNIT="$ROOT/etc/systemd/system/$TIMER_NAME.timer"
 ENABLE_TIMER=0
+DRY_RUN=0
 INSTALL_ARGS=()
 
 usage() {
@@ -50,6 +65,8 @@ Options:
                        also how you roll back)
       --enable-timer   install and start a systemd timer that re-runs this
                        script daily, keeping the host on the newest release
+      --dry-run        print the decision this run would act on and stop;
+                       needs --tag, downloads nothing, changes nothing
   -s, --sni NAME       first install only: passed to install-selfsigned.sh
   -p, --port PORT      first install only: passed to install-selfsigned.sh
   -u, --username NAME  first install only: passed to install-selfsigned.sh
@@ -58,7 +75,8 @@ Options:
 
 REPO and TAG can also be given as environment variables, as can the
 install-selfsigned.sh variables (SNI, PORT, USERNAME, PASSWORD) on a first
-install.
+install. VOLTO_DEPLOY_ROOT prefixes every install path (/usr/local/bin,
+/etc/volto, /etc/systemd/system); it exists for --dry-run tests.
 
 Re-running is safe: the version check turns a run with nothing new into a
 no-op, and the first-install path inherits install-selfsigned.sh's guarantees
@@ -81,6 +99,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -t|--tag)       [ $# -ge 2 ] || die "$1 needs a value"; TAG="$2"; shift 2 ;;
         --enable-timer) ENABLE_TIMER=1; shift ;;
+        --dry-run)      DRY_RUN=1; shift ;;
         -s|--sni|-p|--port|-u|--username|-w|--password)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
@@ -91,25 +110,31 @@ done
 
 # --- preflight ---------------------------------------------------------------
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
-[ "$(uname -s)" = Linux ] ||
-    die "this script deploys releases to a Linux host; on a dev machine build with cargo instead"
-command -v systemctl >/dev/null 2>&1 || die "systemd is required"
-for tool in curl tar sha256sum; do
-    command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
-done
+# A dry run neither installs nor downloads, so none of this applies to it -- and
+# demanding it would put the decision logic out of reach of every dev host.
+if [ "$DRY_RUN" -eq 0 ]; then
+    [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
+    [ "$(uname -s)" = Linux ] ||
+        die "this script deploys releases to a Linux host; on a dev machine build with cargo instead"
+    command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+    for tool in curl tar sha256sum; do
+        command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
+    done
 
-case "$(uname -m)" in
-    x86_64)        TARGET=x86_64-unknown-linux-musl ;;
-    aarch64|arm64) TARGET=aarch64-unknown-linux-musl ;;
-    *)             die "no release build for this architecture: $(uname -m)" ;;
-esac
+    case "$(uname -m)" in
+        x86_64)        TARGET=x86_64-unknown-linux-musl ;;
+        aarch64|arm64) TARGET=aarch64-unknown-linux-musl ;;
+        *)             die "no release build for this architecture: $(uname -m)" ;;
+    esac
+fi
 
 if [ -n "$TAG" ]; then
     case "$TAG" in
         v[0-9]*) ;;
         *) die "--tag expects the tag name as on the releases page, e.g. v0.1.0" ;;
     esac
+elif [ "$DRY_RUN" -eq 1 ]; then
+    die "--dry-run needs --tag: resolving the latest release would need the network"
 else
     # The /releases/latest redirect carries the tag; following it with HEAD asks
     # GitHub for one URL instead of an API call, so there is no rate limit to
@@ -140,7 +165,24 @@ SELF_SOURCE="$0"
 # unit must be regenerated even when the version already matches, and doing so
 # needs the tarball (it carries the installer and the example config).
 if [ "$INSTALLED" = "$VERSION" ] && [ -f "$CONF" ] && [ -f "$UNIT" ]; then
-    note "volto $INSTALLED is already deployed and intact ($TAG), nothing to do"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "dry-run: already deployed and intact ($TAG)"
+    else
+        note "volto $INSTALLED is already deployed and intact ($TAG), nothing to do"
+    fi
+elif [ "$DRY_RUN" -eq 1 ]; then
+    # Same two questions the real branches below ask, in the same order: a
+    # missing config means the first-install path, anything else an update.
+    MISSING=""
+    [ -f "$CONF" ] || MISSING="$MISSING config"
+    [ -f "$UNIT" ] || MISSING="$MISSING unit"
+    [ -z "$MISSING" ] || MISSING=" (missing:$MISSING)"
+
+    if [ ! -f "$CONF" ]; then
+        echo "dry-run: would install $TAG$MISSING"
+    else
+        echo "dry-run: would update ${INSTALLED:-(unknown)} -> $TAG$MISSING"
+    fi
 else
     NAME="volto-${VERSION}-${TARGET}"
     BASE="https://github.com/$REPO/releases/download/$TAG"
@@ -217,10 +259,18 @@ refresh_self() {
     note "installed this script as $SELF_INSTALLED"
 }
 
-if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "/etc/systemd/system/$TIMER_NAME.timer" ]; then
+if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "$TIMER_UNIT" ]; then
+    # refresh_self runs in a dry run too: copying this script to $SELF_INSTALLED
+    # is the guardrail that broke under `curl ... | bash`, and it is the one step
+    # here that a test can exercise for real under VOLTO_DEPLOY_ROOT.
     refresh_self
 
-    cat >"/etc/systemd/system/$TIMER_NAME.service" <<'EOF'
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "dry-run: would enable timer"
+        exit 0
+    fi
+
+    cat >"$TIMER_SERVICE" <<'EOF'
 [Unit]
 Description=Deploy or update volto from the latest GitHub release
 Wants=network-online.target
@@ -231,7 +281,7 @@ Type=oneshot
 ExecStart=/usr/local/sbin/volto-deploy
 EOF
 
-    cat >"/etc/systemd/system/$TIMER_NAME.timer" <<'EOF'
+    cat >"$TIMER_UNIT" <<'EOF'
 [Unit]
 Description=Daily volto update check
 
@@ -252,6 +302,10 @@ EOF
 fi
 
 # --- report ------------------------------------------------------------------
+
+# The report queries the installed binary and systemd; a dry run has decided
+# everything it can decide by here.
+[ "$DRY_RUN" -eq 0 ] || exit 0
 
 echo
 echo "==> done"

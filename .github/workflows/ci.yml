@@ -51,6 +51,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+        env:
+          # The scrub gate (tests/it_scrub.rs) looks for private literals that
+          # cannot be written down in a public repository, so the list comes
+          # from a repository secret. Absent -- on a fork, say -- the variable
+          # is empty and only the CJK half of the gate runs.
+          VOLTO_SCRUB_PATTERNS: ${{ secrets.VOLTO_SCRUB_PATTERNS }}
 
   interop:
     # Cross-implementation check. `cargo test` has volto on both ends — its
