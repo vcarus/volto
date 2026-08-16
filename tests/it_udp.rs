@@ -16,6 +16,10 @@ use volto::datagram;
 /// H3_DATAGRAM_ERROR, the code RFC 9297 §2.1 names for an unusable datagram.
 const H3_DATAGRAM_ERROR: u64 = 0x33;
 
+/// H3_NO_ERROR, RFC 9114 §8.1: "no error. This is used when the connection or
+/// stream needs to be closed, but there is no error to signal."
+const H3_NO_ERROR: u64 = 0x100;
+
 /// Waits for the server to close the QUIC connection, returning its error code.
 ///
 /// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
@@ -604,6 +608,110 @@ async fn a_truncated_capsule_is_rejected() {
             code.value()
         ),
         other => panic!("expected a stream reset, got {other:?}"),
+    }
+}
+
+/// A DATAGRAM capsule declaring more bytes than a UDP payload can hold is a
+/// *parse* error, and gets the code registered for one.
+///
+/// The pair to [`a_truncated_capsule_is_rejected`], and the reason both exist:
+/// RFC 9297 §5.2 registers 0x33 as a "Datagram or Capsule Protocol parse error",
+/// while RFC 9114 §4.1.2 wants H3_MESSAGE_ERROR (0x10e) for a message that is
+/// merely malformed. This capsule failed to parse — its declared length can
+/// never be a UDP datagram — whereas the truncated one parsed perfectly and just
+/// stopped early. Asserting the two side by side is what keeps the distinction
+/// from collapsing back into one code the next time this path is touched.
+#[tokio::test]
+async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
+    use volto::capsule;
+
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (_, mut stream) = open_session(
+        &mut client,
+        &server,
+        &target.ip().to_string(),
+        target.port(),
+    )
+    .await;
+
+    // Only the header: the decoder rejects the declared length before it waits
+    // for a single byte of the value, which is the point — buffering 64 KiB to
+    // find out it was never valid is exactly what the limit prevents.
+    let mut wire = bytes::BytesMut::new();
+    datagram::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
+    datagram::put_varint(&mut wire, capsule::MAX_DATAGRAM_CAPSULE_VALUE + 1);
+    stream
+        .send_data(wire.freeze())
+        .await
+        .expect("send an oversized capsule header");
+
+    let error = loop {
+        match tokio::time::timeout(TIMEOUT, stream.recv_data())
+            .await
+            .expect("the server responded")
+        {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("an oversized capsule must not read as a clean end of stream"),
+            Err(error) => break error,
+        }
+    };
+
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+            code.value(),
+            H3_DATAGRAM_ERROR,
+            "expected H3_DATAGRAM_ERROR (0x33), got {code:?} = {:#x}",
+            code.value()
+        ),
+        other => panic!("expected a stream reset, got {other:?}"),
+    }
+}
+
+/// The tunnel accepted and closed on the spot asks the client to stop sending
+/// with H3_NO_ERROR, because nothing went wrong.
+///
+/// The blackhole answer (D49) is "a target that hung up immediately", and a
+/// target hanging up is not an error. Any other code here would put a fault in
+/// the client's log for a request this server deliberately treated as fine.
+/// Observable because the STOP_SENDING goes out before the 200 does, so the
+/// first write after the response is refused with the code it carried.
+#[tokio::test]
+async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
+    let server = TestServer::start().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (_, mut stream) = open_session(&mut client, &server, "0.0.0.0", 443).await;
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let error = loop {
+        match stream
+            .send_data(Bytes::from_static(b"anything at all"))
+            .await
+        {
+            // quinn only surfaces the stop once the write reaches the peer's
+            // state, so an early write can still be accepted locally.
+            Ok(()) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the server never stopped the stream"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => break error,
+        }
+    };
+
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+            code.value(),
+            H3_NO_ERROR,
+            "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",
+            code.value()
+        ),
+        other => panic!("expected the peer to stop the stream, got {other:?}"),
     }
 }
 

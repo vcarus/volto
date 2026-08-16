@@ -278,6 +278,13 @@ async fn refuses_a_target_that_is_not_listening() {
     );
 }
 
+/// A request this proxy will not serve is answered and *finished*, never reset.
+///
+/// Decision D40, and the reason the second half of this test exists: a status
+/// that is immediately followed by a RESET_STREAM is worse than useless, because
+/// the client is entitled to read the reset as "the proxy broke" and may retry or
+/// fail over instead of surfacing the 400. Only reading past the response to a
+/// clean end of stream tells the two apart — `recv_response` succeeds either way.
 #[tokio::test]
 async fn refuses_an_authority_without_a_port() {
     let server = TestServer::start().await;
@@ -295,6 +302,15 @@ async fn refuses_an_authority_without_a_port() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .expect("the stream ended promptly")
+        .expect("a refusal must end cleanly, not with a stream error");
+    assert!(
+        end.is_none(),
+        "a 400 carries no body: the next read is the end of the stream"
+    );
 }
 
 /// A proxy is not an origin server: ordinary requests are refused, not panicked

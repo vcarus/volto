@@ -36,16 +36,31 @@ impl SharedBuffer {
         String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
     }
 
-    /// Waits for a logged line containing every one of `needles`.
+    /// How much has been logged so far, as an offset for [`Self::since`].
+    ///
+    /// Lines are written whole, so this is always a line boundary. Taking one
+    /// before each scenario is what stops a scenario from being satisfied by an
+    /// earlier scenario's line — two of them close for the same reason.
+    fn mark(&self) -> usize {
+        self.0.lock().expect("buffer lock").len()
+    }
+
+    /// Everything logged after `mark`.
+    fn since(&self, mark: usize) -> String {
+        let buffer = self.0.lock().expect("buffer lock");
+        String::from_utf8_lossy(&buffer[mark.min(buffer.len())..]).into_owned()
+    }
+
+    /// Waits for a line logged after `mark` containing every one of `needles`.
     ///
     /// Polled rather than slept through: the server logs from its own task, so
     /// the line appears some unpredictable moment after the client observes the
     /// connection go away.
-    async fn wait_for_line(&self, needles: &[&str]) -> String {
+    async fn wait_for_line(&self, mark: usize, needles: &[&str]) -> String {
         let deadline = Instant::now() + TIMEOUT;
 
         loop {
-            let logged = self.contents();
+            let logged = self.since(mark);
             let found = logged
                 .lines()
                 .find(|line| needles.iter().all(|needle| line.contains(needle)))
@@ -83,7 +98,10 @@ impl<'a> MakeWriter<'a> for SharedBuffer {
     }
 }
 
-/// The three ways a connection ends, each with the level and reason it earns.
+/// Generous upper bound for a shutdown that has nothing to drain.
+const STOP_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The five ways a connection ends, each with the level and reason it earns.
 ///
 /// One test function, because the subscriber is process-wide: splitting the
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
@@ -96,11 +114,12 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .with_ansi(false)
         .init();
 
-    let server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
+    let mut server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
 
     // 1. The peer goes silent and the idle timeout expires. This is the case the
     //    production logs were full of, misfiled as an error.
     {
+        let mark = buffer.mark();
         let client = H3Client::connect(&server).await;
         let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
             .await
@@ -111,7 +130,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
 
         let line = buffer
-            .wait_for_line(&[" INFO ", "connection closed", "reason=\"idle\""])
+            .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"idle\""])
             .await;
         assert!(
             !line.contains("with error"),
@@ -123,11 +142,15 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
     //    Surge sends. Nothing slow may happen between connecting and closing, or
     //    the 1s idle timeout would decide this scenario instead.
     {
+        let mark = buffer.mark();
         let client = H3Client::connect(&server).await;
         client.quic.close(quinn::VarInt::from_u32(0), b"");
 
         let line = buffer
-            .wait_for_line(&[" INFO ", "connection closed", "reason=\"peer_close\""])
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
             .await;
         assert!(
             !line.contains("with error"),
@@ -138,17 +161,92 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
     // 3. Any other application error code is the peer reporting a problem, and
     //    still deserves a warning.
     {
+        let mark = buffer.mark();
         let client = H3Client::connect(&server).await;
         client.quic.close(quinn::VarInt::from_u32(42), b"");
 
         buffer
-            .wait_for_line(&[" WARN ", "connection closed with error", "ApplicationClose"])
+            .wait_for_line(
+                mark,
+                &[" WARN ", "connection closed with error", "ApplicationClose"],
+            )
             .await;
     }
 
-    // The whole point of the grading: exactly one of the three closes was worth a
-    // warning, and it was not either of the routine ones.
+    // 4. H3_NO_ERROR (0x100), which RFC 9114 §8.1 defines as "no error [...] used
+    //    when the connection or stream needs to be closed, but there is no error
+    //    to signal". Surge does not send it — it uses 0x0, scenario 2 — so this
+    //    branch has no production traffic keeping it honest, and dropping it
+    //    would put every spec-following client back into the warning stream.
+    {
+        let mark = buffer.mark();
+        let client = H3Client::connect(&server).await;
+        client.quic.close(quinn::VarInt::from_u32(0x100), b"");
+
+        let line = buffer
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
+            .await;
+        assert!(
+            !line.contains("with error"),
+            "H3_NO_ERROR is the absence of an error; line was:\n{line}"
+        );
+    }
+
+    // 5. The server shuts down: GOAWAY goes out, there is nothing to drain, and
+    //    the accept loop returns `Ok(())` on its own terms rather than through an
+    //    error. Last, because it stops the server.
+    {
+        let mark = buffer.mark();
+        let client = H3Client::connect(&server).await;
+        server.shutdown();
+
+        let line = buffer
+            .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"drained\""])
+            .await;
+        assert!(
+            !line.contains("with error"),
+            "a completed drain is the tidiest ending there is; line was:\n{line}"
+        );
+
+        drop(client);
+        server.wait_until_stopped(STOP_TIMEOUT).await;
+    }
+
+    // Every routine close still carries the two diagnostic fields the transport
+    // is tuned from. Both are read off the connection *after* `conn::handle` has
+    // returned and dropped the HTTP/3 layer — the same object at the same moment
+    // that made `close_reason()` unusable — so nothing but an assertion stands
+    // between them and quietly becoming a placeholder. `initial_rtt_ms = 150`
+    // was derived from `rtt_ms` samples, and `remote_now` is the only externally
+    // visible trace of a migration or NAT rebind mid-connection.
     let logged = buffer.contents();
+    let closes: Vec<&str> = logged
+        .lines()
+        .filter(|line| line.contains(" INFO ") && line.contains("connection closed"))
+        .collect();
+    assert_eq!(
+        closes.len(),
+        4,
+        "four of the five closes are routine; log was:\n{logged}"
+    );
+    for line in &closes {
+        assert!(
+            line.contains("rtt_ms="),
+            "a close log must carry the measured RTT; line was:\n{line}"
+        );
+        // The real address, not an empty or default one: this is what a
+        // migration would show up as having changed.
+        assert!(
+            line.contains("remote_now=127.0.0.1:"),
+            "a close log must carry the address the peer ended on; line was:\n{line}"
+        );
+    }
+
+    // The whole point of the grading: exactly one of the five closes was worth a
+    // warning, and it was none of the routine ones.
     let warnings: Vec<&str> = logged
         .lines()
         .filter(|line| line.contains("connection closed with error"))

@@ -169,23 +169,36 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     // what makes `max_datagram_frame_size` appear in our transport
     // parameters. CONNECT-UDP sizes the datagram buffers explicitly.
 
-    // Congestion controller, BBR by default. A loss-based controller (CUBIC,
-    // NewReno) reads the non-congestive packet loss of a long international path
-    // as congestion and collapses the window — the download direction stalls to
-    // near-zero while a co-located Shadowsocks server on the same box sails
-    // through, because the Linux kernel runs BBR for TCP. BBR models bandwidth
-    // and RTT instead, holding throughput on exactly these paths. See
-    // `config::CongestionControl` for why this is the default and stays
-    // configurable.
-    let controller: Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> =
-        match limits.congestion_control {
-            CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
-            CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
-            CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
-        };
-    transport.congestion_controller_factory(controller);
+    transport.congestion_controller_factory(congestion_factory(limits.congestion_control));
 
     Ok(transport)
+}
+
+/// The quinn congestion controller factory named by `[limits] congestion_control`.
+///
+/// Split out from [`transport_config`] purely so it can be tested: `TransportConfig`
+/// has no getter for the factory and its `Debug` skips it, so the mapping is
+/// invisible to the assertions above — a `Bbr => CubicConfig` slip passes every one
+/// of them. The failure it would cause is not subtle in production (the download
+/// direction of a long international path collapsed to near-zero on 2026-08-13, and
+/// it took a day to localise) but it is entirely silent here, so the unit test
+/// builds the controller and downcasts it.
+///
+/// BBR by default. A loss-based controller (CUBIC, NewReno) reads the
+/// non-congestive packet loss of a long international path as congestion and
+/// collapses the window — the download direction stalls to near-zero while a
+/// co-located Shadowsocks server on the same box sails through, because the Linux
+/// kernel runs BBR for TCP. BBR models bandwidth and RTT instead, holding
+/// throughput on exactly these paths. See `config::CongestionControl` for why this
+/// is the default and stays configurable.
+fn congestion_factory(
+    cc: CongestionControl,
+) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    match cc {
+        CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+        CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
+        CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
+    }
 }
 
 /// The live configuration, swapped wholesale on reload.
@@ -730,6 +743,67 @@ mod tests {
         assert!(fd_budget_is_tight(256, 256), "the macOS default pairing");
         assert!(fd_budget_is_tight(1024, 1024));
         assert!(fd_budget_is_tight(64, 1));
+    }
+
+    /// Builds the controller a `[limits] congestion_control` value selects and
+    /// names its concrete type.
+    ///
+    /// `TransportConfig` keeps the factory behind a private field that its `Debug`
+    /// does not print, so [`transport_debug`] — which pins every other transport
+    /// parameter — cannot see this one at all. `Controller::into_any` exists for
+    /// exactly this downcast.
+    fn controller_type_of(cc: crate::config::CongestionControl) -> &'static str {
+        let built = congestion_factory(cc).build(std::time::Instant::now(), 1200);
+        let any = built.into_any();
+
+        if any.is::<quinn::congestion::Bbr>() {
+            "bbr"
+        } else if any.is::<quinn::congestion::Cubic>() {
+            "cubic"
+        } else if any.is::<quinn::congestion::NewReno>() {
+            "newreno"
+        } else {
+            "unknown"
+        }
+    }
+
+    /// Every `congestion_control` value selects the controller it names.
+    #[test]
+    fn each_congestion_control_value_selects_its_controller() {
+        use crate::config::CongestionControl;
+
+        for (value, expected) in [
+            (CongestionControl::Bbr, "bbr"),
+            (CongestionControl::Cubic, "cubic"),
+            (CongestionControl::NewReno, "newreno"),
+        ] {
+            assert_eq!(controller_type_of(value), expected, "{value:?}");
+        }
+    }
+
+    /// The default really is BBR, all the way to the built controller.
+    ///
+    /// The one assertion in this module with a production incident behind it. quinn
+    /// defaults to CUBIC, so every way of losing this mapping — a mis-edited match
+    /// arm, a refactor that drops the `congestion_controller_factory` call, a
+    /// default that stops being BBR — lands on a loss-based controller, and a
+    /// loss-based controller collapses the download direction of the production
+    /// path to near-zero while leaving upload, CPU and every log line looking
+    /// normal. Nothing else in the suite can tell the two apart.
+    #[test]
+    fn the_default_congestion_controller_is_bbr() {
+        let limits = crate::config::Limits::default();
+
+        assert_eq!(
+            limits.congestion_control,
+            crate::config::CongestionControl::Bbr,
+            "the default must stay BBR"
+        );
+        assert_eq!(
+            controller_type_of(limits.congestion_control),
+            "bbr",
+            "the default limits must build a BBR controller, not quinn's CUBIC"
+        );
     }
 
     #[test]
