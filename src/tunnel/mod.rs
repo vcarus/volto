@@ -77,6 +77,12 @@ pub struct Context {
     pub quota: Arc<Quota>,
     /// How long a UDP session may sit idle.
     pub idle_timeout: Duration,
+    /// Budget for reaching a target, or `None` when it is disabled.
+    ///
+    /// Spent twice per request and separately — once on name resolution, once on
+    /// the whole list of addresses it resolved to — so the worst case a tunnel
+    /// slot is held before any byte flows is twice this.
+    pub connect_timeout: Option<Duration>,
     /// Packets a UDP session may send before its target has answered.
     pub unanswered_packet_budget: u32,
 }
@@ -95,6 +101,7 @@ impl Context {
             policy: Arc::new(Policy::new(&config.security)),
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
             idle_timeout: config.limits.udp_session_timeout(),
+            connect_timeout: config.limits.connect_timeout(),
             unanswered_packet_budget: config.security.unanswered_packet_budget,
         }
     }
@@ -177,6 +184,8 @@ impl Quota {
 pub enum ProxyError {
     /// The target name could not be resolved.
     DnsError,
+    /// The resolver did not answer inside the `[limits] connect_timeout` budget.
+    DnsTimeout,
     /// Every address the target resolved to is prohibited by policy.
     DestinationIpProhibited,
     /// The target is a legal destination but could not be reached.
@@ -204,6 +213,75 @@ pub(crate) struct Unreachable {
     pub(crate) error: std::io::Error,
 }
 
+/// A name that could not be turned into addresses, and why not.
+///
+/// The two cases are reported differently, so the callers have to be able to
+/// tell them apart: a resolver that answered "no" is a 502, while one that did
+/// not answer at all inside the `[limits] connect_timeout` budget is a 504.
+#[derive(Debug)]
+pub(crate) enum ResolveFailure {
+    /// The resolver answered, unsuccessfully.
+    Failed(std::io::Error),
+    /// The budget expired before the resolver answered.
+    TimedOut(Duration),
+}
+
+impl ResolveFailure {
+    /// The RFC 9209 type this failure is reported as.
+    pub(crate) fn proxy_error(&self) -> ProxyError {
+        match self {
+            Self::Failed(_) => ProxyError::DnsError,
+            Self::TimedOut(_) => ProxyError::DnsTimeout,
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(error) => write!(f, "{error}"),
+            Self::TimedOut(budget) => write!(f, "no answer within {budget:?}"),
+        }
+    }
+}
+
+/// Resolves `host`/`port`, giving the resolver at most `budget`.
+///
+/// Bounded because the tunnel slot and the file descriptor it stands for are
+/// already held by the time this runs: a stub resolver whose nameserver has gone
+/// away takes tens of seconds to give up, and every one of them is a slot the
+/// client cannot use for anything else. `None` leaves the wait to the resolver,
+/// which is what `connect_timeout = 0` asks for.
+pub(crate) async fn resolve_within(
+    host: &str,
+    port: u16,
+    budget: Option<Duration>,
+) -> Result<Vec<std::net::SocketAddr>, ResolveFailure> {
+    within_budget(crate::net::resolve(host, port), budget).await
+}
+
+/// Applies a resolution budget to `lookup`.
+///
+/// Split from [`resolve_within`] so the budget can be tested against a lookup
+/// that never answers, which no real resolver can be made to do on demand.
+async fn within_budget<F>(
+    lookup: F,
+    budget: Option<Duration>,
+) -> Result<Vec<std::net::SocketAddr>, ResolveFailure>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
+{
+    let resolved = match budget {
+        Some(budget) => match tokio::time::timeout(budget, lookup).await {
+            Ok(resolved) => resolved,
+            Err(_) => return Err(ResolveFailure::TimedOut(budget)),
+        },
+        None => lookup.await,
+    };
+
+    resolved.map_err(ResolveFailure::Failed)
+}
+
 impl ProxyError {
     /// The complete `Proxy-Status` field value.
     ///
@@ -212,6 +290,7 @@ impl ProxyError {
     fn field_value(self) -> &'static str {
         match self {
             Self::DnsError => "volto; error=dns_error",
+            Self::DnsTimeout => "volto; error=dns_timeout",
             Self::DestinationIpProhibited => "volto; error=destination_ip_prohibited",
             Self::DestinationUnavailable => "volto; error=destination_unavailable",
             Self::ConnectionRefused => "volto; error=connection_refused",
@@ -247,8 +326,8 @@ impl ProxyError {
     /// RFC 9209 §2.1.2 allows the parameter anywhere, so this list is a privacy
     /// judgement rather than a syntactic one, and every exclusion is deliberate:
     ///
-    /// * `dns_error` — there is no hop to name. The lookup is what failed, so any
-    ///   address in the response would be invented.
+    /// * `dns_error` and `dns_timeout` — there is no hop to name. The lookup is
+    ///   what failed, so any address in the response would be invented.
     /// * `destination_ip_prohibited` and `http_request_denied` — the request was
     ///   refused *by this proxy*, and echoing the resolved address would turn
     ///   every refusal into a lookup oracle: a client that cannot reach an
@@ -327,7 +406,7 @@ impl ProxyError {
     pub fn recommended_status(self) -> StatusCode {
         match self {
             Self::DnsError | Self::ConnectionRefused => StatusCode::BAD_GATEWAY,
-            Self::ConnectionTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::DnsTimeout | Self::ConnectionTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::DestinationUnavailable | Self::ConnectionLimitReached => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
@@ -454,6 +533,7 @@ mod tests {
     fn proxy_status_values_are_rfc_9209_shaped() {
         for (error, expected) in [
             (ProxyError::DnsError, "dns_error"),
+            (ProxyError::DnsTimeout, "dns_timeout"),
             (
                 ProxyError::DestinationIpProhibited,
                 "destination_ip_prohibited",
@@ -486,6 +566,7 @@ mod tests {
     fn every_error_type_carries_its_recommended_status() {
         for (error, expected) in [
             (ProxyError::DnsError, StatusCode::BAD_GATEWAY),
+            (ProxyError::DnsTimeout, StatusCode::GATEWAY_TIMEOUT),
             (ProxyError::ConnectionRefused, StatusCode::BAD_GATEWAY),
             (ProxyError::ConnectionTimeout, StatusCode::GATEWAY_TIMEOUT),
             (
@@ -592,6 +673,7 @@ mod tests {
 
         for error in [
             ProxyError::DnsError,
+            ProxyError::DnsTimeout,
             ProxyError::DestinationIpProhibited,
             ProxyError::HttpRequestDenied,
             ProxyError::ConnectionLimitReached,
@@ -645,6 +727,80 @@ mod tests {
         assert_eq!(sf_string(r#"a"b"#), r#""a\"b""#);
         assert_eq!(sf_string(r"a\b"), r#""a\\b""#);
         assert_eq!(sf_string(""), "\"\"");
+    }
+
+    /// A resolver that never answers costs the request its budget and no more,
+    /// and is reported as the timeout it is rather than as an ordinary lookup
+    /// failure — the two carry different statuses.
+    ///
+    /// Real time rather than a paused clock, because tokio's `test-util` feature
+    /// is not enabled in this tree; the budget is therefore small and the upper
+    /// bound generous, so only a genuinely unbounded wait can fail it.
+    #[tokio::test]
+    async fn a_resolver_that_never_answers_costs_only_the_budget() {
+        let budget = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+
+        // The outer timeout is what turns a regression here into a failure
+        // rather than a hung test run.
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            within_budget(std::future::pending(), Some(budget)),
+        )
+        .await
+        .expect("the budget must bound the wait")
+        .expect_err("a lookup that never answers must not succeed");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(failure, ResolveFailure::TimedOut(_)), "{failure}");
+        assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
+        assert_eq!(
+            failure.proxy_error().recommended_status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert!(elapsed >= budget, "returned early, after {elapsed:?}");
+    }
+
+    /// A lookup that answers is passed straight through, budget or no budget.
+    #[tokio::test]
+    async fn a_lookup_that_answers_is_passed_through() {
+        let addresses = vec!["192.0.2.1:443".parse().expect("address")];
+
+        for budget in [None, Some(Duration::from_secs(10))] {
+            let resolved = within_budget(std::future::ready(Ok(addresses.clone())), budget)
+                .await
+                .expect("a lookup that answers must succeed");
+            assert_eq!(resolved, addresses);
+        }
+
+        // And a resolver that says no keeps saying no, as `dns_error`.
+        let failure = within_budget(
+            std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            Some(Duration::from_secs(10)),
+        )
+        .await
+        .expect_err("a lookup that fails must fail");
+        assert_eq!(failure.proxy_error(), ProxyError::DnsError);
+    }
+
+    /// The mapping the two resolution failures are told apart by.
+    #[test]
+    fn a_resolver_timeout_is_a_different_type_from_a_resolver_failure() {
+        use std::io::{Error, ErrorKind};
+
+        let failed = ResolveFailure::Failed(Error::from(ErrorKind::NotFound));
+        assert_eq!(failed.proxy_error(), ProxyError::DnsError);
+        assert_eq!(
+            failed.proxy_error().recommended_status(),
+            StatusCode::BAD_GATEWAY
+        );
+
+        let timed_out = ResolveFailure::TimedOut(Duration::from_secs(10));
+        assert_eq!(timed_out.proxy_error(), ProxyError::DnsTimeout);
+        assert_eq!(
+            timed_out.proxy_error().recommended_status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
     }
 
     #[tokio::test]

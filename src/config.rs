@@ -18,6 +18,7 @@
 //! udp_session_timeout  = 180   # seconds
 //! max_targets_per_conn = 256
 //! max_connections      = 256
+//! connect_timeout      = 10    # seconds, 0 disables the budget
 //! max_streams_bidi     = 1024
 //! max_idle_timeout     = 60    # seconds
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
@@ -81,6 +82,22 @@ pub const DEFAULT_UDP_SESSION_TIMEOUT: u64 = 180;
 /// `max_connections * max_targets_per_conn` is 256 * 256 = 65536, which is the
 /// `LimitNOFILE` the shipped systemd unit sets.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
+
+/// Default budget for reaching a target, in seconds.
+///
+/// Applied twice per request and separately: once to name resolution, once to
+/// the whole list of addresses the name resolved to. A tunnel slot and the file
+/// descriptor behind it are held for the length of both, so without a budget an
+/// unreachable target pins them for however long the operating system waits on a
+/// SYN that draws no answer — on Linux roughly two minutes, which is long enough
+/// for ordinary browsing to a black-holed address to exhaust
+/// `max_targets_per_conn` on its own.
+///
+/// Ten seconds is well past a healthy connect on any path this proxy serves (the
+/// production RTT is under 100 ms) while being short enough that a client's
+/// budget is not consumed by one dead target. Zero restores the unbounded
+/// behaviour and leaves the wait to the operating system.
+pub const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
 
 /// Default number of authentication failures tolerated on one connection.
 pub const DEFAULT_MAX_AUTH_FAILURES: u32 = 5;
@@ -270,6 +287,12 @@ pub struct Limits {
     /// handshake completes and before any per-connection state is built.
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+    /// Seconds allowed for reaching a target. Zero disables the budget.
+    ///
+    /// Spent twice per request: once on name resolution, once on the whole list
+    /// of addresses it resolved to. See [`DEFAULT_CONNECT_TIMEOUT`].
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout: u64,
     /// Concurrent client-initiated bidirectional streams per QUIC connection.
     #[serde(default = "default_max_streams_bidi")]
     pub max_streams_bidi: u32,
@@ -403,6 +426,10 @@ fn default_max_connections() -> u32 {
     DEFAULT_MAX_CONNECTIONS
 }
 
+fn default_connect_timeout() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT
+}
+
 fn default_max_auth_failures() -> u32 {
     DEFAULT_MAX_AUTH_FAILURES
 }
@@ -449,6 +476,7 @@ impl Default for Limits {
             udp_session_timeout: default_udp_session_timeout(),
             max_targets_per_conn: default_max_targets_per_conn(),
             max_connections: default_max_connections(),
+            connect_timeout: default_connect_timeout(),
             max_streams_bidi: default_max_streams_bidi(),
             max_idle_timeout: default_max_idle_timeout(),
             keep_alive_interval: default_keep_alive_interval(),
@@ -485,6 +513,17 @@ impl Limits {
     /// `initial_rtt_ms` as a [`Duration`](std::time::Duration).
     pub fn initial_rtt(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.initial_rtt_ms)
+    }
+
+    /// The budget for reaching a target, or `None` when it is disabled.
+    ///
+    /// Read once per request rather than baked into the transport, so it is not
+    /// one of the parameters a connection is stuck with for its whole life.
+    pub fn connect_timeout(&self) -> Option<std::time::Duration> {
+        match self.connect_timeout {
+            0 => None,
+            seconds => Some(std::time::Duration::from_secs(seconds)),
+        }
     }
 
     /// The keep-alive interval, or `None` when keep-alives are disabled.
@@ -831,6 +870,11 @@ mod tests {
         assert_eq!(cfg.limits.udp_session_timeout, 180);
         assert_eq!(cfg.limits.max_targets_per_conn, 256);
         assert_eq!(cfg.limits.max_connections, 256);
+        assert_eq!(cfg.limits.connect_timeout, 10);
+        assert_eq!(
+            cfg.limits.connect_timeout(),
+            Some(std::time::Duration::from_secs(10))
+        );
         assert_eq!(cfg.limits.max_streams_bidi, 1024);
         assert_eq!(cfg.security.max_auth_failures, 5);
         // The connection cap and the tunnel quota multiply out to the fd budget
@@ -969,6 +1013,44 @@ mod tests {
                 .validate()
                 .expect_err("must be rejected");
             assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
+        }
+    }
+
+    /// Zero disables the connect budget rather than meaning "give up at once",
+    /// which is the same shape `keep_alive_interval = 0` has.
+    #[test]
+    fn a_zero_connect_timeout_disables_the_budget() {
+        let cfg = parse("[limits]\nconnect_timeout = 0");
+        assert_valid_apart_from_certs(&cfg, "connect_timeout = 0");
+        assert_eq!(cfg.limits.connect_timeout, 0);
+        assert_eq!(cfg.limits.connect_timeout(), None);
+
+        // And an ordinary value is carried through as a duration.
+        let cfg = parse("[limits]\nconnect_timeout = 3");
+        assert_valid_apart_from_certs(&cfg, "connect_timeout = 3");
+        assert_eq!(
+            cfg.limits.connect_timeout(),
+            Some(std::time::Duration::from_secs(3))
+        );
+    }
+
+    /// A budget that is not a whole number of seconds is a typo, and must fail at
+    /// startup rather than silently becoming a default.
+    #[test]
+    fn a_malformed_connect_timeout_is_rejected() {
+        for value in ["-1", "\"10\"", "1.5", "true"] {
+            let err = toml::from_str::<Config>(&format!(
+                r#"
+                [server]
+                listen = "127.0.0.1:4433"
+                cert = "/tmp/c.pem"
+                key = "/tmp/k.pem"
+                [limits]
+                connect_timeout = {value}
+                "#
+            ))
+            .expect_err("{value} must be rejected");
+            assert!(err.to_string().contains("connect_timeout"), "{err}");
         }
     }
 

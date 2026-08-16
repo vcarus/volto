@@ -2,13 +2,17 @@
 
 mod common;
 
+use std::net::SocketAddr;
+use std::time::Duration;
+
 use bytes::Bytes;
 use common::{
     closed_address, connect_request, read_at_least, read_to_end, spawn_close_reporting_target,
     spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_reset_after_read_target, ConnectionEnd, H3Client, TestServer, TIMEOUT,
+    spawn_reset_after_read_target, ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{Method, Request, StatusCode};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
@@ -276,6 +280,119 @@ async fn refuses_a_target_that_is_not_listening() {
         Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
         "the refusal must name the address that refused the connection"
     );
+}
+
+/// Arms an address that black-holes SYNs, in the only portable way there is.
+///
+/// A listening socket with the smallest possible backlog whose `accept` is never
+/// called: once the accept queue is full the kernel simply drops further SYNs,
+/// which is exactly what a target behind a silently discarding firewall looks
+/// like from here — the connect neither completes nor fails, it just never
+/// finishes. Filling the queue is done by connecting until an attempt stops
+/// completing, which is also the proof that the arming worked.
+///
+/// Returns the address, the connections holding the queue full, and the listener
+/// — all three must stay alive for the address to keep black-holing. `None`
+/// means this kernel does not behave that way, and the caller should skip rather
+/// than fail: a differently tuned host must not make the suite red.
+async fn arm_a_blackholed_address() -> Option<(SocketAddr, Vec<TcpStream>, TcpListener)> {
+    let socket = TcpSocket::new_v4().ok()?;
+    socket
+        .bind("127.0.0.1:0".parse().expect("bind address"))
+        .ok()?;
+    let listener = socket.listen(1).ok()?;
+    let addr = listener.local_addr().ok()?;
+
+    let mut holding = Vec::new();
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr)).await {
+            // The queue has room still; keep the connection so it stays taken.
+            Ok(Ok(held)) => holding.push(held),
+            // Refused rather than dropped: this kernel does not black-hole.
+            Ok(Err(_)) => return None,
+            // A SYN that draws no answer at all: the queue is full.
+            Err(_) => return Some((addr, holding, listener)),
+        }
+    }
+
+    None
+}
+
+/// A target that swallows SYNs must cost the client its connect budget and then
+/// a refusal, rather than holding the tunnel slot for the operating system's own
+/// retry schedule — around two minutes on Linux.
+#[tokio::test]
+async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
+    let Some((blackhole, _holding, _listener)) = arm_a_blackholed_address().await else {
+        eprintln!(
+            "skipping: this kernel does not drop SYNs for a full accept queue,              so no black-holed address can be arranged"
+        );
+        return;
+    };
+
+    let server =
+        TestServer::start_with(&format!("[limits]\nconnect_timeout = 1\n{ALLOW_PRIVATE}")).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let started = std::time::Instant::now();
+    let mut stream = client
+        .send
+        .send_request(connect_request(&blackhole.to_string()))
+        .await
+        .expect("send CONNECT");
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    let elapsed = started.elapsed();
+
+    // RFC 9209: a target that never answered is a timeout, not an unreachable
+    // one, and the status follows the registered type.
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let proxy_status = response
+        .headers()
+        .get("proxy-status")
+        .map(|value| value.to_str().expect("proxy-status is ASCII"))
+        .expect("a refusal must say why");
+    assert!(
+        proxy_status.contains("error=connection_timeout"),
+        "{proxy_status}"
+    );
+    // And it names the hop it gave up on.
+    assert!(
+        proxy_status.contains(&blackhole.to_string()),
+        "{proxy_status}"
+    );
+
+    // The budget, not the kernel, decided when to give up.
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "answered before the budget expired, after {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the connect was not bounded by the budget: {elapsed:?}"
+    );
+
+    // And the tunnel slot went back: the same connection still serves a target
+    // that does answer.
+    let target = spawn_echo_target().await;
+    let mut good = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+    let response = tokio::time::timeout(TIMEOUT, good.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    good.send_data(Bytes::from_static(b"after the timeout"))
+        .await
+        .expect("send payload");
+    let echoed = read_at_least(&mut good, b"after the timeout".len()).await;
+    assert_eq!(&echoed, b"after the timeout");
 }
 
 /// A request this proxy will not serve is answered and *finished*, never reset.

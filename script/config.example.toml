@@ -66,6 +66,24 @@ users = [
 # Default: 256
 #max_connections = 256
 
+# Seconds allowed for reaching a target; 0 disables the budget.
+#
+# Spent twice per request and separately: once on name resolution, once on the
+# whole list of addresses it resolved to. Both happen while the request already
+# holds a tunnel slot and a file descriptor, and without a budget a target that
+# silently drops SYNs holds them for as long as the kernel keeps retrying --
+# around two minutes on Linux. That is enough for ordinary browsing to spend a
+# connection's whole max_targets_per_conn on tunnels that will never open.
+#
+# A lookup that runs out of budget is answered with 504 and
+# `Proxy-Status: volto; error=dns_timeout`; a connect that runs out is answered
+# with 504 and `error=connection_timeout`. Unlike the transport parameters below,
+# this is a per-request budget rather than something negotiated at handshake
+# time: a reload applies it to connections accepted after it, and every request
+# such a connection makes gets the whole budget afresh.
+# Default: 10
+#connect_timeout = 10
+
 # --- QUIC transport parameters ----------------------------------------------
 # All five apply to connections accepted from now on. A reload (SIGHUP) carries
 # them to new connections; connections already open keep what they negotiated at

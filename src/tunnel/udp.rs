@@ -274,17 +274,17 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     // Decision D9: a resolver failure is a 502, not a 400. A transient DNS
     // failure is not something the client did wrong, and the RFC 9209 reason
     // tells it which of the two happened.
-    let addresses = match net::resolve(&host, port).await {
+    //
+    // Bounded by `[limits] connect_timeout` like the TCP path, and for the same
+    // reason: the tunnel slot is held while the resolver is asked, so a resolver
+    // that stops answering must not be able to hold it indefinitely. A lookup
+    // that ran out of budget is a 504 `dns_timeout` rather than a 502.
+    let addresses = match tunnel::resolve_within(&host, port, ctx.connect_timeout).await {
         Ok(addresses) => addresses,
-        Err(error) => {
-            debug!(stream_id, host, port, %error, "failed to resolve connect-udp target");
-            tunnel::refuse_because(
-                &mut stream,
-                StatusCode::BAD_GATEWAY,
-                ProxyError::DnsError,
-                stream_id,
-            )
-            .await;
+        Err(failure) => {
+            let error = failure.proxy_error();
+            debug!(stream_id, host, port, reason = %failure, "failed to resolve connect-udp target");
+            tunnel::refuse_because(&mut stream, error.recommended_status(), error, stream_id).await;
             return;
         }
     };

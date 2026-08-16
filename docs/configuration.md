@@ -43,6 +43,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `udp_session_timeout` | seconds | `180` | Idle timeout for a UDP session. RFC 9298 §3.1 says a proxy SHOULD NOT go below 120; volto warns if you do |
 | `max_targets_per_conn` | integer | `256` | Concurrent tunnels on one QUIC connection, TCP and UDP sharing the budget. Beyond it, requests get 503 with `Proxy-Status: volto; error=connection_limit_reached` |
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit. Excess connections are refused during the handshake, before any per-connection state exists here |
+| `connect_timeout` | seconds | `10` | Budget for reaching a target; `0` disables it. Spent twice per request and separately — once on name resolution, once on the whole list of addresses it resolved to — so a request holds its tunnel slot for at most twice this before any byte flows. A lookup that runs out answers 504 with `Proxy-Status: volto; error=dns_timeout`, a connect that runs out answers 504 with `error=connection_timeout` |
 | `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel. quinn's own default of 100 runs out during ordinary browsing |
 | `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600 |
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
@@ -58,6 +59,17 @@ descriptor, so `max_targets_per_conn` and systemd's `LimitNOFILE` are two halves
 of the same budget. The defaults line up deliberately: 256 connections × 256
 tunnels = 65536, the `LimitNOFILE` in the shipped unit. volto warns at startup
 when `RLIMIT_NOFILE` leaves no margin.
+
+**`connect_timeout` is spent per request, not per connection.** Without it a
+target that silently drops SYNs holds a tunnel slot and its file descriptor for
+as long as the operating system keeps retrying — around two minutes on Linux —
+so a handful of black-holed addresses during ordinary browsing can spend a
+connection's whole `max_targets_per_conn` on tunnels that will never open. No
+attacker is needed for that. A reload carries a new value to connections
+accepted from then on, and each request those connections make gets the budget
+afresh; connections already open keep the value they were accepted with, like
+the rest of the per-connection policy. Set it to `0` only to hand the wait back
+to the operating system.
 
 **The last six keys are QUIC transport parameters and apply to new connections
 only.** A reload carries them to connections accepted from then on; connections

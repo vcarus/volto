@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::h3api::{self, Buffer, Reader, Stream, Writer};
 use crate::tunnel::{Context, ProxyError, Unreachable};
-use crate::{net, policy, tunnel};
+use crate::{policy, tunnel};
 
 /// Bytes read from the target per relay iteration.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
@@ -66,20 +66,17 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     // Resolution is explicit so the addresses are visible to the policy below —
     // `TcpStream::connect((host, port))` would resolve internally and leave
-    // nothing to filter.
-    let addresses = match net::resolve(&host, port).await {
+    // nothing to filter. It is also bounded: the tunnel slot is already held.
+    let addresses = match tunnel::resolve_within(&host, port, ctx.connect_timeout).await {
         Ok(addresses) => addresses,
-        Err(error) => {
+        Err(failure) => {
             // A resolver failure is not the client's fault (decision D9), so it is
-            // a 502 with the RFC 9209 reason rather than a 400.
-            debug!(stream_id, authority, %error, "failed to resolve target");
-            tunnel::refuse_because(
-                &mut stream,
-                StatusCode::BAD_GATEWAY,
-                ProxyError::DnsError,
-                stream_id,
-            )
-            .await;
+            // a 502 with the RFC 9209 reason rather than a 400 — and a resolver
+            // that never answered is a 504 `dns_timeout` instead, because those
+            // are different things to an operator reading the log.
+            let error = failure.proxy_error();
+            debug!(stream_id, authority, reason = %failure, "failed to resolve target");
+            tunnel::refuse_because(&mut stream, error.recommended_status(), error, stream_id).await;
             return;
         }
     };
@@ -129,7 +126,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         return;
     }
 
-    let tcp = match connect_any(&allowed).await {
+    let tcp = match connect_any(&allowed, ctx.connect_timeout).await {
         Ok(tcp) => tcp,
         Err(failure) => {
             // RFC 9114 §4.4: a proxy that cannot establish the connection
@@ -184,11 +181,66 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 /// Trying every address matters for dual-stack targets, where the AAAA record
 /// may be unreachable while the A record works. The address of the last attempt
 /// travels with the error, since that is the hop the client is told about.
-async fn connect_any(addresses: &[SocketAddr]) -> Result<TcpStream, Unreachable> {
+///
+/// `budget` bounds the **whole** loop rather than each address, so a name with
+/// several unreachable addresses cannot multiply the wait by their number. Why
+/// it is bounded at all: the tunnel slot and the file descriptor behind it are
+/// held for the length of this call, and a target that silently drops SYNs
+/// otherwise holds them for as long as the operating system retries — around two
+/// minutes on Linux. No attacker is needed for that; a handful of black-holed
+/// addresses during ordinary browsing is enough to spend a connection's whole
+/// `max_targets_per_conn` on tunnels that will never open.
+///
+/// One thing this deliberately does not do is notice the client giving up: a
+/// request stream reset mid-connect leaves the attempt running until it finishes
+/// or the budget expires. Bounding it is what makes that acceptable.
+async fn connect_any(
+    addresses: &[SocketAddr],
+    budget: Option<Duration>,
+) -> Result<TcpStream, Unreachable> {
+    connect_any_with(addresses, budget, TcpStream::connect).await
+}
+
+/// [`connect_any`] with the per-address connect step supplied by the caller.
+///
+/// Split out only so the budget can be tested against a connect that never
+/// completes; production always passes [`TcpStream::connect`].
+async fn connect_any_with<C, F>(
+    addresses: &[SocketAddr],
+    budget: Option<Duration>,
+    connect: C,
+) -> Result<TcpStream, Unreachable>
+where
+    C: Fn(SocketAddr) -> F,
+    F: std::future::Future<Output = io::Result<TcpStream>>,
+{
+    // Taken once, before the first attempt: every address draws on the same
+    // budget.
+    let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
     let mut last = None;
 
     for address in addresses {
-        match TcpStream::connect(address).await {
+        let attempt = connect(*address);
+
+        let result = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, attempt).await {
+                Ok(result) => result,
+                // Reported as the hop that was still in flight, which is the one
+                // the client is waiting on.
+                Err(_) => {
+                    return Err(Unreachable {
+                        next_hop: Some(*address),
+                        error: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "the connect budget expired before the target answered",
+                        ),
+                    })
+                }
+            },
+            None => attempt.await,
+        };
+
+        match result {
             Ok(tcp) => return Ok(tcp),
             Err(error) => {
                 debug!(%address, %error, "target address unreachable, trying the next");
@@ -413,7 +465,119 @@ fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_authority;
+    use super::{connect_any_with, split_authority};
+    use std::io;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+
+    fn address(literal: &str) -> SocketAddr {
+        literal.parse().expect("socket address")
+    }
+
+    /// A target that black-holes SYNs is the case the budget exists for: the
+    /// operating system would keep retrying for around two minutes, and the
+    /// tunnel slot and file descriptor are held for all of it.
+    ///
+    /// Real time with a small budget rather than a paused clock, because tokio's
+    /// `test-util` feature is not enabled in this tree. The upper bound is two
+    /// orders of magnitude above the budget, so only an unbounded wait fails it.
+    #[tokio::test]
+    async fn the_connect_budget_bounds_a_target_that_never_answers() {
+        let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
+        let budget = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+
+        // The outer timeout is what turns a regression here into a failure
+        // rather than a hung test run.
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_any_with(&addresses, Some(budget), |_| {
+                std::future::pending::<io::Result<TcpStream>>()
+            }),
+        )
+        .await
+        .expect("the budget must bound the wait")
+        .expect_err("a connect that never answers must not succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
+        // The hop named is the one still in flight, which is the one the client
+        // is waiting on.
+        assert_eq!(failure.next_hop, Some(addresses[0]));
+        assert!(elapsed >= budget, "returned early, after {elapsed:?}");
+    }
+
+    /// One budget for the whole list, not one per address: several unreachable
+    /// addresses must not multiply the wait by their number.
+    ///
+    /// The first address spends three quarters of the budget and fails, the
+    /// second never answers. Shared, that ends at the budget; one budget each
+    /// would end at 1.75 times it, which the upper bound below excludes.
+    #[tokio::test]
+    async fn every_address_draws_on_the_same_budget() {
+        let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
+        let budget = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_any_with(&addresses, Some(budget), |address| async move {
+                if address == addresses[0] {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+                }
+                std::future::pending().await
+            }),
+        )
+        .await
+        .expect("the budget must bound the wait")
+        .expect_err("the budget must expire");
+        let elapsed = started.elapsed();
+
+        assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(failure.next_hop, Some(addresses[1]));
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "the second address got a budget of its own: {elapsed:?}"
+        );
+    }
+
+    /// With the budget disabled the loop behaves exactly as it did before it
+    /// existed: every address is tried, and the last failure is what travels out.
+    #[tokio::test]
+    async fn a_disabled_budget_tries_every_address() {
+        let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
+        let attempted = std::cell::RefCell::new(Vec::new());
+
+        let failure = connect_any_with(&addresses, None, |address| {
+            attempted.borrow_mut().push(address);
+            async move { Err(io::Error::from(io::ErrorKind::ConnectionRefused)) }
+        })
+        .await
+        .expect_err("every address refuses");
+
+        assert_eq!(attempted.into_inner(), addresses);
+        assert_eq!(failure.error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(failure.next_hop, Some(addresses[1]));
+    }
+
+    /// An empty list has no hop to name, and must not be reported as a timeout.
+    #[tokio::test]
+    async fn an_empty_address_list_names_no_hop() {
+        let failure = tokio::time::timeout(
+            Duration::from_secs(5),
+            connect_any_with(&[], Some(Duration::from_secs(10)), |_| {
+                std::future::pending::<io::Result<TcpStream>>()
+            }),
+        )
+        .await
+        .expect("an empty list needs no waiting at all")
+        .expect_err("there is nothing to connect to");
+
+        assert_eq!(failure.error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(failure.next_hop, None);
+    }
 
     #[test]
     fn accepts_host_and_port() {
