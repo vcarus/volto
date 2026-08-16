@@ -158,7 +158,7 @@ initial_rtt_ms = 150
 # That is loopback, RFC 1918, link-local, shared address space (100.64.0.0/10,
 # the inside of a carrier-grade NAT), IETF protocol assignments (192.0.0.0/24),
 # benchmarking (198.18.0.0/15), reserved space (240.0.0.0/4), the documentation
-# ranges, ULA, 2001:db8::/32 and 100::/64.
+# ranges, ULA, the deprecated site-local fec0::/10, 2001:db8::/32 and 100::/64.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust

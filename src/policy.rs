@@ -26,8 +26,8 @@
 //! * **Private** — everything RFC 6890 calls special-purpose and this proxy
 //!   might actually reach: loopback, RFC 1918, link-local, shared address space,
 //!   the benchmarking and documentation ranges, reserved space, ULA and the
-//!   deprecated IPv4-compatible space. Denied by default, unlocked by
-//!   `allow_private_networks`.
+//!   deprecated IPv4-compatible and IPv6 site-local spaces. Denied by default,
+//!   unlocked by `allow_private_networks`.
 //!
 //! # Transition addresses are judged as IPv4
 //!
@@ -176,6 +176,12 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// networks number their own infrastructure with, `192.0.0.0/24` holds protocol
 /// assignments including the DS-Lite `192.0.0.0/29` link, and `240.0.0.0/4` is
 /// routed inside more than one large private network in practice.
+///
+/// One entry is here despite having left the registry: `fec0::/10`, the IPv6
+/// site-local prefix RFC 3879 deprecated. New stacks treat it as global unicast,
+/// which is exactly why it is worth denying — a network that numbered its
+/// interior with it before 2004 still routes it, and nothing on the public
+/// internet answers there, so a request for it is either a mistake or a way in.
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -202,6 +208,7 @@ fn is_private(ip: IpAddr) -> bool {
             v6.is_loopback()
                 || is_unique_local(v6)
                 || is_unicast_link_local(v6)
+                || is_site_local(v6)
                 || is_ipv4_compatible(v6)
                 || is_ipv6_documentation(v6)
                 || is_discard_only(v6)
@@ -310,6 +317,15 @@ fn is_unicast_link_local(v6: Ipv6Addr) -> bool {
     v6.segments()[0] & 0xffc0 == 0xfe80
 }
 
+/// `fec0::/10` — the deprecated site-local unicast prefix (RFC 3879).
+///
+/// Adjacent to link-local and, on a network old enough to still use it, just as
+/// internal. Nothing routes it globally, so denying it costs no legitimate
+/// destination.
+fn is_site_local(v6: Ipv6Addr) -> bool {
+    v6.segments()[0] & 0xffc0 == 0xfec0
+}
+
 /// `::/96` — the deprecated IPv4-compatible range, and `::1` with it.
 ///
 /// Treated as private rather than as ordinary IPv6: stacks that still honour the
@@ -370,6 +386,10 @@ mod tests {
         "fdff::1",
         "fe80::1",
         "febf::1",
+        // RFC 3879 deprecated site-local, still routed on networks that predate
+        // the deprecation.
+        "fec0::1",
+        "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
         // RFC 3849 documentation and the RFC 6666 discard prefix.
         "2001:db8::1",
         "100::1",
@@ -400,7 +420,7 @@ mod tests {
         "2001:4860:4860::8888",
         "2606:4700::1111",
         "fbff::1",      // just below fc00::/7
-        "fec0::1",      // just above fe80::/10
+        "fe7f::1",      // just below fe80::/10; above it fec0::/10 runs into ff00::/8
         "2001:db9::1",  // just above 2001:db8::/32
         "100:0:0:1::1", // just outside 100::/64
     ];
@@ -559,6 +579,28 @@ mod tests {
         // opening private space does not open it.
         assert!(!policy(true, &[]).allows_address(ip("255.255.255.255")));
         assert!(policy(true, &[]).allows_address(ip("240.0.0.1")));
+
+        // fec0::/10 has no public neighbour on either side: below it is fe80::/10
+        // (link-local, private) and above it ff00::/8 (multicast, never), so the
+        // edges are stated against those instead. The nearest public address is
+        // the one just below fe80::/10.
+        assert!(strict.allows_address(ip("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff")));
+        for private in [
+            "fe80::",
+            "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fec0::",
+            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(
+                !strict.allows_address(ip(private)),
+                "{private} is inside a private range and must be denied"
+            );
+            assert!(
+                policy(true, &[]).allows_address(ip(private)),
+                "{private} must follow the switch"
+            );
+        }
+        assert!(!policy(true, &[]).allows_address(ip("ff00::")));
     }
 
     /// NAT64, 6to4 and Teredo addresses are routes to an IPv4 address, so they
