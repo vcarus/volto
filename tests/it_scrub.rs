@@ -19,7 +19,11 @@
 //!   line with the pattern *redacted* — CI logs are public too.
 //!
 //! With neither source present the literal check simply does not run, which is
-//! the right outcome for a fork or a checkout without the notes.
+//! the right outcome for a fork or a checkout without the notes — with one
+//! exception. On a push to the canonical repository the secret is supposed to be
+//! there, and a run that finds it missing must say so loudly rather than pass
+//! with the gate half open: a renamed or expired secret would otherwise turn the
+//! whole check into a no-op without anyone noticing.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,6 +121,17 @@ fn scrub_patterns(root: &Path) -> Vec<String> {
     patterns
 }
 
+/// Whether this is GitHub Actions running a `push` in the repository that owns
+/// the secret.
+///
+/// Only there is an empty pattern list a failure: a fork has no secret, and a
+/// pull request — including Dependabot's — runs without repository secrets by
+/// design, so both legitimately fall back to the CJK check alone.
+fn is_push_to_canonical_repository() -> bool {
+    std::env::var("GITHUB_EVENT_NAME").as_deref() == Ok("push")
+        && std::env::var("GITHUB_REPOSITORY").as_deref() == Ok("vcarus/volto")
+}
+
 /// Public repository, English only: no CJK anywhere in the tracked tree.
 #[test]
 fn no_tracked_file_contains_cjk_characters() {
@@ -162,6 +177,12 @@ fn no_tracked_file_contains_a_private_literal() {
 
     let patterns = scrub_patterns(&root);
     if patterns.is_empty() {
+        assert!(
+            !is_push_to_canonical_repository(),
+            "no scrub patterns available on a push to the canonical repository: the \
+             VOLTO_SCRUB_PATTERNS secret is missing or empty, so the private-literal \
+             gate did not run"
+        );
         eprintln!(
             "no scrub patterns available (set VOLTO_SCRUB_PATTERNS or provide \
              dev_docs/scrub-patterns.txt); only the CJK check ran"
