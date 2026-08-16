@@ -153,13 +153,20 @@ users = [
 initial_rtt_ms = 150
 
 [security]
-# Allow tunnels to loopback, RFC 1918, link-local and ULA addresses.
+# Allow tunnels to the address space RFC 6890 marks special-purpose.
+#
+# That is loopback, RFC 1918, link-local, shared address space (100.64.0.0/10,
+# the inside of a carrier-grade NAT), IETF protocol assignments (192.0.0.0/24),
+# benchmarking (198.18.0.0/15), reserved space (240.0.0.0/4), the documentation
+# ranges, ULA, 2001:db8::/32 and 100::/64.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust
 # 127.0.0.1 or a private range without further authentication. IPv4-mapped
-# addresses (`::ffff:127.0.0.1`) are normalized before matching, so turning this
-# off cannot be worked around that way.
+# addresses (`::ffff:127.0.0.1`) are normalized before matching, and IPv6
+# transition addresses (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16,
+# Teredo 2001::/32) are judged by the IPv4 address they carry, so turning this
+# off cannot be worked around either way.
 #
 # Multicast, broadcast and the unspecified address are refused regardless of this
 # setting — they are amplification primitives, not destinations.

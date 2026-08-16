@@ -101,13 +101,18 @@ timer fire early and retransmit packets that were never lost.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `allow_private_networks` | bool | `false` | Allow tunnels to loopback, RFC 1918, link-local and ULA addresses. Keep it off on a public deployment |
+| `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it |
 
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
   `::127.0.0.1` gets past `allow_private_networks = false`.
+- IPv6 transition addresses are judged by the IPv4 address they carry, because
+  that is what a host routing them actually reaches: NAT64 (`64:ff9b::/96` and
+  `64:ff9b:1::/48`), 6to4 (`2002::/16`) and Teredo (`2001::/32`). So
+  `64:ff9b::7f00:1` is refused as the 127.0.0.1 it is, while `64:ff9b::808:808`
+  is reachable as 8.8.8.8.
 - Multicast, broadcast and the unspecified address are never dialled,
   **regardless** of that setting. They are amplification primitives, not
   destinations. What the client is *told* about the unspecified address is a

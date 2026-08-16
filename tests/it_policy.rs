@@ -286,6 +286,61 @@ async fn ipv4_mapped_and_ipv6_loopback_are_prohibited() {
     }
 }
 
+/// RFC 6890's special-purpose space is not public space.
+///
+/// `100.64.0.0/10` is where a carrier-grade NAT keeps its subscribers, so a
+/// proxy that dials it is reaching into somebody's private network with the
+/// proxy's own source address — the thing `allow_private_networks = false`
+/// exists to prevent. The same goes for a transition address that carries a
+/// private IPv4 address: `64:ff9b::7f00:1` is a route to 127.0.0.1 written as a
+/// global-looking IPv6 literal.
+#[tokio::test]
+async fn special_purpose_and_transition_addresses_are_prohibited_by_default() {
+    let server = TestServer::start_with("").await;
+    let mut client = H3Client::connect(&server).await;
+
+    for authority in [
+        "100.64.0.1:443",
+        "[64:ff9b::7f00:1]:443",
+        "[2002:a00:1::]:443",
+    ] {
+        let response = respond_to(&mut client, connect_request(authority)).await;
+        assert_refused(
+            &response,
+            StatusCode::FORBIDDEN,
+            "destination_ip_prohibited",
+        );
+    }
+}
+
+/// The other half: the switch reaches them like any other private range.
+///
+/// "Reachable" is asserted as "not refused by this proxy", and deliberately no
+/// further. What happens after the policy lets the address through belongs to
+/// the network the test runs on — 100.64.0.0/10 is unroutable on one host, the
+/// path to the ISP's own CGNAT on the next — so any answer other than the policy
+/// refusal is the whole observable difference. The connect budget is pinned low
+/// so a host where the range black-holes still answers promptly.
+#[tokio::test]
+async fn special_purpose_addresses_are_reachable_when_private_space_is_allowed() {
+    let server =
+        TestServer::start_with(&format!("[limits]\nconnect_timeout = 1\n{ALLOW_PRIVATE}")).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let response = respond_to(&mut client, connect_request("100.64.0.1:443")).await;
+    assert_ne!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "the address must not be refused by policy once private space is open"
+    );
+    if let Some(reason) = proxy_status(&response) {
+        assert!(
+            !reason.contains("destination_ip_prohibited"),
+            "the policy must not be what refused it: {reason}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn connect_udp_to_a_prohibited_address_is_refused() {
     let server = TestServer::start_with("").await;
