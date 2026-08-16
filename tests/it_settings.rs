@@ -9,8 +9,12 @@
 mod common;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
-use common::{connect_quic, connect_request, H3Client, TestServer, TIMEOUT};
+use bytes::{Bytes, BytesMut};
+use common::{connect_quic, connect_request, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT};
+use volto::capsule::{Capsule, CapsuleDecoder};
+use volto::datagram;
 
 /// Unidirectional stream type of the HTTP/3 control stream (RFC 9114 §6.2.1).
 const STREAM_TYPE_CONTROL: u64 = 0x00;
@@ -29,6 +33,12 @@ const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
+
+/// HEADERS frame type (RFC 9114 §7.2.2).
+const FRAME_HEADERS: u64 = 0x01;
+
+/// DATA frame type (RFC 9114 §7.2.1).
+const FRAME_DATA: u64 = 0x00;
 
 /// How many unidirectional streams to inspect before giving up.
 ///
@@ -263,4 +273,177 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     }
 
     Some((value, length))
+}
+
+// ---------------------------------------------------------------------------
+// The peer's SETTINGS, arriving after the first request
+// ---------------------------------------------------------------------------
+
+/// A CONNECT-UDP session opened before the peer's SETTINGS were processed must
+/// still move onto QUIC datagrams once they arrive.
+///
+/// `h3` reads the control stream whenever the accept future is polled, so its
+/// own view of the peer's settings flips as soon as the SETTINGS frame lands —
+/// but this server's copy of it used to be refreshed only when a *request* was
+/// accepted. A session started before that point therefore stayed on the
+/// RFC 9297 capsule fallback for target-to-client traffic until another request
+/// happened along, which on a connection that opens one tunnel and keeps it is
+/// never.
+///
+/// The in-repo `h3` client cannot produce that ordering: it sends SETTINGS as
+/// part of connection setup, before any request can be made. So the client here
+/// is raw quinn with a hand-encoded HEADERS frame, and the ordering is the whole
+/// point — request first, control stream second.
+#[tokio::test]
+async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    // A CONNECT-UDP request on a bare QUIC connection: no control stream, so the
+    // server has no peer settings to read and cannot know datagrams are allowed.
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    let quarter_stream_id = datagram::quarter_stream_id(u64::from(send.id()));
+    send.write_all(&connect_udp_headers_frame(
+        &server.addr.to_string(),
+        &target.ip().to_string(),
+        target.port(),
+    ))
+    .await
+    .expect("send the CONNECT-UDP request");
+
+    // The response proves the session is established *now*, i.e. before anything
+    // below sends SETTINGS. Without this the request and the settings could be
+    // processed together and the ordering under test would never happen.
+    let (frame_type, _) = read_frame(&mut recv).await;
+    assert_eq!(
+        frame_type, FRAME_HEADERS,
+        "the server must answer the request with a HEADERS frame"
+    );
+
+    // And with datagrams not known to be allowed, the reply travels as a capsule
+    // on the request stream — the fallback this test is about escaping.
+    connection
+        .send_datagram(datagram::encode_udp_payload(
+            quarter_stream_id,
+            b"before settings",
+        ))
+        .expect("send a UDP payload as a QUIC datagram");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(
+        frame_type, FRAME_DATA,
+        "the capsule stream travels in DATA frames"
+    );
+    let mut decoder = CapsuleDecoder::new();
+    decoder.push(Bytes::from(payload));
+    match decoder.next_capsule().expect("well-formed capsules") {
+        Some(Capsule::Datagram {
+            context_id,
+            payload,
+        }) => {
+            assert_eq!(context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
+            assert_eq!(&payload[..], b"before settings");
+        }
+        other => panic!("expected a DATAGRAM capsule, got {other:?}"),
+    }
+
+    // Only now does the peer say datagrams are allowed. The control stream is
+    // kept open for the rest of the test: closing it is H3_CLOSED_CRITICAL_STREAM.
+    let mut control = connection
+        .open_uni()
+        .await
+        .expect("open the control stream");
+    control
+        .write_all(&control_stream_with_datagrams_enabled())
+        .await
+        .expect("send SETTINGS");
+
+    // From here the reply must arrive as a QUIC datagram. Retried rather than
+    // slept on: the server samples the peer's settings on a timer, so which side
+    // of the flip a single packet lands on is a race, while *never* flipping is
+    // the bug.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the session never moved onto QUIC datagrams after the peer's SETTINGS              enabled them"
+        );
+
+        connection
+            .send_datagram(datagram::encode_udp_payload(
+                quarter_stream_id,
+                b"after settings",
+            ))
+            .expect("send a UDP payload as a QUIC datagram");
+
+        match tokio::time::timeout(Duration::from_millis(200), connection.read_datagram()).await {
+            Ok(raw) => {
+                let decoded = datagram::decode(raw.expect("read a datagram"))
+                    .expect("server datagrams must be well formed");
+                assert_eq!(decoded.quarter_stream_id, quarter_stream_id);
+                assert_eq!(decoded.context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
+                assert_eq!(&decoded.payload[..], b"after settings");
+                break;
+            }
+            // Nothing yet; the flag may not have been sampled. Try again.
+            Err(_) => continue,
+        }
+    }
+}
+
+/// Encodes a CONNECT-UDP request (RFC 9298 §3) as an HTTP/3 HEADERS frame.
+///
+/// Hand-built because the point of the test above is an ordering the `h3` client
+/// cannot produce. QPACK is used statelessly, which needs no encoder stream.
+fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<u8> {
+    use h3::qpack::{encode_stateless, HeaderField};
+
+    let fields = vec![
+        HeaderField::new(&b":method"[..], &b"CONNECT"[..]),
+        HeaderField::new(&b":protocol"[..], &b"connect-udp"[..]),
+        HeaderField::new(&b":scheme"[..], &b"https"[..]),
+        HeaderField::new(&b":authority"[..], authority.as_bytes()),
+        HeaderField::new(
+            &b":path"[..],
+            format!("/.well-known/masque/udp/{host}/{port}/").into_bytes(),
+        ),
+    ];
+
+    let mut block = Vec::new();
+    encode_stateless(&mut block, &fields).expect("qpack encoding");
+
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, block.len() as u64);
+    frame.extend_from_slice(&block);
+    frame.to_vec()
+}
+
+/// The bytes of a client control stream whose SETTINGS enable HTTP Datagrams.
+fn control_stream_with_datagrams_enabled() -> Vec<u8> {
+    let mut settings = BytesMut::new();
+    datagram::put_varint(&mut settings, SETTINGS_H3_DATAGRAM);
+    datagram::put_varint(&mut settings, 1);
+
+    let mut stream = BytesMut::new();
+    datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
+    datagram::put_varint(&mut stream, FRAME_SETTINGS);
+    datagram::put_varint(&mut stream, settings.len() as u64);
+    stream.extend_from_slice(&settings);
+    stream.to_vec()
+}
+
+/// Reads one HTTP/3 frame from a raw request stream.
+async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
+    let frame_type = read_varint(recv).await;
+    let length = read_varint(recv).await;
+
+    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
+        .await
+        .expect("frame payload arrived")
+        .expect("frame payload");
+
+    (frame_type, payload)
 }
