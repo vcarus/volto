@@ -285,7 +285,8 @@ sudo sysctl -w net.core.wmem_max=8388608
 
 `systemctl reload volto` sends SIGHUP. volto re-reads the configuration file and
 applies it to connections accepted from then on: a renewed certificate, a changed
-user list, changed transport parameters. Established connections keep the
+user list, a raised or lowered `limits.max_connections`, changed transport
+parameters. Established connections keep the
 configuration they were accepted with — a tunnel's rules must not change
 mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
 

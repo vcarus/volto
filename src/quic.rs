@@ -299,8 +299,6 @@ impl Server {
         let mut shutdown = self.shutdown.clone();
         let mut connections = JoinSet::new();
 
-        let max_connections = config.limits.max_connections;
-
         loop {
             // Reap eagerly rather than only in the select below: with `biased`
             // ordering a steady stream of new connections would starve that
@@ -320,6 +318,14 @@ impl Server {
                         // The endpoint was closed from elsewhere.
                         break;
                     };
+
+                    // Read per accepted connection rather than snapshotted
+                    // before the loop: `docs/deployment.md#reloading` promises a
+                    // reload applies to connections accepted from then on, and
+                    // lowering this cap during an incident is exactly the sort of
+                    // thing that promise is for. The cost is an `Arc` load on a
+                    // path that is already opening a QUIC connection.
+                    let max_connections = self.config().limits.max_connections;
 
                     if max_connections > 0 && connections.len() >= max_connections as usize {
                         // Refused at the QUIC layer: the peer is told immediately

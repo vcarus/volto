@@ -154,6 +154,80 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
     );
 }
 
+/// Attempts a bare QUIC connection, reporting whether the server took it.
+///
+/// A connection past the cap is refused during the handshake, so the attempt
+/// fails rather than producing a connection that is then unusable.
+async fn connect_attempt(server: &TestServer) -> bool {
+    let endpoint = common::client_endpoint(&server.ca, &["h3"]);
+    tokio::time::timeout(
+        TIMEOUT,
+        endpoint
+            .connect(server.addr, "localhost")
+            .expect("start connecting"),
+    )
+    .await
+    .expect("the attempt finished")
+    .is_ok()
+}
+
+/// `max_connections` is read per accepted connection, so a reload moves it.
+///
+/// This is the knob an operator turns during an incident, and
+/// `docs/deployment.md#reloading` promises it applies to connections accepted
+/// from then on. It used to be copied into a local once, before the accept loop,
+/// so neither raising nor lowering it did anything until a restart.
+#[tokio::test]
+async fn reloading_replaces_the_connection_cap() {
+    let server =
+        TestServer::start_with(&format!("[limits]\nmax_connections = 1\n{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+
+    // One connection fits, and is kept for the rest of the test so the cap keeps
+    // biting.
+    let mut first = H3Client::connect(&server).await;
+    assert_eq!(
+        respond_to(&mut first, connect_request(&target.to_string()))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        !connect_attempt(&server).await,
+        "a second connection must be refused while the cap is 1"
+    );
+
+    // Raised: the second connection now fits.
+    server.rewrite_config(&format!("[limits]\nmax_connections = 2\n{ALLOW_PRIVATE}"));
+    server.reload().expect("a valid configuration must apply");
+
+    let mut second = H3Client::connect(&server).await;
+    assert_eq!(
+        respond_to(&mut second, connect_request(&target.to_string()))
+            .await
+            .status(),
+        StatusCode::OK,
+        "the raised cap must apply to connections accepted after the reload"
+    );
+
+    // Lowered again, below what is already open: the connections that exist are
+    // left alone, and the next one is refused.
+    server.rewrite_config(&format!("[limits]\nmax_connections = 1\n{ALLOW_PRIVATE}"));
+    server.reload().expect("a valid configuration must apply");
+
+    assert!(
+        !connect_attempt(&server).await,
+        "the lowered cap must apply to connections accepted after the reload"
+    );
+    assert_eq!(
+        respond_to(&mut first, connect_request(&target.to_string()))
+            .await
+            .status(),
+        StatusCode::OK,
+        "connections already open must survive a lowered cap"
+    );
+}
+
 /// A reload can also tighten the destination policy.
 #[tokio::test]
 async fn reloading_replaces_the_destination_policy() {
