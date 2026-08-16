@@ -13,6 +13,8 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # Actions are pinned to commit SHAs with the release in a trailing comment;
+  # Dependabot updates the SHA and the comment together.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

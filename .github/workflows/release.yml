@@ -7,6 +7,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Only the job that publishes gets to write, and only to releases (see below).
+# Actions are pinned to full commit SHAs, as in ci.yml, because this workflow
+# holds the token that could replace a published archive.
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build (${{ matrix.target }})
@@ -18,12 +24,12 @@ jobs:
           - x86_64-unknown-linux-musl
           - aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Static musl binaries, so a release runs on any glibc vintage. ring needs
       # a working cross C toolchain for aarch64, which is what `cross` provides;
       # --locked keeps the load-bearing h3/h3-quinn git pins intact.
-      - uses: houseabsolute/actions-rust-cross@v1
+      - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build
           target: ${{ matrix.target }}
@@ -47,7 +53,7 @@ jobs:
              script/config.example.toml script/masque.service "dist/${name}/script/"
           tar -C dist -czf "${name}.tar.gz" "${name}"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: volto-${{ matrix.target }}
           path: "*.tar.gz"
@@ -63,9 +69,9 @@ jobs:
       # The changelog lives in the tag's annotation. Check the repository out
       # before anything else: checkout cleans the workspace, so the artifacts
       # have to land after it.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
@@ -107,7 +113,7 @@ jobs:
           BOILERPLATE
           cat notes.md
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
             artifacts/*.tar.gz

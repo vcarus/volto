@@ -10,6 +10,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# The token every job gets unless it says otherwise. Nothing here writes to the
+# repository, so nothing here can be made to.
+permissions:
+  contents: read
+
+# Every action is pinned to a full commit SHA, with the release it corresponds
+# to in a trailing comment; a tag like `@v7` can be moved, a SHA cannot.
+# Dependabot reads the comment and bumps both together. `dtolnay/rust-toolchain`
+# is the odd one out: it selects the toolchain from the ref it is called with, so
+# a SHA pin has to sit on its master branch and name the toolchain explicitly.
+
 env:
   CARGO_TERM_COLOR: always
   # The h3/h3-quinn pins are load-bearing: CI must build the committed lockfile.
@@ -20,9 +31,10 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --check
 
@@ -30,12 +42,19 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --all-targets --locked -- -D warnings
+      # rustdoc's own lints -- a link to an item that does not exist, or that a
+      # public reader cannot see -- are warnings by default and nothing else
+      # runs rustdoc, so they would accumulate unseen.
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   audit:
     # RustSec advisories against the committed `Cargo.lock`. Dependabot already
@@ -61,14 +80,14 @@ jobs:
       # issues on a `schedule` trigger, which this workflow does not have.
       checks: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Fails the check on a vulnerability. Informational advisories -- an
       # unmaintained or yanked crate -- are reported in the check run without
       # failing, so they can be seen and acted on at leisure (that is how the
       # `rustls-pemfile` advisory was noticed and the crate dropped). Should a
       # real vulnerability ever have to be accepted, add its RUSTSEC id to
       # `ignore:` with the reason rather than deleting this job.
-      - uses: rustsec/audit-check@v2
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -82,9 +101,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo test --locked
         env:
           # The scrub gate (tests/it_scrub.rs) looks for private literals that
@@ -118,10 +139,12 @@ jobs:
       VOLTO_USER: interop
       VOLTO_PASSWORD: interop-password-not-a-secret
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # Single source of truth for the Go version: the module's own go.mod.
           go-version-file: tests/interop/go.mod
