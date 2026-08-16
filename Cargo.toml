@@ -40,7 +40,9 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "logging",
 ] }
-rustls-pemfile = "2"
+# PEM parsing comes from rustls' own `pki_types::pem::PemObject` (rustls-pki-types
+# >= 1.9); `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134) and was only a
+# wrapper around the same code.
 
 tokio = { version = "1", features = [
     "rt-multi-thread",

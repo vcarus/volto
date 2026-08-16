@@ -6,11 +6,11 @@
 //! keeps behaviour independent of initialisation order elsewhere in the process.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::config;
@@ -48,7 +48,7 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open server.cert = {}", path.display()))?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut BufReader::new(file))
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(file)
         .collect::<std::result::Result<_, _>>()
         .with_context(|| format!("failed to parse server.cert = {}", path.display()))?;
 
@@ -66,14 +66,16 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open server.key = {}", path.display()))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(file))
-        .with_context(|| format!("failed to parse server.key = {}", path.display()))?;
-
-    match key {
-        Some(key) => Ok(key),
-        None => bail!(
+    // `PrivateKeyDer` accepts PKCS#8, PKCS#1 and SEC1 sections and skips any
+    // other PEM object on the way, so a bundle file works too.
+    match PrivateKeyDer::from_pem_reader(file) {
+        Ok(key) => Ok(key),
+        Err(pem::Error::NoItemsFound) => bail!(
             "server.key = {} contains no PRIVATE KEY block",
             path.display()
         ),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to parse server.key = {}", path.display()))
+        }
     }
 }

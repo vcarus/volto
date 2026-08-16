@@ -63,12 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # Fails the check on a vulnerability. Informational advisories -- an
-      # unmaintained or yanked crate -- are reported without failing, which is the
-      # behaviour we want: `rustls-pemfile` is already unmaintained
-      # (RUSTSEC-2025-0134) with no drop-in replacement, and an advisory nobody can
-      # act on should not block every merge. Should a real vulnerability ever have
-      # to be accepted, add its RUSTSEC id to `ignore:` with the reason rather than
-      # deleting this job.
+      # unmaintained or yanked crate -- are reported in the check run without
+      # failing, so they can be seen and acted on at leisure (that is how the
+      # `rustls-pemfile` advisory was noticed and the crate dropped). Should a
+      # real vulnerability ever have to be accepted, add its RUSTSEC id to
+      # `ignore:` with the reason rather than deleting this job.
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
