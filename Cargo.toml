@@ -73,6 +73,14 @@ anyhow = "1"
 # bit (Linux only, behind cfg in net.rs).
 libc = "0.2"
 
+# SO_RCVBUF/SO_SNDBUF on the endpoint's UDP socket (D56). Already in the tree via
+# quinn-udp, so this is a direct dependency on a crate that was being compiled
+# anyway. Used directly rather than through `quinn::udp::UdpSocketState`, whose
+# setter is a `&self` method: reaching it would mean constructing a
+# `UdpSocketState` -- a whole batch of setsockopts -- purely to call the same
+# one-line `socket2::SockRef` wrapper quinn repeats when it wraps the socket.
+socket2 = "0.6"
+
 [dev-dependencies]
 rcgen = "0.14"
 # Property tests (`tests/it_props.rs`) over the three hand-rolled parsers that

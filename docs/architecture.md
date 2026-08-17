@@ -25,6 +25,15 @@ the stream cap, idle timeout, keep-alive, MTU settings, congestion controller an
 initial RTT are configuration rather than constants; they apply to connections
 accepted from then on, including across a SIGHUP reload.
 
+The UDP socket underneath is bound here rather than by `quinn::Endpoint::server`,
+which is a bare `std::net::UdpSocket::bind` and never sets `SO_RCVBUF`/`SO_SNDBUF`
+— a server that does not ask keeps `net.core.rmem_default` whatever `rmem_max`
+says. `limits.socket_recv_buffer` / `socket_send_buffer` are requested at that
+moment and the granted sizes read back, so a capped request becomes a startup
+warning rather than silent packet loss. Being a property of the socket rather
+than of a connection, these two are the only `[limits]` keys a reload cannot
+change.
+
 Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and
 `SETTINGS_H3_DATAGRAM` (0x33). Surge checks for both and disconnects if either is

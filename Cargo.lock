@@ -1395,6 +1395,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "serde",
+ "socket2",
  "subtle",
  "tokio",
  "toml",

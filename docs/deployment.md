@@ -273,13 +273,37 @@ line up: 256 connections × 256 tunnels = 65536 = `LimitNOFILE`. volto checks
 `RLIMIT_NOFILE` at startup and warns when the margin is thin, which is worth
 heeding rather than silencing.
 
-On a high-bandwidth path the kernel's default UDP socket buffers become the
-packet-loss point. quinn does not change system values for you:
+## UDP socket buffers
+
+On a high-bandwidth path the kernel's UDP socket buffers are where packets are
+dropped first, and two different sysctls decide how big they are. Only one of
+them is a ceiling:
+
+* `net.core.rmem_default` / `wmem_default` is what a socket gets when the
+  application never asks — about 208 KiB on a stock Linux.
+* `net.core.rmem_max` / `wmem_max` is the most an application may *request*.
+  Raising it does nothing at all for a program that does not ask.
+
+volto asks. `limits.socket_recv_buffer` and `limits.socket_send_buffer` are
+requested when the socket is created — 2 MiB each by default — so on this server
+the ceiling is the sysctl that matters:
 
 ```sh
-sudo sysctl -w net.core.rmem_max=8388608
-sudo sysctl -w net.core.wmem_max=8388608
+sudo sysctl -w net.core.rmem_max=4194304
+sudo sysctl -w net.core.wmem_max=4194304
 ```
+
+Sized so the default request fits with room to spare; put the same lines in
+`/etc/sysctl.d/` to survive a reboot. When the kernel caps the request instead,
+volto warns at startup and names the sysctl to raise, so a host that never had
+these touched says so in its own log rather than dropping packets quietly.
+
+Two readings that look wrong and are not. Linux reports a granted buffer as
+double the size — the accounting includes per-packet overhead — so a satisfied
+2 MiB request shows as `rb 4194304` in `ss -uanpm`, and that same number is what
+the startup line prints as `so_rcvbuf`. And both keys take effect only when the
+socket is created: a reload does not rebind it, so changing them needs a
+restart. `0` hands the size back to the operating system.
 
 ## Reloading
 

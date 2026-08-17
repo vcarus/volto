@@ -5,9 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
+use socket2::SockRef;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -211,6 +212,9 @@ type LiveConfig = Arc<RwLock<Arc<Config>>>;
 /// A bound QUIC endpoint ready to accept connections.
 pub struct Server {
     endpoint: quinn::Endpoint,
+    /// What the kernel granted for the endpoint socket's buffers, for the
+    /// startup line. Fixed at bind time: nothing reloadable can change it.
+    socket_buffers: SocketBuffers,
     config: LiveConfig,
     /// Fires the graceful shutdown. Handed to whoever watches for signals.
     trigger: Trigger,
@@ -220,11 +224,32 @@ pub struct Server {
 
 impl Server {
     /// Binds the UDP socket and prepares the QUIC server configuration.
+    ///
+    /// `quinn::Endpoint::server` is expanded by hand here, because the socket has
+    /// to be reachable between the bind and the endpoint: quinn's own helper is a
+    /// bare `std::net::UdpSocket::bind` and never touches `SO_RCVBUF`/`SO_SNDBUF`,
+    /// so a server that does not ask keeps `net.core.rmem_default` — around
+    /// 208 KiB — however high `net.core.rmem_max` is set, that sysctl being a
+    /// ceiling on requests rather than an allocation (D56). Everything passed to
+    /// [`quinn::Endpoint::new`] below is what the helper passes internally; none
+    /// of it may be dropped in the name of tidiness.
     pub fn bind(config: Arc<Config>) -> Result<Self> {
         let quic_config = server_config(&config)?;
 
-        let endpoint = quinn::Endpoint::server(quic_config, config.server.listen)
+        let socket = std::net::UdpSocket::bind(config.server.listen)
             .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
+
+        let socket_buffers = SocketBuffers::request(&socket, &config.limits);
+
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| anyhow!("no async runtime is available for the QUIC endpoint"))?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(quic_config),
+            socket,
+            runtime,
+        )
+        .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
 
         warn_if_fd_budget_is_tight(config.limits.max_targets_per_conn);
 
@@ -232,6 +257,7 @@ impl Server {
 
         Ok(Self {
             endpoint,
+            socket_buffers,
             config: Arc::new(RwLock::new(config)),
             trigger,
             shutdown,
@@ -293,6 +319,12 @@ impl Server {
             listen = %config.server.listen,
             alpn = ?config.server.alpn,
             grace_secs = config.server.shutdown_grace,
+            // The kernel's numbers, not the configured ones: these are what
+            // `ss -uanpm` prints as `rb` and `tb`, so a log line and an `ss`
+            // reading can be put side by side. Absent when the kernel would not
+            // say, which is why they are `Option`s rather than a sentinel.
+            so_rcvbuf = self.socket_buffers.recv,
+            so_sndbuf = self.socket_buffers.send,
             "accepting QUIC connections"
         );
 
@@ -585,6 +617,160 @@ fn fd_budget_is_tight(limit: u64, max_targets_per_conn: u32) -> bool {
     limit < u64::from(max_targets_per_conn) + FD_HEADROOM
 }
 
+/// One direction of the endpoint socket's buffer, with the names its messages
+/// need.
+///
+/// The two directions differ only in which setsockopt they use and which sysctl
+/// caps them, so they are one code path with this as the parameter rather than
+/// two near-identical ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketBuffer {
+    /// `SO_RCVBUF`: what the kernel holds for us until the endpoint reads it.
+    Recv,
+    /// `SO_SNDBUF`: what the kernel holds for us until the interface sends it.
+    Send,
+}
+
+impl SocketBuffer {
+    /// The `[limits]` key that asks for this buffer.
+    fn key(self) -> &'static str {
+        match self {
+            Self::Recv => "limits.socket_recv_buffer",
+            Self::Send => "limits.socket_send_buffer",
+        }
+    }
+
+    /// The Linux sysctl that caps what may be asked for.
+    fn ceiling_sysctl(self) -> &'static str {
+        match self {
+            Self::Recv => "net.core.rmem_max",
+            Self::Send => "net.core.wmem_max",
+        }
+    }
+}
+
+/// What the kernel reports the endpoint socket's buffers are, after being asked.
+///
+/// Carried from [`Server::bind`] to [`Server::run`] for one reason: the startup
+/// line prints them. They are also the only place the granted sizes are visible
+/// at all, since neither quinn nor this module reads them again.
+#[derive(Debug, Clone, Copy, Default)]
+struct SocketBuffers {
+    /// `SO_RCVBUF` as the kernel reports it, or `None` if it would not say.
+    recv: Option<usize>,
+    /// `SO_SNDBUF` as the kernel reports it, or `None` if it would not say.
+    send: Option<usize>,
+}
+
+impl SocketBuffers {
+    /// Asks for the configured sizes and reads back what the kernel granted.
+    fn request(socket: &std::net::UdpSocket, limits: &crate::config::Limits) -> Self {
+        let socket = SockRef::from(socket);
+
+        Self {
+            recv: request_socket_buffer(&socket, SocketBuffer::Recv, limits.socket_recv_buffer),
+            send: request_socket_buffer(&socket, SocketBuffer::Send, limits.socket_send_buffer),
+        }
+    }
+}
+
+/// Asks the kernel for `requested` bytes of buffer and reports what it granted.
+///
+/// The socket half of the pair; [`socket_buffer_was_capped`] is the judgement,
+/// kept separate so both of its answers can be tested without a socket.
+///
+/// Nothing here is fatal, and that is deliberate. A refused `setsockopt` leaves
+/// the socket exactly where it was — on the operating system's default, which is
+/// where every release before this one ran — so refusing to start over it would
+/// trade a working server for a tuning preference.
+///
+/// Two ways a host can decline. It can clamp, which is what both hosts we build
+/// for do: Linux at `net.core.rmem_max`, macOS at `kern.ipc.maxsockbuf` (8 MiB
+/// by default, measured on Darwin 24). Or it can fail the call outright, which
+/// older macOS releases are documented to do above the same ceiling and which
+/// costs nothing to handle. Both endings are warned about and neither stops the
+/// server; `0` asks for nothing at all, the escape hatch for a host whose
+/// operator has already sized these elsewhere.
+fn request_socket_buffer(
+    socket: &SockRef<'_>,
+    which: SocketBuffer,
+    requested: usize,
+) -> Option<usize> {
+    let refused = if requested == 0 {
+        false
+    } else {
+        let asked = match which {
+            SocketBuffer::Recv => socket.set_recv_buffer_size(requested),
+            SocketBuffer::Send => socket.set_send_buffer_size(requested),
+        };
+
+        match asked {
+            Ok(()) => false,
+            Err(error) => {
+                warn!(
+                    key = which.key(),
+                    requested,
+                    %error,
+                    "the kernel refused the UDP socket buffer {} asks for, so the socket \
+                     keeps the operating system default. Lower the value, or raise this \
+                     host's ceiling ({} on Linux, kern.ipc.maxsockbuf on macOS).",
+                    which.key(),
+                    which.ceiling_sysctl(),
+                );
+                true
+            }
+        }
+    };
+
+    let granted = match which {
+        SocketBuffer::Recv => socket.recv_buffer_size(),
+        SocketBuffer::Send => socket.send_buffer_size(),
+    };
+    let granted = match granted {
+        Ok(granted) => granted,
+        Err(error) => {
+            debug!(
+                key = which.key(),
+                %error,
+                "could not read back the UDP socket buffer size"
+            );
+            return None;
+        }
+    };
+
+    // Skipped after a refusal: that path has already said its piece, and the
+    // read-back would only repeat it in different words.
+    if requested > 0 && !refused && socket_buffer_was_capped(requested, granted) {
+        warn!(
+            key = which.key(),
+            requested,
+            actual = granted,
+            "the kernel granted less UDP socket buffer than {} asks for: a burst that \
+             outruns this socket is dropped there, silently, and has to be sent again. \
+             Raise this host's ceiling (sysctl -w {}=<bytes> on Linux, \
+             kern.ipc.maxsockbuf on macOS) or lower {} so it stops asking for more than \
+             the host allows.",
+            which.key(),
+            which.ceiling_sysctl(),
+            which.key(),
+        );
+    }
+
+    Some(granted)
+}
+
+/// Whether the kernel granted less buffer than was asked for.
+///
+/// Split out from the socket I/O so both answers can be asserted on without one,
+/// and written as `<` rather than `!=` deliberately: Linux reports back **twice**
+/// the size it granted, because `SO_RCVBUF`'s accounting includes per-packet
+/// overhead, while macOS reports the number unchanged. An equality check would
+/// call every Linux host truncated — including the ones that got exactly what
+/// they asked for.
+fn socket_buffer_was_capped(requested: usize, granted: usize) -> bool {
+    granted < requested
+}
+
 /// Aggregate flow-control window for one connection, in bytes.
 ///
 /// 16 MiB against the 2 MiB [`STREAM_RECEIVE_WINDOW`]: eight simultaneously
@@ -749,6 +935,97 @@ mod tests {
         assert!(fd_budget_is_tight(256, 256), "the macOS default pairing");
         assert!(fd_budget_is_tight(1024, 1024));
         assert!(fd_budget_is_tight(64, 1));
+    }
+
+    /// The read-back convention differs by platform, so the judgement is written
+    /// as `<` and has to stay that way.
+    ///
+    /// Linux reports twice what it granted; macOS reports it unchanged. The two
+    /// middle cases below are the ones an equality check would get wrong.
+    #[test]
+    fn a_capped_socket_buffer_is_recognised() {
+        // Linux, request satisfied: doubled on the way back.
+        assert!(!socket_buffer_was_capped(2 * 1024 * 1024, 4 * 1024 * 1024));
+        // macOS, request satisfied: reported unchanged.
+        assert!(!socket_buffer_was_capped(2 * 1024 * 1024, 2 * 1024 * 1024));
+        // Linux, clamped at a stock `net.core.rmem_max` of 212992.
+        assert!(socket_buffer_was_capped(2 * 1024 * 1024, 425_984));
+        // The socket left on an untouched default while a size was asked for.
+        assert!(socket_buffer_was_capped(2 * 1024 * 1024, 212_992));
+    }
+
+    /// A size every host allows is granted, in both directions.
+    ///
+    /// 128 KiB, not the 2 MiB default, and the difference is the whole point:
+    /// GitHub's runners ship `net.core.rmem_max` = 212992, so asserting that the
+    /// default is obtained would fail on CI while saying nothing about this code.
+    /// What is under test is that a request the host *can* satisfy comes back
+    /// classified as satisfied — on either platform's read-back convention.
+    #[test]
+    fn a_modest_socket_buffer_request_is_granted() {
+        const MODEST: usize = 128 * 1024;
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let socket = SockRef::from(&socket);
+
+        for which in [SocketBuffer::Recv, SocketBuffer::Send] {
+            let granted =
+                request_socket_buffer(&socket, which, MODEST).expect("the kernel reports the size");
+            assert!(
+                !socket_buffer_was_capped(MODEST, granted),
+                "{which:?}: 128 KiB is below every stock ceiling, but the kernel \
+                 reported {granted}"
+            );
+        }
+    }
+
+    /// A size no host allows is reported as not granted, however it was declined.
+    ///
+    /// A host may clamp the request (Linux at `net.core.rmem_max`, macOS at
+    /// `kern.ipc.maxsockbuf`) or fail the `setsockopt` outright and leave the
+    /// default in place, and the assertion deliberately does not say which — that
+    /// is a property of the host, not of this code. Both endings must arrive at
+    /// "we did not get what we asked for", because that is the one condition the
+    /// startup warning is built on.
+    #[test]
+    fn an_absurd_socket_buffer_request_is_seen_as_capped() {
+        const ABSURD: usize = 1024 * 1024 * 1024;
+
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let socket = SockRef::from(&socket);
+
+        for which in [SocketBuffer::Recv, SocketBuffer::Send] {
+            let granted =
+                request_socket_buffer(&socket, which, ABSURD).expect("the kernel reports the size");
+            assert!(
+                socket_buffer_was_capped(ABSURD, granted),
+                "{which:?}: 1 GiB cannot have been granted, but the kernel reported \
+                 {granted}"
+            );
+        }
+    }
+
+    /// `0` is the escape hatch: the socket is left exactly as the OS made it.
+    ///
+    /// Measured against a second, untouched socket rather than a constant,
+    /// because the default is a host property (and a doubled one on Linux).
+    #[test]
+    fn a_zero_socket_buffer_request_leaves_the_socket_alone() {
+        let asked = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let untouched = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let asked = SockRef::from(&asked);
+        let untouched = SockRef::from(&untouched);
+
+        assert_eq!(
+            request_socket_buffer(&asked, SocketBuffer::Recv, 0),
+            untouched.recv_buffer_size().ok(),
+            "a zero receive buffer request must not touch the socket"
+        );
+        assert_eq!(
+            request_socket_buffer(&asked, SocketBuffer::Send, 0),
+            untouched.send_buffer_size().ok(),
+            "a zero send buffer request must not touch the socket"
+        );
     }
 
     /// Builds the controller a `[limits] congestion_control` value selects and

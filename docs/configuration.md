@@ -51,6 +51,8 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` pins the packet size at `initial_mtu`: slower, but deterministic |
 | `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `cubic` or `newreno` |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
+| `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
+| `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max` |
 
 ### Notes that matter in practice
 
@@ -74,10 +76,25 @@ request stream while its target is still being dialled does not cancel the dial,
 so with the budget off the slot stays spent until the kernel gives up. volto
 warns at startup when the budget is off.
 
-**The last six keys are QUIC transport parameters and apply to new connections
-only.** A reload carries them to connections accepted from then on; connections
-already open keep what they negotiated at handshake time, because QUIC cannot
-renegotiate transport parameters.
+**`max_streams_bidi`, `max_idle_timeout`, `keep_alive_interval`, `initial_mtu`,
+`mtu_discovery`, `congestion_control` and `initial_rtt_ms` are QUIC transport
+settings and apply to new connections only.** A reload carries them to
+connections accepted from then on; connections already open keep what they
+negotiated at handshake time, because QUIC cannot renegotiate transport
+parameters.
+
+**The two socket buffer keys are startup-only, not reloadable at all.** They are
+applied to the UDP socket when it is created, and a reload does not rebind that
+socket — changing them needs a restart, the same as `[server].listen`. Each
+request is capped by the host: `net.core.rmem_max` / `net.core.wmem_max` on
+Linux, `kern.ipc.maxsockbuf` on macOS, and a host may fail the request outright
+rather than clamping it. volto warns at startup, naming the sysctl, whenever it
+got less than it asked for, and comes up on the operating system's default
+either way. `0` asks for nothing and leaves that default in place. The reason
+these keys exist at all is that quinn never calls `setsockopt` itself, so a
+server that does not ask gets `net.core.rmem_default` — around 208 KiB —
+however high `rmem_max` has been raised; see
+[UDP socket buffers](deployment.md#udp-socket-buffers).
 
 **`keep_alive_interval` is validated as strictly below half the idle timeout,
 not at most half.** At exactly half, losing a single keep-alive packet is enough

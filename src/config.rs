@@ -26,6 +26,8 @@
 //! mtu_discovery        = true
 //! congestion_control   = "bbr" # bbr | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
+//! socket_recv_buffer   = 2097152 # bytes, 0 keeps the OS default
+//! socket_send_buffer   = 2097152 # bytes, 0 keeps the OS default
 //!
 //! [security]
 //! allow_private_networks   = false
@@ -169,6 +171,40 @@ const INITIAL_RTT_RANGE_MS: std::ops::RangeInclusive<u64> = 10..=10_000;
 /// conntrack entry will have expired long before, so a larger timeout only delays
 /// noticing a peer that is already unreachable.
 const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
+
+/// Default UDP socket receive buffer to request, in bytes.
+///
+/// Not a size that arrives on its own. quinn never calls
+/// `setsockopt(SO_RCVBUF)`, so a QUIC server that does not ask keeps whatever
+/// the kernel hands out — `net.core.rmem_default`, around 208 KiB on a stock
+/// Linux — however high `net.core.rmem_max` has been raised, because that
+/// sysctl is only a ceiling on what an application may *request*, not an
+/// allocation.
+///
+/// 2 MiB is cheap insurance in the same spirit as the per-stream flow-control
+/// window in [`crate::quic`]: it costs nothing until a burst needs it, and the
+/// bursts it covers are ordinary ones — a batch of packets arriving while the
+/// read loop is elsewhere, a GSO segment train, a scheduling hiccup. What it
+/// buys is the absence of a silent drop, which the kernel counts as `receive
+/// buffer errors` in `netstat -su` and the sender pays for in retransmissions.
+///
+/// Requested when the socket is created, so this is a startup-only setting.
+/// Zero leaves the operating system's own value alone.
+pub const DEFAULT_SOCKET_RECV_BUFFER: usize = 2 * 1024 * 1024;
+
+/// Default UDP socket send buffer to request, in bytes.
+///
+/// The mirror of [`DEFAULT_SOCKET_RECV_BUFFER`] on the way out: capped by
+/// `net.core.wmem_max` rather than `rmem_max`, and drained by the network
+/// interface rather than by this process. It binds on the same bursts, with a
+/// milder ending: when the endpoint hands the kernel more at once than the
+/// buffer holds, the send returns `EAGAIN` and quinn holds the packet until the
+/// socket drains — a stall rather than a drop, though the kernel still counts
+/// each one as a `send buffer error` in `netstat -su`.
+///
+/// Requested when the socket is created, so this is a startup-only setting.
+/// Zero leaves the operating system's own value alone.
+pub const DEFAULT_SOCKET_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
 /// Default number of concurrent tunnels allowed on one QUIC connection.
 ///
@@ -327,6 +363,31 @@ pub struct Limits {
     /// for the trade-off and how to pick a value from the connection logs.
     #[serde(default = "default_initial_rtt_ms")]
     pub initial_rtt_ms: u64,
+    /// UDP socket receive buffer to request, in bytes. Zero keeps the OS default.
+    ///
+    /// Applied to the socket when it is created, which makes this a startup-only
+    /// setting: a `SIGHUP` reload does not rebind the socket, so a change here
+    /// needs a restart — the same class as [`Server::listen`], and unlike every
+    /// key above it.
+    ///
+    /// Two things the kernel does with the request are worth knowing before
+    /// reading a log line about it. It is capped at a host ceiling —
+    /// `net.core.rmem_max` on Linux, `kern.ipc.maxsockbuf` on macOS — and a host
+    /// may fail the call outright instead of clamping. And on Linux the value
+    /// read back is *double* what was granted, because the accounting includes
+    /// per-packet overhead, so a satisfied 2 MiB request reads as 4194304 both
+    /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
+    /// warns at startup when it got less than it asked for. See
+    /// [`DEFAULT_SOCKET_RECV_BUFFER`].
+    #[serde(default = "default_socket_recv_buffer")]
+    pub socket_recv_buffer: usize,
+    /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
+    ///
+    /// Startup-only, read back and warned about exactly like
+    /// [`Limits::socket_recv_buffer`]; the ceiling on this side is
+    /// `net.core.wmem_max`. See [`DEFAULT_SOCKET_SEND_BUFFER`].
+    #[serde(default = "default_socket_send_buffer")]
+    pub socket_send_buffer: usize,
 }
 
 /// `[security]` — destination policy and abuse mitigations.
@@ -462,6 +523,14 @@ fn default_initial_rtt_ms() -> u64 {
     DEFAULT_INITIAL_RTT_MS
 }
 
+fn default_socket_recv_buffer() -> usize {
+    DEFAULT_SOCKET_RECV_BUFFER
+}
+
+fn default_socket_send_buffer() -> usize {
+    DEFAULT_SOCKET_SEND_BUFFER
+}
+
 fn default_denied_ports() -> Vec<u16> {
     DEFAULT_DENIED_PORTS.to_vec()
 }
@@ -484,6 +553,8 @@ impl Default for Limits {
             mtu_discovery: default_mtu_discovery(),
             congestion_control: default_congestion_control(),
             initial_rtt_ms: default_initial_rtt_ms(),
+            socket_recv_buffer: default_socket_recv_buffer(),
+            socket_send_buffer: default_socket_send_buffer(),
         }
     }
 }
@@ -898,6 +969,12 @@ mod tests {
         assert_eq!(cfg.limits.keep_alive_interval, 20);
         assert_eq!(cfg.limits.initial_mtu, 1200);
         assert!(cfg.limits.mtu_discovery);
+        // The socket buffers are asked for, not inherited: quinn never calls
+        // setsockopt, so an absent key would leave `net.core.rmem_default`.
+        assert_eq!(cfg.limits.socket_recv_buffer, DEFAULT_SOCKET_RECV_BUFFER);
+        assert_eq!(cfg.limits.socket_send_buffer, DEFAULT_SOCKET_SEND_BUFFER);
+        assert_eq!(cfg.limits.socket_recv_buffer, 2 * 1024 * 1024);
+        assert_eq!(cfg.limits.socket_send_buffer, 2 * 1024 * 1024);
         // BBR by default: the point of the proxy is lossy long-haul paths.
         assert_eq!(cfg.limits.congestion_control, CongestionControl::Bbr);
         // The defaults must themselves satisfy the keep-alive rule.
@@ -1302,6 +1379,26 @@ mod tests {
             error.contains("server.cert"),
             "the example must be valid apart from its certificate paths, got: {error}"
         );
+    }
+
+    /// Both socket buffer keys parse, and `0` is a legal value rather than a
+    /// number to be validated away.
+    ///
+    /// `0` is the escape hatch that hands the size back to the operating system,
+    /// so it has to survive parsing untouched; every other value is judged by the
+    /// kernel at bind time and reported as a startup warning if it was capped,
+    /// which is why there is no range check here to test.
+    #[test]
+    fn socket_buffer_sizes_parse_and_zero_is_accepted() {
+        let cfg = parse("[limits]\nsocket_recv_buffer = 4194304\nsocket_send_buffer = 1048576");
+        assert_eq!(cfg.limits.socket_recv_buffer, 4 * 1024 * 1024);
+        assert_eq!(cfg.limits.socket_send_buffer, 1024 * 1024);
+        assert_valid_apart_from_certs(&cfg, "explicit socket buffer sizes");
+
+        let cfg = parse("[limits]\nsocket_recv_buffer = 0\nsocket_send_buffer = 0");
+        assert_eq!(cfg.limits.socket_recv_buffer, 0);
+        assert_eq!(cfg.limits.socket_send_buffer, 0);
+        assert_valid_apart_from_certs(&cfg, "socket buffers left to the OS");
     }
 
     #[test]

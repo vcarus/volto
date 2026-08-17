@@ -88,7 +88,7 @@ users = [
 #connect_timeout = 10
 
 # --- QUIC transport parameters ----------------------------------------------
-# All five apply to connections accepted from now on. A reload (SIGHUP) carries
+# All seven apply to connections accepted from now on. A reload (SIGHUP) carries
 # them to new connections; connections already open keep what they negotiated at
 # handshake time, because QUIC cannot renegotiate transport parameters.
 
@@ -154,6 +154,38 @@ users = [
 # margin: a value below the real RTT retransmits packets that were never lost.
 # Range 10..10000. Server default when unset: 333
 initial_rtt_ms = 150
+
+# --- UDP socket buffers (startup only) ---------------------------------------
+# Unlike the transport parameters above, these two are applied to the UDP socket
+# at the moment it is created. A reload does not rebind that socket, so changing
+# either one needs a restart.
+
+# UDP socket receive buffer to request, in bytes; 0 leaves the OS default alone.
+#
+# quinn never asks the kernel for a socket buffer of its own, so a server that
+# leaves this to the system gets net.core.rmem_default -- around 208 KiB -- no
+# matter how high net.core.rmem_max is: that sysctl is a ceiling on what an
+# application may request, not an allocation. volto asks for this many bytes when
+# it creates the socket, which is also the only moment it can: a reload does not
+# rebind the socket, so changing this needs a restart.
+#
+# If the host's ceiling is lower than the value here, the kernel caps the request
+# and volto warns at startup naming the sysctl to raise. Linux reports a granted
+# buffer as double its size, so a satisfied 2 MiB request reads as rb 4194304 in
+# `ss -uanpm` and as so_rcvbuf=4194304 in the startup line.
+# Default: 2097152
+#socket_recv_buffer = 2097152
+
+# UDP socket send buffer to request, in bytes; 0 leaves the OS default alone.
+#
+# The same knob in the outbound direction, capped by net.core.wmem_max, and
+# equally a startup-time setting. What it prevents is milder than a drop: when
+# packets are handed to the kernel faster than the interface takes them, the
+# send stalls until the buffer drains (the kernel counts each stall as a
+# `send buffer error` in `netstat -su`); a larger buffer lets a burst go out in
+# one go.
+# Default: 2097152
+#socket_send_buffer = 2097152
 
 [security]
 # Allow tunnels to the address space RFC 6890 marks special-purpose.
