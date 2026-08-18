@@ -16,10 +16,6 @@ use volto::datagram;
 /// H3_DATAGRAM_ERROR, the code RFC 9297 §2.1 names for an unusable datagram.
 const H3_DATAGRAM_ERROR: u64 = 0x33;
 
-/// H3_NO_ERROR, RFC 9114 §8.1: "no error. This is used when the connection or
-/// stream needs to be closed, but there is no error to signal."
-const H3_NO_ERROR: u64 = 0x100;
-
 /// Waits for the server to close the QUIC connection, returning its error code.
 ///
 /// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
@@ -670,49 +666,52 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     }
 }
 
-/// The tunnel accepted and closed on the spot asks the client to stop sending
-/// with H3_NO_ERROR, because nothing went wrong.
+/// A session accepted and closed on the spot leaves the client's own side alone
+/// (decision D59), on the CONNECT-UDP path as much as on the TCP one.
 ///
-/// The blackhole answer (D49) is "a target that hung up immediately", and a
-/// target hanging up is not an error. Any other code here would put a fault in
-/// the client's log for a request this server deliberately treated as fine.
-/// Observable because the STOP_SENDING goes out before the 200 does, so the
-/// first write after the response is refused with the code it carried.
+/// Both callers of the blackhole close share one helper, so this is the same
+/// wire behaviour `it_policy` pins for a CONNECT — checked here because a
+/// CONNECT-UDP session reaches it through a different route (the RFC 9298 path
+/// template, and a 200 that has to carry the capsule protocol field) and could
+/// regress on its own.
+///
+/// The client keeps writing well past the point where the old behaviour would
+/// have stopped it: STOP_SENDING was sent before the 200 then, so the first
+/// write to reach the server's state was refused within milliseconds.
 #[tokio::test]
-async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
+async fn a_session_closed_on_the_spot_leaves_the_client_to_close_its_own_side() {
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
     let (_, mut stream) = open_session(&mut client, &server, "0.0.0.0", 443).await;
 
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    let error = loop {
-        match stream
-            .send_data(Bytes::from_static(b"anything at all"))
-            .await
-        {
-            // quinn only surfaces the stop once the write reaches the peer's
-            // state, so an early write can still be accepted locally.
-            Ok(()) => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the server never stopped the stream"
-                );
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(error) => break error,
-        }
-    };
+    // The server closed its own side: the capsule stream ends cleanly and
+    // carries nothing, since there is no socket to report anything about.
+    let capsules = common::read_to_end(&mut stream).await;
+    assert!(
+        capsules.is_empty(),
+        "no capsule may precede the close of a session with no socket"
+    );
 
-    match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
-            code.value(),
-            H3_NO_ERROR,
-            "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",
-            code.value()
-        ),
-        other => panic!("expected the peer to stop the stream, got {other:?}"),
+    // Nothing parses these — the session never got a capsule loop — but a client
+    // that started sending before the response arrived is exactly the case the
+    // drain exists for, so they have to be accepted rather than refused.
+    let until = tokio::time::Instant::now() + Duration::from_millis(500);
+    while tokio::time::Instant::now() < until {
+        stream
+            .send_data(Bytes::from_static(
+                b"a capsule the client had already queued",
+            ))
+            .await
+            .expect("the server must not stop a client that is still sending");
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    // And the close is the client's to make.
+    tokio::time::timeout(TIMEOUT, stream.finish())
+        .await
+        .expect("finishing did not time out")
+        .expect("the client closes its own side cleanly");
 }
 
 /// An unknown capsule type must be skipped, leaving the session usable.
