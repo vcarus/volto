@@ -269,25 +269,6 @@ impl Stream {
         self.inner.send_response(response).await
     }
 
-    /// Reads the next chunk the peer sent on this stream.
-    ///
-    /// `Ok(None)` means the peer finished its sending side — for a CONNECT
-    /// tunnel, the client's FIN. The same method exists on [`Reader`]; this one
-    /// is for the paths that never split the stream.
-    ///
-    /// Reading all the way to that `Ok(None)` matters beyond the bytes: quinn
-    /// sends STOP_SENDING(0) for a receive stream dropped with data still
-    /// unread, so *abandoning* a stream is not the same as leaving the peer
-    /// alone — only draining it to the end (or to a reset) is.
-    pub async fn recv_data(&mut self) -> Result<Option<Buffer>, StreamError> {
-        match self.inner.recv_data().await? {
-            // As in `Reader::recv_data`: for h3-quinn the buffer already is
-            // `Bytes`, so this is a refcount bump rather than a copy.
-            Some(mut buf) => Ok(Some(buf.copy_to_bytes(buf.remaining()))),
-            None => Ok(None),
-        }
-    }
-
     /// Ends the sending side cleanly (a QUIC stream FIN).
     pub async fn finish(&mut self) -> Result<(), StreamError> {
         self.inner.finish().await

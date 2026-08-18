@@ -422,134 +422,52 @@ async fn a_blackholed_udp_target_is_accepted_then_closed() {
     );
 }
 
-/// D59: a tunnel closed on the spot must not cut the client's sending side off.
+/// The tunnel accepted and closed on the spot asks the client to stop sending
+/// with H3_NO_ERROR, and asks at once.
 ///
-/// The behaviour this replaces sent STOP_SENDING before the 200, which a client
-/// that had already started writing into the tunnel — a TLS ClientHello on a
-/// stream it has every reason to believe is open — saw as its write failing. One
-/// client stack mapped that onto a transport-level PROTOCOL_VIOLATION and tore
-/// down the whole QUIC connection, taking every other tunnel with it. RFC 9114
-/// §4.1 allows either choice; this is the other one: "clients SHOULD continue
-/// sending the content of the request and close the stream normally".
+/// The blackhole answer (D49) is "a target that hung up immediately", and a
+/// target hanging up is not an error. Any other code here would put a fault in
+/// the client's log for a request this server deliberately treated as fine.
+/// Observable because the STOP_SENDING goes out before the 200 does, so the
+/// first write after the response is refused with the code it carried.
 ///
-/// Written as a loop of small writes because quinn only surfaces a peer's stop
-/// once a write reaches the peer's state, so a single write proves nothing — the
-/// old behaviour is caught within the first few iterations.
+/// The time bound is the half that matters: a server that instead waits for the
+/// client to close first and only stops it after a grace period — the shape
+/// this path briefly had, and rolled back (D59) — satisfies everything else
+/// here, just seconds later. `it_udp` pins the same behaviour on the CONNECT-UDP
+/// path, which reaches the shared close through a different route.
 #[tokio::test]
-async fn a_tunnel_closed_on_the_spot_leaves_the_client_to_close_its_own_side() {
+async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
+    /// RFC 9114 §8.1: "no error. This is used when the connection or stream
+    /// needs to be closed, but there is no error to signal."
+    const H3_NO_ERROR: u64 = 0x100;
+
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
     let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // The server's half is closed already; that is not in question here.
-    assert!(common::read_to_end(&mut stream).await.is_empty());
-
-    // Well under the server's drain limit, and far past the point where an
-    // immediate STOP_SENDING would have shown up.
-    let until = tokio::time::Instant::now() + Duration::from_millis(500);
-    while tokio::time::Instant::now() < until {
-        stream
+    let started = tokio::time::Instant::now();
+    let error = loop {
+        match stream
             .send_data(Bytes::from_static(
                 b"the first flight the client had queued",
             ))
             .await
-            .expect("the server must not stop a client that is still writing");
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-
-    // The client ends the stream itself, which is the whole point: the close is
-    // normal on both sides, and no reset or stop was ever sent.
-    tokio::time::timeout(TIMEOUT, stream.finish())
-        .await
-        .expect("finishing did not time out")
-        .expect("the client closes its own side cleanly");
-}
-
-/// The other half of D59: waiting for the client is bounded.
-///
-/// A client that reads the 200 and then neither closes nor resets would
-/// otherwise hold a tunnel slot forever, so past the drain's time limit the
-/// server falls back to what it used to do at once — STOP_SENDING with
-/// H3_NO_ERROR, because nothing went wrong and any other code would put a fault
-/// in the client's log for a request this server treated as fine.
-///
-/// The writes are small and slow on purpose: a few hundred bytes over the whole
-/// wait, so it is the time limit that trips and not the byte cap.
-#[tokio::test]
-async fn a_client_that_never_closes_a_tunnel_closed_on_the_spot_is_stopped() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
-    let mut client = H3Client::connect(&server).await;
-
-    let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(common::read_to_end(&mut stream).await.is_empty());
-
-    let started = tokio::time::Instant::now();
-    let error = loop {
-        match stream.send_data(Bytes::from_static(b"never closing")).await {
+        {
+            // quinn only surfaces the stop once the write reaches the peer's
+            // state, so an early write can still be accepted locally.
             Ok(()) => {
                 assert!(
                     started.elapsed() < TIMEOUT,
-                    "the server never stopped a client that would not close"
+                    "the server never stopped the stream"
                 );
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
             Err(error) => break error,
         }
     };
-
-    assert_stopped_with_no_error(error);
-    // And it came from the wait running out rather than up front, which is the
-    // half of this the previous behaviour would also have satisfied.
-    assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "the client must be left alone until the drain gives up, stopped after {:?}",
-        started.elapsed()
-    );
-}
-
-/// The drain's other bound: a client that floods instead of closing is stopped
-/// by the byte cap, long before the time limit it never reaches.
-#[tokio::test]
-async fn a_client_that_floods_a_tunnel_closed_on_the_spot_is_stopped_by_the_byte_cap() {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
-    let mut client = H3Client::connect(&server).await;
-
-    let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(common::read_to_end(&mut stream).await.is_empty());
-
-    // Comfortably more than the cap in total, in chunks small enough that the
-    // stop is surfaced on one of the writes rather than after all of them.
-    let chunk = Bytes::from(vec![0x5a; 16 * 1024]);
-    let started = tokio::time::Instant::now();
-    let error = loop {
-        match stream.send_data(chunk.clone()).await {
-            Ok(()) => assert!(
-                tokio::time::Instant::now() < started + TIMEOUT,
-                "the server never stopped a client flooding a closed tunnel"
-            ),
-            Err(error) => break error,
-        }
-    };
-
-    assert_stopped_with_no_error(error);
-    // The cap is what tripped, not the wait: the whole flood fits in a fraction
-    // of the time limit over loopback.
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "the byte cap must stop a flood well before the time limit, took {:?}",
-        started.elapsed()
-    );
-}
-
-/// Asserts a stream error is the peer stopping us with H3_NO_ERROR (0x100).
-fn assert_stopped_with_no_error(error: h3::error::StreamError) {
-    /// RFC 9114 §8.1: "no error. This is used when the connection or stream
-    /// needs to be closed, but there is no error to signal."
-    const H3_NO_ERROR: u64 = 0x100;
 
     match error {
         h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
@@ -560,6 +478,11 @@ fn assert_stopped_with_no_error(error: h3::error::StreamError) {
         ),
         other => panic!("expected the peer to stop the stream, got {other:?}"),
     }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the stop must be asked for up front, not after a wait; it took {:?}",
+        started.elapsed()
+    );
 }
 
 /// Private space can be opened up deliberately — the deployments where reaching a

@@ -215,12 +215,9 @@ unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true).
 One refusal is deliberately quieter than its neighbours, in the log and on the
 wire. A target whose every resolved address is `0.0.0.0` or `::` is a name a
 filtering resolver has blackholed: that decision belongs to the resolver, not to
-volto, so it is logged at INFO and answered with a 200 whose stream volto closes
-from its side at once — the client sees a tunnel that opened and died, which is
-what a blocked name looks like through a transport that has no way to explain
-itself. The client's own half is left to the client: volto reads and discards
-whatever is still arriving until the client closes too, and only cuts it off if
-that has not happened within a few seconds or tens of kilobytes.
+volto, so it is logged at INFO and answered with a 200 whose stream is closed
+immediately — the client sees a tunnel that opened and died, which is what a
+blocked name looks like through a transport that has no way to explain itself.
 Answering 403 instead would invite the client to blame the proxy for an ad
 blocker's decision. A target that resolves to loopback, private or mixed
 addresses is a refusal volto really did make: it stays a WARN and a 403 with

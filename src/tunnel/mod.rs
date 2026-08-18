@@ -637,150 +637,36 @@ pub(crate) async fn refuse_with(
 /// channel shows for such a name, and what a target that accepts a connection
 /// and hangs up immediately looks like on the wire.
 ///
-/// Mechanically the close is the tidy one: a FIN on the response stream and
-/// **never a reset** — RFC 9114 §4.4 reserves an abruptly terminated stream for
-/// a failure of the target connection (H3_CONNECT_ERROR), which this is not, and
-/// a reset would also be the one signal a client is entitled to read as "the
-/// proxy broke". A clean FIN is what RFC 9297 §3.3 treats as the normal end of a
+/// Mechanically the close is the tidy one, and it is the same one an
+/// established session ends with: STOP_SENDING with H3_NO_ERROR for anything
+/// the client is still sending, then a FIN on the response stream. **Never a
+/// reset** — RFC 9114 §4.4 reserves an abruptly terminated stream for a failure
+/// of the target connection (H3_CONNECT_ERROR), which this is not, and a reset
+/// would also be the one signal a client is entitled to read as "the proxy
+/// broke". A clean FIN is what RFC 9297 §3.3 treats as the normal end of a
 /// capsule stream, and on the CONNECT-UDP path it also settles RFC 9298 §3.1's
 /// pairing of socket and request stream in the only way available here: there
 /// is no socket, so no request stream is left open waiting for one.
 ///
-/// What it deliberately does *not* do any more (decision D59) is abort the
-/// request side first. RFC 9114 §4.1 offers both halves of the choice — a server
-/// that does not need the rest of the request "MAY abort reading the request
-/// stream", and if it does not, "clients SHOULD continue sending the content of
-/// the request and close the stream normally" — and this path used to take the
-/// first. Sending STOP_SENDING into a client that is still writing the first
-/// bytes of its tunnel turned out to be the trigger for a rare transport-level
-/// PROTOCOL_VIOLATION from one client stack, which costs the whole QUIC
-/// connection and every other tunnel on it. So the response goes out, the
-/// sending side closes, and the client's own close is then waited for — bounded,
-/// see [`drain_until_peer_closes`].
+/// The STOP_SENDING up front is the shape to keep. RFC 9114 §4.1 leaves the
+/// choice open — a server may abort reading the request, or leave the client to
+/// finish and close it — and the other shape was tried once (D59): 200 and FIN
+/// only, then read and discard until the client closed, on the theory that a
+/// stop landing on a client still writing its first bytes was what made one
+/// client stack answer with a transport-level PROTOCOL_VIOLATION. A frame-level
+/// A/B against that very stack showed the two shapes are indistinguishable to it
+/// (it resets within a round trip either way) and production kept failing under
+/// the drain, so the simpler shape came back. That fault is on the client's
+/// side and does not depend on what this close sends.
 pub(crate) async fn accept_then_close(stream: &mut Stream, headers: HeaderMap, stream_id: u64) {
+    stream.stop_receiving(h3api::NO_ERROR);
+
     if let Err(error) = stream.respond_with(StatusCode::OK, headers).await {
         debug!(stream_id, %error, "failed to send 200 for a tunnel closed on the spot");
         return;
     }
     if let Err(error) = stream.finish().await {
-        // Not a reason to skip the drain: what failed is the sending side, and
-        // walking away from the receiving one is exactly the abrupt stop this
-        // path exists to avoid. A stream that is broken in both directions ends
-        // the drain on its first read anyway.
         debug!(stream_id, %error, "failed to close a tunnel after its 200");
-    }
-
-    drain_until_peer_closes(stream, stream_id).await;
-}
-
-/// How long [`accept_then_close`] waits for the client to close its own side.
-///
-/// A client that has read the 200 and the FIN behind it has nothing left to do
-/// but close, so the ordinary wait is a round trip. The limit only has to cover
-/// the client that had already started writing into the tunnel before the
-/// response arrived — one flight, a TLS ClientHello — and three seconds is far
-/// more than that takes on any path this server is deployed behind. Kept short
-/// on purpose: the tunnel slot is held for the whole wait.
-const DRAIN_TIME_LIMIT: Duration = Duration::from_secs(3);
-
-/// How much [`accept_then_close`] reads and discards before it gives up waiting.
-///
-/// A well-behaved client sends at most that first flight here — a ClientHello is
-/// a few kilobytes even with a post-quantum key share — so 64 KiB is a full
-/// order of magnitude of headroom, and it bounds what a client that keeps
-/// writing into a closed tunnel can make this server read. Nothing is buffered:
-/// each chunk is counted and dropped.
-const DRAIN_BYTE_LIMIT: usize = 64 * 1024;
-
-/// How long the drain keeps reading after the time limit, to land its stop.
-///
-/// See [`drain_until_peer_closes`]: at the pinned `h3-quinn` revision a stop
-/// asked for while a read is outstanding is only recorded, and applied when that
-/// read next completes. This is how long that chance lasts. Short, because the
-/// only client it can reach is one that is still writing, and such a client
-/// writes often.
-const DRAIN_STOP_GRACE: Duration = Duration::from_millis(500);
-
-/// Which of the drain's two limits ran out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainLimit {
-    /// The client neither closed nor reset within [`DRAIN_TIME_LIMIT`].
-    Time,
-    /// The client sent more than [`DRAIN_BYTE_LIMIT`] without closing.
-    Bytes,
-}
-
-impl DrainLimit {
-    /// The name this limit appears under in the fallback log line.
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Time => "time",
-            Self::Bytes => "bytes",
-        }
-    }
-}
-
-/// Reads and discards whatever the client is still sending, until it closes.
-///
-/// The point is the *absence* of a signal: a receive stream that simply goes out
-/// of scope is not left alone, because quinn sends STOP_SENDING(0) for one
-/// dropped with data still unread. Reaching end of stream — or the client's own
-/// reset — is therefore the only way to let the client finish on its own terms,
-/// and it is what [`h3api::Stream::recv_data`] is here for.
-///
-/// Bounded in both dimensions so a client that never closes cannot hold the
-/// tunnel slot: past either limit this falls back to the old behaviour, a
-/// STOP_SENDING with H3_NO_ERROR, since nothing went wrong and no other code
-/// would be truthful. Runs in the request's own task, so the wait costs this request
-/// and nothing else on the connection.
-async fn drain_until_peer_closes(stream: &mut Stream, stream_id: u64) {
-    let mut drained: usize = 0;
-
-    let tripped = tokio::time::timeout(DRAIN_TIME_LIMIT, async {
-        loop {
-            match stream.recv_data().await {
-                // The client closed its sending side, or reset it. Either way it
-                // is done and there is nothing left to ask it to stop.
-                Ok(None) | Err(_) => return None,
-                Ok(Some(chunk)) => {
-                    drained = drained.saturating_add(chunk.len());
-                    if drained >= DRAIN_BYTE_LIMIT {
-                        return Some(DrainLimit::Bytes);
-                    }
-                }
-            }
-        }
-    })
-    .await;
-
-    let limit = match tripped {
-        Ok(None) => return,
-        Ok(Some(limit)) => limit,
-        Err(_elapsed) => DrainLimit::Time,
-    };
-
-    // The signal to watch: a client that neither closes nor resets after being
-    // told the tunnel is over. Expected to be rare enough that every line is
-    // worth reading, which is why it names the limit that ran out.
-    debug!(
-        stream_id,
-        drained,
-        limit = limit.as_str(),
-        "a client did not close a tunnel closed on the spot; stopping it"
-    );
-    stream.stop_receiving(h3api::NO_ERROR);
-
-    // A quirk of the pinned `h3-quinn` revision, and the reason the time limit
-    // needs a coda: while a read is outstanding the underlying receive stream
-    // lives *inside* that read's future, so a stop asked for at that moment is
-    // only recorded, to be applied when the read next completes. Reading once
-    // more is what gets H3_NO_ERROR onto the wire rather than the bare 0 quinn
-    // sends for a receive stream dropped unread — and a client still writing,
-    // the only one that can tell the two apart, hits it on its next chunk. The
-    // byte limit needs none of this: it is reached *by* a completed read, so the
-    // stop goes out at once.
-    if limit == DrainLimit::Time {
-        let _ = tokio::time::timeout(DRAIN_STOP_GRACE, stream.recv_data()).await;
     }
 }
 
