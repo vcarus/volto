@@ -9,7 +9,7 @@
 //! cert   = "/etc/volto/fullchain.pem"
 //! key    = "/etc/volto/privkey.pem"
 //! alpn   = ["h3"]      # optional, this is the default
-//! shutdown_grace = 30  # seconds to let tunnels finish after SIGTERM
+//! shutdown_grace = 5   # seconds to let tunnels finish after SIGTERM
 //!
 //! [auth]
 //! users = [{ username = "user1", password = "..." }]
@@ -68,10 +68,15 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Default grace period for a graceful shutdown, in seconds.
 ///
-/// Long enough for an in-flight page load or API call to finish, short enough
-/// that a service manager's own kill timeout (systemd's default `TimeoutStopSec`
-/// is 90s) does not overtake it.
-pub const DEFAULT_SHUTDOWN_GRACE: u64 = 30;
+/// Long enough for an in-flight page load or API call to finish, and short on
+/// purpose: a client that keeps using a connection after GOAWAY instead of
+/// opening a fresh one — the Surge client does — has every new request fail
+/// for as long as the drain lasts, so the grace period is also a window of
+/// failed requests on the client, and it only buys time for transfers that are
+/// already running. Five seconds keeps that window short while still letting
+/// short exchanges complete. Well below a service manager's own kill timeout
+/// (systemd's default `TimeoutStopSec` is 90s).
+pub const DEFAULT_SHUTDOWN_GRACE: u64 = 5;
 
 /// Default UDP session idle timeout, in seconds.
 ///
@@ -1036,7 +1041,7 @@ mod tests {
         );
         // The defaults must themselves satisfy the keep-alive rule.
         assert!(cfg.limits.keep_alive_interval * 2 < cfg.limits.max_idle_timeout);
-        assert_eq!(cfg.server.shutdown_grace, 30);
+        assert_eq!(cfg.server.shutdown_grace, 5);
         assert_eq!(cfg.server.alpn_wire(), vec![b"h3".to_vec()]);
 
         // Security defaults: private space closed, port 25 closed, port 53 open

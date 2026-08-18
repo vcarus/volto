@@ -55,7 +55,7 @@ async fn an_established_tunnel_survives_goaway_and_finishes() {
     assert_eq!(&read_at_least(&mut stream, 6).await, b"after!");
 
     // Once the client is done, the server should finish its side and stop —
-    // well inside the 30s default grace period.
+    // well inside the default grace period.
     stream.finish().await.expect("finish the request stream");
     common::read_to_end(&mut stream).await;
 

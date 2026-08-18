@@ -25,9 +25,12 @@ key = "/etc/volto/privkey.pem"
 #alpn = ["h3"]
 
 # Seconds to let established tunnels finish after SIGTERM before closing anyway.
-# Keep systemd's TimeoutStopSec above this value.
-# Default: 30
-#shutdown_grace = 30
+# Short by default: a client that keeps using a connection after GOAWAY (Surge
+# does) has its new requests fail for the whole drain, so this is also how long
+# each restart looks broken from the client. Raise it if in-flight transfers
+# matter more. Keep systemd's TimeoutStopSec above this value.
+# Default: 5
+#shutdown_grace = 5
 
 [auth]
 # Credentials accepted on every CONNECT request, as HTTP Basic.

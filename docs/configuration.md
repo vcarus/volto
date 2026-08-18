@@ -23,7 +23,7 @@ whole and the running configuration keeps serving; see
 | `cert` | path | required | PEM certificate chain, leaf first |
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging |
-| `shutdown_grace` | seconds | `30` | How long established tunnels may finish after SIGTERM. systemd's `TimeoutStopSec` must be larger |
+| `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. systemd's `TimeoutStopSec` must be larger |
 
 ## `[auth]`
 

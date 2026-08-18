@@ -332,9 +332,14 @@ hook running unattended, and a typo must not become an outage.
 
 SIGTERM stops the endpoint from accepting new connections, sends GOAWAY on the
 established ones and waits for their tunnels to finish, up to
-`server.shutdown_grace` (default 30 s). Keep systemd's `TimeoutStopSec`
-comfortably above that value — the shipped unit uses 45 — so systemd does not
-send SIGKILL mid-drain.
+`server.shutdown_grace` (default 5 s). The default is short on purpose: a
+client that keeps using a connection after GOAWAY instead of opening a new one
+— Surge does — has every new request fail until the drain ends, so a long
+grace period trades a longer outage for every new request against finishing the
+transfers already in flight. Raise it if long transfers matter more to you than
+a few seconds of failed requests at each restart. Keep systemd's
+`TimeoutStopSec` comfortably above whatever you choose — the shipped unit uses
+45 — so systemd does not send SIGKILL mid-drain.
 
 ## Running behind a UDP relay
 
