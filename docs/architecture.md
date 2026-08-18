@@ -58,6 +58,21 @@ reaches application code. Protocols h3 knows (`connect-ip`, `webtransport`,
 gap costs nothing in practice, so it is an accepted deviation rather than an
 upstream patch.
 
+### Target address selection
+
+Both tunnel kinds resolve their target through one function in `tunnel/mod.rs`,
+which is also where the resolved list is ordered by
+`limits.ip_family_preference` — before the destination policy filters it and
+before either tunnel dials anything, so the two cannot disagree about which
+family goes first. The default is IPv4-first, deliberately unlike `getaddrinfo`, which
+orders by RFC 6724 and so puts global IPv6 ahead of IPv4 on any host with an
+IPv6 route. That ordering is an operator policy on a proxy rather than a
+resolver detail: the TCP path walks the list in order, so the non-preferred
+family costs a full connect attempt, and the CONNECT-UDP path has no failover at
+all — connecting a UDP socket only asks the kernel for a route, so the first
+address with one wins outright. The reorder is a stable partition, leaving
+RFC 6724's ordering within each family intact; `system` opts out of it entirely.
+
 ### TCP tunnels
 
 `tunnel/tcp.rs` resolves `:authority` explicitly — not implicitly through

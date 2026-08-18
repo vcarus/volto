@@ -67,7 +67,12 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // Resolution is explicit so the addresses are visible to the policy below —
     // `TcpStream::connect((host, port))` would resolve internally and leave
     // nothing to filter. It is also bounded: the tunnel slot is already held.
-    let addresses = match tunnel::resolve_within(&host, port, ctx.connect_timeout).await {
+    // The list comes back ordered by `[limits] ip_family_preference` (decision
+    // D58), and `connect_any` walks it in that order, so on a dual-stack target
+    // the non-preferred family is only reached after the preferred one fails.
+    let resolved =
+        tunnel::resolve_within(&host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
+    let addresses = match resolved {
         Ok(addresses) => addresses,
         Err(failure) => {
             // A resolver failure is not the client's fault (decision D9), so it is

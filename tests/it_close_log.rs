@@ -215,13 +215,15 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         server.wait_until_stopped(STOP_TIMEOUT).await;
     }
 
-    // Every routine close still carries the two diagnostic fields the transport
-    // is tuned from. Both are read off the connection *after* `conn::handle` has
-    // returned and dropped the HTTP/3 layer — the same object at the same moment
-    // that made `close_reason()` unusable — so nothing but an assertion stands
-    // between them and quietly becoming a placeholder. `initial_rtt_ms = 150`
-    // was derived from `rtt_ms` samples, and `remote_now` is the only externally
-    // visible trace of a migration or NAT rebind mid-connection.
+    // Every routine close still carries the diagnostic fields the transport is
+    // read through. All are taken off the connection *after* `conn::handle`
+    // has returned and dropped the HTTP/3 layer — the same object at the same
+    // moment that made `close_reason()` unusable — so nothing but an assertion
+    // stands between them and quietly becoming a placeholder. `initial_rtt_ms =
+    // 150` was derived from `rtt_ms` samples, `remote_now` is the only
+    // externally visible trace of a migration or NAT rebind mid-connection,
+    // `mtu` is what path MTU discovery settled on, and `mtu_black_holes` is how
+    // often it was knocked back to the floor on the way.
     let logged = buffer.contents();
     let closes: Vec<&str> = logged
         .lines()
@@ -236,6 +238,20 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         assert!(
             line.contains("rtt_ms="),
             "a close log must carry the measured RTT; line was:\n{line}"
+        );
+        // The packet size DPLPMTUD settled on, which is how an operator tells a
+        // path that carried the probes from one that black-holed them. Never
+        // below the QUIC floor, so a zero here is a placeholder rather than a
+        // measurement.
+        assert!(
+            line.contains("mtu=1"),
+            "a close log must carry the path MTU discovery settled on; line was:\n{line}"
+        );
+        // Loopback drops nothing, so the detector has nothing to fire on: the
+        // count is a real zero, and its presence is what is being pinned.
+        assert!(
+            line.contains("mtu_black_holes=0"),
+            "a close log must carry the black-hole detector's count; line was:\n{line}"
         );
         // The real address, not an empty or default one: this is what a
         // migration would show up as having changed.

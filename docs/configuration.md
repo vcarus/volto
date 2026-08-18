@@ -44,6 +44,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `max_targets_per_conn` | integer | `256` | Concurrent tunnels on one QUIC connection, TCP and UDP sharing the budget. Beyond it, requests get 503 with `Proxy-Status: volto; error=connection_limit_reached` |
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit. Excess connections are refused during the handshake, before any per-connection state exists here |
 | `connect_timeout` | seconds | `10` | Budget for reaching a target; `0` disables it. Spent twice per request and separately — once on name resolution, once on the whole list of addresses it resolved to — so a request holds its tunnel slot for at most twice this before any byte flows. A lookup that runs out answers 504 with `Proxy-Status: volto; error=dns_timeout`, a connect that runs out answers 504 with `error=connection_timeout` |
+| `ip_family_preference` | string | `"ipv4"` | Which address family a resolved target name is tried on first: `ipv4`, `ipv6` or `system` (the resolver's own RFC 6724 order). Applies to both tunnel kinds |
 | `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel. quinn's own default of 100 runs out during ordinary browsing |
 | `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600 |
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
@@ -81,7 +82,9 @@ warns at startup when the budget is off.
 settings and apply to new connections only.** A reload carries them to
 connections accepted from then on; connections already open keep what they
 negotiated at handshake time, because QUIC cannot renegotiate transport
-parameters.
+parameters. `ip_family_preference` is not a transport parameter, but it is
+snapshotted the same way: a connection resolves every target with the preference
+that was in force when it was accepted.
 
 **The two socket buffer keys are startup-only, not reloadable at all.** They are
 applied to the UDP socket when it is created, and a reload does not rebind that
@@ -108,14 +111,50 @@ and collapses the window — downloads stall to near zero while a co-located TCP
 proxy, which the kernel runs on BBR, is unaffected. BBR models bandwidth and RTT
 instead. Switch to cubic only on a clean path, or as a fallback.
 
+**Path MTU discovery reports what it found in the connection close line.** The
+`INFO ... connection closed` and `WARN ... connection closed with error` lines
+carry `mtu=`, the largest UDP payload the sender settled on for that path, and
+`mtu_black_holes=`, how many times quinn's black-hole detector pushed it back to
+the floor during the connection, next to `rtt_ms=` and `remote_now=`. Both are
+reports, not knobs. A `mtu=` still at `initial_mtu` when a long-lived connection
+ends means the DPLPMTUD probes were never acknowledged, which is what a path
+that black-holes large packets looks like from here, and the case
+`mtu_discovery = false` exists for; anything above `initial_mtu` is discovery
+having done its job. The counter tells a fall-back apart from a path that never
+got there: the detector is a heuristic over loss bursts, and full-size packets
+lost to ordinary congestion during a bulk transfer look the same to it as a
+path that stopped carrying them, after which the connection sends
+`initial_mtu`-sized packets for a one-minute cooldown before probing again. A
+non-zero count on a path where other connections settle above the floor is
+therefore that heuristic firing, not the path changing.
+
 **`initial_rtt_ms` seeds the handshake retransmission timers.** Until the first
 ACK arrives there is no RTT sample, and a lost handshake packet waits roughly
 three times this value before it is resent. The default of 333 comes from
 RFC 9002 and is deliberately conservative. On a known path, set 1.5–2× the RTT
 that volto's connection logs report as `rtt_ms` — a measured ~90 ms path wants
 about 150 — which cuts the worst-case handshake stall from about a second to a
-few hundred milliseconds. Keep the margin: a value below the real RTT makes the
-timer fire early and retransmit packets that were never lost.
+few hundred milliseconds. The example configuration in `script/` — and therefore
+every install derived from it — ships 150 for that reason; the compiled-in
+fallback used when the key is absent stays at 333. Keep the margin: a value
+below the real RTT makes the timer fire early and retransmit packets that were
+never lost.
+
+**`ip_family_preference` decides which half of a dual-stack target is tried
+first, and it is an operator's call rather than the resolver's.** `getaddrinfo`
+sorts its answers by RFC 6724, which puts a global IPv6 address ahead of every
+IPv4 one whenever the host has a usable IPv6 route — the right answer for a host
+that is only a client of the internet, and the wrong one for a proxy whose IPv6
+egress is tunnelled or worse peered than its native IPv4, which is a common
+shape on a VPS. volto therefore defaults to `ipv4`. A TCP tunnel would otherwise
+spend the whole IPv6 connect attempt before IPv4 is tried, and a CONNECT-UDP
+session would not recover at all: its socket is connected to the first address
+that has a route, and nothing later revisits that choice. Set `ipv6` when the
+host's IPv6 path is the better one — native IPv6 with tunnelled or NATed IPv4 —
+and `system` to hand the ordering back to the resolver, which on glibc can then
+be shaped through `gai.conf`. The ordering is a stable partition, so whatever
+RFC 6724 decided *within* a family still stands; a target that resolves to one
+family, an IP literal above all, is unaffected by any of the three.
 
 ## `[security]`
 

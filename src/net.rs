@@ -13,6 +13,32 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
+use crate::config::IpFamilyPreference;
+
+/// Reorders `addresses` so the preferred address family comes first.
+///
+/// A *stable* partition rather than a sort: within one family the resolver's own
+/// order survives untouched, so whatever RFC 6724 decided between two IPv6
+/// addresses (or two IPv4 ones) still decides which of them is tried first. Only
+/// the choice *between* the families is taken away from the resolver, because
+/// only that choice is an operator's to make — see [`IpFamilyPreference`].
+///
+/// [`System`](IpFamilyPreference::System) leaves the list exactly as it arrived.
+/// A list that is empty or single-family — an IP literal is always the latter —
+/// is unchanged by any preference.
+pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreference) {
+    let prefer_ipv6 = match preference {
+        IpFamilyPreference::System => return,
+        IpFamilyPreference::Ipv4 => false,
+        IpFamilyPreference::Ipv6 => true,
+    };
+
+    // `sort_by_key` is a stable sort, which is the whole requirement here: the
+    // key has two values, so every pair inside one family compares equal and
+    // keeps the order it came in with.
+    addresses.sort_by_key(|address| address.is_ipv6() != prefer_ipv6);
+}
+
 /// Resolves `host`/`port` to a non-empty list of socket addresses.
 ///
 /// An IP literal resolves to itself without consulting the resolver. Both
@@ -199,6 +225,122 @@ mod tests {
             limit > 0,
             "a process with no descriptors could not run this"
         );
+    }
+
+    /// Two of each family, interleaved, so both the partition and its stability
+    /// are visible in one list.
+    fn mixed() -> Vec<SocketAddr> {
+        vec![
+            "[2001:db8::1]:443".parse().unwrap(),
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::2]:443".parse().unwrap(),
+            "192.0.2.2:443".parse().unwrap(),
+        ]
+    }
+
+    #[test]
+    fn the_default_preference_puts_ipv4_first() {
+        let mut addresses = mixed();
+        prefer_family(&mut addresses, IpFamilyPreference::Ipv4);
+        assert_eq!(
+            addresses,
+            vec![
+                "192.0.2.1:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+                "[2001:db8::1]:443".parse().unwrap(),
+                "[2001:db8::2]:443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_ipv6_preference_puts_ipv6_first() {
+        let mut addresses = mixed();
+        prefer_family(&mut addresses, IpFamilyPreference::Ipv6);
+        assert_eq!(
+            addresses,
+            vec![
+                "[2001:db8::1]:443".parse().unwrap(),
+                "[2001:db8::2]:443".parse().unwrap(),
+                "192.0.2.1:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_system_preference_leaves_the_resolver_order_alone() {
+        let mut addresses = mixed();
+        prefer_family(&mut addresses, IpFamilyPreference::System);
+        assert_eq!(addresses, mixed(), "the resolver's order is the answer");
+    }
+
+    /// The property that makes this a partition and not a sort: RFC 6724 still
+    /// decides the order *within* a family, so an unstable sort would silently
+    /// throw away the resolver's tie-breaking.
+    #[test]
+    fn ordering_within_a_family_is_preserved() {
+        for preference in [IpFamilyPreference::Ipv4, IpFamilyPreference::Ipv6] {
+            let mut addresses = vec![
+                "192.0.2.9:443".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::9]:443".parse().unwrap(),
+                "192.0.2.1:443".parse().unwrap(),
+                "[2001:db8::1]:443".parse().unwrap(),
+                "192.0.2.5:443".parse().unwrap(),
+            ];
+            prefer_family(&mut addresses, preference);
+
+            let v4: Vec<SocketAddr> = addresses.iter().copied().filter(|a| a.is_ipv4()).collect();
+            let v6: Vec<SocketAddr> = addresses.iter().copied().filter(|a| a.is_ipv6()).collect();
+            assert_eq!(
+                v4,
+                vec![
+                    "192.0.2.9:443".parse::<SocketAddr>().unwrap(),
+                    "192.0.2.1:443".parse().unwrap(),
+                    "192.0.2.5:443".parse().unwrap(),
+                ],
+                "{preference:?}"
+            );
+            assert_eq!(
+                v6,
+                vec![
+                    "[2001:db8::9]:443".parse::<SocketAddr>().unwrap(),
+                    "[2001:db8::1]:443".parse().unwrap(),
+                ],
+                "{preference:?}"
+            );
+        }
+    }
+
+    /// The two shapes that arrive most often: an IP literal, which resolves to
+    /// one address, and a name with only one family behind it.
+    #[test]
+    fn single_family_and_empty_lists_are_untouched() {
+        for preference in [
+            IpFamilyPreference::Ipv4,
+            IpFamilyPreference::Ipv6,
+            IpFamilyPreference::System,
+        ] {
+            let mut empty: Vec<SocketAddr> = Vec::new();
+            prefer_family(&mut empty, preference);
+            assert!(empty.is_empty(), "{preference:?}");
+
+            let only_v4: Vec<SocketAddr> = vec![
+                "192.0.2.1:443".parse().unwrap(),
+                "192.0.2.2:443".parse().unwrap(),
+            ];
+            let mut addresses = only_v4.clone();
+            prefer_family(&mut addresses, preference);
+            assert_eq!(addresses, only_v4, "{preference:?}");
+
+            let only_v6: Vec<SocketAddr> = vec![
+                "[2001:db8::1]:443".parse().unwrap(),
+                "[2001:db8::2]:443".parse().unwrap(),
+            ];
+            let mut addresses = only_v6.clone();
+            prefer_family(&mut addresses, preference);
+            assert_eq!(addresses, only_v6, "{preference:?}");
+        }
     }
 
     #[tokio::test]

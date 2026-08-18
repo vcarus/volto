@@ -279,7 +279,9 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     // reason: the tunnel slot is held while the resolver is asked, so a resolver
     // that stops answering must not be able to hold it indefinitely. A lookup
     // that ran out of budget is a 504 `dns_timeout` rather than a 502.
-    let addresses = match tunnel::resolve_within(&host, port, ctx.connect_timeout).await {
+    let resolved =
+        tunnel::resolve_within(&host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
+    let addresses = match resolved {
         Ok(addresses) => addresses,
         Err(failure) => {
             let error = failure.proxy_error();
@@ -773,6 +775,11 @@ fn capsule_headers() -> HeaderMap {
 ///
 /// As on the TCP path, the address of the last attempt travels with the error:
 /// it is the hop an RFC 9209 `next-hop` parameter names.
+///
+/// Unlike the TCP path, this is not a failover: connecting a UDP socket only
+/// asks the kernel for a route, so the first address with one wins and nothing
+/// later can correct the choice. The family ordering applied at resolution
+/// (decision D58) is therefore the whole of the decision here.
 async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unreachable> {
     let mut last = None;
 

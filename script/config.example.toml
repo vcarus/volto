@@ -87,6 +87,28 @@ users = [
 # Default: 10
 #connect_timeout = 10
 
+# Which address family a resolved target name is tried on first:
+# "ipv4", "ipv6" or "system".
+#
+# Not a resolver detail but an operator policy. getaddrinfo -- glibc and musl
+# alike -- orders its answers by RFC 6724, which puts a global IPv6 address ahead
+# of every IPv4 one whenever the host has a usable IPv6 route. On a VPS whose
+# IPv6 egress is tunnelled, or simply worse peered than its native IPv4, that
+# sends every dual-stack target down the weaker path first: a TCP tunnel waits
+# out the whole IPv6 connect before IPv4 is tried, and a CONNECT-UDP session
+# never recovers at all, because its socket is connected to the first address
+# with a route and nothing revisits that choice.
+#
+# So the default is "ipv4". Set "ipv6" when this host's IPv6 path is the better
+# one, and "system" to hand the ordering back to the resolver (which on glibc
+# can then be shaped through /etc/gai.conf). The reordering is a stable
+# partition, so RFC 6724 still decides the order within a family, and a target
+# that resolves to a single family -- an IP literal above all -- is unaffected.
+# Like connect_timeout above, this is snapshotted per connection: a reload
+# applies it to connections accepted after it.
+# Default: "ipv4"
+#ip_family_preference = "ipv4"
+
 # --- QUIC transport parameters ----------------------------------------------
 # All seven apply to connections accepted from now on. A reload (SIGHUP) carries
 # them to new connections; connections already open keep what they negotiated at

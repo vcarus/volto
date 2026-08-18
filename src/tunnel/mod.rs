@@ -12,7 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
 use crate::auth::Authenticator;
-use crate::config::Config;
+use crate::config::{Config, IpFamilyPreference};
 use crate::h3api::{self, ConnectProtocol, Stream};
 use crate::policy::Policy;
 
@@ -83,6 +83,12 @@ pub struct Context {
     /// the whole list of addresses it resolved to — so the worst case a tunnel
     /// slot is held before any byte flows is twice this.
     pub connect_timeout: Option<Duration>,
+    /// Which address family a resolved target is tried on first.
+    ///
+    /// Snapshotted with the rest of the connection's `[limits]`, so a reload
+    /// changes what connections accepted from then on do and leaves a running
+    /// one alone.
+    pub ip_family_preference: IpFamilyPreference,
     /// Packets a UDP session may send before its target has answered.
     pub unanswered_packet_budget: u32,
 }
@@ -102,6 +108,7 @@ impl Context {
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
             idle_timeout: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
+            ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
         }
     }
@@ -245,19 +252,29 @@ impl std::fmt::Display for ResolveFailure {
     }
 }
 
-/// Resolves `host`/`port`, giving the resolver at most `budget`.
+/// Resolves `host`/`port`, giving the resolver at most `budget` and ordering the
+/// answer by `family`.
 ///
 /// Bounded because the tunnel slot and the file descriptor it stands for are
 /// already held by the time this runs: a stub resolver whose nameserver has gone
 /// away takes tens of seconds to give up, and every one of them is a slot the
 /// client cannot use for anything else. `None` leaves the wait to the resolver,
 /// which is what `connect_timeout = 0` asks for.
+///
+/// The address-family ordering happens here, once, rather than in each tunnel
+/// (decision D58): this is the single point where a name becomes a list of
+/// addresses, and it sits before the destination policy filters that list and
+/// before either tunnel starts dialling it, so both kinds agree on which family
+/// is tried first without either having to remember to ask.
 pub(crate) async fn resolve_within(
     host: &str,
     port: u16,
     budget: Option<Duration>,
+    family: IpFamilyPreference,
 ) -> Result<Vec<std::net::SocketAddr>, ResolveFailure> {
-    within_budget(crate::net::resolve(host, port), budget).await
+    let mut addresses = within_budget(crate::net::resolve(host, port), budget).await?;
+    crate::net::prefer_family(&mut addresses, family);
+    Ok(addresses)
 }
 
 /// Applies a resolution budget to `lookup`.

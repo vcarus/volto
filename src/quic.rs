@@ -424,10 +424,32 @@ impl Server {
             );
 
             // `conn::handle` consumes the connection; keep a handle so the close
-            // logs can report the path RTT the connection actually measured and
-            // the address the peer ended on — `remote_now` differing from
-            // `remote` is the only externally visible trace of a migration or
-            // NAT rebind during the connection's life.
+            // logs can report what the connection learned about its path: the
+            // RTT it measured, the address the peer ended on — `remote_now`
+            // differing from `remote` is the only externally visible trace of a
+            // migration or NAT rebind during the connection's life — and the
+            // MTU.
+            //
+            // `mtu` is the packet size DPLPMTUD settled on in this direction —
+            // a report, not a knob: it is here so an operator can see whether
+            // discovery ever got past `initial_mtu` on their path. On a
+            // connection that lived long enough to probe, a value still at the
+            // floor means the probes went unanswered (the shape a path that
+            // black-holes large packets has) or a black hole was detected later
+            // and discovery fell back; anything above it is discovery having
+            // done its job.
+            //
+            // `mtu_black_holes` counts how often quinn's black-hole detector
+            // fired and pushed the packet size back to the floor for its
+            // cooldown. It is what tells those two apart when `mtu` alone
+            // cannot: discovery may have climbed back by the time the
+            // connection ends, hiding a fall-back that a bulk transfer in the
+            // middle paid for. quinn's detector is a heuristic over loss
+            // bursts, and a burst of full-size packets lost to ordinary
+            // congestion looks the same to it as a path that stopped carrying
+            // them, so a non-zero count on a path that other connections probe
+            // fine is the signature of a false positive rather than of the
+            // path.
             let rtt_probe = quic.clone();
 
             // Which of the two log levels this connection deserves is decided
@@ -454,6 +476,9 @@ impl Server {
                 },
             };
 
+            // One snapshot for both fields, so they describe the same instant.
+            let path = rtt_probe.stats().path;
+
             match closed {
                 Ok(reason) => {
                     info!(
@@ -461,6 +486,8 @@ impl Server {
                         remote_now = %rtt_probe.remote_address(),
                         reason,
                         rtt_ms = rtt_probe.rtt().as_millis(),
+                        mtu = path.current_mtu,
+                        mtu_black_holes = path.black_holes_detected,
                         "connection closed"
                     );
                 }
@@ -470,6 +497,8 @@ impl Server {
                         remote_now = %rtt_probe.remote_address(),
                         %error,
                         rtt_ms = rtt_probe.rtt().as_millis(),
+                        mtu = path.current_mtu,
+                        mtu_black_holes = path.black_holes_detected,
                         "connection closed with error"
                     );
                 }

@@ -19,6 +19,7 @@
 //! max_targets_per_conn = 256
 //! max_connections      = 256
 //! connect_timeout      = 10    # seconds, 0 disables the budget
+//! ip_family_preference = "ipv4" # ipv4 | ipv6 | system
 //! max_streams_bidi     = 1024
 //! max_idle_timeout     = 60    # seconds
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
@@ -307,6 +308,37 @@ pub enum CongestionControl {
     NewReno,
 }
 
+/// Which address family a target name is tried on first, selected by
+/// `[limits].ip_family_preference`.
+///
+/// The default is IPv4, which is deliberately *not* what the C library hands
+/// back. `getaddrinfo` — glibc and musl alike — orders its answers by RFC 6724,
+/// and that ordering puts a global IPv6 address ahead of every IPv4 one whenever
+/// the host has a usable IPv6 route. On a host that is only a client of the
+/// internet that is the right answer. On a proxy it is an operator policy
+/// wearing a resolver's clothes: a host whose IPv6 egress is tunnelled, or
+/// otherwise weaker than its native IPv4 — a common shape on a VPS — would send
+/// every dual-stack target down the weaker path first. A TCP tunnel pays for
+/// that with the whole IPv6 attempt before IPv4 is even tried, because
+/// [`crate::tunnel::tcp`] walks the address list in order; a CONNECT-UDP session
+/// pays for it outright, because its socket is connected to the first address
+/// that has a route and there is no failover behind that choice.
+///
+/// [`System`](Self::System) is the escape hatch back to RFC 6724 ordering, which
+/// on glibc an operator can shape further through `gai.conf`. The knob and its
+/// default have precedent: shadowsocks-rust carries the same choice as
+/// `ipv6_first`, likewise off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IpFamilyPreference {
+    /// Try IPv4 addresses before IPv6 ones. The default.
+    Ipv4,
+    /// Try IPv6 addresses before IPv4 ones.
+    Ipv6,
+    /// Keep the resolver's own order, which on libc means RFC 6724.
+    System,
+}
+
 /// `[limits]` — resource and lifetime limits.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,6 +361,13 @@ pub struct Limits {
     /// of addresses it resolved to. See [`DEFAULT_CONNECT_TIMEOUT`].
     #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
+    /// Which address family a resolved target is tried on first.
+    ///
+    /// Applied once, at the single point where a name becomes a list of
+    /// addresses, so both tunnel kinds see the same order; see
+    /// [`IpFamilyPreference`] for why the default departs from the resolver's.
+    #[serde(default = "default_ip_family_preference")]
+    pub ip_family_preference: IpFamilyPreference,
     /// Concurrent client-initiated bidirectional streams per QUIC connection.
     #[serde(default = "default_max_streams_bidi")]
     pub max_streams_bidi: u32,
@@ -499,6 +538,10 @@ fn default_max_streams_bidi() -> u32 {
     DEFAULT_MAX_STREAMS_BIDI
 }
 
+fn default_ip_family_preference() -> IpFamilyPreference {
+    IpFamilyPreference::Ipv4
+}
+
 fn default_max_idle_timeout() -> u64 {
     DEFAULT_MAX_IDLE_TIMEOUT
 }
@@ -546,6 +589,7 @@ impl Default for Limits {
             max_targets_per_conn: default_max_targets_per_conn(),
             max_connections: default_max_connections(),
             connect_timeout: default_connect_timeout(),
+            ip_family_preference: default_ip_family_preference(),
             max_streams_bidi: default_max_streams_bidi(),
             max_idle_timeout: default_max_idle_timeout(),
             keep_alive_interval: default_keep_alive_interval(),
@@ -977,6 +1021,13 @@ mod tests {
         assert_eq!(cfg.limits.socket_send_buffer, 2 * 1024 * 1024);
         // BBR by default: the point of the proxy is lossy long-haul paths.
         assert_eq!(cfg.limits.congestion_control, CongestionControl::Bbr);
+        // IPv4 first by default, which is not what the resolver would have
+        // ordered on a dual-stack host (decision D58).
+        assert_eq!(
+            cfg.limits.ip_family_preference,
+            IpFamilyPreference::Ipv4,
+            "the default must put IPv4 first"
+        );
         // The defaults must themselves satisfy the keep-alive rule.
         assert!(cfg.limits.keep_alive_interval * 2 < cfg.limits.max_idle_timeout);
         assert_eq!(cfg.server.shutdown_grace, 30);
@@ -1276,6 +1327,42 @@ mod tests {
         )
         .expect_err("an unknown controller must be rejected");
         assert!(err.to_string().contains("congestion_control"), "{err}");
+    }
+
+    #[test]
+    fn the_ip_family_preference_is_selectable_and_defaults_to_ipv4() {
+        assert_eq!(
+            parse("").limits.ip_family_preference,
+            IpFamilyPreference::Ipv4,
+            "the default must be IPv4-first"
+        );
+        for (value, expected) in [
+            ("ipv4", IpFamilyPreference::Ipv4),
+            ("ipv6", IpFamilyPreference::Ipv6),
+            ("system", IpFamilyPreference::System),
+        ] {
+            let cfg = parse(&format!("[limits]\nip_family_preference = \"{value}\""));
+            assert_eq!(cfg.limits.ip_family_preference, expected, "{value}");
+            assert_valid_apart_from_certs(&cfg, value);
+        }
+    }
+
+    /// A typo must name the key it was made in, since that is all an operator
+    /// reading a failed startup has to go on.
+    #[test]
+    fn an_unknown_ip_family_preference_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            [limits]
+            ip_family_preference = "v4"
+            "#,
+        )
+        .expect_err("an unknown preference must be rejected");
+        assert!(err.to_string().contains("ip_family_preference"), "{err}");
     }
 
     #[test]
