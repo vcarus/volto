@@ -64,14 +64,20 @@ jobs:
     # This turns it into a failing build instead.
     #
     # A job of its own, and a cheap one: cargo-audit reads the lockfile and never
-    # builds the crate, so it needs no toolchain, shares no cache with the test
-    # matrix, and cannot slow it down.
+    # builds the crate, so it shares no cache with the test matrix and cannot
+    # slow it down.
     #
     # The blind spot is worth naming. cargo-audit skips every lockfile entry whose
     # source is not the default registry -- it does not fall back to the version a
     # git dependency declares -- so the `h3` / `h3-quinn` git-rev pins are invisible
     # to this job. They stay covered by the manual review a rev bump already
     # requires (see .github/dependabot.yml).
+    #
+    # The `[patch.crates-io]` fork of `quinn-proto` would fall into that same hole,
+    # but it does not have to: the fork is the upstream `quinn-proto-0.11.17` tag
+    # plus three commits, so advisories against 0.11.17 apply to it verbatim. The
+    # second step below recovers it by auditing a copy of the lockfile with that
+    # one `source` line pointed back at the registry.
     name: audit (RustSec)
     runs-on: ubuntu-latest
     permissions:
@@ -90,6 +96,41 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      # TEMPORARY, and paired with the `[patch.crates-io]` stanza in Cargo.toml:
+      # delete both together once quinn-proto ships the fix upstream.
+      - uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        with:
+          tool: cargo-audit
+      - name: Audit the patched quinn-proto as its upstream release
+        run: |
+          set -euo pipefail
+          LOCK="$RUNNER_TEMP/Cargo.audit.lock"
+
+          # Only inside the quinn-proto entry -- from its `name =` line to the
+          # next `[[package]]` header -- so no other git source is touched. A
+          # `checksum` line is simply absent for a git entry, which cargo-audit
+          # accepts: it reads name, version and source and nothing else.
+          sed -e '/^name = "quinn-proto"$/,/^\[\[package\]\]$/ s|^source = "git+.*"$|source = "registry+https://github.com/rust-lang/crates.io-index"|' \
+            Cargo.lock > "$LOCK"
+
+          # Assert the rewrite landed. Without this the step would keep passing
+          # if the entry ever changed shape, having quietly audited nothing.
+          entry="$(grep -A 2 '^name = "quinn-proto"$' "$LOCK")"
+          printf '%s\n' "$entry"
+          case "$entry" in
+            *'source = "registry+https://github.com/rust-lang/crates.io-index"'*) ;;
+            *)
+              echo "::error::the quinn-proto source rewrite did not apply"
+              exit 1
+              ;;
+          esac
+
+          # Vulnerabilities fail the step; informational advisories are reported
+          # without failing, matching the action above. Note that this scan does
+          # not read that action's `ignore:` list -- an accepted RUSTSEC id has to
+          # be written in both places.
+          cargo audit -f "$LOCK"
 
   test:
     # macOS is the development host and Linux the deployment target; both have to
