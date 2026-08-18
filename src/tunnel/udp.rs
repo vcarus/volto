@@ -113,7 +113,7 @@ impl SessionRegistry {
             .cloned()
     }
 
-    /// Number of live sessions. Used by tests and future accounting.
+    /// Number of live sessions.
     pub fn len(&self) -> usize {
         self.sessions
             .lock()

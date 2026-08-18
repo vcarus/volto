@@ -444,16 +444,6 @@ impl ProxyError {
         }
     }
 
-    /// The registered error type name, for logs.
-    pub fn as_str(self) -> &'static str {
-        // Everything after `error=`; the field value is the single source of truth
-        // so the two cannot drift apart.
-        self.field_value()
-            .rsplit_once("error=")
-            .expect("every field value carries an error parameter")
-            .1
-    }
-
     /// This error as a response header map.
     pub fn headers(self) -> HeaderMap {
         let mut headers = HeaderMap::with_capacity(1);
@@ -813,8 +803,6 @@ mod tests {
             ),
             (ProxyError::HttpRequestDenied, "http_request_denied"),
         ] {
-            assert_eq!(error.as_str(), expected);
-
             let value = error.field_value();
             // `<identifier>; error=<type>`: the identifier names this proxy, the
             // parameter names the failure.
@@ -852,8 +840,7 @@ mod tests {
             assert_eq!(
                 error.recommended_status(),
                 expected,
-                "{} must answer {expected}",
-                error.as_str()
+                "{error:?} must answer {expected}"
             );
         }
     }
@@ -924,10 +911,7 @@ mod tests {
         ] {
             assert_eq!(
                 proxy_status(&error.headers_with_next_hop(Some(hop))),
-                format!(
-                    "volto; error={}; next-hop=\"192.0.2.7:443\"",
-                    error.as_str()
-                )
+                format!("{}; next-hop=\"192.0.2.7:443\"", error.field_value())
             );
         }
     }
@@ -951,13 +935,11 @@ mod tests {
             assert_eq!(
                 value,
                 error.field_value(),
-                "{} must stay exactly as it is without a next-hop",
-                error.as_str()
+                "{error:?} must stay exactly as it is without a next-hop"
             );
             assert!(
                 !value.contains("10.1.2.3") && !value.contains("next-hop"),
-                "{} leaked an address: {value}",
-                error.as_str()
+                "{error:?} leaked an address: {value}"
             );
         }
     }

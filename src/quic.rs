@@ -305,11 +305,6 @@ impl Server {
             .context("failed to read the local address of the QUIC endpoint")
     }
 
-    /// The underlying quinn endpoint.
-    pub fn endpoint(&self) -> &quinn::Endpoint {
-        &self.endpoint
-    }
-
     /// Accepts connections until the endpoint closes or shutdown is triggered.
     ///
     /// Each connection is handled in its own task, so a failure only ever affects
