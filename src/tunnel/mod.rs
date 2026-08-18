@@ -9,12 +9,12 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
 use crate::h3api::{self, ConnectProtocol, Stream};
-use crate::policy::Policy;
+use crate::policy::{self, Policy};
 
 /// How a request should be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +220,22 @@ pub(crate) struct Unreachable {
     pub(crate) error: std::io::Error,
 }
 
+impl Unreachable {
+    /// The failure of a target that offered nothing to attempt.
+    ///
+    /// Both tunnel types walk a list of addresses and keep the last failure, so
+    /// both need an answer for a list that was empty. Neither can actually reach
+    /// it — [`admit_target`] never hands back an empty list — so this is the
+    /// empty-list arm written out rather than asserted, and there is no hop to
+    /// name in it.
+    pub(crate) fn no_addresses() -> Self {
+        Self {
+            next_hop: None,
+            error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to try"),
+        }
+    }
+}
+
 /// A name that could not be turned into addresses, and why not.
 ///
 /// The two cases are reported differently, so the callers have to be able to
@@ -297,6 +313,117 @@ where
     };
 
     resolved.map_err(ResolveFailure::Failed)
+}
+
+/// Turns a request's target into the addresses it may be dialled on, answering
+/// the request itself when there are none it may use.
+///
+/// `Some(addresses)` is a non-empty, policy-filtered, family-ordered list, ready
+/// for the caller to dial. `None` means the request has **already been
+/// answered** — with a 403, a 502, a 504, or the 200 that closes on the spot —
+/// and the caller has nothing left to do but return.
+///
+/// Both tunnel types run exactly this preamble, which is why it is written once:
+/// two copies drift, and a drift here is the two protocols disagreeing about
+/// what a policy refusal looks like.
+///
+/// The order of the three steps is part of the design:
+///
+/// * The port rule needs no address, so it is applied before the resolver is
+///   asked anything: a denied port cannot be used to make the proxy run lookups.
+/// * Resolution is explicit, rather than left to the connect call, so the
+///   addresses are visible to the policy below — and bounded, because the tunnel
+///   slot and the file descriptor it stands for are already held. A resolver
+///   failure is not the client's fault (decision D9), so it is a 502 with the
+///   RFC 9209 reason rather than a 400, and a resolver that never answered is a
+///   504 `dns_timeout` instead, because those are different things to an
+///   operator reading the log. The list comes back ordered by `[limits]
+///   ip_family_preference` (decision D58) and the callers dial it in that order,
+///   so on a dual-stack target the non-preferred family is only reached after
+///   the preferred one fails.
+/// * A name resolving to a mix of public and private addresses keeps only the
+///   public ones, so DNS rebinding onto loopback gains nothing.
+///
+/// Nothing left after that filter splits two ways (decision D49). A name whose
+/// every address is the unspecified one was blocked by a filtering resolver
+/// upstream, and that verdict is not this proxy's: answering 403 would make the
+/// client attribute an ad blocker's decision to the proxy, and this is the only
+/// protocol in the client's stable with an in-band channel to say anything at
+/// all, so it is the only one that gets blamed. Such a request is accepted and
+/// closed on the spot instead. Every other refusal — loopback, RFC 1918, a mix —
+/// keeps its loud 403 with the RFC 9209 reason, because that is what an SSRF
+/// probe looks like from here and the client really is being refused by this
+/// proxy. The criterion belongs to [`policy::is_dns_blackhole`] and the response
+/// mechanics to [`accept_then_close`]; only the choice between them is made
+/// here.
+///
+/// `accepted_headers` supplies what an accepted response of the caller's tunnel
+/// type has to carry — nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
+/// field for CONNECT-UDP. Deferred, so only the one path that sends a 200 pays
+/// for building it.
+pub(crate) async fn admit_target(
+    host: &str,
+    port: u16,
+    ctx: &Context,
+    stream: &mut Stream,
+    stream_id: u64,
+    accepted_headers: impl FnOnce() -> HeaderMap,
+) -> Option<Vec<std::net::SocketAddr>> {
+    if !ctx.policy.allows_port(port) {
+        debug!(stream_id, host, port, "target port denied by policy");
+        refuse_because(
+            stream,
+            StatusCode::FORBIDDEN,
+            ProxyError::HttpRequestDenied,
+            stream_id,
+        )
+        .await;
+        return None;
+    }
+
+    let resolved = resolve_within(host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
+    let addresses = match resolved {
+        Ok(addresses) => addresses,
+        Err(failure) => {
+            let error = failure.proxy_error();
+            debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
+            refuse_because(stream, error.recommended_status(), error, stream_id).await;
+            return None;
+        }
+    };
+
+    let allowed = ctx.policy.allowed_addresses(&addresses);
+    if allowed.is_empty() {
+        if policy::is_dns_blackhole(&addresses) {
+            info!(
+                stream_id,
+                host,
+                port,
+                ?addresses,
+                "every address of the target is a DNS blackhole"
+            );
+            accept_then_close(stream, accepted_headers(), stream_id).await;
+            return None;
+        }
+
+        warn!(
+            stream_id,
+            host,
+            port,
+            ?addresses,
+            "every address of the target is prohibited by policy"
+        );
+        refuse_because(
+            stream,
+            StatusCode::FORBIDDEN,
+            ProxyError::DestinationIpProhibited,
+            stream_id,
+        )
+        .await;
+        return None;
+    }
+
+    Some(allowed)
 }
 
 impl ProxyError {

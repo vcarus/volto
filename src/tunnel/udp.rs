@@ -40,8 +40,8 @@ use tracing::{debug, info, warn};
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{self, Reader, Stream, Writer};
-use crate::tunnel::{Context, ProxyError, Unreachable};
-use crate::{net, policy, tunnel};
+use crate::tunnel::{Context, Unreachable};
+use crate::{net, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
@@ -255,85 +255,24 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
     let _guard = ctx.sessions.register(quarter_stream_id, inbound_tx);
 
-    // Cheapest check first, and one that needs no resolver.
-    if !ctx.policy.allows_port(port) {
-        debug!(stream_id, host, port, "target port denied by policy");
-        tunnel::refuse_because(
-            &mut stream,
-            StatusCode::FORBIDDEN,
-            ProxyError::HttpRequestDenied,
-            stream_id,
-        )
-        .await;
+    // Port policy, resolution and destination policy, in that order and with
+    // every refusal already answered by the time this returns — see
+    // [`tunnel::admit_target`]. RFC 9298 §3.1 is what puts it here rather than
+    // after the 2xx: resolution must complete first, so a bad name is refused
+    // instead of silently swallowing every packet. The 200-then-close path is
+    // handed [`capsule_headers`] because that answer is a real successful
+    // response to a CONNECT-UDP request, and the RFC 9297 `Capsule-Protocol`
+    // field is what makes it one.
+    //
+    // Every path out of here that answers the request returns, dropping `_guard`
+    // with it — which unregisters the Quarter Stream ID and discards whatever
+    // the client sent optimistically; the router then drops later datagrams for
+    // that id silently, exactly as it does for a session that has just closed.
+    let Some(allowed) =
+        tunnel::admit_target(&host, port, &ctx, &mut stream, stream_id, capsule_headers).await
+    else {
         return;
-    }
-
-    // RFC 9298 §3.1: resolution must complete before the 2xx, so a bad name is
-    // refused instead of silently swallowing every packet.
-    //
-    // Decision D9: a resolver failure is a 502, not a 400. A transient DNS
-    // failure is not something the client did wrong, and the RFC 9209 reason
-    // tells it which of the two happened.
-    //
-    // Bounded by `[limits] connect_timeout` like the TCP path, and for the same
-    // reason: the tunnel slot is held while the resolver is asked, so a resolver
-    // that stops answering must not be able to hold it indefinitely. A lookup
-    // that ran out of budget is a 504 `dns_timeout` rather than a 502.
-    let resolved =
-        tunnel::resolve_within(&host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
-    let addresses = match resolved {
-        Ok(addresses) => addresses,
-        Err(failure) => {
-            let error = failure.proxy_error();
-            debug!(stream_id, host, port, reason = %failure, "failed to resolve connect-udp target");
-            tunnel::refuse_because(&mut stream, error.recommended_status(), error, stream_id).await;
-            return;
-        }
     };
-
-    let allowed = ctx.policy.allowed_addresses(&addresses);
-    if allowed.is_empty() {
-        // The same split as the TCP path, for the same reason (decision D49). A
-        // resolver that answers only the unspecified address has filtered the
-        // name; that block belongs to the resolver, not to this proxy, so the
-        // session is accepted and closed at once rather than refused. The 200
-        // still carries the RFC 9297 `Capsule-Protocol` field, because it is a
-        // real successful response to a CONNECT-UDP request and the field is
-        // what makes it one. Anything else — a private address among the
-        // answers above all — stays a warning and a 403.
-        //
-        // Returning here drops `_guard`, which unregisters the Quarter Stream ID
-        // and discards whatever the client sent optimistically; the router then
-        // drops later datagrams for that id silently, exactly as it does for a
-        // session that has just closed.
-        if policy::is_dns_blackhole(&addresses) {
-            info!(
-                stream_id,
-                host,
-                port,
-                ?addresses,
-                "every address of the target is a DNS blackhole"
-            );
-            tunnel::accept_then_close(&mut stream, capsule_headers(), stream_id).await;
-            return;
-        }
-
-        warn!(
-            stream_id,
-            host,
-            port,
-            ?addresses,
-            "every address of the target is prohibited by policy"
-        );
-        tunnel::refuse_because(
-            &mut stream,
-            StatusCode::FORBIDDEN,
-            ProxyError::DestinationIpProhibited,
-            stream_id,
-        )
-        .await;
-        return;
-    }
 
     let socket = match bind_any(&allowed).await {
         Ok(socket) => socket,
@@ -796,10 +735,7 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unrea
         }
     }
 
-    Err(last.unwrap_or_else(|| Unreachable {
-        next_hop: None,
-        error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to bind to"),
-    }))
+    Err(last.unwrap_or_else(Unreachable::no_addresses))
 }
 
 /// Checks a CONNECT-UDP request against the rules that are about the message

@@ -30,11 +30,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::h3api::{self, Buffer, Reader, Stream, Writer};
-use crate::tunnel::{Context, ProxyError, Unreachable};
-use crate::{policy, tunnel};
+use crate::tunnel;
+use crate::tunnel::{Context, Unreachable};
 
 /// Bytes read from the target per relay iteration.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
@@ -50,86 +50,15 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         }
     };
 
-    // The port rule needs no address, so it is applied before the resolver is
-    // asked anything: a denied port cannot be used to make the proxy run lookups.
-    if !ctx.policy.allows_port(port) {
-        debug!(stream_id, authority, port, "target port denied by policy");
-        tunnel::refuse_because(
-            &mut stream,
-            StatusCode::FORBIDDEN,
-            ProxyError::HttpRequestDenied,
-            stream_id,
-        )
-        .await;
+    // Port policy, resolution and destination policy, in that order and with
+    // every refusal already answered by the time this returns — see
+    // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
+    // headers of its own, so the 200-then-close path is handed an empty map.
+    let Some(allowed) =
+        tunnel::admit_target(&host, port, ctx, &mut stream, stream_id, HeaderMap::new).await
+    else {
         return;
-    }
-
-    // Resolution is explicit so the addresses are visible to the policy below —
-    // `TcpStream::connect((host, port))` would resolve internally and leave
-    // nothing to filter. It is also bounded: the tunnel slot is already held.
-    // The list comes back ordered by `[limits] ip_family_preference` (decision
-    // D58), and `connect_any` walks it in that order, so on a dual-stack target
-    // the non-preferred family is only reached after the preferred one fails.
-    let resolved =
-        tunnel::resolve_within(&host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
-    let addresses = match resolved {
-        Ok(addresses) => addresses,
-        Err(failure) => {
-            // A resolver failure is not the client's fault (decision D9), so it is
-            // a 502 with the RFC 9209 reason rather than a 400 — and a resolver
-            // that never answered is a 504 `dns_timeout` instead, because those
-            // are different things to an operator reading the log.
-            let error = failure.proxy_error();
-            debug!(stream_id, authority, reason = %failure, "failed to resolve target");
-            tunnel::refuse_because(&mut stream, error.recommended_status(), error, stream_id).await;
-            return;
-        }
     };
-
-    // A name resolving to a mix of public and private addresses keeps only the
-    // public ones, so DNS rebinding onto loopback gains nothing.
-    let allowed = ctx.policy.allowed_addresses(&addresses);
-    if allowed.is_empty() {
-        // Two different things end up here, and they get different answers
-        // (decision D49). A name that resolves to nothing but the unspecified
-        // address was blocked by a filtering resolver upstream: that is not this
-        // proxy's verdict, so it must not look like one. Answering 403 makes the
-        // client attribute an ad blocker's decision to the proxy — and this is
-        // the only protocol in the client's stable with an in-band channel to
-        // say anything at all, so it is the only one that gets blamed. The
-        // tunnel is therefore accepted and closed on the spot, which is what a
-        // target that accepts and hangs up immediately looks like on the wire,
-        // and what every other transport shows for a blackholed name.
-        //
-        // Every other refusal — loopback, RFC 1918, a mix — keeps its loud 403
-        // with the RFC 9209 reason, because that is what an SSRF probe looks
-        // like from here and the client really is being refused by this proxy.
-        if policy::is_dns_blackhole(&addresses) {
-            info!(
-                stream_id,
-                authority,
-                ?addresses,
-                "every address of the target is a DNS blackhole"
-            );
-            tunnel::accept_then_close(&mut stream, HeaderMap::new(), stream_id).await;
-            return;
-        }
-
-        warn!(
-            stream_id,
-            authority,
-            ?addresses,
-            "every address of the target is prohibited by policy"
-        );
-        tunnel::refuse_because(
-            &mut stream,
-            StatusCode::FORBIDDEN,
-            ProxyError::DestinationIpProhibited,
-            stream_id,
-        )
-        .await;
-        return;
-    }
 
     let tcp = match connect_any(&allowed, ctx.connect_timeout).await {
         Ok(tcp) => tcp,
@@ -257,12 +186,7 @@ where
         }
     }
 
-    // Callers only ever pass a non-empty list, so the fallback is the empty-list
-    // arm written out rather than asserted: there is no hop to name in it.
-    Err(last.unwrap_or_else(|| Unreachable {
-        next_hop: None,
-        error: io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to"),
-    }))
+    Err(last.unwrap_or_else(Unreachable::no_addresses))
 }
 
 /// Pumps client → target.
