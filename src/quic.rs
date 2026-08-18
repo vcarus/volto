@@ -81,66 +81,18 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(limits.max_streams_bidi));
 
-    // The bound on what an *unauthenticated* peer can make this process hold.
-    //
-    // quinn's default is `VarInt::MAX` — no aggregate limit at all — and the
-    // per-stream window is 2 MiB (ours, set just below). With our raised stream
-    // limit that is 1024 x 2 MiB, so a single connection could pin 2 GiB of
-    // receive buffer before we ever see a request to authenticate: open the
-    // streams, fill each window, stop. On a 1 GB VPS one connection is enough to
-    // end the process.
-    //
-    // The cap only constrains data that has arrived and not yet been read, and
-    // both tunnel pumps read continuously, so it binds exactly when the target is
-    // slower than the client — which is the case that should be bounded.
+    // The bound on what an unauthenticated peer can make this process hold,
+    // where quinn's default is no aggregate bound at all; the arithmetic is in
+    // [`CONNECTION_RECEIVE_WINDOW`].
     transport.receive_window(CONNECTION_RECEIVE_WINDOW);
 
-    // Raised above quinn's own default of 1,250,000, not inherited from it and no
-    // longer a pin at it. No RFC constrains the value — RFC 9000 §4.2 leaves the
-    // amount of credit to implementations outright, and §4.3 only observes the
-    // consequence of getting it wrong: an endpoint that "cannot ensure that its
-    // peer always has available flow control credit that is greater than the
-    // peer's bandwidth-delay product" finds "its receive throughput will be
-    // limited by flow control". That is advice, not a requirement, and it is the
-    // whole of the case. The production path's BDP — a 100 Mbps client uplink over
-    // a 95 ms RTT — is about 1.19 MB, so quinn's default sat at roughly 1.05x it:
-    // exactly one BDP, with no margin for a window update still in flight. 2 MiB
-    // is about 1.75x. The peer we
-    // interoperate with sizes its own side far higher still: Surge's ClientHello
-    // advertises `initial_max_stream_data_bidi_local` = 12 MiB per stream.
-    //
-    // Not a memory decision. `receive_window` above is the real bound — the
-    // invariant is that (the sum of the highest offsets received) minus (the bytes
-    // read) stays within it — so a larger per-stream window cannot raise the
-    // per-connection worst case, which is unchanged at 16 MiB. What this value
-    // actually decides is how few simultaneously saturated tunnels it takes to
-    // spend the whole connection's credit — 16 MiB / 2 MiB = 8 — which is a
-    // fairness property rather than a memory one, and 8:1 is still far more
-    // conservative than the 1.33:1 the peer itself runs (16 MiB of
-    // `initial_max_data` against 12 MiB per stream). The per-tunnel ceiling in the
-    // download direction is whatever the client advertises to us and is not
-    // settable here.
+    // A deliberate raise above quinn's own default, sized against the production
+    // path's bandwidth-delay product; the case for the number, and why it is not
+    // a memory decision, is in [`STREAM_RECEIVE_WINDOW`].
     transport.stream_receive_window(STREAM_RECEIVE_WINDOW);
 
-    // This one *is* set to exactly what quinn already defaults to, so it changes
-    // not a byte on the wire today. It is pinned because upstream derives it from
-    // `STREAM_RWND`, a private constant inside `TransportConfig::default` with no
-    // stability guarantee, while the throughput arithmetic below is quoted against
-    // it. Dependabot proposes cargo bumps weekly; a patch release that moved that
-    // constant would leave the documented numbers quietly false. Setting the value
-    // here makes them true by construction instead of by inheritance.
-    //
-    // The mirror image of `receive_window`, and the only bound on what this
-    // process buffers for a client that stops reading: a per-connection aggregate
-    // cap on unacknowledged outbound stream data. 10 MB over the ~90 ms path RTT
-    // is about 889 Mbps against a measured peak of 177 Mbps, so it is nowhere near
-    // a throughput constraint.
-    //
-    // Note the asymmetry it leaves: 16 MiB of inbound credit granted against a
-    // 10 MB outbound cap, on a proxy whose traffic is mostly outbound. That is an
-    // accepted decision, not an oversight — lifting the outbound cap to match
-    // would add roughly 1.6 GiB of theoretical worst case across `max_connections`
-    // (256 by default) in exchange for throughput we cannot measure a need for.
+    // Exactly what quinn already defaults to, set here rather than inherited so
+    // the arithmetic quoted against it cannot go stale; see [`SEND_WINDOW`].
     transport.send_window(SEND_WINDOW);
 
     transport.max_idle_timeout(Some(
@@ -801,24 +753,48 @@ fn socket_buffer_was_capped(requested: usize, granted: usize) -> bool {
 
 /// Aggregate flow-control window for one connection, in bytes.
 ///
-/// 16 MiB against the 2 MiB [`STREAM_RECEIVE_WINDOW`]: eight simultaneously
-/// saturated tunnels still get their full stream windows, while the worst case
-/// stops being a function of `max_streams_bidi`.
+/// The bound on what an *unauthenticated* peer can make this process hold.
+/// quinn's own default is `VarInt::MAX` — no aggregate limit at all — and with
+/// this server's raised stream limit that is 1024 x the 2 MiB
+/// [`STREAM_RECEIVE_WINDOW`], so a single connection could pin 2 GiB of receive
+/// buffer before we ever see a request to authenticate: open the streams, fill
+/// each window, stop. On a 1 GB VPS one connection is enough to end the process.
+///
+/// The cap only constrains data that has arrived and not yet been read, and both
+/// tunnel pumps read continuously, so it binds exactly when the target is slower
+/// than the client — which is the case that should be bounded.
+///
+/// 16 MiB against the 2 MiB per-stream window: eight simultaneously saturated
+/// tunnels still get their full stream windows, while the worst case stops being
+/// a function of `max_streams_bidi`.
 const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
 
 /// Per-stream flow-control window, in bytes.
 ///
-/// A deliberate raise above quinn's own default of 1,250,000, not a pin at it.
-/// No RFC constrains the value; RFC 9000 §4.3 only observes that credit below the
-/// peer's bandwidth-delay product caps receive throughput. At the production
-/// path's BDP of about 1.19 MB (100 Mbps over 95 ms) quinn's default was roughly
-/// 1.05x — one BDP with no margin — where this is about 1.75x. Measured
-/// corroboration: Surge advertises 12 MiB per stream to us.
+/// A deliberate raise above quinn's own default of 1,250,000, not inherited from
+/// it and not a pin at it. No RFC constrains the value — RFC 9000 §4.2 leaves the
+/// amount of credit to implementations outright, and §4.3 only observes the
+/// consequence of getting it wrong: an endpoint that "cannot ensure that its peer
+/// always has available flow control credit that is greater than the peer's
+/// bandwidth-delay product" finds "its receive throughput will be limited by flow
+/// control". That is advice, not a requirement, and it is the whole of the case.
+/// The production path's BDP — a 100 Mbps client uplink over a 95 ms RTT — is
+/// about 1.19 MB, so quinn's default sat at roughly 1.05x it: exactly one BDP,
+/// with no margin for a window update still in flight. 2 MiB is about 1.75x.
+/// Measured corroboration: the peer we interoperate with sizes its own side far
+/// higher still, Surge's ClientHello advertising
+/// `initial_max_stream_data_bidi_local` = 12 MiB per stream.
 ///
-/// Not a memory bound — [`CONNECTION_RECEIVE_WINDOW`] is, and it caps the
-/// aggregate whatever this value is, so the per-connection worst case does not
-/// move. This only sets how few saturated tunnels can spend a connection's whole
-/// credit: 16 MiB / 2 MiB = 8.
+/// Not a memory decision. [`CONNECTION_RECEIVE_WINDOW`] is the real bound — the
+/// invariant is that (the sum of the highest offsets received) minus (the bytes
+/// read) stays within it — so a larger per-stream window cannot raise the
+/// per-connection worst case, which is unchanged at 16 MiB. What this value
+/// actually decides is how few simultaneously saturated tunnels it takes to spend
+/// the whole connection's credit — 16 MiB / 2 MiB = 8 — which is a fairness
+/// property rather than a memory one, and 8:1 is still far more conservative than
+/// the 1.33:1 the peer itself runs (16 MiB of `initial_max_data` against 12 MiB
+/// per stream). The per-tunnel ceiling in the download direction is whatever the
+/// client advertises to us and is not settable here.
 const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(2 * 1024 * 1024);
 
 /// quinn's own default per-stream receive window, in bytes.
@@ -832,10 +808,25 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 
 /// Aggregate unacknowledged outbound stream data per connection, in bytes.
 ///
-/// quinn's own default, restated for the same reason, and the only bound on what
-/// this process buffers for a client that has stopped reading. 10 MB is about
-/// 889 Mbps at the production path's RTT, so the cap costs no measurable
-/// throughput.
+/// The mirror image of [`CONNECTION_RECEIVE_WINDOW`], and the only bound on what
+/// this process buffers for a client that has stopped reading. 10 MB over the
+/// ~90 ms path RTT is about 889 Mbps against a measured peak of 177 Mbps, so it
+/// is nowhere near a throughput constraint.
+///
+/// Set to exactly what quinn already defaults to, so it changes not a byte on the
+/// wire today. It is pinned rather than inherited because upstream derives that
+/// default from `STREAM_RWND`, a private constant inside quinn's
+/// `TransportConfig::default` with no stability guarantee, while the arithmetic
+/// above is quoted against it. Dependabot proposes cargo bumps weekly; a patch
+/// release that moved that constant would leave the documented numbers quietly
+/// false. Setting the value here makes them true by construction instead of by
+/// inheritance.
+///
+/// Note the asymmetry it leaves: 16 MiB of inbound credit granted against a
+/// 10 MB outbound cap, on a proxy whose traffic is mostly outbound. That is an
+/// accepted decision, not an oversight — lifting the outbound cap to match would
+/// add roughly 1.6 GiB of theoretical worst case across `max_connections` (256 by
+/// default) in exchange for throughput we cannot measure a need for.
 const SEND_WINDOW: u64 = 10_000_000;
 
 /// Descriptors assumed to be needed beyond one connection's full tunnel quota:
