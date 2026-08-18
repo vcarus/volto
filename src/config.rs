@@ -346,51 +346,42 @@ pub enum IpFamilyPreference {
 
 /// `[limits]` — resource and lifetime limits.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Seconds a UDP session may sit idle before it is closed.
-    #[serde(default = "default_udp_session_timeout")]
     pub udp_session_timeout: u64,
     /// Concurrent tunnels allowed on one QUIC connection.
-    #[serde(default = "default_max_targets_per_conn")]
     pub max_targets_per_conn: u32,
     /// Simultaneously open QUIC connections. Zero means no limit.
     ///
     /// Beyond this, new connections are refused at the QUIC layer, before a
     /// handshake completes and before any per-connection state is built.
-    #[serde(default = "default_max_connections")]
     pub max_connections: u32,
     /// Seconds allowed for reaching a target. Zero disables the budget.
     ///
     /// Spent twice per request: once on name resolution, once on the whole list
     /// of addresses it resolved to. See [`DEFAULT_CONNECT_TIMEOUT`].
-    #[serde(default = "default_connect_timeout")]
     pub connect_timeout: u64,
     /// Which address family a resolved target is tried on first.
     ///
     /// Applied once, at the single point where a name becomes a list of
     /// addresses, so both tunnel kinds see the same order; see
     /// [`IpFamilyPreference`] for why the default departs from the resolver's.
-    #[serde(default = "default_ip_family_preference")]
     pub ip_family_preference: IpFamilyPreference,
     /// Concurrent client-initiated bidirectional streams per QUIC connection.
-    #[serde(default = "default_max_streams_bidi")]
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
     ///
     /// Only half of what decides that: RFC 9000 §10.1 takes the minimum of both
     /// endpoints' advertisements, so a client advertising less wins. See
     /// [`DEFAULT_MAX_IDLE_TIMEOUT`].
-    #[serde(default = "default_max_idle_timeout")]
     pub max_idle_timeout: u64,
     /// Seconds between keep-alive packets. Zero disables them.
     ///
     /// Must be below half of [`Limits::max_idle_timeout`]; see
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL`] for why.
-    #[serde(default = "default_keep_alive_interval")]
     pub keep_alive_interval: u64,
     /// Size of the first QUIC packets, in bytes. At least 1200.
-    #[serde(default = "default_initial_mtu")]
     pub initial_mtu: u16,
     /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
     ///
@@ -400,16 +391,13 @@ pub struct Limits {
     /// size to the 1200-byte floor for the rest of the connection, with nothing
     /// left to probe it back up. Trades throughput for predictability on a path
     /// that black-holes large packets.
-    #[serde(default = "default_mtu_discovery")]
     pub mtu_discovery: bool,
     /// QUIC congestion controller. Defaults to BBR; see [`CongestionControl`].
-    #[serde(default = "default_congestion_control")]
     pub congestion_control: CongestionControl,
     /// Milliseconds of round-trip time assumed before the first measurement.
     ///
     /// Seeds the handshake retransmission timers; see [`DEFAULT_INITIAL_RTT_MS`]
     /// for the trade-off and how to pick a value from the connection logs.
-    #[serde(default = "default_initial_rtt_ms")]
     pub initial_rtt_ms: u64,
     /// UDP socket receive buffer to request, in bytes. Zero keeps the OS default.
     ///
@@ -427,14 +415,12 @@ pub struct Limits {
     /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
     /// warns at startup when it got less than it asked for. See
     /// [`DEFAULT_SOCKET_RECV_BUFFER`].
-    #[serde(default = "default_socket_recv_buffer")]
     pub socket_recv_buffer: usize,
     /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
     ///
     /// Startup-only, read back and warned about exactly like
     /// [`Limits::socket_recv_buffer`]; the ceiling on this side is
     /// `net.core.wmem_max`. See [`DEFAULT_SOCKET_SEND_BUFFER`].
-    #[serde(default = "default_socket_send_buffer")]
     pub socket_send_buffer: usize,
 }
 
@@ -444,27 +430,23 @@ pub struct Limits {
 /// of reach, the classic relay port is closed, and a session that has not heard
 /// from its target cannot be used as an amplifier.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Security {
     /// Allow tunnels to loopback, RFC 1918, link-local and ULA addresses.
     ///
     /// Off by default: the proxy's own source address often carries privileges a
     /// remote client must not borrow.
-    #[serde(default)]
     pub allow_private_networks: bool,
     /// Target ports that are refused regardless of address.
-    #[serde(default = "default_denied_ports")]
     pub denied_ports: Vec<u16>,
     /// Packets a UDP session may send before its target has answered.
     ///
     /// Zero disables the mitigation.
-    #[serde(default = "default_unanswered_packet_budget")]
     pub unanswered_packet_budget: u32,
     /// Authentication failures tolerated on one connection before it is closed.
     ///
     /// Not a rate limit: it raises the cost of guessing from "one handshake, then
     /// unlimited attempts" to "one handshake per N attempts". Zero disables it.
-    #[serde(default = "default_max_auth_failures")]
     pub max_auth_failures: u32,
 }
 
@@ -494,11 +476,10 @@ pub struct Server {
 /// `RUST_LOG` takes precedence over [`Log::level`] when set, so an operator can
 /// raise verbosity without editing the config file.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct Log {
     /// A `tracing_subscriber` filter directive, e.g. `"info"` or
     /// `"volto=debug,quinn=info"`.
-    #[serde(default = "default_log_level")]
     pub level: String,
     /// Write TLS secrets to the file named by `SSLKEYLOGFILE`.
     ///
@@ -507,7 +488,6 @@ pub struct Log {
     /// "handshake fine, nothing flows" can be diagnosed at frame level. It also
     /// hands anyone who can read that file the plaintext of every session, so it
     /// is off by default and warned about when on.
-    #[serde(default)]
     pub keylog: bool,
 }
 
@@ -519,95 +499,23 @@ fn default_shutdown_grace() -> u64 {
     DEFAULT_SHUTDOWN_GRACE
 }
 
-fn default_log_level() -> String {
-    DEFAULT_LOG_LEVEL.to_owned()
-}
-
-fn default_udp_session_timeout() -> u64 {
-    DEFAULT_UDP_SESSION_TIMEOUT
-}
-
-fn default_max_targets_per_conn() -> u32 {
-    DEFAULT_MAX_TARGETS_PER_CONN
-}
-
-fn default_max_connections() -> u32 {
-    DEFAULT_MAX_CONNECTIONS
-}
-
-fn default_connect_timeout() -> u64 {
-    DEFAULT_CONNECT_TIMEOUT
-}
-
-fn default_max_auth_failures() -> u32 {
-    DEFAULT_MAX_AUTH_FAILURES
-}
-
-fn default_max_streams_bidi() -> u32 {
-    DEFAULT_MAX_STREAMS_BIDI
-}
-
-fn default_ip_family_preference() -> IpFamilyPreference {
-    IpFamilyPreference::Ipv4
-}
-
-fn default_max_idle_timeout() -> u64 {
-    DEFAULT_MAX_IDLE_TIMEOUT
-}
-
-fn default_keep_alive_interval() -> u64 {
-    DEFAULT_KEEP_ALIVE_INTERVAL
-}
-
-fn default_initial_mtu() -> u16 {
-    DEFAULT_INITIAL_MTU
-}
-
-fn default_mtu_discovery() -> bool {
-    true
-}
-
-fn default_congestion_control() -> CongestionControl {
-    CongestionControl::Bbr
-}
-
-fn default_initial_rtt_ms() -> u64 {
-    DEFAULT_INITIAL_RTT_MS
-}
-
-fn default_socket_recv_buffer() -> usize {
-    DEFAULT_SOCKET_RECV_BUFFER
-}
-
-fn default_socket_send_buffer() -> usize {
-    DEFAULT_SOCKET_SEND_BUFFER
-}
-
-fn default_denied_ports() -> Vec<u16> {
-    DEFAULT_DENIED_PORTS.to_vec()
-}
-
-fn default_unanswered_packet_budget() -> u32 {
-    DEFAULT_UNANSWERED_PACKET_BUDGET
-}
-
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            udp_session_timeout: default_udp_session_timeout(),
-            max_targets_per_conn: default_max_targets_per_conn(),
-            max_connections: default_max_connections(),
-            connect_timeout: default_connect_timeout(),
-            ip_family_preference: default_ip_family_preference(),
-            max_streams_bidi: default_max_streams_bidi(),
-            max_idle_timeout: default_max_idle_timeout(),
-            keep_alive_interval: default_keep_alive_interval(),
-            initial_mtu: default_initial_mtu(),
-            mtu_discovery: default_mtu_discovery(),
-            congestion_control: default_congestion_control(),
-            initial_rtt_ms: default_initial_rtt_ms(),
-            socket_recv_buffer: default_socket_recv_buffer(),
-            socket_send_buffer: default_socket_send_buffer(),
+            udp_session_timeout: DEFAULT_UDP_SESSION_TIMEOUT,
+            max_targets_per_conn: DEFAULT_MAX_TARGETS_PER_CONN,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            ip_family_preference: IpFamilyPreference::Ipv4,
+            max_streams_bidi: DEFAULT_MAX_STREAMS_BIDI,
+            max_idle_timeout: DEFAULT_MAX_IDLE_TIMEOUT,
+            keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
+            initial_mtu: DEFAULT_INITIAL_MTU,
+            mtu_discovery: true,
+            congestion_control: CongestionControl::Bbr,
+            initial_rtt_ms: DEFAULT_INITIAL_RTT_MS,
+            socket_recv_buffer: DEFAULT_SOCKET_RECV_BUFFER,
+            socket_send_buffer: DEFAULT_SOCKET_SEND_BUFFER,
         }
     }
 }
@@ -616,9 +524,9 @@ impl Default for Security {
     fn default() -> Self {
         Self {
             allow_private_networks: false,
-            denied_ports: default_denied_ports(),
-            unanswered_packet_budget: default_unanswered_packet_budget(),
-            max_auth_failures: default_max_auth_failures(),
+            denied_ports: DEFAULT_DENIED_PORTS.to_vec(),
+            unanswered_packet_budget: DEFAULT_UNANSWERED_PACKET_BUDGET,
+            max_auth_failures: DEFAULT_MAX_AUTH_FAILURES,
         }
     }
 }
@@ -662,7 +570,7 @@ impl Limits {
 impl Default for Log {
     fn default() -> Self {
         Self {
-            level: default_log_level(),
+            level: DEFAULT_LOG_LEVEL.to_owned(),
             keylog: false,
         }
     }
