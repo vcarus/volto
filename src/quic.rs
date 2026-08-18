@@ -160,9 +160,13 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     // below instead, so a typo is reported rather than quietly corrected.
     transport.initial_mtu(limits.initial_mtu);
     if !limits.mtu_discovery {
-        // Pins the packet size at `initial_mtu` for the life of the connection:
-        // spec §5.4's conservative setting for a path that black-holes large
-        // packets, where a stable small MTU beats an optimistic large one.
+        // Stops the upward search, so packets start at `initial_mtu` and are
+        // never probed larger: spec §5.4's conservative setting for a path that
+        // black-holes large packets, where a stable small MTU beats an
+        // optimistic large one. Not a hard pin — quinn's black-hole detector
+        // keeps running with discovery off, and if it fires the packet size
+        // drops to the 1200-byte floor for the rest of the connection, since
+        // nothing is left to probe it back up.
         transport.mtu_discovery_config(None);
     }
 

@@ -389,8 +389,12 @@ pub struct Limits {
     pub initial_mtu: u16,
     /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
     ///
-    /// On by default. Turning it off pins the packet size at `initial_mtu`, trading
-    /// throughput for determinism on a path that black-holes large packets.
+    /// On by default. Turning it off stops the upward search: packets start at
+    /// `initial_mtu` and are never probed larger. It is not a hard pin, though —
+    /// quinn's black-hole detector still runs, and if it fires it drops the packet
+    /// size to the 1200-byte floor for the rest of the connection, with nothing
+    /// left to probe it back up. Trades throughput for predictability on a path
+    /// that black-holes large packets.
     #[serde(default = "default_mtu_discovery")]
     pub mtu_discovery: bool,
     /// QUIC congestion controller. Defaults to BBR; see [`CongestionControl`].
@@ -892,9 +896,11 @@ impl Config {
 
         if !self.limits.mtu_discovery {
             warnings.push(format!(
-                "limits.mtu_discovery is off: the packet size is pinned at \
-                 limits.initial_mtu = {} bytes and will never adapt. Deliberate on a path \
-                 that black-holes large packets, a throughput loss anywhere else",
+                "limits.mtu_discovery is off: the packet size starts at \
+                 limits.initial_mtu = {} bytes and is never probed larger; it can still \
+                 fall to 1200 if quinn's black-hole detector fires, and nothing brings it \
+                 back up. Deliberate on a path that black-holes large packets, a throughput \
+                 loss anywhere else",
                 self.limits.initial_mtu
             ));
         }

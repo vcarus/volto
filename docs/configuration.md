@@ -49,7 +49,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600 |
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up |
-| `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` pins the packet size at `initial_mtu`: slower, but deterministic |
+| `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
 | `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `cubic` or `newreno` |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |

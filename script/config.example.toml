@@ -148,8 +148,11 @@ users = [
 # Probe for a path MTU larger than initial_mtu (RFC 8899 DPLPMTUD).
 #
 # Leave it on unless the path black-holes large packets — the symptom is a
-# handshake that succeeds while large transfers stall. Turning it off pins the
-# packet size at initial_mtu for good: slower, but deterministic.
+# handshake that succeeds while large transfers stall. Turning it off stops the
+# upward search: packets start at initial_mtu and are never probed larger. It is
+# not a hard pin — quinn's black-hole detector still runs, and if it fires the
+# packet size drops to the 1200-byte floor for the rest of the connection, with
+# nothing left to probe it back up. Slower, but predictable.
 # Default: true
 #mtu_discovery = true
 
