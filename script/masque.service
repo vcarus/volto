@@ -1,6 +1,8 @@
 # systemd unit for volto, a MASQUE proxy server.
 #
-# Install:
+# Install: script/install-selfsigned.sh does all of this, plus a certificate and a
+# generated credential. The steps below are for an operator who would rather not
+# run it, or who already has a certificate.
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin volto
 #   sudo install -m 0755 target/release/volto /usr/local/bin/volto
 #   sudo install -d -o volto -g volto -m 0750 /etc/volto

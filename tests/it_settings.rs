@@ -254,6 +254,13 @@ async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
 }
 
 /// Decodes a variable-length integer from a buffer, returning its byte length.
+///
+/// Hand-written rather than `volto::datagram::peek_varint`, which is the same
+/// algorithm: the server's own SETTINGS are the one thing in this file that must
+/// be read independently of the code under test, so a bug in that decoder cannot
+/// make this test agree with it. The same reasoning as `basic_credentials` in
+/// `tests/common`. The `datagram::put_varint` calls elsewhere here only *build*
+/// client bytes, where a broken encoder fails loudly instead of passing quietly.
 fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let first = *buf.first()?;
     let length = 1usize << (first >> 6);
