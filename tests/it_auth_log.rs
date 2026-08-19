@@ -9,7 +9,8 @@
 mod common;
 
 use common::{
-    auth_section, basic_credentials, connect_request, H3Client, SharedBuffer, TestServer, TIMEOUT,
+    auth_section, basic_credentials, connect_request, respond_to, H3Client, SharedBuffer,
+    TestServer,
 };
 use http::{HeaderName, StatusCode};
 
@@ -37,15 +38,7 @@ async fn a_rejected_password_is_never_logged() {
         attempted.parse().expect("header value"),
     );
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(&mut client, request).await;
     assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
 
     let logged = buffer.contents();

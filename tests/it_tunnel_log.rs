@@ -22,8 +22,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    connect_request, spawn_large_reply_udp_target, H3Client, SharedBuffer, TestServer,
-    ALLOW_PRIVATE, TIMEOUT,
+    connect_request, open_udp_session, respond_to, spawn_large_reply_udp_target, H3Client,
+    SharedBuffer, TestServer, ALLOW_PRIVATE,
 };
 use http::StatusCode;
 use volto::datagram;
@@ -62,15 +62,7 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(BLACKHOLED))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(&mut client, connect_request(BLACKHOLED)).await;
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -109,15 +101,7 @@ async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(PROHIBITED))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(&mut client, connect_request(PROHIBITED)).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let line = buffer
@@ -149,20 +133,7 @@ async fn the_oversize_sentinel_fires_once_per_session(buffer: &SharedBuffer) {
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
 
-    let mut stream = client
-        .send
-        .send_request(common::connect_udp_request(
-            server.addr,
-            &target.ip().to_string(),
-            target.port(),
-        ))
-        .await
-        .expect("send CONNECT-UDP");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     let limit = client
         .quic
@@ -170,7 +141,6 @@ async fn the_oversize_sentinel_fires_once_per_session(buffer: &SharedBuffer) {
         .expect("the server must accept datagrams");
     assert!(limit < 8000, "the reply must not fit in a datagram");
 
-    let qsid = datagram::quarter_stream_id(stream.id().into_inner());
     let send_one = |nth: u8| {
         client
             .quic

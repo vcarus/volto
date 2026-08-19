@@ -17,10 +17,9 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use common::{
-    connect_request, connect_udp_request, read_at_least, H3Client, TestServer, ALLOW_PRIVATE,
+    open_tcp_tunnel, open_udp_session_to, read_at_least, H3Client, TestServer, ALLOW_PRIVATE,
     TIMEOUT,
 };
-use http::StatusCode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use volto::datagram;
@@ -115,17 +114,7 @@ fn announce_udp(socket: UdpSocket, tag: &'static [u8]) {
 /// CONNECTs to `localhost:port` through `server` and returns the target's tag.
 async fn tag_through_tcp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
     let mut client = H3Client::connect(server).await;
-    let mut stream = client
-        .send
-        .send_request(connect_request(&format!("localhost:{port}")))
-        .await
-        .expect("send CONNECT");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &format!("localhost:{port}")).await;
 
     read_at_least(&mut stream, V4_TAG.len()).await
 }
@@ -133,19 +122,9 @@ async fn tag_through_tcp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
 /// Opens a CONNECT-UDP session to `localhost:port` and returns the target's tag.
 async fn tag_through_udp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
     let mut client = H3Client::connect(server).await;
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(server.addr, "localhost", port))
-        .await
-        .expect("send CONNECT-UDP");
+    let (quarter_stream_id, _stream) =
+        open_udp_session_to(&mut client, server, "localhost", port).await;
 
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let quarter_stream_id = datagram::quarter_stream_id(stream.id().into_inner());
     client
         .quic
         .send_datagram(datagram::encode_udp_payload(quarter_stream_id, b"which?"))

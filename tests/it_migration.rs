@@ -7,8 +7,7 @@
 mod common;
 
 use bytes::Bytes;
-use common::{connect_request, read_at_least, spawn_echo_target, H3Client, TestServer, TIMEOUT};
-use http::StatusCode;
+use common::{open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, TestServer};
 
 #[tokio::test]
 async fn a_tcp_tunnel_survives_the_client_changing_address() {
@@ -16,16 +15,7 @@ async fn a_tcp_tunnel_survives_the_client_changing_address() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     stream
         .send_data(Bytes::from_static(b"before the move"))
@@ -54,16 +44,7 @@ async fn new_tunnels_open_after_the_client_changed_address() {
 
     client.rebind();
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT after rebinding");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     stream
         .send_data(Bytes::from_static(b"fresh tunnel"))

@@ -10,10 +10,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    connect_request, connect_udp_request, read_at_least, spawn_echo_target, spawn_udp_echo_target,
-    H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
+    connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
+    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
 };
-use http::StatusCode;
 /// A tunnel that is in use when the signal arrives keeps working, and the server
 /// waits for it rather than dropping it.
 #[tokio::test]
@@ -22,16 +21,7 @@ async fn an_established_tunnel_survives_goaway_and_finishes() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     stream
         .send_data(Bytes::from_static(b"before"))
@@ -64,22 +54,8 @@ async fn an_established_udp_session_survives_goaway() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(
-            server.addr,
-            &target.ip().to_string(),
-            target.port(),
-        ))
-        .await
-        .expect("send CONNECT-UDP");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
-    let qsid = volto::datagram::quarter_stream_id(stream.id().into_inner());
     server.shutdown();
 
     // Datagrams still flow: they do not go through the request stream at all, so
@@ -111,16 +87,7 @@ async fn new_requests_are_refused_after_goaway() {
 
     // One tunnel held open, so the connection is still draining and the refusal
     // cannot be confused with the connection simply being gone.
-    let mut held = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, held.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut held = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     server.shutdown();
 
@@ -167,16 +134,7 @@ async fn the_grace_period_bounds_the_wait() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Deliberately left open, and deliberately still in use.
     stream

@@ -10,48 +10,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    auth_section, basic_credentials, connect_request, connect_udp_request, read_at_least,
-    spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE, TIMEOUT,
+    auth_section, basic_credentials, connect_request, connect_udp_request, open_tcp_tunnel,
+    open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
+    spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{HeaderName, Request, Response, StatusCode};
 use volto::datagram;
 
 /// The credentials the test servers below are configured with.
 const USER: (&str, &str) = ("user1", "s3cret");
-
-/// Sends a request and waits for the response headers.
-async fn respond_to(client: &mut H3Client, request: Request<()>) -> Response<()> {
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send request");
-
-    tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response")
-}
-
-/// Sends a request and keeps the stream, for cases that then use the tunnel.
-async fn open_tunnel(
-    client: &mut H3Client,
-    request: Request<()>,
-) -> (Response<()>, common::ClientStream) {
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send request");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-
-    (response, stream)
-}
 
 /// The `Proxy-Status` field of a response, if it has one.
 fn proxy_status(response: &Response<()>) -> Option<&str> {
@@ -373,7 +340,8 @@ async fn a_blackholed_tcp_target_is_accepted_then_closed() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
+    let (response, mut stream) =
+        send_and_respond(&mut client, connect_request("0.0.0.0:443")).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(
         proxy_status(&response).is_none(),
@@ -396,7 +364,7 @@ async fn a_blackholed_udp_target_is_accepted_then_closed() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, mut stream) = open_tunnel(
+    let (response, mut stream) = send_and_respond(
         &mut client,
         connect_udp_request(server.addr, "0.0.0.0", 443),
     )
@@ -445,8 +413,7 @@ async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, mut stream) = open_tunnel(&mut client, connect_request("0.0.0.0:443")).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, "0.0.0.0:443").await;
 
     let started = tokio::time::Instant::now();
     let error = loop {
@@ -494,7 +461,7 @@ async fn private_addresses_are_reachable_when_allowed() {
     let mut client = H3Client::connect(&server).await;
 
     let (response, mut stream) =
-        open_tunnel(&mut client, connect_request(&target.to_string())).await;
+        send_and_respond(&mut client, connect_request(&target.to_string())).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(proxy_status(&response).is_none(), "a 200 needs no reason");
 
@@ -583,10 +550,7 @@ async fn the_tunnel_quota_is_enforced_per_connection() {
     // Held open, so the slots stay occupied.
     let mut held = Vec::new();
     for _ in 0..2 {
-        let (response, stream) =
-            open_tunnel(&mut client, connect_request(&target.to_string())).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        held.push(stream);
+        held.push(open_tcp_tunnel(&mut client, &target.to_string()).await);
     }
 
     let refused = respond_to(&mut client, connect_request(&target.to_string())).await;
@@ -615,9 +579,7 @@ async fn tcp_and_udp_tunnels_share_the_quota() {
     let udp_target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, _held) =
-        open_tunnel(&mut client, connect_request(&tcp_target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let _held = open_tcp_tunnel(&mut client, &tcp_target.to_string()).await;
 
     let refused = respond_to(
         &mut client,
@@ -642,9 +604,7 @@ async fn a_finished_tunnel_returns_its_slot() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, mut stream) =
-        open_tunnel(&mut client, connect_request(&target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Close the tunnel from the client side and let it drain.
     stream.finish().await.expect("finish the request stream");
@@ -683,14 +643,8 @@ async fn packets_to_a_silent_target_are_capped() {
     let (target, received) = spawn_silent_udp_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, _stream) = open_tunnel(
-        &mut client,
-        connect_udp_request(server.addr, &target.ip().to_string(), target.port()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    let qsid = datagram::quarter_stream_id(_stream.id().into_inner());
     for i in 0..SENT {
         client
             .quic
@@ -732,13 +686,7 @@ async fn the_cap_is_lifted_once_the_target_answers() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (response, stream) = open_tunnel(
-        &mut client,
-        connect_udp_request(server.addr, &target.ip().to_string(), target.port()),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let qsid = datagram::quarter_stream_id(stream.id().into_inner());
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     // The one packet the budget allows, and its echo: that reply lifts the cap.
     client

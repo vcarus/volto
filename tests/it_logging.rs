@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{closed_address, connect_request, H3Client, SharedBuffer, TestServer, TIMEOUT};
+use common::{closed_address, connect_request, respond_to, H3Client, SharedBuffer, TestServer};
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {
@@ -36,17 +36,8 @@ async fn inbound_requests_are_logged_with_every_header() {
         .headers_mut()
         .insert("x-volto-probe", "surge-behaviour".parse().unwrap());
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send CONNECT");
-
     // Once the response is in, the request has certainly been logged.
-    let _ = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let _ = respond_to(&mut client, request).await;
 
     let logged = buffer.contents();
 

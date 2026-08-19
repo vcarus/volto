@@ -6,20 +6,23 @@
 
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::Location;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{Method, Request, Uri};
+use http::{Method, Request, Response, StatusCode, Uri};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use volto::config::Config;
+use volto::datagram;
 use volto::quic::ReloadHandle;
 use volto::quic::Server;
 use volto::shutdown::Trigger;
@@ -507,6 +510,135 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<
         .extensions_mut()
         .insert(h3::ext::Protocol::CONNECT_UDP);
     request
+}
+
+/// Sends `request` and waits for the response headers, asserting nothing.
+///
+/// For the tests whose subject *is* the answer: they assert on the status, or on
+/// a `Proxy-Status` field, themselves.
+pub async fn respond_to(client: &mut H3Client, request: Request<()>) -> Response<()> {
+    send_and_respond(client, request).await.0
+}
+
+/// [`respond_to`], keeping the request stream for cases that then use it.
+pub async fn send_and_respond(
+    client: &mut H3Client,
+    request: Request<()>,
+) -> (Response<()>, ClientStream) {
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .expect("send request");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+
+    (response, stream)
+}
+
+/// Opens a CONNECT tunnel to `authority` and asserts it was accepted.
+///
+/// Written as a synchronous function returning a future rather than as an `async
+/// fn` so that `#[track_caller]` works: on an `async fn` the attribute applies to
+/// the call that builds the future, not to the poll that panics, and rustc warns
+/// that it is a no-op there. Taking the location up front and putting it in the
+/// message is what keeps a failure attributable to the test that opened the
+/// tunnel rather than to this line.
+#[track_caller]
+pub fn open_tcp_tunnel<'a>(
+    client: &'a mut H3Client,
+    authority: &'a str,
+) -> impl Future<Output = ClientStream> + 'a {
+    let caller = Location::caller();
+    async move {
+        let (response, stream) = send_and_respond(client, connect_request(authority)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the tunnel to {authority} opened at {caller} was refused: proxy-status={:?}",
+            response.headers().get("proxy-status")
+        );
+        stream
+    }
+}
+
+/// Opens a CONNECT-UDP session to `target` and returns its Quarter Stream ID.
+///
+/// Same shape as [`open_tcp_tunnel`], and for the same reason.
+#[track_caller]
+pub fn open_udp_session<'a>(
+    client: &'a mut H3Client,
+    server: &'a TestServer,
+    target: SocketAddr,
+) -> impl Future<Output = (u64, ClientStream)> + 'a {
+    let caller = Location::caller();
+    udp_session(
+        client,
+        server,
+        target.ip().to_string(),
+        target.port(),
+        caller,
+    )
+}
+
+/// [`open_udp_session`] for a target named rather than addressed.
+///
+/// The RFC 9298 template carries a host, so a name is as legitimate a target as
+/// an address — and the only way to reach one whose family the proxy is left to
+/// choose (`it_family`) or one the resolver blackholes (`it_udp`).
+#[track_caller]
+pub fn open_udp_session_to<'a>(
+    client: &'a mut H3Client,
+    server: &'a TestServer,
+    host: &str,
+    port: u16,
+) -> impl Future<Output = (u64, ClientStream)> + 'a {
+    let caller = Location::caller();
+    udp_session(client, server, host.to_owned(), port, caller)
+}
+
+/// The body behind both session helpers, with `caller` already captured.
+async fn udp_session(
+    client: &mut H3Client,
+    server: &TestServer,
+    host: String,
+    port: u16,
+    caller: &'static Location<'static>,
+) -> (u64, ClientStream) {
+    let (response, stream) =
+        send_and_respond(client, connect_udp_request(server.addr, &host, port)).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the session to {host}:{port} opened at {caller} was refused: proxy-status={:?}",
+        response.headers().get("proxy-status")
+    );
+    // RFC 9297 §3.4: the response should announce the capsule protocol, and §3.2
+    // forbids it from describing a body. Protocol requirements rather than
+    // scaffolding, so they belong to every session this helper opens.
+    assert_eq!(
+        response
+            .headers()
+            .get("capsule-protocol")
+            .map(|value| value.to_str().expect("capsule-protocol is ASCII")),
+        Some("?1"),
+        "the 2xx to the session opened at {caller} must carry Capsule-Protocol: ?1"
+    );
+    assert!(
+        response.headers().get("content-length").is_none(),
+        "a CONNECT-UDP response frames no content; session opened at {caller}"
+    );
+    assert!(
+        response.headers().get("content-type").is_none(),
+        "a CONNECT-UDP response frames no content; session opened at {caller}"
+    );
+
+    let quarter_stream_id = datagram::quarter_stream_id(stream.id().into_inner());
+    (quarter_stream_id, stream)
 }
 
 /// A UDP target on an ephemeral loopback port that answers with `reply`.

@@ -16,10 +16,10 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    auth_section, basic_credentials, connect_request, read_at_least, spawn_echo_target, H3Client,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    auth_section, basic_credentials, connect_request, read_at_least, respond_to, send_and_respond,
+    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use http::{HeaderName, Request, Response, StatusCode};
+use http::{HeaderName, Response, StatusCode};
 
 /// Sends a CONNECT with credentials and returns the response.
 async fn connect_as(
@@ -36,19 +36,6 @@ async fn connect_as(
             .expect("header value"),
     );
     respond_to(client, request).await
-}
-
-async fn respond_to(client: &mut H3Client, request: Request<()>) -> Response<()> {
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send request");
-
-    tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response")
 }
 
 /// The headline case: rotate the credentials, reload, and the change is in force
@@ -121,15 +108,7 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
             .parse()
             .expect("header value"),
     );
-    let mut held = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, held.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let (response, mut held) = send_and_respond(&mut client, request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     server.rewrite_config(&format!(

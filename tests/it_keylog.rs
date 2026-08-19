@@ -15,8 +15,7 @@ mod common;
 
 use std::sync::LazyLock;
 
-use common::{connect_request, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT};
-use http::StatusCode;
+use common::{open_tcp_tunnel, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE};
 use tokio::sync::Mutex;
 
 /// Serializes the two tests: `SSLKEYLOGFILE` is process-wide, and rustls reads it
@@ -46,16 +45,7 @@ async fn enabling_keylog_writes_the_tls_secrets() {
     // the handshake and the application data have been derived.
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let _stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     let contents = std::fs::read_to_string(&keylog).expect("the keylog file must exist");
     assert!(
@@ -103,17 +93,8 @@ async fn keylog_is_off_unless_asked_for() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
     // A fully negotiated session, which is what would have produced secrets.
-    assert_eq!(response.status(), StatusCode::OK);
+    let _stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     assert!(
         !keylog.exists(),

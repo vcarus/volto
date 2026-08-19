@@ -17,10 +17,9 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    connect_request, connect_udp_request, read_at_least, read_to_end, spawn_echo_target,
+    open_tcp_tunnel, open_udp_session, read_at_least, read_to_end, spawn_echo_target,
     spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use http::StatusCode;
 use volto::datagram;
 
 /// Slots to run the churn tests with.
@@ -29,28 +28,6 @@ use volto::datagram;
 /// server-side releases still in flight behind the client cannot be mistaken for
 /// one.
 const CHURN_SLOTS: u32 = 32;
-
-/// Opens one TCP tunnel and asserts it was accepted.
-async fn open_tcp_tunnel(client: &mut H3Client, authority: &str) -> common::ClientStream {
-    let mut stream = client
-        .send
-        .send_request(connect_request(authority))
-        .await
-        .expect("send CONNECT");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "the tunnel was refused: {:?}",
-        response.headers().get("proxy-status")
-    );
-
-    stream
-}
 
 /// Runs `count` tunnels at once on a single connection, each verifying that what
 /// comes back is its own data.
@@ -130,30 +107,10 @@ async fn udp_churn(cycles: usize) {
     let mut client = H3Client::connect(&server).await;
 
     for i in 0..cycles {
-        let mut stream = client
-            .send
-            .send_request(connect_udp_request(
-                server.addr,
-                &target.ip().to_string(),
-                target.port(),
-            ))
-            .await
-            .expect("send CONNECT-UDP");
-
-        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-            .await
-            .expect("response arrived")
-            .expect("response");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "session {i} was refused: {:?}",
-            response.headers().get("proxy-status")
-        );
+        let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
         // A round trip proves the session is really wired up, so the churn is
         // over live sessions rather than over refusals.
-        let qsid = datagram::quarter_stream_id(stream.id().into_inner());
         let payload = format!("session-{i}");
         client
             .quic

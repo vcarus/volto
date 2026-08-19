@@ -49,8 +49,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
-use common::{connect_request, connect_udp_request, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT};
-use http::StatusCode;
+use common::{open_tcp_tunnel, open_udp_session, H3Client, TestServer, ALLOW_PRIVATE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
@@ -523,52 +522,6 @@ async fn spawn_udp_burst_target(size: usize, burst: usize) -> (SocketAddr, Arc<A
     });
 
     (addr, sent)
-}
-
-// ---------------------------------------------------------------------------
-// Tunnel helpers
-// ---------------------------------------------------------------------------
-
-async fn open_tcp_tunnel(client: &mut H3Client, authority: &str) -> common::ClientStream {
-    let mut stream = client
-        .send
-        .send_request(connect_request(authority))
-        .await
-        .expect("send CONNECT");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK, "the tunnel was refused");
-
-    stream
-}
-
-/// Opens a CONNECT-UDP session, returning its Quarter Stream ID and stream.
-async fn open_udp_session(
-    client: &mut H3Client,
-    server: &TestServer,
-    target: SocketAddr,
-) -> (u64, common::ClientStream) {
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(
-            server.addr,
-            &target.ip().to_string(),
-            target.port(),
-        ))
-        .await
-        .expect("send CONNECT-UDP");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK, "the session was refused");
-
-    let qsid = datagram::quarter_stream_id(stream.id().into_inner());
-    (qsid, stream)
 }
 
 /// Allows loopback targets and turns the RFC 9298 §7 amplification cap off.

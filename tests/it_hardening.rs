@@ -9,8 +9,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    auth_section, basic_credentials, connect_request, spawn_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE, TIMEOUT,
+    auth_section, basic_credentials, connect_request, open_tcp_tunnel, spawn_echo_target, H3Client,
+    TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{HeaderName, StatusCode};
 
@@ -42,16 +42,7 @@ async fn the_connection_cap_refuses_further_connections() {
     let mut first = H3Client::connect(&server).await;
     let mut second = H3Client::connect(&server).await;
     for client in [&mut first, &mut second] {
-        let mut stream = client
-            .send
-            .send_request(connect_request(&target.to_string()))
-            .await
-            .expect("send CONNECT");
-        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-            .await
-            .expect("response arrived")
-            .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
+        let _stream = open_tcp_tunnel(client, &target.to_string()).await;
     }
 
     // The third is refused during the handshake.
@@ -91,16 +82,7 @@ async fn a_closed_connection_frees_its_slot() {
     let target = spawn_echo_target().await;
 
     let mut client = H3Client::connect(&server).await;
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Dropping both closes the QUIC connection, which ends the server-side task.
     drop(stream);

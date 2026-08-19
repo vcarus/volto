@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use common::{connect_quic, connect_request, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT};
+use common::{
+    connect_quic, connect_request, respond_to, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
+};
 use volto::capsule::{Capsule, CapsuleDecoder};
 use volto::datagram;
 
@@ -112,15 +114,7 @@ async fn an_oversized_header_section_is_refused() {
     // Port 25 is on the default deny list, and the port rule is checked before the
     // resolver runs, so the 403 arrives without touching the network. CONNECT to a
     // TEST-NET address would instead hang on hosts that blackhole the SYN.
-    let mut warm_up = client
-        .send
-        .send_request(connect_request("192.0.2.1:25"))
-        .await
-        .expect("send CONNECT");
-    let _ = tokio::time::timeout(TIMEOUT, warm_up.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let _ = respond_to(&mut client, connect_request("192.0.2.1:25")).await;
 
     // Comfortably past the 64 KiB limit, well under any flow-control window.
     let mut request = connect_request("192.0.2.1:25");

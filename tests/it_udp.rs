@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    closed_udp_address, connect_udp_request, spawn_flooding_udp_target,
-    spawn_large_reply_udp_target, spawn_tagged_udp_target, spawn_udp_echo_target, H3Client,
-    TestServer, TIMEOUT,
+    closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
+    spawn_flooding_udp_target, spawn_large_reply_udp_target, spawn_tagged_udp_target,
+    spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
 };
 use http::StatusCode;
 use volto::datagram;
@@ -80,55 +80,13 @@ async fn recv_payload_for(
     }
 }
 
-/// Opens a CONNECT-UDP session and returns its Quarter Stream ID.
-async fn open_session(
-    client: &mut H3Client,
-    server: &TestServer,
-    host: &str,
-    port: u16,
-) -> (u64, common::ClientStream) {
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(server.addr, host, port))
-        .await
-        .expect("send CONNECT-UDP");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    // RFC 9297 §3.4: the response should announce the capsule protocol, and
-    // §3.2 forbids it from describing a body.
-    assert_eq!(
-        response
-            .headers()
-            .get("capsule-protocol")
-            .map(|value| value.to_str().unwrap()),
-        Some("?1"),
-        "the 2xx must carry Capsule-Protocol: ?1"
-    );
-    assert!(response.headers().get("content-length").is_none());
-    assert!(response.headers().get("content-type").is_none());
-
-    let quarter_stream_id = datagram::quarter_stream_id(stream.id().into_inner());
-    (quarter_stream_id, stream)
-}
-
 #[tokio::test]
 async fn forwards_udp_payloads_to_a_target_and_back() {
     let server = TestServer::start().await;
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, _stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     client
         .quic
@@ -153,13 +111,7 @@ async fn concurrent_sessions_do_not_cross_talk() {
     let mut sessions = Vec::new();
     for tag in 1..=4u8 {
         let target = spawn_tagged_udp_target(tag).await;
-        let (qsid, stream) = open_session(
-            &mut client,
-            &server,
-            &target.ip().to_string(),
-            target.port(),
-        )
-        .await;
+        let (qsid, stream) = open_udp_session(&mut client, &server, target).await;
         sessions.push((tag, qsid, stream));
     }
 
@@ -202,13 +154,7 @@ async fn unknown_context_ids_are_dropped_without_ending_the_session() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, _stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     // Context 9 is not one we registered.
     client
@@ -235,13 +181,7 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, _stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     client
         .quic
@@ -277,13 +217,7 @@ async fn an_out_of_range_quarter_stream_id_closes_the_connection() {
 
         // With a live session on the connection: the datagram must take the
         // whole connection down regardless of what else is running on it.
-        let (qsid, _stream) = open_session(
-            &mut client,
-            &server,
-            &target.ip().to_string(),
-            target.port(),
-        )
-        .await;
+        let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
         assert!(qsid <= datagram::MAX_QUARTER_STREAM_ID, "a real session id");
 
         client
@@ -312,13 +246,7 @@ async fn a_datagram_without_a_quarter_stream_id_closes_the_connection() {
 
     for payload in [Bytes::new(), Bytes::from_static(&[0xc0])] {
         let mut client = H3Client::connect(&server).await;
-        let (_qsid, _stream) = open_session(
-            &mut client,
-            &server,
-            &target.ip().to_string(),
-            target.port(),
-        )
-        .await;
+        let (_qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
         client
             .quic
@@ -347,13 +275,7 @@ async fn a_truncated_context_id_is_dropped_without_closing_the_connection() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, _stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     // A well-formed Quarter Stream ID and nothing after it.
     let mut truncated = bytes::BytesMut::new();
@@ -391,15 +313,7 @@ async fn refuses_a_path_that_is_not_the_connect_udp_template() {
         .extensions_mut()
         .insert(h3::ext::Protocol::CONNECT_UDP);
 
-    let mut stream = client
-        .send
-        .send_request(request)
-        .await
-        .expect("send CONNECT-UDP");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(&mut client, request).await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -409,15 +323,11 @@ async fn refuses_an_invalid_port_in_the_template() {
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(server.addr, "127.0.0.1", 0))
-        .await
-        .expect("send CONNECT-UDP");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(
+        &mut client,
+        connect_udp_request(server.addr, "127.0.0.1", 0),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -432,13 +342,7 @@ async fn closing_the_request_stream_ends_the_session() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, mut stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Confirm it works before closing it.
     client
@@ -475,13 +379,7 @@ async fn empty_payloads_are_forwarded() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, _stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     client
         .quic
@@ -507,21 +405,7 @@ async fn capsules_carry_payloads_when_datagrams_are_unavailable() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect_without_datagrams(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(
-            server.addr,
-            &target.ip().to_string(),
-            target.port(),
-        ))
-        .await
-        .expect("send CONNECT-UDP");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let (_, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Send the UDP payload as a DATAGRAM capsule, split across two writes to
     // exercise reassembly on the server side.
@@ -569,21 +453,7 @@ async fn a_truncated_capsule_is_rejected() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(
-            server.addr,
-            &target.ip().to_string(),
-            target.port(),
-        ))
-        .await
-        .expect("send CONNECT-UDP");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    let (_, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Half a capsule, then end the stream.
     let encoded = capsule::encode_datagram(0, b"incomplete");
@@ -634,13 +504,7 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (_, mut stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (_, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Only the header: the decoder rejects the declared length before it waits
     // for a single byte of the value, which is the point — buffering 64 KiB to
@@ -699,7 +563,7 @@ async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (_, mut stream) = open_session(&mut client, &server, "0.0.0.0", 443).await;
+    let (_, mut stream) = open_udp_session_to(&mut client, &server, "0.0.0.0", 443).await;
 
     let started = tokio::time::Instant::now();
     let error = loop {
@@ -745,13 +609,7 @@ async fn unknown_capsule_types_are_skipped() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, mut stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // An unknown capsule type, followed by a real one on the same stream.
     // Encoded with the varint codec rather than by hand: 0x41 written as a raw
@@ -786,13 +644,7 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
     let big_target = spawn_large_reply_udp_target(8000).await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, mut stream) = open_session(
-        &mut client,
-        &server,
-        &big_target.ip().to_string(),
-        big_target.port(),
-    )
-    .await;
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, big_target).await;
 
     let limit = client
         .quic
@@ -818,13 +670,7 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
 
     // The session is still alive: a small reply still gets through.
     let small_target = spawn_udp_echo_target().await;
-    let (small_qsid, _small_stream) = open_session(
-        &mut client,
-        &server,
-        &small_target.ip().to_string(),
-        small_target.port(),
-    )
-    .await;
+    let (small_qsid, _small_stream) = open_udp_session(&mut client, &server, small_target).await;
     client
         .quic
         .send_datagram(datagram::encode_udp_payload(small_qsid, b"small"))
@@ -848,13 +694,7 @@ async fn an_idle_session_closes_the_request_stream() {
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, mut stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // The session works to begin with.
     client
@@ -915,13 +755,7 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     let mut client =
         H3Client::connect_without_datagrams_with_stream_window(&server, STREAM_WINDOW).await;
 
-    let (_, mut stream) = open_session(
-        &mut client,
-        &server,
-        &target.ip().to_string(),
-        target.port(),
-    )
-    .await;
+    let (_, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // One capsule to wake the target, and then nothing: the replies come back as
     // capsules, fill the window, and stay there.
@@ -958,8 +792,7 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     // The connection itself must be untouched: one stalled response is a stream
     // error, never a connection error.
     let echo = spawn_udp_echo_target().await;
-    let (_, _second) =
-        open_session(&mut client, &server, &echo.ip().to_string(), echo.port()).await;
+    let (_, _second) = open_udp_session(&mut client, &server, echo).await;
 }
 
 /// An unreachable target must close the session, not leave it hanging.
@@ -978,13 +811,7 @@ async fn an_unreachable_target_closes_the_session() {
     let closed = closed_udp_address().await;
     let mut client = H3Client::connect(&server).await;
 
-    let (qsid, mut stream) = open_session(
-        &mut client,
-        &server,
-        &closed.ip().to_string(),
-        closed.port(),
-    )
-    .await;
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, closed).await;
 
     client
         .quic
@@ -1031,15 +858,7 @@ async fn refuses_content_framing_fields_on_the_capsule_stream() {
             http::HeaderValue::from_static(value),
         );
 
-        let mut stream = client
-            .send
-            .send_request(request)
-            .await
-            .expect("send CONNECT-UDP");
-        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-            .await
-            .expect("response arrived")
-            .expect("response");
+        let response = respond_to(&mut client, request).await;
 
         assert_eq!(
             response.status(),
@@ -1048,15 +867,11 @@ async fn refuses_content_framing_fields_on_the_capsule_stream() {
         );
     }
 
-    let mut stream = client
-        .send
-        .send_request(connect_udp_request(server.addr, "127.0.0.1", target.port()))
-        .await
-        .expect("send CONNECT-UDP");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
+    let response = respond_to(
+        &mut client,
+        connect_udp_request(server.addr, "127.0.0.1", target.port()),
+    )
+    .await;
 
     assert_eq!(
         response.status(),
@@ -1087,15 +902,7 @@ async fn any_capsule_protocol_value_still_opens_a_tunnel() {
             http::HeaderValue::from_str(value).expect("header value"),
         );
 
-        let mut stream = client
-            .send
-            .send_request(request)
-            .await
-            .expect("send CONNECT-UDP");
-        let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-            .await
-            .expect("response arrived")
-            .expect("response");
+        let response = respond_to(&mut client, request).await;
 
         assert_eq!(
             response.status(),
