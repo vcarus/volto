@@ -59,6 +59,12 @@ Options:
 Every option can also be given as an environment variable: BINARY, SNI, PORT,
 USERNAME, PASSWORD.
 
+The username must not contain a colon (RFC 7617). Neither the username nor the
+password may contain " \ | or &: the first two cannot be written into the
+generated TOML, and the other two are metacharacters of the substitution that
+writes it. Every other printable character is fine, and a generated password is
+never affected.
+
 Re-running is safe: an existing config file, certificate or user is kept as it
 is. --force regenerates the certificate only; it never rewrites config.toml, so
 edits you made there survive. Note that regenerating the certificate changes the
@@ -73,6 +79,30 @@ die() {
 
 note() {
     echo "  $*"
+}
+
+# Rejects credentials the generated config could not express, or that the
+# substitution writing it would rewrite into something else.
+#
+# Called from the --print-config path as well as from the preflight, because
+# that flag runs the same generator and used to reach it with no check at all.
+check_credentials() {
+    # A username with a colon cannot be expressed in HTTP Basic (RFC 7617), and
+    # volto rejects one at startup. Catch it here, where the message can be
+    # clearer.
+    case "$USERNAME" in
+        *:*) die "username must not contain a colon (RFC 7617)" ;;
+        '')  die "username must not be empty" ;;
+    esac
+    case "$USERNAME$PASSWORD" in
+        # Neither survives being written into a double-quoted TOML string.
+        *'"'*|*\\*) die "username and password must not contain quotes or backslashes" ;;
+        # Both are metacharacters of the substitution in generate_config: `|` is
+        # its delimiter, and an unescaped `&` in a sed replacement expands to the
+        # whole matched line. Rejected rather than escaped so what is installed
+        # is always exactly what was asked for.
+        *'|'*|*'&'*) die "username and password must not contain a pipe or an ampersand" ;;
+    esac
 }
 
 # --- arguments --------------------------------------------------------------
@@ -111,10 +141,34 @@ generate_config() {
         "$EXAMPLE_SRC"
 }
 
+# Every substitution must have taken: a silent miss would leave the example's
+# placeholder password in a live config.
+verify_config() {
+    grep -q "^listen = \"0.0.0.0:$PORT\"$" "$1" || die "failed to set listen in the config"
+    grep -q "^cert = \"$CERT\"$" "$1" || die "failed to set cert in the config"
+    grep -q "^key = \"$KEY\"$" "$1" || die "failed to set key in the config"
+    # Fixed-string, unlike the three above: a password is arbitrary text, and as
+    # a basic regular expression a perfectly ordinary one containing `*` or `.`
+    # would fail to match the line it had just been written into correctly.
+    grep -qF -- "password = \"$PASSWORD\"" "$1" || die "failed to set the user in the config"
+    if grep -q 'replace-me-with-something-long' "$1"; then
+        die "the example placeholder password survived; refusing to install this config"
+    fi
+}
+
 if [ "$PRINT_CONFIG" -eq 1 ]; then
     [ -f "$EXAMPLE_SRC" ] || die "missing $EXAMPLE_SRC"
+    check_credentials
     [ -n "$PASSWORD" ] || PASSWORD="$(openssl rand -base64 18)"
-    generate_config
+    # Through a file rather than straight to stdout, so this path runs the same
+    # verification the install path does. That is what puts the verification
+    # within reach of the test suite, which cannot run the rest of the script.
+    tmp="$(mktemp)"
+    # shellcheck disable=SC2064  # $tmp must expand now, not at trap time.
+    trap "rm -f '$tmp'" EXIT
+    generate_config >"$tmp"
+    verify_config "$tmp"
+    cat "$tmp"
     exit 0
 fi
 
@@ -132,15 +186,7 @@ case "$PORT" in
 esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "port out of range: $PORT"
 
-# A username with a colon cannot be expressed in HTTP Basic (RFC 7617), and volto
-# rejects one at startup. Catch it here, where the message can be clearer.
-case "$USERNAME" in
-    *:*) die "username must not contain a colon (RFC 7617)" ;;
-    '')  die "username must not be empty" ;;
-esac
-case "$USERNAME$PASSWORD" in
-    *'"'*|*\\*) die "username and password must not contain quotes or backslashes" ;;
-esac
+check_credentials
 
 [ -f "$BINARY" ] || die "no volto binary at $BINARY — build it first: cargo build --release"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
@@ -226,16 +272,7 @@ else
     trap "rm -f '$tmp'" EXIT
 
     generate_config >"$tmp"
-
-    # Every substitution must have taken: a silent miss would leave the example's
-    # placeholder password in a live config.
-    grep -q "^listen = \"0.0.0.0:$PORT\"$" "$tmp" || die "failed to set listen in the config"
-    grep -q "^cert = \"$CERT\"$" "$tmp" || die "failed to set cert in the config"
-    grep -q "^key = \"$KEY\"$" "$tmp" || die "failed to set key in the config"
-    grep -q "password = \"$PASSWORD\"" "$tmp" || die "failed to set the user in the config"
-    if grep -q 'replace-me-with-something-long' "$tmp"; then
-        die "the example placeholder password survived; refusing to install this config"
-    fi
+    verify_config "$tmp"
 
     install -o volto -g volto -m 0640 "$tmp" "$CONF"
     rm -f "$tmp"

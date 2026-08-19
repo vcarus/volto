@@ -20,8 +20,9 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Runs the installer's config generator with the given arguments.
-fn generated_config(args: &[&str]) -> String {
+/// Runs `--print-config` with the given arguments, returning its exit status,
+/// standard output and standard error.
+fn print_config(args: &[&str]) -> (bool, String, String) {
     let script = repo_root().join("script/install-selfsigned.sh");
 
     let output = Command::new("bash")
@@ -32,13 +33,18 @@ fn generated_config(args: &[&str]) -> String {
         .output()
         .expect("the installer script must be runnable");
 
-    assert!(
+    (
         output.status.success(),
-        "--print-config failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        String::from_utf8(output.stdout).expect("the generated config must be UTF-8"),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
 
-    String::from_utf8(output.stdout).expect("the generated config must be UTF-8")
+/// Runs the installer's config generator with the given arguments.
+fn generated_config(args: &[&str]) -> String {
+    let (ok, stdout, stderr) = print_config(args);
+    assert!(ok, "--print-config failed: {stderr}");
+    stdout
 }
 
 #[test]
@@ -133,6 +139,56 @@ fn the_shipped_config_seeds_a_long_haul_initial_rtt() {
 
     // The server-side default is deliberately not changed with it.
     assert_eq!(volto::config::DEFAULT_INITIAL_RTT_MS, 333);
+}
+
+/// A hand-picked password full of regular-expression metacharacters must reach
+/// the config unchanged.
+///
+/// The generated default is base64, so only an operator who chooses their own
+/// password ever exercises this — and every one of these characters is ordinary
+/// in a password. `*` is the one that used to matter most: the config came out
+/// perfectly correct, and then the script's own verification, a basic regular
+/// expression, failed to find the line it had just written and aborted the
+/// install with "failed to set the user in the config".
+#[test]
+fn a_password_full_of_metacharacters_survives_verbatim() {
+    for password in ["Pa*ss.w0rd", "a+b.c*d", "^start$", "[brackets]"] {
+        let text = generated_config(&["-u", "alice", "-w", password]);
+        let config: Config = toml::from_str(&text).unwrap_or_else(|error| {
+            panic!("{password} produced a config volto cannot parse: {error}\n{text}")
+        });
+
+        assert_eq!(config.auth.users.len(), 1, "{text}");
+        assert_eq!(config.auth.users[0].username, "alice");
+        assert_eq!(
+            config.auth.users[0].password, password,
+            "the password must reach the config verbatim:\n{text}"
+        );
+    }
+}
+
+/// The two characters the generator genuinely cannot carry must be refused, and
+/// refused with a message that names them.
+///
+/// `|` is the delimiter of the substitutions that build the config, so it used
+/// to end the `s` command early and abort the run with `sed: bad flag in
+/// substitute command`. `&` expands to the whole matched line in a sed
+/// replacement, so it used to write a mangled credential line. Both now stop at
+/// the check, on `--print-config` as much as on a real install — that path used
+/// to skip the character check entirely.
+#[test]
+fn credentials_with_a_pipe_or_an_ampersand_are_refused() {
+    for argument in ["-w", "-u"] {
+        for value in ["a|b", "p&ssword"] {
+            let (ok, stdout, stderr) = print_config(&[argument, value]);
+
+            assert!(!ok, "{argument} {value} must be refused, got:\n{stdout}");
+            assert!(
+                stderr.contains("must not contain a pipe or an ampersand"),
+                "the refusal must name the characters, got: {stderr}"
+            );
+        }
+    }
 }
 
 /// `-h` must work and describe the safety-relevant flags.

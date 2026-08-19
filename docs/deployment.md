@@ -96,6 +96,13 @@ sudo script/install-selfsigned.sh \
   --password 'or let it generate one'
 ```
 
+A username may not contain a colon (RFC 7617), and neither a username nor a
+password may contain `"`, `\`, `|` or `&`: the first two cannot be written into
+the generated TOML string, and the other two are metacharacters of the
+substitution that writes it. The installer refuses them up front rather than
+installing something other than what was asked for. Everything else printable is
+accepted, `*` and `.` included, and a generated password never runs into this.
+
 Re-running is safe: an existing config file, certificate or user is kept.
 `--force` regenerates the certificate only — it never rewrites `config.toml`, so
 hand edits survive. Regenerating changes the fingerprint, and every client then
