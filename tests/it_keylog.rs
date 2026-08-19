@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::LazyLock;
 
-use common::{connect_request, spawn_echo_target, H3Client, TestServer, TIMEOUT};
+use common::{connect_request, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT};
 use http::StatusCode;
 use tokio::sync::Mutex;
 
@@ -40,11 +40,7 @@ async fn enabling_keylog_writes_the_tls_secrets() {
     // thread, nothing else in this binary depends on the environment.
     std::env::set_var("SSLKEYLOGFILE", &keylog);
 
-    let server = TestServer::start_with_log(
-        "[security]\nallow_private_networks = true\n",
-        "keylog = true\n",
-    )
-    .await;
+    let server = TestServer::start_with_log(ALLOW_PRIVATE, "keylog = true\n").await;
 
     // A complete handshake plus one successful request, so the secrets for both
     // the handshake and the application data have been derived.
@@ -104,7 +100,7 @@ async fn keylog_is_off_unless_asked_for() {
     let keylog = dir.join("must-not-appear.log");
     std::env::set_var("SSLKEYLOGFILE", &keylog);
 
-    let server = TestServer::start_with("[security]\nallow_private_networks = true\n").await;
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
     let mut stream = client

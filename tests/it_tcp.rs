@@ -7,10 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    closed_address, connect_request, read_at_least, read_to_end, spawn_close_reporting_target,
-    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    closed_address, connect_request, read_at_least, read_to_end, spawn_drain_then_reply_target,
+    spawn_echo_target, spawn_end_reporting_target, spawn_flood_then_reset_target,
+    spawn_reset_after_read_target, ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{Method, Request, StatusCode};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -236,36 +235,6 @@ async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     );
 }
 
-/// When the client resets the request stream, the target socket must be closed
-/// rather than left dangling.
-#[tokio::test]
-async fn client_reset_closes_the_target_connection() {
-    let server = TestServer::start().await;
-    let (target, mut closed) = spawn_close_reporting_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let mut stream = client
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("send CONNECT");
-
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // Abruptly reset the request stream instead of finishing it.
-    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
-    drop(stream);
-
-    tokio::time::timeout(TIMEOUT, closed.recv())
-        .await
-        .expect("the target connection must be closed after a client reset")
-        .expect("close notification");
-}
-
 /// RFC 9114 §4.4: "if the underlying TCP implementation permits it, the proxy
 /// SHOULD send a TCP segment with the RST bit set" when the client resets the
 /// tunnel. Observable at the target as `ECONNRESET` on a read that would have
@@ -420,7 +389,8 @@ async fn arm_a_blackholed_address() -> Option<(SocketAddr, Vec<TcpStream>, TcpLi
 async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
     let Some((blackhole, _holding, _listener)) = arm_a_blackholed_address().await else {
         eprintln!(
-            "skipping: this kernel does not drop SYNs for a full accept queue,              so no black-holed address can be arranged"
+            "skipping: this kernel does not drop SYNs for a full accept queue, so no \
+             black-holed address can be arranged"
         );
         return;
     };

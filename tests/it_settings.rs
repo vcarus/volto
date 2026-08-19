@@ -367,7 +367,8 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "the session never moved onto QUIC datagrams after the peer's SETTINGS              enabled them"
+            "the session never moved onto QUIC datagrams after the peer's SETTINGS \
+             enabled them"
         );
 
         connection

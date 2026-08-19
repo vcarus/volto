@@ -12,40 +12,7 @@
 
 mod common;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
-
-use common::{closed_address, connect_request, H3Client, TestServer, TIMEOUT};
-use tracing_subscriber::fmt::MakeWriter;
-
-/// A writer that accumulates everything logged into a shared buffer.
-#[derive(Clone, Default)]
-struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl SharedBuffer {
-    fn contents(&self) -> String {
-        String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
-    }
-}
-
-impl Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("buffer lock").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedBuffer {
-    type Writer = SharedBuffer;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
+use common::{closed_address, connect_request, H3Client, SharedBuffer, TestServer, TIMEOUT};
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {

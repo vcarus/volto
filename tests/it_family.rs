@@ -109,17 +109,7 @@ fn announce_tcp(listener: TcpListener, tag: &'static [u8]) {
 
 /// Answers every datagram with `tag`.
 fn announce_udp(socket: UdpSocket, tag: &'static [u8]) {
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((_, from)) => {
-                    let _ = socket.send_to(tag, from).await;
-                }
-                Err(_) => return,
-            }
-        }
-    });
+    common::spawn_udp_target_on(socket, |_| Some(tag.to_vec()));
 }
 
 /// CONNECTs to `localhost:port` through `server` and returns the target's tag.

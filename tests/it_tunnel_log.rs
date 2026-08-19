@@ -19,15 +19,13 @@
 
 mod common;
 
-use std::io::Write;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::{
-    connect_request, spawn_large_reply_udp_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    connect_request, spawn_large_reply_udp_target, H3Client, SharedBuffer, TestServer,
+    ALLOW_PRIVATE, TIMEOUT,
 };
 use http::StatusCode;
-use tracing_subscriber::fmt::MakeWriter;
 use volto::datagram;
 
 /// A name whose every address is the unspecified one: the shape a filtering
@@ -37,74 +35,6 @@ const BLACKHOLED: &str = "0.0.0.0:443";
 /// Loopback, which the default policy refuses. A different authority from
 /// [`BLACKHOLED`] so the two scenarios' lines can never be confused.
 const PROHIBITED: &str = "127.0.0.1:443";
-
-/// A writer that accumulates everything logged into a shared buffer.
-#[derive(Clone, Default)]
-struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-impl SharedBuffer {
-    /// How much has been logged so far, as an offset for [`Self::since`].
-    ///
-    /// Lines are written whole, so this is always a line boundary.
-    fn mark(&self) -> usize {
-        self.0.lock().expect("buffer lock").len()
-    }
-
-    /// Everything logged after `mark`.
-    fn since(&self, mark: usize) -> String {
-        let buffer = self.0.lock().expect("buffer lock");
-        String::from_utf8_lossy(&buffer[mark.min(buffer.len())..]).into_owned()
-    }
-
-    /// The lines logged after `mark` that contain every one of `needles`.
-    fn lines_since(&self, mark: usize, needles: &[&str]) -> Vec<String> {
-        self.since(mark)
-            .lines()
-            .filter(|line| needles.iter().all(|needle| line.contains(needle)))
-            .map(str::to_owned)
-            .collect()
-    }
-
-    /// Waits for a line logged after `mark` containing every one of `needles`.
-    ///
-    /// Polled rather than slept through: the server logs from its own task, so
-    /// the line lands some unpredictable moment after the client sees a result.
-    async fn wait_for_line(&self, mark: usize, needles: &[&str]) -> String {
-        let deadline = Instant::now() + TIMEOUT;
-
-        loop {
-            if let Some(line) = self.lines_since(mark, needles).into_iter().next() {
-                return line;
-            }
-
-            assert!(
-                Instant::now() < deadline,
-                "no line containing {needles:?} within {TIMEOUT:?}; log was:\n{}",
-                self.since(mark)
-            );
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-}
-
-impl Write for SharedBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("buffer lock").extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedBuffer {
-    type Writer = SharedBuffer;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
 
 #[tokio::test]
 async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {

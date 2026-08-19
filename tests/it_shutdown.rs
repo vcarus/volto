@@ -11,14 +11,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{
     connect_request, connect_udp_request, read_at_least, spawn_echo_target, spawn_udp_echo_target,
-    H3Client, TestServer, TIMEOUT,
+    H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
 };
 use http::StatusCode;
-
-/// Generous upper bound for a shutdown that should take about as long as its
-/// grace period. Failing this means the grace period is not being enforced.
-const STOP_TIMEOUT: Duration = Duration::from_secs(20);
-
 /// A tunnel that is in use when the signal arrives keeps working, and the server
 /// waits for it rather than dropping it.
 #[tokio::test]
@@ -168,9 +163,7 @@ async fn new_requests_are_refused_after_goaway() {
 /// open: the grace period expires and the endpoint closes anyway.
 #[tokio::test]
 async fn the_grace_period_bounds_the_wait() {
-    let mut server =
-        TestServer::start_with("shutdown_grace = 1\n[security]\nallow_private_networks = true\n")
-            .await;
+    let mut server = TestServer::start_with(&format!("shutdown_grace = 1\n{ALLOW_PRIVATE}")).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -208,8 +201,7 @@ async fn the_grace_period_bounds_the_wait() {
 #[tokio::test]
 async fn an_idle_server_stops_promptly() {
     let mut server =
-        TestServer::start_with("shutdown_grace = 300\n[security]\nallow_private_networks = true\n")
-            .await;
+        TestServer::start_with(&format!("shutdown_grace = 300\n{ALLOW_PRIVATE}")).await;
 
     // A connected but idle client: no tunnels, so nothing to wait for.
     let _client = H3Client::connect(&server).await;

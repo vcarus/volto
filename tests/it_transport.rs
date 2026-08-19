@@ -15,15 +15,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT};
-
-/// One second of idle timeout, with keep-alives off so nothing refreshes it.
-///
-/// Keep-alives have to be disabled explicitly: the default 20s interval would both
-/// fail validation against a 1s timeout and, if it did not, keep the connection
-/// alive forever.
-const IMPATIENT: &str = "[limits]\nmax_idle_timeout = 1\nkeep_alive_interval = 0\n";
-
+use common::{H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT};
 /// The configured idle timeout is the one that applies.
 ///
 /// Asserting both bounds matters: that the connection closes at all proves the

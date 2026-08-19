@@ -9,8 +9,8 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Method, Request, Uri};
@@ -34,6 +34,18 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// from reaching services that trust `127.0.0.1`. Tests that are *about* the
 /// policy build their own `[security]` section instead; see `it_policy`.
 pub const ALLOW_PRIVATE: &str = "[security]\nallow_private_networks = true\n";
+
+/// One second of idle timeout, with keep-alives off so nothing refreshes it.
+///
+/// Keep-alives have to be disabled explicitly: the default 20s interval would both
+/// fail validation against a 1s timeout and, if it did not, keep the connection
+/// alive forever. A client that connects and then says nothing is timed out by the
+/// server after about a second.
+pub const IMPATIENT: &str = "[limits]\nmax_idle_timeout = 1\nkeep_alive_interval = 0\n";
+
+/// Generous upper bound for a shutdown that should take about as long as its
+/// grace period. Failing this means the grace period is not being enforced.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The client-side request stream type produced by [`H3Client::connect`].
 pub type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
@@ -497,24 +509,50 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<
     request
 }
 
-/// A UDP target that echoes each packet back to its sender.
-pub async fn spawn_udp_echo_target() -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp echo");
-    let addr = socket.local_addr().expect("udp echo address");
+/// A UDP target on an ephemeral loopback port that answers with `reply`.
+///
+/// `reply` is handed each packet as it arrives and decides what goes back:
+/// `Some(bytes)` is sent to the sender, `None` leaves the packet unanswered. A
+/// send that fails is dropped, since the loopback losing a reply is not what any
+/// test built on this is about.
+pub async fn spawn_udp_target(
+    reply: impl FnMut(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp target");
+    let addr = socket.local_addr().expect("udp target address");
+    spawn_udp_target_on(socket, reply);
+    addr
+}
 
+/// [`spawn_udp_target`] on a socket that is already bound.
+///
+/// The variant a caller needs when the address is the point: `it_family` binds
+/// the same port on both loopback families, which no `bind` inside a helper can
+/// arrange.
+pub fn spawn_udp_target_on(
+    socket: UdpSocket,
+    mut reply: impl FnMut(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+) {
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         loop {
             match socket.recv_from(&mut buf).await {
                 Ok((length, from)) => {
-                    let _ = socket.send_to(&buf[..length], from).await;
+                    if let Some(answer) = reply(&buf[..length]) {
+                        let _ = socket.send_to(&answer, from).await;
+                    }
                 }
                 Err(_) => return,
             }
         }
     });
+}
 
-    addr
+/// A UDP target that echoes each packet back to its sender.
+pub async fn spawn_udp_echo_target() -> SocketAddr {
+    spawn_udp_target(|packet| Some(packet.to_vec())).await
 }
 
 /// A UDP target that echoes each packet back with `tag` prepended.
@@ -522,27 +560,13 @@ pub async fn spawn_udp_echo_target() -> SocketAddr {
 /// The tag makes it possible to tell which target answered, which is how
 /// cross-talk between concurrent sessions is detected.
 pub async fn spawn_tagged_udp_target(tag: u8) -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind udp target");
-    let addr = socket.local_addr().expect("udp target address");
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((length, from)) => {
-                    let mut reply = Vec::with_capacity(length + 1);
-                    reply.push(tag);
-                    reply.extend_from_slice(&buf[..length]);
-                    let _ = socket.send_to(&reply, from).await;
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    addr
+    spawn_udp_target(move |packet| {
+        let mut reply = Vec::with_capacity(packet.len() + 1);
+        reply.push(tag);
+        reply.extend_from_slice(packet);
+        Some(reply)
+    })
+    .await
 }
 
 /// A UDP target that counts the packets it receives and never answers.
@@ -551,24 +575,14 @@ pub async fn spawn_tagged_udp_target(tag: u8) -> SocketAddr {
 /// target never consents to the conversation. The counter is what the outbound
 /// budget is measured against.
 pub async fn spawn_silent_udp_target() -> (SocketAddr, Arc<AtomicU64>) {
-    let socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind udp target");
-    let addr = socket.local_addr().expect("udp target address");
     let received = Arc::new(AtomicU64::new(0));
-
     let counter = received.clone();
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok(_) => {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(_) => return,
-            }
-        }
-    });
+
+    let addr = spawn_udp_target(move |_| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        None
+    })
+    .await;
 
     (addr, received)
 }
@@ -577,25 +591,8 @@ pub async fn spawn_silent_udp_target() -> (SocketAddr, Arc<AtomicU64>) {
 ///
 /// Used to produce a packet too large for a QUIC datagram.
 pub async fn spawn_large_reply_udp_target(size: usize) -> SocketAddr {
-    let socket = UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind udp target");
-    let addr = socket.local_addr().expect("udp target address");
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        let reply = vec![0x5au8; size];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((_, from)) => {
-                    let _ = socket.send_to(&reply, from).await;
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    addr
+    let reply = vec![0x5au8; size];
+    spawn_udp_target(move |_| Some(reply.clone())).await
 }
 
 /// A UDP target that answers the first packet with `count` replies of `size`.
@@ -628,12 +625,18 @@ pub async fn spawn_flooding_udp_target(count: usize, size: usize) -> SocketAddr 
     addr
 }
 
-/// Reads from a client stream until at least `n` bytes have arrived.
-pub async fn read_at_least(stream: &mut ClientStream, n: usize) -> Vec<u8> {
+/// Reads from a client stream until `enough` accepts what has arrived, or until
+/// the server finishes its sending side.
+///
+/// Returns the bytes read and whether the stream ended before `enough` did.
+async fn read_while(
+    stream: &mut ClientStream,
+    mut enough: impl FnMut(usize) -> bool,
+) -> (Vec<u8>, bool) {
     use bytes::Buf;
 
     let mut out = Vec::new();
-    while out.len() < n {
+    while !enough(out.len()) {
         let chunk = tokio::time::timeout(TIMEOUT, stream.recv_data())
             .await
             .expect("read did not time out")
@@ -641,28 +644,23 @@ pub async fn read_at_least(stream: &mut ClientStream, n: usize) -> Vec<u8> {
 
         match chunk {
             Some(mut buf) => out.extend_from_slice(buf.copy_to_bytes(buf.remaining()).as_ref()),
-            None => panic!("stream ended after {} of {n} bytes", out.len()),
+            None => return (out, true),
         }
     }
+
+    (out, false)
+}
+
+/// Reads from a client stream until at least `n` bytes have arrived.
+pub async fn read_at_least(stream: &mut ClientStream, n: usize) -> Vec<u8> {
+    let (out, ended) = read_while(stream, |read| read >= n).await;
+    assert!(!ended, "stream ended after {} of {n} bytes", out.len());
     out
 }
 
 /// Reads from a client stream until the server finishes its sending side.
 pub async fn read_to_end(stream: &mut ClientStream) -> Vec<u8> {
-    use bytes::Buf;
-
-    let mut out = Vec::new();
-    loop {
-        let chunk = tokio::time::timeout(TIMEOUT, stream.recv_data())
-            .await
-            .expect("read did not time out")
-            .expect("read succeeded");
-
-        match chunk {
-            Some(mut buf) => out.extend_from_slice(buf.copy_to_bytes(buf.remaining()).as_ref()),
-            None => return out,
-        }
-    }
+    read_while(stream, |_| false).await.0
 }
 
 /// A TCP target that echoes every chunk straight back.
@@ -800,35 +798,6 @@ pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
     addr
 }
 
-/// A TCP target that reports over the channel once its connection has ended.
-///
-/// Used to prove the proxy really closes the target socket instead of leaking
-/// it: if the connection is never torn down, nothing arrives on the receiver.
-pub async fn spawn_close_reporting_target() -> (SocketAddr, tokio::sync::mpsc::Receiver<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
-    let addr = listener.local_addr().expect("target address");
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut buf = [0u8; 1024];
-                loop {
-                    // Both EOF and a read error mean the connection is over.
-                    match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-                let _ = tx.send(()).await;
-            });
-        }
-    });
-
-    (addr, rx)
-}
-
 /// How a target connection ended, as seen by the target.
 ///
 /// `Eof` is a clean FIN; `Failed(kind)` is the error a read failed with, which is
@@ -843,8 +812,10 @@ pub enum ConnectionEnd {
 
 /// A TCP target that reports **how** its connection ended.
 ///
-/// Like [`spawn_close_reporting_target`], but the report distinguishes a clean
-/// end of stream from an abortive one instead of collapsing both into "closed".
+/// Used to prove the proxy really closes the target socket instead of leaking it
+/// — nothing arrives on the receiver if the connection is never torn down — and,
+/// beyond that, to tell a clean end of stream from an abortive one rather than
+/// collapsing both into "closed".
 pub async fn spawn_end_reporting_target() -> (SocketAddr, tokio::sync::mpsc::Receiver<ConnectionEnd>)
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
@@ -889,4 +860,83 @@ pub async fn closed_address() -> SocketAddr {
     let addr = listener.local_addr().expect("address");
     drop(listener);
     addr
+}
+
+/// A writer that accumulates everything logged into a shared buffer.
+///
+/// Installed as the subscriber's `MakeWriter` by the test binaries that assert on
+/// log output. Each of those is a binary of its own because
+/// `tracing_subscriber::fmt().init()` may run once per process.
+#[derive(Clone, Default)]
+pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuffer {
+    /// Everything logged so far.
+    pub fn contents(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
+    }
+
+    /// How much has been logged so far, as an offset for [`Self::since`].
+    ///
+    /// Lines are written whole, so this is always a line boundary. Taking one
+    /// before each scenario is what stops a scenario from being satisfied by an
+    /// earlier scenario's line — two of them may close for the same reason.
+    pub fn mark(&self) -> usize {
+        self.0.lock().expect("buffer lock").len()
+    }
+
+    /// Everything logged after `mark`.
+    pub fn since(&self, mark: usize) -> String {
+        let buffer = self.0.lock().expect("buffer lock");
+        String::from_utf8_lossy(&buffer[mark.min(buffer.len())..]).into_owned()
+    }
+
+    /// The lines logged after `mark` that contain every one of `needles`.
+    pub fn lines_since(&self, mark: usize, needles: &[&str]) -> Vec<String> {
+        self.since(mark)
+            .lines()
+            .filter(|line| needles.iter().all(|needle| line.contains(needle)))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Waits for a line logged after `mark` containing every one of `needles`.
+    ///
+    /// Polled rather than slept through: the server logs from its own task, so
+    /// the line lands some unpredictable moment after the client sees a result.
+    pub async fn wait_for_line(&self, mark: usize, needles: &[&str]) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+
+        loop {
+            if let Some(line) = self.lines_since(mark, needles).into_iter().next() {
+                return line;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "no line containing {needles:?} within {TIMEOUT:?}; log was:\n{}",
+                self.since(mark)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+}
+
+impl std::io::Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("buffer lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+    type Writer = SharedBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
 }
