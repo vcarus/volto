@@ -672,6 +672,58 @@ pub async fn spawn_reset_after_read_target() -> SocketAddr {
     addr
 }
 
+/// A TCP target that floods `flood` bytes, never reads, and then sends a RST.
+///
+/// The sibling of [`spawn_reset_after_read_target`] for the other order of
+/// events: the reset has to be noticed by the proxy's *write* pump rather than
+/// its read pump, and the two used to disagree about what the client is told.
+///
+/// Both halves of the proxy have to be pinned for that to be deterministic,
+/// because an RST makes the socket fail in both directions at once:
+///
+/// * the flood — larger than the client's stream flow-control window, and the
+///   client under test does not read the tunnel while it lasts — parks the read
+///   pump inside `send_data`, where it cannot see the socket fail at all;
+/// * never reading parks the write pump inside `write_all`, once the client's
+///   upload has filled every buffer in between.
+///
+/// The flood is bounded by time as well as size because the target's own writes
+/// block as soon as that pipeline is full, and it still has to reach the reset.
+pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let payload = vec![0x5au8; 64 * 1024];
+                let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                    let mut written = 0usize;
+                    while written < flood {
+                        if socket.write_all(&payload).await.is_err() {
+                            return;
+                        }
+                        written += payload.len();
+                    }
+                    // Written out, and still not reading: let the proxy's write
+                    // pump block until the timeout above ends this.
+                    std::future::pending::<()>().await;
+                })
+                .await;
+
+                // Deprecated because a non-zero linger can block the thread on
+                // drop; at zero the close is immediate by definition, which is
+                // what turns it into a reset.
+                #[allow(deprecated)]
+                let _ = socket.set_linger(Some(Duration::ZERO));
+                drop(socket);
+            });
+        }
+    });
+
+    addr
+}
+
 /// A TCP target that reports over the channel once its connection has ended.
 ///
 /// Used to prove the proxy really closes the target socket instead of leaking

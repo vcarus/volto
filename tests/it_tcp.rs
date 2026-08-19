@@ -9,10 +9,22 @@ use bytes::Bytes;
 use common::{
     closed_address, connect_request, read_at_least, read_to_end, spawn_close_reporting_target,
     spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_reset_after_read_target, ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
+    TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{Method, Request, StatusCode};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+/// H3_CONNECT_ERROR (RFC 9114 §8.1).
+const H3_CONNECT_ERROR: u64 = 0x010f;
+
+/// The code a peer-initiated reset carries, or a panic naming what arrived.
+fn remote_terminate_code(error: &h3::error::StreamError) -> u64 {
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. } => code.value(),
+        other => panic!("expected a remote stream reset, got {other:?}"),
+    }
+}
 
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
@@ -92,11 +104,12 @@ async fn client_half_close_still_receives_remaining_target_data() {
 
 /// A target that resets after the tunnel is up must surface as a stream reset
 /// with H3_CONNECT_ERROR, not as a clean end of stream.
+///
+/// This is the case the *read* pump notices, because the client is not uploading
+/// and the write pump is parked reading from it. Its sibling below covers the
+/// other order, where the write pump is the one that finds the target gone.
 #[tokio::test]
 async fn target_reset_becomes_h3_connect_error() {
-    /// H3_CONNECT_ERROR (RFC 9114 §8.1).
-    const H3_CONNECT_ERROR: u64 = 0x010f;
-
     let server = TestServer::start().await;
     let target = spawn_reset_after_read_target().await;
     let mut client = H3Client::connect(&server).await;
@@ -131,14 +144,96 @@ async fn target_reset_becomes_h3_connect_error() {
         Err(error) => error,
     };
 
-    match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
-            code.value(),
-            H3_CONNECT_ERROR,
-            "expected H3_CONNECT_ERROR, got {code:?}"
-        ),
-        other => panic!("expected a remote stream reset, got {other:?}"),
-    }
+    assert_eq!(
+        remote_terminate_code(&error),
+        H3_CONNECT_ERROR,
+        "expected H3_CONNECT_ERROR on the response side, got {error:?}"
+    );
+}
+
+/// The same target reset, noticed by the *write* pump instead.
+///
+/// The client keeps uploading and does not read the tunnel while it does, which
+/// parks the write pump in `write_all` and the read pump in `send_data` — so
+/// when the RST lands only the write pump is in a position to see it. It used to
+/// stop the client's sending side and then simply return, dropping the writer,
+/// and a dropped `quinn::SendStream` finishes rather than resets: the response
+/// direction ended in a clean FIN. That is the truncation shape, and what an
+/// upload-shaped protocol through the tunnel would read as a complete response.
+/// RFC 9114 §4.4 rules it out — any error on the TCP connection, a received RST
+/// included, is a stream error of type H3_CONNECT_ERROR.
+#[tokio::test]
+async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
+    let server = TestServer::start().await;
+    // Comfortably past the client's 1.25 MB stream flow-control window, so the
+    // proxy still has unsent target data when the reset arrives.
+    let target = spawn_flood_then_reset_target(8 * 1024 * 1024).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = client
+        .send
+        .send_request(connect_request(&target.to_string()))
+        .await
+        .expect("send CONNECT");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("response arrived")
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Pushed from a task so the stream comes back afterwards for the response
+    // direction, and deliberately without reading it in the meantime. The byte
+    // bound is only a backstop: the upload parks on flow control long before it,
+    // because the proxy has stopped reading the stream.
+    let payload = Bytes::from(vec![0xa5u8; 64 * 1024]);
+    let upload = tokio::spawn(async move {
+        let mut sent = 0usize;
+        loop {
+            if let Err(error) = stream.send_data(payload.clone()).await {
+                return (Some(error), stream);
+            }
+            sent += payload.len();
+            if sent > 64 * 1024 * 1024 {
+                return (None, stream);
+            }
+        }
+    });
+
+    let (send_error, mut stream) = tokio::time::timeout(TIMEOUT, upload)
+        .await
+        .expect("the upload must end")
+        .expect("the upload task");
+
+    let send_error = send_error.expect("the client's upload must be stopped by the target's reset");
+    assert_eq!(
+        remote_terminate_code(&send_error),
+        H3_CONNECT_ERROR,
+        "expected H3_CONNECT_ERROR on the sending side, got {send_error:?}"
+    );
+
+    // Drain what the target managed to send before the reset; the flood is there
+    // to pin the read pump, not to be checked. What matters is how it ends.
+    let error = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!(
+                    "a target reset reached the client as a clean end of stream: a truncated \
+                     response is indistinguishable from a complete one"
+                ),
+                Err(error) => return error,
+            }
+        }
+    })
+    .await
+    .expect("the reset arrived");
+
+    assert_eq!(
+        remote_terminate_code(&error),
+        H3_CONNECT_ERROR,
+        "expected H3_CONNECT_ERROR on the response side, got {error:?}"
+    );
 }
 
 /// When the client resets the request stream, the target socket must be closed

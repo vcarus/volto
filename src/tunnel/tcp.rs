@@ -10,12 +10,15 @@
 //! |---|---|
 //! | client finishes its sending side (FIN) | shut down **only** the write side of the TCP socket, keep reading from the target |
 //! | target reaches EOF | finish our sending side, keep reading from the client |
-//! | target resets or errors | reset the request stream with `H3_CONNECT_ERROR` |
+//! | target resets or errors | reset the request stream with `H3_CONNECT_ERROR`, whichever direction noticed |
 //! | client resets the request stream, or stops reading it | close the TCP connection with a reset |
 //!
 //! The two directions therefore run as independent pumps that are joined, plus a
 //! sticky teardown signal for the abnormal cases where one direction failing
-//! must stop the other.
+//! must stop the other. The signal carries *why* the tunnel is being torn down —
+//! see `Teardown` below — because the two reasons need opposite things from the pump
+//! that did not see the failure: a target error has to be spelled out on that
+//! half too, whereas a client abort has already been spelled out by the client.
 //!
 //! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
@@ -38,6 +41,30 @@ use crate::tunnel::{Context, Unreachable};
 
 /// Bytes read from the target per relay iteration.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
+
+/// Why the tunnel is being torn down, carried on the teardown channel.
+///
+/// A bare "stop now" flag is not enough, because neither pump can tell from a
+/// flag alone how to close its own half — and simply returning gets it wrong in
+/// one direction each time. `quinn::SendStream::drop` finishes the stream, so a
+/// writer dropped on a target error puts a clean FIN on the wire and a truncated
+/// response reads to the client as a complete one; `quinn::RecvStream::drop`
+/// stops the peer with code 0, so a reader dropped on the same target error
+/// contradicts the `H3_CONNECT_ERROR` the other half just sent.
+///
+/// With the reason attached, a target error reaches the client as
+/// `H3_CONNECT_ERROR` whichever pump noticed it (RFC 9114 §4.4), and a client
+/// abort still leaves both halves alone, since the client is the one that closed
+/// them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Teardown {
+    /// Nothing has gone wrong; both directions are still relaying.
+    Running,
+    /// The client reset the request stream or stopped reading it.
+    ClientAbort,
+    /// The connection to the target failed, in either direction.
+    TargetError,
+}
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
 pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Context) {
@@ -100,7 +127,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     // Sticky so a teardown cannot be missed by a pump that is not yet waiting.
     // The sender lives here, outliving both pumps.
-    let (teardown, teardown_rx) = watch::channel(false);
+    let (teardown, teardown_rx) = watch::channel(Teardown::Running);
 
     tokio::join!(
         client_to_target(reader, tcp_write, &teardown, teardown_rx.clone()),
@@ -193,8 +220,8 @@ where
 async fn client_to_target(
     mut reader: Reader,
     mut tcp_write: OwnedWriteHalf,
-    teardown: &watch::Sender<bool>,
-    mut teardown_rx: watch::Receiver<bool>,
+    teardown: &watch::Sender<Teardown>,
+    mut teardown_rx: watch::Receiver<Teardown>,
 ) {
     loop {
         let chunk = tokio::select! {
@@ -203,7 +230,26 @@ async fn client_to_target(
             // write side down on the way out would put a FIN on the wire, which
             // is the wrong signal for every path that gets here — and would
             // overtake the reset when the other pump armed one.
-            () = torn_down(&mut teardown_rx) => {
+            reason = torn_down(&mut teardown_rx) => {
+                // The other pump found the target broken and reset its half with
+                // H3_CONNECT_ERROR. Ask for the same code here rather than
+                // letting the `Reader` drop stop the client with code 0, which
+                // would leave the two halves carrying different verdicts on the
+                // same failure.
+                //
+                // Only a request, not a guarantee, at the pinned `h3-quinn`
+                // revision: its `RecvStream::poll_data` moves the `quinn` stream
+                // into a boxed read future, and a `stop_sending` arriving while
+                // that read is in flight is parked in `pending_stop` and applied
+                // only when the read resolves — which it will not, since nothing
+                // more is coming. The client is then stopped with code 0 by the
+                // drop, as before. It lands when the teardown beats the first
+                // read, and it is what this half means either way; the response
+                // direction, which is the one that could truncate data, is
+                // reset unconditionally by the other pump.
+                if reason == Teardown::TargetError {
+                    reader.stop_receiving(h3api::CONNECT_ERROR);
+                }
                 tcp_write.forget();
                 return;
             }
@@ -216,7 +262,7 @@ async fn client_to_target(
                     // The target is gone (RST, EPIPE): the tunnel is broken.
                     debug!(%error, "write to target failed");
                     reader.stop_receiving(h3api::CONNECT_ERROR);
-                    let _ = teardown.send(true);
+                    let _ = teardown.send(Teardown::TargetError);
                     return;
                 }
             }
@@ -240,7 +286,7 @@ async fn client_to_target(
                 // rather than the FIN a natural drop would produce.
                 abort_target(tcp_write.as_ref());
                 tcp_write.forget();
-                let _ = teardown.send(true);
+                let _ = teardown.send(Teardown::ClientAbort);
                 return;
             }
         }
@@ -251,8 +297,8 @@ async fn client_to_target(
 async fn target_to_client(
     mut writer: Writer,
     mut tcp_read: OwnedReadHalf,
-    teardown: &watch::Sender<bool>,
-    mut teardown_rx: watch::Receiver<bool>,
+    teardown: &watch::Sender<Teardown>,
+    mut teardown_rx: watch::Receiver<Teardown>,
 ) {
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
@@ -263,7 +309,21 @@ async fn target_to_client(
 
         let read = tokio::select! {
             biased;
-            () = torn_down(&mut teardown_rx) => return,
+            reason = torn_down(&mut teardown_rx) => {
+                // The write pump found the target broken. RFC 9114 §4.4 makes
+                // that a stream error of type H3_CONNECT_ERROR, and returning
+                // without saying so would drop the `Writer` — and a dropped
+                // `quinn::SendStream` finishes rather than resets, so the client
+                // would read a truncated response as a complete one.
+                //
+                // A client abort needs nothing from this side: the client has
+                // already reset the stream or stopped reading it, and answering
+                // its own close with a reset only adds a second signal.
+                if reason == Teardown::TargetError {
+                    writer.reset(h3api::CONNECT_ERROR);
+                }
+                return;
+            }
             read = tcp_read.read_buf(&mut buf) => read,
         };
 
@@ -289,7 +349,7 @@ async fn target_to_client(
                     // connection is closed with a reset. The other pump does the
                     // dropping; this only decides how the socket closes.
                     abort_target(tcp_read.as_ref());
-                    let _ = teardown.send(true);
+                    let _ = teardown.send(Teardown::ClientAbort);
                     return;
                 }
             }
@@ -298,7 +358,7 @@ async fn target_to_client(
                 // a stream reset with H3_CONNECT_ERROR.
                 debug!(%error, "read from target failed");
                 writer.reset(h3api::CONNECT_ERROR);
-                let _ = teardown.send(true);
+                let _ = teardown.send(Teardown::TargetError);
                 return;
             }
         }
@@ -337,16 +397,19 @@ fn abort_target(tcp: &TcpStream) {
     }
 }
 
-/// Resolves once either direction has asked for the tunnel to be torn down.
-async fn torn_down(teardown_rx: &mut watch::Receiver<bool>) {
+/// Resolves once either direction has asked for the tunnel to be torn down,
+/// with the reason it gave.
+async fn torn_down(teardown_rx: &mut watch::Receiver<Teardown>) -> Teardown {
     loop {
-        if *teardown_rx.borrow_and_update() {
-            return;
+        let reason = *teardown_rx.borrow_and_update();
+        if reason != Teardown::Running {
+            return reason;
         }
         // The sender outlives both pumps, so this cannot actually fail; treat a
-        // closed channel as a teardown anyway.
+        // closed channel as a teardown anyway. Reported as a client abort,
+        // which is the reason that asks nothing of the waking pump.
         if teardown_rx.changed().await.is_err() {
-            return;
+            return Teardown::ClientAbort;
         }
     }
 }
