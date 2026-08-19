@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    closed_udp_address, connect_udp_request, spawn_large_reply_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
+    closed_udp_address, connect_udp_request, spawn_flooding_udp_target,
+    spawn_large_reply_udp_target, spawn_tagged_udp_target, spawn_udp_echo_target, H3Client,
+    TestServer, TIMEOUT,
 };
 use http::StatusCode;
 use volto::datagram;
@@ -19,6 +20,10 @@ const H3_DATAGRAM_ERROR: u64 = 0x33;
 /// H3_NO_ERROR, RFC 9114 §8.1: "no error. This is used when the connection or
 /// stream needs to be closed, but there is no error to signal."
 const H3_NO_ERROR: u64 = 0x100;
+
+/// H3_REQUEST_CANCELLED, RFC 9114 §8.1: "the request or its response --
+/// including pushed response -- is cancelled".
+const H3_REQUEST_CANCELLED: u64 = 0x10c;
 
 /// Waits for the server to close the QUIC connection, returning its error code.
 ///
@@ -879,6 +884,82 @@ async fn an_idle_session_closes_the_request_stream() {
         ended.is_ok(),
         "the idle session should end cleanly, got {ended:?}"
     );
+}
+
+/// A client that stops reading the capsule stream gets that stream reset, and
+/// the connection carrying it survives.
+///
+/// Only the capsule fallback can reach this: with QUIC datagrams the target's
+/// packets bypass the request stream and its flow control entirely. On the
+/// fallback they do not, so a client that stops reading parks the server inside
+/// `send_data` with no way to make progress.
+///
+/// The idle timeout used to wrap that write along with the rest of the loop
+/// step, and `send_data` is not cancel-safe: the cancelled write left a partial
+/// DATA frame in the backend's buffer, and the tidy `finish()` that followed
+/// FINned a truncated capsule — malformed by RFC 9297 §3.3. Worse on the *first*
+/// request stream of a connection, which is what this session is: `h3` writes
+/// one grease frame ahead of the FIN there, the backend refuses a second write
+/// while the first is unflushed, and the whole connection went down with
+/// H3_INTERNAL_ERROR. Opening a second session at the end is what pins that.
+#[tokio::test]
+async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
+    use volto::capsule;
+
+    // Small enough that the target's replies cannot fit, so the server is parked
+    // in its write long before the timeout rather than because of it.
+    const STREAM_WINDOW: u32 = 64 * 1024;
+
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let target = spawn_flooding_udp_target(512, 1200).await;
+    let mut client =
+        H3Client::connect_without_datagrams_with_stream_window(&server, STREAM_WINDOW).await;
+
+    let (_, mut stream) = open_session(
+        &mut client,
+        &server,
+        &target.ip().to_string(),
+        target.port(),
+    )
+    .await;
+
+    // One capsule to wake the target, and then nothing: the replies come back as
+    // capsules, fill the window, and stay there.
+    stream
+        .send_data(capsule::encode_datagram(0, b"go"))
+        .await
+        .expect("send the trigger capsule");
+
+    // Deliberately not reading yet — reading would let the blocked write make
+    // progress. Long enough for the one-second idle timeout to have fired.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let error = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("a stalled capsule stream must be reset, not finished"),
+                Err(error) => return error,
+            }
+        }
+    })
+    .await
+    .expect("the server must end the stalled stream on its own");
+
+    match error {
+        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+            code.value(),
+            H3_REQUEST_CANCELLED,
+            "expected H3_REQUEST_CANCELLED, got {code:?}"
+        ),
+        other => panic!("expected a stream reset, got {other:?}"),
+    }
+
+    // The connection itself must be untouched: one stalled response is a stream
+    // error, never a connection error.
+    let echo = spawn_udp_echo_target().await;
+    let (_, _second) =
+        open_session(&mut client, &server, &echo.ip().to_string(), echo.port()).await;
 }
 
 /// An unreachable target must close the session, not leave it hanging.

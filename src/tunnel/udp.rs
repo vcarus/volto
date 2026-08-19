@@ -24,6 +24,10 @@
 //!   is refused.
 //! * An oversized outbound packet is **dropped**, never downgraded to a capsule
 //!   (RFC 9298 §6.1).
+//! * On the capsule fallback, a write to the client that makes no progress for a
+//!   whole idle timeout ends the session by **resetting** the request stream
+//!   rather than finishing it — see `Session::forward_to_client`, which is
+//!   also why the idle timeout covers only the wait for work and not the work.
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
@@ -373,6 +377,20 @@ enum Step {
     Aborted,
 }
 
+/// Which of a session's three sources produced work, before it is handled.
+///
+/// Exists so the idle timeout can cover the *waiting* and nothing else; see
+/// [`Session::run`].
+enum Event {
+    /// A payload the connection's datagram router decoded for this session, or
+    /// `None` if the router dropped our sender.
+    Inbound(Option<Bytes>),
+    /// A packet read from the target socket, or the error that ended it.
+    Socket(std::io::Result<usize>),
+    /// A chunk of the request stream's capsule sequence, its end, or its error.
+    Stream(Result<Option<Bytes>, h3api::StreamError>),
+}
+
 impl Session {
     /// Pumps the session until it closes, one direction at a time.
     async fn run(&mut self, stream_id: u64) {
@@ -380,38 +398,29 @@ impl Session {
         let mut packet = vec![0u8; MAX_UDP_PAYLOAD];
 
         loop {
-            // Wrapping the whole step measures idleness directly: any branch
-            // firing resets the clock. Every branch below is cancel-safe.
-            let step = tokio::time::timeout(self.ctx.idle_timeout, async {
+            // The timeout covers *waiting for* one of the three sources and
+            // nothing else, which is what makes it a measure of idleness: all
+            // three awaits below are cancel-safe (`mpsc::Receiver::recv`,
+            // `UdpSocket::recv` and the stream read all resume where they left
+            // off), so an expiry here cannot lose anything half-done.
+            //
+            // Handling the event is deliberately outside it. `forward_to_client`
+            // writes to the request stream on the capsule path, and a write in
+            // flight is exactly what must not be cancelled: the backend keeps a
+            // partial DATA frame, which the tidy `finish()` below would then FIN
+            // in the middle of a capsule. That branch bounds its own write
+            // instead, and ends the session by resetting rather than finishing.
+            let event = tokio::time::timeout(self.ctx.idle_timeout, async {
                 tokio::select! {
-                    payload = self.inbound.recv() => match payload {
-                        Some(payload) => self.forward_to_target(payload).await,
-                        // Only happens if the registry dropped our sender.
-                        None => Step::Stop,
-                    },
-                    received = self.socket.recv(&mut packet) => match received {
-                        Ok(length) => self.forward_to_client(&packet[..length]).await,
-                        Err(error) => {
-                            // ICMP errors surface here on a connected socket.
-                            // RFC 9298 §3.1: the request stream must be closed.
-                            debug!(stream_id, %error, "target socket failed");
-                            Step::Stop
-                        }
-                    },
-                    chunk = self.reader.recv_data() => {
-                        self.handle_stream_chunk(stream_id, chunk).await
-                    }
+                    payload = self.inbound.recv() => Event::Inbound(payload),
+                    received = self.socket.recv(&mut packet) => Event::Socket(received),
+                    chunk = self.reader.recv_data() => Event::Stream(chunk),
                 }
             })
             .await;
 
-            match step {
-                Ok(Step::Continue) => {}
-                Ok(Step::Stop) => break,
-                // The stream carries its own error signal already; anything
-                // added here would only muddy it. The socket still closes, with
-                // `self`.
-                Ok(Step::Aborted) => return,
+            let event = match event {
+                Ok(event) => event,
                 Err(_elapsed) => {
                     debug!(
                         stream_id,
@@ -420,6 +429,29 @@ impl Session {
                     );
                     break;
                 }
+            };
+
+            let step = match event {
+                Event::Inbound(Some(payload)) => self.forward_to_target(payload).await,
+                // Only happens if the registry dropped our sender.
+                Event::Inbound(None) => Step::Stop,
+                Event::Socket(Ok(length)) => self.forward_to_client(&packet[..length]).await,
+                Event::Socket(Err(error)) => {
+                    // ICMP errors surface here on a connected socket. RFC 9298
+                    // §3.1: the request stream must be closed.
+                    debug!(stream_id, %error, "target socket failed");
+                    Step::Stop
+                }
+                Event::Stream(chunk) => self.handle_stream_chunk(stream_id, chunk).await,
+            };
+
+            match step {
+                Step::Continue => {}
+                Step::Stop => break,
+                // The stream carries its own error signal already; anything
+                // added here would only muddy it. The socket still closes, with
+                // `self`.
+                Step::Aborted => return,
             }
         }
 
@@ -531,12 +563,35 @@ impl Session {
         // there a datagram path exists and RFC 9298 §6.1 says not to bypass it,
         // whereas here there is none, so capsules are the correct channel.
         let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packet);
-        if let Err(error) = self.writer.send_data(encoded).await {
-            debug!(%error, "failed to send a DATAGRAM capsule");
-            return Step::Stop;
-        }
 
-        Step::Continue
+        // The one write in this session that can block for as long as the peer
+        // likes: `send_data` applies the peer's flow control, so a client that
+        // stops reading the stream parks it indefinitely. A write that has made
+        // no progress for a whole idle timeout is that client.
+        //
+        // It cannot simply be abandoned. A cancelled send leaves a partial DATA
+        // frame in the backend's buffer, and the tidy `finish()` the session
+        // otherwise ends with would then FIN a truncated capsule — malformed by
+        // RFC 9297 §3.3 — or, on the first request stream of a connection, fail
+        // the whole connection while `h3` tries to write its one grease frame
+        // ahead of the FIN. So the stream is reset instead, which says the same
+        // thing without leaving a half-written frame behind.
+        match tokio::time::timeout(self.ctx.idle_timeout, self.writer.send_data(encoded)).await {
+            Ok(Ok(())) => Step::Continue,
+            Ok(Err(error)) => {
+                debug!(%error, "failed to send a DATAGRAM capsule");
+                Step::Stop
+            }
+            Err(_elapsed) => {
+                debug!(
+                    quarter_stream_id = self.quarter_stream_id,
+                    timeout_secs = self.ctx.idle_timeout.as_secs(),
+                    "client stopped reading the capsule stream, resetting it"
+                );
+                self.writer.reset(h3api::REQUEST_CANCELLED);
+                Step::Aborted
+            }
+        }
     }
 
     /// Handles bytes, EOF or an error on the request stream.

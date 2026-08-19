@@ -275,6 +275,29 @@ impl Drop for TestServer {
 
 /// A QUIC client endpoint that trusts `ca` and offers `alpn`.
 pub fn client_endpoint(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::Endpoint {
+    client_endpoint_with(ca, alpn, None)
+}
+
+/// [`client_endpoint`] with a per-stream receive window of `window` bytes.
+///
+/// quinn's default is 1.25 MB, which is a lot of data to push through a tunnel
+/// before a server's write to the client blocks on it. Tests that need the
+/// server *parked* on flow control shrink it instead of flooding.
+pub fn client_endpoint_with_stream_window(
+    ca: &CertificateDer<'static>,
+    alpn: &[&str],
+    window: u32,
+) -> quinn::Endpoint {
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(window.into());
+    client_endpoint_with(ca, alpn, Some(transport))
+}
+
+fn client_endpoint_with(
+    ca: &CertificateDer<'static>,
+    alpn: &[&str],
+    transport: Option<quinn::TransportConfig>,
+) -> quinn::Endpoint {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).expect("trust the test CA");
 
@@ -286,9 +309,12 @@ pub fn client_endpoint(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::En
         .with_no_client_auth();
     crypto.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("quic tls"),
     ));
+    if let Some(transport) = transport {
+        client_config.transport_config(Arc::new(transport));
+    }
 
     let mut endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
@@ -356,6 +382,26 @@ impl H3Client {
     /// the session has to fall back to DATAGRAM capsules on the request stream.
     pub async fn connect_without_datagrams(server: &TestServer) -> Self {
         Self::connect_with_datagrams(server, false).await
+    }
+
+    /// [`H3Client::connect_without_datagrams`] with a per-stream receive window
+    /// of `window` bytes, so a server writing capsules blocks after that much.
+    pub async fn connect_without_datagrams_with_stream_window(
+        server: &TestServer,
+        window: u32,
+    ) -> Self {
+        let endpoint = client_endpoint_with_stream_window(&server.ca, &["h3"], window);
+        let connection = tokio::time::timeout(
+            TIMEOUT,
+            endpoint
+                .connect(server.addr, "localhost")
+                .expect("start connecting"),
+        )
+        .await
+        .expect("handshake did not time out")
+        .expect("handshake");
+
+        Self::from_quic(endpoint, connection, false).await
     }
 
     async fn connect_with_datagrams(server: &TestServer, datagrams: bool) -> Self {
@@ -545,6 +591,36 @@ pub async fn spawn_large_reply_udp_target(size: usize) -> SocketAddr {
                     let _ = socket.send_to(&reply, from).await;
                 }
                 Err(_) => return,
+            }
+        }
+    });
+
+    addr
+}
+
+/// A UDP target that answers the first packet with `count` replies of `size`.
+///
+/// Enough of them to fill a client's stream flow-control window, so a proxy
+/// relaying them over DATAGRAM capsules ends up parked in its write to the
+/// client. Sent as fast as the socket takes them, with an occasional yield so
+/// the runtime is not starved; a send that fails is left dropped, since UDP loss
+/// is not what any test built on this is about.
+pub async fn spawn_flooding_udp_target(count: usize, size: usize) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp target");
+    let addr = socket.local_addr().expect("udp target address");
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let reply = vec![0x5au8; size];
+        let Ok((_, from)) = socket.recv_from(&mut buf).await else {
+            return;
+        };
+        for sent in 0..count {
+            let _ = socket.send_to(&reply, from).await;
+            if sent % 32 == 31 {
+                tokio::task::yield_now().await;
             }
         }
     });

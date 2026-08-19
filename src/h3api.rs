@@ -50,6 +50,13 @@ pub const CONNECT_ERROR: Code = Code::H3_CONNECT_ERROR;
 /// The peer sent something malformed (RFC 9114 §8.1).
 pub const MESSAGE_ERROR: Code = Code::H3_MESSAGE_ERROR;
 
+/// The request or its response is cancelled (RFC 9114 §8.1).
+///
+/// The closest registered code for a response body this server gives up on
+/// because the peer stopped reading it: nothing was malformed and nothing failed
+/// upstream, the transfer simply cannot be completed.
+pub const REQUEST_CANCELLED: Code = Code::H3_REQUEST_CANCELLED;
+
 /// A datagram or capsule could not be parsed (RFC 9297 §5.2).
 ///
 /// The registry entry for 0x33 is literally "Datagram or Capsule Protocol parse
