@@ -11,6 +11,16 @@
 //! in [`crate::conn`] deliberately keeps `Debug` shapes — there the Rust spelling
 //! of a header map, or of an absent `:protocol`, *is* the evidence D3 is waiting
 //! for.
+//!
+//! The third rule is about *provenance*: [`or_dash`] prints with `Display`, which
+//! escapes nothing, so it is only for values the server produced or validated
+//! itself — the ALPN it negotiated from its own list, the SNI rustls accepted as
+//! a DNS name, a `SocketAddr` it resolved. Bytes the peer chose (the user-id of
+//! a rejected credential) are recorded as a plain `str` field instead, which
+//! tracing prints quoted and `Debug`-escaped: `username="user1"`, and a newline
+//! or a terminal escape sequence inside it stays on the one line, spelled out.
+//! systemd splits a service's stdout on `\n`, so an unescaped newline would
+//! otherwise hand an unauthenticated client a journal entry of its own.
 
 use std::fmt;
 

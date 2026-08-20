@@ -191,7 +191,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             warn!(
                 stream_id,
                 remote = %context.remote,
-                username = %crate::logfmt::or_dash(denied.username()),
+                // Recorded as a `str`, not through `or_dash`: these bytes are the
+                // peer's, and tracing prints a `str` field quoted and escaped, so
+                // a newline or a terminal escape in a guessed user-id cannot
+                // forge a journal line. See `logfmt`'s third rule.
+                username = denied.username().unwrap_or(crate::logfmt::ABSENT),
                 reason = denied.reason(),
                 "authentication failed"
             );
