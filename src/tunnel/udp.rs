@@ -306,7 +306,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
         quarter_stream_id,
         host,
         port,
-        ?target,
+        target = %crate::logfmt::or_dash(target),
         datagrams = ctx.datagrams_allowed(),
         "udp session established"
     );

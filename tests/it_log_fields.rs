@@ -1,8 +1,9 @@
 //! Operator-facing log fields print values, not Rust's `Option` spelling.
 //!
-//! The four fields asserted here — `alpn`, `server_name`, `target`, `username` —
-//! used to be formatted with tracing's `?` sigil straight off an `Option`, so
-//! production lines read `alpn=Some("h3")` and `target=Some(104.16.132.229:80)`.
+//! The fields asserted here — `alpn`, `server_name`, `target` on both tunnel
+//! lines, `username` — used to be formatted with tracing's `?` sigil straight off
+//! an `Option`, so production lines read `alpn=Some("h3")` and
+//! `target=Some(104.16.132.229:80)`.
 //! Nothing pinned that shape, which is the failure mode D51 catalogued: the
 //! predicate is tested, the last hop to the observable output is not, and a
 //! change to it goes unnoticed until someone reads a log a week later. Hence this
@@ -20,8 +21,9 @@
 mod common;
 
 use common::{
-    auth_section, basic_credentials, connect_request, open_tcp_tunnel, respond_to,
-    spawn_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    auth_section, basic_credentials, connect_request, open_tcp_tunnel, open_udp_session,
+    respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer,
+    ALLOW_PRIVATE,
 };
 use http::{HeaderName, StatusCode};
 
@@ -38,8 +40,10 @@ async fn operator_facing_fields_print_values_not_options() {
 
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let target = spawn_echo_target().await;
+    let udp_target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
     let _stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    let (_qsid, _session) = open_udp_session(&mut client, &server, udp_target).await;
 
     let logged = buffer.contents();
 
@@ -66,6 +70,18 @@ async fn operator_facing_fields_print_values_not_options() {
     assert!(
         tunnel.contains(&format!("target={target}")),
         "the dialled address must print as its value; line was:\n{tunnel}"
+    );
+
+    // The session line, same field, other tunnel. The first release of this
+    // test opened no UDP session, and `target=Some(…)` on this line reached
+    // production while the `!contains("Some(")` backstop below stayed green.
+    let session = logged
+        .lines()
+        .find(|line| line.contains("udp session established"))
+        .unwrap_or_else(|| panic!("no udp session established line; log was:\n{logged}"));
+    assert!(
+        session.contains(&format!("target={udp_target}")),
+        "the connected address must print as its value; line was:\n{session}"
     );
 
     // The `username` of a rejected attempt, on the WARN line a fail2ban rule
