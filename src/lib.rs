@@ -20,6 +20,7 @@
 //! * [`capsule`] — the Capsule Protocol (RFC 9297 §3) incremental decoder.
 //! * [`datagram`] — HTTP Datagram payload coding (RFC 9297) and QUIC varints.
 //! * [`net`] — explicit name resolution and UDP socket setup.
+//! * [`logfmt`] — how an optional value is spelled in a log field.
 //! * [`tunnel`] — request routing, the per-connection context and the tunnels.
 //!
 //! # Security status
@@ -41,6 +42,7 @@ pub mod config;
 pub mod conn;
 pub mod datagram;
 pub mod h3api;
+pub mod logfmt;
 pub mod net;
 pub mod policy;
 pub mod quic;

@@ -120,7 +120,12 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         return;
     }
 
-    info!(stream_id, authority, ?target, "tcp tunnel established");
+    info!(
+        stream_id,
+        authority,
+        target = %crate::logfmt::or_dash(target),
+        "tcp tunnel established"
+    );
 
     let (writer, reader) = stream.split();
     let (tcp_read, tcp_write) = tcp.into_split();

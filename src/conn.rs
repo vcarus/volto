@@ -191,7 +191,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             warn!(
                 stream_id,
                 remote = %context.remote,
-                username = ?denied.username(),
+                username = %crate::logfmt::or_dash(denied.username()),
                 reason = denied.reason(),
                 "authentication failed"
             );

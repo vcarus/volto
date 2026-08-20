@@ -379,7 +379,7 @@ address, so per-IP banning at the server cannot distinguish them — see
 A failed authentication logs one stable `WARN` line carrying the source address:
 
 ```
-WARN ... authentication failed ... remote=203.0.113.7:5678 username=Some("user1") reason="credentials rejected"
+WARN ... authentication failed ... remote=203.0.113.7:5678 username=user1 reason="credentials rejected"
 ```
 
 `/etc/fail2ban/filter.d/volto.conf`:

@@ -366,8 +366,8 @@ impl Server {
             let peer = peer_info(&quic);
             info!(
                 remote = %peer.remote,
-                alpn = ?peer.alpn,
-                server_name = ?peer.server_name,
+                alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
+                server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
                 // At this point the estimate comes from the handshake samples
                 // alone; the close logs below carry the lifetime smoothed value.
                 rtt_ms = quic.rtt().as_millis(),
