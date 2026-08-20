@@ -73,9 +73,9 @@ jobs:
     # to this job. They stay covered by the manual review a rev bump already
     # requires (see .github/dependabot.yml).
     #
-    # The `[patch.crates-io]` fork of `quinn-proto` would fall into that same hole,
-    # but it does not have to: the fork is the upstream `quinn-proto-0.11.17` tag
-    # plus three commits, so advisories against 0.11.17 apply to it verbatim. The
+    # The `[patch.crates-io]` pin of `quinn-proto` would fall into that same hole,
+    # but it does not have to: the pinned commit is the upstream `quinn-proto-0.11.17`
+    # tag plus three fixes, so advisories against 0.11.17 apply to it verbatim. The
     # second step below recovers it by auditing a copy of the lockfile with that
     # one `source` line pointed back at the registry.
     name: audit (RustSec)

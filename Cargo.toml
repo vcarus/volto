@@ -95,25 +95,28 @@ proptest = "1"
 # and pushes the re-probe out again, so the MTU stays there for the whole
 # download. That branch is also missing two comparison fixes that upstream
 # landed on `main` only. Until a quinn-proto 0.11.x release carries all three,
-# we carry them ourselves -- a fork of the `quinn-proto-0.11.17` tag with three
-# commits on top, every one of them in `quinn-proto/src/connection/mtud.rs`:
+# we pin the `0.11.x` branch commit that carries them: `dcb9eabe` is the squash
+# merge of quinn-rs/quinn#2799, which is the `quinn-proto-0.11.17` tag plus the
+# three fixes, every one of them in `quinn-proto/src/connection/mtud.rs`:
 #
-#   7108a315  Fix some comparisons in the black hole detector    (upstream #2400)
-#   0f457685  Relax MTU discovery state assertion                (upstream #2400)
-#   3f35067f  proto: treat an equal-size delivery as evidence against a
-#             preceding loss burst                               (ours, #2792)
+#   Fix some comparisons in the black hole detector               (upstream #2400)
+#   Relax MTU discovery state assertion                           (upstream #2400)
+#   proto: treat an equal-size delivery as evidence against a
+#          preceding loss burst                                   (#2792, ours)
 #
 # Upstream refs: the bug is quinn-rs/quinn#2791, the fix quinn-rs/quinn#2792
-# (open against `main`), and #2400 was never backported to 0.11.x.
+# (merged to `main`), and #2799 brought all three to `0.11.x` on 2026-08-20.
+# Until 2026-08-20 the same three commits were served from a personal fork;
+# the `quinn-proto` crate at this commit is tree-identical to that fork's rev.
 #
 # EXIT CONDITION: delete this stanza as soon as a quinn-proto 0.11.x release
 # includes the fix, then `cargo update -p quinn-proto` and drop the CI audit
 # workaround (see `.github/workflows/ci.yml`). Two blind spots until then, both
 # spelled out in docs/architecture.md: Dependabot cannot bump a git patch, so
-# the fork is rebased by hand; and cargo-audit ignores lockfile entries whose
+# the rev is moved by hand; and cargo-audit ignores lockfile entries whose
 # source is not the default registry, which the `audit` job works around by
 # rewriting that one source line back to the registry before it scans -- the
-# fork's version *is* the upstream tag, so advisories filed against quinn-proto
-# 0.11.17 apply to us unchanged.
+# pinned commit's version *is* the upstream tag, so advisories filed against
+# quinn-proto 0.11.17 apply to us unchanged.
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/vcarus/quinn", rev = "3f35067fd236e224edf82d8b03a810a9b1d34a3e" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "dcb9eabee2284141d24fc1632903d7a5269be404" }

@@ -208,37 +208,39 @@ without reviewing the upstream changes and running the full suite.
 ## Why quinn-proto is patched (temporary)
 
 `Cargo.toml` carries a `[patch.crates-io]` stanza pointing `quinn-proto` at a
-commit on a fork. quinn-proto's MTU black-hole detector treats an ordinary
-congestion loss burst during a bulk transfer as proof that the path has stopped
-carrying the current MTU, so a download makes the connection fall back to the
-1200-byte floor — and on the 0.11.x branch every further loss burst at the floor
-re-triggers the detector and pushes the next probe out again, so the MTU stays
-there for as long as the transfer lasts. That branch is also missing two
-comparison fixes that upstream landed on `main` only.
+commit on upstream's `0.11.x` branch. quinn-proto's MTU black-hole detector treats
+an ordinary congestion loss burst during a bulk transfer as proof that the path
+has stopped carrying the current MTU, so a download makes the connection fall
+back to the 1200-byte floor — and on the 0.11.x branch every further loss burst
+at the floor re-triggers the detector and pushes the next probe out again, so the
+MTU stays there for as long as the transfer lasts. That branch was also missing
+two comparison fixes that upstream had landed on `main` only.
 
-The fork is the `quinn-proto-0.11.17` tag with three commits on top, all of them
-in `quinn-proto/src/connection/mtud.rs`:
+The pinned commit, `dcb9eabe`, is the squash merge of
+[quinn-rs/quinn#2799](https://github.com/quinn-rs/quinn/pull/2799): the
+`quinn-proto-0.11.17` tag plus three fixes, all of them in
+`quinn-proto/src/connection/mtud.rs`:
 
-- **`7108a315`** — "Fix some comparisons in the black hole detector", cherry-picked
-  from [quinn-rs/quinn#2400](https://github.com/quinn-rs/quinn/pull/2400).
-- **`0f457685`** — "Relax MTU discovery state assertion", from the same PR.
-- **`3f35067f`** — "proto: treat an equal-size delivery as evidence against a
-  preceding loss burst". The actual bug is
+- "Fix some comparisons in the black hole detector" and "Relax MTU discovery
+  state assertion", backported from
+  [quinn-rs/quinn#2400](https://github.com/quinn-rs/quinn/pull/2400).
+- "proto: treat an equal-size delivery as evidence against a preceding loss
+  burst". The actual bug is
   [#2791](https://github.com/quinn-rs/quinn/issues/2791) and the fix
-  [#2792](https://github.com/quinn-rs/quinn/pull/2792), open against `main`;
-  #2400 was never backported to 0.11.x.
+  [#2792](https://github.com/quinn-rs/quinn/pull/2792), merged to `main`.
 
-Because the fork's version *is* the upstream tag, anything true of quinn-proto
-0.11.17 is true here except those three commits.
+No 0.11.x *release* carries these yet, which is why the stanza pins a commit
+rather than a version. Because that commit's version *is* the upstream tag,
+anything true of quinn-proto 0.11.17 is true here except those three fixes.
 
 **Exit condition:** drop the stanza as soon as a quinn-proto 0.11.x release
 includes the fix, then `cargo update -p quinn-proto` and remove the CI audit
 workaround described below. Two things do not work while it is in place:
 
 - Dependabot does not touch git dependencies, so it cannot bump this one. The
-  fork is rebased by hand whenever quinn-proto ships a security or hardening
-  release, and rebasing is forced if a `quinn` release raises its quinn-proto
-  requirement above 0.11.17.
+  pinned commit is moved by hand whenever quinn-proto ships a security or
+  hardening release, and moving it is forced if a `quinn` release raises its
+  quinn-proto requirement above 0.11.17.
 - cargo-audit skips lockfile entries whose source is not the default registry, so
   the patched entry would fall out of RustSec coverage. The `audit` job in
   `.github/workflows/ci.yml` works around this by scanning a copy of `Cargo.lock`
