@@ -326,6 +326,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
             budget => Some(budget),
         },
         oversize_reported: false,
+        eviction_reported: false,
         ctx,
     };
 
@@ -359,6 +360,11 @@ struct Session {
     /// plain `bool` because the session loop is the only thing that touches it,
     /// one step at a time.
     oversize_reported: bool,
+    /// Whether this session has already reported a queue eviction.
+    ///
+    /// The same shape and the same reason as `oversize_reported`: see
+    /// [`send_buffer_verdict`].
+    eviction_reported: bool,
     ctx: Context,
 }
 
@@ -435,7 +441,9 @@ impl Session {
                 Event::Inbound(Some(payload)) => self.forward_to_target(payload).await,
                 // Only happens if the registry dropped our sender.
                 Event::Inbound(None) => Step::Stop,
-                Event::Socket(Ok(length)) => self.forward_to_client(&packet[..length]).await,
+                Event::Socket(Ok(length)) => {
+                    self.forward_to_client(stream_id, &packet[..length]).await
+                }
                 Event::Socket(Err(error)) => {
                     // ICMP errors surface here on a connected socket. RFC 9298
                     // §3.1: the request stream must be closed.
@@ -512,7 +520,7 @@ impl Session {
     }
 
     /// Forwards a packet received from the target to the client.
-    async fn forward_to_client(&mut self, packet: &[u8]) -> Step {
+    async fn forward_to_client(&mut self, stream_id: u64, packet: &[u8]) -> Step {
         // The socket is connected, so anything arriving here really is from the
         // target: the conversation is two-way and the amplification cap is done.
         self.unanswered_budget = None;
@@ -551,6 +559,44 @@ impl Session {
             }
 
             let encoded = datagram::encode_udp_payload(self.quarter_stream_id, packet);
+
+            // quinn's `send_datagram` is `send(data, drop = true)`: when the
+            // outgoing queue would grow past `datagram_send_buffer_size` it
+            // silently drops the *oldest* queued datagrams to make room, saying
+            // so only in its own `trace!`. The `Blocked` error that would
+            // otherwise report it is `unreachable!()` on this path, so the
+            // `debug!` below can never see this loss — the remaining space,
+            // read before the send, is the only handle on it there is (D72).
+            //
+            // The packet still goes out unchanged: the eviction was decided by
+            // how far behind the queue already is, and holding this packet back
+            // would only trade a fresh datagram for a stale one. Visibility,
+            // nothing more.
+            //
+            // Steady-state cost is one extra connection-lock acquisition per
+            // outbound UDP packet, the same order as the one `send_datagram`
+            // itself takes.
+            let space = self.ctx.datagrams.datagram_send_buffer_space();
+            let len = encoded.len();
+            match send_buffer_verdict(len, space, &mut self.eviction_reported) {
+                SendBuffer::Room => {}
+                SendBuffer::EvictsAndReport => info!(
+                    stream_id,
+                    quarter_stream_id = self.quarter_stream_id,
+                    space,
+                    len,
+                    "QUIC datagram send buffer full, older datagrams evicted; further \
+                     evictions on this session are logged at debug level"
+                ),
+                SendBuffer::EvictsQuietly => debug!(
+                    stream_id,
+                    quarter_stream_id = self.quarter_stream_id,
+                    space,
+                    len,
+                    "QUIC datagram send buffer full, older datagrams evicted"
+                ),
+            }
+
             if let Err(error) = self.ctx.datagrams.send_datagram(encoded) {
                 debug!(%error, "failed to send a QUIC datagram");
             }
@@ -719,6 +765,54 @@ fn oversize_verdict(encoded_len: usize, limit: usize, reported: &mut bool) -> Ov
         Oversize::DropQuietly
     } else {
         Oversize::DropAndReport
+    }
+}
+
+/// Whether the outbound datagram queue still has room for a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendBuffer {
+    /// Room for this datagram; nothing queued is lost.
+    Room,
+    /// No room, and the first such send on this session: worth an `info!`.
+    EvictsAndReport,
+    /// No room, and not the first: `debug!` only.
+    EvictsQuietly,
+}
+
+/// Decides whether sending this datagram evicts older ones, and how loudly.
+///
+/// quinn queues outbound datagrams in a buffer of `datagram_send_buffer_size`
+/// (1 MiB by default) and, on the path `send_datagram` takes, makes room for a
+/// new one by discarding the oldest queued ones rather than by refusing the new
+/// one or applying backpressure. That is the right trade for UDP — the fresh
+/// packet is the useful one — but it happens entirely inside quinn, so a session
+/// losing packets to a QUIC sender that has fallen a megabyte behind looks, from
+/// every log this server writes, exactly like a session that is fine.
+///
+/// So the space is read before the send and the shortfall reported, on the same
+/// terms as [`oversize_verdict`]: once per session at `info!`, then `debug!`,
+/// because evictions arrive per packet and a flood of one benign message buries
+/// the warnings that matter. Nothing is dropped or delayed here — the caller
+/// sends the packet either way.
+///
+/// Exactly-enough space is room, not an eviction. `datagram_send_buffer_space()`
+/// is the limit minus what is queued minus one datagram's own overhead, which
+/// makes `len <= space` quinn's own "this one fits" predicate written the other
+/// way round — the same comparison that would return `Blocked` if the caller had
+/// asked not to drop. A datagram larger than that is what puts the queue over
+/// its limit, and quinn brings it back under by discarding from the front, on
+/// this send or the next one; either way the loss is already decided by the time
+/// anything here could react to it, which is why this function only grades how
+/// loudly to say so.
+fn send_buffer_verdict(len: usize, space: usize, reported: &mut bool) -> SendBuffer {
+    if len <= space {
+        return SendBuffer::Room;
+    }
+
+    if std::mem::replace(reported, true) {
+        SendBuffer::EvictsQuietly
+    } else {
+        SendBuffer::EvictsAndReport
     }
 }
 
@@ -1176,6 +1270,54 @@ mod tests {
                 &mut reported
             ),
             Oversize::DropAndReport
+        );
+    }
+
+    /// The same one-`info!`-per-session rule for a queue that has fallen behind.
+    ///
+    /// Pure arithmetic and a flag, like the oversize rule above, and asserted the
+    /// same way: a live session would need a QUIC connection whose send queue is
+    /// a megabyte behind, which is exactly the state no test can arrange.
+    #[test]
+    fn only_the_first_send_buffer_eviction_of_a_session_is_reported() {
+        let mut reported = false;
+        assert_eq!(
+            send_buffer_verdict(1200, 512, &mut reported),
+            SendBuffer::EvictsAndReport,
+            "an operator must be told once that queued datagrams are being discarded"
+        );
+
+        for _ in 0..3 {
+            assert_eq!(
+                send_buffer_verdict(1200, 0, &mut reported),
+                SendBuffer::EvictsQuietly,
+                "every later eviction in the same session stays at debug level"
+            );
+        }
+    }
+
+    /// The other half: room is room, and exactly enough of it is still room.
+    #[test]
+    fn a_datagram_the_queue_has_room_for_costs_no_report() {
+        let mut reported = false;
+        for _ in 0..3 {
+            assert_eq!(
+                send_buffer_verdict(1200, 1_048_576, &mut reported),
+                SendBuffer::Room
+            );
+        }
+        assert!(!reported, "a datagram that fits displaces nothing");
+
+        // The boundary quinn itself draws: `datagram_send_buffer_space()` has the
+        // per-datagram overhead subtracted already, so a datagram of exactly that
+        // many bytes is the last one that fits.
+        assert_eq!(
+            send_buffer_verdict(1200, 1200, &mut reported),
+            SendBuffer::Room
+        );
+        assert_eq!(
+            send_buffer_verdict(1201, 1200, &mut reported),
+            SendBuffer::EvictsAndReport
         );
     }
 
