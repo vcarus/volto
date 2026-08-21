@@ -3,7 +3,7 @@
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,6 +75,15 @@ pub struct Context {
     pub policy: Arc<Policy>,
     /// How many tunnels this connection may hold open at once.
     pub quota: Arc<Quota>,
+    /// How many tunnels this connection has been granted a slot for so far.
+    ///
+    /// Counted once per request that gets past [`Quota::acquire`], TCP and
+    /// CONNECT-UDP alike; a request turned away before that — 407, the tunnel
+    /// limit itself, a destination the policy rejects — never reaches it, so
+    /// this is work done rather than attempts made. Owned by [`crate::quic`],
+    /// which reads it once when the connection ends to report it on the closing
+    /// line (D72); nothing here ever reads it back.
+    pub tunnels: Arc<AtomicU64>,
     /// How long a UDP session may sit idle.
     pub idle_timeout: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
@@ -95,7 +104,11 @@ pub struct Context {
 
 impl Context {
     /// Builds the context for one accepted connection.
-    pub fn new(config: &Config, datagrams: quinn::Connection) -> Self {
+    ///
+    /// `tunnels` is the connection's tunnel counter, created by [`crate::quic`]
+    /// so that it outlives this context and can be read once the connection is
+    /// over.
+    pub fn new(config: &Config, datagrams: quinn::Connection, tunnels: Arc<AtomicU64>) -> Self {
         Self {
             remote: datagrams.remote_address(),
             auth_failures: Arc::new(AtomicU32::new(0)),
@@ -106,6 +119,7 @@ impl Context {
             auth: Arc::new(Authenticator::new(&config.auth)),
             policy: Arc::new(Policy::new(&config.security)),
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
+            tunnels,
             idle_timeout: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
             ip_family_preference: config.limits.ip_family_preference,

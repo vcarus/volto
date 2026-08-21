@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -401,7 +402,25 @@ impl Server {
             // them, so a non-zero count on a path that other connections probe
             // fine is the signature of a false positive rather than of the
             // path.
+            //
+            // `tunnels` is how many requests on this connection were granted a
+            // tunnel slot — TCP CONNECT and CONNECT-UDP alike — so a connection
+            // that only ever failed authentication reports zero. `tx_bytes` and
+            // `rx_bytes` are UDP-level byte counts: everything this endpoint put
+            // on or took off the wire for this connection, QUIC and HTTP/3
+            // framing, retransmissions, ACKs and padding included. They are
+            // neither tunnel payload — always smaller — nor bytes the peer
+            // acknowledged, since a packet is counted when it is sent whether or
+            // not it arrived, so they answer "how much did this connection move
+            // through this host" and nothing finer. `sent_packets` and
+            // `lost_packets` are reported together because a loss rate needs
+            // both: either number alone says nothing about the path (D72).
             let rtt_probe = quic.clone();
+
+            // Created here rather than inside the connection so it survives it:
+            // `conn::handle` hands it to every request, and it is read below,
+            // once, after the connection is over.
+            let tunnels = Arc::new(AtomicU64::new(0));
 
             // Which of the two log levels this connection deserves is decided
             // from the error value `conn::handle` returned, and never from
@@ -412,7 +431,7 @@ impl Server {
             // back here, `close_reason()` reports that drop rather than whatever
             // actually ended the connection — which is precisely how the idle
             // timeout ended up logged as an error for a whole release cycle.
-            let closed = match conn::handle(quic, config, shutdown).await {
+            let closed = match conn::handle(quic, config, shutdown, tunnels.clone()).await {
                 // The accept loop ended on its own terms: the peer said it would
                 // send no further requests, or the GOAWAY drain completed.
                 Ok(()) => Ok("drained"),
@@ -427,8 +446,12 @@ impl Server {
                 },
             };
 
-            // One snapshot for both fields, so they describe the same instant.
-            let path = rtt_probe.stats().path;
+            // One snapshot for every transport field below, so they all
+            // describe the same instant — and the only read of them there is, so
+            // the counters cost nothing while the connection runs.
+            let stats = rtt_probe.stats();
+            let path = stats.path;
+            let tunnels = tunnels.load(Ordering::Relaxed);
 
             match closed {
                 Ok(reason) => {
@@ -439,6 +462,11 @@ impl Server {
                         rtt_ms = rtt_probe.rtt().as_millis(),
                         mtu = path.current_mtu,
                         mtu_black_holes = path.black_holes_detected,
+                        tunnels,
+                        tx_bytes = stats.udp_tx.bytes,
+                        rx_bytes = stats.udp_rx.bytes,
+                        sent_packets = path.sent_packets,
+                        lost_packets = path.lost_packets,
                         "connection closed"
                     );
                 }
@@ -450,6 +478,11 @@ impl Server {
                         rtt_ms = rtt_probe.rtt().as_millis(),
                         mtu = path.current_mtu,
                         mtu_black_holes = path.black_holes_detected,
+                        tunnels,
+                        tx_bytes = stats.udp_tx.bytes,
+                        rx_bytes = stats.udp_rx.bytes,
+                        sent_packets = path.sent_packets,
+                        lost_packets = path.lost_packets,
                         "connection closed with error"
                     );
                 }

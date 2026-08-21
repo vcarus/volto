@@ -10,7 +10,7 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use http::{Request, StatusCode};
@@ -43,6 +43,9 @@ const SETTINGS_POLLS: u32 = 100;
 /// Returns `Err` only for connection-level failures; per-request problems are
 /// logged and confined to their own stream.
 ///
+/// `tunnels` counts the requests that get a tunnel slot here; it belongs to
+/// [`crate::quic`], which reads it after this returns (D72).
+///
 /// # Shutdown
 ///
 /// When `shutdown` fires this sends a GOAWAY and then keeps the connection alive
@@ -62,13 +65,14 @@ pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
     mut shutdown: Shutdown,
+    tunnels: Arc<AtomicU64>,
 ) -> Result<(), h3api::ConnectionError> {
     // Cloned before the handshake: `h3` takes ownership of the connection, but
     // HTTP Datagrams bypass `h3` entirely and need the QUIC connection directly.
     let datagrams = quic.clone();
 
     let mut connection = h3api::Connection::handshake(quic).await?;
-    let context = Context::new(&config, datagrams.clone());
+    let context = Context::new(&config, datagrams.clone(), tunnels);
 
     // One reader per connection, demultiplexing datagrams to sessions by
     // Quarter Stream ID.
@@ -242,6 +246,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
         .await;
         return;
     };
+
+    // Counted where the slot is taken rather than where the request arrived, so
+    // the connection's closing line reports tunnels this connection actually
+    // got, not requests it made (D72).
+    context.tunnels.fetch_add(1, Ordering::Relaxed);
 
     match tunnel::route(&req) {
         Route::Tcp => match req.uri().authority() {

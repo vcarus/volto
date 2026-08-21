@@ -14,7 +14,29 @@
 
 mod common;
 
-use common::{H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT};
+use bytes::Bytes;
+use common::{
+    open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, SharedBuffer, TestServer,
+    ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
+};
+
+/// Reads a numeric field's value off a formatted log line.
+///
+/// Most assertions here pin a field's presence, which is enough for a counter
+/// whose value the test cannot arrange. The traffic counters can be arranged —
+/// this connection did send packets — and a field wired to the wrong source is
+/// present and zero rather than absent, so those are read rather than matched.
+#[track_caller]
+fn numeric_field(line: &str, name: &str) -> u64 {
+    let rest = line
+        .split_once(&format!("{name}="))
+        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
+        .1;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
+}
 
 /// The five ways a connection ends, each with the level and reason it earns.
 ///
@@ -30,6 +52,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .init();
 
     let mut server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
+    let echo = spawn_echo_target().await;
 
     // 1. The peer goes silent and the idle timeout expires. This is the case the
     //    production logs were full of, misfiled as an error.
@@ -51,14 +74,30 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             !line.contains("with error"),
             "an idle timeout must not be logged as an error; line was:\n{line}"
         );
+        // Nothing was ever tunnelled over this connection, and the counter has
+        // to say so rather than fall to whatever the previous one held.
+        assert!(
+            line.contains("tunnels=0"),
+            "a connection that opened no tunnel must report none; line was:\n{line}"
+        );
     }
 
     // 2. The peer closes cleanly with application error code 0x0, which is what
     //    Surge sends. Nothing slow may happen between connecting and closing, or
     //    the 1s idle timeout would decide this scenario instead.
+    //
+    //    This is also the one connection here that does any work — a tunnel with
+    //    a payload echoed back through it — so it is where the traffic counters
+    //    are read with something in them.
     {
         let mark = buffer.mark();
-        let client = H3Client::connect(&server).await;
+        let mut client = H3Client::connect(&server).await;
+        let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
+        tunnel
+            .send_data(Bytes::from_static(b"payload"))
+            .await
+            .expect("send payload");
+        assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
         client.quic.close(quinn::VarInt::from_u32(0), b"");
 
         let line = buffer
@@ -70,6 +109,26 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         assert!(
             !line.contains("with error"),
             "a clean peer close must not be logged as an error; line was:\n{line}"
+        );
+        // One request took a tunnel slot on this connection, and only one.
+        assert!(
+            line.contains("tunnels=1"),
+            "the connection that opened one tunnel must report one; line was:\n{line}"
+        );
+        // Bytes and packets are read off the transport, so a connection that
+        // completed a handshake and echoed a payload cannot report zero in
+        // either direction.
+        assert!(
+            numeric_field(&line, "tx_bytes") > 0,
+            "a connection that answered must have sent UDP bytes; line was:\n{line}"
+        );
+        assert!(
+            numeric_field(&line, "rx_bytes") > 0,
+            "a connection that was driven must have received UDP bytes; line was:\n{line}"
+        );
+        assert!(
+            numeric_field(&line, "sent_packets") > 0,
+            "a connection that answered must have sent packets; line was:\n{line}"
         );
     }
 
@@ -137,8 +196,9 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
     // stands between them and quietly becoming a placeholder. `initial_rtt_ms =
     // 150` was derived from `rtt_ms` samples, `remote_now` is the only
     // externally visible trace of a migration or NAT rebind mid-connection,
-    // `mtu` is what path MTU discovery settled on, and `mtu_black_holes` is how
-    // often it was knocked back to the floor on the way.
+    // `mtu` is what path MTU discovery settled on, `mtu_black_holes` is how
+    // often it was knocked back to the floor on the way, and the five D72
+    // counters say how much the connection carried while it lasted.
     let logged = buffer.contents();
     let closes: Vec<&str> = logged
         .lines()
@@ -174,6 +234,22 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             line.contains("remote_now=127.0.0.1:"),
             "a close log must carry the address the peer ended on; line was:\n{line}"
         );
+        // How much this connection carried: one tunnel count and four transport
+        // counters, all taken from the same snapshot as the fields above. Their
+        // values depend on what the scenario did — scenario 2 is where they are
+        // checked against real traffic — but every close line owes them.
+        for field in [
+            "tunnels=",
+            "tx_bytes=",
+            "rx_bytes=",
+            "sent_packets=",
+            "lost_packets=",
+        ] {
+            assert!(
+                line.contains(field),
+                "a close log must carry {field}; line was:\n{line}"
+            );
+        }
     }
 
     // The whole point of the grading: exactly one of the five closes was worth a

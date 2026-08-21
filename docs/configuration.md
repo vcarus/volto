@@ -128,6 +128,21 @@ path that stopped carrying them, after which the connection sends
 non-zero count on a path where other connections settle above the floor is
 therefore that heuristic firing, not the path changing.
 
+**Those lines also report what the connection carried.** Alongside `rtt_ms=`
+and `mtu=` they carry `tunnels=`, how many requests on that connection were
+granted a tunnel slot — TCP CONNECT and CONNECT-UDP draw on the same budget, and
+a request turned away before it (407, the tunnel limit, a destination the policy
+rejects) is not counted — and four transport counters. `tx_bytes=` and
+`rx_bytes=` are UDP-level byte counts: everything this server put on or took off
+the wire for that connection, QUIC and HTTP/3 framing, retransmissions,
+acknowledgements and padding included. They are neither tunnel payload, which is
+always smaller, nor bytes the peer acknowledged, since a packet is counted when
+it is sent whether or not it arrived; read them as how much this connection
+moved through the host, not as an accounting figure. `sent_packets=` and
+`lost_packets=` are reported together because a loss rate needs both, and a
+single count on its own says nothing about the path. All five come from one
+snapshot taken as the connection ends, so they cost nothing while it is running.
+
 **`initial_rtt_ms` seeds the handshake retransmission timers.** Until the first
 ACK arrives there is no RTT sample, and a lost handshake packet waits roughly
 three times this value before it is resent. The default of 333 comes from
