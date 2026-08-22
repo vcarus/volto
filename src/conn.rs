@@ -10,8 +10,10 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use http::{Request, StatusCode};
 use tracing::{debug, info, warn};
@@ -44,6 +46,18 @@ use crate::{auth, h3api};
 /// The wait is deliberately unbounded here: the grace period belongs to the
 /// endpoint ([`crate::quic`]), which closes everything when it expires. Bounding
 /// it in both places would mean two timeouts to keep consistent.
+///
+/// # The unauthenticated bound
+///
+/// Until some request on this connection has passed the credentials check, the
+/// wait for the next request stream is bounded by `SILENCE_FACTOR` idle
+/// timeouts, after which the connection is closed with H3_NO_ERROR. Without it
+/// a peer that completes the QUIC handshake and then says nothing holds a
+/// `max_connections` slot for as long as it keeps its socket open, since the
+/// keep-alive PINGs `quic.rs` sends are answered by its QUIC stack with no
+/// application involved and so keep the transport's idle timeout from ever
+/// firing (D76). Once a request authenticates the bound is gone for the life of
+/// the connection.
 pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
@@ -81,6 +95,7 @@ pub async fn handle(
     let router = tokio::spawn(udp::route_datagrams(datagrams, context.sessions.clone()));
 
     let mut going_away = false;
+    let silence = config.limits.max_idle_timeout() * SILENCE_FACTOR;
 
     let result = loop {
         tokio::select! {
@@ -112,13 +127,29 @@ pub async fn handle(
                 break Ok(());
             }
 
-            accepted = connection.accept() => match accepted {
-                Ok(Some(resolver)) => {
+            accepted = next_request(&mut connection, &context, silence) => match accepted {
+                NextRequest::Stream(resolver) => {
                     tokio::spawn(handle_request(resolver, context.clone()));
                 }
                 // The peer will send no further requests.
-                Ok(None) => break Ok(()),
-                Err(error) => break Err(error),
+                NextRequest::Finished => break Ok(()),
+                NextRequest::Failed(error) => break Err(error),
+
+                // Nothing wrong happened here: a peer that has not
+                // authenticated is simply not owed a connection slot it is not
+                // using. So this is a close with no error to signal rather than
+                // a violation, and `quic.rs` logs it as the idle ending it is
+                // (D76).
+                NextRequest::Silent => {
+                    debug!(
+                        remote = %context.remote,
+                        timeout_secs = silence.as_secs(),
+                        "no request within the bound on an unauthenticated connection"
+                    );
+                    break Err(connection.close_quietly(
+                        "no request within the idle timeout",
+                    ));
+                }
             },
 
         }
@@ -130,9 +161,85 @@ pub async fn handle(
     result
 }
 
+/// How many idle timeouts an unauthenticated connection may spend saying
+/// nothing before it is closed (D76).
+///
+/// The factor is not padding. The transport's own idle timeout is the primary
+/// mechanism and has to keep its primacy: it needs no application involvement,
+/// it reports a peer that vanished exactly as that, and every existing test and
+/// log line about an idle connection is about it. It fires one idle timeout
+/// after the last packet *received*, while the bound here is armed when the
+/// wait begins -- never later than that packet, and at the handshake earlier --
+/// so at one idle timeout the two would race, and the application timer would
+/// win even on a peer that is merely gone.
+///
+/// Two therefore separates them: a peer that stops sending is closed by the
+/// transport, exactly as before, and this bound acts only on the peers the
+/// transport cannot see as idle at all -- one whose stack is answering our
+/// keep-alive PINGs, or one sending packets of its own. The cost of the factor
+/// is that such a peer holds its slot for two idle timeouts rather than one,
+/// which is bounded either way.
+const SILENCE_FACTOR: u32 = 2;
+
+/// What waiting for the next request stream produced.
+enum NextRequest {
+    /// A request stream, ready to be resolved.
+    Stream(h3api::Resolver),
+    /// The peer will send no further requests.
+    Finished,
+    /// Nothing arrived within the bound, on a connection that has never
+    /// authenticated (D76).
+    Silent,
+    /// The connection failed or was closed.
+    Failed(h3api::ConnectionError),
+}
+
+impl From<Result<Option<h3api::Resolver>, h3api::ConnectionError>> for NextRequest {
+    fn from(accepted: Result<Option<h3api::Resolver>, h3api::ConnectionError>) -> Self {
+        match accepted {
+            Ok(Some(resolver)) => Self::Stream(resolver),
+            Ok(None) => Self::Finished,
+            Err(error) => Self::Failed(error),
+        }
+    }
+}
+
+/// Waits for the next request stream, bounded while nothing has authenticated.
+///
+/// Cancel-safe, because [`h3api::Connection::accept`] is: the timeout adds no
+/// state of its own, so a caller may poll this inside a `select!` and lose only
+/// the elapsed part of the bound.
+///
+/// The flag is read on every pass rather than once, because it is written by the
+/// request tasks: a request accepted a moment ago may be authenticating right
+/// now, and a bound that had already been armed against it must not close the
+/// connection out from under it.
+async fn next_request(
+    connection: &mut h3api::Connection,
+    context: &Context,
+    within: Duration,
+) -> NextRequest {
+    loop {
+        if context.is_authenticated() {
+            return connection.accept().await.into();
+        }
+
+        match tokio::time::timeout(within, connection.accept()).await {
+            Ok(accepted) => return accepted.into(),
+            Err(_elapsed) if context.is_authenticated() => continue,
+            Err(_elapsed) => return NextRequest::Silent,
+        }
+    }
+}
+
 /// Resolves one request, authenticates it, and routes it to a tunnel.
 async fn handle_request(resolver: h3api::Resolver, context: Context) {
-    let (req, mut stream) = match resolver.resolve().await {
+    // Bounded for the same reason the accept loop is: a peer may open a request
+    // stream, send one byte and stop, and `max_streams_bidi` of those would be
+    // `max_streams_bidi` parked tasks per connection, from a peer that has not
+    // authenticated. On expiry the stream is reset with H3_REQUEST_INCOMPLETE
+    // and the connection carries on (D76).
+    let (req, mut stream) = match resolver.resolve(context.max_idle_timeout).await {
         Ok(resolved) => resolved,
         Err(error) => {
             // Malformed headers, a client reset mid-headers, and similar. The
@@ -149,9 +256,18 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT — TCP or UDP — has to pass through here.
     match context.auth.authenticate(req.headers()) {
-        Ok(Some(username)) => debug!(stream_id, username, "request authenticated"),
-        // No users configured: an open proxy, as warned about at startup.
-        Ok(None) => {}
+        Ok(Some(username)) => {
+            // Lifts D76's bound for the rest of this connection's life: the peer
+            // has proved who it is, and may now hold the connection idle for as
+            // long as the transport allows.
+            context.mark_authenticated();
+            debug!(stream_id, username, "request authenticated");
+        }
+        // No users configured: an open proxy, as warned about at startup. There
+        // is no door to get past, so the first request past this point counts as
+        // having got past it -- otherwise every connection to an unauthenticated
+        // proxy would be living under D76's bound, tunnels and all.
+        Ok(None) => context.mark_authenticated(),
         Err(denied) => {
             // The attempted user-id is logged, never anything derived from the
             // password. `remote` is here so a fail2ban rule has something to act
@@ -232,7 +348,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             udp::run(&req, stream, stream_id, context).await;
         }
         Route::UnsupportedProtocol(protocol) => {
-            debug!(stream_id, protocol, "unsupported :protocol");
+            debug!(
+                stream_id,
+                protocol = %bounded(protocol),
+                "unsupported :protocol"
+            );
             tunnel::refuse(&mut stream, StatusCode::NOT_IMPLEMENTED, stream_id).await;
         }
         Route::NotConnect => {
@@ -280,8 +400,8 @@ fn log_request(req: &Request<()>, stream_id: u64) {
 
     let protocol = match h3api::connect_protocol(req) {
         h3api::ConnectProtocol::Absent => None,
-        h3api::ConnectProtocol::ConnectUdp => Some("connect-udp"),
-        h3api::ConnectProtocol::Unsupported(name) => Some(name),
+        h3api::ConnectProtocol::ConnectUdp => Some(Cow::Borrowed("connect-udp")),
+        h3api::ConnectProtocol::Unsupported(name) => Some(bounded(name)),
     };
 
     debug!(
@@ -294,6 +414,39 @@ fn log_request(req: &Request<()>, stream_id: u64) {
         headers = ?headers,
         "inbound request"
     );
+}
+
+/// Caps a peer-controlled token at what a log line can afford to carry.
+///
+/// The `:protocol` value is kept as the bytes that arrived, so that the 501
+/// RFC 9220 §3 asks for can name the protocol the client actually requested —
+/// and those bytes are a field section's worth, up to
+/// [`h3api::MAX_FIELD_SECTION_SIZE`], from a peer that has not authenticated.
+/// Logging it whole would put tens of kilobytes in the journal twice per
+/// request, for free. Only the head of it is logged, on the same reasoning as
+/// [`redact_credentials`]'s bound on the auth scheme; the routing decision and
+/// the response still see the whole value.
+///
+/// The length is kept because a token cut short is otherwise indistinguishable
+/// from a short one, and truncation lands on a character boundary because
+/// slicing a `str` anywhere else panics.
+fn bounded(token: &str) -> Cow<'_, str> {
+    /// Longest token echoed into the log in full. `connect-udp` is 11.
+    const MAX_TOKEN: usize = 32;
+
+    if token.len() <= MAX_TOKEN {
+        return Cow::Borrowed(token);
+    }
+
+    let mut end = MAX_TOKEN;
+    while !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!(
+        "{}... <truncated from {} bytes>",
+        &token[..end],
+        token.len()
+    ))
 }
 
 /// Whether a header carries credentials and must therefore be redacted.
@@ -415,6 +568,39 @@ mod tests {
             );
             assert!(!redacted.contains("dXNlcjE6czNjcmV0"), "{redacted:?}");
         }
+    }
+
+    /// An unauthenticated peer can name a 64 KiB `:protocol`; the log gets the
+    /// head of it and the length, not the whole thing.
+    #[test]
+    fn a_logged_token_is_bounded() {
+        assert_eq!(bounded("connect-udp"), "connect-udp");
+        assert_eq!(bounded(""), "");
+        // Exactly at the bound is still echoed whole.
+        let full = "p".repeat(32);
+        assert_eq!(bounded(&full), full);
+
+        let long = "p".repeat(64 * 1024);
+        let logged = bounded(&long);
+        assert_eq!(
+            logged,
+            format!("{full}... <truncated from 65536 bytes>"),
+            "the head and the real length, and nothing else"
+        );
+        assert!(logged.len() < 80, "{logged}");
+    }
+
+    /// Truncation must land on a character boundary, or slicing panics.
+    #[test]
+    fn a_multibyte_token_is_cut_on_a_boundary() {
+        // Ten three-byte characters: the 32-byte cut falls inside the eleventh.
+        let token = "\u{20ac}".repeat(20);
+        let logged = bounded(&token);
+        assert!(
+            logged.starts_with(&"\u{20ac}".repeat(10)),
+            "expected ten whole characters, got {logged}"
+        );
+        assert!(logged.contains("truncated from 60 bytes"), "{logged}");
     }
 
     /// A non-UTF-8 value cannot be split into scheme and secret, so all of it goes.

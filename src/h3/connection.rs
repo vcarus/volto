@@ -358,6 +358,30 @@ impl Connection {
             .await
             .map_err(critical_write)
     }
+
+    /// Ends the connection because this endpoint is done with it, not because
+    /// anything went wrong.
+    ///
+    /// The counterpart of the violation close: the same mechanism -- RFC 9114 §8
+    /// makes a CONNECTION_CLOSE carrying an HTTP/3 code *be* the connection
+    /// error -- with the code §8.1 defines for having nothing to report:
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
+    //# H3_NO_ERROR (0x0100):  No error.  This is used when the connection or
+    //# stream needs to be closed, but there is no error to signal.
+    ///
+    /// `reason` reaches the peer in the CONNECTION_CLOSE frame and comes back
+    /// in the returned error, which [`crate::h3api::benign_close`] grades as a
+    /// routine ending rather than a fault -- so the caller can `break` on it
+    /// and let the connection's closing line stay at the level an idle timeout
+    /// gets. Returning the error rather than logging here is what keeps that
+    /// grading in one place (D50).
+    pub fn close_quietly(&self, reason: &'static str) -> ConnectionError {
+        self.handle
+            .quic
+            .close(varint(Code::H3_NO_ERROR), reason.as_bytes());
+        ConnectionError::Local(Violation::connection(Code::H3_NO_ERROR, reason))
+    }
 }
 
 impl Drop for Connection {

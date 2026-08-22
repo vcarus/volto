@@ -75,19 +75,59 @@ impl Resolver {
         }
     }
 
-    /// Reads and validates the request headers.
+    /// Reads and validates the request headers, giving up after `within`.
     ///
     /// On failure the stream has already been ended -- reset and stopped for a
     /// malformed request, or the whole connection closed for a frame sequence
     /// that cannot be parsed -- so the caller has nothing left to do but log it.
-    pub async fn resolve(self) -> Result<(Request<()>, Stream), StreamError> {
+    ///
+    /// # The deadline
+    ///
+    /// A peer opens a request stream by sending on it, and may then send one
+    /// byte and stop. Nothing in HTTP/3 obliges it to finish the request, and
+    /// the QUIC idle timeout is no backstop while [`crate::quic`]'s keep-alive
+    /// PINGs are being answered by its stack, so without `within` each such
+    /// stream parks a task until the connection ends -- `max_streams_bidi` of
+    /// them per connection, at a byte apiece, from a peer that has not
+    /// authenticated (D76).
+    ///
+    /// The stream is the only thing a lapsed deadline ends: it is reset and
+    /// stopped, and the connection carries on serving everything else on it.
+    pub async fn resolve(
+        self,
+        within: std::time::Duration,
+    ) -> Result<(Request<()>, Stream), StreamError> {
         let Self {
             handle,
             mut send,
             mut frames,
         } = self;
 
-        match read_request(&mut frames).await {
+        let read = match tokio::time::timeout(within, read_request(&mut frames)).await {
+            Ok(read) => read,
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
+            //# H3_REQUEST_INCOMPLETE (0x010d):  The client's stream terminated
+            //# without containing a fully formed request.
+            //
+            // The stream has not terminated -- it has stopped, which no code in
+            // §8.1 names -- but what the peer is owed is the same answer either
+            // way: the request it began will not be served because it never
+            // finished arriving. `read_request` reaches for the same code when
+            // the stream really does end early, and a client cannot usefully
+            // tell "you stopped" from "you stopped for good".
+            Err(_elapsed) => {
+                let violation = Violation::stream(
+                    Code::H3_REQUEST_INCOMPLETE,
+                    "the request headers did not arrive within one idle timeout",
+                );
+                let _ = send.reset(varint(violation.code()));
+                frames.stop(violation.code());
+                return Err(StreamError::Local(violation));
+            }
+        };
+
+        match read {
             Ok(request) => Ok((
                 request,
                 Stream {
@@ -101,6 +141,38 @@ impl Resolver {
                 frame::Error::Stream(error) => error,
                 frame::Error::Protocol(violation) if violation.is_connection_error() => {
                     StreamError::Connection(handle.fail(violation))
+                }
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+                //# A server that receives a larger header section than it is
+                //# willing to handle can send an HTTP 431 (Request Header
+                //# Fields Too Large) status code ([RFC6585]).
+                //
+                // Which is worth the two extra lines: a client that has
+                // overshot the limit this server advertised is told which of
+                // its requests to fix, where a bare RESET_STREAM leaves it
+                // guessing. The answer goes out first and that side is finished
+                // cleanly; the receiving side is then stopped with the code,
+                // because the rest of the section is precisely what this server
+                // has declined to read. H3_EXCESSIVE_LOAD reaches this arm only
+                // from the frame layer's buffering limit, which is the same
+                // 64 KiB the peer was told about in
+                // `SETTINGS_MAX_FIELD_SECTION_SIZE`.
+                frame::Error::Protocol(violation)
+                    if violation.code() == Code::H3_EXCESSIVE_LOAD =>
+                {
+                    let mut stream = Stream {
+                        handle,
+                        send,
+                        frames,
+                        header: BytesMut::with_capacity(2 * MAX_VARINT),
+                    };
+                    let _ = stream
+                        .respond(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                        .await;
+                    let _ = stream.finish().await;
+                    stream.stop_receiving(violation.code());
+                    StreamError::Local(violation)
                 }
 
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
@@ -362,6 +434,21 @@ fn add_field(headers: &mut HeaderMap, name: &[u8], value: &[u8]) -> Result<(), V
     //# any value other than "trailers".
     if name == http::header::TE && value.as_bytes() != b"trailers" {
         return Err(malformed("a TE field with a value other than \"trailers\""));
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9110#section-7.2
+    //# Host = uri-host [ ":" port ] ; Section 4
+    //
+    // One host and one optional port: the grammar leaves no room for a list,
+    // and RFC 9110 §7.2 states no rule for a repeated Host field. So this is
+    // this server's own, and it is the strict reading, because the alternative
+    // is worse than strict. RFC 9114 §4.3.1 requires :authority and Host to
+    // "contain the same value", and the agreement check below reads one Host --
+    // whichever came first. Two Host fields that disagree would then let the
+    // second one say anything at all, which is the request-smuggling shape this
+    // proxy least wants to be the first hop of.
+    if name == http::header::HOST && headers.contains_key(http::header::HOST) {
+        return Err(malformed("more than one Host field"));
     }
 
     headers.append(name, value);
@@ -735,6 +822,27 @@ mod tests {
         let mut agreeing = connect_udp();
         agreeing.push(field("host", "proxy.example:443"));
         assert!(build_request(agreeing).is_ok());
+    }
+
+    /// A second Host field is refused rather than resolved: the check above
+    /// reads one of them, and the other would be free to say anything.
+    #[test]
+    fn a_repeated_host_field_is_refused() {
+        for second in ["one.example", "other.example"] {
+            refused(vec![
+                field(":method", "GET"),
+                field(":scheme", "https"),
+                field(":path", "/"),
+                field("host", "one.example"),
+                field("host", second),
+            ]);
+        }
+
+        // Repeating a field that is not Host is ordinary HTTP.
+        let mut repeated = connect();
+        repeated.push(field("x-volto-probe", "one"));
+        repeated.push(field("x-volto-probe", "two"));
+        assert!(build_request(repeated).is_ok());
     }
 
     /// The table of malformed requests, each naming the rule it breaks.

@@ -78,11 +78,24 @@ const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 
 /// Largest payload this reader will buffer for one non-DATA frame.
 ///
-/// A HEADERS frame is the only buffered frame a peer controls the size of, and
-/// its encoded form is always smaller than the field section it decodes to --
-/// which [`MAX_FIELD_SECTION_SIZE`] already bounds. So this cannot refuse
-/// anything the advertised limit would have allowed, and it refuses it before
-/// a single byte is allocated rather than after 2^62 were promised.
+/// A policy bound on *encoded* bytes, and this server's own rule rather than
+/// anything the RFC asks for. It applies to every buffered frame -- HEADERS,
+/// SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- because each of
+/// them declares its length as a varint that may claim 2^62 bytes, and the
+/// declared length is refused here before a single byte is allocated for it.
+///
+/// Its value is [`MAX_FIELD_SECTION_SIZE`], which makes it the same number as
+/// the advertised field-section limit without being the same *rule*: RFC 9114
+/// §4.2.2 sizes a field section by the uncompressed name and value plus 32
+/// bytes per field, while this counts the octets that arrived. The two usually
+/// run the same way round, since the static table and Huffman coding shrink a
+/// real request -- but not always. A Huffman code is up to 30 bits wide
+/// (RFC 7541 Appendix B), so a literal made of bytes the table codes poorly can
+/// grow by up to 3.75x, and such a section can be inside the advertised limit
+/// and still refused here. No encoder produces one, because Huffman coding is
+/// optional per field and an encoder that would grow a literal sends it as it
+/// is; what this bounds is what a peer that is *not* a real encoder can make an
+/// unauthenticated connection hold.
 const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
 /// Longest frame header there can be: a type and a length, both varints.
@@ -167,6 +180,25 @@ pub enum Frame {
 /// has. Everything else is validated as the RFC requires and then dropped,
 /// because keeping a value nothing reads is how a setting silently stops being
 /// honoured.
+///
+/// One of the dropped values carries a SHOULD this server knowingly does not
+/// honour, so it is recorded here rather than left to be rediscovered:
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+//# An implementation that has received this parameter SHOULD NOT send an
+//# HTTP message header that exceeds the indicated size, as the peer will
+//# likely refuse to process it.
+///
+/// A peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is parsed -- so that a malformed
+/// or duplicated one is still caught -- and then dropped. Every response this
+/// server sends is a status line and at most two short fields, some 200 bytes
+/// by §4.2.2's own accounting, so honouring the SHOULD would mean carrying the
+/// value through the connection, the request and the response writer to change
+/// nothing: the only peer it could affect is one advertising a limit small
+/// enough to refuse a bare `407`, which has asked for a proxy it cannot use.
+/// Trimming fields to fit would also mean choosing which of a `Proxy-Status`
+/// explanation or a `Proxy-Authenticate` challenge to drop, and neither is
+/// better sent truncated than in full.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings {
     /// `SETTINGS_H3_DATAGRAM = 1`.
@@ -515,15 +547,31 @@ fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
         }
 
         match identifier {
-            // RFC 9297 §2.1.1: "The value of the SETTINGS_H3_DATAGRAM setting
-            // MUST be either 0 or 1."
+            //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1
+            //# If the SETTINGS_H3_DATAGRAM setting is received with a value
+            //# that is neither 0 nor 1, the receiver MUST terminate the
+            //# connection with error H3_SETTINGS_ERROR.
             SETTING_H3_DATAGRAM => settings.datagrams = boolean(identifier, value)?,
+
             // RFC 9220 §3 gives this setting the semantics it has in HTTP/2,
-            // where RFC 8441 §3 says "The value of the parameter MUST be 0
-            // or 1."
-            SETTING_ENABLE_CONNECT_PROTOCOL => {
-                boolean(identifier, value)?;
-            }
+            // where RFC 8441 §3 constrains the value -- "The value of the
+            // parameter MUST be 0 or 1" -- but says of the direction this
+            // server receives it in:
+            //
+            //= https://www.rfc-editor.org/rfc/rfc8441#section-3
+            //# Receipt of this parameter by a server does not have any impact.
+            //
+            // So a client sending it at all is already sending something with
+            // no meaning here, and a value outside {0, 1} is that same nothing
+            // spelled wrong. Nothing in RFC 9114 §7.2.4 makes a malformed
+            // *value* of an otherwise ignored setting a connection error, and
+            // closing on one would drop tunnels over a field this server does
+            // not read. It is logged and ignored.
+            SETTING_ENABLE_CONNECT_PROTOCOL if value > 1 => tracing::debug!(
+                value,
+                "ignoring SETTINGS_ENABLE_CONNECT_PROTOCOL with a value other \
+                 than 0 or 1, which has no meaning at a server"
+            ),
             // Everything else is ignored: RFC 9114 §7.2.4 for an identifier
             // this server does not understand, §7.2.4.1 for a reserved one.
             _ => {}
@@ -545,11 +593,22 @@ fn boolean(identifier: u64, value: u64) -> Result<bool, Violation> {
 }
 
 /// A SETTINGS payload that ends in the middle of a pair.
+///
+/// H3_FRAME_ERROR rather than H3_SETTINGS_ERROR: this is a frame whose payload
+/// does not hold the fields its length promised, which §7.1 answers for every
+/// frame type alike, before any of §7.2.4's rules about *which* settings are
+/// allowed can apply.
 fn truncated_settings() -> Violation {
-    settings_error("the SETTINGS payload ends mid-pair")
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+    //# A frame payload that contains additional bytes after the identified
+    //# fields or a frame payload that terminates before the end of the
+    //# identified fields MUST be treated as a connection error of type
+    //# H3_FRAME_ERROR.
+    Violation::connection(Code::H3_FRAME_ERROR, "the SETTINGS payload ends mid-pair")
 }
 
-/// Every SETTINGS fault is the same connection error (RFC 9114 §7.2.4.1).
+/// A SETTINGS payload whose identifiers or values break RFC 9114 §7.2.4's
+/// rules, as opposed to its layout.
 fn settings_error(detail: impl Into<std::borrow::Cow<'static, str>>) -> Violation {
     Violation::connection(Code::H3_SETTINGS_ERROR, detail)
 }
@@ -682,24 +741,47 @@ mod tests {
         assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
     }
 
+    /// RFC 9297 §2.1.1 states the H3_DATAGRAM rule as a MUST on the receiver,
+    /// so a value outside {0, 1} ends the connection.
     #[test]
-    fn a_boolean_setting_with_another_value_is_refused() {
-        for identifier in [SETTING_H3_DATAGRAM, SETTING_ENABLE_CONNECT_PROTOCOL] {
-            let error = parse_settings(&settings(&[(identifier, 2)])).expect_err("refused");
-            assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
-        }
+    fn a_datagram_setting_with_another_value_is_refused() {
+        let error = parse_settings(&settings(&[(SETTING_H3_DATAGRAM, 2)])).expect_err("refused");
+        assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+        assert!(error.is_connection_error());
+
         // A setting whose value this server does not constrain is untouched.
         assert!(parse_settings(&settings(&[(SETTING_MAX_FIELD_SECTION_SIZE, 1 << 40)])).is_ok());
     }
 
+    /// RFC 8441 §3: "Receipt of this parameter by a server does not have any
+    /// impact." A value it never defined is ignored with the rest of it, rather
+    /// than costing the peer its tunnels.
     #[test]
-    fn a_settings_payload_that_ends_mid_pair_is_refused() {
+    fn enable_connect_protocol_is_ignored_whatever_its_value_is() {
+        for value in [0, 1, 2, crate::datagram::VARINT_MAX] {
+            let parsed = parse_settings(&settings(&[
+                (SETTING_ENABLE_CONNECT_PROTOCOL, value),
+                (SETTING_H3_DATAGRAM, 1),
+            ]))
+            .unwrap_or_else(|error| panic!("value {value} must be ignored, got {error}"));
+            assert!(parsed.datagrams, "the rest of the frame must still apply");
+        }
+    }
+
+    /// RFC 9114 §7.1 answers a payload that ends before its fields do, whatever
+    /// the frame type; §7.2.4's H3_SETTINGS_ERROR is for what the settings say,
+    /// not for a frame that was cut short.
+    #[test]
+    fn a_settings_payload_that_ends_mid_pair_is_a_frame_error() {
         let mut payload = settings(&[(SETTING_H3_DATAGRAM, 1)]);
         payload.pop();
-        assert_eq!(
-            parse_settings(&payload).expect_err("refused").code(),
-            Code::H3_SETTINGS_ERROR
-        );
+        let error = parse_settings(&payload).expect_err("refused");
+        assert_eq!(error.code(), Code::H3_FRAME_ERROR);
+        assert!(error.is_connection_error());
+
+        // An identifier with no value at all is the same fault.
+        let error = parse_settings(&[0x33]).expect_err("refused");
+        assert_eq!(error.code(), Code::H3_FRAME_ERROR);
     }
 
     #[test]

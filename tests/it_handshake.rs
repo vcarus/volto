@@ -12,19 +12,47 @@
 //! client here answers keep-alives, and every ACK restarts the idle timer. The
 //! connection would stay open — holding a `max_connections` slot — for as long
 //! as the peer cared to keep its socket open.
+//!
+//! The rest of the file is the other half of the same problem (D76): a peer that
+//! completes both handshakes and then says nothing, or sends a request it never
+//! finishes. Both are bounded while the connection has never authenticated, and
+//! both bounds vanish the moment one has.
 
 mod common;
 
+use std::future::Future;
+use std::panic::Location;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use common::{
-    client_endpoint_with_transport, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client,
+    auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport,
+    connect_request, open_tcp_tunnel, read_at_least, send_and_respond, spawn_echo_target, H3Client,
     TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
+use http::{header, StatusCode};
+use volto::datagram;
 
 /// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1), the code the server hangs up with.
 const H3_STREAM_CREATION_ERROR: u64 = 0x103;
+
+/// H3_NO_ERROR (RFC 9114 §8.1): a close with nothing to report.
+const H3_NO_ERROR: u64 = 0x100;
+
+/// H3_REQUEST_INCOMPLETE (RFC 9114 §8.1).
+const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
+
+/// HEADERS frame type (RFC 9114 §7.2.2).
+const FRAME_HEADERS: u64 = 0x01;
+
+/// Room for two connections at a time, on top of the 1s idle timeout.
+///
+/// Small enough that a peer holding a slot it never uses is visible from the
+/// outside: the third client is refused while the first two are alive.
+const TWO_SLOTS: &str = "max_connections = 2\n";
+
+/// The credentials the tests that configure authentication use.
+const USER: (&str, &str) = ("user1", "s3cret");
 
 /// A client that grants no unidirectional streams must not hold a connection
 /// slot indefinitely.
@@ -92,4 +120,336 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
         .await
         .expect("send payload");
     assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+}
+
+// ---------------------------------------------------------------------------
+// D76: an unauthenticated connection may not sit on a slot for ever
+// ---------------------------------------------------------------------------
+
+/// A peer that completes the handshake and then never asks for anything must
+/// give the slot back.
+///
+/// The two silent peers here are exactly the shape the v0.4.0 review found: a
+/// plain QUIC connection, no request stream ever opened, kept alive by its own
+/// stack answering the packets that cross it. Under `max_connections = 2` they
+/// used to lock the server out for as long as they cared to stay, without ever
+/// authenticating — which is what the third client proves, first by being
+/// refused and then, once the bound has expired, by connecting.
+#[tokio::test]
+async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
+    let server = TestServer::start_with(&format!("{IMPATIENT}{TWO_SLOTS}")).await;
+
+    let first = silent_peer(&server).await;
+    let second = silent_peer(&server).await;
+
+    // While they hold both slots, nobody else gets in. This is the symptom the
+    // bound exists to end, asserted rather than described.
+    let refused = client_endpoint(&server.ca, &["h3"]);
+    let error = tokio::time::timeout(
+        TIMEOUT,
+        refused
+            .connect(server.addr, "localhost")
+            .expect("start connecting"),
+    )
+    .await
+    .expect("a refusal must not take ten seconds")
+    .expect_err("the server is at its connection limit");
+    assert!(
+        matches!(
+            error,
+            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
+        ),
+        "expected the connection to be refused, got {error}"
+    );
+
+    // Two idle timeouts later both are gone, with nothing to report: neither
+    // peer broke a rule, they simply had nothing to say.
+    assert_closed_with(&first.1, H3_NO_ERROR, Duration::from_secs(8)).await;
+    assert_closed_with(&second.1, H3_NO_ERROR, Duration::from_secs(8)).await;
+
+    // And the slots really were returned, not merely reported closed.
+    let (_endpoint, admitted) = common::connect_quic(&server).await;
+    assert!(
+        admitted.close_reason().is_none(),
+        "the third client must be admitted once the silent peers are gone"
+    );
+}
+
+/// A peer whose only request failed authentication is no better off.
+///
+/// 407 is not a slot: the connection has still never had an authenticated
+/// request on it, so the bound still applies. This is the other half of the
+/// review's C1 — a peer that answers the challenge by saying nothing at all.
+#[tokio::test]
+async fn a_peer_that_only_fails_authentication_gives_its_slot_back() {
+    let server = TestServer::start_with(&format!(
+        "{IMPATIENT}{}",
+        auth_section(&[(USER.0, "the right password")])
+    ))
+    .await;
+
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(
+        "192.0.2.1:443",
+        Some(&basic_credentials(USER.0, "the wrong password")),
+    ))
+    .await
+    .expect("send a CONNECT request");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(status_of(&payload), "407", "the guess must be refused");
+
+    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
+}
+
+/// A connection that has authenticated once may idle for as long as it likes.
+///
+/// The invariant that makes the bound safe to ship: Surge keeps a connection
+/// open between requests, and a proxy that hung up on it every couple of idle
+/// timeouts would cost a handshake every time. Here the server's own keep-alive
+/// holds the transport open, so the only thing that could close the connection
+/// during the wait is the bound — and it must not.
+#[tokio::test]
+async fn an_authenticated_connection_is_not_bounded() {
+    // A 3s idle timeout with keep-alives on, so the transport itself keeps the
+    // connection alive while the test waits out more than the 6s bound.
+    let server = TestServer::start_with(&format!(
+        "[limits]\nmax_idle_timeout = 3\nkeep_alive_interval = 1\n{ALLOW_PRIVATE}{}",
+        auth_section(&[USER])
+    ))
+    .await;
+    let echo = spawn_echo_target().await;
+
+    let mut client = H3Client::connect(&server).await;
+    let mut tunnel = authenticated_tunnel(&mut client, &echo.to_string()).await;
+    tunnel
+        .send_data(Bytes::from_static(b"payload"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+
+    // Longer than the bound (two 3s idle timeouts), with not a byte of HTTP/3
+    // traffic in it.
+    tokio::time::sleep(Duration::from_millis(6_500)).await;
+
+    // Still usable, which it would not be if the bound had applied.
+    let mut second = authenticated_tunnel(&mut client, &echo.to_string()).await;
+    second
+        .send_data(Bytes::from_static(b"still here"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut second, 10).await, b"still here");
+}
+
+/// A request stream that stalls before its HEADERS costs one stream, not the
+/// connection.
+///
+/// `max_streams_bidi` is 1024 by default, and a byte apiece is all it takes to
+/// park that many request tasks. The bound is per stream and so is the answer:
+/// RFC 9114 §8.1's H3_REQUEST_INCOMPLETE, with everything else on the
+/// connection untouched.
+#[tokio::test]
+async fn a_request_that_stalls_before_its_headers_is_reset() {
+    let server = TestServer::start_with(IMPATIENT).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    let (mut stalled_send, mut stalled_recv) =
+        connection.open_bi().await.expect("open a request stream");
+    // One byte: enough to open the stream at the server, not enough to be a
+    // frame header, let alone a request.
+    stalled_send
+        .write_all(&[0x01])
+        .await
+        .expect("send one byte of a request");
+
+    let error = tokio::time::timeout(TIMEOUT, stalled_recv.read_to_end(64))
+        .await
+        .expect("the server must not wait for a request that is not coming")
+        .expect_err("the stalled stream must be reset");
+    match error {
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_INCOMPLETE,
+            "the peer must be told its request never arrived"
+        ),
+        other => panic!("expected a reset, got {other}"),
+    }
+
+    // The connection is untouched: another request on it is served normally.
+    // Port 25 is on the default deny list and the port rule is checked before
+    // the resolver runs, so the 403 arrives without touching the network.
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .expect("the connection must still be usable");
+    send.write_all(&connect_headers_frame("192.0.2.1:25", None))
+        .await
+        .expect("send a CONNECT request");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(status_of(&payload), "403");
+}
+
+/// Opens a QUIC connection that keeps itself alive and never says anything.
+///
+/// The keep-alive is what makes these tests about the application bound rather
+/// than about the transport's: with it, every ACK restarts the server's idle
+/// timer, so the transport can never be the thing that closes the connection.
+#[track_caller]
+fn silent_peer(server: &TestServer) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> {
+    let caller = Location::caller();
+    let ca = server.ca.clone();
+    let addr = server.addr;
+
+    async move {
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_millis(100)));
+
+        let endpoint = client_endpoint_with_transport(&ca, &["h3"], transport);
+        let connection = tokio::time::timeout(
+            TIMEOUT,
+            endpoint
+                .connect(addr, "localhost")
+                .expect("start connecting"),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the handshake at {caller} timed out"))
+        .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
+
+        (endpoint, connection)
+    }
+}
+
+/// Waits for the server to close `connection`, asserting the code it used.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// reports the test rather than this line (D66).
+#[track_caller]
+fn assert_closed_with(
+    connection: &quinn::Connection,
+    expected: u64,
+    within: Duration,
+) -> impl Future<Output = ()> + '_ {
+    let caller = Location::caller();
+    async move {
+        let error = tokio::time::timeout(within, connection.closed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the connection opened at {caller} was still open after {within:?}")
+            });
+
+        match error {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                close.error_code.into_inner(),
+                expected,
+                "at {caller}: the server closed with the wrong code; reason was {:?}",
+                String::from_utf8_lossy(&close.reason)
+            ),
+            // An idle timeout here would mean the keep-alive stopped working
+            // and the test stopped testing what it says it does.
+            other => panic!("at {caller}: expected the server to close, got {other}"),
+        }
+    }
+}
+
+/// Opens a CONNECT tunnel carrying credentials, and asserts it was accepted.
+#[track_caller]
+fn authenticated_tunnel<'a>(
+    client: &'a mut H3Client,
+    authority: &'a str,
+) -> impl Future<Output = common::ClientStream> + 'a {
+    let caller = Location::caller();
+    async move {
+        let mut request = connect_request(authority);
+        request.headers_mut().insert(
+            header::PROXY_AUTHORIZATION,
+            basic_credentials(USER.0, USER.1)
+                .parse()
+                .expect("header value"),
+        );
+
+        let (response, stream) = send_and_respond(client, request).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the tunnel opened at {caller} was refused"
+        );
+        stream
+    }
+}
+
+/// Encodes a classic CONNECT request (RFC 9114 §4.4) as a HEADERS frame.
+///
+/// Hand-built because these tests drive raw QUIC streams: the point of most of
+/// them is what the server does with a peer the shared client cannot imitate.
+fn connect_headers_frame(authority: &str, credentials: Option<&str>) -> Vec<u8> {
+    let mut fields: Vec<(&[u8], &[u8])> = vec![
+        (b":method", b"CONNECT"),
+        (b":authority", authority.as_bytes()),
+    ];
+    if let Some(credentials) = credentials {
+        fields.push((b"proxy-authorization", credentials.as_bytes()));
+    }
+
+    let mut block = BytesMut::new();
+    volto::h3::qpack::encode(&mut block, fields);
+
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, block.len() as u64);
+    frame.extend_from_slice(&block);
+    frame.to_vec()
+}
+
+/// Reads one HTTP/3 frame from a raw request stream.
+async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
+    let frame_type = read_varint(recv).await;
+    let length = read_varint(recv).await;
+
+    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
+        .await
+        .expect("frame payload arrived")
+        .expect("frame payload");
+
+    (frame_type, payload)
+}
+
+/// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
+async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
+    let mut first = [0u8; 1];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut first))
+        .await
+        .expect("varint arrived")
+        .expect("varint first byte");
+
+    let length = 1usize << (first[0] >> 6);
+    let mut value = u64::from(first[0] & 0x3f);
+
+    if length > 1 {
+        let mut tail = vec![0u8; length - 1];
+        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut tail))
+            .await
+            .expect("varint tail arrived")
+            .expect("varint tail");
+        for byte in tail {
+            value = (value << 8) | u64::from(byte);
+        }
+    }
+
+    value
+}
+
+/// The `:status` of a response field section.
+fn status_of(block: &[u8]) -> String {
+    let fields = volto::h3::qpack::decode(block, 64 * 1024).expect("the response must decode");
+    let status = fields
+        .iter()
+        .find(|field| field.name.as_ref() == b":status")
+        .expect("a response carries :status");
+    String::from_utf8(status.value.to_vec()).expect("a numeric status")
 }

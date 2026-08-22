@@ -136,6 +136,15 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
             Some(BenignClose::PeerClosed)
         }
 
+        // This endpoint closed the connection with nothing to report, which is
+        // what `Connection::close_quietly` does when a peer that never
+        // authenticated has gone silent for too long (D76). The peer was idle;
+        // that an application timer rather than the transport's own noticed it
+        // does not make it a fault.
+        ConnectionError::Local(violation) if violation.code() == NO_ERROR => {
+            Some(BenignClose::Idle)
+        }
+
         _ => None,
     }
 }
@@ -143,6 +152,7 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::h3::error::Violation;
     use http::Method;
 
     fn request_with_protocol(protocol: Option<&str>) -> Request<()> {
@@ -208,12 +218,33 @@ mod tests {
         }
     }
 
+    /// A close this endpoint makes with nothing to report is graded with the
+    /// idle timeout it stands in for, not with the violations (D76).
+    #[test]
+    fn our_own_quiet_close_is_routine() {
+        assert_eq!(
+            benign_close(&ConnectionError::Local(Violation::connection(
+                NO_ERROR,
+                "no request within the timeout"
+            ))),
+            Some(BenignClose::Idle)
+        );
+    }
+
     #[test]
     fn a_reported_problem_still_warns() {
         assert_eq!(
             benign_close(&ConnectionError::ApplicationClose {
                 code: Code::new(42)
             }),
+            None
+        );
+        // A violation is still a violation, whatever its code says about us.
+        assert_eq!(
+            benign_close(&ConnectionError::Local(Violation::connection(
+                Code::H3_FRAME_UNEXPECTED,
+                "a frame that may not appear here"
+            ))),
             None
         );
         assert_eq!(

@@ -74,6 +74,16 @@ pub struct Context {
     pub auth_failures: Arc<AtomicU32>,
     /// Failures tolerated before the connection is closed. Zero disables it.
     pub max_auth_failures: u32,
+    /// Whether any request on this connection has passed the credentials check.
+    ///
+    /// Set once and never cleared. It is what lifts D76's bound on how long a
+    /// connection may go without sending a request: a client that has proved
+    /// who it is may hold an idle connection for as long as the transport's own
+    /// idle timeout allows, which is what makes a proxy worth reconnecting to.
+    /// A server with no users configured has nothing to check, so its first
+    /// request sets this too -- the flag means "this peer got past the door",
+    /// not "credentials were seen".
+    pub authenticated: Arc<AtomicBool>,
     /// The peer's address, for logs that a fail2ban rule can act on.
     pub remote: std::net::SocketAddr,
     /// Which destinations this proxy may reach.
@@ -91,6 +101,13 @@ pub struct Context {
     pub tunnels: Arc<AtomicU64>,
     /// How long a UDP session may sit idle.
     pub idle_timeout: Duration,
+    /// The connection's QUIC idle timeout, from `[limits] max_idle_timeout`.
+    ///
+    /// Carried here for the one thing a request handler does with it: bounding
+    /// how long a request stream may take to deliver its HEADERS frame (D76).
+    /// Distinct from [`Context::idle_timeout`], which is a UDP session's own and
+    /// unrelated budget.
+    pub max_idle_timeout: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///
     /// Spent twice per request and separately — once on name resolution, once on
@@ -124,6 +141,7 @@ impl Context {
             remote: datagrams.remote_address(),
             auth_failures: Arc::new(AtomicU32::new(0)),
             max_auth_failures: config.security.max_auth_failures,
+            authenticated: Arc::new(AtomicBool::new(false)),
             datagrams,
             sessions: Arc::new(udp::SessionRegistry::default()),
             peer_datagrams,
@@ -132,6 +150,7 @@ impl Context {
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
             tunnels,
             idle_timeout: config.limits.udp_session_timeout(),
+            max_idle_timeout: config.limits.max_idle_timeout(),
             connect_timeout: config.limits.connect_timeout(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
@@ -150,6 +169,16 @@ impl Context {
     /// Whether QUIC datagrams may be sent to the peer right now.
     pub(crate) fn datagrams_allowed(&self) -> bool {
         self.peer_datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Records that a request on this connection got past the credentials check.
+    pub(crate) fn mark_authenticated(&self) {
+        self.authenticated.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether any request on this connection has (D76).
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Relaxed)
     }
 }
 

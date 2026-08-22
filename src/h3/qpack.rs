@@ -179,10 +179,30 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
             "a non-zero Required Insert Count with no dynamic table",
         ));
     }
-    // Delta Base is read and discarded: RFC 9204 §4.5.1.2 derives Base from it,
-    // and Base only ever names dynamic entries, every one of which is refused
-    // below. Parsing it is still necessary to find where the field lines start.
-    let (_, _delta_base) = reader.take_int(7)?;
+    // 4.5.1.2. Base, encoded as a Sign bit and a Delta Base value. The Delta
+    // Base itself is read and discarded: RFC 9204 §4.5.1.2 derives Base from
+    // it, and Base only ever names dynamic entries, every one of which is
+    // refused below. Parsing it is still necessary to find where the field
+    // lines start.
+    let (flags, _delta_base) = reader.take_int(7)?;
+
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.5.1.2
+    //# An endpoint MUST treat a field block with a Sign bit of 1 as invalid
+    //# if the value of Required Insert Count is less than or equal to the
+    //# value of Delta Base.
+    //
+    // Required Insert Count is zero above -- with a zero table capacity it can
+    // be nothing else -- and zero is less than or equal to every Delta Base, so
+    // here a Sign bit of 1 is invalid whatever follows it. "Invalid" is not
+    // given a class in §4.5.1.2; this decoder answers it as the same connection
+    // error as the Required Insert Count fault above, because a prefix that
+    // cannot be read leaves this endpoint unable to say what the field lines
+    // after it were encoded against.
+    if flags & 1 == 1 {
+        return Err(connection_error(
+            "a Sign bit of 1 with a zero Required Insert Count",
+        ));
+    }
 
     while let Some(first) = reader.peek() {
         let field = if first & 0b1000_0000 != 0 {
@@ -325,12 +345,15 @@ fn dynamic_reference() -> Violation {
     connection_error("a dynamic table reference with a zero table capacity")
 }
 
-/// A failure RFC 9204 states as a connection error.
+/// A failure this decoder answers by closing the connection.
 ///
-/// There are three of them, and this decoder can reach all three: a reference
-/// to the dynamic table (§2.2.3), an invalid static table index (§3.1), and a
-/// Required Insert Count no conformant encoder could have produced (§4.5.1.1).
-/// Each is quoted at the point it is raised.
+/// RFC 9204 states three of them, and this decoder can reach all three: a
+/// reference to the dynamic table (§2.2.3), an invalid static table index
+/// (§3.1), and a Required Insert Count no conformant encoder could have
+/// produced (§4.5.1.1). A fourth, the field block §4.5.1.2 makes invalid
+/// through its Sign bit, is graded the same way by this server's own reading --
+/// the RFC leaves that one's class unstated. Each is quoted at the point it is
+/// raised.
 fn connection_error(detail: &'static str) -> Violation {
     Violation::connection(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }
@@ -581,6 +604,26 @@ mod tests {
             decode(&[0x01, 0x00, 0xd7], super::super::MAX_FIELD_SECTION_SIZE).expect_err("refused");
         assert_eq!(error.code(), Code::QPACK_DECOMPRESSION_FAILED);
         assert!(error.is_connection_error(), "{error}");
+    }
+
+    /// RFC 9204 §4.5.1.2 makes a field block with a Sign bit of 1 invalid
+    /// "if the value of Required Insert Count is less than or equal to the
+    /// value of Delta Base" -- and this decoder's Required Insert Count is
+    /// always zero, so the Sign bit alone settles it.
+    #[test]
+    fn a_set_sign_bit_is_refused() {
+        // 0x00 = Required Insert Count 0, 0x81 = S = 1 with Delta Base 1, then
+        // an ordinary indexed static field line that would otherwise decode.
+        let error =
+            decode(&[0x00, 0x81, 0xd7], super::super::MAX_FIELD_SECTION_SIZE).expect_err("refused");
+        assert_eq!(error.code(), Code::QPACK_DECOMPRESSION_FAILED);
+        assert!(error.is_connection_error(), "{error}");
+
+        // S = 0 with the same Delta Base is the ordinary case and decodes.
+        assert_eq!(
+            decoded(&[0x00, 0x01, 0xd7]),
+            vec![(":scheme".to_owned(), "https".to_owned())]
+        );
     }
 
     /// RFC 9204 §3.1 states this one as a connection error too.

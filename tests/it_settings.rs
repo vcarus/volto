@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::{
-    connect_quic, connect_request, respond_to, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
+    client_endpoint_with_transport, connect_quic, spawn_udp_echo_target, TestServer, TIMEOUT,
 };
 use volto::capsule::{Capsule, CapsuleDecoder};
 use volto::datagram;
@@ -97,54 +97,123 @@ async fn server_advertises_a_header_size_limit() {
     );
 }
 
-/// The advertised limit has to bite, not just be announced.
+/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
+const H3_EXCESSIVE_LOAD: u64 = 0x107;
+
+/// A client that respects SETTINGS never sends an oversized field section, so
+/// this asserts what happens to the one that does not.
 ///
-/// A client that respects SETTINGS refuses to send an oversized header section at
-/// all, which is the outcome this asserts: the request never reaches the server,
-/// so nothing is buffered or QPACK-decoded on its behalf.
+/// Driven on a raw QUIC stream on purpose: the shared test client checks the
+/// advertised limit before it sends, and a test that stopped there would be
+/// asserting the client's arithmetic rather than the server's answer. What the
+/// server owes the peer is RFC 9114 §4.2.2's — "A server that receives a larger
+/// header section than it is willing to handle can send an HTTP 431 (Request
+/// Header Fields Too Large) status code" — followed by declining to read the
+/// rest of it.
 #[tokio::test]
 async fn an_oversized_header_section_is_refused() {
     let server = TestServer::start().await;
-    let mut client = H3Client::connect(&server).await;
+    let (_endpoint, connection) = connect_quic(&server).await;
 
-    // One ordinary round trip first. SETTINGS arrives on the control stream after
-    // the handshake, so without this the client may not have processed the limit
-    // yet -- the same ordering trap that decision D5 records on the server side.
-    //
-    // Port 25 is on the default deny list, and the port rule is checked before the
-    // resolver runs, so the 403 arrives without touching the network. CONNECT to a
-    // TEST-NET address would instead hang on hosts that blackhole the SYN.
-    let _ = respond_to(&mut client, connect_request("192.0.2.1:25")).await;
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
 
-    // Comfortably past the 64 KiB limit, well under any flow-control window.
-    let mut request = connect_request("192.0.2.1:25");
-    request.headers_mut().insert(
-        "x-volto-oversized",
-        "A".repeat(128 * 1024).parse().expect("header value"),
+    // Twice the advertised limit, declared in the frame header: the server
+    // refuses it from the length alone, so the payload never has to be sent.
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, 2 * EXPECTED_MAX_FIELD_SECTION_SIZE);
+    frame.extend_from_slice(&[0u8; 64]);
+    send.write_all(&frame)
+        .await
+        .expect("send an oversized HEADERS frame");
+
+    // The answer, before anything is reset: 431, and nothing after it.
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(
+        frame_type, FRAME_HEADERS,
+        "the refusal must arrive as a response, not as a bare reset"
     );
+    assert_eq!(status_of(&payload), "431");
 
-    let result = client.send.send_request(request).await;
+    let rest = tokio::time::timeout(TIMEOUT, recv.read_to_end(64))
+        .await
+        .expect("the response stream ended")
+        .expect("the response stream ended cleanly");
     assert!(
-        result.is_err(),
-        "a header section past the advertised limit must be refused"
+        rest.is_empty(),
+        "the response is the whole of it; got {rest:?}"
     );
 
-    // And the connection survives it: one oversized request is a stream-level
-    // problem, not a reason to drop everything else on the connection.
-    let mut ok = client
-        .send
-        .send_request(connect_request("192.0.2.1:25"))
+    // And the rest of the field section is declined rather than read.
+    assert_eq!(
+        stopped_code(&mut send).await,
+        H3_EXCESSIVE_LOAD,
+        "the peer must be told which rule its request broke"
+    );
+
+    // The connection survives it: one oversized request is a stream-level
+    // problem, not a reason to drop everything else on the connection. Port 25
+    // is on the default deny list, and the port rule is checked before the
+    // resolver runs, so the 403 arrives without touching the network.
+    let (mut send, mut recv) = connection
+        .open_bi()
         .await
         .expect("the connection must still be usable");
-    let response = tokio::time::timeout(TIMEOUT, ok.recv_response())
+    send.write_all(&connect_headers_frame("192.0.2.1:25"))
         .await
-        .expect("response arrived")
-        .expect("response");
-    assert!(
-        response.status().is_client_error()
-            || response.status().is_server_error()
-            || response.status().is_success()
-    );
+        .expect("send a CONNECT request");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(status_of(&payload), "403");
+}
+
+/// Encodes a classic CONNECT request (RFC 9114 §4.4) as a HEADERS frame.
+fn connect_headers_frame(authority: &str) -> Vec<u8> {
+    let fields: [(&[u8], &[u8]); 2] = [
+        (b":method", b"CONNECT"),
+        (b":authority", authority.as_bytes()),
+    ];
+
+    let mut block = BytesMut::new();
+    volto::h3::qpack::encode(&mut block, fields);
+
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, block.len() as u64);
+    frame.extend_from_slice(&block);
+    frame.to_vec()
+}
+
+/// The `:status` of a response field section.
+fn status_of(block: &[u8]) -> String {
+    let fields = volto::h3::qpack::decode(block, EXPECTED_MAX_FIELD_SECTION_SIZE)
+        .expect("the server's field section must decode");
+    let status = fields
+        .iter()
+        .find(|field| field.name.as_ref() == b":status")
+        .expect("a response carries :status");
+    String::from_utf8(status.value.to_vec()).expect("a numeric status")
+}
+
+/// Writes until the peer stops the stream, and reports the code it used.
+///
+/// Retried rather than written once: STOP_SENDING travels while the response is
+/// being read here, so a single write can still succeed before it lands.
+async fn stopped_code(send: &mut quinn::SendStream) -> u64 {
+    let stopped = async {
+        loop {
+            match send.write_all(&[0u8; 256]).await {
+                Ok(()) => continue,
+                Err(quinn::WriteError::Stopped(code)) => return code.into_inner(),
+                Err(other) => panic!("expected STOP_SENDING, got {other}"),
+            }
+        }
+    };
+
+    tokio::time::timeout(TIMEOUT, stopped)
+        .await
+        .expect("the server must stop the stream it refused to read")
 }
 
 #[tokio::test]
@@ -515,4 +584,95 @@ async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
         .expect("frame payload");
 
     (frame_type, payload)
+}
+
+/// A peer that says `SETTINGS_H3_DATAGRAM = 1` but never told QUIC how large a
+/// DATAGRAM frame it accepts still gets its packets.
+///
+/// The two halves of the datagram path are negotiated separately: the HTTP/3
+/// setting (RFC 9297 §2.1.1) and the `max_datagram_frame_size` transport
+/// parameter (RFC 9221 §3). A peer that sends the first without the second is
+/// contradicting itself, and neither RFC makes that an error — so the session
+/// has to fall back to the capsule stream, which is the channel that exists.
+/// Reading the missing parameter as a limit of zero instead made every reply
+/// "too large" and the session a silent no-op.
+///
+/// The client here can still *send* QUIC datagrams, because the server
+/// advertised the parameter; it is only the direction towards the client that
+/// has no datagram path. The exchange is repeated so that it spans the moment
+/// the server reads the client's SETTINGS: before that moment the fallback was
+/// already correct, and it is the packets after it that used to disappear.
+#[tokio::test]
+async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(None);
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
+    let connection = tokio::time::timeout(
+        TIMEOUT,
+        endpoint
+            .connect(server.addr, "localhost")
+            .expect("start connecting"),
+    )
+    .await
+    .expect("handshake did not time out")
+    .expect("handshake");
+    // quinn ties the two directions together, so this client can neither
+    // receive QUIC datagrams nor send them, and everything travels as capsules.
+    // What the server sees is the part that matters: SETTINGS_H3_DATAGRAM = 1
+    // and no `max_datagram_frame_size` to send one with.
+
+    // The contradiction, on the control stream: datagrams are welcome.
+    let mut control = connection
+        .open_uni()
+        .await
+        .expect("open the control stream");
+    control
+        .write_all(&control_stream_with_datagrams_enabled())
+        .await
+        .expect("send SETTINGS");
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_udp_headers_frame(
+        &server.addr.to_string(),
+        &target.ip().to_string(),
+        target.port(),
+    ))
+    .await
+    .expect("send the CONNECT-UDP request");
+
+    let (frame_type, _) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS, "the session must be established");
+
+    for round in 0..5 {
+        send.write_all(&frame_bytes(
+            FRAME_DATA,
+            &volto::capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, b"no frame size"),
+        ))
+        .await
+        .expect("send a UDP payload as a DATAGRAM capsule");
+
+        let (frame_type, payload) = read_frame(&mut recv).await;
+        assert_eq!(
+            frame_type, FRAME_DATA,
+            "round {round}: the capsule stream travels in DATA frames"
+        );
+
+        let mut decoder = CapsuleDecoder::new();
+        decoder.push(Bytes::from(payload));
+        match decoder.next_capsule().expect("well-formed capsules") {
+            Some(Capsule::Datagram {
+                context_id,
+                payload,
+            }) => {
+                assert_eq!(context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
+                assert_eq!(&payload[..], b"no frame size", "round {round}");
+            }
+            other => panic!("round {round}: expected a DATAGRAM capsule, got {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

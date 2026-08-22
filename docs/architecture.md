@@ -38,7 +38,11 @@ Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and
 `SETTINGS_H3_DATAGRAM` (0x33). Surge checks for both and disconnects if either is
 missing; this is the first thing to suspect when a client drops immediately after
-a successful TLS handshake.
+a successful TLS handshake. The frame also carries `SETTINGS_MAX_FIELD_SECTION_SIZE`
+(64 KiB), both QPACK settings as zero, and one reserved "grease" identifier of
+RFC 9114 §7.2.4.1's `0x1f * N + 0x21` form, which that section says endpoints
+SHOULD send so peers keep exercising the rule that unknown identifiers are
+ignored.
 
 `conn.rs` runs the accept loop and dispatches each request stream on the
 `:protocol` pseudo-header, after authenticating it:
@@ -56,6 +60,22 @@ server has heard of. The token is carried through as the bytes that arrived, so
 `connect-ip`, `webtransport` and anything else are answered with the status
 RFC 9220 asks for and logged under the name the client actually sent, rather
 than being refused as malformed before anything can look at them.
+
+Until a request on a connection has passed the credentials check, two of that
+loop's waits are bounded: the wait for the next request stream, and the wait for
+an open stream's HEADERS frame. Both bounds come from `limits.max_idle_timeout`
+— the connection one is two of them, so that the transport's own idle timeout
+stays the first thing to fire on a peer that has simply gone away — and both are
+lifted for the life of the connection the moment one request authenticates, so a
+client reusing an idle connection between requests is untouched. Without them a
+peer that finishes the QUIC handshake and then says nothing holds a
+`max_connections` slot for as long as it keeps its socket open, because the
+keep-alive PINGs this server sends are answered by the peer's QUIC stack with no
+application ever involved and the idle timeout therefore never fires. A lapsed
+connection bound closes the connection with `H3_NO_ERROR`, which is not an error
+and is logged as the idle ending it is; a lapsed stream bound resets that one
+stream with `H3_REQUEST_INCOMPLETE` and leaves everything else on the connection
+running.
 
 ### Target address selection
 

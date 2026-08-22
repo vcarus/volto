@@ -519,6 +519,21 @@ impl Session {
         }
     }
 
+    /// The largest QUIC datagram this peer can be sent right now, if any.
+    ///
+    /// `None` is "there is no QUIC datagram path", not "the path is zero bytes
+    /// wide": both the HTTP/3 setting and the QUIC transport parameter have to
+    /// be there, and either one missing sends the session's replies to the
+    /// capsule stream instead. quinn reports the transport half as `None` both
+    /// when the peer sent no `max_datagram_frame_size` and when datagram support
+    /// is off locally, which are the same answer for this purpose.
+    fn datagram_limit(&self) -> Option<usize> {
+        self.ctx
+            .datagrams_allowed()
+            .then(|| self.ctx.datagrams.max_datagram_size())
+            .flatten()
+    }
+
     /// Forwards a packet received from the target to the client.
     async fn forward_to_client(&mut self, stream_id: u64, packet: &[u8]) -> Step {
         // The socket is connected, so anything arriving here really is from the
@@ -531,12 +546,22 @@ impl Session {
             packet.len(),
         );
 
-        if self.ctx.datagrams_allowed() {
+        // Both halves of the datagram path have to be there, and they are
+        // negotiated separately: `SETTINGS_H3_DATAGRAM` is the HTTP/3 one
+        // (RFC 9297 §2.1.1), while `max_datagram_frame_size` is the QUIC
+        // transport parameter that says how large a DATAGRAM frame the peer will
+        // accept — `None` here meaning it sent none, so the peer cannot receive
+        // a QUIC datagram at all (RFC 9221 §3). A peer that advertises the first
+        // without the second is contradicting itself, but nothing in either RFC
+        // makes that a protocol error, and treating the missing limit as a
+        // limit of zero made every packet "too large" and the session a silent
+        // no-op. There is no datagram path to bypass, so the capsule stream is
+        // the correct channel rather than a downgrade.
+        if let Some(limit) = self.datagram_limit() {
             // The QUIC datagram path. If the packet does not fit, it is dropped:
             // RFC 9298 §6.1 says SHOULD NOT fall back to a capsule, because
             // doing so silently converts a lossy flow into a head-of-line
             // blocked one.
-            let limit = self.ctx.datagrams.max_datagram_size().unwrap_or(0);
             match oversize_verdict(encoded_len, limit, &mut self.oversize_reported) {
                 Oversize::Fits => {}
                 Oversize::DropAndReport => {
@@ -603,11 +628,13 @@ impl Session {
             return Step::Continue;
         }
 
-        // The peer never advertised SETTINGS_H3_DATAGRAM, so RFC 9297 §2.1.1
-        // forbids the datagram path entirely and the request stream is the only
-        // way out. This is not the same situation as the oversize case above:
-        // there a datagram path exists and RFC 9298 §6.1 says not to bypass it,
-        // whereas here there is none, so capsules are the correct channel.
+        // No datagram path: either the peer never advertised
+        // SETTINGS_H3_DATAGRAM, which RFC 9297 §2.1.1 makes a prohibition rather
+        // than a preference, or it never told QUIC what size of DATAGRAM frame
+        // it accepts. Either way the request stream is the only way out. This is
+        // not the same situation as the oversize case above: there a datagram
+        // path exists and RFC 9298 §6.1 says not to bypass it, whereas here
+        // there is none, so capsules are the correct channel.
         let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packet);
 
         // The one write in this session that can block for as long as the peer
