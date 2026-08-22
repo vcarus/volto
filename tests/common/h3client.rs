@@ -49,10 +49,13 @@
 
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
 
+use std::future::Future;
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use quinn::VarInt;
 use rustls::pki_types::CertificateDer;
@@ -64,6 +67,7 @@ use volto::h3::frame::{self, Frame, FrameReader, Item};
 use volto::h3::qpack::{self, Field};
 use volto::h3api::{Code, StreamError};
 
+use super::huffman;
 use super::{client_endpoint_with_stream_window, connect_quic, connect_quic_with_ca};
 use super::{TestServer, TIMEOUT};
 
@@ -77,6 +81,21 @@ const STREAM_QPACK_DECODER: u64 = 0x03;
 /// The server's SETTINGS and GOAWAY are a few dozen bytes; anything claiming
 /// more is not worth allocating for in a test harness.
 const MAX_CONTROL_FRAME: u64 = 64 * 1024;
+
+/// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
+///
+/// §7.2.8: "Frame types that were used in HTTP/2 where there is no
+/// corresponding HTTP/3 frame have also been reserved (Section 11.2.1). These
+/// frame types MUST NOT be sent, and their receipt MUST be treated as a
+/// connection error of type H3_FRAME_UNEXPECTED."
+const RESERVED_HTTP2_FRAMES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
+
+/// Sentinel for "the server has not sent GOAWAY yet".
+///
+/// Safe as a sentinel because it is not a value a QUIC variable-length integer
+/// can carry: RFC 9000 §16 caps them at 2^62 - 1, so no real identifier can
+/// collide with it.
+const NO_GOAWAY: u64 = u64::MAX;
 
 /// The value of the `:protocol` pseudo-header, as a request extension.
 ///
@@ -105,6 +124,21 @@ struct Peer {
     max_field_section_size: AtomicU64,
     /// Whether the server has sent GOAWAY (RFC 9114 §5.2).
     closing: AtomicBool,
+    /// The identifier the server's GOAWAY carried, or [`NO_GOAWAY`].
+    ///
+    /// Kept as well as [`Self::closing`] because the identifier is the part a
+    /// test can hold the server to: it names the first request that will be
+    /// rejected, and `it_shutdown` opens a stream past it to prove the server
+    /// really rejects it rather than trusting this client's own bookkeeping.
+    goaway: AtomicU64,
+    /// The first control-stream rule the server broke, if it broke one.
+    ///
+    /// Recorded as well as panicked with, because a panic inside a spawned task
+    /// is caught by tokio and stored in a `JoinHandle` nobody awaits: the
+    /// message would be printed and the test would still pass. Every request
+    /// and every response checks this, so a server that breaks a rule on its
+    /// control stream fails the next test that talks to it.
+    fault: Mutex<Option<String>>,
 }
 
 impl Default for Peer {
@@ -112,6 +146,34 @@ impl Default for Peer {
         Self {
             max_field_section_size: AtomicU64::new(u64::MAX),
             closing: AtomicBool::new(false),
+            goaway: AtomicU64::new(NO_GOAWAY),
+            fault: Mutex::new(None),
+        }
+    }
+}
+
+impl Peer {
+    /// Records that the server broke `rule` on its control stream, and panics.
+    ///
+    /// Only the first rule is kept: everything after a broken control stream is
+    /// a consequence of it, and the first one is what a reader needs.
+    fn broke(&self, rule: String) -> ! {
+        // Released before panicking, so the panic does not poison the mutex and
+        // turn every later `check` into a confusing second failure.
+        {
+            let mut fault = self.fault.lock().expect("fault lock");
+            if fault.is_none() {
+                *fault = Some(rule.clone());
+            }
+        }
+        panic!("{rule}");
+    }
+
+    /// Panics if the server has already broken a control-stream rule.
+    #[track_caller]
+    fn check(&self) {
+        if let Some(rule) = self.fault.lock().expect("fault lock").as_deref() {
+            panic!("{rule}");
         }
     }
 }
@@ -142,6 +204,18 @@ impl H3Client {
     /// Connects and completes the HTTP/3 handshake, advertising datagram support.
     pub async fn connect(server: &TestServer) -> Self {
         Self::connect_with_datagrams(server, true).await
+    }
+
+    /// [`H3Client::connect`] with every field name and value Huffman-coded.
+    ///
+    /// The shape of request Surge actually sends, and the only one that reaches
+    /// the server's `huffman` module from the wire: this crate's own QPACK
+    /// encoder always writes `H = 0`, so without this the decoder would be
+    /// exercised by unit tests alone.
+    pub async fn connect_huffman(server: &TestServer) -> Self {
+        let mut client = Self::connect(server).await;
+        client.send.huffman = true;
+        client
     }
 
     /// Connects while trusting `ca` rather than the server's original certificate.
@@ -204,6 +278,42 @@ impl H3Client {
         self.send.send_request(request).await
     }
 
+    /// The identifier of the server's GOAWAY, if one has arrived.
+    ///
+    /// RFC 9114 §5.2 makes this "the stream ID of the last request that might
+    /// have been processed", and a request stream opened at or past it is
+    /// rejected -- which is the property `it_shutdown` puts on the wire.
+    pub fn goaway(&self) -> Option<u64> {
+        match self.send.peer.goaway.load(Ordering::Relaxed) {
+            NO_GOAWAY => None,
+            identifier => Some(identifier),
+        }
+    }
+
+    /// Waits for the server's GOAWAY and returns the identifier it carried.
+    ///
+    /// Polled rather than notified because the frame arrives on a task of its
+    /// own; written as a synchronous function returning a future so that
+    /// `#[track_caller]` survives to the poll that panics, the same reason
+    /// [`super::open_tcp_tunnel`] is shaped that way.
+    #[track_caller]
+    pub fn await_goaway(&self) -> impl Future<Output = u64> + '_ {
+        let caller = Location::caller();
+        async move {
+            let deadline = tokio::time::Instant::now() + TIMEOUT;
+            loop {
+                if let Some(identifier) = self.goaway() {
+                    return identifier;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no GOAWAY within {TIMEOUT:?}; awaited at {caller}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
     /// Performs the client half of the HTTP/3 handshake on a live connection.
     async fn from_quic(
         endpoint: quinn::Endpoint,
@@ -235,6 +345,7 @@ impl H3Client {
             send: SendRequest {
                 quic: connection.clone(),
                 peer,
+                huffman: false,
             },
             quic: connection,
             _endpoint: endpoint,
@@ -257,6 +368,12 @@ impl Drop for H3Client {
 pub struct SendRequest {
     quic: quinn::Connection,
     peer: Arc<Peer>,
+    /// Whether field names and values go on the wire Huffman-coded.
+    ///
+    /// Set by [`H3Client::connect_huffman`] and nothing else: the default is
+    /// the crate encoder's plain literals, so an existing test's bytes do not
+    /// change under it.
+    huffman: bool,
 }
 
 impl SendRequest {
@@ -269,6 +386,8 @@ impl SendRequest {
         &mut self,
         request: Request<()>,
     ) -> Result<ClientStream, StreamError> {
+        self.peer.check();
+
         if self.peer.closing.load(Ordering::Relaxed) {
             return Err(StreamError::Local(Violation::stream(
                 Code::H3_REQUEST_REJECTED,
@@ -302,10 +421,14 @@ impl SendRequest {
         }
 
         let mut block = BytesMut::new();
-        qpack::encode(
-            &mut block,
-            fields.iter().map(|(name, value)| (&name[..], &value[..])),
-        );
+        if self.huffman {
+            put_huffman_section(&mut block, &fields);
+        } else {
+            qpack::encode(
+                &mut block,
+                fields.iter().map(|(name, value)| (&name[..], &value[..])),
+            );
+        }
 
         let mut header = BytesMut::new();
         frame::put_header(&mut header, frame::HEADERS, block.len() as u64);
@@ -318,6 +441,7 @@ impl SendRequest {
             id,
             header: BytesMut::new(),
             trailers: false,
+            peer: self.peer.clone(),
         })
     }
 }
@@ -333,6 +457,9 @@ pub struct ClientStream {
     header: BytesMut,
     /// Whether a trailer section has been received (RFC 9114 §4.1).
     trailers: bool,
+    /// Shared with the connection task, so [`Self::recv_response`] can report a
+    /// control-stream rule the server broke while this request was in flight.
+    peer: Arc<Peer>,
 }
 
 impl ClientStream {
@@ -361,6 +488,11 @@ impl ClientStream {
                 None => return Err(unexpected("a stream that ended before the response")),
             }
         };
+
+        // Checked here as well as before the request: a rule broken while this
+        // response was in flight is the server's, and this is the first moment
+        // the test's own task can be told about it.
+        self.peer.check();
 
         // No limit: this client advertises none, so nothing the server sends can
         // be too large for it. `MAX_FIELD_SECTION_SIZE` is the *server's* bound
@@ -491,6 +623,68 @@ fn request_fields(request: &Request<()>) -> Vec<(Vec<u8>, Vec<u8>)> {
     fields
 }
 
+/// Encodes a field section with every name and value Huffman-coded.
+///
+/// Written here rather than reached for in [`volto::h3::qpack`], whose encoder
+/// has no way to set the `H` bit -- deliberately, since the server saves
+/// nothing worth having by compressing three response fields. Every line uses
+/// the "Literal Field Line With Literal Name" form of RFC 9204 §4.5.6 even when
+/// the static table has the exact entry, because the point is to put a
+/// Huffman-coded literal in front of the server's decoder rather than to encode
+/// well.
+fn put_huffman_section(out: &mut BytesMut, fields: &[(Vec<u8>, Vec<u8>)]) {
+    // Encoded Field Section Prefix (RFC 9204 §4.5.1): Required Insert Count 0,
+    // Base 0 -- the only prefix a section that names no dynamic entry may have.
+    out.put_u8(0);
+    out.put_u8(0);
+
+    for (name, value) in fields {
+        // 4.5.6: | 0 | 0 | 1 | N | H | Name Length (3+) |, so the bits above
+        // the 3-bit prefix are 0b001 then N = 0 then H = 1.
+        put_huffman_string(out, 3, 0b0_0101, name);
+        // The value is an 8-bit prefix string literal: | H | Value Length (7+) |.
+        put_huffman_string(out, 7, 0b1, value);
+    }
+}
+
+/// Writes one Huffman-coded string literal with `flags` above its length prefix.
+///
+/// `flags` include the `H` bit, which is why this takes them whole rather than
+/// setting the bit itself: in RFC 9204 §4.5.6 the name's `H` sits in the middle
+/// of the representation's own flags, not at the top of the byte.
+fn put_huffman_string(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: &[u8]) {
+    let encoded = huffman::encode(value);
+    // RFC 9204 §4.1.2: "the indicated length is the size of the string after
+    // encoding".
+    put_prefixed_int(out, prefix_bits, flags, encoded.len() as u64);
+    out.put_slice(&encoded);
+}
+
+/// Writes a prefixed integer with `flags` in the bits above the prefix.
+///
+/// RFC 7541 §5.1's encoding, transcribed here rather than borrowed from the
+/// server: these bytes are what the server is asked to parse, so a shared
+/// mistake would be invisible.
+fn put_prefixed_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
+    // Computed in `u16` so a full eight-bit prefix does not shift by the width
+    // of the type it is shifting.
+    let mask = u64::from((1u16 << prefix_bits) - 1);
+    let flags = ((u16::from(flags) << prefix_bits) & 0xff) as u8;
+
+    if value < mask {
+        out.put_u8(flags | value as u8);
+        return;
+    }
+
+    out.put_u8(flags | mask as u8);
+    let mut remaining = value - mask;
+    while remaining >= 0x80 {
+        out.put_u8((remaining as u8 & 0x7f) | 0x80);
+        remaining >>= 7;
+    }
+    out.put_u8(remaining as u8);
+}
+
 /// The size of a field section as RFC 9114 §4.2.2 defines it.
 ///
 /// "The size of a field list is calculated based on the uncompressed size of
@@ -609,8 +803,18 @@ async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
     }
 }
 
-/// Reads the server's control stream until the connection ends.
+/// Reads the server's control stream until the connection ends, holding it to
+/// the rules RFC 9114 states for one.
+///
+/// Every connection this suite opens runs through here, so these are assertions
+/// the whole suite carries rather than one test's: a server that opened with the
+/// wrong frame, repeated its SETTINGS, or put a request-stream frame on its
+/// control stream used to be waved through by a `_ => {}` arm and every test
+/// still passed. Unknown and reserved-for-greasing types stay ignored, because
+/// §9 requires exactly that.
 async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
+    let mut settings_seen = false;
+
     loop {
         let (Some(kind), Some(length)) =
             (read_varint(&mut recv).await, read_varint(&mut recv).await)
@@ -618,7 +822,10 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
             return;
         };
         if length > MAX_CONTROL_FRAME {
-            return;
+            peer.broke(format!(
+                "the server sent a {length}-byte frame of type {kind:#x} on its control stream, \
+                 past the {MAX_CONTROL_FRAME} bytes this client will read"
+            ));
         }
 
         let mut payload = vec![0u8; length as usize];
@@ -626,19 +833,81 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
             return;
         }
 
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+        //# Each side MUST initiate a single control stream at the beginning of
+        //# the connection and send its SETTINGS frame as the first frame on
+        //# this stream.
+        //
+        // "Any other frame type" includes an unknown one: §9 makes the point
+        // explicitly, that an unknown frame "does not satisfy that requirement".
+        if !settings_seen && kind != frame::SETTINGS {
+            peer.broke(format!(
+                "the server's control stream opened with frame type {kind:#x} rather than SETTINGS"
+            ));
+        }
+
         match kind {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+            //# A SETTINGS frame MUST be sent as the first frame of each control
+            //# stream (see Section 6.2.1) by each peer, and it MUST NOT be sent
+            //# subsequently.
+            frame::SETTINGS if settings_seen => {
+                peer.broke("the server sent a second SETTINGS frame on its control stream".into());
+            }
             frame::SETTINGS => {
+                settings_seen = true;
                 if let Some(size) = max_field_section_size(&payload) {
                     peer.max_field_section_size.store(size, Ordering::Relaxed);
                 }
             }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+            //# DATA frames MUST be associated with an HTTP request or response.
+            //# If a DATA frame is received on a control stream, the recipient
+            //# MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+            //# HEADERS frames can only be sent on request streams or push
+            //# streams. If a HEADERS frame is received on a control stream, the
+            //# recipient MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+            //# If a PUSH_PROMISE frame is received on the control stream, the
+            //# client MUST respond with a connection error of type
+            //# H3_FRAME_UNEXPECTED.
+            frame::DATA | frame::HEADERS | frame::PUSH_PROMISE => {
+                peer.broke(format!(
+                    "the server sent frame type {kind:#x}, which belongs on a request stream, \
+                     on its control stream"
+                ));
+            }
+
+            kind if RESERVED_HTTP2_FRAMES.contains(&kind) => {
+                peer.broke(format!(
+                    "the server sent frame type {kind:#x}, reserved because HTTP/2 used it"
+                ));
+            }
+
             //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
             //# Requests or pushes with the indicated identifier or greater are
             //# rejected (Section 4.1.1) by the sender of the GOAWAY.
             //
             // Every request this client could still open would be past it: the
-            // identifier is the next stream it has not used yet.
-            frame::GOAWAY => peer.closing.store(true, Ordering::Relaxed),
+            // identifier is the next stream it has not used yet. The identifier
+            // itself is recorded so a test can open a stream past it and hold
+            // the server to that sentence on the wire.
+            frame::GOAWAY => {
+                if let Some((identifier, _)) = peek_varint(&payload) {
+                    peer.goaway.store(identifier, Ordering::Relaxed);
+                }
+                peer.closing.store(true, Ordering::Relaxed);
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+            //# Implementations MUST ignore unknown or unsupported values in all
+            //# extensible protocol elements.
             _ => {}
         }
     }

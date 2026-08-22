@@ -8,11 +8,26 @@ mod common;
 
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use common::{
     connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
     spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
 };
+use volto::h3::{frame, qpack};
+
+/// H3_REQUEST_REJECTED, RFC 9114 §8.1: "A server rejected a request without
+/// performing any application processing."
+///
+/// §4.1.1 is where it is asked for: "When the server cancels a request without
+/// performing any application processing, the request is considered
+/// 'rejected'. The server SHOULD abort its response stream with the error code
+/// H3_REQUEST_REJECTED."
+const H3_REQUEST_REJECTED: u64 = 0x10b;
+
+/// The distance between consecutive client-initiated bidirectional stream ids
+/// (RFC 9000 §2.1), and so between one request and the next.
+const REQUEST_STREAM_STEP: u64 = 4;
+
 /// A tunnel that is in use when the signal arrives keeps working, and the server
 /// waits for it rather than dropping it.
 #[tokio::test]
@@ -76,9 +91,125 @@ async fn an_established_udp_session_survives_goaway() {
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
-/// After the GOAWAY, new requests are refused rather than served. The client sees
-/// this as a failure to open the request at all, which is the signal RFC 9114
-/// §5.2 says it may safely retry elsewhere on.
+/// The GOAWAY names the first request the server will not serve, and a stream
+/// opened past it is rejected on the wire.
+///
+/// The point of doing this with raw QUIC streams rather than through the test
+/// client: that client refuses to open a request once it has seen a GOAWAY, so
+/// [`new_requests_are_refused_after_goaway`] below would pass against a server
+/// that had no rejection logic at all. Everything asserted here is the server's
+/// -- the identifier it chose, and the two error codes it puts on the stream.
+///
+/// RFC 9114 §5.2: "Requests or pushes with the indicated identifier or greater
+/// are rejected (Section 4.1.1) by the sender of the GOAWAY."
+#[tokio::test]
+async fn a_request_stream_past_the_goaway_identifier_is_rejected() {
+    let mut server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // One tunnel, so the connection has something to drain and stays open while
+    // the rejection below is asserted.
+    let mut held = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    let last_accepted = held.id();
+
+    server.shutdown();
+
+    // The identifier is four past the last request the server accepted: that
+    // request is untouched, and everything from the next stream on is refused.
+    let identifier = client.await_goaway().await;
+    assert_eq!(
+        identifier,
+        last_accepted + REQUEST_STREAM_STEP,
+        "the GOAWAY must name the first request the server will not serve"
+    );
+
+    // A request stream at the identifier, carrying a CONNECT the server would
+    // otherwise have served -- the same target the tunnel above is using.
+    let (mut send, mut recv) = client
+        .quic
+        .open_bi()
+        .await
+        .expect("open a request stream past the GOAWAY identifier");
+    assert!(
+        u64::from(send.id()) >= identifier,
+        "stream {} is not past the identifier {identifier}",
+        send.id()
+    );
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send the CONNECT request");
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.1
+    //# The server SHOULD abort its response stream with the error code
+    //# H3_REQUEST_REJECTED.
+    let read = tokio::time::timeout(TIMEOUT, recv.read_chunk(64, true))
+        .await
+        .expect("the server answered the rejected request");
+    match read {
+        Err(quinn::ReadError::Reset(code)) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_REJECTED,
+            "expected H3_REQUEST_REJECTED (0x10b) on the response side, got {:#x}",
+            code.into_inner()
+        ),
+        other => panic!("expected the response side to be reset, got {other:?}"),
+    }
+
+    // And the request side is stopped rather than read, so the client is not
+    // left writing a body nobody will look at.
+    let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+        .await
+        .expect("the server stopped the request side")
+        .expect("stop code");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(H3_REQUEST_REJECTED),
+        "expected STOP_SENDING with H3_REQUEST_REJECTED (0x10b)"
+    );
+
+    // Rejecting a late request does not disturb the tunnel that was already
+    // open, which is the whole reason a GOAWAY has an identifier at all.
+    held.send_data(Bytes::from_static(b"alive"))
+        .await
+        .expect("the held tunnel still works");
+    assert_eq!(&read_at_least(&mut held, 5).await, b"alive");
+
+    held.finish().await.expect("finish");
+    common::read_to_end(&mut held).await;
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+}
+
+/// One CONNECT request as an HTTP/3 HEADERS frame.
+///
+/// Hand-built because the test above needs a request on a stream the client's
+/// own `send_request` would refuse to open.
+fn connect_headers_frame(authority: &str) -> Vec<u8> {
+    // RFC 9114 §4.4: a classic CONNECT carries :method and :authority, and
+    // neither :scheme nor :path.
+    let fields: [(&[u8], &[u8]); 2] = [
+        (b":method", b"CONNECT"),
+        (b":authority", authority.as_bytes()),
+    ];
+
+    let mut block = BytesMut::new();
+    qpack::encode(&mut block, fields);
+
+    let mut request = BytesMut::new();
+    frame::put_header(&mut request, frame::HEADERS, block.len() as u64);
+    request.extend_from_slice(&block);
+    request.to_vec()
+}
+
+/// After the GOAWAY, the client stops opening requests of its own accord.
+///
+/// What this asserts is the *client* side of RFC 9114 §5.2 -- a peer that has
+/// seen a GOAWAY takes its new work elsewhere -- plus the fact that the server
+/// sends one at all, since the refusal below only starts once the frame has
+/// been read off the server's control stream. What the server does with a
+/// request that arrives anyway is
+/// [`a_request_stream_past_the_goaway_identifier_is_rejected`] above; this test
+/// cannot see it, because the client never puts such a request on the wire.
 #[tokio::test]
 async fn new_requests_are_refused_after_goaway() {
     let mut server = TestServer::start().await;

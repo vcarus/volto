@@ -10,6 +10,7 @@
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
 
 pub mod h3client;
+pub mod huffman;
 
 pub use h3client::{ClientStream, H3Client, Protocol};
 
