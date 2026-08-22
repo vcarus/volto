@@ -64,6 +64,13 @@ pub(crate) fn connection_specific_field(req: &Request) -> Option<&'static str> {
 }
 
 /// RFC 9110 §7.6.1's connection-specific fields other than `Connection`.
+///
+/// Four of the five that section lists. The fifth is `TE`, which RFC 9114 §4.2
+/// exempts when it says `trailers` and nothing else -- the sentence is quoted in
+/// `crate::h3::stream`, where the value it carries is checked and where the
+/// answer is the reset a malformed field section gets. So `TE` is not judged
+/// here, and its absence from this list is the exemption rather than an
+/// oversight.
 const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "proxy-connection",
     "keep-alive",

@@ -73,6 +73,13 @@ impl Status {
     }
 
     /// The three digits, as `:status` carries them.
+    ///
+    /// # Panics
+    ///
+    /// Never in practice: every constant here is an ASCII literal and
+    /// [`Self::parse`] accepts nothing else, so the digits cannot be anything a
+    /// `str` will not hold. The check is kept rather than made unchecked
+    /// because it costs three comparisons on a path that writes a response.
     pub fn as_str(&self) -> &str {
         // ASCII digits by construction: every constant is a literal and `parse`
         // accepts nothing else.
@@ -156,9 +163,11 @@ pub struct FieldValue(Box<[u8]>);
 impl FieldValue {
     /// Wraps a value this server authored.
     ///
-    /// Panics on an octet no field value may carry. The bound to `'static` is
-    /// what makes that acceptable: the argument is a literal in this tree, so a
-    /// panic here is a bug found by the first test that sends the field, never
+    /// # Panics
+    ///
+    /// On an octet no field value may carry. The bound to `'static` is what
+    /// makes that acceptable: the argument is a literal in this tree, so a panic
+    /// here is a bug found by the first test that sends the field, never
     /// something a peer can provoke.
     pub fn from_static(value: &'static str) -> Self {
         assert!(
@@ -240,10 +249,20 @@ impl Fields {
 
     /// Adds a field, keeping every value a repeated name already had.
     ///
-    /// The name must be lowercase, since it goes on the wire as it is given
-    /// (RFC 9114 §4.2).
+    /// The name must be a lowercase token, since it goes on the wire as it is
+    /// given and RFC 9114 §4.2 makes an uppercase one malformed. Asserted in
+    /// debug builds, and for the reason [`FieldValue::from_static`] gives: every
+    /// name this server appends is a literal in this tree or one
+    /// [`field_name`] has already accepted, so a violation is a bug rather than
+    /// something a peer can provoke -- and a release build has no business
+    /// panicking over it.
     pub fn append(&mut self, name: impl Into<Box<str>>, value: FieldValue) {
-        self.0.push((name.into(), value));
+        let name = name.into();
+        debug_assert!(
+            field_name(name.as_bytes()).is_some(),
+            "{name:?} is not a field name"
+        );
+        self.0.push((name, value));
     }
 
     /// The first value of `name`, or `None` if there is none.

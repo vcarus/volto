@@ -348,12 +348,7 @@ fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         let authority =
             authority.ok_or_else(|| malformed("a CONNECT request without :authority"))?;
 
-        (
-            None,
-            Some(uri_authority(nonempty(&authority, ":authority")?)?.into()),
-            None,
-            None,
-        )
+        (None, Some(uri_authority(&authority)?.into()), None, None)
     } else {
         // Extended CONNECT and ordinary requests are built the same way; only
         // where the authority may come from differs.
@@ -389,10 +384,10 @@ fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
             (None, None) => return Err(malformed("a request with neither :authority nor Host")),
         };
 
-        let (path, query) = split_target(nonempty(&target, ":path")?)?;
+        let (path, query) = split_target(&target, protocol.is_some())?;
         (
-            Some(uri_scheme(nonempty(&scheme, ":scheme")?)?.into()),
-            Some(uri_authority(nonempty(named, ":authority")?)?.into()),
+            Some(uri_scheme(&scheme)?.into()),
+            Some(uri_authority(named)?.into()),
             Some(path.into()),
             query.map(Into::into),
         )
@@ -450,6 +445,15 @@ fn uri_scheme(scheme: &[u8]) -> Result<&str, Violation> {
 fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
     let invalid = || malformed("an :authority that is not an authority");
 
+    // RFC 9114 §4.3.1 requires a non-empty one, and this is the only pseudo-
+    // header where emptiness has to be said: an empty :scheme is not a scheme
+    // and an empty :path is not an absolute path, so the syntax below refuses
+    // both on its own. Every character an authority may contain is optional, so
+    // nothing here would refuse the empty string.
+    if authority.is_empty() {
+        return Err(malformed("an empty :authority"));
+    }
+
     if !authority
         .iter()
         .all(|byte| byte.is_ascii_alphanumeric() || AUTHORITY_PUNCTUATION.contains(byte))
@@ -469,11 +473,13 @@ fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
 /// refused along with everything else outside that set, because a fragment is
 /// not part of a request target (RFC 9110 §7.1) and silently dropping one would
 /// mean acting on a target the client did not send.
-fn split_target(target: &[u8]) -> Result<(&str, Option<&str>), Violation> {
+fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), Violation> {
     // §4.3.1's asterisk form, which belongs to OPTIONS. This server answers such
     // a request with the 501 every method it does not implement gets, and can
-    // only do so if the request is not malformed first.
-    if target == b"*" {
+    // only do so if the request is not malformed first. It is not a path, so it
+    // is refused on an extended CONNECT, where RFC 8441 §4 asks for the :path of
+    // a target URI and the tunnel that follows has to parse one.
+    if target == b"*" && !extended {
         return Ok(("*", None));
     }
 
@@ -541,9 +547,9 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //# fields MUST be treated as malformed.
     //
     // Only the Connection field itself is refused here, with the stream reset
-    // a malformed request gets. RFC 9110 §7.6.1's wider list -- Proxy-Connection,
-    // Keep-Alive, Transfer-Encoding, Upgrade -- is judged in
-    // `crate::tunnel::connection_specific_field`, where the answer can be a 400
+    // a malformed request gets. RFC 9110 §7.6.1's wider list is judged in
+    // `crate::tunnel::connection_specific_field`, which says which fields it
+    // covers and why TE is not among them; the answer there can be a 400
     // (RFC 9114 §4.1.2 allows a response before the stream is closed), which
     // tells the client rather more than a bare reset would.
     if name == "connection" {
@@ -577,14 +583,6 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
 
     fields.append(name, value);
     Ok(())
-}
-
-/// Rejects an empty pseudo-header value (RFC 9114 §4.3.1).
-fn nonempty<'a>(value: &'a [u8], field: &'static str) -> Result<&'a [u8], Violation> {
-    if value.is_empty() {
-        return Err(malformed(Cow::Owned(format!("an empty {field}"))));
-    }
-    Ok(value)
 }
 
 /// A message this server will not process (RFC 9114 §4.1.2).
@@ -1138,9 +1136,32 @@ mod tests {
         }
 
         // A path is an absolute path, and a fragment is not part of a target.
-        assert!(build_request(replacing(":path", "*")).is_ok());
         for path in ["masque/udp/", "/a b", "/a#b", "/a\u{1}b"] {
             refused(replacing(":path", path));
         }
+
+        // A query is pchar / "/" / "?" (RFC 3986 §3.4), and "#" opens a fragment
+        // there as much as it does in a path.
+        assert!(build_request(replacing(":path", "/a?b=c&d=%20e")).is_ok());
+        for path in ["/a?b#c", "/a?b[c", "/a?b c", "/a?b\u{1}c"] {
+            refused(replacing(":path", path));
+        }
+
+        // §4.3.1's asterisk form is OPTIONS's and is not a path: an ordinary
+        // request may carry it so that the answer is the 501 an unimplemented
+        // method gets, and an extended CONNECT may not, because RFC 8441 §4 asks
+        // it for the :path of a target URI.
+        let mut options = vec![
+            field(":method", "OPTIONS"),
+            field(":scheme", "https"),
+            field(":authority", "proxy.example:443"),
+            field(":path", "*"),
+        ];
+        assert!(build_request(options.clone()).is_ok());
+        refused(replacing(":path", "*"));
+
+        // And an ordinary request is not thereby excused a real path.
+        options[3] = field(":path", "masque/udp/");
+        refused(options);
     }
 }
