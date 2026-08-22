@@ -242,16 +242,12 @@ async fn client_to_target(
                 // would leave the two halves carrying different verdicts on the
                 // same failure.
                 //
-                // Only a request, not a guarantee, at the pinned `h3-quinn`
-                // revision: its `RecvStream::poll_data` moves the `quinn` stream
-                // into a boxed read future, and a `stop_sending` arriving while
-                // that read is in flight is parked in `pending_stop` and applied
-                // only when the read resolves — which it will not, since nothing
-                // more is coming. The client is then stopped with code 0 by the
-                // drop, as before. It lands when the teardown beats the first
-                // read, and it is what this half means either way; the response
-                // direction, which is the one that could truncate data, is
-                // reset unconditionally by the other pump.
+                // The ask reaches the wire here and not later: `stop_receiving`
+                // is `quinn::RecvStream::stop`, which queues STOP_SENDING at the
+                // point of call. It is dropped only when this direction has
+                // already ended, and then there is nothing left to stop. The
+                // response direction, which is the one that could truncate data,
+                // is reset unconditionally by the other pump either way.
                 if reason == Teardown::TargetError {
                     reader.stop_receiving(h3api::CONNECT_ERROR);
                 }

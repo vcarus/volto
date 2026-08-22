@@ -537,7 +537,8 @@ mod tests {
     }
 
     /// A literal with a static name reference, Huffman-encoded, which is what
-    /// the `h3` client emits for `:authority` and `:path`.
+    /// a client that compresses its field values emits for `:authority` and
+    /// `:path`.
     #[test]
     fn a_huffman_literal_with_a_name_reference_decodes() {
         // 0x50 = 0101 0000: literal, N=0, T=1 (static), name index 0

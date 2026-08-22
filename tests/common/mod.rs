@@ -1,10 +1,17 @@
 //! Shared test harness: a self-signed Volto instance, HTTP/3 clients and
 //! cooperating TCP targets.
 //!
-//! The test client is built from the same pinned `h3` revision as the server, so
-//! these tests exercise exactly the code path a real client drives.
+//! The HTTP/3 client lives in [`h3client`] and is built on the same codec as the
+//! server -- `volto::h3` -- so the two ends of every test here share a reading
+//! of the framing and of QPACK. What that costs, and why the cross-implementation
+//! check now belongs entirely to the `interop` CI job (a real `volto` process
+//! driven by Go's masque-go), is spelled out in that module's documentation.
 
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
+
+pub mod h3client;
+
+pub use h3client::{ClientStream, H3Client, Protocol};
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -14,7 +21,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, Uri};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
@@ -49,9 +55,6 @@ pub const IMPATIENT: &str = "[limits]\nmax_idle_timeout = 1\nkeep_alive_interval
 /// Generous upper bound for a shutdown that should take about as long as its
 /// grace period. Failing this means the grace period is not being enforced.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// The client-side request stream type produced by [`H3Client::connect`].
-pub type ClientStream = h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 /// A directory that deletes itself when dropped.
 pub struct TempDir {
@@ -363,111 +366,6 @@ pub async fn connect_quic_with_ca(
     (endpoint, connection)
 }
 
-/// An HTTP/3 client with its connection driven in the background.
-pub struct H3Client {
-    /// Handle used to open requests.
-    pub send: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    /// The underlying QUIC connection.
-    ///
-    /// HTTP Datagrams are not exposed by `h3` (this crate deliberately excludes
-    /// `h3-datagram`), so tests drive them through quinn directly, exactly as the
-    /// server does.
-    pub quic: quinn::Connection,
-    // Both are kept alive for as long as the client is: dropping the endpoint or
-    // stopping the driver would tear the connection down.
-    _endpoint: quinn::Endpoint,
-    driver: JoinHandle<()>,
-}
-
-impl H3Client {
-    /// Connects and completes the HTTP/3 handshake, advertising datagram support.
-    pub async fn connect(server: &TestServer) -> Self {
-        Self::connect_with_datagrams(server, true).await
-    }
-
-    /// Connects while trusting `ca` rather than the server's original certificate.
-    pub async fn connect_with_ca(server: &TestServer, ca: CertificateDer<'static>) -> Self {
-        let (endpoint, connection) = connect_quic_with_ca(server, ca).await;
-        Self::from_quic(endpoint, connection, true).await
-    }
-
-    /// Connects without advertising `SETTINGS_H3_DATAGRAM`.
-    ///
-    /// RFC 9297 §2.1.1 then forbids the server from sending QUIC datagrams, so
-    /// the session has to fall back to DATAGRAM capsules on the request stream.
-    pub async fn connect_without_datagrams(server: &TestServer) -> Self {
-        Self::connect_with_datagrams(server, false).await
-    }
-
-    /// [`H3Client::connect_without_datagrams`] with a per-stream receive window
-    /// of `window` bytes, so a server writing capsules blocks after that much.
-    pub async fn connect_without_datagrams_with_stream_window(
-        server: &TestServer,
-        window: u32,
-    ) -> Self {
-        let endpoint = client_endpoint_with_stream_window(&server.ca, &["h3"], window);
-        let connection = tokio::time::timeout(
-            TIMEOUT,
-            endpoint
-                .connect(server.addr, "localhost")
-                .expect("start connecting"),
-        )
-        .await
-        .expect("handshake did not time out")
-        .expect("handshake");
-
-        Self::from_quic(endpoint, connection, false).await
-    }
-
-    async fn connect_with_datagrams(server: &TestServer, datagrams: bool) -> Self {
-        let (endpoint, connection) = connect_quic(server).await;
-        Self::from_quic(endpoint, connection, datagrams).await
-    }
-
-    /// Moves the client onto a fresh local socket while the connection lives
-    /// on — the address change a phone produces when it hops networks. The
-    /// server must treat it as a QUIC migration (RFC 9000 §9), not a new peer.
-    pub fn rebind(&self) {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a fresh client socket");
-        self._endpoint
-            .rebind(socket)
-            .expect("rebind the client endpoint");
-    }
-
-    async fn from_quic(
-        endpoint: quinn::Endpoint,
-        connection: quinn::Connection,
-        datagrams: bool,
-    ) -> Self {
-        let mut builder = h3::client::builder();
-        builder
-            .enable_extended_connect(true)
-            .enable_datagram(datagrams);
-
-        let (mut driver, send) = builder
-            .build::<_, _, Bytes>(h3_quinn::Connection::new(connection.clone()))
-            .await
-            .expect("http/3 handshake");
-
-        let driver = tokio::spawn(async move {
-            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-        });
-
-        Self {
-            send,
-            quic: connection,
-            _endpoint: endpoint,
-            driver,
-        }
-    }
-}
-
-impl Drop for H3Client {
-    fn drop(&mut self) {
-        self.driver.abort();
-    }
-}
-
 /// Builds a classic CONNECT request: authority-form URI, no `:protocol`.
 pub fn connect_request(authority: &str) -> Request<()> {
     let uri = Uri::builder()
@@ -506,9 +404,7 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<
         .uri(uri)
         .body(())
         .expect("connect-udp request");
-    request
-        .extensions_mut()
-        .insert(h3::ext::Protocol::CONNECT_UDP);
+    request.extensions_mut().insert(Protocol::CONNECT_UDP);
     request
 }
 
@@ -637,7 +533,7 @@ async fn udp_session(
         "a CONNECT-UDP response frames no content; session opened at {caller}"
     );
 
-    let quarter_stream_id = datagram::quarter_stream_id(stream.id().into_inner());
+    let quarter_stream_id = datagram::quarter_stream_id(stream.id());
     (quarter_stream_id, stream)
 }
 

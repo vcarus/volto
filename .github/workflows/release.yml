@@ -28,7 +28,7 @@ jobs:
 
       # Static musl binaries, so a release runs on any glibc vintage. ring needs
       # a working cross C toolchain for aarch64, which is what `cross` provides;
-      # --locked keeps the load-bearing h3/h3-quinn git pins intact.
+      # --locked keeps the committed lockfile, quinn-proto patch included.
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build

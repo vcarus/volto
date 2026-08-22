@@ -98,7 +98,8 @@ cargo run -- --config config.toml
   firewall, file-descriptor budget, reloads, running behind a UDP relay and
   fail2ban.
 - [docs/architecture.md](docs/architecture.md) — how a request becomes a tunnel,
-  why h3 is pinned and quinn-proto patched, and what the tests assert.
+  what the in-tree HTTP/3 layer does and does not implement, why quinn-proto is
+  patched, and what the tests assert.
 
 A commented example configuration ships in
 [script/config.example.toml](script/config.example.toml).

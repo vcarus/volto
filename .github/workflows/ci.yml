@@ -23,7 +23,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The h3/h3-quinn pins are load-bearing: CI must build the committed lockfile.
+  # Nothing here is ever an incremental rebuild, and the cache is smaller without
+  # the artefacts. What every job does build is the committed lockfile, which is
+  # why they all pass `--locked`.
   CARGO_INCREMENTAL: 0
 
 jobs:
@@ -67,17 +69,15 @@ jobs:
     # builds the crate, so it shares no cache with the test matrix and cannot
     # slow it down.
     #
-    # The blind spot is worth naming. cargo-audit skips every lockfile entry whose
-    # source is not the default registry -- it does not fall back to the version a
-    # git dependency declares -- so the `h3` / `h3-quinn` git-rev pins are invisible
-    # to this job. They stay covered by the manual review a rev bump already
-    # requires (see .github/dependabot.yml).
-    #
-    # The `[patch.crates-io]` pin of `quinn-proto` would fall into that same hole,
-    # but it does not have to: the pinned commit is the upstream `quinn-proto-0.11.17`
-    # tag plus three fixes, so advisories against 0.11.17 apply to it verbatim. The
-    # second step below recovers it by auditing a copy of the lockfile with that
-    # one `source` line pointed back at the registry.
+    # cargo-audit skips every lockfile entry whose source is not the default
+    # registry -- it does not fall back to the version a git dependency declares.
+    # Exactly one entry in this lockfile is in that position, the `[patch.crates-io]`
+    # pin of `quinn-proto`, and it does not have to stay there: the pinned commit is
+    # the upstream `quinn-proto-0.11.17` tag plus three fixes, so advisories against
+    # 0.11.17 apply to it verbatim. The second step below recovers it by auditing a
+    # copy of the lockfile with that one `source` line pointed back at the registry,
+    # which leaves the audit with no blind spot at all. Delete the step together
+    # with the patch.
     name: audit (RustSec)
     runs-on: ubuntu-latest
     permissions:
@@ -158,11 +158,13 @@ jobs:
           VOLTO_SCRUB_PATTERNS: ${{ secrets.VOLTO_SCRUB_PATTERNS }}
 
   interop:
-    # Cross-implementation check. `cargo test` has volto on both ends — its
-    # client is built from the same pinned `h3` revision as the server, so the
-    # two agree by construction even where both are wrong. Here a real volto
-    # process is driven by Go's quic-go/masque-go instead, which shares no code
-    # and no reading of the RFCs with it.
+    # Cross-implementation check, and the only one there is. `cargo test` has
+    # volto on both ends: since HTTP/3 moved into `src/h3`, its client
+    # (`tests/common/h3client.rs`) is built on the server's own codec, so the two
+    # agree by construction even where both are wrong. Here a real volto process
+    # is driven by Go's quic-go/masque-go instead, which shares no code and no
+    # reading of the RFCs with it -- which makes this job more load-bearing than
+    # it was, not less.
     #
     # Linux only: this is about the protocol on the wire, not about the host, and
     # the platform matrix is already covered by the `test` job above.

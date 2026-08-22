@@ -6,8 +6,8 @@ rust-version = "1.85"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
 license = "MIT"
-# The h3/h3-quinn git pins below cannot be expressed on crates.io, and this is a
-# server rather than a library anyone would depend on.
+# The `[patch.crates-io]` stanza below cannot be expressed on crates.io, and this
+# is a server rather than a library anyone would depend on.
 publish = false
 
 [dependencies]
@@ -64,31 +64,14 @@ libc = "0.2"
 socket2 = "0.6"
 
 [dev-dependencies]
-# TEST-ONLY. The server no longer uses `h3`/`h3-quinn`: HTTP/3 is implemented in
-# `src/h3`. They stay here as the *client* the integration suite drives this
-# server with, which is the point -- the tests assert on-wire behaviour, and the
-# implementation asserting it shares no code with the one producing it.
-#
-# The git revision is pinned for the same reason it always was: the published
-# 0.0.x releases lack the fixes in #331 (h3-quinn panic), #340 (datagram Quarter
-# Stream ID), #344 (unbounded memory on slow consumers) and #357. Keep this rev
-# and `Cargo.lock` in sync; bump both deliberately.
-#
-# NOTE: `h3-datagram` is intentionally *not* a dependency. Its 0.0.2 release
-# encodes the Quarter Stream ID as zero, which misroutes every UDP session after
-# the first on a connection; both sides of these tests use `src/datagram.rs`
-# instead.
-# The `i-implement-...` feature is what lets `tests/it_settings.rs` reach
-# `h3::qpack` to hand-encode a request the client API cannot express.
-h3 = { git = "https://github.com/hyperium/h3", rev = "b986a537ddb1ccdd1eca3685b883cf7549ff7698", features = [
-    "i-implement-a-third-party-backend-and-opt-into-breaking-changes",
-] }
-h3-quinn = { git = "https://github.com/hyperium/h3", rev = "b986a537ddb1ccdd1eca3685b883cf7549ff7698" }
-
 rcgen = "0.14"
-# Property tests (`tests/it_props.rs`) over the three hand-rolled parsers that
-# read untrusted bytes. A stand-in for coverage-guided fuzzing: `cargo fuzz`
-# needs a nightly toolchain, and the dev host has stable Rust only.
+# Property tests over the parsers that read untrusted bytes, as a stand-in for
+# coverage-guided fuzzing: `cargo fuzz` needs a nightly toolchain, and the dev
+# host has stable Rust only. `tests/it_props.rs` covers the datagram and capsule
+# decoders and the CONNECT-UDP path template; the rest are unit tests next to the
+# code, in `src/h3/frame.rs` (the frame decoder, the SETTINGS parser) and
+# `src/h3/qpack.rs` (the field-section decoder, which is also what reaches the
+# Huffman decoder).
 proptest = "1"
 
 # TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion

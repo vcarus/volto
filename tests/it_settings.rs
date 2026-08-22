@@ -44,8 +44,8 @@ const FRAME_DATA: u64 = 0x00;
 
 /// How many unidirectional streams to inspect before giving up.
 ///
-/// `h3` also opens a grease stream, so the control stream is not guaranteed to
-/// be the first one accepted.
+/// The server opens its two QPACK streams alongside the control stream, so the
+/// control stream is not guaranteed to be the first one accepted.
 const MAX_UNI_STREAMS: usize = 8;
 
 #[tokio::test]
@@ -71,10 +71,10 @@ async fn server_advertises_extended_connect_and_h3_datagram() {
 
 /// A header-size limit must be advertised, and it must be a real one.
 ///
-/// `h3` defaults `max_field_section_size` to `VarInt::MAX`, which means an
-/// unauthenticated peer's header block is buffered and decoded in full before the
-/// server can look at it. Asserting the advertised value on the wire is what
-/// keeps that default from creeping back in (audit 2026-08, finding 1.1b).
+/// Advertise none and an unauthenticated peer's header block is buffered and
+/// decoded in full before the server can look at it, which is the state this
+/// server was in until audit 2026-08, finding 1.1b. Asserting the advertised
+/// value on the wire is what keeps it from coming back.
 #[tokio::test]
 async fn server_advertises_a_header_size_limit() {
     let server = TestServer::start().await;
@@ -283,15 +283,15 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 /// A CONNECT-UDP session opened before the peer's SETTINGS were processed must
 /// still move onto QUIC datagrams once they arrive.
 ///
-/// `h3` reads the control stream whenever the accept future is polled, so its
-/// own view of the peer's settings flips as soon as the SETTINGS frame lands —
-/// but this server's copy of it used to be refreshed only when a *request* was
-/// accepted. A session started before that point therefore stayed on the
-/// RFC 9297 capsule fallback for target-to-client traffic until another request
-/// happened along, which on a connection that opens one tunnel and keeps it is
-/// never.
+/// The server's copy of the peer's datagram setting used to be refreshed only
+/// when a *request* was accepted. A session started before that point therefore
+/// stayed on the RFC 9297 capsule fallback for target-to-client traffic until
+/// another request happened along, which on a connection that opens one tunnel
+/// and keeps it is never. The flag is now written by the task that reads the
+/// peer's control stream and read by every session per packet, so there is no
+/// sampling step left to get wrong.
 ///
-/// The in-repo `h3` client cannot produce that ordering: it sends SETTINGS as
+/// The shared test client cannot produce that ordering: it sends SETTINGS as
 /// part of connection setup, before any request can be made. So the client here
 /// is raw quinn with a hand-encoded HEADERS frame, and the ordering is the whole
 /// point — request first, control stream second.
@@ -361,9 +361,9 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
         .expect("send SETTINGS");
 
     // From here the reply must arrive as a QUIC datagram. Retried rather than
-    // slept on: the server samples the peer's settings on a timer, so which side
-    // of the flip a single packet lands on is a race, while *never* flipping is
-    // the bug.
+    // slept on: the SETTINGS frame and this datagram are in flight at the same
+    // time, so which side of the flip a single packet lands on is a race, while
+    // *never* flipping is the bug.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
@@ -396,24 +396,21 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 
 /// Encodes a CONNECT-UDP request (RFC 9298 §3) as an HTTP/3 HEADERS frame.
 ///
-/// Hand-built because the point of the test above is an ordering the `h3` client
-/// cannot produce. QPACK is used statelessly, which needs no encoder stream.
+/// Hand-built because the point of the test above is an ordering the shared test
+/// client cannot produce. Only the QPACK static table and literals are used, so
+/// no encoder stream is needed.
 fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<u8> {
-    use h3::qpack::{encode_stateless, HeaderField};
-
-    let fields = vec![
-        HeaderField::new(&b":method"[..], &b"CONNECT"[..]),
-        HeaderField::new(&b":protocol"[..], &b"connect-udp"[..]),
-        HeaderField::new(&b":scheme"[..], &b"https"[..]),
-        HeaderField::new(&b":authority"[..], authority.as_bytes()),
-        HeaderField::new(
-            &b":path"[..],
-            format!("/.well-known/masque/udp/{host}/{port}/").into_bytes(),
-        ),
+    let path = format!("/.well-known/masque/udp/{host}/{port}/");
+    let fields: [(&[u8], &[u8]); 5] = [
+        (b":method", b"CONNECT"),
+        (b":protocol", b"connect-udp"),
+        (b":scheme", b"https"),
+        (b":authority", authority.as_bytes()),
+        (b":path", path.as_bytes()),
     ];
 
-    let mut block = Vec::new();
-    encode_stateless(&mut block, &fields).expect("qpack encoding");
+    let mut block = BytesMut::new();
+    volto::h3::qpack::encode(&mut block, fields);
 
     let mut frame = BytesMut::new();
     datagram::put_varint(&mut frame, FRAME_HEADERS);

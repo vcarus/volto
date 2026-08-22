@@ -1,14 +1,12 @@
 # Dependabot only touches registry dependencies and action versions.
 #
-# The `h3` / `h3-quinn` git-rev pins in Cargo.toml are deliberately outside its
-# reach: Dependabot ignores git dependencies, and those pins are load-bearing
-# (the published releases carry proxy-fatal bugs — see docs/architecture.md).
-#
-# The `[patch.crates-io]` entry redirecting `quinn-proto` to a fork is out of its
-# reach for the same reason, and it is meant to be temporary: that fork is
-# rebased by hand until an upstream 0.11.x release carries the MTU black-hole
-# detector fix, at which point the whole stanza goes away. Both the patch and its
-# exit condition are documented in docs/architecture.md.
+# The `[patch.crates-io]` entry redirecting `quinn-proto` at a git commit is
+# outside its reach: Dependabot ignores git dependencies. It is meant to be
+# temporary — the commit is moved by hand until an upstream 0.11.x release
+# carries the MTU black-hole detector fix, at which point the whole stanza goes
+# away. Both the patch and its exit condition are documented in
+# docs/architecture.md. It is the only dependency in the tree that Dependabot
+# cannot see.
 #
 # Every dependency PR must pass the full CI suite, on Linux and macOS, before it
 # is merged.

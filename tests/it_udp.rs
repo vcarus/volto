@@ -311,7 +311,7 @@ async fn refuses_a_path_that_is_not_the_connect_udp_template() {
         .expect("request");
     request
         .extensions_mut()
-        .insert(h3::ext::Protocol::CONNECT_UDP);
+        .insert(common::Protocol::CONNECT_UDP);
 
     let response = respond_to(&mut client, request).await;
 
@@ -476,7 +476,7 @@ async fn a_truncated_capsule_is_rejected() {
     };
 
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
             code.value(),
             0x010e,
             "expected H3_MESSAGE_ERROR (0x10e), got {code:?} = {:#x}",
@@ -529,7 +529,7 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     };
 
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
             code.value(),
             H3_DATAGRAM_ERROR,
             "expected H3_DATAGRAM_ERROR (0x33), got {code:?} = {:#x}",
@@ -585,7 +585,7 @@ async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
     };
 
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
             code.value(),
             H3_NO_ERROR,
             "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",
@@ -736,12 +736,10 @@ async fn an_idle_session_closes_the_request_stream() {
 ///
 /// The idle timeout used to wrap that write along with the rest of the loop
 /// step, and `send_data` is not cancel-safe: the cancelled write left a partial
-/// DATA frame in the backend's buffer, and the tidy `finish()` that followed
-/// FINned a truncated capsule — malformed by RFC 9297 §3.3. Worse on the *first*
-/// request stream of a connection, which is what this session is: `h3` writes
-/// one grease frame ahead of the FIN there, the backend refuses a second write
-/// while the first is unflushed, and the whole connection went down with
-/// H3_INTERNAL_ERROR. Opening a second session at the end is what pins that.
+/// DATA frame in the buffer, and the tidy `finish()` that followed FINned a
+/// truncated capsule — malformed by RFC 9297 §3.3. It took the whole connection
+/// down with it rather than just this stream, which is why a second session is
+/// opened at the end: that is the half being pinned here.
 #[tokio::test]
 async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     use volto::capsule;
@@ -781,7 +779,7 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     .expect("the server must end the stalled stream on its own");
 
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
             code.value(),
             H3_REQUEST_CANCELLED,
             "expected H3_REQUEST_CANCELLED, got {code:?}"

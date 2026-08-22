@@ -51,12 +51,11 @@ Authentication deliberately runs *before* routing, so an unauthenticated client
 gets 407 rather than learning from a 501 which `:protocol` values this server
 implements.
 
-One caveat about that 501: at the pinned h3 revision, `:protocol` values unknown
-to h3 itself are rejected as `H3_MESSAGE_ERROR` inside h3 before the request
-reaches application code. Protocols h3 knows (`connect-ip`, `webtransport`,
-`websocket`) still get a proper 501. RFC 9220 makes the 501 a SHOULD, and the
-gap costs nothing in practice, so it is an accepted deviation rather than an
-upstream patch.
+That 501 is a real one for every `:protocol` value, not only the ones this
+server has heard of. The token is carried through as the bytes that arrived, so
+`connect-ip`, `webtransport` and anything else are answered with the status
+RFC 9220 asks for and logged under the name the client actually sent, rather
+than being refused as malformed before anything can look at them.
 
 ### Target address selection
 
@@ -170,40 +169,77 @@ the decoder desynchronizes on the first capsule that arrives.
 RFC 9297 §2.1.1 also forbids sending QUIC datagrams before the peer has
 advertised `SETTINGS_H3_DATAGRAM`. volto tracks this per connection rather than
 snapshotting it at handshake time, because the peer's SETTINGS frame usually
-arrives after the handshake completes — a snapshot would silently drop the first
-session's packets. The flag is re-read on every request and, until it is set,
-every 100 ms for the first ten seconds of the connection as well: a request can
-be accepted before the control stream carrying the SETTINGS has been read, and
-without the timer a connection whose only session was opened that early would
-stay on the capsule fallback for its whole life. Sessions already open switch to
-QUIC datagrams the moment the flag is seen. After ten seconds the timer retires —
-SETTINGS are the first frame on the control stream (RFC 9114 §6.2.1) and a
-setting cannot be revoked (§7.2.4), so a peer that has not enabled datagrams by
-then never will.
+arrives after the handshake completes — and a request can be accepted before the
+control stream carrying it has been read, so a connection whose only session was
+opened that early would stay on the capsule fallback for its whole life. The
+flag is one shared atomic: the task that reads the peer's control stream writes
+it, and every session reads it once per packet, so a session already open moves
+onto QUIC datagrams the moment the SETTINGS arrive, with no sampling step in
+between to get wrong.
 
-## Why h3 is pinned
+## The HTTP/3 layer
 
-`Cargo.toml` pins `h3` and `h3-quinn` to a git revision, and `Cargo.lock` is
-committed. The published 0.0.x releases predate three fixes that a proxy cannot
-live without ([hyperium/h3](https://github.com/hyperium/h3)):
+HTTP/3 is implemented in `src/h3` rather than taken from a crate. What it covers
+is what a CONNECT proxy needs, and it is stated in full:
 
-- **#340** — `h3-datagram` 0.0.2 computes the Quarter Stream ID varint and then
-  writes a zeroed array instead. Every outbound datagram is tagged Quarter Stream
-  ID 0, so the first UDP session on a connection happens to work and every
-  session after it is misrouted. This is the textbook version of "handshake fine,
-  no packets".
-- **#344** — unbounded memory growth in `BufRecvStream` against a slow consumer,
-  which is a denial-of-service surface for a long-running proxy.
-- **#331** — a panic in h3-quinn when `stop_sending` lands on a receive stream
-  that is still in progress. A proxy resets tunnel streams routinely.
-- **#357** — included in the same pinned revision.
+- **Framing** (RFC 9114 §7) — an incremental decoder that hands DATA payload on
+  in the chunks quinn delivered it in, buffers every other frame because none of
+  them can be acted on piecewise, and skips an unknown frame type by its declared
+  length without allocating for it.
+- **QPACK** (RFC 9204) against the static table, including Huffman decoding
+  (RFC 7541 Appendix B).
+- **The control stream** — SETTINGS, GOAWAY, and the rules about what may appear
+  there, read by a task of its own for as long as the connection lasts.
+- **Request validation** — RFC 9114 §4.1.2, §4.3 and §4.4 plus RFC 8441 §4: the
+  point at which a field section becomes an `http::Request` or is refused as
+  malformed.
 
-`h3-datagram` is deliberately **not** a dependency, both because of #340 and
-because everything volto needs from it is two varint operations; quinn's native
-`send_datagram`/`read_datagram` plus `src/datagram.rs` cover it.
+What it leaves out, deliberately:
 
-Do not bump the revision, run a blanket `cargo update`, or add `h3-datagram`
-without reviewing the upstream changes and running the full suite.
+- **The QPACK dynamic table.** `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and
+  `SETTINGS_QPACK_BLOCKED_STREAMS` are both advertised as 0, which RFC 9204
+  §3.2.3 and §2.1.2 make binding on the peer's encoder. A field line referencing
+  a dynamic entry is therefore a protocol violation answered with
+  `QPACK_DECOMPRESSION_FAILED`, not a gap in the implementation — and the
+  eviction, the two instruction streams and the head-of-line blocking that go
+  with a dynamic table are all gone with it.
+- **Huffman encoding.** A response here is a status line and at most two short
+  fields; compressing it would save a handful of bytes per tunnel. Decoding is
+  implemented because a client's request arrives Huffman-coded.
+- **Server push and WebTransport.** A push stream from a client is a connection
+  error either way (RFC 9114 §6.2.2), and `webtransport` is a `:protocol` this
+  server answers 501 to.
+
+A connection error is a `quinn::Connection::close` carrying the HTTP/3 code,
+which is exactly what RFC 9114 §8 defines one to be. Nothing has to be
+propagated between tasks: closing the connection makes every operation on it
+fail on its own, so only the *reason* is recorded on the way past — quinn
+overwrites its own stored reason with "closed locally" — and read back by the
+accept loop.
+
+Field sections are bounded at 64 KiB, advertised as
+`SETTINGS_MAX_FIELD_SECTION_SIZE` so a peer that respects SETTINGS never sends
+more, and enforced on receipt so one that does not gets no further. The frame
+layer refuses an oversized non-DATA frame from its declared length, before a byte
+is allocated for it.
+
+Two deviations are taken knowingly:
+
+- A CONNECT-UDP request carrying `Content-Length` or `Transfer-Encoding` is
+  answered **400 with a `Proxy-Status` field** (RFC 9297 §3.2) rather than reset
+  as malformed under RFC 9114 §4.2's rule about connection-specific fields. A
+  status the client can read says more than a bare stream reset, and `it_udp`
+  pins that answer. The `Connection` field itself is still treated as malformed.
+- A peer that closes its QPACK encoder or decoder stream is **not** treated as
+  `H3_CLOSED_CRITICAL_STREAM`, which RFC 9204 §4.2 requires. With a zero table
+  capacity those streams carry nothing, so nothing is lost when they end — and a
+  client that tidily finishes its streams a moment before CONNECTION_CLOSE would
+  otherwise be logged as a fault it did not commit.
+
+HTTP Datagrams are hand-rolled in `src/datagram.rs`. That started as a way around
+`h3-datagram` 0.0.2, which tagged every datagram with Quarter Stream ID 0 and so
+misrouted every session after the first on a connection; it is simply ours now —
+about thirty lines of varint work with no dependency behind them.
 
 ## Why quinn-proto is patched (temporary)
 
@@ -249,10 +285,12 @@ workaround described below. Two things do not work while it is in place:
 
 ## The h3api boundary
 
-`src/h3api.rs` is the only module allowed to name `h3` or `h3-quinn` types.
-Everything else sees `http`, `bytes` and `quinn` types. The boundary keeps a
-0.0.x dependency's API churn contained in one file, and leaves the door open to
-swapping the HTTP/3 implementation without touching the tunnel logic.
+`src/h3api.rs` is the facade over `src/h3`: the only module allowed to name a
+type from it, so that everything else — `conn`, `quic`, the tunnels — sees
+`http`, `bytes` and `quinn` types plus the handful of wrappers it exports. The
+boundary began as insulation from a 0.0.x dependency's API churn and was kept on
+its own terms: it is the list of what a proxy actually asks of HTTP/3, and it is
+short enough to read in one sitting.
 
 One gotcha it cannot hide: `h3api::Connection::handshake` consumes the
 `quinn::Connection`, so clone it first if you also need datagram I/O.
@@ -282,12 +320,13 @@ Two tests are load-bearing beyond their names:
 setup/teardown rounds) and a light tier in the default run that catches slot
 leaks by shrinking the quota until a leak turns into an observable 503.
 
-Test infrastructure lives in `tests/common/mod.rs`: an in-process server plus
-self-signed certificates from `rcgen`, so no test needs a fixture on disk.
+Test infrastructure lives in `tests/common/`: an in-process server plus
+self-signed certificates from `rcgen`, so no test needs a fixture on disk, and
+the HTTP/3 client in `tests/common/h3client.rs` that drives it.
 
-One thing that suite cannot do is disagree with itself: its client is built from
-the same pinned `h3` revision as the server, so both ends share any
-misunderstanding of the specification. The `interop` CI job closes that gap by
+One thing that suite cannot do is disagree with itself: that client is built on
+the same codec as the server, so a misreading of the framing or of QPACK is one
+both ends share. The `interop` CI job closes that gap by
 starting a real `volto` process and driving it with Go's
 [masque-go](https://github.com/quic-go/masque-go) on quic-go — an independent
 implementation — over the RFC 9298 default URI template, with authentication on

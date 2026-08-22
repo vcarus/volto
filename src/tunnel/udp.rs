@@ -616,12 +616,10 @@ impl Session {
         // no progress for a whole idle timeout is that client.
         //
         // It cannot simply be abandoned. A cancelled send leaves a partial DATA
-        // frame in the backend's buffer, and the tidy `finish()` the session
-        // otherwise ends with would then FIN a truncated capsule — malformed by
-        // RFC 9297 §3.3 — or, on the first request stream of a connection, fail
-        // the whole connection while `h3` tries to write its one grease frame
-        // ahead of the FIN. So the stream is reset instead, which says the same
-        // thing without leaving a half-written frame behind.
+        // frame on the stream, and the tidy `finish()` the session otherwise
+        // ends with would then FIN a truncated capsule — malformed by RFC 9297
+        // §3.3. So the stream is reset instead, which says the same thing
+        // without leaving a half-written frame behind.
         match tokio::time::timeout(self.ctx.idle_timeout, self.writer.send_data(encoded)).await {
             Ok(Ok(())) => Step::Continue,
             Ok(Err(error)) => {
@@ -1100,8 +1098,8 @@ mod tests {
     }
 
     /// RFC 9298 §3.4: `:scheme` must be there and must not be empty. Only a
-    /// hand-rolled client can get this wrong — `h3` fills the field in — which
-    /// is exactly why the server cannot assume it.
+    /// hand-rolled client can get this wrong — a client library fills the field
+    /// in — which is exactly why the server cannot assume it.
     #[test]
     fn rejects_a_request_without_a_scheme() {
         let mut request = connect_udp_request();

@@ -5,10 +5,11 @@ the test suite is expected to pass on both.
 
 ## Building
 
-Rust 1.85 or newer. `Cargo.lock` is committed and `h3`/`h3-quinn` are pinned to a
-git revision (the published releases carry proxy-fatal bugs — see
-[architecture.md](architecture.md#why-h3-is-pinned)), so build with the lockfile
-and do **not** run `cargo update`:
+Rust 1.85 or newer. `Cargo.lock` is committed, and `quinn-proto` is redirected
+by a `[patch.crates-io]` stanza to a commit carrying an MTU fix no release has
+yet (see
+[architecture.md](architecture.md#why-quinn-proto-is-patched-temporary)), so
+build with the lockfile and do **not** run `cargo update`:
 
 ```sh
 cargo build --release --locked      # target/release/volto

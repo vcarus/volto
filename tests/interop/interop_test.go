@@ -2,9 +2,9 @@
 // CONNECT-UDP sessions through a running volto server.
 //
 // Every other test in this repository has volto on both ends — the in-process
-// HTTP/3 client in `tests/common/mod.rs` is built from the same pinned `h3`
-// revision as the server, so the two agree by construction even where both are
-// wrong. This suite removes that symmetry: the client is Go's
+// HTTP/3 client in `tests/common/h3client.rs` is built on the server's own
+// HTTP/3 codec, so the two agree by construction even where both are wrong.
+// This suite removes that symmetry: the client is Go's
 // github.com/quic-go/masque-go on top of quic-go, an implementation that shares
 // no code, no QUIC stack and no reading of the RFCs with volto.
 //

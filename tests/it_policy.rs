@@ -437,7 +437,7 @@ async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
     };
 
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => assert_eq!(
+        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
             code.value(),
             H3_NO_ERROR,
             "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",

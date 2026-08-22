@@ -19,9 +19,9 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 const H3_CONNECT_ERROR: u64 = 0x010f;
 
 /// The code a peer-initiated reset carries, or a panic naming what arrived.
-fn remote_terminate_code(error: &h3::error::StreamError) -> u64 {
+fn remote_terminate_code(error: &volto::h3api::StreamError) -> u64 {
     match error {
-        h3::error::StreamError::RemoteTerminate { code, .. } => code.value(),
+        volto::h3api::StreamError::RemoteTerminate { code } => code.value(),
         other => panic!("expected a remote stream reset, got {other:?}"),
     }
 }
@@ -104,8 +104,8 @@ async fn target_reset_becomes_h3_connect_error() {
         .await
         .expect("send payload");
 
-    // `recv_data` yields an opaque `Buf` that is not `Debug`, so `expect_err`
-    // is unavailable here.
+    // Matched rather than `expect_err`ed: the point is to name what a success
+    // would have meant, which a panic message from `expect_err` cannot.
     let error = match tokio::time::timeout(TIMEOUT, stream.recv_data())
         .await
         .expect("the reset arrived")
@@ -209,7 +209,7 @@ async fn client_reset_aborts_the_target_connection() {
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Abruptly reset the request stream instead of finishing it.
-    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+    stream.stop_stream(volto::h3api::Code::H3_REQUEST_CANCELLED);
     drop(stream);
 
     let end = tokio::time::timeout(TIMEOUT, ended.recv())

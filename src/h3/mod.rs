@@ -18,20 +18,25 @@
 //!
 //! # Why it exists
 //!
-//! It replaces the `h3` and `h3-quinn` crates, which remain in the tree as test
-//! dependencies so the integration suite drives this server with an
-//! independently written client. That is the point of the exercise: the tests
-//! assert on-wire behaviour, and the client asserting it shares no code with the
-//! server producing it.
+//! It replaces the `h3` and `h3-quinn` crates, which are no longer in the tree
+//! at all. They were pinned to a git revision because the published releases
+//! carried bugs a proxy cannot live with, and being generic over any QUIC stack
+//! cost this server -- which has exactly one -- more than it bought. What a
+//! proxy asks of HTTP/3 turned out to be small enough to state in full, which is
+//! what the modules above do.
+//!
+//! The integration suite's client is built on these same modules
+//! (`tests/common/h3client.rs`), so the check that this server has not
+//! misunderstood the wire in a way a peer would notice belongs entirely to the
+//! `interop` CI job, which drives a real server with Go's masque-go.
 //!
 //! # What holds it together
 //!
-//! * **Nothing is generic over the QUIC layer.** `h3` is generic so that any
-//!   QUIC stack can back it; this server has exactly one, so the types are
-//!   `quinn`'s and the indirection is gone. `quinn::SendStream` and
-//!   `quinn::RecvStream` are held directly, which also means their `Drop`
-//!   behaviour -- a finish on the send side, `STOP_SENDING` on the receive side
-//!   -- is what `tunnel::tcp` reasons about, unmediated.
+//! * **Nothing is generic over the QUIC layer.** The types are `quinn`'s, and
+//!   the indirection a library needs in order to back any stack is gone.
+//!   `quinn::SendStream` and `quinn::RecvStream` are held directly, which also
+//!   means their `Drop` behaviour -- a finish on the send side, `STOP_SENDING`
+//!   on the receive side -- is what `tunnel::tcp` reasons about, unmediated.
 //! * **The peer's state is shared, not polled.** One background task per
 //!   connection reads every unidirectional stream, so the peer's SETTINGS take
 //!   effect the moment they arrive rather than the next time a request is

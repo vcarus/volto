@@ -425,7 +425,7 @@ impl Server {
             // Which of the two log levels this connection deserves is decided
             // from the error value `conn::handle` returned, and never from
             // `rtt_probe.close_reason()`. Returning from `conn::handle` drops
-            // the `h3` connection, whose `Drop` closes the QUIC connection with
+            // the HTTP/3 connection, whose `Drop` closes the QUIC connection with
             // H3_NO_ERROR; quinn's close path then unconditionally overwrites
             // the stored reason with `LocallyClosed`. So by the time control is
             // back here, `close_reason()` reports that drop rather than whatever

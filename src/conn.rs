@@ -128,8 +128,8 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     let (req, mut stream) = match resolver.resolve().await {
         Ok(resolved) => resolved,
         Err(error) => {
-            // Malformed headers, a client reset mid-headers, and similar. `h3`
-            // has already reset the stream for us.
+            // Malformed headers, a client reset mid-headers, and similar. The
+            // resolver has already reset the stream for us.
             debug!(%error, "failed to resolve request");
             return;
         }
