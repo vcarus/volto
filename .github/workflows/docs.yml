@@ -1,0 +1,63 @@
+name: Docs
+
+# The crate's rustdoc, rebuilt from `main` on every push and published with
+# GitHub Pages. The CI workflow already builds it as a lint gate; this one keeps
+# the result. It runs only on `main`: a pull request cannot publish, and nothing
+# in it needs more than read access to the repository.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Deployments queue rather than cancel: Pages serves whichever finished last,
+# and cancelling one midway would leave a stale site behind a newer commit.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The same invocation the CI gate runs, so what gets published is exactly
+      # what passed.
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # rustdoc puts the crate one directory down and leaves a lock file behind;
+      # the site root sends a reader to the crate, and the lock does not ship.
+      - run: |
+          printf '<!doctype html><meta http-equiv="refresh" content="0; url=volto/">\n' > target/doc/index.html
+          rm -f target/doc/.lock
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: target/doc
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    # The only write this workflow performs, scoped to the job that performs it.
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

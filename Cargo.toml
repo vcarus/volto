@@ -5,6 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
+documentation = "https://vcarus.github.io/volto/"
 license = "MIT"
 # The `[patch.crates-io]` stanza below cannot be expressed on crates.io, and this
 # is a server rather than a library anyone would depend on.

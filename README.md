@@ -103,6 +103,8 @@ cargo run --locked -- --config config.toml
 - [docs/architecture.md](docs/architecture.md) — how a request becomes a tunnel,
   what the in-tree HTTP/3 layer does and does not implement, why quinn-proto is
   patched, and what the tests assert.
+- [API documentation](https://vcarus.github.io/volto/) — the crate's rustdoc,
+  module by module, rebuilt from `main` on every push.
 
 A commented example configuration ships in
 [script/config.example.toml](script/config.example.toml).
