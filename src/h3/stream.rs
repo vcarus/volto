@@ -2,11 +2,12 @@
 //!
 //! # Reading
 //!
-//! A request stream carries HEADERS, then a body of DATA frames, then an
-//! optional trailer section (RFC 9114 §4.1). Only the first of those is
-//! buffered: the body is handed on in the chunks it arrived in, because for this
-//! server the body *is* the tunnel and every copy of it would be paid for per
-//! packet.
+//! A request stream carries HEADERS and then a body of DATA frames. Only the
+//! first is buffered: the body is handed on in the chunks it arrived in, because
+//! for this server the body *is* the tunnel and every copy of it would be paid
+//! for per packet. Nothing follows the body -- RFC 9114 §4.4 permits only DATA
+//! on a stream whose CONNECT has completed, so the trailer section §4.1 allows
+//! an ordinary request is a frame this server never sees a use for.
 //!
 //! # Validating
 //!
@@ -127,13 +128,21 @@ impl Resolver {
             // out first and that side is finished cleanly; the receiving side is
             // then stopped with the code, because the rest of the section is
             // precisely what this server has declined to read.
-            // H3_EXCESSIVE_LOAD reaches this arm only as a stream-class
-            // violation, which is what both of its stream-class sources are:
-            // the per-frame buffering limit and a field section that decoded
-            // past what `SETTINGS_MAX_FIELD_SECTION_SIZE` told the peer to
-            // send, the same 64 KiB either way. The connection-wide buffering
-            // budget (D77) carries the same code as a connection-class
-            // violation, and that one is `answer`'s.
+            //
+            // All three of this server's H3_EXCESSIVE_LOAD sources on a request
+            // stream are stream-class and all three land here: the per-frame
+            // buffering limit, a field section that decoded past what
+            // `SETTINGS_MAX_FIELD_SECTION_SIZE` told the peer to send -- the
+            // same 64 KiB either way -- and the connection-wide buffering budget
+            // of D77, which refuses the request that would overrun it rather
+            // than the connection holding it. The guard stays because
+            // `is_connection_error` is what decides between answering and
+            // closing everywhere else in this file, and a code is not a class.
+            //
+            // The write is bounded for the reason `tunnel::refuse_with`'s
+            // documentation gives, and abandoned the same way: a peer that
+            // grants no flow-control window never takes these fifty-odd bytes,
+            // and a FIN would only queue behind them.
             Err(frame::Error::Protocol(violation))
                 if violation.code() == Code::H3_EXCESSIVE_LOAD
                     && !violation.is_connection_error() =>
@@ -144,10 +153,18 @@ impl Resolver {
                     frames,
                     header: BytesMut::with_capacity(2 * MAX_VARINT),
                 };
-                let _ = stream
-                    .respond(Status::REQUEST_HEADER_FIELDS_TOO_LARGE)
-                    .await;
-                let _ = stream.finish();
+                match tokio::time::timeout(
+                    within,
+                    stream.respond(Status::REQUEST_HEADER_FIELDS_TOO_LARGE),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        let _ = stream.finish();
+                    }
+                    Ok(Err(_refused)) => {}
+                    Err(_elapsed) => stream.reset(Code::H3_REQUEST_CANCELLED),
+                }
                 stream.stop_receiving(violation.code());
                 Err(StreamError::Local(violation))
             }
@@ -209,9 +226,15 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
             // first.
             Some(Item::Skipped { .. }) => {}
 
-            // RFC 9114 §4.1's rule about an invalid sequence of frames, quoted
-            // in full on `Reader::recv_data`, where the rest of a request
-            // stream's frame order is judged.
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# Receipt of an invalid sequence of frames MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED. In particular, a
+            //# DATA frame before any HEADERS frame, or a HEADERS or DATA frame
+            //# after the trailing HEADERS frame, is considered invalid.
+            //
+            // The first of those cases. What may follow the HEADERS is judged
+            // by `Reader::recv_data`, under the stricter rule §4.4 gives a
+            // stream whose CONNECT has completed.
             Some(_) => {
                 return Err(Violation::connection(
                     Code::H3_FRAME_UNEXPECTED,
@@ -687,7 +710,6 @@ impl Stream {
             Reader {
                 handle: self.handle,
                 frames: self.frames,
-                trailers: false,
             },
         )
     }
@@ -733,8 +755,6 @@ impl Writer {
 pub struct Reader {
     handle: Handle,
     frames: FrameReader,
-    /// Whether a trailer section has been received (RFC 9114 §4.1).
-    trailers: bool,
 }
 
 impl Reader {
@@ -763,48 +783,31 @@ impl Reader {
                 // surface as `Some(empty)`: a caller relaying the body would
                 // put a zero-length packet on the far side of the tunnel, and a
                 // caller counting chunks would count one that carried nothing.
-                // The frame is still a DATA frame for the rule below.
-                Item::Data(data) if !self.trailers && data.is_empty() => {}
+                Item::Data(data) if data.is_empty() => {}
 
-                Item::Data(data) if !self.trailers => return Ok(Some(data)),
+                Item::Data(data) => return Ok(Some(data)),
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                //# Receipt of an invalid sequence of frames MUST be treated as a
-                //# connection error of type H3_FRAME_UNEXPECTED. In
-                //# particular, a DATA frame before any HEADERS frame, or a
-                //# HEADERS or DATA frame after the trailing HEADERS frame, is
-                //# considered invalid.
-                Item::Data(_) => {
-                    return Err(self.report(
-                        Violation::connection(
-                            Code::H3_FRAME_UNEXPECTED,
-                            "a DATA frame after the trailer section",
-                        )
-                        .into(),
-                    ))
-                }
-
-                // The trailer section. Its fields are of no use to a tunnel --
-                // there is no representation for them to describe -- so they are
-                // accepted and dropped, and only the end of the stream may
-                // follow.
-                Item::Frame(Frame::Headers(_)) if !self.trailers => self.trailers = true,
-
-                Item::Frame(Frame::Headers(_)) => {
-                    return Err(self.report(
-                        Violation::connection(
-                            Code::H3_FRAME_UNEXPECTED,
-                            "a second trailer section",
-                        )
-                        .into(),
-                    ))
-                }
-
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+                //# Once the CONNECT method has completed, only DATA frames are
+                //# permitted to be sent on the stream. Extension frames MAY be
+                //# used if specifically permitted by the definition of the
+                //# extension. Receipt of any other known frame type MUST be
+                //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+                //
+                // A [`Reader`] exists only once this server has answered a
+                // CONNECT with a 200, so that sentence is the whole of the
+                // frame rule for the rest of the stream -- a trailer section
+                // included. There is no representation on a tunnel for a
+                // trailer to describe, and RFC 9220 §3 extends CONNECT to
+                // other protocols by pointing at this same section rather than
+                // by reopening it. The exception the sentence makes is the one
+                // RFC 9114 §9 makes for unknown types, and those are skipped
+                // above; every known one arrives here.
                 Item::Frame(_) => {
                     return Err(self.report(
                         Violation::connection(
                             Code::H3_FRAME_UNEXPECTED,
-                            "a frame that may not appear on a request stream",
+                            "a frame other than DATA once the CONNECT method had completed",
                         )
                         .into(),
                     ))

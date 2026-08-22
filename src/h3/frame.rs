@@ -105,18 +105,18 @@ const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
 
 /// What one connection may hold in `FrameDecoder` payload buffers, as a
-/// counter every decoder on it shares (D77).
+/// counter every request stream on it shares (D77).
 ///
 /// `MAX_BUFFERED_FRAME` is per frame and so per stream; this is the sum over
 /// the streams, which is the number a peer opening many of them actually
 /// controls. [`super::HEADERS_BUFFER_BUDGET`] says why that distinction is
 /// worth a counter and how the value was chosen.
 ///
-/// Every decoder on a connection holds the same one -- the control stream's and
-/// one per request stream -- so a share taken on any of them is a share the
-/// others cannot take. Charging happens when a decoder commits to buffering a
-/// frame and releasing when that frame completes or its decoder is dropped, so
-/// the counter reads zero on a connection with nothing half-received on it.
+/// Every request stream's decoder holds the same one, so a share taken on any
+/// of them is a share the others cannot take. Charging happens when a decoder
+/// commits to buffering a frame and releasing when that frame completes or its
+/// decoder is dropped, so the counter reads zero on a connection with nothing
+/// half-received on it.
 #[derive(Debug, Default)]
 pub struct BufferBudget {
     /// Bytes announced by the frames currently being buffered.
@@ -129,17 +129,39 @@ pub struct BufferBudget {
 }
 
 impl BufferBudget {
+    /// A budget of its own, for a stream that shares one with nothing.
+    ///
+    /// The counter is shared because a peer chooses how many request streams to
+    /// open; the control stream is one per connection and buffers one frame at a
+    /// time, so the per-frame bound holds it on its own and it has nothing to
+    /// share. Keeping it out of the shared counter is also what stops a peer
+    /// that has filled that counter with request streams from making its own
+    /// well-formed SETTINGS or GOAWAY the frame that is refused: a refusal there
+    /// could not be the stream-class one a charge past the budget hands out,
+    /// since closing the control stream is itself a connection error
+    /// (RFC 9114 §6.2.1, quoted in [`super::connection`]).
+    pub fn unshared() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
     /// Takes `bytes` from the budget, or reports that the connection is past
     /// it.
     ///
-    /// A connection error rather than a stream one, because the peer at fault
-    /// is not identifiable stream by stream: every stream involved may be
-    /// within [`MAX_BUFFERED_FRAME`], and the one that happens to arrive last
-    /// has done nothing the others did not. RFC 9114 §8.1 defines
-    /// H3_EXCESSIVE_LOAD for a peer "exhibiting a behavior that might be
-    /// generating excessive load", which is what holding a connection's whole
-    /// buffering allowance in frames it never finishes is -- the same reading
-    /// [`super::qpack`] takes of the same code.
+    /// A *stream* error, on the stream whose frame is arriving. That stream is
+    /// not the one at fault -- the bound is a connection's, every stream holding
+    /// a share of it may be within [`MAX_BUFFERED_FRAME`], and the one that
+    /// happens to arrive last has done nothing the others did not. But the
+    /// alternative is to close a connection, and its tunnels, over a request
+    /// that is merely the seventeenth largest one allowed at once, which a
+    /// client breaking no rule can reach. RFC 9114 §4.2.2 says what to do with a
+    /// field section this server is unwilling to handle, and it is about the one
+    /// request: `stream::Resolver` answers this with the same 431 the per-frame
+    /// bound gets, and the connection carries on.
+    ///
+    /// RFC 9114 §8.1 defines H3_EXCESSIVE_LOAD for a peer "exhibiting a
+    /// behavior that might be generating excessive load", which is what holding
+    /// a connection's whole buffering allowance in frames it never finishes is
+    /// -- the same reading [`super::qpack`] takes of the same code.
     ///
     /// `fetch_update` rather than an add-then-check: a rejected charge must
     /// leave the counter untouched, or two streams failing at once would each
@@ -152,7 +174,7 @@ impl BufferBudget {
                 (wanted <= HEADERS_BUFFER_BUDGET).then_some(wanted)
             })
             .map_err(|held| {
-                Violation::connection(
+                Violation::stream(
                     Code::H3_EXCESSIVE_LOAD,
                     format!(
                         "buffering another {bytes} bytes would put this connection past the \
@@ -165,19 +187,36 @@ impl BufferBudget {
     }
 
     /// Gives `bytes` back to the budget.
+    ///
+    /// Saturating, and asserted in debug builds: nothing today can return more
+    /// than it took -- `charged` is written only after a charge succeeds and
+    /// zeroed by the `mem::take` that hands it here -- but an underflow would
+    /// wrap the counter to somewhere near `usize::MAX` and leave the connection
+    /// refusing every request from then on, with a reason line reporting a
+    /// figure no machine has the memory for. A saturating subtraction turns that
+    /// into a budget that is merely wrong, which is recoverable and legible.
     fn release(&self, bytes: usize) {
         if bytes > 0 {
-            self.held.fetch_sub(bytes, Ordering::Relaxed);
+            let held = self
+                .held
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                    Some(held.saturating_sub(bytes))
+                });
+            debug_assert!(
+                held.is_ok_and(|held| held >= bytes),
+                "released {bytes} bytes from a budget holding {held:?}"
+            );
         }
     }
 
     /// Bytes currently charged to this connection.
     ///
-    /// For the tests that assert the accounting: what is charged and released
-    /// is not visible on the wire until the budget is spent, and a share that
-    /// is never returned would show up only as a connection that eventually
-    /// refuses a request it should have served.
-    pub fn held(&self) -> usize {
+    /// For the unit tests that assert the accounting, and nothing else: what is
+    /// charged and released is not visible on the wire until the budget is
+    /// spent, and a share that is never returned would show up only as a
+    /// connection that eventually refuses a request it should have served.
+    #[cfg(test)]
+    fn held(&self) -> usize {
         self.held.load(Ordering::Relaxed)
     }
 }
@@ -1162,10 +1201,10 @@ mod tests {
         assert_eq!(budget.held(), 0);
     }
 
-    /// D77: frames each within [`MAX_BUFFERED_FRAME`] still end the connection
-    /// once their sum is past what one connection may hold.
+    /// D77: frames each within [`MAX_BUFFERED_FRAME`] are still refused once
+    /// their sum is past what one connection may hold.
     #[test]
-    fn frames_past_the_connection_budget_end_the_connection() {
+    fn frames_past_the_connection_budget_are_refused_one_at_a_time() {
         /// A decoder that has announced a full-sized frame and sent none of it.
         fn announce(budget: &Arc<BufferBudget>) -> (FrameDecoder, Result<Option<Item>, Error>) {
             let mut decoder = FrameDecoder::new(budget.clone());
@@ -1197,8 +1236,8 @@ mod tests {
         };
         assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
         assert!(
-            violation.is_connection_error(),
-            "the peer is at fault, not any one of its streams"
+            !violation.is_connection_error(),
+            "the arriving request is refused, not the connection carrying it"
         );
         assert_eq!(
             budget.held(),

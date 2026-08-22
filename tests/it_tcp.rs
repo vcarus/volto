@@ -21,6 +21,9 @@ const H3_CONNECT_ERROR: u64 = 0x010f;
 /// H3_MESSAGE_ERROR (RFC 9114 §8.1), the answer to a malformed request.
 const H3_MESSAGE_ERROR: u64 = 0x010e;
 
+/// H3_FRAME_UNEXPECTED (RFC 9114 §8.1), the answer to a frame out of place.
+const H3_FRAME_UNEXPECTED: u64 = 0x0105;
+
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
     let server = TestServer::start().await;
@@ -557,5 +560,46 @@ async fn concurrent_tunnels_on_one_connection_stay_independent() {
     for (i, stream) in &mut streams {
         let echoed = read_at_least(stream, 8).await;
         assert_eq!(echoed, vec![*i; 8], "tunnel {i} received another's bytes");
+    }
+}
+
+/// RFC 9114 §4.4 permits only DATA on a stream whose CONNECT has completed, and
+/// makes any other known frame a connection error — a trailer section included,
+/// which is the one an ordinary request would be allowed.
+#[tokio::test]
+async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // A working tunnel first, so what is refused is a frame on a stream that had
+    // completed its CONNECT rather than one that never got that far.
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    stream
+        .send_data(Bytes::from_static(b"hello volto"))
+        .await
+        .expect("send payload");
+    let echoed = read_at_least(&mut stream, b"hello volto".len()).await;
+    assert_eq!(&echoed, b"hello volto");
+
+    stream
+        .send_trailers(&[(b"x-trailer", b"volto")])
+        .await
+        .expect("send a trailer section");
+
+    let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("a trailer section must end the connection");
+
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            let reason = String::from_utf8_lossy(&close.reason);
+            assert_eq!(
+                close.error_code.into_inner(),
+                H3_FRAME_UNEXPECTED,
+                "the peer must be told which rule it broke; reason was {reason:?}"
+            );
+        }
+        other => panic!("expected an application close, got {other}"),
     }
 }

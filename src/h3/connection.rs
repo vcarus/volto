@@ -95,10 +95,11 @@ pub(crate) struct Shared {
     /// What this connection may hold in half-received frames at once (D77).
     ///
     /// Its own `Arc` for the same reason `peer_datagrams` has one: it is held
-    /// by things that outlive no single scope. Every [`FrameReader`] on the
-    /// connection draws on this one -- the peer's control stream and one per
-    /// request stream -- which is what makes the bound a property of the
-    /// connection rather than of each stream separately.
+    /// by things that outlive no single scope. Every request stream's
+    /// [`FrameReader`] draws on this one, which is what makes the bound a
+    /// property of the connection rather than of each stream separately. The
+    /// peer's control stream is the one reader that does not: see
+    /// [`BufferBudget::unshared`].
     buffered: Arc<BufferBudget>,
     /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
     ///
@@ -775,7 +776,10 @@ async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
 
 /// Reads the peer's control stream until the connection ends.
 async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
-    let mut frames = FrameReader::new(recv, handle.budget());
+    // Not the connection's budget: one control stream buffering one frame at a
+    // time is already bounded, and a refusal here could not be the stream-class
+    // one that budget hands out (see [`BufferBudget::unshared`]).
+    let mut frames = FrameReader::new(recv, BufferBudget::unshared());
     let mut control = Control::default();
 
     loop {

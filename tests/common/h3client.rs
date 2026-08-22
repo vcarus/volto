@@ -507,7 +507,8 @@ impl ClientStream {
                 Some(Item::Skipped { .. }) => {}
 
                 // RFC 9114 §4.1's rule about an invalid sequence of frames,
-                // quoted in full on `volto::h3::stream::Reader::recv_data`.
+                // quoted in full in `volto::h3::stream`, where the server side
+                // of the same rule is judged.
                 Some(_) => return Err(unexpected("a response that does not begin with HEADERS")),
                 None => return Err(unexpected("a stream that ended before the response")),
             }
@@ -570,6 +571,21 @@ impl ClientStream {
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
         frame::put_header(&mut self.header, frame::DATA, data.len() as u64);
         let mut chunks = [self.header.split().freeze(), data];
+        self.send.write_all_chunks(&mut chunks).await?;
+        Ok(())
+    }
+
+    /// Sends a trailer section: a second HEADERS frame on a live stream.
+    ///
+    /// Nothing this suite does with a tunnel wants one, and RFC 9114 §4.4 leaves
+    /// no room for one on a stream whose CONNECT has completed. It is here so a
+    /// test can send what the server has to refuse.
+    pub async fn send_trailers(&mut self, fields: &[(&[u8], &[u8])]) -> Result<(), StreamError> {
+        let mut block = BytesMut::new();
+        qpack::encode(&mut block, fields.iter().copied());
+
+        frame::put_header(&mut self.header, frame::HEADERS, block.len() as u64);
+        let mut chunks = [self.header.split().freeze(), block.freeze()];
         self.send.write_all_chunks(&mut chunks).await?;
         Ok(())
     }

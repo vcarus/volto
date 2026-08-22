@@ -237,6 +237,73 @@ async fn a_refusal_the_peer_will_not_take_is_reset() {
     );
 }
 
+/// The 431 the codec answers with is bounded like every other refusal.
+///
+/// It is written before any tunnel exists and by a different piece of code than
+/// `tunnel::refuse_with`, so it needs the deadline said separately: a peer that
+/// grants no room for the answer would otherwise park a server task on a window
+/// that is not coming, holding the request it is refusing (review H1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_431_the_peer_will_not_take_is_reset() {
+    let server = TestServer::start_with(DELIBERATE).await;
+    let endpoint =
+        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    // Twice the advertised limit, declared in the frame header: the server
+    // refuses it from the length alone, so this is the 431 arm of the codec
+    // rather than anything a tunnel decides.
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, 2 * volto::h3::MAX_FIELD_SECTION_SIZE);
+    frame.extend_from_slice(b"\x00");
+    send.write_all(&frame)
+        .await
+        .expect("announce an oversized field section");
+
+    // Past the server's idle timeout without reading a byte: reading is what
+    // would grow the window and let the answer through.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(4096))
+        .await
+        .expect("the server must not wait for a window that is not coming")
+        .expect_err("an answer the peer would not take must end in a reset");
+
+    match error {
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_CANCELLED,
+            "an abandoned answer is a cancelled request"
+        ),
+        other => panic!("expected the response side to be reset, got {other}"),
+    }
+
+    // One abandoned answer is not a reason to drop everything else.
+    assert!(
+        connection.close_reason().is_none(),
+        "the connection must survive a stream it could not answer"
+    );
+}
+
+/// Transport parameters for a peer with no room for an answer at all.
+///
+/// A ten-byte 431 fits in any per-stream window big enough for the server's own
+/// 19-byte SETTINGS frame, so what has to be exhausted here is the *connection*
+/// window. Nothing in this test reads the server's control stream, so those 19
+/// bytes stay charged to that window for the whole of it and leave less than a
+/// response behind them.
+fn windowless_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(24u32.into());
+    transport.stream_receive_window(24u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    transport
+}
+
 /// Transport parameters for a peer that takes an answer and then stops reading.
 ///
 /// 24 bytes is under every response this server sends and over the 19-byte
@@ -307,16 +374,26 @@ async fn a_zero_budget_disables_the_cap() {
     );
 }
 
+/// Field sections of the largest advertised size one connection may hold
+/// half-received at once (D77).
+///
+/// The whole of the bound, and written out rather than derived: dividing
+/// `HEADERS_BUFFER_BUDGET` by `MAX_FIELD_SECTION_SIZE` is how the value was
+/// chosen, so a change to either of them belongs in a test that says what the
+/// number became.
+const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
+
 /// Request streams enough to run one connection past its buffering budget (D77).
 ///
 /// Each of them announces the largest field section the server advertises, which
 /// is also the most it will buffer for a single frame, so the budget divides into
-/// exactly that many of them and the next one is the one that cannot fit. The
-/// spare few are there because the peer does not have to get the arithmetic right
-/// for the bound to hold, and because the server is entitled to be holding
-/// nothing at all by the time the last of them arrives.
+/// exactly [`FULL_SIZED_FRAMES_THAT_FIT`] of them and the next one is the one
+/// that cannot fit. The spare few are what makes the count of refusals exact
+/// without the test having to know which stream the server's tasks reach first:
+/// not one of these frames is ever completed, so every one past the budget is
+/// refused whatever order they arrive in.
 fn streams_past_the_budget() -> usize {
-    volto::h3::HEADERS_BUFFER_BUDGET / volto::h3::MAX_FIELD_SECTION_SIZE as usize + 4
+    FULL_SIZED_FRAMES_THAT_FIT + 4
 }
 
 /// Opens a request stream, announces a full-sized HEADERS frame on it and sends
@@ -344,45 +421,73 @@ async fn announce_oversized_headers(
 
 /// Every frame here is within what the server will buffer for one frame, and no
 /// stream breaks a rule of its own — so the bound that has to catch this is the
-/// one on their sum, and the peer at fault is the connection (D77).
+/// one on their sum, and what it catches is the request rather than the
+/// connection carrying it (D77).
 #[tokio::test(flavor = "multi_thread")]
 async fn headers_buffered_across_a_connection_are_bounded() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
-    // Held for the life of the test: a finished or reset stream would give its
-    // share of the budget back, which is precisely what this must not rely on.
-    let mut streams = Vec::new();
+    assert_eq!(
+        volto::h3::HEADERS_BUFFER_BUDGET / volto::h3::MAX_FIELD_SECTION_SIZE as usize,
+        FULL_SIZED_FRAMES_THAT_FIT,
+        "the budget is a number of full-sized frames, and the arithmetic below \
+         is written in terms of that number"
+    );
+
+    // Every stream is held for the life of the test: a finished or reset one
+    // would give its share of the budget back, which is precisely what this must
+    // not rely on. Which of them is refused is up to the order the server's
+    // tasks reach them in, so all of them are read at once and only the count is
+    // asserted.
+    let (refusals, mut refused) = tokio::sync::mpsc::channel(streams_past_the_budget());
     for _ in 0..streams_past_the_budget() {
-        streams.push(announce_oversized_headers(&connection).await);
+        let (send, mut recv) = announce_oversized_headers(&connection).await;
+        let refusals = refusals.clone();
+        tokio::spawn(async move {
+            // The sending half is parked here rather than dropped: dropping it
+            // finishes the stream, which would tell the server the frame it is
+            // holding will never be completed.
+            let _send = send;
+            if let Ok(response) = recv.read_to_end(4096).await {
+                let _ = refusals.send(response).await;
+            }
+        });
+    }
+    drop(refusals);
+
+    for _ in FULL_SIZED_FRAMES_THAT_FIT..streams_past_the_budget() {
+        let response = tokio::time::timeout(TIMEOUT, refused.recv())
+            .await
+            .expect("a stream past the buffering budget must be refused")
+            .expect("the refusals arrive on live streams");
+        assert_eq!(
+            status_of_response(&response),
+            "431",
+            "a request this connection cannot hold is refused as a request"
+        );
     }
 
-    let error = tokio::time::timeout(TIMEOUT, connection.closed())
-        .await
-        .expect("a connection past the buffering budget must be closed");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => {
-            let reason = String::from_utf8_lossy(&close.reason);
-            assert_eq!(
-                close.error_code.into_inner(),
-                H3_EXCESSIVE_LOAD,
-                "the peer must be told which rule it broke; reason was {reason:?}"
-            );
-            assert!(
-                reason.contains("unfinished frames"),
-                "the reason {reason:?} does not say what the connection was holding"
-            );
-        }
-        other => panic!("expected an application close, got {other}"),
-    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), refused.recv())
+            .await
+            .is_err(),
+        "only the streams the budget could not hold may be refused"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), connection.closed())
+            .await
+            .is_err(),
+        "a request the connection cannot hold must not cost it the connection"
+    );
 }
 
-/// The other half of the bound: a client that finishes what it starts is never
-/// touched by it, however many requests it has in flight.
+/// The other half of the bound: a client that finishes what it starts, one
+/// request at a time, is never anywhere near it.
 ///
 /// Same number of streams as the test above, so the two differ in exactly one
-/// thing — whether the HEADERS frames are complete.
+/// thing — whether the HEADERS frames are complete. What a client with many
+/// full-sized requests genuinely in flight meets is the test below this one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_of_complete_requests_never_reaches_the_budget() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -400,4 +505,220 @@ async fn a_connection_of_complete_requests_never_reaches_the_budget() {
             .is_err(),
         "a client whose requests all arrived in full must not be disconnected"
     );
+}
+
+/// A CONNECT request padded to the largest field section this server advertises.
+///
+/// Legal on both of the counts that bound one, which is what makes it the shape
+/// this bound has to be judged on: the RFC 9114 §4.2.2 size — name plus value
+/// plus 32 bytes a field — is exactly `SETTINGS_MAX_FIELD_SECTION_SIZE`, and the
+/// encoded frame is smaller still, since the formula charges 32 bytes a field
+/// that no encoding of it pays. A peer sending sixteen of these at once has
+/// broken no rule about any one of them.
+fn full_sized_connect_section(authority: &str) -> BytesMut {
+    /// A field name a proxy has no opinion about, so only its size matters.
+    const PADDING: &[u8] = b"x-padding";
+
+    let mut fields: Vec<(&[u8], &[u8])> = vec![
+        (b":method", b"CONNECT"),
+        (b":authority", authority.as_bytes()),
+    ];
+    let named: usize = fields
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + 32)
+        .sum();
+    let padding =
+        vec![b'a'; volto::h3::MAX_FIELD_SECTION_SIZE as usize - named - PADDING.len() - 32];
+    fields.push((PADDING, &padding));
+
+    let mut block = BytesMut::new();
+    volto::h3::qpack::encode(&mut block, fields.iter().copied());
+    block
+}
+
+/// The bound is on what one connection holds at one moment, and a peer that
+/// reaches it pays for it with one request (D77).
+///
+/// Sixteen full-sized field sections may be in flight at once and every one of
+/// them is served; a seventeenth is answered with 431 and stopped, and the
+/// connection — sixteen requests and sixteen tunnels still on it — carries on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_past_the_buffering_budget_costs_only_that_request() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let target = spawn_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    let block = full_sized_connect_section(&target.to_string());
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, FRAME_HEADERS);
+    datagram::put_varint(&mut frame, block.len() as u64);
+    frame.extend_from_slice(&block);
+    let frame = frame.to_vec();
+
+    let budget = volto::h3::HEADERS_BUFFER_BUDGET;
+    let section = block.len();
+    assert!(
+        FULL_SIZED_FRAMES_THAT_FIT * section <= budget
+            && (FULL_SIZED_FRAMES_THAT_FIT + 1) * section > budget,
+        "{FULL_SIZED_FRAMES_THAT_FIT} field sections of {section} bytes are what a \
+         budget of {budget} holds, and one more is what it does not"
+    );
+
+    // What a frame is charged is the length it announces rather than how much of
+    // it has arrived, so the whole of the budget is committed by the frame
+    // headers alone -- which is what lets these sixteen be genuinely at once,
+    // without a megabyte of padding having to cross the wire first.
+    let announced = frame.len() - section + 1;
+
+    // Sixteen requests, every one of them announced before any is completed, so
+    // the budget is fully committed at one moment. All sixteen are served: this
+    // is the number the constant was chosen to allow.
+    let mut streams = Vec::new();
+    for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
+        let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&frame[..announced])
+            .await
+            .expect("announce a full-sized request");
+        streams.push((send, recv));
+    }
+    for (send, _) in &mut streams {
+        send.write_all(&frame[announced..])
+            .await
+            .expect("finish a full-sized request");
+    }
+    for (_, recv) in &mut streams {
+        let (frame_type, payload) = read_frame(recv).await;
+        assert_eq!(frame_type, FRAME_HEADERS);
+        assert_eq!(
+            status_of(&payload),
+            "200",
+            "a request the budget can hold must be served"
+        );
+    }
+
+    // Seventeen, none of them ever completed, so nothing is given back and
+    // exactly one charge has to fail -- whichever stream the server reaches
+    // last, which is why the refusal is looked for rather than expected on a
+    // particular one.
+    let mut sends = Vec::new();
+    let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
+    for index in 0..=FULL_SIZED_FRAMES_THAT_FIT {
+        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&frame[..announced])
+            .await
+            .expect("announce a full-sized request");
+        sends.push(send);
+
+        let refusals = refusals.clone();
+        tokio::spawn(async move {
+            // A refused request is answered and its stream finished; one the
+            // budget holds says nothing at all, and this parks for the rest of
+            // the test.
+            if let Ok(response) = recv.read_to_end(4096).await {
+                let _ = refusals.send((index, response)).await;
+            }
+        });
+    }
+    drop(refusals);
+
+    let (index, response) = tokio::time::timeout(TIMEOUT, refused.recv())
+        .await
+        .expect("one of seventeen full-sized requests must be refused")
+        .expect("the refusal arrives on a live stream");
+    assert_eq!(
+        status_of_response(&response),
+        "431",
+        "the request the budget could not hold is refused as a request"
+    );
+    assert_eq!(
+        stopped_code(&mut sends[index]).await,
+        H3_EXCESSIVE_LOAD,
+        "the peer must be told which rule the request it lost broke"
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), refused.recv())
+            .await
+            .is_err(),
+        "only the one request the budget could not hold may be refused"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), connection.closed())
+            .await
+            .is_err(),
+        "a request the connection cannot hold must not cost it the connection"
+    );
+}
+
+/// Reads one HTTP/3 frame from a raw request stream.
+async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
+    let mut header = Vec::new();
+    let (frame_type, length) = loop {
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut byte))
+            .await
+            .expect("a frame header arrived")
+            .expect("a frame header");
+        header.push(byte[0]);
+
+        if let Some((frame_type, used)) = datagram::peek_varint(&header) {
+            if let Some((length, _)) = datagram::peek_varint(&header[used..]) {
+                break (frame_type, length);
+            }
+        }
+    };
+
+    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
+        .await
+        .expect("the frame payload arrived")
+        .expect("the frame payload");
+
+    (frame_type, payload)
+}
+
+/// The `:status` of a response read whole from a raw request stream.
+fn status_of_response(response: &[u8]) -> String {
+    let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
+    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
+    let (length, more) = datagram::peek_varint(&response[used..]).expect("a frame length");
+
+    let payload = &response[used + more..];
+    assert_eq!(
+        payload.len() as u64,
+        length,
+        "the response is the whole of what the stream carried"
+    );
+    status_of(payload)
+}
+
+/// The `:status` of a response field section.
+fn status_of(block: &[u8]) -> String {
+    let fields = volto::h3::qpack::decode(block, volto::h3::MAX_FIELD_SECTION_SIZE)
+        .expect("the server's field section must decode");
+    let status = fields
+        .iter()
+        .find(|field| field.name.as_ref() == b":status")
+        .expect("a response carries :status");
+    String::from_utf8(status.value.to_vec()).expect("a numeric status")
+}
+
+/// Writes until the peer stops the stream, and reports the code it used.
+///
+/// Retried rather than written once: STOP_SENDING travels while the response is
+/// being read here, so a single write can still succeed before it lands.
+async fn stopped_code(send: &mut quinn::SendStream) -> u64 {
+    let stopped = async {
+        loop {
+            match send.write_all(&[0u8; 256]).await {
+                Ok(()) => continue,
+                Err(quinn::WriteError::Stopped(code)) => return code.into_inner(),
+                Err(other) => panic!("expected STOP_SENDING, got {other}"),
+            }
+        }
+    };
+
+    tokio::time::timeout(TIMEOUT, stopped)
+        .await
+        .expect("the server must stop the stream it refused to read")
 }

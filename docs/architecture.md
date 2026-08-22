@@ -263,14 +263,19 @@ is allocated for it.
 
 That bound is per frame, and a peer may open as many streams as its transport
 parameters allow. What one connection may hold in frames it has announced but not
-finished is therefore bounded separately, at 1 MiB summed over every stream on it,
-the control stream included: a frame is charged for the length it announced the
-moment the decoder commits to buffering it, and the charge is returned when the
-frame completes or when the stream carrying it ends. Going past that is a
-connection error of type `H3_EXCESSIVE_LOAD`. No client that finishes what it
-starts can reach it — a CONNECT request with credentials is a few hundred bytes,
-so every request stream the transport allows could be mid-HEADERS at once and
-still be well inside it.
+finished is therefore bounded separately, at 1 MiB summed over its request
+streams: a frame is charged for the length it announced the moment the decoder
+commits to buffering it, and the charge is returned when the frame completes or
+when the stream carrying it ends. The request that would take a connection past
+that is refused with **431 and stopped** with `H3_EXCESSIVE_LOAD`, which is the
+same answer a single oversized field section gets; the connection and its tunnels
+are untouched. A CONNECT request with credentials is a few hundred bytes, so
+every request stream the transport allows could be mid-HEADERS at once and still
+be using a tenth of the budget — what reaches it is sixteen field sections of the
+largest advertised size in flight together, and the seventeenth of those is what
+is refused. The peer's control stream is not counted in it: there is one of it
+per connection, it buffers one frame at a time, and nothing on it can be refused
+stream by stream.
 
 One choice here is worth stating, though it is within the RFC: a malformed
 request is answered with a bare **400 and a clean stream close** rather than a

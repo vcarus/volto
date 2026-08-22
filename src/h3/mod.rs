@@ -102,10 +102,26 @@ pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 ///
 /// A megabyte is sixteen frames of the largest size this server will buffer at
 /// all, and some four thousand of the size a real one is -- a CONNECT request
-/// carrying Basic credentials is under 300 bytes, so every stream the transport
-/// allows could be mid-HEADERS at once and still be a third of the way in. No
-/// client that finishes what it starts can reach it, which is why the value is
-/// a constant here rather than a knob in `[limits]`.
+/// carrying Basic credentials is under 300 bytes, so all 1024 request streams
+/// the transport allows could be mid-HEADERS at once and still be using a tenth
+/// of this.
+///
+/// The exact boundary is worth stating, because it is not "a client that
+/// finishes what it starts": what is counted is the announced length of the
+/// frames being buffered *at one moment*, so sixteen concurrent field sections
+/// of the largest advertised size fill it and the seventeenth does not fit --
+/// whether or not every one of them is completed a moment later. A peer that
+/// reaches it loses that one request, which is answered with 431 and stopped
+/// (`frame::BufferBudget::charge`); the connection and every tunnel on it carry
+/// on. Bounding a moment rather than a rate is what makes the value a constant
+/// here rather than a knob in `[limits]`: it is a ceiling on memory, and the
+/// machine's is not configurable either.
+///
+/// The peer's control stream is not counted here. There is one of it per
+/// connection and it buffers one frame at a time, so `frame::MAX_BUFFERED_FRAME`
+/// bounds it on its own -- and a peer that had filled this budget with request
+/// streams must not thereby have its own SETTINGS or GOAWAY refused, since
+/// nothing on that stream can be refused stream by stream.
 ///
 /// The unit is encoded octets as they arrived, the same count
 /// `frame::MAX_BUFFERED_FRAME` applies per frame -- not RFC 9114 §4.2.2's
