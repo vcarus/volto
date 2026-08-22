@@ -802,6 +802,11 @@ async fn an_unreachable_target_closes_the_session() {
 /// The target is a working echo server and the same request without the offending
 /// field is accepted at the end, so the refusals cannot be coming from anything
 /// else about the request.
+///
+/// `Transfer-Encoding` is the third field that paragraph forbids and is not
+/// here: it is connection-specific under RFC 9114 §4.2 as well, and is refused
+/// for every request before routing, which is where `it_tcp` pins it on this
+/// route among others.
 #[tokio::test]
 async fn refuses_content_framing_fields_on_the_capsule_stream() {
     let server = TestServer::start().await;
@@ -812,7 +817,6 @@ async fn refuses_content_framing_fields_on_the_capsule_stream() {
         ("content-length", "0"),
         ("content-length", "42"),
         ("content-type", "application/octet-stream"),
-        ("transfer-encoding", "chunked"),
     ] {
         let mut request = connect_udp_request(server.addr, "127.0.0.1", target.port());
         request.fields.append(name, FieldValue::from_static(value));

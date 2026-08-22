@@ -120,11 +120,14 @@ pub struct Context {
     /// How many tunnels this connection has been granted a slot for so far.
     ///
     /// Counted once per request that gets past [`Quota::acquire`], TCP and
-    /// CONNECT-UDP alike; a request turned away before that — 407, the tunnel
-    /// limit itself, a destination the policy rejects — never reaches it, so
-    /// this is work done rather than attempts made. Owned by [`crate::quic`],
-    /// which reads it once when the connection ends to report it on the closing
-    /// line (D72); nothing here ever reads it back.
+    /// CONNECT-UDP alike, so this is slots taken rather than requests made: a
+    /// request refused before the slot — 407, a malformed message, the tunnel
+    /// limit itself — never reaches it. It is *not* tunnels that carried
+    /// anything, though: the slot is taken before the target is judged, so a
+    /// destination the policy rejects and a target that cannot be reached are
+    /// both counted here. Owned by [`crate::quic`], which reads it once when
+    /// the connection ends to report it on the closing line (D72); nothing here
+    /// ever reads it back.
     pub tunnels: Arc<AtomicU64>,
     /// How long a UDP session may sit idle.
     pub idle_timeout: Duration,

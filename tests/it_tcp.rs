@@ -18,6 +18,9 @@ use volto::h3api::{FieldValue, Method, Request, Status};
 /// H3_CONNECT_ERROR (RFC 9114 §8.1).
 const H3_CONNECT_ERROR: u64 = 0x010f;
 
+/// H3_MESSAGE_ERROR (RFC 9114 §8.1), the answer to a malformed request.
+const H3_MESSAGE_ERROR: u64 = 0x010e;
+
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
     let server = TestServer::start().await;
@@ -384,43 +387,134 @@ async fn refuses_an_authority_without_a_port() {
 
 /// RFC 9114 §4.2: "any message containing connection-specific fields MUST be
 /// treated as malformed". The answer is a 400 rather than a reset, which RFC
-/// 9114 §4.1.2 allows. The target is a working echo server and the same request
-/// without the offending field is accepted at the end, so the refusals cannot be
-/// coming from anything else about the request.
+/// 9114 §4.1.2 allows.
+///
+/// Table-driven over every route a request can be dispatched to and over every
+/// field RFC 9110 §7.6.1 names, because the rule is about the *message*: it
+/// cannot depend on which tunnel the request asked for, on whether this server
+/// implements that tunnel at all, or on whether the sender has authenticated
+/// (review M4). Each route is exercised with a clean request first, so a 400
+/// cannot be some other refusal wearing the same status.
 #[tokio::test]
 async fn refuses_connection_specific_fields() {
     let server = TestServer::start().await;
     let target = spawn_echo_target().await;
+    let udp_target = common::spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    for (name, value) in [
-        ("proxy-connection", "keep-alive"),
-        ("keep-alive", "timeout=5"),
-        ("transfer-encoding", "chunked"),
-        ("upgrade", "websocket"),
-    ] {
-        let mut request = connect_request(&target.to_string());
-        request.fields.append(name, FieldValue::from_static(value));
+    // Every route through the dispatcher, with what each answers when there is
+    // nothing wrong with the request: a 400 below that came from the wrong place
+    // would show up here as the wrong control.
+    let routes = [
+        ("tcp", Status::OK),
+        ("connect-udp", Status::OK),
+        ("unknown-protocol", Status::NOT_IMPLEMENTED),
+        ("not-connect", Status::NOT_IMPLEMENTED),
+    ];
 
-        let (response, mut stream) = send_and_respond(&mut client, request).await;
+    for (route, accepted) in routes {
+        let response =
+            respond_to(&mut client, request_on(route, &server, target, udp_target)).await;
         assert_eq!(
-            response.status,
-            Status::BAD_REQUEST,
-            "{name}: {value} must be refused"
+            response.status, accepted,
+            "{route}: the control request must reach the route it names"
         );
-        let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+
+        for (name, value) in [
+            ("proxy-connection", "keep-alive"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+        ] {
+            let mut request = request_on(route, &server, target, udp_target);
+            request.fields.append(name, FieldValue::from_static(value));
+
+            let (response, mut stream) = send_and_respond(&mut client, request).await;
+            assert_eq!(
+                response.status,
+                Status::BAD_REQUEST,
+                "{route}: {name}: {value} must be refused"
+            );
+            let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+                .await
+                .expect("the stream ended promptly")
+                .expect("a refusal must end cleanly, not with a stream error");
+            assert!(end.is_none(), "{route}: {name}: a 400 carries no body");
+        }
+
+        // `TE` is the fifth field of RFC 9110 §7.6.1 and the one RFC 9114 §4.2
+        // lets through -- "it MUST NOT contain any value other than 'trailers'".
+        // Any other value is malformed too, but the codec catches it while the
+        // field section is still being decoded, so the answer is a reset rather
+        // than a status. Same rule, different half of the pipeline.
+        let mut request = request_on(route, &server, target, udp_target);
+        request.fields.append("te", FieldValue::from_static("gzip"));
+
+        let mut stream = client
+            .send
+            .send_request(request)
             .await
-            .expect("the stream ended promptly")
-            .expect("a refusal must end cleanly, not with a stream error");
-        assert!(end.is_none(), "{name}: a 400 carries no body");
+            .expect("send a request carrying TE");
+        let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+            .await
+            .expect("the server must answer promptly")
+            .expect_err("a TE other than trailers must be refused as malformed");
+        assert_peer_reset(&error, H3_MESSAGE_ERROR);
     }
 
-    let response = respond_to(&mut client, connect_request(&target.to_string())).await;
+    // And before the credentials check, not after it: the rule is about the
+    // message, so an unauthenticated peer must be told what is wrong with its
+    // request rather than that it should have signed it (review M4).
+    let guarded = TestServer::start_with(&format!(
+        "{ALLOW_PRIVATE}{}",
+        common::auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let mut stranger = H3Client::connect(&guarded).await;
+
+    let mut request = connect_request(&target.to_string());
+    request
+        .fields
+        .append("transfer-encoding", FieldValue::from_static("chunked"));
+    let response = respond_to(&mut stranger, request).await;
     assert_eq!(
         response.status,
-        Status::OK,
-        "the same request without a connection-specific field must be accepted"
+        Status::BAD_REQUEST,
+        "a malformed message is malformed whoever sent it"
     );
+}
+
+/// One request on each of the routes `conn::handle_request` dispatches to.
+///
+/// The unknown `:protocol` and the plain GET carry everything RFC 8441 §4 and
+/// RFC 9114 §4.3.1 make mandatory, so a refusal can only be the routing arm
+/// under test rather than a malformed request short of it.
+fn request_on(
+    route: &str,
+    server: &TestServer,
+    tcp_target: SocketAddr,
+    udp_target: SocketAddr,
+) -> Request {
+    match route {
+        "tcp" => connect_request(&tcp_target.to_string()),
+        "connect-udp" => common::connect_udp_request(server.addr, "127.0.0.1", udp_target.port()),
+        "unknown-protocol" => {
+            let mut request = Request::new(Method::Connect);
+            request.scheme = Some("https".into());
+            request.authority = Some(server.addr.to_string().into());
+            request.path = Some("/.well-known/masque/ip/*/*/".into());
+            request.protocol = Some("connect-ip".into());
+            request
+        }
+        "not-connect" => {
+            let mut request = Request::new(Method::Other("GET".into()));
+            request.scheme = Some("https".into());
+            request.authority = Some(server.addr.to_string().into());
+            request.path = Some("/".into());
+            request
+        }
+        other => panic!("no such route: {other}"),
+    }
 }
 
 /// A proxy is not an origin server: ordinary requests are refused, not panicked

@@ -143,7 +143,7 @@ impl Authenticator {
     fn check(&self, value: &FieldValue) -> Result<&str, Denied> {
         let value = value
             .to_str()
-            .ok_or(Denied::Malformed("credentials are not valid ASCII"))?;
+            .ok_or(Denied::Malformed("credentials are not valid UTF-8"))?;
 
         let token = basic_token(value)?;
         let decoded = decode_base64(token.as_bytes())
@@ -190,6 +190,19 @@ pub fn challenge_fields() -> Fields {
     let mut fields = Fields::new();
     fields.append(PROXY_AUTHENTICATE, FieldValue::from_static(CHALLENGE));
     fields
+}
+
+/// Whether a field carries credentials, and so must never be logged verbatim.
+///
+/// Both names this server accepts (decision D3), matched case-insensitively —
+/// a field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
+/// by `h3::stream`), but this must not depend on that. It reads the same list
+/// [`credentials`] does, so settling D3 cannot accept a third field name here
+/// and go on printing it in [`crate::conn`]'s request log.
+pub(crate) fn is_credential_field(name: &str) -> bool {
+    CREDENTIAL_FIELDS
+        .iter()
+        .any(|field| name.eq_ignore_ascii_case(field))
 }
 
 /// Every credentials field value, in the order they are tried.

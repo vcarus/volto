@@ -247,6 +247,28 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     let stream_id = stream.id();
     log_request(&req, stream_id);
 
+    // Before authentication, before the quota, before routing: RFC 9114 §4.2
+    // makes a message carrying a connection-specific field malformed, and that
+    // is a judgement about the message rather than about who sent it or what it
+    // asks for. The other half of the same sentence -- the `Connection` field
+    // itself -- is refused in the codec, which is earlier still, so judging this
+    // half after the credentials check made one MUST answer 407 to an
+    // unauthenticated peer and 400 to an authenticated one (review M4).
+    if let Some(field) = tunnel::connection_specific_field(&req) {
+        debug!(
+            stream_id,
+            field, "request carries a connection-specific field"
+        );
+        tunnel::refuse(
+            &mut stream,
+            Status::BAD_REQUEST,
+            stream_id,
+            context.max_idle_timeout,
+        )
+        .await;
+        return;
+    }
+
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT — TCP or UDP — has to pass through here.
@@ -340,24 +362,6 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // got, not requests it made (D72).
     context.tunnels.fetch_add(1, Ordering::Relaxed);
 
-    // Judged before routing because the rule is about the message, not the
-    // tunnel type: RFC 9114 §4.2 makes a request carrying a connection-specific
-    // field malformed whatever it asks for.
-    if let Some(field) = tunnel::connection_specific_field(&req) {
-        debug!(
-            stream_id,
-            field, "request carries a connection-specific field"
-        );
-        tunnel::refuse(
-            &mut stream,
-            Status::BAD_REQUEST,
-            stream_id,
-            context.max_idle_timeout,
-        )
-        .await;
-        return;
-    }
-
     match tunnel::route(&req) {
         Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {
@@ -382,7 +386,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
         Route::UnsupportedProtocol(protocol) => {
             debug!(
                 stream_id,
-                protocol = %bounded(protocol),
+                // As a `str` rather than through `%`: `bounded` cuts the length
+                // and nothing else, and a `:protocol` token is only checked for
+                // being UTF-8, so a newline in one would forge a journal line
+                // straight through `Display` (review M5). See `logfmt`.
+                protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
             tunnel::refuse(
@@ -432,7 +440,7 @@ fn log_request(req: &Request, stream_id: u64) {
         .fields
         .iter()
         .map(|(name, value)| {
-            if is_credential_header(name) {
+            if auth::is_credential_field(name) {
                 return format!("{name}: {}", redact_credentials(value));
             }
             match value.to_str() {
@@ -458,15 +466,6 @@ fn log_request(req: &Request, stream_id: u64) {
         headers = ?headers,
         "inbound request"
     );
-}
-
-/// Whether a header carries credentials and must therefore be redacted.
-///
-/// Both names this server accepts (decision D3), matched case-insensitively —
-/// a field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
-/// by `h3::stream`), but this must not depend on that.
-fn is_credential_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("proxy-authorization") || name.eq_ignore_ascii_case("authorization")
 }
 
 /// Renders a credential header value as its scheme plus the size of the secret.
@@ -511,16 +510,19 @@ mod tests {
         redact_credentials(&FieldValue::parse(value.as_bytes()).expect("field value"))
     }
 
+    /// The redaction above and the acceptance in [`auth`] read the same list,
+    /// which is the point: two of them would let decision D3 be settled in one
+    /// place and print the credential in the other.
     #[test]
     fn both_credential_headers_are_recognised() {
-        assert!(is_credential_header("proxy-authorization"));
-        assert!(is_credential_header("authorization"));
+        assert!(auth::is_credential_field("proxy-authorization"));
+        assert!(auth::is_credential_field("authorization"));
         // The wire name is lowercase (RFC 9114 §4.2); the match does not lean
         // on that having been enforced elsewhere.
-        assert!(is_credential_header("Proxy-Authorization"));
-        assert!(is_credential_header("AUTHORIZATION"));
-        assert!(!is_credential_header("user-agent"));
-        assert!(!is_credential_header("x-volto-probe"));
+        assert!(auth::is_credential_field("Proxy-Authorization"));
+        assert!(auth::is_credential_field("AUTHORIZATION"));
+        assert!(!auth::is_credential_field("user-agent"));
+        assert!(!auth::is_credential_field("x-volto-probe"));
     }
 
     /// The scheme survives, the secret does not.

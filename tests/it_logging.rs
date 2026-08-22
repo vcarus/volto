@@ -9,6 +9,11 @@
 //! The tension this test pins down: the header *name* and the auth scheme must
 //! survive, because that is the evidence decision D3 is waiting for, while the
 //! credential itself must not reach the log at all.
+//!
+//! The second half of the test is about the other DEBUG line a request can
+//! produce -- the one naming an unimplemented `:protocol`. That token is the
+//! peer's bytes and is only ever checked for being UTF-8, so it may carry a
+//! newline; what it may not do is put that newline into the journal unescaped.
 
 mod common;
 
@@ -69,5 +74,26 @@ async fn inbound_requests_are_logged_with_every_header() {
     assert!(
         logged.contains("x-volto-probe: surge-behaviour"),
         "arbitrary headers must be logged; log was:\n{logged}"
+    );
+
+    // A `:protocol` this server does not implement is echoed into a DEBUG line
+    // of its own. systemd splits a service's stdout on `\n`, so a token
+    // containing one must reach the journal escaped -- printed through
+    // `Display` it was a complete forged entry, stamped with volto's unit and a
+    // timestamp of its own (review M5).
+    let mut forgery = connect_request(&target.to_string());
+    forgery.scheme = Some("https".into());
+    forgery.path = Some("/".into());
+    forgery.protocol = Some("x\nWARN volto - forged".into());
+    let _ = respond_to(&mut client, forgery).await;
+
+    let logged = buffer.contents();
+    assert!(
+        logged.contains(r#"protocol="x\nWARN volto - forged""#),
+        "the peer's token must print quoted and escaped; log was:\n{logged}"
+    );
+    assert!(
+        !logged.lines().any(|line| line == "WARN volto - forged"),
+        "a newline in a peer's token must not buy it a journal entry; log was:\n{logged}"
     );
 }
