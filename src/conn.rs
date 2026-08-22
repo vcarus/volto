@@ -309,20 +309,12 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             // With the count on the far side of the write, a peer that grants no
             // flow-control window never reaches it and guesses for free until it
             // runs out of streams (review H1).
-            let too_many = context.record_auth_failure();
-
-            tunnel::refuse_with(
-                &mut stream,
-                Status::PROXY_AUTHENTICATION_REQUIRED,
-                auth::challenge_fields(),
-                stream_id,
-                context.max_idle_timeout,
-            )
-            .await;
-
             // Guessing should cost a handshake every few attempts rather than
-            // being free for the life of one connection.
-            if too_many {
+            // being free for the life of one connection. The close is decided
+            // here too, before the 407 is written: a peer that will not take
+            // the answer must not keep the connection for another idle timeout
+            // while the write waits on it (review H1, re-verification).
+            if context.record_auth_failure() {
                 warn!(
                     remote = %context.remote,
                     failures = context.max_auth_failures,
@@ -332,7 +324,17 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                     h3api::AUTH_FAILURE_LIMIT_CODE,
                     b"too many authentication failures",
                 );
+                return;
             }
+
+            tunnel::refuse_with(
+                &mut stream,
+                Status::PROXY_AUTHENTICATION_REQUIRED,
+                auth::challenge_fields(),
+                stream_id,
+                context.max_idle_timeout,
+            )
+            .await;
             return;
         }
     }

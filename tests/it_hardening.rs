@@ -162,19 +162,22 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 
     // Eight guesses, none of them read: `send_request` returns the stream and
     // nothing here ever asks it for the response, so every 407 is stuck on the
-    // window the client refused to grow.
+    // window the client refused to grow. The third guess is the one that ends
+    // the connection, and it does so at once, so a later `send_request` may
+    // already find it closed -- that is the behaviour under test, not a failure.
     let mut unread = Vec::new();
-    for _ in 0..8 {
+    for attempt in 0..8 {
         let request = authorized_connect("192.0.2.1:443", "user1", "wrong");
-        unread.push(
-            client
-                .send
-                .send_request(request)
-                .await
-                .expect("send a guess"),
-        );
+        match client.send.send_request(request).await {
+            Ok(stream) => unread.push(stream),
+            Err(error) => {
+                assert!(attempt >= 3, "guess {attempt} was refused early: {error}");
+                break;
+            }
+        }
     }
 
+    let started = std::time::Instant::now();
     let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
         .await
         .expect("a peer that will not read its answers must still run out of guesses");
@@ -189,6 +192,15 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
         ),
         other => panic!("expected an application close, got {other}"),
     }
+
+    // The close is decided before the 407 is written, so it does not wait on
+    // the bounded write: the last guess ends the connection at once, not one
+    // idle timeout (2 s here) later.
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the close must not wait behind the unanswerable 407; took {:?}",
+        started.elapsed()
+    );
 }
 
 /// A refusal the peer will not take is abandoned, and only that stream suffers.
