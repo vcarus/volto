@@ -1,11 +1,12 @@
 //! Per-connection driving: accept request streams, authenticate them, dispatch
 //! them.
 //!
-//! A connection owns the things every tunnel on it shares: the Quarter Stream ID
-//! routing table, the task that reads QUIC datagrams and delivers them through it,
-//! the credentials and destination policy each request is checked against, and the
-//! tunnel quota they all draw on. All of it lives in [`crate::tunnel::Context`],
-//! cloned per request.
+//! A connection owns the things every tunnel on it shares: the credentials and
+//! destination policy each request is checked against, the QUIC connection its
+//! UDP sessions send datagrams on, and the tunnel quota they all draw on. All of
+//! it lives in [`crate::tunnel::Context`], cloned per request. Inbound datagrams
+//! are not among them: they are routed by the HTTP/3 connection, to the request
+//! stream each one names (D79).
 //!
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
@@ -64,9 +65,11 @@ pub async fn handle(
     mut shutdown: Shutdown,
     tunnels: Arc<AtomicU64>,
 ) -> Result<(), h3api::ConnectionError> {
-    // Cloned before the handshake: the HTTP/3 layer takes ownership of the
-    // connection, but HTTP Datagrams bypass it entirely and need the QUIC
-    // connection directly.
+    // Cloned before the handshake, which takes ownership of the connection: a
+    // UDP session sends its datagrams on the QUIC connection itself, and asks it
+    // per packet how large a datagram may be and how far behind its send queue
+    // is. Only the sending half -- inbound datagrams are routed by the HTTP/3
+    // connection to the request stream that claimed them (D79).
     let datagrams = quic.clone();
 
     // One idle timeout for the whole HTTP/3 handshake -- the same value
@@ -78,21 +81,12 @@ pub async fn handle(
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
     // what the copy cost.
-    let context = Context::new(
-        &config,
-        datagrams.clone(),
-        connection.peer_datagrams(),
-        tunnels,
-    );
-
-    // One reader per connection, demultiplexing datagrams to sessions by
-    // Quarter Stream ID.
-    let router = tokio::spawn(udp::route_datagrams(datagrams, context.sessions.clone()));
+    let context = Context::new(&config, datagrams, connection.peer_datagrams(), tunnels);
 
     let mut going_away = false;
     let silence = config.limits.max_idle_timeout() * SILENCE_FACTOR;
 
-    let result = loop {
+    loop {
         tokio::select! {
             biased;
 
@@ -148,12 +142,7 @@ pub async fn handle(
             },
 
         }
-    };
-
-    // No sessions can outlive the connection, so neither should the router.
-    router.abort();
-
-    result
+    }
 }
 
 /// How many idle timeouts an unauthenticated connection may spend saying

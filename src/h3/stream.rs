@@ -32,7 +32,7 @@ use bytes::{Bytes, BytesMut};
 use http::uri::Uri;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 
-use super::connection::Handle;
+use super::connection::{DatagramReceiver, Handle};
 use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
 use super::qpack::{self, Field};
@@ -496,6 +496,27 @@ impl Stream {
     /// The Quarter Stream ID of RFC 9297 is this value divided by four.
     pub fn id(&self) -> u64 {
         u64::from(self.send.id())
+    }
+
+    /// Claims this stream's inbound HTTP Datagrams (RFC 9297 §2.1).
+    ///
+    /// Every datagram on the connection names a request stream by Quarter
+    /// Stream ID, which is that stream's id divided by four; this is how the
+    /// one stream that wants them says so. Until it is called nothing routes to
+    /// this stream and it costs nothing, which is what keeps a TCP tunnel --
+    /// which has no use for a datagram -- out of the routing table entirely.
+    ///
+    /// `None` if they have already been claimed. Only the first caller can be
+    /// the session, because the [`DatagramReceiver`] deregisters the stream when
+    /// it is dropped and a second one would take the first's entry with it.
+    ///
+    /// Called *before* the response, not after: RFC 9298 §5 lets a client start
+    /// sending payloads before its request is answered, and a claim made here
+    /// means those land in the session's queue rather than being dropped as
+    /// belonging to no one.
+    pub fn datagrams(&mut self) -> Option<DatagramReceiver> {
+        self.handle
+            .register_datagrams(crate::datagram::quarter_stream_id(self.id()))
     }
 
     /// Sends a response consisting of just a status line.

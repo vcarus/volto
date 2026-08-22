@@ -14,11 +14,11 @@
 //! * [`quic`] — the QUIC endpoint, transport parameters and the accept loop.
 //! * [`shutdown`] — the graceful-shutdown signal shared by endpoint and connections.
 //! * [`h3`] — HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
-//!   stream, request streams.
+//!   stream, request streams, and the routing of inbound HTTP Datagrams to the
+//!   stream each one names.
 //! * [`h3api`] — the facade over that layer, and the only HTTP/3 vocabulary
 //!   the rest of the crate uses.
-//! * [`conn`] — per-connection driving, request dispatch, and the datagram
-//!   router shared by every UDP session on the connection.
+//! * [`conn`] — per-connection driving and request dispatch.
 //! * [`capsule`] — the Capsule Protocol (RFC 9297 §3) incremental decoder.
 //! * [`datagram`] — HTTP Datagram payload coding (RFC 9297) and QUIC varints.
 //! * [`net`] — explicit name resolution and UDP socket setup.

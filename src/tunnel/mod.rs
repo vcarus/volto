@@ -49,14 +49,16 @@ pub fn route(req: &Request<()>) -> Route<'_> {
 ///
 /// Cloned per request — the cost is a handful of refcount bumps. The UDP-specific
 /// members are here rather than in [`udp`] because a connection owns them
-/// regardless of which tunnel type ends up using them: the datagram router is
-/// started before the first request arrives.
+/// regardless of which tunnel type ends up using them: both are settled at the
+/// handshake, before the first request arrives.
 #[derive(Clone)]
 pub struct Context {
-    /// The QUIC connection, used directly for datagram I/O.
+    /// The QUIC connection, used directly for sending datagrams.
+    ///
+    /// Only the sending half: an inbound datagram is routed to the request
+    /// stream it names by the HTTP/3 connection, and reaches a session through
+    /// the [`h3api::DatagramReceiver`] that stream handed it (D79).
     pub datagrams: quinn::Connection,
-    /// Connection-wide Quarter Stream ID routing table.
-    pub sessions: Arc<udp::SessionRegistry>,
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
     /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
@@ -142,7 +144,6 @@ impl Context {
             max_auth_failures: config.security.max_auth_failures,
             authenticated: Arc::new(AtomicBool::new(false)),
             datagrams,
-            sessions: Arc::new(udp::SessionRegistry::default()),
             peer_datagrams,
             auth: Arc::new(Authenticator::new(&config.auth)),
             policy: Arc::new(Policy::new(&config.security)),
@@ -200,7 +201,8 @@ pub struct Quota {
 ///
 /// Dropping is the *only* way a slot is returned, which is what makes every exit
 /// path — response failure, idle timeout, reset, panic — leak-free by
-/// construction, in the same spirit as [`udp::SessionRegistry`]'s guard.
+/// construction, in the same spirit as the [`h3api::DatagramReceiver`] a UDP
+/// session holds for as long as its Quarter Stream ID routes.
 pub type Slot = OwnedSemaphorePermit;
 
 impl Quota {

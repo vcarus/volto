@@ -606,8 +606,8 @@ const IN_FLIGHT: usize = 256;
 
 /// Datagrams in flight from the client towards the target.
 ///
-/// Deliberately below `udp::INBOUND_QUEUE_DEPTH` (64), the per-session channel
-/// the connection's datagram router `try_send`s into. That queue is the real
+/// Deliberately below `h3::connection::INBOUND_QUEUE_DEPTH` (64), the
+/// per-session channel the connection's datagram router `try_send`s into. That queue is the real
 /// bound on this direction: the router drops rather than blocks, by design, so
 /// letting more than 64 packets pile up in front of one session measures the
 /// drop policy instead of the forwarding cost. Measured at a 256-packet window,

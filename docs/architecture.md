@@ -140,9 +140,18 @@ for at least 120), and closing the socket must also close the request stream.
 
 ## Datagram routing
 
-Each connection runs one `read_datagram` task, in `conn.rs`, that routes inbound
-datagrams to per-session channels. Two fields decide where a packet goes, and
-getting either subtly wrong is silent:
+Each connection routes inbound datagrams to per-session channels from its own
+background task, in `src/h3/connection.rs` — the same task that reads the peer's
+unidirectional streams, since both belong to the connection and both end with
+it. Routing is per *request stream*, which is why it lives in the HTTP/3 layer:
+a session claims its Quarter Stream ID by asking its stream for a
+`DatagramReceiver` and holds the claim exactly as long as it holds that
+receiver, so a session that ends — however it ends — takes its routing entry
+with it. Sending is the other half and stays outside: a UDP session writes its
+datagrams straight onto the `quinn::Connection`.
+
+Two fields decide where a packet goes, and getting either subtly wrong is
+silent:
 
 - **Quarter Stream ID = stream ID ÷ 4** (RFC 9297 §2.1), not the stream ID.
   Client-initiated bidirectional stream IDs are always multiples of four, so the
@@ -164,7 +173,8 @@ which is why no dependency is carried for them.
 
 Routing uses a bounded channel and `try_send`: a session that is not draining
 its queue loses packets, which is correct UDP behaviour, instead of blocking the
-routing task and starving every other session on the connection.
+routing task and starving every other session on the connection. A CONNECT (TCP)
+tunnel never claims a receiver, so it never appears in the table at all.
 
 ## The capsule stream
 
@@ -331,7 +341,8 @@ its own terms: it is the list of what a proxy actually asks of HTTP/3, and it is
 short enough to read in one sitting.
 
 One gotcha it cannot hide: `h3api::Connection::handshake` consumes the
-`quinn::Connection`, so clone it first if you also need datagram I/O.
+`quinn::Connection`, so clone it first if you also need to *send* datagrams on
+it. Receiving them needs no clone — the HTTP/3 connection routes them itself.
 
 ## Testing
 

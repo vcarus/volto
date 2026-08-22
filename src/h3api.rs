@@ -11,16 +11,20 @@
 //! `bytes::Bytes` -- are passed through unchanged; isolating those would buy
 //! nothing.
 //!
-//! One deliberate exception: HTTP Datagrams (RFC 9297) are sent and received
-//! straight through `quinn::Connection`, not through this module. They are a
-//! QUIC transport facility rather than an HTTP/3 one, and the routing they need
-//! is per-session rather than per-connection, so the datagram task in `conn.rs`
-//! owns them end to end.
+//! Inbound HTTP Datagrams (RFC 9297) are named here too, because the routing
+//! they need is *per request stream*: a datagram carries the Quarter Stream ID
+//! of the stream it belongs to, so the layer that owns request streams is the
+//! layer that can hand it to the right one. A session claims its share with
+//! [`Stream::datagrams`] and holds it for as long as it holds the
+//! [`DatagramReceiver`] (D79). Sending is the one half that stays outside:
+//! `tunnel::udp` writes datagrams straight onto the `quinn::Connection` it
+//! already holds for the send-buffer and datagram-size questions it asks per
+//! packet.
 
 use bytes::Bytes;
 use http::Request;
 
-pub use crate::h3::connection::Connection;
+pub use crate::h3::connection::{Connection, DatagramReceiver};
 pub use crate::h3::error::{Code, ConnectionError, StreamError};
 pub use crate::h3::stream::{Reader, Resolver, Stream, Writer};
 pub use crate::h3::MAX_FIELD_SECTION_SIZE;
@@ -52,14 +56,6 @@ pub const REQUEST_CANCELLED: Code = Code::H3_REQUEST_CANCELLED;
 /// error", which is more precise than H3_MESSAGE_ERROR for anything that went
 /// wrong inside the payload rather than in the HTTP message itself.
 pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
-
-/// The same code as a QUIC application error, for closing the whole connection.
-///
-/// RFC 9297 §2.1 states two receiver obligations as *connection* errors of type
-/// H3_DATAGRAM_ERROR, which a stream reset cannot express. Derived from
-/// [`DATAGRAM_ERROR`] so the two cannot drift apart.
-pub const DATAGRAM_ERROR_CLOSE: quinn::VarInt =
-    quinn::VarInt::from_u32(DATAGRAM_ERROR.value() as u32);
 
 /// Connection close code used when a peer exhausts its authentication attempts.
 ///
@@ -255,10 +251,10 @@ mod tests {
         );
     }
 
-    /// The two derived constants must stay equal to what they are derived from.
+    /// The close code is a number the peer reads, so it is pinned rather than
+    /// left to whatever `quinn::VarInt::from_u32` was handed.
     #[test]
-    fn the_datagram_close_code_matches_the_stream_code() {
-        assert_eq!(DATAGRAM_ERROR_CLOSE.into_inner(), DATAGRAM_ERROR.value());
+    fn the_auth_failure_close_code_is_the_one_documented() {
         assert_eq!(AUTH_FAILURE_LIMIT_CODE.into_inner(), 0x10b);
     }
 }

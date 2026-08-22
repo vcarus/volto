@@ -8,7 +8,8 @@
 //! on the connection, each tagged with the Quarter Stream ID of its request
 //! stream. So a session needs three things pumped at once:
 //!
-//! * inbound datagrams, delivered by the connection-wide router via a channel;
+//! * inbound datagrams, delivered by the HTTP/3 connection's router through the
+//!   channel this session claimed for its Quarter Stream ID;
 //! * outbound packets read from the UDP socket;
 //! * the request stream itself, which carries capsules and the close signal.
 //!
@@ -31,196 +32,20 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-
 use bytes::Bytes;
 use http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use percent_encoding::percent_decode_str;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
-use crate::h3api::{self, Reader, Stream, Writer};
+use crate::h3api::{self, DatagramReceiver, Reader, Stream, Writer};
 use crate::tunnel::{Context, Unreachable};
 use crate::{net, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
-
-/// Inbound datagrams buffered per session before packets start being dropped.
-///
-/// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
-/// slow target turn into unbounded memory growth. The same queue serves both
-/// phases of a session — the one before the target socket exists, where it holds
-/// what RFC 9298 §5 calls optimistically sent packets, and the running one — so
-/// this constant is the whole per-session bound rather than one of two.
-///
-/// # What this costs at the configured limits
-///
-/// Worst case is `depth x payload x max_targets_per_conn x max_connections`.
-/// Only the payload needs care: a QUIC DATAGRAM frame cannot be fragmented, so a
-/// datagram never exceeds the `max_udp_payload_size` this server advertises
-/// (quinn's default, 1472 bytes) even though RFC 9298 §5 permits a 65527-byte UDP
-/// payload in principle. With the shipped defaults (`INBOUND_QUEUE_DEPTH` = 64,
-/// `max_targets_per_conn` = 256, `max_connections` = 256) that is ~92 KiB per
-/// session, ~23 MiB per connection and ~5.8 GiB across a server saturated at both
-/// limits — an operator lowering either limit lowers it proportionally.
-///
-/// Registering a session before its target socket exists does **not** raise that
-/// ceiling: the queue is the same size in both phases, sessions are still capped
-/// by the per-connection tunnel quota, and a full queue is already reachable on a
-/// running session whenever a client sends faster than the proxy forwards. What
-/// it changes is how long a full queue can sit undrained — no longer than name
-/// resolution takes, after which the session either starts draining or is refused
-/// and the queue is discarded with it.
-const INBOUND_QUEUE_DEPTH: usize = 64;
-
-/// Routes inbound HTTP datagrams to the session that owns them.
-///
-/// Keyed by Quarter Stream ID, which is how RFC 9297 §2.1 names a session on the
-/// wire. Owned by the connection and shared with every session on it.
-#[derive(Default)]
-pub struct SessionRegistry {
-    sessions: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
-}
-
-impl SessionRegistry {
-    /// Registers a session, returning a guard that deregisters it on drop.
-    ///
-    /// The guard is what keeps the table from leaking entries: a session can end
-    /// through any of half a dozen paths, and all of them drop it.
-    fn register(
-        self: &Arc<Self>,
-        quarter_stream_id: u64,
-        inbound: mpsc::Sender<Bytes>,
-    ) -> SessionGuard {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(quarter_stream_id, inbound);
-
-        SessionGuard {
-            registry: Arc::clone(self),
-            quarter_stream_id,
-        }
-    }
-
-    /// The inbound sink for a Quarter Stream ID, if a session owns it.
-    fn get(&self, quarter_stream_id: u64) -> Option<mpsc::Sender<Bytes>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&quarter_stream_id)
-            .cloned()
-    }
-
-    /// Number of live sessions.
-    pub fn len(&self) -> usize {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .len()
-    }
-
-    /// Whether any session is live.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-/// Deregisters a session when dropped.
-struct SessionGuard {
-    registry: Arc<SessionRegistry>,
-    quarter_stream_id: u64,
-}
-
-impl Drop for SessionGuard {
-    fn drop(&mut self) {
-        self.registry
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.quarter_stream_id);
-    }
-}
-
-/// Delivers inbound QUIC datagrams to their sessions until the connection ends.
-///
-/// One task per connection. What happens to a datagram that cannot be delivered
-/// depends on *why*, and RFC 9297 §2.1 draws the lines:
-///
-/// * a Quarter Stream ID that cannot be parsed, or one above 2^60-1, is a
-///   **connection error** of type H3_DATAGRAM_ERROR — neither can name a QUIC
-///   stream, so there is nothing to drop it *for*;
-/// * a Quarter Stream ID with no live session is **dropped**. The RFC permits
-///   discarding a datagram whose request stream does not exist, which happens
-///   routinely when a session closes with packets still in flight;
-/// * a datagram whose Context ID is truncated or unknown is likewise dropped.
-///
-/// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
-/// stream "that cannot be created due to the peer's stream limits" SHOULD draw
-/// H3_ID_ERROR. RFC 9297 §2.1 grants the exemption this router relies on —
-/// "Generating an error is not mandatory because the QUIC stream limit might be
-/// unknown to the HTTP/3 layer" — and this router sits outside the HTTP/3 layer
-/// altogether, so it cannot tell that case apart from a session that has already
-/// closed.
-pub async fn route_datagrams(quic: quinn::Connection, sessions: Arc<SessionRegistry>) {
-    loop {
-        let datagram = match quic.read_datagram().await {
-            Ok(datagram) => datagram,
-            // The connection is gone; so is every session on it.
-            Err(error) => {
-                debug!(%error, "stopped reading QUIC datagrams");
-                return;
-            }
-        };
-
-        let decoded = match datagram::decode(datagram) {
-            Ok(decoded) => decoded,
-            // The two conditions RFC 9297 §2.1 states as MUST-close.
-            Err(error) if error.is_connection_error() => {
-                warn!(%error, "closing the connection after an unusable HTTP datagram");
-                quic.close(h3api::DATAGRAM_ERROR_CLOSE, b"invalid HTTP datagram");
-                return;
-            }
-            Err(error) => {
-                debug!(%error, "malformed HTTP datagram");
-                continue;
-            }
-        };
-
-        if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
-            // RFC 9298 §5: an unknown context must be dropped silently, never
-            // treated as an error.
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                context_id = decoded.context_id,
-                "dropping datagram with an unknown context id"
-            );
-            continue;
-        }
-
-        let Some(inbound) = sessions.get(decoded.quarter_stream_id) else {
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                "dropping datagram for an unknown session"
-            );
-            continue;
-        };
-
-        // Never block the router on one slow session: dropping a UDP packet is
-        // legitimate, stalling every other session is not.
-        if inbound.try_send(decoded.payload).is_err() {
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                "inbound queue full or closed, dropping datagram"
-            );
-        }
-    }
-}
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Context) {
@@ -247,17 +72,26 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     // HTTP Datagrams before receiving the response to its UDP proxying request",
     // and a proxy receiving them early "SHALL either drop that HTTP Datagram
     // silently or buffer it temporarily (on the order of a round trip)".
-    // Registering here takes the second option: the packets land in the queue the
+    // Claiming here takes the second option: the packets land in the queue the
     // session is about to read from, so a client that opens a tunnel and sends
     // immediately does not lose its first packets to name resolution.
     //
-    // Every refusal below returns, dropping the guard and with it the queue —
-    // which is the discard the same paragraph calls for when the request the
-    // datagrams were waiting on never succeeds. [`INBOUND_QUEUE_DEPTH`] carries
-    // what that buffer costs.
+    // Every refusal below returns, dropping the receiver and with it both the
+    // queue and the claim — which is the discard the same paragraph calls for
+    // when the request the datagrams were waiting on never succeeds.
     let quarter_stream_id = datagram::quarter_stream_id(stream_id);
-    let (inbound_tx, inbound_rx) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-    let _guard = ctx.sessions.register(quarter_stream_id, inbound_tx);
+    let Some(inbound) = stream.datagrams() else {
+        // Unreachable: a request stream reaches exactly one tunnel, and this is
+        // the only place that asks for its datagrams. Answered rather than
+        // asserted, because a session that cannot receive anything is a broken
+        // tunnel and 500 says so, where a panic would take the connection down.
+        debug!(
+            stream_id,
+            "the datagrams of this stream are already claimed"
+        );
+        tunnel::refuse(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, stream_id).await;
+        return;
+    };
 
     // Port policy, resolution and destination policy, in that order and with
     // every refusal already answered by the time this returns — see
@@ -268,10 +102,11 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     // response to a CONNECT-UDP request, and the RFC 9297 `Capsule-Protocol`
     // field is what makes it one.
     //
-    // Every path out of here that answers the request returns, dropping `_guard`
-    // with it — which unregisters the Quarter Stream ID and discards whatever
-    // the client sent optimistically; the router then drops later datagrams for
-    // that id silently, exactly as it does for a session that has just closed.
+    // Every path out of here that answers the request returns, dropping
+    // `inbound` with it — which gives up the Quarter Stream ID and discards
+    // whatever the client sent optimistically; the router then drops later
+    // datagrams for that id silently, exactly as it does for a session that has
+    // just closed.
     let Some(allowed) =
         tunnel::admit_target(&host, port, &ctx, &mut stream, stream_id, capsule_headers).await
     else {
@@ -315,7 +150,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
     let mut session = Session {
         quarter_stream_id,
         socket,
-        inbound: inbound_rx,
+        inbound,
         reader,
         writer,
         decoder: CapsuleDecoder::new(),
@@ -339,8 +174,9 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
 struct Session {
     quarter_stream_id: u64,
     socket: UdpSocket,
-    /// Payloads the connection router decoded for this session.
-    inbound: mpsc::Receiver<Bytes>,
+    /// Payloads the connection's router decoded for this session, and this
+    /// session's claim on its Quarter Stream ID.
+    inbound: DatagramReceiver,
     reader: Reader,
     writer: Writer,
     /// The request stream body is a capsule sequence (RFC 9297 §3.2).
@@ -389,7 +225,7 @@ enum Step {
 /// [`Session::run`].
 enum Event {
     /// A payload the connection's datagram router decoded for this session, or
-    /// `None` if the router dropped our sender.
+    /// `None` if it will send nothing further.
     Inbound(Option<Bytes>),
     /// A packet read from the target socket, or the error that ended it.
     Socket(std::io::Result<usize>),
@@ -406,7 +242,7 @@ impl Session {
         loop {
             // The timeout covers *waiting for* one of the three sources and
             // nothing else, which is what makes it a measure of idleness: all
-            // three awaits below are cancel-safe (`mpsc::Receiver::recv`,
+            // three awaits below are cancel-safe (`DatagramReceiver::recv`,
             // `UdpSocket::recv` and the stream read all resume where they left
             // off), so an expiry here cannot lose anything half-done.
             //
@@ -439,7 +275,8 @@ impl Session {
 
             let step = match event {
                 Event::Inbound(Some(payload)) => self.forward_to_target(payload).await,
-                // Only happens if the registry dropped our sender.
+                // Only reachable if the routing table lost this session's
+                // entry, which nothing but dropping `inbound` can do.
                 Event::Inbound(None) => Step::Stop,
                 Event::Socket(Ok(length)) => {
                     self.forward_to_client(stream_id, &packet[..length]).await
@@ -1344,87 +1181,5 @@ mod tests {
             send_buffer_verdict(1201, 1200, &mut reported),
             SendBuffer::EvictsAndReport
         );
-    }
-
-    /// RFC 9298 §5 lets a client send UDP payloads before the response arrives,
-    /// and lets the proxy buffer them. Registering the session before the target
-    /// socket exists is what turns that permission into behaviour: a datagram the
-    /// router delivers while the session loop has not started yet must still be
-    /// there when it does — once, in order, and without a consumer running.
-    ///
-    /// Deterministic on purpose: forcing that ordering through a live server
-    /// would mean racing the resolver, so the guarantee is asserted where it
-    /// actually lives, on the registry and its queue.
-    #[tokio::test]
-    async fn datagrams_delivered_before_the_session_starts_are_kept() {
-        let registry = Arc::new(SessionRegistry::default());
-        let (inbound_tx, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-        let _guard = registry.register(9, inbound_tx);
-
-        // Exactly what `route_datagrams` does, with nothing reading the far end.
-        for payload in [b"first".as_slice(), b"second".as_slice()] {
-            let sink = registry.get(9).expect("the session is registered");
-            sink.try_send(Bytes::copy_from_slice(payload))
-                .expect("an early datagram must be buffered, not refused");
-        }
-
-        // The session loop starts only now.
-        assert_eq!(inbound.recv().await.as_deref(), Some(b"first".as_slice()));
-        assert_eq!(inbound.recv().await.as_deref(), Some(b"second".as_slice()));
-        assert!(
-            inbound.try_recv().is_err(),
-            "a buffered datagram must be delivered once, not replayed"
-        );
-    }
-
-    /// The other half of the same design: the buffer is bounded by
-    /// [`INBOUND_QUEUE_DEPTH`], and a request that never reaches its target
-    /// discards whatever it had accumulated.
-    #[tokio::test]
-    async fn the_early_buffer_is_bounded_and_dies_with_the_session() {
-        let registry = Arc::new(SessionRegistry::default());
-        let (inbound_tx, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-        let guard = registry.register(9, inbound_tx);
-
-        let sink = registry.get(9).expect("the session is registered");
-        for _ in 0..INBOUND_QUEUE_DEPTH {
-            sink.try_send(Bytes::from_static(b"x"))
-                .expect("within the queue depth");
-        }
-        assert!(
-            sink.try_send(Bytes::from_static(b"x")).is_err(),
-            "the queue must stop accepting at its depth rather than grow"
-        );
-
-        // A refusal path returns before the session runs: the guard drops, the
-        // Quarter Stream ID stops routing, and the buffer goes with the receiver.
-        drop(guard);
-        drop(inbound);
-        assert!(registry.get(9).is_none());
-        assert!(
-            sink.try_send(Bytes::from_static(b"x")).is_err(),
-            "nothing may be handed to a session that was refused"
-        );
-    }
-
-    #[test]
-    fn registry_routes_by_quarter_stream_id() {
-        let registry = Arc::new(SessionRegistry::default());
-        let (tx_a, _rx_a) = mpsc::channel(1);
-        let (tx_b, _rx_b) = mpsc::channel(1);
-
-        let guard_a = registry.register(1, tx_a);
-        let guard_b = registry.register(2, tx_b);
-        assert_eq!(registry.len(), 2);
-        assert!(registry.get(1).is_some());
-        assert!(registry.get(2).is_some());
-        assert!(registry.get(3).is_none());
-
-        drop(guard_a);
-        assert_eq!(registry.len(), 1);
-        assert!(registry.get(1).is_none(), "the guard must deregister");
-
-        drop(guard_b);
-        assert!(registry.is_empty());
     }
 }

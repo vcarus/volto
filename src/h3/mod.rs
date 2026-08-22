@@ -1,7 +1,8 @@
 //! HTTP/3 (RFC 9114) for a proxy, implemented in the tree.
 //!
 //! This is the server half of HTTP/3 and nothing else: it accepts request
-//! streams, decodes a request, sends a response, and moves body bytes. There is
+//! streams, decodes a request, sends a response, moves body bytes, and hands
+//! each inbound HTTP Datagram to the request stream it names. There is
 //! no client, no server push, no WebTransport, and no QPACK dynamic table --
 //! every one of them is either unreachable for a CONNECT proxy or refused as a
 //! protocol violation, so leaving them out costs no conformance.
@@ -13,7 +14,8 @@
 //! * [`huffman`] — RFC 7541 Appendix B, decoding only.
 //! * [`qpack`] — RFC 9204 field sections against the static table.
 //! * [`frame`] — RFC 9114 §7 framing, incremental and copy-free for DATA.
-//! * [`connection`] — the connection: SETTINGS, the control stream, GOAWAY.
+//! * [`connection`] — the connection: SETTINGS, the control stream, GOAWAY,
+//!   and inbound HTTP Datagram routing (RFC 9297).
 //! * [`stream`] — one request stream, from its HEADERS to its last byte.
 //!
 //! # Why it exists
@@ -38,9 +40,9 @@
 //!   means their `Drop` behaviour -- a finish on the send side, `STOP_SENDING`
 //!   on the receive side -- is what `tunnel::tcp` reasons about, unmediated.
 //! * **The peer's state is shared, not polled.** One background task per
-//!   connection reads every unidirectional stream, so the peer's SETTINGS take
-//!   effect the moment they arrive rather than the next time a request is
-//!   accepted.
+//!   connection reads every unidirectional stream and every datagram, so the
+//!   peer's SETTINGS take effect the moment they arrive rather than the next
+//!   time a request is accepted.
 //! * **A connection error is a `quinn::Connection::close`.** RFC 9114 §8 makes
 //!   an HTTP/3 connection error a QUIC CONNECTION_CLOSE carrying the HTTP/3
 //!   code, which is exactly what that call sends; every operation still in

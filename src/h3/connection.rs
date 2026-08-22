@@ -6,8 +6,9 @@
 //!
 //! * the three unidirectional streams this endpoint opens and then holds open
 //!   for its lifetime -- control, QPACK encoder, QPACK decoder;
-//! * a background task that accepts the peer's unidirectional streams and reads
-//!   its control stream for as long as the connection lasts;
+//! * a background task that serves everything the peer sends outside its
+//!   request streams: its unidirectional streams, its control stream, and its
+//!   HTTP Datagrams;
 //! * [`Connection::accept`], which hands request streams to the caller.
 //!
 //! The background task is what makes the peer's SETTINGS usable the moment they
@@ -21,6 +22,22 @@
 //! ([`Connection::peer_datagrams`]), so there is no moment at which the peer's
 //! answer is known and not yet acted on, and nothing to poll.
 //!
+//! # HTTP Datagrams
+//!
+//! That same task routes the peer's HTTP Datagrams (RFC 9297), because what a
+//! datagram names is a request stream: the first varint of its payload is a
+//! Quarter Stream ID, which is a request stream's id divided by four. A session
+//! claims one by asking its stream for a [`DatagramReceiver`]
+//! ([`Stream::datagrams`](super::stream::Stream::datagrams)) and holds the
+//! claim for exactly as long as it holds the receiver, so a stream that ends --
+//! through any of the half-dozen paths a tunnel can end through -- takes its
+//! routing entry with it and nothing has to remember to deregister it (D79).
+//!
+//! Only the receiving half is here. A datagram goes *out* on the
+//! [`quinn::Connection`] itself, which the UDP sessions hold anyway for the
+//! send-buffer and datagram-size questions they ask per packet, and which has
+//! no HTTP/3 in it to consult.
+//!
 //! # How a connection error is signalled
 //!
 //! RFC 9114 §8 defines an HTTP/3 connection error as a QUIC CONNECTION_CLOSE
@@ -31,15 +48,19 @@
 //! *reason*, which quinn overwrites with "closed locally" -- so it is recorded
 //! on the way past and read back by [`Connection::accept`].
 
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::debug;
 
-use crate::datagram::{peek_varint, put_varint, varint_len};
+use crate::datagram::{self, peek_varint, put_varint, varint_len};
 
 use super::error::{Code, ConnectionError, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
@@ -79,6 +100,14 @@ pub(crate) struct Shared {
     /// request stream -- which is what makes the bound a property of the
     /// connection rather than of each stream separately.
     buffered: Arc<BufferBudget>,
+    /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
+    ///
+    /// The whole of the connection's datagram routing: an entry is a live
+    /// session's claim on one Quarter Stream ID, put there by
+    /// [`Self::register_datagrams`] and taken out again when the
+    /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
+    /// never asks -- every TCP tunnel -- never appears here at all.
+    sessions: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
     /// Whether a control stream has already been accepted (RFC 9114 §6.2.1).
@@ -101,6 +130,144 @@ impl Shared {
     fn record(&self, violation: Violation) -> Violation {
         self.local_error.get_or_init(|| violation).clone()
     }
+
+    /// Claims `quarter_stream_id` for a session, or reports that it is taken.
+    ///
+    /// `None` means an entry already exists, which is a caller asking twice for
+    /// one stream: the receiver was handed out once and a second one would
+    /// deregister the first on drop. The map is the guard, so there is no
+    /// separate flag to keep in step with it.
+    fn register_datagrams(self: &Arc<Self>, quarter_stream_id: u64) -> Option<DatagramReceiver> {
+        let (sink, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+
+        match self.lock().entry(quarter_stream_id) {
+            Entry::Occupied(_) => return None,
+            Entry::Vacant(slot) => slot.insert(sink),
+        };
+
+        Some(DatagramReceiver {
+            shared: Arc::clone(self),
+            quarter_stream_id,
+            inbound,
+        })
+    }
+
+    /// Hands one decoded datagram to the session that claimed its Quarter
+    /// Stream ID, or drops it.
+    ///
+    /// Every outcome here is a drop rather than an error. RFC 9297 §2.1's two
+    /// MUST-close conditions are about the Quarter Stream ID *field* and are
+    /// settled before this is reached, by [`crate::datagram::decode`]; what is
+    /// left is a well-formed datagram with nowhere to go, which happens
+    /// routinely when a session closes with packets still in flight.
+    fn deliver(&self, decoded: datagram::Datagram) {
+        if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
+            // RFC 9298 §5: an unknown context must be dropped silently, never
+            // treated as an error.
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                context_id = decoded.context_id,
+                "dropping datagram with an unknown context id"
+            );
+            return;
+        }
+
+        let Some(inbound) = self.lock().get(&decoded.quarter_stream_id).cloned() else {
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                "dropping datagram for an unknown session"
+            );
+            return;
+        };
+
+        // Never block the router on one slow session: dropping a UDP packet is
+        // legitimate, stalling every other session is not.
+        if inbound.try_send(decoded.payload).is_err() {
+            debug!(
+                quarter_stream_id = decoded.quarter_stream_id,
+                "inbound queue full or closed, dropping datagram"
+            );
+        }
+    }
+
+    /// The routing table, with a poisoned lock treated as an ordinary one.
+    ///
+    /// Nothing under it can be left half-updated: every use is a single map
+    /// operation, so a panic elsewhere in the process says nothing about the
+    /// state of this map.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, mpsc::Sender<Bytes>>> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Inbound datagrams buffered per session before packets start being dropped.
+///
+/// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
+/// slow target turn into unbounded memory growth. The same queue serves both
+/// phases of a session — the one before the target socket exists, where it holds
+/// what RFC 9298 §5 calls optimistically sent packets, and the running one — so
+/// this constant is the whole per-session bound rather than one of two.
+///
+/// # What this costs at the configured limits
+///
+/// Worst case is `depth x payload x max_targets_per_conn x max_connections`.
+/// Only the payload needs care: a QUIC DATAGRAM frame cannot be fragmented, so a
+/// datagram never exceeds the `max_udp_payload_size` this server advertises
+/// (quinn's default, 1472 bytes) even though RFC 9298 §5 permits a 65527-byte UDP
+/// payload in principle. With the shipped defaults (`INBOUND_QUEUE_DEPTH` = 64,
+/// `max_targets_per_conn` = 256, `max_connections` = 256) that is ~92 KiB per
+/// session, ~23 MiB per connection and ~5.8 GiB across a server saturated at both
+/// limits — an operator lowering either limit lowers it proportionally.
+///
+/// Registering a session before its target socket exists does **not** raise that
+/// ceiling: the queue is the same size in both phases, sessions are still capped
+/// by the per-connection tunnel quota, and a full queue is already reachable on a
+/// running session whenever a client sends faster than the proxy forwards. What
+/// it changes is how long a full queue can sit undrained — no longer than name
+/// resolution takes, after which the session either starts draining or is refused
+/// and the queue is discarded with it.
+pub const INBOUND_QUEUE_DEPTH: usize = 64;
+
+/// One session's inbound HTTP Datagrams, and its claim on a Quarter Stream ID.
+///
+/// Obtained from [`Stream::datagrams`](super::stream::Stream::datagrams) and
+/// held for the life of the session. Dropping it takes the Quarter Stream ID
+/// out of the connection's routing table, which is what keeps the table from
+/// leaking entries: a session can end through any of half a dozen paths --
+/// refused before it started, idle, reset, its socket broken -- and every one of
+/// them drops this.
+///
+/// Datagrams that arrive after the drop are dropped like any other unknown id,
+/// which is exactly what RFC 9297 §2.1 permits for a stream that no longer
+/// exists.
+pub struct DatagramReceiver {
+    shared: Arc<Shared>,
+    quarter_stream_id: u64,
+    inbound: mpsc::Receiver<Bytes>,
+}
+
+impl DatagramReceiver {
+    /// Waits for the next payload routed to this session.
+    ///
+    /// `None` means the connection's router will send nothing further, which on
+    /// a live connection cannot happen: the sending half lives in the routing
+    /// table under this receiver's own entry, and that entry outlives the
+    /// receiver by nothing at all.
+    ///
+    /// Cancel-safe ([`tokio::sync::mpsc::Receiver::recv`] is), so a session may
+    /// poll it inside a `select!` with a timeout -- which is what a UDP session
+    /// does with all three of its sources.
+    pub async fn recv(&mut self) -> Option<Bytes> {
+        self.inbound.recv().await
+    }
+}
+
+impl Drop for DatagramReceiver {
+    fn drop(&mut self) {
+        self.shared.lock().remove(&self.quarter_stream_id);
+    }
 }
 
 /// A cheap handle to the connection, held by every stream and task on it.
@@ -118,6 +285,15 @@ impl Handle {
     /// reading frames (D77).
     pub(crate) fn budget(&self) -> Arc<BufferBudget> {
         self.shared.buffered.clone()
+    }
+
+    /// Claims a Quarter Stream ID for a session on this connection.
+    ///
+    /// The stream's own call, forwarded: only [`super::stream::Stream`] knows
+    /// the stream id this is derived from, and only [`Shared`] holds the table
+    /// it goes into.
+    pub(crate) fn register_datagrams(&self, quarter_stream_id: u64) -> Option<DatagramReceiver> {
+        self.shared.register_datagrams(quarter_stream_id)
     }
 
     /// Ends the connection because the peer broke a rule (RFC 9114 §8).
@@ -199,8 +375,8 @@ pub struct Connection {
     /// dropping a [`quinn::SendStream`] finishes it, and RFC 9204 §4.2 makes
     /// the closure of either stream a connection error at the peer.
     _qpack: [quinn::SendStream; 2],
-    /// The task reading the peer's unidirectional streams.
-    unidirectional: JoinHandle<()>,
+    /// The task reading the peer's unidirectional streams and datagrams.
+    peer: JoinHandle<()>,
     /// The highest request stream id handed to the caller.
     last_accepted: Option<u64>,
     /// The identifier sent in GOAWAY, once [`Self::shutdown`] has sent one.
@@ -262,13 +438,13 @@ impl Connection {
             }
         };
 
-        let unidirectional = tokio::spawn(serve_unidirectional(handle.clone()));
+        let peer = tokio::spawn(serve_peer(handle.clone()));
 
         Ok(Self {
             handle,
             control,
             _qpack: [encoder, decoder],
-            unidirectional,
+            peer,
             last_accepted: None,
             going_away: None,
         })
@@ -397,7 +573,8 @@ impl Connection {
 }
 
 impl Drop for Connection {
-    /// Closes the QUIC connection and stops reading the peer's streams.
+    /// Closes the QUIC connection and stops reading the peer's streams and
+    /// datagrams.
     ///
     /// H3_NO_ERROR is RFC 9114 §8.1's code for when "the connection or stream
     /// needs to be closed, but there is no error to signal". `quic.rs` depends
@@ -409,7 +586,7 @@ impl Drop for Connection {
             varint(Code::H3_NO_ERROR),
             b"connection closed by the server",
         );
-        self.unidirectional.abort();
+        self.peer.abort();
     }
 }
 
@@ -443,21 +620,99 @@ fn critical_write(error: quinn::WriteError) -> ConnectionError {
     }
 }
 
-/// Accepts the peer's unidirectional streams for the life of the connection.
-async fn serve_unidirectional(handle: Handle) {
+/// Serves what the peer sends outside its request streams, for the life of the
+/// connection: its unidirectional streams and its HTTP Datagrams.
+///
+/// One task for both, because both are the connection's rather than any
+/// stream's, both end when it does, and neither can be starved by the other:
+/// [`quinn::Connection::accept_uni`] leaves an unaccepted stream queued and
+/// [`quinn::Connection::read_datagram`] an undelivered datagram, so a branch
+/// that loses the race here loses nothing but the poll. Handling is not done
+/// inline either -- a unidirectional stream gets a task of its own, and a
+/// datagram is a map lookup and a `try_send` that never blocks -- so a flood of
+/// one kind cannot hold the other up.
+async fn serve_peer(handle: Handle) {
     let mut streams = JoinSet::new();
 
     loop {
-        let Ok(recv) = handle.quic.accept_uni().await else {
-            // The connection is gone; so is anything that could arrive on it.
-            return;
-        };
+        tokio::select! {
+            accepted = handle.quic.accept_uni() => {
+                let Ok(recv) = accepted else {
+                    // The connection is gone; so is anything that could arrive
+                    // on it.
+                    return;
+                };
 
-        // Reap the handlers that have finished, so a peer opening streams in a
-        // loop cannot make this set grow without bound.
-        while streams.try_join_next().is_some() {}
+                // Reap the handlers that have finished, so a peer opening
+                // streams in a loop cannot make this set grow without bound.
+                while streams.try_join_next().is_some() {}
 
-        streams.spawn(serve_stream(handle.clone(), recv));
+                streams.spawn(serve_stream(handle.clone(), recv));
+            }
+
+            received = handle.quic.read_datagram() => {
+                let datagram = match received {
+                    Ok(datagram) => datagram,
+                    // The connection is gone; so is every session on it.
+                    Err(error) => {
+                        debug!(%error, "stopped reading QUIC datagrams");
+                        return;
+                    }
+                };
+
+                if route_datagram(&handle, datagram).is_break() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Decodes one QUIC datagram and delivers it, or ends the connection.
+///
+/// What happens to a datagram that cannot be delivered depends on *why*, and
+/// RFC 9297 §2.1 draws the lines:
+///
+/// * a Quarter Stream ID that cannot be parsed, or one above 2^60-1, is a
+///   **connection error** of type H3_DATAGRAM_ERROR -- neither can name a QUIC
+///   stream, so there is nothing to drop it *for*;
+/// * a Quarter Stream ID with no live session is **dropped**. The RFC permits
+///   discarding a datagram whose request stream does not exist, which happens
+///   routinely when a session closes with packets still in flight;
+/// * a datagram whose Context ID is truncated or unknown is likewise dropped.
+///
+/// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
+/// stream "that cannot be created due to the peer's stream limits" SHOULD draw
+/// H3_ID_ERROR. RFC 9297 §2.1 grants the exemption this router relies on —
+/// "Generating an error is not mandatory because the QUIC stream limit might be
+/// unknown to the HTTP/3 layer" — and it is unknown to this one: the limit is a
+/// transport parameter [`crate::quic`] sets, which nothing here reads, so a
+/// Quarter Stream ID past it cannot be told apart from a session that has
+/// already closed.
+fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
+    match datagram::decode(datagram) {
+        Ok(decoded) => {
+            handle.shared.deliver(decoded);
+            ControlFlow::Continue(())
+        }
+
+        // The two conditions RFC 9297 §2.1 states as MUST-close. Reported
+        // through `fail` like every other connection error in this layer, so
+        // the code on the wire and the reason the caller is given cannot
+        // disagree -- and so a datagram violation racing with a stream one ends
+        // the connection once, with whichever was first.
+        Err(error) if error.is_connection_error() => {
+            handle.fail(Violation::connection(
+                Code::H3_DATAGRAM_ERROR,
+                format!("an unusable HTTP datagram: {error}"),
+            ));
+            ControlFlow::Break(())
+        }
+
+        Err(error) => {
+            debug!(%error, "malformed HTTP datagram");
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -1190,6 +1445,149 @@ mod tests {
         let reported = shared.record(second);
         assert_eq!(reported, first);
         assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
+    }
+
+    /// A datagram as it arrives on the wire: two varints and a payload.
+    fn datagram(quarter_stream_id: u64, context_id: u64, payload: &[u8]) -> datagram::Datagram {
+        datagram::decode(datagram::encode(quarter_stream_id, context_id, payload))
+            .expect("a well-formed datagram")
+    }
+
+    /// The routing rule itself: a datagram reaches the session that claimed its
+    /// Quarter Stream ID and no other.
+    ///
+    /// The bug class this guards against is silent -- a session receiving
+    /// another's traffic looks exactly like a session that works -- so both
+    /// halves are asserted: what each receiver got, and that neither got the
+    /// other's.
+    #[tokio::test]
+    async fn a_datagram_reaches_the_session_that_claimed_its_quarter_stream_id() {
+        let shared = Arc::new(Shared::default());
+        let mut first = shared.register_datagrams(1).expect("a free id");
+        let mut second = shared.register_datagrams(2).expect("a free id");
+
+        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for one"));
+        shared.deliver(datagram(2, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for two"));
+
+        assert_eq!(first.recv().await.as_deref(), Some(b"for one".as_slice()));
+        assert_eq!(second.recv().await.as_deref(), Some(b"for two".as_slice()));
+        assert!(first.inbound.try_recv().is_err(), "one payload each");
+        assert!(second.inbound.try_recv().is_err(), "one payload each");
+    }
+
+    /// The claim lasts exactly as long as the receiver: this is what keeps the
+    /// table from leaking an entry per session, and what makes a datagram for a
+    /// session that has ended a drop rather than a delivery to a queue nobody
+    /// reads.
+    #[tokio::test]
+    async fn dropping_the_receiver_gives_up_the_quarter_stream_id() {
+        let shared = Arc::new(Shared::default());
+
+        let inbound = shared.register_datagrams(1).expect("a free id");
+        assert!(
+            shared.register_datagrams(1).is_none(),
+            "a claimed id must not be handed out twice"
+        );
+        drop(inbound);
+
+        assert!(shared.lock().is_empty(), "the entry must be gone");
+
+        // Which is observable from the outside: the id is free again, and a
+        // datagram that arrives in between is dropped instead of piling up in
+        // the queue the finished session left behind.
+        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"too late"));
+        let mut reopened = shared.register_datagrams(1).expect("free again");
+        assert!(
+            reopened.inbound.try_recv().is_err(),
+            "a new session must not inherit a finished one's datagrams"
+        );
+    }
+
+    /// Both of the drops RFC 9297 §2.1 and RFC 9298 §5 call for, and the
+    /// session surviving each of them.
+    #[tokio::test]
+    async fn unknown_ids_are_dropped_and_the_session_survives() {
+        let shared = Arc::new(Shared::default());
+        let mut inbound = shared.register_datagrams(1).expect("a free id");
+
+        // A Quarter Stream ID no session owns: legitimate whenever a session
+        // closes with packets still in flight.
+        shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, b"nowhere"));
+        // A context this server never registered (RFC 9298 §5).
+        shared.deliver(datagram(1, 9, b"unknown context"));
+
+        assert!(
+            inbound.inbound.try_recv().is_err(),
+            "neither may reach a session"
+        );
+
+        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"still here"));
+        assert_eq!(
+            inbound.recv().await.as_deref(),
+            Some(b"still here".as_slice())
+        );
+    }
+
+    /// RFC 9298 §5 lets a client send UDP payloads before the response arrives,
+    /// and lets the proxy buffer them. Claiming the Quarter Stream ID before the
+    /// target socket exists is what turns that permission into behaviour: a
+    /// datagram the router delivers while the session loop has not started yet
+    /// must still be there when it does — once, in order, and without a consumer
+    /// running.
+    ///
+    /// Deterministic on purpose: forcing that ordering through a live server
+    /// would mean racing the resolver, so the guarantee is asserted where it
+    /// actually lives, on the routing table and its queue.
+    #[tokio::test]
+    async fn datagrams_delivered_before_the_session_starts_are_kept() {
+        let shared = Arc::new(Shared::default());
+        let mut inbound = shared.register_datagrams(9).expect("a free id");
+
+        for payload in [b"first".as_slice(), b"second".as_slice()] {
+            shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
+        }
+
+        // The session loop starts only now.
+        assert_eq!(inbound.recv().await.as_deref(), Some(b"first".as_slice()));
+        assert_eq!(inbound.recv().await.as_deref(), Some(b"second".as_slice()));
+        assert!(
+            inbound.inbound.try_recv().is_err(),
+            "a buffered datagram must be delivered once, not replayed"
+        );
+    }
+
+    /// The other half of the same design: the buffer is bounded by
+    /// [`INBOUND_QUEUE_DEPTH`], and the router drops rather than blocks or grows
+    /// when a session is not draining it.
+    #[tokio::test]
+    async fn the_early_buffer_is_bounded_and_the_overflow_is_dropped() {
+        let shared = Arc::new(Shared::default());
+        let mut inbound = shared.register_datagrams(9).expect("a free id");
+
+        for index in 0..INBOUND_QUEUE_DEPTH {
+            shared.deliver(datagram(
+                9,
+                datagram::CONTEXT_ID_UDP_PAYLOAD,
+                &[index as u8],
+            ));
+        }
+        shared.deliver(datagram(
+            9,
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            b"past the depth",
+        ));
+
+        for index in 0..INBOUND_QUEUE_DEPTH {
+            assert_eq!(
+                inbound.recv().await.as_deref(),
+                Some([index as u8].as_slice()),
+                "everything within the depth is kept, in order"
+            );
+        }
+        assert!(
+            inbound.inbound.try_recv().is_err(),
+            "the queue must stop accepting at its depth rather than grow"
+        );
     }
 
     /// RFC 9114 §6.2.1 stands while the connection does; once it is over, the
