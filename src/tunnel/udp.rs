@@ -723,11 +723,11 @@ fn send_buffer_verdict(len: usize, space: usize, reported: &mut bool) -> SendBuf
 fn is_per_packet_send_error(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(libc::EMSGSIZE) | Some(libc::EPERM) | Some(libc::EACCES)
+        Some(libc::EMSGSIZE | libc::EPERM | libc::EACCES)
     )
 }
 
-/// The response headers of a CONNECT-UDP 2xx.
+/// The response fields of a CONNECT-UDP 2xx.
 ///
 /// RFC 9297 §3.4 says a response that uses the Capsule Protocol SHOULD carry
 /// `Capsule-Protocol: ?1`, and §3.2 forbids Content-Length, Content-Type and

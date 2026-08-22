@@ -348,7 +348,6 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
         );
         tunnel::refuse_because(
             &mut stream,
-            Status::SERVICE_UNAVAILABLE,
             ProxyError::ConnectionLimitReached,
             stream_id,
             context.max_idle_timeout,

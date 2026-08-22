@@ -185,7 +185,7 @@ impl Authenticator {
     }
 }
 
-/// The `Proxy-Authenticate` header a 407 response carries.
+/// The `Proxy-Authenticate` field a 407 response carries.
 pub fn challenge_fields() -> Fields {
     let mut fields = Fields::new();
     fields.append(PROXY_AUTHENTICATE, FieldValue::from_static(CHALLENGE));

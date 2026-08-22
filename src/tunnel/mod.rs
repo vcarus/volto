@@ -464,7 +464,6 @@ pub(crate) async fn admit_target(
         debug!(stream_id, host, port, "target port denied by policy");
         refuse_because(
             stream,
-            Status::FORBIDDEN,
             ProxyError::HttpRequestDenied,
             stream_id,
             ctx.max_idle_timeout,
@@ -479,14 +478,7 @@ pub(crate) async fn admit_target(
         Err(failure) => {
             let error = failure.proxy_error();
             debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
-            refuse_because(
-                stream,
-                error.recommended_status(),
-                error,
-                stream_id,
-                ctx.max_idle_timeout,
-            )
-            .await;
+            refuse_because(stream, error, stream_id, ctx.max_idle_timeout).await;
             return None;
         }
     };
@@ -514,7 +506,6 @@ pub(crate) async fn admit_target(
         );
         refuse_because(
             stream,
-            Status::FORBIDDEN,
             ProxyError::DestinationIpProhibited,
             stream_id,
             ctx.max_idle_timeout,
@@ -574,7 +565,7 @@ impl ProxyError {
         )
     }
 
-    /// This error as a response header map, naming the hop it happened on.
+    /// This error as the field lines of a response, naming the hop it happened on.
     ///
     /// The address is dropped unless `Self::discloses_next_hop` allows it, so a
     /// caller cannot leak one by passing it to the wrong error type.
@@ -678,14 +669,24 @@ pub(crate) async fn refuse(stream: &mut Stream, status: Status, stream_id: u64, 
 }
 
 /// Refuses a request, explaining why in an RFC 9209 `Proxy-Status` field.
+///
+/// The status is the error's own (`recommended_status`), so the table that
+/// argues for each pairing — including D11's departure from the registry — is
+/// the only thing that decides one.
 pub(crate) async fn refuse_because(
     stream: &mut Stream,
-    status: Status,
     error: ProxyError,
     stream_id: u64,
     within: Duration,
 ) {
-    refuse_with(stream, status, error.fields(), stream_id, within).await;
+    refuse_with(
+        stream,
+        error.recommended_status(),
+        error.fields(),
+        stream_id,
+        within,
+    )
+    .await;
 }
 
 /// Refuses a request whose target could not be reached, naming the failed hop.
@@ -711,7 +712,7 @@ pub(crate) async fn refuse_unreachable(
     .await;
 }
 
-/// Refuses a request with an explicit set of response headers.
+/// Refuses a request with an explicit set of response fields.
 ///
 /// # The deadline
 ///
@@ -954,7 +955,7 @@ mod tests {
         );
     }
 
-    /// Reads the `Proxy-Status` field out of a header map.
+    /// Reads the `Proxy-Status` field out of a field list.
     fn proxy_status(fields: &Fields) -> String {
         fields
             .get(PROXY_STATUS)
