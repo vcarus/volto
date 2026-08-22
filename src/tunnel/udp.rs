@@ -100,7 +100,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
     // [`tunnel::admit_target`]. RFC 9298 §3.1 is what puts it here rather than
     // after the 2xx: resolution must complete first, so a bad name is refused
     // instead of silently swallowing every packet. The 200-then-close path is
-    // handed [`capsule_headers`] because that answer is a real successful
+    // handed [`capsule_fields`] because that answer is a real successful
     // response to a CONNECT-UDP request, and the RFC 9297 `Capsule-Protocol`
     // field is what makes it one.
     //
@@ -110,7 +110,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
     // datagrams for that id silently, exactly as it does for a session that has
     // just closed.
     let Some(allowed) =
-        tunnel::admit_target(&host, port, &ctx, &mut stream, stream_id, capsule_headers).await
+        tunnel::admit_target(&host, port, &ctx, &mut stream, stream_id, capsule_fields).await
     else {
         return;
     };
@@ -132,7 +132,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         }
     };
 
-    if let Err(error) = stream.respond_with(Status::OK, capsule_headers()).await {
+    if let Err(error) = stream.respond_with(Status::OK, capsule_fields()).await {
         debug!(stream_id, %error, "failed to send 200 for connect-udp");
         return;
     }
@@ -714,7 +714,7 @@ fn is_per_packet_send_error(error: &std::io::Error) -> bool {
 /// `Capsule-Protocol: ?1`, and §3.2 forbids Content-Length, Content-Type and
 /// Transfer-Encoding on it, since the body is a capsule sequence rather than a
 /// representation. Sending only the one field satisfies both.
-fn capsule_headers() -> Fields {
+fn capsule_fields() -> Fields {
     let mut fields = Fields::new();
     fields.append("capsule-protocol", FieldValue::from_static("?1"));
     fields

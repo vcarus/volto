@@ -411,7 +411,7 @@ where
 /// mechanics to [`accept_then_close`]; only the choice between them is made
 /// here.
 ///
-/// `accepted_headers` supplies what an accepted response of the caller's tunnel
+/// `accepted_fields` supplies what an accepted response of the caller's tunnel
 /// type has to carry — nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
 /// field for CONNECT-UDP. Deferred, so only the one path that sends a 200 pays
 /// for building it.
@@ -421,7 +421,7 @@ pub(crate) async fn admit_target(
     ctx: &Context,
     stream: &mut Stream,
     stream_id: u64,
-    accepted_headers: impl FnOnce() -> Fields,
+    accepted_fields: impl FnOnce() -> Fields,
 ) -> Option<Vec<std::net::SocketAddr>> {
     if !ctx.policy.allows_port(port) {
         debug!(stream_id, host, port, "target port denied by policy");
@@ -456,7 +456,7 @@ pub(crate) async fn admit_target(
                 ?addresses,
                 "every address of the target is a DNS blackhole"
             );
-            accept_then_close(stream, accepted_headers(), stream_id).await;
+            accept_then_close(stream, accepted_fields(), stream_id).await;
             return None;
         }
 
@@ -499,7 +499,7 @@ impl ProxyError {
     }
 
     /// This error as the field lines of a response.
-    pub fn headers(self) -> Fields {
+    pub fn fields(self) -> Fields {
         let mut fields = Fields::new();
         fields.append(PROXY_STATUS, FieldValue::from_static(self.field_value()));
         fields
@@ -532,9 +532,9 @@ impl ProxyError {
     ///
     /// The address is dropped unless `Self::discloses_next_hop` allows it, so a
     /// caller cannot leak one by passing it to the wrong error type.
-    pub fn headers_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> Fields {
+    pub fn fields_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> Fields {
         let Some(address) = next_hop.filter(|_| self.discloses_next_hop()) else {
-            return self.headers();
+            return self.fields();
         };
 
         // `<identifier>; error=<type>; next-hop="<address>"`. RFC 9209 §2.1.2
@@ -638,7 +638,7 @@ pub(crate) async fn refuse_because(
     error: ProxyError,
     stream_id: u64,
 ) {
-    refuse_with(stream, status, error.headers(), stream_id).await;
+    refuse_with(stream, status, error.fields(), stream_id).await;
 }
 
 /// Refuses a request whose target could not be reached, naming the failed hop.
@@ -652,7 +652,7 @@ pub(crate) async fn refuse_unreachable(stream: &mut Stream, failure: &Unreachabl
     refuse_with(
         stream,
         error.recommended_status(),
-        error.headers_with_next_hop(failure.next_hop),
+        error.fields_with_next_hop(failure.next_hop),
         stream_id,
     )
     .await;
@@ -748,7 +748,7 @@ mod tests {
             // parameter names the failure.
             assert_eq!(value, format!("volto; error={expected}"));
 
-            let fields = error.headers();
+            let fields = error.fields();
             assert_eq!(
                 fields.get(PROXY_STATUS).and_then(FieldValue::to_str),
                 Some(value)
@@ -850,7 +850,7 @@ mod tests {
             ProxyError::DestinationUnavailable,
         ] {
             assert_eq!(
-                proxy_status(&error.headers_with_next_hop(Some(hop))),
+                proxy_status(&error.fields_with_next_hop(Some(hop))),
                 format!("{}; next-hop=\"192.0.2.7:443\"", error.field_value())
             );
         }
@@ -871,7 +871,7 @@ mod tests {
             ProxyError::HttpRequestDenied,
             ProxyError::ConnectionLimitReached,
         ] {
-            let value = proxy_status(&error.headers_with_next_hop(Some(hop)));
+            let value = proxy_status(&error.fields_with_next_hop(Some(hop)));
             assert_eq!(
                 value,
                 error.field_value(),
@@ -894,8 +894,8 @@ mod tests {
             ProxyError::DestinationUnavailable,
         ] {
             assert_eq!(
-                error.headers_with_next_hop(None).get(PROXY_STATUS),
-                error.headers().get(PROXY_STATUS)
+                error.fields_with_next_hop(None).get(PROXY_STATUS),
+                error.fields().get(PROXY_STATUS)
             );
         }
     }
@@ -907,7 +907,7 @@ mod tests {
     fn a_next_hop_is_a_quoted_structured_field_string() {
         let ipv6: std::net::SocketAddr = "[2001:db8::1]:53".parse().expect("address");
         assert_eq!(
-            proxy_status(&ProxyError::ConnectionRefused.headers_with_next_hop(Some(ipv6))),
+            proxy_status(&ProxyError::ConnectionRefused.fields_with_next_hop(Some(ipv6))),
             "volto; error=connection_refused; next-hop=\"[2001:db8::1]:53\""
         );
 

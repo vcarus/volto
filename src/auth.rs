@@ -180,7 +180,7 @@ impl Authenticator {
 }
 
 /// The `Proxy-Authenticate` header a 407 response carries.
-pub fn challenge_headers() -> Fields {
+pub fn challenge_fields() -> Fields {
     let mut fields = Fields::new();
     fields.append(PROXY_AUTHENTICATE, FieldValue::from_static(CHALLENGE));
     fields
@@ -318,7 +318,7 @@ mod tests {
         value(&format!("Basic {token}"))
     }
 
-    fn headers(pairs: &[(&str, FieldValue)]) -> Fields {
+    fn fields(pairs: &[(&str, FieldValue)]) -> Fields {
         let mut fields = Fields::new();
         for (name, value) in pairs {
             fields.append(*name, value.clone());
@@ -333,7 +333,7 @@ mod tests {
         // Even a nonsense credential is irrelevant when nothing is required.
         assert_eq!(auth.authenticate(&Fields::new()), Ok(None));
         assert_eq!(
-            auth.authenticate(&headers(&[(PROXY_AUTHORIZATION, value("garbage"))])),
+            auth.authenticate(&fields(&[(PROXY_AUTHORIZATION, value("garbage"))])),
             Ok(None)
         );
     }
@@ -341,16 +341,16 @@ mod tests {
     #[test]
     fn proxy_authorization_is_accepted() {
         let auth = authenticator(&[("user1", "s3cret")]);
-        let headers = headers(&[(PROXY_AUTHORIZATION, basic("user1", "s3cret"))]);
-        assert_eq!(auth.authenticate(&headers), Ok(Some("user1")));
+        let fields = fields(&[(PROXY_AUTHORIZATION, basic("user1", "s3cret"))]);
+        assert_eq!(auth.authenticate(&fields), Ok(Some("user1")));
     }
 
     /// The fallback that makes decision D3 safe to leave open.
     #[test]
     fn authorization_is_accepted_as_a_fallback() {
         let auth = authenticator(&[("user1", "s3cret")]);
-        let headers = headers(&[(AUTHORIZATION, basic("user1", "s3cret"))]);
-        assert_eq!(auth.authenticate(&headers), Ok(Some("user1")));
+        let fields = fields(&[(AUTHORIZATION, basic("user1", "s3cret"))]);
+        assert_eq!(auth.authenticate(&fields), Ok(Some("user1")));
     }
 
     /// Whichever header carries the good credentials, the request passes.
@@ -358,13 +358,13 @@ mod tests {
     fn either_header_matching_is_enough() {
         let auth = authenticator(&[("user1", "s3cret")]);
 
-        let good_fallback = headers(&[
+        let good_fallback = fields(&[
             (PROXY_AUTHORIZATION, basic("user1", "wrong")),
             (AUTHORIZATION, basic("user1", "s3cret")),
         ]);
         assert_eq!(auth.authenticate(&good_fallback), Ok(Some("user1")));
 
-        let good_primary = headers(&[
+        let good_primary = fields(&[
             (PROXY_AUTHORIZATION, basic("user1", "s3cret")),
             (AUTHORIZATION, basic("user1", "wrong")),
         ]);
@@ -376,8 +376,8 @@ mod tests {
         let auth = authenticator(&[("a", "pw-a"), ("b", "pw-b"), ("c", "pw-c")]);
 
         for (username, password) in [("a", "pw-a"), ("b", "pw-b"), ("c", "pw-c")] {
-            let headers = headers(&[(PROXY_AUTHORIZATION, basic(username, password))]);
-            assert_eq!(auth.authenticate(&headers), Ok(Some(username)));
+            let fields = fields(&[(PROXY_AUTHORIZATION, basic(username, password))]);
+            assert_eq!(auth.authenticate(&fields), Ok(Some(username)));
         }
     }
 
@@ -386,10 +386,10 @@ mod tests {
     #[test]
     fn credentials_may_not_be_mixed_between_users() {
         let auth = authenticator(&[("a", "pw-a"), ("b", "pw-b")]);
-        let headers = headers(&[(PROXY_AUTHORIZATION, basic("a", "pw-b"))]);
+        let fields = fields(&[(PROXY_AUTHORIZATION, basic("a", "pw-b"))]);
 
         assert_eq!(
-            auth.authenticate(&headers),
+            auth.authenticate(&fields),
             Err(Denied::Rejected {
                 username: "a".to_owned()
             })
@@ -401,8 +401,8 @@ mod tests {
         let auth = authenticator(&[("user1", "s3cret")]);
 
         for (username, password) in [("user1", "wrong"), ("user2", "s3cret"), ("", "")] {
-            let headers = headers(&[(PROXY_AUTHORIZATION, basic(username, password))]);
-            let denied = auth.authenticate(&headers).expect_err("must be rejected");
+            let fields = fields(&[(PROXY_AUTHORIZATION, basic(username, password))]);
+            let denied = auth.authenticate(&fields).expect_err("must be rejected");
             assert_eq!(denied.username(), Some(username), "{denied:?}");
         }
     }
@@ -421,9 +421,9 @@ mod tests {
             ("USER1", "s3cret"),
             ("user1 ", "s3cret"),
         ] {
-            let headers = headers(&[(PROXY_AUTHORIZATION, basic(username, password))]);
+            let fields = fields(&[(PROXY_AUTHORIZATION, basic(username, password))]);
             assert!(
-                auth.authenticate(&headers).is_err(),
+                auth.authenticate(&fields).is_err(),
                 "{username:?}/{password:?} must not authenticate"
             );
         }
@@ -456,8 +456,8 @@ mod tests {
         ];
 
         for case in cases {
-            let headers = headers(&[(PROXY_AUTHORIZATION, value(case))]);
-            let denied = auth.authenticate(&headers).expect_err("must be rejected");
+            let fields = fields(&[(PROXY_AUTHORIZATION, value(case))]);
+            let denied = auth.authenticate(&fields).expect_err("must be rejected");
             assert!(
                 matches!(denied, Denied::Malformed(_)),
                 "{case:?} gave {denied:?}"
@@ -479,9 +479,9 @@ mod tests {
             format!("bAsIc {token}"),
             format!("Basic  {token}"),
         ] {
-            let headers = headers(&[(PROXY_AUTHORIZATION, value(&text))]);
+            let fields = fields(&[(PROXY_AUTHORIZATION, value(&text))]);
             assert_eq!(
-                auth.authenticate(&headers),
+                auth.authenticate(&fields),
                 Ok(Some("user1")),
                 "{text:?} must authenticate"
             );
@@ -492,8 +492,8 @@ mod tests {
     #[test]
     fn passwords_may_contain_colons() {
         let auth = authenticator(&[("user1", "a:b:c")]);
-        let headers = headers(&[(PROXY_AUTHORIZATION, basic("user1", "a:b:c"))]);
-        assert_eq!(auth.authenticate(&headers), Ok(Some("user1")));
+        let fields = fields(&[(PROXY_AUTHORIZATION, basic("user1", "a:b:c"))]);
+        assert_eq!(auth.authenticate(&fields), Ok(Some("user1")));
     }
 
     /// Credentials are bytes, so non-ASCII passwords work as long as the client
@@ -501,15 +501,15 @@ mod tests {
     #[test]
     fn non_ascii_credentials_round_trip() {
         let auth = authenticator(&[("üser", "pässwörd")]);
-        let headers = headers(&[(PROXY_AUTHORIZATION, basic("üser", "pässwörd"))]);
-        assert_eq!(auth.authenticate(&headers), Ok(Some("üser")));
+        let fields = fields(&[(PROXY_AUTHORIZATION, basic("üser", "pässwörd"))]);
+        assert_eq!(auth.authenticate(&fields), Ok(Some("üser")));
     }
 
     #[test]
     fn the_challenge_names_the_realm() {
-        let headers = challenge_headers();
+        let fields = challenge_fields();
         assert_eq!(
-            headers.get(PROXY_AUTHENTICATE).and_then(FieldValue::to_str),
+            fields.get(PROXY_AUTHENTICATE).and_then(FieldValue::to_str),
             Some("Basic realm=\"masque\"")
         );
     }

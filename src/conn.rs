@@ -270,7 +270,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             tunnel::refuse_with(
                 &mut stream,
                 Status::PROXY_AUTHENTICATION_REQUIRED,
-                auth::challenge_headers(),
+                auth::challenge_fields(),
                 stream_id,
             )
             .await;
