@@ -464,18 +464,8 @@ async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
             ));
         }
 
-        STREAM_QPACK_ENCODER | STREAM_QPACK_DECODER => {
-            let seen = if stream_type == STREAM_QPACK_ENCODER {
-                &handle.shared.encoder_seen
-            } else {
-                &handle.shared.decoder_seen
-            };
-            if seen.swap(true, Ordering::Relaxed) {
-                handle.fail(duplicate("a second QPACK stream of the same kind"));
-                return;
-            }
-            drain(recv).await;
-        }
+        STREAM_QPACK_ENCODER => serve_qpack(&handle, recv, QpackStream::Encoder).await,
+        STREAM_QPACK_DECODER => serve_qpack(&handle, recv, QpackStream::Decoder).await,
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# Recipients of unknown stream types MUST either abort reading of the
@@ -577,6 +567,11 @@ struct Control {
     settings: bool,
     /// The last GOAWAY identifier the peer sent.
     goaway: Option<u64>,
+    /// The largest push ID the peer has allowed (RFC 9114 §7.2.7), if any.
+    ///
+    /// Kept only to enforce that it never shrinks: this server never pushes,
+    /// so the value itself is never consulted.
+    max_push_id: Option<u64>,
 }
 
 impl Control {
@@ -652,9 +647,32 @@ impl Control {
                 Ok(())
             }
 
-            // This server never pushes, so there is no push to cancel and no
-            // push id worth raising. Both are accepted and ignored.
-            (Frame::CancelPush(_) | Frame::MaxPushId(_), true) => Ok(()),
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
+            //# If a server receives a CANCEL_PUSH frame for a push ID that has
+            //# not yet been mentioned by a PUSH_PROMISE frame, this MUST be
+            //# treated as a connection error of type H3_ID_ERROR.
+            //
+            // This server never sends PUSH_PROMISE, so no push ID has ever been
+            // mentioned and every CANCEL_PUSH names one that has not.
+            (Frame::CancelPush(push_id), true) => Err(Violation::connection(
+                Code::H3_ID_ERROR,
+                format!("a CANCEL_PUSH for push ID {push_id}, which was never promised"),
+            )),
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
+            //# A MAX_PUSH_ID frame cannot reduce the maximum push ID; receipt of
+            //# a MAX_PUSH_ID frame that contains a smaller value than previously
+            //# received MUST be treated as a connection error of type H3_ID_ERROR.
+            (Frame::MaxPushId(push_id), true) => {
+                if self.max_push_id.is_some_and(|previous| push_id < previous) {
+                    return Err(Violation::connection(
+                        Code::H3_ID_ERROR,
+                        format!("a MAX_PUSH_ID that shrank to {push_id}"),
+                    ));
+                }
+                self.max_push_id = Some(push_id);
+                Ok(())
+            }
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
             //# A server MUST treat the receipt of a PUSH_PROMISE frame as a
@@ -671,23 +689,171 @@ impl Control {
     }
 }
 
-/// Reads and discards a stream until the peer stops sending on it.
+/// Which of the peer's two QPACK streams (RFC 9204 §4.2) is being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QpackStream {
+    /// The peer's encoder stream, carrying encoder instructions (RFC 9204 §4.3).
+    Encoder,
+    /// The peer's decoder stream, carrying decoder instructions (RFC 9204 §4.4).
+    Decoder,
+}
+
+impl QpackStream {
+    /// The flag recording whether a stream of this kind has been accepted.
+    fn seen(self, shared: &Shared) -> &AtomicBool {
+        match self {
+            Self::Encoder => &shared.encoder_seen,
+            Self::Decoder => &shared.decoder_seen,
+        }
+    }
+
+    /// The error code RFC 9204 §6 assigns to a fault on this stream.
+    fn code(self) -> Code {
+        match self {
+            Self::Encoder => Code::QPACK_ENCODER_STREAM_ERROR,
+            Self::Decoder => Code::QPACK_DECODER_STREAM_ERROR,
+        }
+    }
+}
+
+/// The most continuation bytes an instruction's prefixed integer may run to.
 ///
-/// The QPACK encoder and decoder streams have nothing to say to a decoder that
-/// advertised a zero table capacity, but they still have to be read: a receiver
-/// that never reads stalls the peer's stream flow control, and RFC 9204 §4.2
-/// forbids the peer from closing them, so stopping them is not an option
-/// either.
+/// RFC 9204 §4.1.1 requires decoding integers "up to and including 62 bits
+/// long", which a 5- or 6-bit prefix reaches in nine continuation bytes of
+/// seven bits each. A tenth is a value no conformant encoder produces, and this
+/// server's own rule is to end the stream there rather than read on forever.
+const MAX_INTEGER_CONTINUATION: usize = 9;
+
+/// Reads one of the peer's QPACK streams for the life of the connection.
+///
+/// This decoder advertised a table capacity of zero and this encoder never
+/// touches the dynamic table, so neither stream can carry an instruction that
+/// changes anything here -- but they still have to be read: a receiver that
+/// never reads stalls the peer's stream flow control, and RFC 9204 §4.2 forbids
+/// the peer from closing them, so stopping them is not an option either. Reading
+/// means checking: with no table, nearly every instruction is one the RFC makes
+/// a connection error, and [`qpack_instruction`] says which. Only the first byte
+/// of each is ever needed, so the rest of an accepted instruction is read past.
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
 /// connection error of type H3_CLOSED_CRITICAL_STREAM. That is deliberately not
-/// enforced: with a zero table capacity the streams carry nothing this server
-/// reads, while a client tearing a connection down may well finish its send
-/// streams a moment before its CONNECTION_CLOSE arrives -- and answering an
-/// ordinary goodbye with a protocol error would turn a race into a fault report
-/// in the operator's log.
-async fn drain(mut recv: quinn::RecvStream) {
-    while let Ok(Some(_)) = recv.read_chunk(usize::MAX, true).await {}
+/// enforced: the streams carry nothing this server acts on, while a client
+/// tearing a connection down may well finish its send streams a moment before
+/// its CONNECTION_CLOSE arrives -- and answering an ordinary goodbye with a
+/// protocol error would turn a race into a fault report in the operator's log.
+async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
+    if kind.seen(&handle.shared).swap(true, Ordering::Relaxed) {
+        handle.fail(duplicate("a second QPACK stream of the same kind"));
+        return;
+    }
+
+    // Whether the last accepted instruction's integer is still running, and how
+    // many continuation bytes of it have been read.
+    let mut continuing = false;
+    let mut continuation = 0usize;
+
+    while let Ok(Some(chunk)) = recv.read_chunk(usize::MAX, true).await {
+        for &byte in &chunk.bytes {
+            if continuing {
+                continuation += 1;
+                if continuation > MAX_INTEGER_CONTINUATION {
+                    handle.fail(Violation::connection(
+                        kind.code(),
+                        "an integer past 62 bits",
+                    ));
+                    return;
+                }
+                continuing = byte & 0b1000_0000 != 0;
+                continue;
+            }
+
+            match qpack_instruction(kind, byte) {
+                Ok(more) => {
+                    continuing = more;
+                    continuation = 0;
+                }
+                Err(violation) => {
+                    handle.fail(violation);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Judges an instruction on one of the peer's QPACK streams by its first byte.
+///
+/// `Ok(true)` means the instruction is acceptable and its integer continues into
+/// the bytes that follow; `Ok(false)` that it is acceptable and complete; `Err`
+/// that it is a connection error. The first byte is always enough: every
+/// refused instruction is refused by its opcode alone, and for the two that are
+/// allowed the prefix bits settle the only question there is.
+fn qpack_instruction(kind: QpackStream, first: u8) -> Result<bool, Violation> {
+    let refuse = |what: &'static str| Err(Violation::connection(kind.code(), what));
+
+    match kind {
+        QpackStream::Encoder => {
+            //= https://www.rfc-editor.org/rfc/rfc9204#section-3.2.2
+            //# It is an error if the encoder attempts to add an entry that is
+            //# larger than the dynamic table capacity; the decoder MUST treat
+            //# this as a connection error of type QPACK_ENCODER_STREAM_ERROR.
+            //
+            // With a capacity of zero every entry is larger than it, which
+            // covers both Insert instructions (§4.3.2, §4.3.3) and Duplicate
+            // (§4.3.4), which adds an entry too.
+            if first & 0b1000_0000 != 0 {
+                return refuse("an Insert with Name Reference with no dynamic table");
+            }
+            if first & 0b0100_0000 != 0 {
+                return refuse("an Insert with Literal Name with no dynamic table");
+            }
+            if first & 0b0010_0000 != 0 {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+                //# The decoder MUST treat a new dynamic table capacity value that
+                //# exceeds this limit as a connection error of type
+                //# QPACK_ENCODER_STREAM_ERROR.
+                //
+                // The limit is the zero this server advertised, and a 5-bit
+                // prefix of zero is the only encoding of zero (§4.1.1), so the
+                // first byte decides.
+                if first & 0b0001_1111 != 0 {
+                    return refuse("a dynamic table capacity above the zero this server allows");
+                }
+                return Ok(false);
+            }
+            refuse("a Duplicate with no dynamic table")
+        }
+
+        QpackStream::Decoder => {
+            if first & 0b1000_0000 != 0 {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.1
+                //# If an encoder receives a Section Acknowledgment instruction
+                //# referring to a stream on which every encoded field section
+                //# with a non-zero Required Insert Count has already been
+                //# acknowledged, this MUST be treated as a connection error of
+                //# type QPACK_DECODER_STREAM_ERROR.
+                //
+                // This encoder never uses the dynamic table, so no field section
+                // it sent had a non-zero Required Insert Count: on every stream,
+                // all of them -- none -- stand acknowledged already.
+                return refuse("a Section Acknowledgment for a field section that needed none");
+            }
+            if first & 0b0100_0000 != 0 {
+                // Stream Cancellation (§4.4.2): nothing to undo and nothing the
+                // RFC asks to check; only the stream id has to be read past.
+                return Ok(first & 0b0011_1111 == 0b0011_1111);
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9204#section-4.4.3
+            //# An encoder that receives an Increment field equal to zero, or one
+            //# that increases the Known Received Count beyond what the encoder
+            //# has sent, MUST treat this as a connection error of type
+            //# QPACK_DECODER_STREAM_ERROR.
+            //
+            // This encoder has sent no insertions, so any increment is beyond
+            // them, and an increment of zero is an error in its own right.
+            refuse("an Insert Count Increment when nothing was inserted")
+        }
+    }
 }
 
 /// Reads a unidirectional stream's type, the varint it opens with.
@@ -850,20 +1016,75 @@ mod tests {
         }
     }
 
-    /// A server that never pushes has nothing to do about either frame, and
-    /// RFC 9114 gives it nothing to complain about either.
+    /// This server never sends PUSH_PROMISE, so no push ID was ever mentioned
+    /// and RFC 9114 §7.2.3 makes every CANCEL_PUSH an H3_ID_ERROR.
     #[test]
-    fn push_bookkeeping_frames_are_accepted_and_ignored() {
+    fn a_cancel_push_names_a_push_that_was_never_promised() {
         let shared = Shared::default();
         let mut control = Control::default();
         control.accept(settings(true), &shared).expect("accepted");
 
-        control
+        let error = control
             .accept(Item::Frame(Frame::CancelPush(7)), &shared)
-            .expect("accepted");
-        control
-            .accept(Item::Frame(Frame::MaxPushId(9)), &shared)
-            .expect("accepted");
+            .expect_err("refused");
+        assert_eq!(error.code(), Code::H3_ID_ERROR);
+    }
+
+    #[test]
+    fn a_max_push_id_may_grow_but_not_shrink() {
+        let shared = Shared::default();
+        let mut control = Control::default();
+        control.accept(settings(true), &shared).expect("accepted");
+
+        for push_id in [9, 9, 12] {
+            control
+                .accept(Item::Frame(Frame::MaxPushId(push_id)), &shared)
+                .expect("a push ID that does not shrink is allowed");
+        }
+        let error = control
+            .accept(Item::Frame(Frame::MaxPushId(8)), &shared)
+            .expect_err("a smaller push ID is refused");
+        assert_eq!(error.code(), Code::H3_ID_ERROR);
+    }
+
+    #[test]
+    fn qpack_encoder_instructions_are_refused_except_a_zero_capacity() {
+        for (first, what) in [
+            (0b1000_0000, "an Insert with Name Reference"),
+            (0b1111_1111, "an Insert with Name Reference, every bit set"),
+            (0b0100_0000, "an Insert with Literal Name"),
+            (0b0000_0000, "a Duplicate"),
+            (0b0010_0001, "a capacity of 1"),
+            (0b0011_1111, "a capacity of 31 or more"),
+        ] {
+            let error = qpack_instruction(QpackStream::Encoder, first).expect_err(what);
+            assert_eq!(error.code(), Code::QPACK_ENCODER_STREAM_ERROR, "{what}");
+            assert!(error.is_connection_error(), "{what}");
+        }
+
+        let more = qpack_instruction(QpackStream::Encoder, 0b0010_0000).expect("a capacity of 0");
+        assert!(!more, "a capacity of 0 is complete in its first byte");
+    }
+
+    #[test]
+    fn qpack_decoder_instructions_are_refused_except_stream_cancellation() {
+        for (first, what) in [
+            (0b1000_0000, "a Section Acknowledgment"),
+            (0b1111_1111, "a Section Acknowledgment, every bit set"),
+            (0b0000_0000, "an Insert Count Increment of 0"),
+            (0b0000_0001, "an Insert Count Increment of 1"),
+            (0b0011_1111, "an Insert Count Increment of 63 or more"),
+        ] {
+            let error = qpack_instruction(QpackStream::Decoder, first).expect_err(what);
+            assert_eq!(error.code(), Code::QPACK_DECODER_STREAM_ERROR, "{what}");
+            assert!(error.is_connection_error(), "{what}");
+        }
+
+        let more = qpack_instruction(QpackStream::Decoder, 0b0100_0100).expect("cancel stream 4");
+        assert!(!more, "a small stream id is complete in its first byte");
+        let more =
+            qpack_instruction(QpackStream::Decoder, 0b0111_1111).expect("cancel a big stream");
+        assert!(more, "a stream id of 63 or more continues");
     }
 
     #[test]

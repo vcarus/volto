@@ -149,9 +149,11 @@ pub enum Frame {
     Settings(Settings),
     /// GOAWAY with the identifier the peer will not serve past.
     Goaway(u64),
-    /// CANCEL_PUSH, which a server that never pushes has nothing to do about.
+    /// CANCEL_PUSH with its push ID, which a server that never pushes can only
+    /// ever find unpromised (RFC 9114 §7.2.3).
     CancelPush(u64),
-    /// MAX_PUSH_ID, likewise.
+    /// MAX_PUSH_ID with its push ID, which may grow but never shrink
+    /// (RFC 9114 §7.2.7).
     MaxPushId(u64),
     /// PUSH_PROMISE, which a server must never receive (RFC 9114 §7.2.5).
     PushPromise,

@@ -201,14 +201,20 @@ What it leaves out, deliberately:
   §3.2.3 and §2.1.2 make binding on the peer's encoder. A field line referencing
   a dynamic entry is therefore a protocol violation answered with
   `QPACK_DECOMPRESSION_FAILED`, not a gap in the implementation — and the
-  eviction, the two instruction streams and the head-of-line blocking that go
-  with a dynamic table are all gone with it.
+  eviction and head-of-line blocking that go with a dynamic table are gone with
+  it. The peer's encoder and decoder streams are still read, instruction by
+  instruction: with no table, an insertion, a capacity above zero, a Section
+  Acknowledgment or an Insert Count Increment is the connection error RFC 9204
+  §3.2.2, §4.3.1, §4.4.1 and §4.4.3 make it, and only a zero capacity and a
+  Stream Cancellation pass.
 - **Huffman encoding.** A response here is a status line and at most two short
   fields; compressing it would save a handful of bytes per tunnel. Decoding is
   implemented because a client's request arrives Huffman-coded.
 - **Server push and WebTransport.** A push stream from a client is a connection
   error either way (RFC 9114 §6.2.2), and `webtransport` is a `:protocol` this
-  server answers 501 to.
+  server answers 501 to. The push bookkeeping frames are still judged: every
+  CANCEL_PUSH names a push this server never promised (RFC 9114 §7.2.3), and a
+  MAX_PUSH_ID may not shrink (§7.2.7) — both `H3_ID_ERROR`.
 
 A connection error is a `quinn::Connection::close` carrying the HTTP/3 code,
 which is exactly what RFC 9114 §8 defines one to be. Nothing has to be
@@ -225,11 +231,16 @@ is allocated for it.
 
 Two deviations are taken knowingly:
 
-- A CONNECT-UDP request carrying `Content-Length` or `Transfer-Encoding` is
-  answered **400 with a `Proxy-Status` field** (RFC 9297 §3.2) rather than reset
-  as malformed under RFC 9114 §4.2's rule about connection-specific fields. A
-  status the client can read says more than a bare stream reset, and `it_udp`
-  pins that answer. The `Connection` field itself is still treated as malformed.
+- A CONNECT-UDP request carrying `Content-Length`, `Content-Type` or
+  `Transfer-Encoding` is answered with a bare **400 and a clean stream close**
+  (RFC 9297 §3.2 makes such a request malformed) rather than reset. That much is
+  within RFC 9114 §4.1.2, which lets a server "send an HTTP response indicating
+  the error prior to closing or resetting the stream", and `it_udp` pins the 400.
+  The deviation proper is narrower: on a plain CONNECT, `Transfer-Encoding`,
+  `Keep-Alive`, `Proxy-Connection` and `Upgrade` — the connection-specific
+  fields RFC 9114 §4.2 says make a message malformed — are not rejected at all,
+  since a tunnel has no use for them. The `Connection` field itself is still
+  treated as malformed.
 - A peer that closes its QPACK encoder or decoder stream is **not** treated as
   `H3_CLOSED_CRITICAL_STREAM`, which RFC 9204 §4.2 requires. With a zero table
   capacity those streams carry nothing, so nothing is lost when they end — and a
