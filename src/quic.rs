@@ -268,6 +268,10 @@ impl Server {
     pub async fn run(&self) {
         let config = self.config();
         info!(
+            // The binary's own version, so a journal read after an upgrade
+            // says which build produced the lines that follow without having
+            // to be matched against the deploy log or a checksum.
+            version = env!("CARGO_PKG_VERSION"),
             listen = %config.server.listen,
             alpn = ?config.server.alpn,
             grace_secs = config.server.shutdown_grace,
