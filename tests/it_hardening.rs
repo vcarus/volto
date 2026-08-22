@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    auth_section, basic_credentials, connect_quic, connect_request, open_tcp_tunnel,
+    auth_section, authorized_connect, connect_quic, connect_request, open_tcp_tunnel,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
-use volto::h3api::{FieldValue, Status};
+use volto::h3api::Status;
 
 /// HEADERS frame type (RFC 9114 §7.2.2).
 const FRAME_HEADERS: u64 = 0x01;
@@ -38,11 +38,7 @@ const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 
 
 /// A CONNECT attempt with the given credentials, returning the status.
 async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
-    let mut request = connect_request(authority);
-    request.fields.append(
-        "proxy-authorization",
-        FieldValue::parse(basic_credentials("user1", password).as_bytes())?,
-    );
+    let request = authorized_connect(authority, "user1", password);
 
     let mut stream = client.send.send_request(request).await.ok()?;
     let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
@@ -169,11 +165,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     // window the client refused to grow.
     let mut unread = Vec::new();
     for _ in 0..8 {
-        let mut request = connect_request("192.0.2.1:443");
-        request.fields.append(
-            "proxy-authorization",
-            FieldValue::parse(basic_credentials("user1", "wrong").as_bytes()).expect("credentials"),
-        );
+        let request = authorized_connect("192.0.2.1:443", "user1", "wrong");
         unread.push(
             client
                 .send

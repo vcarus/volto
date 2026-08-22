@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::{
-    auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport,
-    connect_request, finish_connect, open_tcp_tunnel, read_at_least, send_and_respond,
-    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    auth_section, authorized_connect, basic_credentials, client_endpoint,
+    client_endpoint_with_transport, finish_connect, open_tcp_tunnel, read_at_least,
+    send_and_respond, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::Status;
@@ -481,12 +481,7 @@ fn authenticated_tunnel<'a>(
 ) -> impl Future<Output = common::ClientStream> + 'a {
     let caller = Location::caller();
     async move {
-        let mut request = connect_request(authority);
-        request.fields.append(
-            "proxy-authorization",
-            common::field_value(&basic_credentials(USER.0, USER.1)),
-        );
-
+        let request = authorized_connect(authority, USER.0, USER.1);
         let (response, stream) = send_and_respond(client, request).await;
         assert_eq!(
             response.status,

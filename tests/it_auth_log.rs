@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    auth_section, basic_credentials, connect_request, respond_to, H3Client, SharedBuffer,
-    TestServer,
+    auth_section, authorize, basic_credentials, connect_request, respond_to, H3Client,
+    SharedBuffer, TestServer,
 };
 use volto::h3api::Status;
 
@@ -33,9 +33,7 @@ async fn a_rejected_password_is_never_logged() {
     // include what was tried.
     let attempted = basic_credentials(USERNAME, "wrong-guess");
     let mut request = connect_request("192.0.2.1:443");
-    request
-        .fields
-        .append("proxy-authorization", common::field_value(&attempted));
+    authorize(&mut request, &attempted);
 
     let response = respond_to(&mut client, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);

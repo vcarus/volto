@@ -16,13 +16,13 @@ mod common;
 
 use bytes::{Bytes, BytesMut};
 use common::{
-    auth_section, basic_credentials, connect_request, huffman, open_tcp_tunnel, open_udp_session,
-    read_at_least, respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE, TIMEOUT,
+    auth_section, authorized_connect, huffman, open_tcp_tunnel, open_udp_session, read_at_least,
+    respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
+    TIMEOUT,
 };
 use volto::datagram;
 use volto::h3::frame;
-use volto::h3api::{Request, Status};
+use volto::h3api::Status;
 
 /// QPACK_DECOMPRESSION_FAILED (RFC 9204 §6, registered in §8.3).
 ///
@@ -158,14 +158,14 @@ async fn huffman_coded_credentials_are_decoded_byte_for_byte() {
 
     let refused = respond_to(
         &mut client,
-        authorized_connect(&target.to_string(), &basic_credentials(USER.0, "wrong")),
+        authorized_connect(&target.to_string(), USER.0, "wrong"),
     )
     .await;
     assert_eq!(refused.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
     let accepted = respond_to(
         &mut client,
-        authorized_connect(&target.to_string(), &basic_credentials(USER.0, USER.1)),
+        authorized_connect(&target.to_string(), USER.0, USER.1),
     )
     .await;
     assert_eq!(
@@ -173,15 +173,6 @@ async fn huffman_coded_credentials_are_decoded_byte_for_byte() {
         Status::OK,
         "Huffman-coded credentials must decode to the same bytes that were sent"
     );
-}
-
-/// A CONNECT carrying `Proxy-Authorization: <credentials>`.
-fn authorized_connect(authority: &str, credentials: &str) -> Request {
-    let mut request = connect_request(authority);
-    request
-        .fields
-        .append("proxy-authorization", common::field_value(credentials));
-    request
 }
 
 // ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ mod common;
 use bytes::Bytes;
 use common::Response;
 use common::{
-    auth_section, basic_credentials, connect_request, read_at_least, respond_to, send_and_respond,
+    auth_section, authorized_connect, connect_request, read_at_least, respond_to, send_and_respond,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
 };
 use volto::h3api::{FieldValue, Status};
@@ -29,12 +29,7 @@ async fn connect_as(
     username: &str,
     password: &str,
 ) -> Response {
-    let mut request = connect_request(authority);
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials(username, password)),
-    );
-    respond_to(client, request).await
+    respond_to(client, authorized_connect(authority, username, password)).await
 }
 
 /// The headline case: rotate the credentials, reload, and the change is in force
@@ -100,11 +95,7 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
     let target = spawn_echo_target().await;
 
     let mut client = H3Client::connect(&server).await;
-    let mut request = connect_request(&target.to_string());
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials("user1", "old-password")),
-    );
+    let request = authorized_connect(&target.to_string(), "user1", "old-password");
     let (response, mut held) = send_and_respond(&mut client, request).await;
     assert_eq!(response.status, Status::OK);
 

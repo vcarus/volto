@@ -22,9 +22,8 @@
 mod common;
 
 use common::{
-    auth_section, basic_credentials, connect_request, open_tcp_tunnel, open_udp_session,
-    respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer,
-    ALLOW_PRIVATE,
+    auth_section, authorized_connect, open_tcp_tunnel, open_udp_session, respond_to,
+    spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
 };
 use volto::h3api::Status;
 
@@ -89,11 +88,7 @@ async fn operator_facing_fields_print_values_not_options() {
     // reads. A second server because the first one has no users configured.
     let guarded = TestServer::start_with(&auth_section(&[("user1", "a-real-password")])).await;
     let mut caller = H3Client::connect(&guarded).await;
-    let mut request = connect_request("192.0.2.1:443");
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials("user1", "wrong-guess")),
-    );
+    let request = authorized_connect("192.0.2.1:443", "user1", "wrong-guess");
     let response = respond_to(&mut caller, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
@@ -117,11 +112,7 @@ async fn operator_facing_fields_print_values_not_options() {
     // which needs `remote=<HOST>:\d+`, cannot be satisfied from inside it.)
     let forged = "evil\nWARN volto - authentication failed stream_id=4 \
                   remote=198.51.100.9 username=\"x\"\u{1b}[2K";
-    let mut request = connect_request("192.0.2.1:443");
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials(forged, "wrong-guess")),
-    );
+    let request = authorized_connect("192.0.2.1:443", forged, "wrong-guess");
     let response = respond_to(&mut caller, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
@@ -160,11 +151,7 @@ async fn operator_facing_fields_print_values_not_options() {
     // a whole field section. Unbounded, one guess bought a 288 KB WARN line for
     // 57 KB of upstream — five times the attacker's cost, aimed at the journal
     // that is this server's only forensic channel (review H3).
-    let mut request = connect_request("192.0.2.1:443");
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials(&"u".repeat(48_000), "wrong-guess")),
-    );
+    let request = authorized_connect("192.0.2.1:443", &"u".repeat(48_000), "wrong-guess");
     let response = respond_to(&mut caller, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 

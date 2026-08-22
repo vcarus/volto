@@ -11,10 +11,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::Response;
 use common::{
-    assert_peer_reset, auth_section, basic_credentials, connect_request, connect_udp_request,
-    open_tcp_tunnel, open_udp_session, read_at_least, respond_to, send_and_respond,
-    spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE, TIMEOUT,
+    assert_peer_reset, auth_section, authorize, authorized_connect, basic_credentials,
+    connect_request, connect_udp_request, open_tcp_tunnel, open_udp_session, read_at_least,
+    respond_to, send_and_respond, spawn_echo_target, spawn_silent_udp_target,
+    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Request, Status};
@@ -40,10 +40,11 @@ fn assert_refused(response: &Response, status: Status, error: &str) {
     );
 }
 
-/// A CONNECT request carrying credentials in `header`.
-fn authorized_connect(authority: &str, header: &str, value: &str) -> Request {
+/// A CONNECT request carrying credentials in `field`, which is the axis one
+/// test below is about -- every other caller wants `common::authorized_connect`.
+fn authorized_connect_in(authority: &str, field: &str, value: &str) -> Request {
     let mut request = connect_request(authority);
-    request.fields.append(header, common::field_value(value));
+    request.fields.append(field, common::field_value(value));
     request
 }
 
@@ -72,18 +73,18 @@ async fn correct_credentials_are_accepted_in_either_header() {
     let target = spawn_echo_target().await;
     let credentials = basic_credentials(USER.0, USER.1);
 
-    for header in ["proxy-authorization", "authorization"] {
+    for field in ["proxy-authorization", "authorization"] {
         let mut client = H3Client::connect(&server).await;
         let response = respond_to(
             &mut client,
-            authorized_connect(&target.to_string(), header, &credentials),
+            authorized_connect_in(&target.to_string(), field, &credentials),
         )
         .await;
 
         assert_eq!(
             response.status,
             Status::OK,
-            "credentials in {header} must be accepted"
+            "credentials in {field} must be accepted"
         );
     }
 }
@@ -108,11 +109,9 @@ async fn bad_or_missing_credentials_are_refused_with_a_challenge() {
 
     for credentials in &bad {
         let mut client = H3Client::connect(&server).await;
-        let response = respond_to(
-            &mut client,
-            authorized_connect(&target.to_string(), "proxy-authorization", credentials),
-        )
-        .await;
+        let mut request = connect_request(&target.to_string());
+        authorize(&mut request, credentials);
+        let response = respond_to(&mut client, request).await;
 
         assert_eq!(
             response.status,
@@ -155,10 +154,7 @@ async fn connect_udp_is_authenticated_too() {
     );
 
     let mut request = connect_udp_request(server.addr, &target.ip().to_string(), target.port());
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials(USER.0, USER.1)),
-    );
+    authorize(&mut request, &basic_credentials(USER.0, USER.1));
     let authenticated = respond_to(&mut client, request).await;
     assert_eq!(authenticated.status, Status::OK);
 }
@@ -176,11 +172,7 @@ async fn credentials_are_not_interchangeable_between_users() {
 
     let mixed = respond_to(
         &mut client,
-        authorized_connect(
-            &target.to_string(),
-            "proxy-authorization",
-            &basic_credentials("alice", "pw-bob"),
-        ),
+        authorized_connect(&target.to_string(), "alice", "pw-bob"),
     )
     .await;
     assert_eq!(mixed.status, Status::PROXY_AUTHENTICATION_REQUIRED);
@@ -190,11 +182,7 @@ async fn credentials_are_not_interchangeable_between_users() {
         let mut client = H3Client::connect(&server).await;
         let response = respond_to(
             &mut client,
-            authorized_connect(
-                &target.to_string(),
-                "proxy-authorization",
-                &basic_credentials(username, password),
-            ),
+            authorized_connect(&target.to_string(), username, password),
         )
         .await;
         assert_eq!(response.status, Status::OK, "{username} must pass");

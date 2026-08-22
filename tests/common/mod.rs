@@ -431,6 +431,26 @@ pub fn field_value(value: &str) -> FieldValue {
     FieldValue::parse(value.as_bytes()).expect("a valid field value")
 }
 
+/// Adds credentials to a request, in the field decision D3 treats as primary.
+///
+/// Kept separate from `authorized_connect` for the requests that are not a
+/// classic CONNECT -- a CONNECT-UDP one, or a credential no `basic_credentials`
+/// call could have produced.
+#[track_caller]
+pub fn authorize(request: &mut Request, credentials: &str) {
+    request
+        .fields
+        .append("proxy-authorization", field_value(credentials));
+}
+
+/// A classic CONNECT carrying HTTP Basic credentials.
+#[track_caller]
+pub fn authorized_connect(authority: &str, username: &str, password: &str) -> Request {
+    let mut request = connect_request(authority);
+    authorize(&mut request, &basic_credentials(username, password));
+    request
+}
+
 /// Builds a CONNECT-UDP request for `target` using the RFC 9298 §2 template.
 ///
 /// `target_host` is percent-encoded per RFC 9298 §3.1, so an IPv6 literal

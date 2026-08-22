@@ -11,8 +11,8 @@ mod common;
 
 use bytes::{Bytes, BytesMut};
 use common::{
-    auth_section, basic_credentials, connect_request, read_at_least, respond_to, spawn_echo_target,
-    H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    auth_section, authorize, basic_credentials, connect_request, read_at_least, respond_to,
+    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::h3::frame;
 use volto::h3api::{Method, Request, Status};
@@ -122,14 +122,14 @@ fn connect_ip_request(proxy: &str) -> Request {
     request.authority = Some(proxy.into());
     request.path = Some("/.well-known/masque/ip/*/*/".into());
     request.protocol = Some("connect-ip".into());
-    authorize(&mut request);
+    authorize_as_user(&mut request);
     request
 }
 
 /// `common::open_tcp_tunnel` for a server that requires credentials.
 async fn open_tcp_tunnel_as_user(client: &mut H3Client, authority: &str) -> common::ClientStream {
     let mut request = connect_request(authority);
-    authorize(&mut request);
+    authorize_as_user(&mut request);
 
     let (response, stream) = common::send_and_respond(client, request).await;
     assert_eq!(
@@ -142,9 +142,6 @@ async fn open_tcp_tunnel_as_user(client: &mut H3Client, authority: &str) -> comm
 }
 
 /// Adds this suite's credentials to a request.
-fn authorize(request: &mut Request) {
-    request.fields.append(
-        "proxy-authorization",
-        common::field_value(&basic_credentials(USER.0, USER.1)),
-    );
+fn authorize_as_user(request: &mut Request) {
+    authorize(request, &basic_credentials(USER.0, USER.1));
 }
