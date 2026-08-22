@@ -9,29 +9,30 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::Response;
 use common::{
     assert_peer_reset, auth_section, basic_credentials, connect_request, connect_udp_request,
     open_tcp_tunnel, open_udp_session, read_at_least, respond_to, send_and_respond,
     spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer,
     ALLOW_PRIVATE, TIMEOUT,
 };
-use http::{HeaderName, Request, Response, StatusCode};
 use volto::datagram;
+use volto::h3api::{FieldValue, Request, Status};
 
 /// The credentials the test servers below are configured with.
 const USER: (&str, &str) = ("user1", "s3cret");
 
 /// The `Proxy-Status` field of a response, if it has one.
-fn proxy_status(response: &Response<()>) -> Option<&str> {
+fn proxy_status(response: &Response) -> Option<&str> {
     response
-        .headers()
+        .fields
         .get("proxy-status")
         .map(|value| value.to_str().expect("proxy-status is ASCII"))
 }
 
 /// Asserts a refusal carries the RFC 9209 reason it should.
-fn assert_refused(response: &Response<()>, status: StatusCode, error: &str) {
-    assert_eq!(response.status(), status);
+fn assert_refused(response: &Response, status: Status, error: &str) {
+    assert_eq!(response.status, status);
     assert_eq!(
         proxy_status(response),
         Some(format!("volto; error={error}").as_str()),
@@ -40,11 +41,9 @@ fn assert_refused(response: &Response<()>, status: StatusCode, error: &str) {
 }
 
 /// A CONNECT request carrying credentials in `header`.
-fn authorized_connect(authority: &str, header: HeaderName, value: &str) -> Request<()> {
+fn authorized_connect(authority: &str, header: &str, value: &str) -> Request {
     let mut request = connect_request(authority);
-    request
-        .headers_mut()
-        .insert(header, value.parse().expect("header value"));
+    request.fields.append(header, common::field_value(value));
     request
 }
 
@@ -62,7 +61,7 @@ async fn no_configured_users_means_no_authentication() {
     let mut client = H3Client::connect(&server).await;
 
     let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
 }
 
 /// Both header names are accepted (decision D3): Surge's manual does not say
@@ -73,20 +72,17 @@ async fn correct_credentials_are_accepted_in_either_header() {
     let target = spawn_echo_target().await;
     let credentials = basic_credentials(USER.0, USER.1);
 
-    for header in [
-        HeaderName::from_static("proxy-authorization"),
-        HeaderName::from_static("authorization"),
-    ] {
+    for header in ["proxy-authorization", "authorization"] {
         let mut client = H3Client::connect(&server).await;
         let response = respond_to(
             &mut client,
-            authorized_connect(&target.to_string(), header.clone(), &credentials),
+            authorized_connect(&target.to_string(), header, &credentials),
         )
         .await;
 
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
+            response.status,
+            Status::OK,
             "credentials in {header} must be accepted"
         );
     }
@@ -114,24 +110,20 @@ async fn bad_or_missing_credentials_are_refused_with_a_challenge() {
         let mut client = H3Client::connect(&server).await;
         let response = respond_to(
             &mut client,
-            authorized_connect(
-                &target.to_string(),
-                HeaderName::from_static("proxy-authorization"),
-                credentials,
-            ),
+            authorized_connect(&target.to_string(), "proxy-authorization", credentials),
         )
         .await;
 
         assert_eq!(
-            response.status(),
-            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            response.status,
+            Status::PROXY_AUTHENTICATION_REQUIRED,
             "{credentials:?} must not authenticate"
         );
         assert_eq!(
             response
-                .headers()
+                .fields
                 .get("proxy-authenticate")
-                .map(|v| v.to_str().unwrap()),
+                .and_then(FieldValue::to_str),
             Some("Basic realm=\"masque\""),
             "RFC 9110 §11.7.1: a 407 must carry a challenge"
         );
@@ -140,8 +132,8 @@ async fn bad_or_missing_credentials_are_refused_with_a_challenge() {
     // And no credentials at all.
     let mut client = H3Client::connect(&server).await;
     let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-    assert!(response.headers().get("proxy-authenticate").is_some());
+    assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
+    assert!(response.fields.get("proxy-authenticate").is_some());
 }
 
 /// Surge sends credentials on *every* CONNECT, so CONNECT-UDP is checked exactly
@@ -158,19 +150,17 @@ async fn connect_udp_is_authenticated_too() {
     )
     .await;
     assert_eq!(
-        unauthenticated.status(),
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        unauthenticated.status,
+        Status::PROXY_AUTHENTICATION_REQUIRED
     );
 
     let mut request = connect_udp_request(server.addr, &target.ip().to_string(), target.port());
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials(USER.0, USER.1)
-            .parse()
-            .expect("header value"),
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials(USER.0, USER.1)),
     );
     let authenticated = respond_to(&mut client, request).await;
-    assert_eq!(authenticated.status(), StatusCode::OK);
+    assert_eq!(authenticated.status, Status::OK);
 }
 
 /// One user's password must not open another user's account.
@@ -188,12 +178,12 @@ async fn credentials_are_not_interchangeable_between_users() {
         &mut client,
         authorized_connect(
             &target.to_string(),
-            HeaderName::from_static("proxy-authorization"),
+            "proxy-authorization",
             &basic_credentials("alice", "pw-bob"),
         ),
     )
     .await;
-    assert_eq!(mixed.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert_eq!(mixed.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
     // Both real users still work.
     for (username, password) in [("alice", "pw-alice"), ("bob", "pw-bob")] {
@@ -202,12 +192,12 @@ async fn credentials_are_not_interchangeable_between_users() {
             &mut client,
             authorized_connect(
                 &target.to_string(),
-                HeaderName::from_static("proxy-authorization"),
+                "proxy-authorization",
                 &basic_credentials(username, password),
             ),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK, "{username} must pass");
+        assert_eq!(response.status, Status::OK, "{username} must pass");
     }
 }
 
@@ -224,11 +214,7 @@ async fn loopback_is_prohibited_by_default() {
     let mut client = H3Client::connect(&server).await;
 
     let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-    assert_refused(
-        &response,
-        StatusCode::FORBIDDEN,
-        "destination_ip_prohibited",
-    );
+    assert_refused(&response, Status::FORBIDDEN, "destination_ip_prohibited");
 }
 
 /// `::ffff:127.0.0.1` is loopback in IPv6 clothing — the bypass the policy
@@ -246,11 +232,7 @@ async fn ipv4_mapped_and_ipv6_loopback_are_prohibited() {
         format!("[::127.0.0.1]:{}", target.port()),
     ] {
         let response = respond_to(&mut client, connect_request(&authority)).await;
-        assert_refused(
-            &response,
-            StatusCode::FORBIDDEN,
-            "destination_ip_prohibited",
-        );
+        assert_refused(&response, Status::FORBIDDEN, "destination_ip_prohibited");
     }
 }
 
@@ -273,11 +255,7 @@ async fn special_purpose_and_transition_addresses_are_prohibited_by_default() {
         "[2002:a00:1::]:443",
     ] {
         let response = respond_to(&mut client, connect_request(authority)).await;
-        assert_refused(
-            &response,
-            StatusCode::FORBIDDEN,
-            "destination_ip_prohibited",
-        );
+        assert_refused(&response, Status::FORBIDDEN, "destination_ip_prohibited");
     }
 }
 
@@ -297,8 +275,8 @@ async fn special_purpose_addresses_are_reachable_when_private_space_is_allowed()
 
     let response = respond_to(&mut client, connect_request("100.64.0.1:443")).await;
     assert_ne!(
-        response.status(),
-        StatusCode::FORBIDDEN,
+        response.status,
+        Status::FORBIDDEN,
         "the address must not be refused by policy once private space is open"
     );
     if let Some(reason) = proxy_status(&response) {
@@ -321,11 +299,7 @@ async fn connect_udp_to_a_prohibited_address_is_refused() {
             connect_udp_request(server.addr, host, target.port()),
         )
         .await;
-        assert_refused(
-            &response,
-            StatusCode::FORBIDDEN,
-            "destination_ip_prohibited",
-        );
+        assert_refused(&response, Status::FORBIDDEN, "destination_ip_prohibited");
     }
 }
 
@@ -343,7 +317,7 @@ async fn a_blackholed_tcp_target_is_accepted_then_closed() {
 
     let (response, mut stream) =
         send_and_respond(&mut client, connect_request("0.0.0.0:443")).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
     assert!(
         proxy_status(&response).is_none(),
         "an accepted request carries no refusal reason"
@@ -370,12 +344,12 @@ async fn a_blackholed_udp_target_is_accepted_then_closed() {
         connect_udp_request(server.addr, "0.0.0.0", 443),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
     assert_eq!(
         response
-            .headers()
+            .fields
             .get("capsule-protocol")
-            .and_then(|value| value.to_str().ok()),
+            .and_then(FieldValue::to_str),
         Some("?1"),
         "a 2xx to connect-udp must still carry the capsule protocol field"
     );
@@ -455,7 +429,7 @@ async fn private_addresses_are_reachable_when_allowed() {
 
     let (response, mut stream) =
         send_and_respond(&mut client, connect_request(&target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
     assert!(proxy_status(&response).is_none(), "a 200 needs no reason");
 
     // And the tunnel really works, rather than merely being answered.
@@ -475,14 +449,14 @@ async fn a_denied_port_is_refused_on_both_paths() {
     let mut client = H3Client::connect(&server).await;
 
     let tcp = respond_to(&mut client, connect_request("127.0.0.1:25")).await;
-    assert_refused(&tcp, StatusCode::FORBIDDEN, "http_request_denied");
+    assert_refused(&tcp, Status::FORBIDDEN, "http_request_denied");
 
     let udp = respond_to(
         &mut client,
         connect_udp_request(server.addr, "127.0.0.1", 25),
     )
     .await;
-    assert_refused(&udp, StatusCode::FORBIDDEN, "http_request_denied");
+    assert_refused(&udp, Status::FORBIDDEN, "http_request_denied");
 }
 
 /// Surge's UDP availability test is a DNS query through the tunnel, so port 53
@@ -499,8 +473,8 @@ async fn udp_port_53_is_reachable_by_default() {
     )
     .await;
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
+        response.status,
+        Status::OK,
         "denying UDP/53 would fail Surge's UDP test"
     );
 }
@@ -521,10 +495,10 @@ async fn an_unresolvable_target_is_a_bad_gateway() {
     let host = vec![label; 5].join(".") + ".invalid";
 
     let tcp = respond_to(&mut client, connect_request(&format!("{host}:443"))).await;
-    assert_refused(&tcp, StatusCode::BAD_GATEWAY, "dns_error");
+    assert_refused(&tcp, Status::BAD_GATEWAY, "dns_error");
 
     let udp = respond_to(&mut client, connect_udp_request(server.addr, &host, 443)).await;
-    assert_refused(&udp, StatusCode::BAD_GATEWAY, "dns_error");
+    assert_refused(&udp, Status::BAD_GATEWAY, "dns_error");
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +523,7 @@ async fn the_tunnel_quota_is_enforced_per_connection() {
     let refused = respond_to(&mut client, connect_request(&target.to_string())).await;
     assert_refused(
         &refused,
-        StatusCode::SERVICE_UNAVAILABLE,
+        Status::SERVICE_UNAVAILABLE,
         "connection_limit_reached",
     );
 
@@ -557,7 +531,7 @@ async fn the_tunnel_quota_is_enforced_per_connection() {
     // per server.
     let mut other = H3Client::connect(&server).await;
     let response = respond_to(&mut other, connect_request(&target.to_string())).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
 }
 
 /// TCP and UDP tunnels draw on one budget, because they cost the same thing: a
@@ -581,7 +555,7 @@ async fn tcp_and_udp_tunnels_share_the_quota() {
     .await;
     assert_refused(
         &refused,
-        StatusCode::SERVICE_UNAVAILABLE,
+        Status::SERVICE_UNAVAILABLE,
         "connection_limit_reached",
     );
 }
@@ -608,10 +582,10 @@ async fn a_finished_tunnel_returns_its_slot() {
     let mut last = None;
     for _ in 0..40 {
         let response = respond_to(&mut client, connect_request(&target.to_string())).await;
-        if response.status() == StatusCode::OK {
+        if response.status == Status::OK {
             return;
         }
-        last = Some(response.status());
+        last = Some(response.status);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

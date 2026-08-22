@@ -12,8 +12,8 @@ use common::{
     spawn_end_reporting_target, spawn_flood_then_reset_target, spawn_reset_after_read_target,
     ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use http::{Method, Request, StatusCode};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
+use volto::h3api::{Method, Request, Status};
 
 /// H3_CONNECT_ERROR (RFC 9114 §8.1).
 const H3_CONNECT_ERROR: u64 = 0x010f;
@@ -244,13 +244,13 @@ async fn refuses_a_target_that_is_not_listening() {
 
     // RFC 9114 §4.4: failure to establish the connection is reported with a
     // non-2xx status, not a stream reset.
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status, Status::BAD_GATEWAY);
 
     // RFC 9209 §2.1.2: the refusal names the hop that refused it, as a
     // structured field String. Only failures to reach a target carry it.
     assert_eq!(
         response
-            .headers()
+            .fields
             .get("proxy-status")
             .map(|value| value.to_str().expect("proxy-status is ASCII")),
         Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
@@ -317,9 +317,9 @@ async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
 
     // RFC 9209: a target that never answered is a timeout, not an unreachable
     // one, and the status follows the registered type.
-    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.status, Status::GATEWAY_TIMEOUT);
     let proxy_status = response
-        .headers()
+        .fields
         .get("proxy-status")
         .map(|value| value.to_str().expect("proxy-status is ASCII"))
         .expect("a refusal must say why");
@@ -370,7 +370,7 @@ async fn refuses_an_authority_without_a_port() {
     let (response, mut stream) =
         send_and_respond(&mut client, connect_request("example.com")).await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, Status::BAD_REQUEST);
 
     let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
         .await
@@ -389,15 +389,14 @@ async fn plain_get_is_not_implemented() {
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("https://{}/", server.addr))
-        .body(())
-        .expect("GET request");
+    let mut req = Request::new(Method::Other("GET".into()));
+    req.scheme = Some("https".into());
+    req.authority = Some(server.addr.to_string().into());
+    req.path = Some("/".into());
 
     let response = respond_to(&mut client, req).await;
 
-    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(response.status, Status::NOT_IMPLEMENTED);
 }
 
 /// Several tunnels multiplexed on one QUIC connection must stay independent.

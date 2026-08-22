@@ -15,11 +15,12 @@
 mod common;
 
 use bytes::Bytes;
+use common::Response;
 use common::{
     auth_section, basic_credentials, connect_request, read_at_least, respond_to, send_and_respond,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
 };
-use http::{HeaderName, Response, StatusCode};
+use volto::h3api::{FieldValue, Status};
 
 /// Sends a CONNECT with credentials and returns the response.
 async fn connect_as(
@@ -27,13 +28,11 @@ async fn connect_as(
     authority: &str,
     username: &str,
     password: &str,
-) -> Response<()> {
+) -> Response {
     let mut request = connect_request(authority);
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials(username, password)
-            .parse()
-            .expect("header value"),
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials(username, password)),
     );
     respond_to(client, request).await
 }
@@ -54,14 +53,14 @@ async fn reloading_replaces_the_accepted_credentials() {
     assert_eq!(
         connect_as(&mut client, &target.to_string(), "user1", "old-password")
             .await
-            .status(),
-        StatusCode::OK
+            .status,
+        Status::OK
     );
     assert_eq!(
         connect_as(&mut client, &target.to_string(), "user1", "new-password")
             .await
-            .status(),
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+            .status,
+        Status::PROXY_AUTHENTICATION_REQUIRED
     );
 
     server.rewrite_config(&format!(
@@ -75,15 +74,15 @@ async fn reloading_replaces_the_accepted_credentials() {
     assert_eq!(
         connect_as(&mut fresh, &target.to_string(), "user1", "new-password")
             .await
-            .status(),
-        StatusCode::OK,
+            .status,
+        Status::OK,
         "the new password must be accepted after a reload"
     );
     assert_eq!(
         connect_as(&mut fresh, &target.to_string(), "user1", "old-password")
             .await
-            .status(),
-        StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            .status,
+        Status::PROXY_AUTHENTICATION_REQUIRED,
         "the withdrawn password must stop working after a reload"
     );
 }
@@ -102,14 +101,12 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
 
     let mut client = H3Client::connect(&server).await;
     let mut request = connect_request(&target.to_string());
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials("user1", "old-password")
-            .parse()
-            .expect("header value"),
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials("user1", "old-password")),
     );
     let (response, mut held) = send_and_respond(&mut client, request).await;
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
 
     server.rewrite_config(&format!(
         "{}{ALLOW_PRIVATE}",
@@ -127,8 +124,8 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
     assert_eq!(
         connect_as(&mut client, &target.to_string(), "user1", "old-password")
             .await
-            .status(),
-        StatusCode::OK,
+            .status,
+        Status::OK,
         "an existing connection keeps its original configuration"
     );
 }
@@ -160,8 +157,8 @@ async fn reloading_replaces_the_connection_cap() {
     assert_eq!(
         respond_to(&mut first, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK
+            .status,
+        Status::OK
     );
     assert!(
         !connect_attempt(&server).await,
@@ -176,8 +173,8 @@ async fn reloading_replaces_the_connection_cap() {
     assert_eq!(
         respond_to(&mut second, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK,
+            .status,
+        Status::OK,
         "the raised cap must apply to connections accepted after the reload"
     );
 
@@ -193,8 +190,8 @@ async fn reloading_replaces_the_connection_cap() {
     assert_eq!(
         respond_to(&mut first, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK,
+            .status,
+        Status::OK,
         "connections already open must survive a lowered cap"
     );
 }
@@ -209,8 +206,8 @@ async fn reloading_replaces_the_destination_policy() {
     assert_eq!(
         respond_to(&mut client, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK
+            .status,
+        Status::OK
     );
 
     // Withdraw access to private address space.
@@ -219,12 +216,12 @@ async fn reloading_replaces_the_destination_policy() {
 
     let mut fresh = H3Client::connect(&server).await;
     let refused = respond_to(&mut fresh, connect_request(&target.to_string())).await;
-    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(refused.status, Status::FORBIDDEN);
     assert_eq!(
         refused
-            .headers()
+            .fields
             .get("proxy-status")
-            .map(|v| v.to_str().unwrap()),
+            .and_then(FieldValue::to_str),
         Some("volto; error=destination_ip_prohibited")
     );
 }
@@ -314,8 +311,8 @@ async fn a_broken_configuration_changes_nothing() {
         assert_eq!(
             connect_as(&mut client, &target.to_string(), "user1", "s3cret")
                 .await
-                .status(),
-            StatusCode::OK,
+                .status,
+            Status::OK,
             "after a failed reload ({label}), the running configuration must survive"
         );
     }
@@ -333,8 +330,8 @@ async fn a_broken_configuration_changes_nothing() {
     assert_eq!(
         connect_as(&mut client, &target.to_string(), "user2", "another")
             .await
-            .status(),
-        StatusCode::OK
+            .status,
+        Status::OK
     );
 }
 
@@ -352,8 +349,8 @@ async fn reloading_swaps_the_certificate() {
     assert_eq!(
         respond_to(&mut client, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK
+            .status,
+        Status::OK
     );
 
     // Issue a fresh certificate for the same name and point the config at it.
@@ -387,8 +384,8 @@ async fn reloading_swaps_the_certificate() {
     assert_eq!(
         respond_to(&mut trusting, connect_request(&target.to_string()))
             .await
-            .status(),
-        StatusCode::OK,
+            .status,
+        Status::OK,
         "the endpoint must serve the reloaded certificate"
     );
 }

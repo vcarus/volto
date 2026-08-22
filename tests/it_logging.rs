@@ -29,12 +29,13 @@ async fn inbound_requests_are_logged_with_every_header() {
     let mut client = H3Client::connect(&server).await;
 
     let mut request = connect_request(&target.to_string());
+    request.fields.append(
+        "authorization",
+        common::field_value("Basic dXNlcjE6c2VjcmV0"),
+    );
     request
-        .headers_mut()
-        .insert("authorization", "Basic dXNlcjE6c2VjcmV0".parse().unwrap());
-    request
-        .headers_mut()
-        .insert("x-volto-probe", "surge-behaviour".parse().unwrap());
+        .fields
+        .append("x-volto-probe", common::field_value("surge-behaviour"));
 
     // Once the response is in, the request has certainly been logged.
     let _ = respond_to(&mut client, request).await;

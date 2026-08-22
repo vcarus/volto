@@ -217,8 +217,14 @@ is what a CONNECT proxy needs, and it is stated in full:
 - **The control stream** — SETTINGS, GOAWAY, and the rules about what may appear
   there, read by a task of its own for as long as the connection lasts.
 - **Request validation** — RFC 9114 §4.1.2, §4.3 and §4.4 plus RFC 8441 §4: the
-  point at which a field section becomes an `http::Request` or is refused as
-  malformed.
+  point at which a field section becomes a request or is refused as malformed.
+- **The message vocabulary** — a status, a method, a request and a list of field
+  lines, in `src/h3/message.rs`. These were the `http` crate's until decision
+  D78; carrying it meant every decoded field was validated and copied a second
+  time into a `HeaderName`/`HeaderValue`, and the pseudo-headers were folded into
+  a URI that the tunnels then took apart again. A field section is now decoded
+  once, validated once, and carried in one type, and the crate is gone from the
+  dependency tree.
 
 What it leaves out, deliberately:
 
@@ -335,10 +341,16 @@ workaround described below. Two things do not work while it is in place:
 
 `src/h3api.rs` is the facade over `src/h3`: the only module allowed to name a
 type from it, so that everything else — `conn`, `quic`, the tunnels — sees
-`http`, `bytes` and `quinn` types plus the handful of wrappers it exports. The
-facade began as insulation from a 0.0.x dependency's API churn and was kept on
-its own terms: it is the list of what a proxy actually asks of HTTP/3, and it is
-short enough to read in one sitting.
+`bytes` and `quinn` types plus the handful of names it exports. The facade began
+as insulation from a 0.0.x dependency's API churn and was kept on its own terms:
+it is the list of what a proxy actually asks of HTTP/3, and it is short enough to
+read in one sitting.
+
+The message types — `Request`, `Status`, `Fields` — are re-exported through it
+rather than wrapped in something else. The rule the facade enforces is about
+*where a type is named*, not about hiding it: nothing outside `src/h3` reaches
+into that module, so this one file still says everything the rest of the crate
+may assume about HTTP/3.
 
 One gotcha it cannot hide: `h3api::Connection::handshake` consumes the
 `quinn::Connection`, so clone it first if you also need to *send* datagrams on

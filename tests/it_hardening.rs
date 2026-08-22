@@ -14,8 +14,8 @@ use common::{
     auth_section, basic_credentials, connect_quic, connect_request, open_tcp_tunnel,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use http::{HeaderName, StatusCode};
 use volto::datagram;
+use volto::h3api::{FieldValue, Status};
 
 /// HEADERS frame type (RFC 9114 §7.2.2).
 const FRAME_HEADERS: u64 = 0x01;
@@ -24,11 +24,11 @@ const FRAME_HEADERS: u64 = 0x01;
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
 
 /// A CONNECT attempt with the given credentials, returning the status.
-async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<StatusCode> {
+async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
     let mut request = connect_request(authority);
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials("user1", password).parse().ok()?,
+    request.fields.append(
+        "proxy-authorization",
+        FieldValue::parse(basic_credentials("user1", password).as_bytes())?,
     );
 
     let mut stream = client.send.send_request(request).await.ok()?;
@@ -36,7 +36,7 @@ async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Opti
         .await
         .ok()?
         .ok()?;
-    Some(response.status())
+    Some(response.status)
 }
 
 /// Past the cap, new connections are refused at the QUIC layer rather than
@@ -73,7 +73,7 @@ async fn the_connection_cap_refuses_further_connections() {
         .await
         .expect("response arrived")
         .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.status, Status::OK);
 }
 
 /// A slot freed by a closed connection becomes available again.
@@ -120,7 +120,7 @@ async fn repeated_authentication_failures_close_the_connection() {
     for i in 0..2 {
         assert_eq!(
             attempt(&mut client, &target.to_string(), "wrong").await,
-            Some(StatusCode::PROXY_AUTHENTICATION_REQUIRED),
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
             "attempt {i} should still be answered"
         );
     }
@@ -149,7 +149,7 @@ async fn successful_authentication_does_not_consume_the_budget() {
     for i in 0..6 {
         assert_eq!(
             attempt(&mut client, &target.to_string(), "s3cret").await,
-            Some(StatusCode::OK),
+            Some(Status::OK),
             "request {i} with correct credentials must succeed"
         );
     }
@@ -177,7 +177,7 @@ async fn a_zero_budget_disables_the_cap() {
     for i in 0..8 {
         assert_eq!(
             attempt(&mut client, &target.to_string(), "wrong").await,
-            Some(StatusCode::PROXY_AUTHENTICATION_REQUIRED),
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
             "failure {i} must still be answered when the cap is off"
         );
     }

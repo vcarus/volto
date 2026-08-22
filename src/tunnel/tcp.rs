@@ -28,14 +28,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use http::{HeaderMap, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::h3api::{self, Buffer, Reader, Stream, Writer};
+use crate::h3api::{self, Buffer, Fields, Reader, Status, Stream, Writer};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
@@ -72,7 +71,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, authority, reason, "malformed CONNECT authority");
-            tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
             return;
         }
     };
@@ -80,9 +79,9 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // Port policy, resolution and destination policy, in that order and with
     // every refusal already answered by the time this returns — see
     // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
-    // headers of its own, so the 200-then-close path is handed an empty map.
+    // fields of its own, so the 200-then-close path is handed an empty list.
     let Some(allowed) =
-        tunnel::admit_target(&host, port, ctx, &mut stream, stream_id, HeaderMap::new).await
+        tunnel::admit_target(&host, port, ctx, &mut stream, stream_id, Fields::new).await
     else {
         return;
     };
@@ -114,7 +113,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     let target = tcp.peer_addr().ok();
 
-    if let Err(error) = stream.respond(StatusCode::OK).await {
+    if let Err(error) = stream.respond(Status::OK).await {
         debug!(stream_id, %error, "failed to send 200 for CONNECT");
         // Dropping `tcp` closes the connection we just opened.
         return;

@@ -33,14 +33,15 @@
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
 use bytes::Bytes;
-use http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode};
 use percent_encoding::percent_decode_str;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
-use crate::h3api::{self, DatagramReceiver, Reader, Stream, Writer};
+use crate::h3api::{
+    self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
+};
 use crate::tunnel::{Context, Unreachable};
 use crate::{net, tunnel};
 
@@ -48,18 +49,19 @@ use crate::{net, tunnel};
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
-pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Context) {
+pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context) {
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
-        tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
         return;
     }
 
-    let (host, port) = match parse_target(req.uri().path(), req.uri().query()) {
+    let path = req.path.as_deref().unwrap_or_default();
+    let (host, port) = match parse_target(path, req.query.as_deref()) {
         Ok(target) => target,
         Err(reason) => {
-            debug!(stream_id, path = %req.uri().path(), reason, "malformed connect-udp request");
-            tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+            debug!(stream_id, path, reason, "malformed connect-udp request");
+            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
             return;
         }
     };
@@ -89,7 +91,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
             stream_id,
             "the datagrams of this stream are already claimed"
         );
-        tunnel::refuse(&mut stream, StatusCode::INTERNAL_SERVER_ERROR, stream_id).await;
+        tunnel::refuse(&mut stream, Status::INTERNAL_SERVER_ERROR, stream_id).await;
         return;
     };
 
@@ -130,7 +132,7 @@ pub async fn run(req: &Request<()>, mut stream: Stream, stream_id: u64, ctx: Con
         }
     };
 
-    if let Err(error) = stream.respond_with(StatusCode::OK, capsule_headers()).await {
+    if let Err(error) = stream.respond_with(Status::OK, capsule_headers()).await {
         debug!(stream_id, %error, "failed to send 200 for connect-udp");
         return;
     }
@@ -712,13 +714,10 @@ fn is_per_packet_send_error(error: &std::io::Error) -> bool {
 /// `Capsule-Protocol: ?1`, and §3.2 forbids Content-Length, Content-Type and
 /// Transfer-Encoding on it, since the body is a capsule sequence rather than a
 /// representation. Sending only the one field satisfies both.
-fn capsule_headers() -> HeaderMap {
-    let mut headers = HeaderMap::with_capacity(1);
-    headers.insert(
-        HeaderName::from_static("capsule-protocol"),
-        HeaderValue::from_static("?1"),
-    );
-    headers
+fn capsule_headers() -> Fields {
+    let mut fields = Fields::new();
+    fields.append("capsule-protocol", FieldValue::from_static("?1"));
+    fields
 }
 
 /// Opens a connected UDP socket to the first address that works.
@@ -783,19 +782,19 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unrea
 /// RESET_STREAM. RFC 9114 §4.1.2 allows a server to send a response before
 /// closing the stream, and resetting instead would discard the buffered
 /// response, leaving the client to guess why its tunnel was refused.
-fn validate(req: &Request<()>) -> Result<(), &'static str> {
-    if req.uri().scheme_str().is_none_or(str::is_empty) {
+fn validate(req: &Request) -> Result<(), &'static str> {
+    if req.scheme.as_deref().is_none_or(str::is_empty) {
         return Err("connect-udp requires a non-empty :scheme");
     }
 
     // Named one at a time so the log says which field was the problem.
-    if req.headers().contains_key(header::CONTENT_LENGTH) {
+    if req.fields.contains("content-length") {
         return Err("content-length is forbidden on a capsule stream");
     }
-    if req.headers().contains_key(header::CONTENT_TYPE) {
+    if req.fields.contains("content-type") {
         return Err("content-type is forbidden on a capsule stream");
     }
-    if req.headers().contains_key(header::TRANSFER_ENCODING) {
+    if req.fields.contains("transfer-encoding") {
         return Err("transfer-encoding is forbidden on a capsule stream");
     }
 
@@ -948,12 +947,13 @@ mod tests {
     }
 
     /// Builds a well-formed CONNECT-UDP request, which the caller then spoils.
-    fn connect_udp_request() -> Request<()> {
-        Request::builder()
-            .method(http::Method::CONNECT)
-            .uri("https://proxy.example/.well-known/masque/udp/192.0.2.1/53/")
-            .body(())
-            .expect("request")
+    fn connect_udp_request() -> Request {
+        let mut request = Request::new(crate::h3api::Method::Connect);
+        request.scheme = Some("https".into());
+        request.authority = Some("proxy.example".into());
+        request.path = Some("/.well-known/masque/udp/192.0.2.1/53/".into());
+        request.protocol = Some("connect-udp".into());
+        request
     }
 
     #[test]
@@ -967,10 +967,10 @@ mod tests {
     #[test]
     fn rejects_a_request_without_a_scheme() {
         let mut request = connect_udp_request();
-        *request.uri_mut() = "/.well-known/masque/udp/192.0.2.1/53/"
-            .parse()
-            .expect("origin-form uri");
+        request.scheme = None;
+        assert!(validate(&request).is_err());
 
+        request.scheme = Some("".into());
         assert!(validate(&request).is_err());
     }
 
@@ -978,9 +978,7 @@ mod tests {
     #[test]
     fn accepts_any_non_empty_scheme() {
         let mut request = connect_udp_request();
-        *request.uri_mut() = "http://proxy.example/.well-known/masque/udp/192.0.2.1/53/"
-            .parse()
-            .expect("uri");
+        request.scheme = Some("http".into());
 
         assert_eq!(validate(&request), Ok(()));
     }
@@ -996,10 +994,7 @@ mod tests {
             ("transfer-encoding", "chunked"),
         ] {
             let mut request = connect_udp_request();
-            request.headers_mut().insert(
-                HeaderName::from_static(name),
-                HeaderValue::from_static(value),
-            );
+            request.fields.append(name, FieldValue::from_static(value));
 
             assert!(
                 validate(&request).is_err(),
@@ -1014,9 +1009,9 @@ mod tests {
     fn the_capsule_protocol_header_is_never_a_reason_to_refuse() {
         for value in ["?1", "?0", "1", "not-a-boolean", ""] {
             let mut request = connect_udp_request();
-            request.headers_mut().insert(
-                HeaderName::from_static("capsule-protocol"),
-                HeaderValue::from_str(value).expect("header value"),
+            request.fields.append(
+                "capsule-protocol",
+                FieldValue::parse(value.as_bytes()).expect("field value"),
             );
 
             assert_eq!(validate(&request), Ok(()), "capsule-protocol: {value:?}");

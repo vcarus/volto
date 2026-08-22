@@ -26,11 +26,17 @@
 //! whether the client encoded the credentials as UTF-8 or ISO-8859-1
 //! (RFC 7617 §2.1 leaves that partly open).
 
-use http::header::{AUTHORIZATION, PROXY_AUTHENTICATE, PROXY_AUTHORIZATION};
-use http::{HeaderMap, HeaderValue};
 use subtle::ConstantTimeEq;
 
 use crate::config;
+use crate::h3api::{FieldValue, Fields};
+
+/// The field a 407 carries its challenge in (RFC 9110 §11.7.1).
+const PROXY_AUTHENTICATE: &str = "proxy-authenticate";
+
+/// The two fields credentials are accepted in, in the order they are tried
+/// (decision D3).
+const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
 
 /// The challenge offered when credentials are missing or wrong.
 ///
@@ -107,7 +113,7 @@ impl Authenticator {
     ///
     /// `Ok(None)` means authentication is disabled, `Ok(Some(username))` names the
     /// user that matched.
-    pub fn authenticate(&self, headers: &HeaderMap) -> Result<Option<&str>, Denied> {
+    pub fn authenticate(&self, fields: &Fields) -> Result<Option<&str>, Denied> {
         if self.is_disabled() {
             return Ok(None);
         }
@@ -117,7 +123,7 @@ impl Authenticator {
         // client's real attempt.
         let mut denial: Option<Denied> = None;
 
-        for value in credentials(headers) {
+        for value in credentials(fields) {
             match self.check(value) {
                 Ok(username) => return Ok(Some(username)),
                 Err(reason) => denial = denial.or(Some(reason)),
@@ -128,10 +134,10 @@ impl Authenticator {
     }
 
     /// Validates one credentials field value.
-    fn check(&self, value: &HeaderValue) -> Result<&str, Denied> {
+    fn check(&self, value: &FieldValue) -> Result<&str, Denied> {
         let value = value
             .to_str()
-            .map_err(|_| Denied::Malformed("credentials are not valid ASCII"))?;
+            .ok_or(Denied::Malformed("credentials are not valid ASCII"))?;
 
         let token = basic_token(value)?;
         let decoded = decode_base64(token.as_bytes())
@@ -174,18 +180,17 @@ impl Authenticator {
 }
 
 /// The `Proxy-Authenticate` header a 407 response carries.
-pub fn challenge_headers() -> HeaderMap {
-    let mut headers = HeaderMap::with_capacity(1);
-    headers.insert(PROXY_AUTHENTICATE, HeaderValue::from_static(CHALLENGE));
-    headers
+pub fn challenge_headers() -> Fields {
+    let mut fields = Fields::new();
+    fields.append(PROXY_AUTHENTICATE, FieldValue::from_static(CHALLENGE));
+    fields
 }
 
 /// Every credentials field value, in the order they are tried.
-fn credentials(headers: &HeaderMap) -> impl Iterator<Item = &HeaderValue> {
-    headers
-        .get_all(PROXY_AUTHORIZATION)
-        .iter()
-        .chain(headers.get_all(AUTHORIZATION).iter())
+fn credentials(fields: &Fields) -> impl Iterator<Item = &FieldValue> {
+    CREDENTIAL_FIELDS
+        .into_iter()
+        .flat_map(|name| fields.get_all(name))
 }
 
 /// Strips the `Basic` scheme, returning the base64 token.
@@ -300,17 +305,25 @@ mod tests {
         })
     }
 
-    fn basic(username: &str, password: &str) -> HeaderValue {
-        let token = encode_base64(format!("{username}:{password}").as_bytes());
-        HeaderValue::from_str(&format!("Basic {token}")).expect("header value")
+    /// The two fields credentials may arrive in (decision D3).
+    const PROXY_AUTHORIZATION: &str = "proxy-authorization";
+    const AUTHORIZATION: &str = "authorization";
+
+    fn value(text: &str) -> FieldValue {
+        FieldValue::parse(text.as_bytes()).expect("field value")
     }
 
-    fn headers(pairs: &[(http::HeaderName, HeaderValue)]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
+    fn basic(username: &str, password: &str) -> FieldValue {
+        let token = encode_base64(format!("{username}:{password}").as_bytes());
+        value(&format!("Basic {token}"))
+    }
+
+    fn headers(pairs: &[(&str, FieldValue)]) -> Fields {
+        let mut fields = Fields::new();
         for (name, value) in pairs {
-            headers.append(name.clone(), value.clone());
+            fields.append(*name, value.clone());
         }
-        headers
+        fields
     }
 
     #[test]
@@ -318,12 +331,9 @@ mod tests {
         let auth = authenticator(&[]);
         assert!(auth.is_disabled());
         // Even a nonsense credential is irrelevant when nothing is required.
-        assert_eq!(auth.authenticate(&HeaderMap::new()), Ok(None));
+        assert_eq!(auth.authenticate(&Fields::new()), Ok(None));
         assert_eq!(
-            auth.authenticate(&headers(&[(
-                PROXY_AUTHORIZATION,
-                HeaderValue::from_static("garbage")
-            )])),
+            auth.authenticate(&headers(&[(PROXY_AUTHORIZATION, value("garbage"))])),
             Ok(None)
         );
     }
@@ -422,7 +432,7 @@ mod tests {
     #[test]
     fn missing_credentials_are_reported_as_missing() {
         let auth = authenticator(&[("user1", "s3cret")]);
-        assert_eq!(auth.authenticate(&HeaderMap::new()), Err(Denied::Missing));
+        assert_eq!(auth.authenticate(&Fields::new()), Err(Denied::Missing));
         assert_eq!(Denied::Missing.username(), None);
     }
 
@@ -446,10 +456,7 @@ mod tests {
         ];
 
         for case in cases {
-            let headers = headers(&[(
-                PROXY_AUTHORIZATION,
-                HeaderValue::from_str(case).expect("header value"),
-            )]);
+            let headers = headers(&[(PROXY_AUTHORIZATION, value(case))]);
             let denied = auth.authenticate(&headers).expect_err("must be rejected");
             assert!(
                 matches!(denied, Denied::Malformed(_)),
@@ -466,20 +473,17 @@ mod tests {
         let auth = authenticator(&[("user1", "s3cret")]);
         let token = encode_base64(b"user1:s3cret");
 
-        for value in [
+        for text in [
             format!("basic {token}"),
             format!("BASIC {token}"),
             format!("bAsIc {token}"),
             format!("Basic  {token}"),
         ] {
-            let headers = headers(&[(
-                PROXY_AUTHORIZATION,
-                HeaderValue::from_str(&value).expect("header value"),
-            )]);
+            let headers = headers(&[(PROXY_AUTHORIZATION, value(&text))]);
             assert_eq!(
                 auth.authenticate(&headers),
                 Ok(Some("user1")),
-                "{value:?} must authenticate"
+                "{text:?} must authenticate"
             );
         }
     }
@@ -505,7 +509,7 @@ mod tests {
     fn the_challenge_names_the_realm() {
         let headers = challenge_headers();
         assert_eq!(
-            headers.get(PROXY_AUTHENTICATE).map(|v| v.to_str().unwrap()),
+            headers.get(PROXY_AUTHENTICATE).and_then(FieldValue::to_str),
             Some("Basic realm=\"masque\"")
         );
     }

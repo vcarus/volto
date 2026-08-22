@@ -12,7 +12,7 @@
 pub mod h3client;
 pub mod huffman;
 
-pub use h3client::{ClientStream, H3Client, Protocol};
+pub use h3client::{ClientStream, H3Client, Response, CONNECT_UDP};
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use http::{Method, Request, Response, StatusCode, Uri};
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +29,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use volto::config::Config;
 use volto::datagram;
+use volto::h3api::{FieldValue, Method, Request, Status};
 use volto::quic::ReloadHandle;
 use volto::quic::Server;
 use volto::shutdown::Trigger;
@@ -418,25 +418,24 @@ pub fn assert_peer_reset(error: &volto::h3api::StreamError, code: u64) {
     );
 }
 
-/// Builds a classic CONNECT request: authority-form URI, no `:protocol`.
-pub fn connect_request(authority: &str) -> Request<()> {
-    let uri = Uri::builder()
-        .authority(authority)
-        .build()
-        .expect("authority-form URI");
+/// Builds a classic CONNECT request: `:authority` and no more (RFC 9114 §4.4).
+pub fn connect_request(authority: &str) -> Request {
+    let mut request = Request::new(Method::Connect);
+    request.authority = Some(authority.into());
+    request
+}
 
-    Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .expect("CONNECT request")
+/// A field value from text a test authored.
+#[track_caller]
+pub fn field_value(value: &str) -> FieldValue {
+    FieldValue::parse(value.as_bytes()).expect("a valid field value")
 }
 
 /// Builds a CONNECT-UDP request for `target` using the RFC 9298 §2 template.
 ///
 /// `target_host` is percent-encoded per RFC 9298 §3.1, so an IPv6 literal
 /// arrives with escaped colons and no brackets.
-pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<()> {
+pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request {
     let encoded_host: String = host
         .chars()
         .map(|c| match c {
@@ -447,16 +446,11 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<
         })
         .collect();
 
-    let uri: Uri = format!("https://{proxy}/.well-known/masque/udp/{encoded_host}/{port}/")
-        .parse()
-        .expect("connect-udp uri");
-
-    let mut request = Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .expect("connect-udp request");
-    request.extensions_mut().insert(Protocol::CONNECT_UDP);
+    let mut request = Request::new(Method::Connect);
+    request.scheme = Some("https".into());
+    request.authority = Some(proxy.to_string().into());
+    request.path = Some(format!("/.well-known/masque/udp/{encoded_host}/{port}/").into());
+    request.protocol = Some(CONNECT_UDP.into());
     request
 }
 
@@ -464,15 +458,12 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request<
 ///
 /// For the tests whose subject *is* the answer: they assert on the status, or on
 /// a `Proxy-Status` field, themselves.
-pub async fn respond_to(client: &mut H3Client, request: Request<()>) -> Response<()> {
+pub async fn respond_to(client: &mut H3Client, request: Request) -> Response {
     send_and_respond(client, request).await.0
 }
 
 /// [`respond_to`], keeping the request stream for cases that then use it.
-pub async fn send_and_respond(
-    client: &mut H3Client,
-    request: Request<()>,
-) -> (Response<()>, ClientStream) {
+pub async fn send_and_respond(client: &mut H3Client, request: Request) -> (Response, ClientStream) {
     let mut stream = client
         .send
         .send_request(request)
@@ -504,10 +495,10 @@ pub fn open_tcp_tunnel<'a>(
     async move {
         let (response, stream) = send_and_respond(client, connect_request(authority)).await;
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
+            response.status,
+            Status::OK,
             "the tunnel to {authority} opened at {caller} was refused: proxy-status={:?}",
-            response.headers().get("proxy-status")
+            response.fields.get("proxy-status")
         );
         stream
     }
@@ -560,28 +551,28 @@ async fn udp_session(
         send_and_respond(client, connect_udp_request(server.addr, &host, port)).await;
 
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
+        response.status,
+        Status::OK,
         "the session to {host}:{port} opened at {caller} was refused: proxy-status={:?}",
-        response.headers().get("proxy-status")
+        response.fields.get("proxy-status")
     );
     // RFC 9297 §3.4: the response should announce the capsule protocol, and §3.2
     // forbids it from describing a body. Protocol requirements rather than
     // scaffolding, so they belong to every session this helper opens.
     assert_eq!(
         response
-            .headers()
+            .fields
             .get("capsule-protocol")
-            .map(|value| value.to_str().expect("capsule-protocol is ASCII")),
+            .and_then(FieldValue::to_str),
         Some("?1"),
         "the 2xx to the session opened at {caller} must carry Capsule-Protocol: ?1"
     );
     assert!(
-        response.headers().get("content-length").is_none(),
+        !response.fields.contains("content-length"),
         "a CONNECT-UDP response frames no content; session opened at {caller}"
     );
     assert!(
-        response.headers().get("content-type").is_none(),
+        !response.fields.contains("content-type"),
         "a CONNECT-UDP response frames no content; session opened at {caller}"
     );
 

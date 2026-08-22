@@ -14,6 +14,8 @@
 //! * [`huffman`] — RFC 7541 Appendix B, decoding only.
 //! * [`qpack`] — RFC 9204 field sections against the static table.
 //! * [`frame`] — RFC 9114 §7 framing, incremental and copy-free for DATA.
+//! * [`message`] — what a request and a response are made of: a status, a
+//!   method, field lines.
 //! * [`connection`] — the connection: SETTINGS, the control stream, GOAWAY,
 //!   and inbound HTTP Datagram routing (RFC 9297).
 //! * [`stream`] — one request stream, from its HEADERS to its last byte.
@@ -52,6 +54,7 @@ pub mod connection;
 pub mod error;
 pub mod frame;
 pub mod huffman;
+pub mod message;
 pub mod qpack;
 pub mod stream;
 

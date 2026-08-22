@@ -10,8 +10,8 @@
 //!
 //! # Validating
 //!
-//! [`Resolver::resolve`] is where a request becomes an [`http::Request`], and
-//! where RFC 9114 §4.1.2's "malformed" verdict is reached. The rules are worth
+//! [`Resolver::resolve`] is where a request becomes a [`Request`], and where
+//! RFC 9114 §4.1.2's "malformed" verdict is reached. The rules are worth
 //! stating together because they are what a proxy is judged on: a request that
 //! this server accepts is one it will open a socket for.
 //!
@@ -29,35 +29,13 @@
 use std::borrow::Cow;
 
 use bytes::{Bytes, BytesMut};
-use http::uri::Uri;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 
 use super::connection::{DatagramReceiver, Handle};
 use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
+use super::message::{self, FieldValue, Fields, Method, Request, Status};
 use super::qpack::{self, Field};
 use super::{varint, MAX_FIELD_SECTION_SIZE, MAX_VARINT};
-
-/// The value of the `:protocol` pseudo-header (RFC 9220 §3, RFC 8441 §4).
-///
-/// Kept as the bytes that arrived rather than mapped onto a fixed set, so a
-/// protocol this server does not implement can be answered with the 501 that
-/// RFC 9220 §3 calls for instead of being rejected as malformed before anything
-/// can look at it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Protocol(Box<str>);
-
-impl Protocol {
-    /// Wraps a `:protocol` token.
-    pub(crate) fn new(token: impl Into<Box<str>>) -> Self {
-        Self(token.into())
-    }
-
-    /// The token as it arrived on the wire.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
 
 /// An accepted request stream whose headers have not been read yet.
 pub struct Resolver {
@@ -97,7 +75,7 @@ impl Resolver {
     pub async fn resolve(
         self,
         within: std::time::Duration,
-    ) -> Result<(Request<()>, Stream), StreamError> {
+    ) -> Result<(Request, Stream), StreamError> {
         let Self {
             handle,
             mut send,
@@ -167,7 +145,7 @@ impl Resolver {
                     header: BytesMut::with_capacity(2 * MAX_VARINT),
                 };
                 let _ = stream
-                    .respond(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                    .respond(Status::REQUEST_HEADER_FIELDS_TOO_LARGE)
                     .await;
                 let _ = stream.finish();
                 stream.stop_receiving(violation.code());
@@ -219,7 +197,7 @@ fn answer(
 }
 
 /// Reads the first frame of a request stream and turns it into a request.
-async fn read_request(frames: &mut FrameReader) -> Result<Request<()>, frame::Error> {
+async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error> {
     let block = loop {
         match frames.next().await? {
             Some(Item::Frame(Frame::Headers(block))) => break block,
@@ -273,19 +251,19 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request<()>, frame::Er
 /// the order the RFC states them: field syntax (§4.2, §10.3), pseudo-header
 /// placement and identity (§4.3), then the per-method shape (§4.3.1, §4.4,
 /// RFC 8441 §4).
-fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
+fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
-    let mut path = None;
+    let mut target = None;
     let mut protocol = None;
-    let mut headers = HeaderMap::new();
+    let mut fields = Fields::new();
     let mut regular_field_seen = false;
 
-    for Field { name, value } in fields {
+    for Field { name, value } in section {
         if !name.starts_with(b":") {
             regular_field_seen = true;
-            add_field(&mut headers, &name, &value)?;
+            add_field(&mut fields, &name, &value)?;
             continue;
         }
 
@@ -300,7 +278,7 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
             b":method" => &mut method,
             b":scheme" => &mut scheme,
             b":authority" => &mut authority,
-            b":path" => &mut path,
+            b":path" => &mut target,
             b":protocol" => &mut protocol,
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
@@ -321,7 +299,7 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
     }
 
     let method = method.ok_or_else(|| malformed("a request without :method"))?;
-    let method = Method::from_bytes(&method).map_err(|_| malformed("an invalid :method"))?;
+    let method = Method::parse(&method).ok_or_else(|| malformed("an invalid :method"))?;
 
     // RFC 8441 §4 defines :protocol for the extended CONNECT method and for
     // nothing else, so on any other request it is a pseudo-header used outside
@@ -331,25 +309,28 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
     //# Pseudo-header fields are only valid in the context in which they are
     //# defined. [...] Endpoints MUST treat a request or response that contains
     //# undefined or invalid pseudo-header fields as malformed.
-    if protocol.is_some() && method != Method::CONNECT {
+    if protocol.is_some() && method != Method::Connect {
         return Err(malformed(":protocol on a request that is not CONNECT"));
     }
 
-    let uri = if method == Method::CONNECT && protocol.is_none() {
+    let (scheme, authority, path, query) = if method == Method::Connect && protocol.is_none() {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
         //# The :scheme and :path pseudo-header fields are omitted [...] The
         //# :authority pseudo-header field contains the host and port to
         //# connect to [...] A CONNECT request that does not conform to these
         //# restrictions is malformed.
-        if scheme.is_some() || path.is_some() {
+        if scheme.is_some() || target.is_some() {
             return Err(malformed("a CONNECT request carrying :scheme or :path"));
         }
         let authority =
             authority.ok_or_else(|| malformed("a CONNECT request without :authority"))?;
 
-        Uri::builder()
-            .authority(nonempty(&authority, ":authority")?)
-            .build()
+        (
+            None,
+            Some(uri_authority(nonempty(&authority, ":authority")?)?.into()),
+            None,
+            None,
+        )
     } else {
         // Extended CONNECT and ordinary requests are built the same way; only
         // where the authority may come from differs.
@@ -359,7 +340,7 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
         //# :scheme and :path pseudo-header fields of the target URI [...]
         //# MUST also be included.
         let scheme = scheme.ok_or_else(|| malformed("a request without :scheme"))?;
-        let path = path.ok_or_else(|| malformed("a request without :path"))?;
+        let target = target.ok_or_else(|| malformed("a request without :path"))?;
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
         //# If the :scheme pseudo-header field identifies a scheme that has a
@@ -373,7 +354,7 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
         // request. RFC 8441 §4 changes one row of it and no more: on a request
         // carrying :protocol the authority is mandatory rather than one of two
         // ways to name the target, so a Host field cannot stand in for it.
-        let authority = match (authority.as_deref(), headers.get(http::header::HOST)) {
+        let named = match (authority.as_deref(), fields.get("host")) {
             (Some(authority), Some(host)) if authority != host.as_bytes() => {
                 return Err(malformed(":authority and Host disagree"))
             }
@@ -385,44 +366,151 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
             (None, None) => return Err(malformed("a request with neither :authority nor Host")),
         };
 
-        Uri::builder()
-            .scheme(&scheme[..])
-            .authority(nonempty(authority, ":authority")?)
-            .path_and_query(nonempty(&path, ":path")?)
-            .build()
+        let (path, query) = split_target(nonempty(&target, ":path")?)?;
+        (
+            Some(uri_scheme(nonempty(&scheme, ":scheme")?)?.into()),
+            Some(uri_authority(nonempty(named, ":authority")?)?.into()),
+            Some(path.into()),
+            query.map(Into::into),
+        )
     };
 
-    let uri = uri.map_err(|_| malformed("pseudo-header fields that are not a valid URI"))?;
+    let protocol = protocol
+        .map(|protocol| {
+            std::str::from_utf8(&protocol)
+                .map(Into::into)
+                .map_err(|_| malformed("a :protocol that is not valid UTF-8"))
+        })
+        .transpose()?;
 
-    let mut request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(())
-        .map_err(|_| malformed("a request that cannot be represented"))?;
-    *request.headers_mut() = headers;
+    Ok(Request {
+        method,
+        scheme,
+        authority,
+        path,
+        query,
+        protocol,
+        fields,
+    })
+}
 
-    if let Some(protocol) = protocol {
-        let protocol = std::str::from_utf8(&protocol)
-            .map_err(|_| malformed("a :protocol that is not valid UTF-8"))?;
-        request.extensions_mut().insert(Protocol::new(protocol));
+/// Checks a `:scheme` value (RFC 3986 §3.1).
+///
+/// `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`, which is the whole of the rule:
+/// what the scheme *says* decides nothing here, and `tunnel::udp` gives the
+/// reason a CONNECT-UDP request is not required to call itself `https`.
+fn uri_scheme(scheme: &[u8]) -> Result<&str, Violation> {
+    let invalid = || malformed("a :scheme that is not a URI scheme");
+
+    if !scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        || !scheme
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return Err(invalid());
     }
 
-    Ok(request)
+    // ASCII by the check above, so the conversion cannot fail; it is written
+    // fallibly rather than as an `expect` because these are a peer's bytes.
+    std::str::from_utf8(scheme).map_err(|_| invalid())
+}
+
+/// Checks an authority (RFC 3986 §3.2).
+///
+/// The characters an authority is made of and no others: unreserved (§2.3),
+/// percent-encoding, sub-delims (§2.2), and ":", "@", "[", "]" -- the union of
+/// what a userinfo, a host and a port may contain. It is the *syntax* that is
+/// judged here and not the shape: `tunnel::tcp` splits the host from the port
+/// and refuses a userinfo, an unbracketed IPv6 literal and a port that is not a
+/// port, and answers each of them with a 400 rather than a stream error, which
+/// tells a client rather more.
+fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
+    let invalid = || malformed("an :authority that is not an authority");
+
+    if !authority
+        .iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || AUTHORITY_PUNCTUATION.contains(byte))
+    {
+        return Err(invalid());
+    }
+
+    // ASCII by the check above; fallible for the reason `uri_scheme` gives.
+    std::str::from_utf8(authority).map_err(|_| invalid())
+}
+
+/// Splits a `:path` into its path and its query, checking both.
+///
+/// RFC 9114 §4.3.1 makes `:path` an absolute path optionally followed by a "?"
+/// and a query, which are the productions of RFC 3986 §3.3 and §3.4: a leading
+/// "/", then `pchar` and "/", and after the "?" those and "?" again. A "#" is
+/// refused along with everything else outside that set, because a fragment is
+/// not part of a request target (RFC 9110 §7.1) and silently dropping one would
+/// mean acting on a target the client did not send.
+fn split_target(target: &[u8]) -> Result<(&str, Option<&str>), Violation> {
+    // §4.3.1's asterisk form, which belongs to OPTIONS. This server answers such
+    // a request with the 501 every method it does not implement gets, and can
+    // only do so if the request is not malformed first.
+    if target == b"*" {
+        return Ok(("*", None));
+    }
+
+    if target.first() != Some(&b'/') {
+        return Err(malformed("a :path that is not an absolute path"));
+    }
+
+    let (path, query) = match target.iter().position(|byte| *byte == b'?') {
+        Some(mark) => (&target[..mark], Some(&target[mark + 1..])),
+        None => (target, None),
+    };
+
+    if !path.iter().all(|byte| is_pchar(*byte) || *byte == b'/') {
+        return Err(malformed("a :path with a character no path may contain"));
+    }
+    if !query.is_none_or(|query| {
+        query
+            .iter()
+            .all(|byte| is_pchar(*byte) || matches!(byte, b'/' | b'?'))
+    }) {
+        return Err(malformed("a :path with a character no query may contain"));
+    }
+
+    // ASCII by the checks above, so neither conversion can fail; written
+    // fallibly for the reason `uri_scheme` gives.
+    let invalid = || malformed("a :path that is not valid UTF-8");
+    Ok((
+        std::str::from_utf8(path).map_err(|_| invalid())?,
+        query
+            .map(|query| std::str::from_utf8(query).map_err(|_| invalid()))
+            .transpose()?,
+    ))
+}
+
+/// The punctuation an authority may contain, beside letters and digits.
+///
+/// Unreserved (RFC 3986 §2.3), the "%" of percent-encoding, sub-delims (§2.2),
+/// and the delimiters §3.2 gives the authority itself.
+const AUTHORITY_PUNCTUATION: &[u8] = b"-._~%!$&'()*+,;=:@[]";
+
+/// Whether `byte` is an RFC 3986 §3.3 `pchar`, or the "%" one begins with.
+///
+/// `unreserved / pct-encoded / sub-delims / ":" / "@"`.
+fn is_pchar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"-._~%!$&'()*+,;=:@".contains(&byte)
 }
 
 /// Adds one regular field, applying RFC 9114 §4.2's rules on the way.
-fn add_field(headers: &mut HeaderMap, name: &[u8], value: &[u8]) -> Result<(), Violation> {
+fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Violation> {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
     //# A request or response containing uppercase characters in field names
     //# MUST be treated as malformed.
-    let name = HeaderName::from_lowercase(name)
-        .map_err(|_| malformed("a field name that is uppercase or not a token"))?;
+    let name = message::field_name(name)
+        .ok_or_else(|| malformed("a field name that is uppercase or not a token"))?;
 
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
     //# Any request or response that contains a character not permitted in a
     //# field value MUST be treated as malformed.
-    let value = HeaderValue::from_bytes(value)
-        .map_err(|_| malformed("a field value with a forbidden character"))?;
+    let value = FieldValue::parse(value)
+        .ok_or_else(|| malformed("a field value with a forbidden character"))?;
 
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
     //# An endpoint MUST NOT generate an HTTP/3 field section containing
@@ -435,7 +523,7 @@ fn add_field(headers: &mut HeaderMap, name: &[u8], value: &[u8]) -> Result<(), V
     // carrying content framing with a 400 (RFC 9297 §3.2), which tells the
     // client rather more than a bare stream reset would, and `it_udp` pins that
     // answer.
-    if name == http::header::CONNECTION {
+    if name == "connection" {
         return Err(malformed(
             "the Connection field, which HTTP/3 has no use for",
         ));
@@ -445,7 +533,7 @@ fn add_field(headers: &mut HeaderMap, name: &[u8], value: &[u8]) -> Result<(), V
     //# The only exception to this is the TE header field, which MAY be
     //# present in an HTTP/3 request header; when it is, it MUST NOT contain
     //# any value other than "trailers".
-    if name == http::header::TE && value.as_bytes() != b"trailers" {
+    if name == "te" && value.as_bytes() != b"trailers" {
         return Err(malformed("a TE field with a value other than \"trailers\""));
     }
 
@@ -460,11 +548,11 @@ fn add_field(headers: &mut HeaderMap, name: &[u8], value: &[u8]) -> Result<(), V
     // whichever came first. Two Host fields that disagree would then let the
     // second one say anything at all, which is the request-smuggling shape this
     // proxy least wants to be the first hop of.
-    if name == http::header::HOST && headers.contains_key(http::header::HOST) {
+    if name == "host" && fields.contains("host") {
         return Err(malformed("more than one Host field"));
     }
 
-    headers.append(name, value);
+    fields.append(name, value);
     Ok(())
 }
 
@@ -523,19 +611,19 @@ impl Stream {
     ///
     /// A 2xx response to CONNECT must not carry Content-Length or
     /// Transfer-Encoding (RFC 9114 §4.4); this sends no field lines at all.
-    pub async fn respond(&mut self, status: StatusCode) -> Result<(), StreamError> {
-        self.respond_with(status, HeaderMap::new()).await
+    pub async fn respond(&mut self, status: Status) -> Result<(), StreamError> {
+        self.respond_with(status, Fields::new()).await
     }
 
-    /// Sends a response with `headers` and no body.
+    /// Sends a response with `fields` and no body.
     ///
     /// Only the field lines given are sent -- nothing synthesises a
     /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
     /// capsule-carrying response.
     pub async fn respond_with(
         &mut self,
-        status: StatusCode,
-        headers: HeaderMap,
+        status: Status,
+        fields: Fields,
     ) -> Result<(), StreamError> {
         // RFC 9114 §4.3.2: `:status` is the one pseudo-header a response has,
         // and it comes before every regular field (§4.3).
@@ -543,9 +631,9 @@ impl Stream {
         qpack::encode(
             &mut block,
             std::iter::once((&b":status"[..], status.as_str().as_bytes())).chain(
-                headers
+                fields
                     .iter()
-                    .map(|(name, value)| (name.as_str().as_bytes(), value.as_bytes())),
+                    .map(|(name, value)| (name.as_bytes(), value.as_bytes())),
             ),
         );
 
@@ -769,28 +857,25 @@ mod tests {
     fn a_classic_connect_becomes_an_authority_form_request() {
         let request = build_request(connect()).expect("accepted");
 
-        assert_eq!(request.method(), Method::CONNECT);
-        assert_eq!(
-            request.uri().authority().map(|a| a.as_str()),
-            Some("example.com:443")
-        );
-        assert!(request.uri().scheme().is_none());
-        assert!(request.extensions().get::<Protocol>().is_none());
+        assert_eq!(request.method, Method::Connect);
+        assert_eq!(request.authority.as_deref(), Some("example.com:443"));
+        assert_eq!(request.scheme, None);
+        assert_eq!(request.path, None);
+        assert_eq!(request.query, None);
+        assert_eq!(request.protocol, None);
     }
 
     #[test]
     fn an_extended_connect_keeps_its_protocol_scheme_and_path() {
         let request = build_request(connect_udp()).expect("accepted");
 
-        assert_eq!(request.uri().scheme_str(), Some("https"));
+        assert_eq!(request.scheme.as_deref(), Some("https"));
         assert_eq!(
-            request.uri().path(),
-            "/.well-known/masque/udp/192.0.2.1/443/"
+            request.path.as_deref(),
+            Some("/.well-known/masque/udp/192.0.2.1/443/")
         );
-        assert_eq!(
-            request.extensions().get::<Protocol>().map(Protocol::as_str),
-            Some("connect-udp")
-        );
+        assert_eq!(request.query, None);
+        assert_eq!(request.protocol.as_deref(), Some("connect-udp"));
     }
 
     /// The point of decoding `:protocol` as bytes: an unimplemented protocol
@@ -802,10 +887,7 @@ mod tests {
         fields[1] = field(":protocol", "connect-ip");
 
         let request = build_request(fields).expect("accepted");
-        assert_eq!(
-            request.extensions().get::<Protocol>().map(Protocol::as_str),
-            Some("connect-ip")
-        );
+        assert_eq!(request.protocol.as_deref(), Some("connect-ip"));
     }
 
     #[test]
@@ -818,8 +900,8 @@ mod tests {
         ])
         .expect("accepted");
 
-        assert_eq!(request.method(), Method::GET);
-        assert_eq!(request.uri().path(), "/");
+        assert_eq!(request.method, Method::Other("GET".into()));
+        assert_eq!(request.path.as_deref(), Some("/"));
     }
 
     /// RFC 9114 §4.3.1 lets the authority arrive as a Host field instead.
@@ -833,10 +915,7 @@ mod tests {
         ])
         .expect("accepted");
 
-        assert_eq!(
-            request.uri().authority().map(|a| a.as_str()),
-            Some("example.com")
-        );
+        assert_eq!(request.authority.as_deref(), Some("example.com"));
     }
 
     #[test]
@@ -978,10 +1057,72 @@ mod tests {
         let request = build_request(fields).expect("accepted");
         assert_eq!(
             request
-                .headers()
+                .fields
                 .get("proxy-authorization")
-                .map(|v| v.as_bytes()),
+                .map(FieldValue::as_bytes),
             Some(&b"Basic dXNlcjE6czNjcmV0"[..])
         );
+    }
+
+    /// The query is kept apart from the path, because the CONNECT-UDP template
+    /// is a rule about each (RFC 9298 §2).
+    #[test]
+    fn a_path_carries_its_query_separately() {
+        let with_query = |path: &str| {
+            let mut fields = connect_udp();
+            fields[4] = field(":path", path);
+            let request = build_request(fields).expect("accepted");
+            (request.path.clone().expect("a path"), request.query.clone())
+        };
+
+        let (path, query) = with_query("/a/b?x=1&y=2");
+        assert_eq!(&*path, "/a/b");
+        assert_eq!(query.as_deref(), Some("x=1&y=2"));
+
+        // A trailing "?" is a query that is present and empty, which is not the
+        // same as one that is absent.
+        let (path, query) = with_query("/a/b?");
+        assert_eq!(&*path, "/a/b");
+        assert_eq!(query.as_deref(), Some(""));
+
+        let (path, query) = with_query("/a/b");
+        assert_eq!(&*path, "/a/b");
+        assert_eq!(query, None);
+    }
+
+    /// The pseudo-headers that name a target are checked for the characters
+    /// RFC 3986 allows them, since nothing downstream would refuse the rest
+    /// as loudly.
+    #[test]
+    fn pseudo_headers_that_name_a_target_are_checked_for_syntax() {
+        let replacing = |name: &str, value: &str| {
+            let mut fields = connect_udp();
+            for existing in &mut fields {
+                if existing.name.as_ref() == name.as_bytes() {
+                    *existing = field(name, value);
+                }
+            }
+            fields
+        };
+
+        // A scheme is ALPHA then ALPHA / DIGIT / "+" / "-" / "." (RFC 3986 §3.1).
+        assert!(build_request(replacing(":scheme", "coap+tcp")).is_ok());
+        for scheme in ["1https", "http s", "http/1"] {
+            refused(replacing(":scheme", scheme));
+        }
+
+        // An authority is unreserved / pct-encoded / sub-delims / ":@[]"
+        // (RFC 3986 §3.2); its shape is `tunnel::tcp`'s to judge, not this.
+        assert!(build_request(replacing(":authority", "[2001:db8::1]:443")).is_ok());
+        assert!(build_request(replacing(":authority", "user@host:443")).is_ok());
+        for authority in ["proxy example:443", "proxy.example:443/", "proxy\u{7f}:443"] {
+            refused(replacing(":authority", authority));
+        }
+
+        // A path is an absolute path, and a fragment is not part of a target.
+        assert!(build_request(replacing(":path", "*")).is_ok());
+        for path in ["masque/udp/", "/a b", "/a#b", "/a\u{1}b"] {
+            refused(replacing(":path", path));
+        }
     }
 }

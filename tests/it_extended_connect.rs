@@ -12,10 +12,10 @@ mod common;
 use bytes::{Bytes, BytesMut};
 use common::{
     auth_section, basic_credentials, connect_request, read_at_least, respond_to, spawn_echo_target,
-    H3Client, Protocol, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use http::{HeaderName, Method, Request, StatusCode, Uri};
 use volto::h3::frame;
+use volto::h3api::{Method, Request, Status};
 
 /// QPACK_DECOMPRESSION_FAILED (RFC 9204 §6, registered in §8.3).
 const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
@@ -43,8 +43,8 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
 
     let response = respond_to(&mut client, connect_ip_request(&server.addr.to_string())).await;
     assert_eq!(
-        response.status(),
-        StatusCode::NOT_IMPLEMENTED,
+        response.status,
+        Status::NOT_IMPLEMENTED,
         "an unsupported :protocol must be answered 501, not refused as malformed"
     );
 
@@ -116,17 +116,12 @@ async fn a_dynamic_table_reference_closes_the_connection() {
 /// RFC 8441 §4 makes `:scheme`, `:path` and `:authority` mandatory alongside
 /// `:protocol`, so all three are here: a request missing one of them would be
 /// malformed and never reach the routing arm under test.
-fn connect_ip_request(proxy: &str) -> Request<()> {
-    let uri: Uri = format!("https://{proxy}/.well-known/masque/ip/*/*/")
-        .parse()
-        .expect("connect-ip uri");
-
-    let mut request = Request::builder()
-        .method(Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .expect("connect-ip request");
-    request.extensions_mut().insert(Protocol("connect-ip"));
+fn connect_ip_request(proxy: &str) -> Request {
+    let mut request = Request::new(Method::Connect);
+    request.scheme = Some("https".into());
+    request.authority = Some(proxy.into());
+    request.path = Some("/.well-known/masque/ip/*/*/".into());
+    request.protocol = Some("connect-ip".into());
     authorize(&mut request);
     request
 }
@@ -138,20 +133,18 @@ async fn open_tcp_tunnel_as_user(client: &mut H3Client, authority: &str) -> comm
 
     let (response, stream) = common::send_and_respond(client, request).await;
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
+        response.status,
+        Status::OK,
         "the tunnel to {authority} was refused: proxy-status={:?}",
-        response.headers().get("proxy-status")
+        response.fields.get("proxy-status")
     );
     stream
 }
 
 /// Adds this suite's credentials to a request.
-fn authorize(request: &mut Request<()>) {
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials(USER.0, USER.1)
-            .parse()
-            .expect("header value"),
+fn authorize(request: &mut Request) {
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials(USER.0, USER.1)),
     );
 }

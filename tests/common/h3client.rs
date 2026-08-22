@@ -56,16 +56,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use rustls::pki_types::CertificateDer;
 use tokio::task::{JoinHandle, JoinSet};
 
 use volto::datagram::{peek_varint, put_varint};
 use volto::h3::error::Violation;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
+use volto::h3::message;
 use volto::h3::qpack::{self, Field};
 use volto::h3::varint;
-use volto::h3api::{Code, StreamError};
+use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
 
 use super::huffman;
 use super::{
@@ -102,17 +102,20 @@ const RESERVED_HTTP2_FRAMES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
 /// collide with it.
 const NO_GOAWAY: u64 = u64::MAX;
 
-/// The value of the `:protocol` pseudo-header, as a request extension.
-///
-/// The same role `h3::ext::Protocol` played: `http::Request` has no field for a
-/// pseudo-header, so extended CONNECT carries it in the extensions map and
-/// [`SendRequest::send_request`] reads it back out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Protocol(pub &'static str);
+/// The `:protocol` token of RFC 9298's CONNECT-UDP.
+pub const CONNECT_UDP: &str = "connect-udp";
 
-impl Protocol {
-    /// The `:protocol` token of RFC 9298's CONNECT-UDP.
-    pub const CONNECT_UDP: Self = Self("connect-udp");
+/// A response: the status, and the field lines that followed it.
+///
+/// The mirror of [`Request`], which this client sends and the server parses.
+/// There is no such type in `volto` itself -- a server reads no responses -- so
+/// it lives here, built on the same [`Status`] and [`Fields`] the server writes.
+#[derive(Debug, Clone)]
+pub struct Response {
+    /// The `:status` pseudo-header (RFC 9114 §4.3.2).
+    pub status: Status,
+    /// The field lines, in the order they arrived.
+    pub fields: Fields,
 }
 
 /// What the server told this client in its SETTINGS and GOAWAY.
@@ -270,10 +273,7 @@ impl H3Client {
     ///
     /// The same shape as `client.send.send_request(..)`, for call sites that
     /// have the client rather than its sender.
-    pub async fn send_request(
-        &mut self,
-        request: Request<()>,
-    ) -> Result<ClientStream, StreamError> {
+    pub async fn send_request(&mut self, request: Request) -> Result<ClientStream, StreamError> {
         self.send.send_request(request).await
     }
 
@@ -393,10 +393,7 @@ impl SendRequest {
     /// Fails without touching the network once the server has sent GOAWAY: RFC
     /// 9114 §5.2 says requests from there on are rejected, and a client that
     /// keeps sending them learns nothing.
-    pub async fn send_request(
-        &mut self,
-        request: Request<()>,
-    ) -> Result<ClientStream, StreamError> {
+    pub async fn send_request(&mut self, request: Request) -> Result<ClientStream, StreamError> {
         self.peer.check();
 
         if self.peer.closing.load(Ordering::Relaxed) {
@@ -481,7 +478,7 @@ impl ClientStream {
     }
 
     /// Reads the response, which is the first frame the server sends.
-    pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
+    pub async fn recv_response(&mut self) -> Result<Response, StreamError> {
         let block = loop {
             match self.frames.next().await.map_err(convert)? {
                 Some(Item::Frame(Frame::Headers(block))) => break block,
@@ -588,47 +585,41 @@ impl ClientStream {
 
 /// Turns a request into the field lines that carry it (RFC 9114 §4.3).
 ///
-/// Pseudo-headers first and in a fixed order, then the regular fields in the
-/// order they were set. Which pseudo-headers appear depends on the request:
-///
-/// * classic CONNECT carries `:method` and `:authority` and nothing else
-///   (RFC 9114 §4.4);
-/// * extended CONNECT adds `:scheme`, `:path` and `:protocol` (RFC 8441 §4);
-/// * every other method carries the usual four.
-fn request_fields(request: &Request<()>) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let uri = request.uri();
-    let protocol = request.extensions().get::<Protocol>();
+/// Pseudo-headers first and in the order RFC 9114 §4.3.1 lists them, then the
+/// regular fields as they were set. Every pseudo-header the request carries is
+/// sent and no others, so what reaches the wire is exactly what the test asked
+/// for -- a classic CONNECT names only `:method` and `:authority`
+/// (RFC 9114 §4.4), an extended one adds `:scheme`, `:path` and `:protocol`
+/// (RFC 8441 §4), and a request that leaves one of them out is a request the
+/// server is meant to refuse.
+fn request_fields(request: &Request) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut fields = vec![(
         b":method".to_vec(),
-        request.method().as_str().as_bytes().to_vec(),
+        request.method.as_str().as_bytes().to_vec(),
     )];
 
     let mut push = |name: &[u8], value: &[u8]| fields.push((name.to_vec(), value.to_vec()));
 
-    if request.method() != Method::CONNECT || protocol.is_some() {
-        // `https` unless the URI says otherwise: the tests address the proxy by
-        // an origin-form URI, and a request with no `:scheme` is malformed.
-        let scheme = uri.scheme_str().unwrap_or("https");
+    if let Some(scheme) = &request.scheme {
         push(b":scheme", scheme.as_bytes());
     }
-
-    if let Some(authority) = uri.authority() {
-        push(b":authority", authority.as_str().as_bytes());
+    if let Some(authority) = &request.authority {
+        push(b":authority", authority.as_bytes());
     }
-
-    if request.method() != Method::CONNECT || protocol.is_some() {
-        let path = uri
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str);
-        push(b":path", path.as_bytes());
+    if let Some(path) = &request.path {
+        // `:path` is the path and the query as one field (RFC 9114 §4.3.1); the
+        // request keeps them apart because the server hands them on separately.
+        match &request.query {
+            Some(query) => push(b":path", format!("{path}?{query}").as_bytes()),
+            None => push(b":path", path.as_bytes()),
+        }
     }
-
-    if let Some(Protocol(protocol)) = protocol {
+    if let Some(protocol) = &request.protocol {
         push(b":protocol", protocol.as_bytes());
     }
 
-    for (name, value) in request.headers() {
-        push(name.as_str().as_bytes(), value.as_bytes());
+    for (name, value) in request.fields.iter() {
+        push(name.as_bytes(), value.as_bytes());
     }
 
     fields
@@ -709,11 +700,15 @@ fn section_size(fields: &[(Vec<u8>, Vec<u8>)]) -> u64 {
 }
 
 /// Turns a decoded field section into a response.
-fn build_response(fields: Vec<Field>) -> Result<Response<()>, StreamError> {
+///
+/// The server is held to RFC 9114 §4.2 here as well as holding a client to it:
+/// a response field name that is not a lowercase token is refused rather than
+/// repaired, and the rule is `volto::h3::message`'s in both directions.
+fn build_response(section: Vec<Field>) -> Result<Response, StreamError> {
     let mut status = None;
-    let mut headers = HeaderMap::new();
+    let mut fields = Fields::new();
 
-    for Field { name, value } in fields {
+    for Field { name, value } in section {
         if name.starts_with(b":") {
             if &name[..] != b":status" {
                 return Err(malformed("a response pseudo-header other than :status"));
@@ -721,22 +716,19 @@ fn build_response(fields: Vec<Field>) -> Result<Response<()>, StreamError> {
             if status.is_some() {
                 return Err(malformed("a repeated :status"));
             }
-            status =
-                Some(StatusCode::from_bytes(&value).map_err(|_| malformed("an invalid :status"))?);
+            status = Some(Status::parse(&value).ok_or_else(|| malformed("an invalid :status"))?);
             continue;
         }
 
-        let name = HeaderName::from_bytes(&name).map_err(|_| malformed("an invalid field name"))?;
-        let value =
-            HeaderValue::from_bytes(&value).map_err(|_| malformed("an invalid field value"))?;
-        headers.append(name, value);
+        let name = message::field_name(&name).ok_or_else(|| malformed("an invalid field name"))?;
+        let value = FieldValue::parse(&value).ok_or_else(|| malformed("an invalid field value"))?;
+        fields.append(name, value);
     }
 
-    let mut response = Response::new(());
-    *response.status_mut() = status.ok_or_else(|| malformed("a response without :status"))?;
-    *response.headers_mut() = headers;
-    *response.version_mut() = http::Version::HTTP_3;
-    Ok(response)
+    Ok(Response {
+        status: status.ok_or_else(|| malformed("a response without :status"))?,
+        fields,
+    })
 }
 
 /// The bytes of this client's control stream: its type, then SETTINGS.

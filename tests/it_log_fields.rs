@@ -25,7 +25,7 @@ use common::{
     respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer,
     ALLOW_PRIVATE,
 };
-use http::{HeaderName, StatusCode};
+use volto::h3api::Status;
 
 /// One test function: `tracing_subscriber::fmt().init()` is process-wide, so
 /// splitting these would race over installing it.
@@ -89,14 +89,12 @@ async fn operator_facing_fields_print_values_not_options() {
     let guarded = TestServer::start_with(&auth_section(&[("user1", "a-real-password")])).await;
     let mut caller = H3Client::connect(&guarded).await;
     let mut request = connect_request("192.0.2.1:443");
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials("user1", "wrong-guess")
-            .parse()
-            .expect("header value"),
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials("user1", "wrong-guess")),
     );
     let response = respond_to(&mut caller, request).await;
-    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
     let logged = buffer.contents();
     let failure = logged
@@ -119,14 +117,12 @@ async fn operator_facing_fields_print_values_not_options() {
     let forged = "evil\nWARN volto - authentication failed stream_id=4 \
                   remote=198.51.100.9 username=\"x\"\u{1b}[2K";
     let mut request = connect_request("192.0.2.1:443");
-    request.headers_mut().insert(
-        HeaderName::from_static("proxy-authorization"),
-        basic_credentials(forged, "wrong-guess")
-            .parse()
-            .expect("header value"),
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials(forged, "wrong-guess")),
     );
     let response = respond_to(&mut caller, request).await;
-    assert_eq!(response.status(), StatusCode::PROXY_AUTHENTICATION_REQUIRED);
+    assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
     let logged = buffer.contents();
     let failures: Vec<&str> = logged

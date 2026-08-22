@@ -24,8 +24,8 @@ use common::{
     connect_request, finish_connect, open_tcp_tunnel, read_at_least, send_and_respond,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
-use http::{header, StatusCode};
 use volto::datagram;
+use volto::h3api::Status;
 
 /// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1), the code the server hangs up with.
 const H3_STREAM_CREATION_ERROR: u64 = 0x103;
@@ -341,17 +341,15 @@ fn authenticated_tunnel<'a>(
     let caller = Location::caller();
     async move {
         let mut request = connect_request(authority);
-        request.headers_mut().insert(
-            header::PROXY_AUTHORIZATION,
-            basic_credentials(USER.0, USER.1)
-                .parse()
-                .expect("header value"),
+        request.fields.append(
+            "proxy-authorization",
+            common::field_value(&basic_credentials(USER.0, USER.1)),
         );
 
         let (response, stream) = send_and_respond(client, request).await;
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
+            response.status,
+            Status::OK,
             "the tunnel opened at {caller} was refused"
         );
         stream

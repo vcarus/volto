@@ -11,8 +11,8 @@ use common::{
     open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
     spawn_tagged_udp_target, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
 };
-use http::StatusCode;
 use volto::datagram;
+use volto::h3api::{FieldValue, Method, Request, Status};
 
 /// H3_DATAGRAM_ERROR, the code RFC 9297 §2.1 names for an unusable datagram.
 const H3_DATAGRAM_ERROR: u64 = 0x33;
@@ -301,21 +301,15 @@ async fn refuses_a_path_that_is_not_the_connect_udp_template() {
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
-    let uri: http::Uri = format!("https://{}/not-masque/1.2.3.4/53/", server.addr)
-        .parse()
-        .expect("uri");
-    let mut request = http::Request::builder()
-        .method(http::Method::CONNECT)
-        .uri(uri)
-        .body(())
-        .expect("request");
-    request
-        .extensions_mut()
-        .insert(common::Protocol::CONNECT_UDP);
+    let mut request = Request::new(Method::Connect);
+    request.scheme = Some("https".into());
+    request.authority = Some(server.addr.to_string().into());
+    request.path = Some("/not-masque/1.2.3.4/53/".into());
+    request.protocol = Some(common::CONNECT_UDP.into());
 
     let response = respond_to(&mut client, request).await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, Status::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -329,7 +323,7 @@ async fn refuses_an_invalid_port_in_the_template() {
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status, Status::BAD_REQUEST);
 }
 
 /// A session ends when the client closes the request stream (RFC 9298 §3.1).
@@ -821,16 +815,13 @@ async fn refuses_content_framing_fields_on_the_capsule_stream() {
         ("transfer-encoding", "chunked"),
     ] {
         let mut request = connect_udp_request(server.addr, "127.0.0.1", target.port());
-        request.headers_mut().insert(
-            http::HeaderName::from_static(name),
-            http::HeaderValue::from_static(value),
-        );
+        request.fields.append(name, FieldValue::from_static(value));
 
         let response = respond_to(&mut client, request).await;
 
         assert_eq!(
-            response.status(),
-            StatusCode::BAD_REQUEST,
+            response.status,
+            Status::BAD_REQUEST,
             "{name}: {value} must be refused"
         );
     }
@@ -842,8 +833,8 @@ async fn refuses_content_framing_fields_on_the_capsule_stream() {
     .await;
 
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
+        response.status,
+        Status::OK,
         "the same request without a framing field must be accepted"
     );
 }
@@ -865,16 +856,15 @@ async fn any_capsule_protocol_value_still_opens_a_tunnel() {
 
     for value in ["?1", "?0", "not-a-boolean"] {
         let mut request = connect_udp_request(server.addr, "127.0.0.1", target.port());
-        request.headers_mut().insert(
-            http::HeaderName::from_static("capsule-protocol"),
-            http::HeaderValue::from_str(value).expect("header value"),
-        );
+        request
+            .fields
+            .append("capsule-protocol", common::field_value(value));
 
         let response = respond_to(&mut client, request).await;
 
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
+            response.status,
+            Status::OK,
             "capsule-protocol: {value} must not change the outcome"
         );
     }

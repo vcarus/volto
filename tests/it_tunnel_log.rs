@@ -25,8 +25,8 @@ use common::{
     connect_request, open_udp_session, respond_to, spawn_large_reply_udp_target, H3Client,
     SharedBuffer, TestServer, ALLOW_PRIVATE,
 };
-use http::StatusCode;
 use volto::datagram;
+use volto::h3api::Status;
 
 /// A name whose every address is the unspecified one: the shape a filtering
 /// resolver returns, and the only thing `is_dns_blackhole` accepts.
@@ -64,8 +64,8 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
 
     let response = respond_to(&mut client, connect_request(BLACKHOLED)).await;
     assert_eq!(
-        response.status(),
-        StatusCode::OK,
+        response.status,
+        Status::OK,
         "a blackholed name is accepted and closed, not refused (D49)"
     );
 
@@ -102,7 +102,7 @@ async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
     let mark = buffer.mark();
 
     let response = respond_to(&mut client, connect_request(PROHIBITED)).await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.status, Status::FORBIDDEN);
 
     let line = buffer
         .wait_for_line(

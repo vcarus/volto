@@ -38,7 +38,6 @@ tokio = { version = "1", features = [
 ] }
 
 bytes = "1"
-http = "1"
 percent-encoding = "2"
 # Constant-time credential comparison (RFC 7617 secrets must not be compared with
 # a short-circuiting `==`). Already in the tree via rustls; `ConstantTimeEq` is

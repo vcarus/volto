@@ -16,13 +16,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{Request, StatusCode};
 use tracing::{debug, info, warn};
 
+use crate::auth;
 use crate::config::Config;
+use crate::h3api::{self, FieldValue, Request, Status};
 use crate::shutdown::Shutdown;
 use crate::tunnel::{self, udp, Context, ProxyError, Route};
-use crate::{auth, h3api};
 
 /// Drives one QUIC connection until the peer stops sending requests.
 ///
@@ -239,7 +239,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT — TCP or UDP — has to pass through here.
-    match context.auth.authenticate(req.headers()) {
+    match context.auth.authenticate(&req.fields) {
         Ok(Some(username)) => {
             // Lifts D76's bound for the rest of this connection's life: the peer
             // has proved who it is, and may now hold the connection idle for as
@@ -269,7 +269,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             );
             tunnel::refuse_with(
                 &mut stream,
-                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                Status::PROXY_AUTHENTICATION_REQUIRED,
                 auth::challenge_headers(),
                 stream_id,
             )
@@ -303,7 +303,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
         );
         tunnel::refuse_because(
             &mut stream,
-            StatusCode::SERVICE_UNAVAILABLE,
+            Status::SERVICE_UNAVAILABLE,
             ProxyError::ConnectionLimitReached,
             stream_id,
         )
@@ -317,15 +317,15 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     context.tunnels.fetch_add(1, Ordering::Relaxed);
 
     match tunnel::route(&req) {
-        Route::Tcp => match req.uri().authority() {
+        Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {
-                let authority = authority.as_str().to_owned();
+                let authority = authority.to_owned();
                 tunnel::tcp::run(&authority, stream, stream_id, &context).await;
             }
             None => {
                 // RFC 9114 §4.4: a CONNECT request must carry :authority.
                 debug!(stream_id, "CONNECT request without :authority");
-                tunnel::refuse(&mut stream, StatusCode::BAD_REQUEST, stream_id).await;
+                tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
             }
         },
         Route::ConnectUdp => {
@@ -337,15 +337,15 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 protocol = %bounded(protocol),
                 "unsupported :protocol"
             );
-            tunnel::refuse(&mut stream, StatusCode::NOT_IMPLEMENTED, stream_id).await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
         }
         Route::NotConnect => {
             debug!(
                 stream_id,
-                method = %req.method(),
+                method = %req.method,
                 "not a CONNECT request; this server only proxies"
             );
-            tunnel::refuse(&mut stream, StatusCode::NOT_IMPLEMENTED, stream_id).await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
         }
     }
 }
@@ -363,21 +363,21 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
 ///   something we do not implement", which is a different bug entirely.
 ///
 /// Neither of those needs the credential, so the credential does not appear.
-fn log_request(req: &Request<()>, stream_id: u64) {
+fn log_request(req: &Request, stream_id: u64) {
     if !tracing::enabled!(tracing::Level::DEBUG) {
         return;
     }
 
     let headers: Vec<String> = req
-        .headers()
+        .fields
         .iter()
         .map(|(name, value)| {
             if is_credential_header(name) {
                 return format!("{name}: {}", redact_credentials(value));
             }
             match value.to_str() {
-                Ok(value) => format!("{name}: {value}"),
-                Err(_) => format!("{name}: <{} non-utf8 bytes>", value.len()),
+                Some(value) => format!("{name}: {value}"),
+                None => format!("{name}: <{} non-utf8 bytes>", value.len()),
             }
         })
         .collect();
@@ -390,10 +390,10 @@ fn log_request(req: &Request<()>, stream_id: u64) {
 
     debug!(
         stream_id,
-        method = %req.method(),
-        path = %req.uri().path(),
-        authority = ?req.uri().authority().map(|a| a.as_str()),
-        scheme = ?req.uri().scheme_str(),
+        method = %req.method,
+        path = %req.path.as_deref().unwrap_or_default(),
+        authority = ?req.authority.as_deref(),
+        scheme = ?req.scheme.as_deref(),
         protocol = ?protocol,
         headers = ?headers,
         "inbound request"
@@ -436,9 +436,10 @@ fn bounded(token: &str) -> Cow<'_, str> {
 /// Whether a header carries credentials and must therefore be redacted.
 ///
 /// Both names this server accepts (decision D3), matched case-insensitively —
-/// `http` lowercases header names on receipt, but this must not depend on that.
-fn is_credential_header(name: &http::HeaderName) -> bool {
-    name == http::header::PROXY_AUTHORIZATION || name == http::header::AUTHORIZATION
+/// a field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
+/// by `h3::stream`), but this must not depend on that.
+fn is_credential_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("proxy-authorization") || name.eq_ignore_ascii_case("authorization")
 }
 
 /// Renders a credential header value as its scheme plus the size of the secret.
@@ -452,11 +453,11 @@ fn is_credential_header(name: &http::HeaderName) -> bool {
 /// attacker-controlled, so this bounds what an unauthenticated peer can write
 /// into the log: without the check, a huge or newline-laden "scheme" could bloat
 /// the log or forge log lines through it.
-fn redact_credentials(value: &http::HeaderValue) -> String {
+fn redact_credentials(value: &FieldValue) -> String {
     /// Longest scheme name echoed into the log. "Negotiate" is 9.
     const MAX_SCHEME: usize = 16;
 
-    let Ok(text) = value.to_str() else {
+    let Some(text) = value.to_str() else {
         return format!("<redacted {} bytes>", value.len());
     };
 
@@ -478,23 +479,21 @@ fn redact_credentials(value: &http::HeaderValue) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http::header::{AUTHORIZATION, PROXY_AUTHORIZATION};
-    use http::{HeaderName, HeaderValue};
 
     fn redact(value: &str) -> String {
-        redact_credentials(&HeaderValue::from_str(value).expect("header value"))
+        redact_credentials(&FieldValue::parse(value.as_bytes()).expect("field value"))
     }
 
     #[test]
     fn both_credential_headers_are_recognised() {
-        assert!(is_credential_header(&PROXY_AUTHORIZATION));
-        assert!(is_credential_header(&AUTHORIZATION));
-        assert!(!is_credential_header(&HeaderName::from_static(
-            "user-agent"
-        )));
-        assert!(!is_credential_header(&HeaderName::from_static(
-            "x-volto-probe"
-        )));
+        assert!(is_credential_header("proxy-authorization"));
+        assert!(is_credential_header("authorization"));
+        // The wire name is lowercase (RFC 9114 §4.2); the match does not lean
+        // on that having been enforced elsewhere.
+        assert!(is_credential_header("Proxy-Authorization"));
+        assert!(is_credential_header("AUTHORIZATION"));
+        assert!(!is_credential_header("user-agent"));
+        assert!(!is_credential_header("x-volto-probe"));
     }
 
     /// The scheme survives, the secret does not.
@@ -590,8 +589,8 @@ mod tests {
     /// A non-UTF-8 value cannot be split into scheme and secret, so all of it goes.
     #[test]
     fn a_non_utf8_value_is_redacted_whole() {
-        let value = HeaderValue::from_bytes(&[0x42, 0x61, 0x73, 0x69, 0x63, 0x20, 0xff, 0xfe])
-            .expect("header value");
+        let value = FieldValue::parse(&[0x42, 0x61, 0x73, 0x69, 0x63, 0x20, 0xff, 0xfe])
+            .expect("field value");
         assert_eq!(redact_credentials(&value), "<redacted 8 bytes>");
     }
 }

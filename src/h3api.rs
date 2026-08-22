@@ -1,15 +1,19 @@
 //! The facade over the HTTP/3 layer.
 //!
 //! Everything the rest of the crate needs from HTTP/3 is named here, and only
-//! here: `conn`, `quic` and the tunnels use `http`, `bytes` and `quinn` types
-//! plus the handful of wrappers below. That facade began as insulation from
-//! the `h3` crate; it survives the move to [`crate::h3`] because it is worth
-//! having on its own terms -- it is the list of what a proxy actually asks of
-//! HTTP/3, and it is short.
+//! here: `conn`, `quic` and the tunnels use `bytes` and `quinn` types plus the
+//! handful of names below. That facade began as insulation from the `h3` crate;
+//! it survives the move to [`crate::h3`] because it is worth having on its own
+//! terms -- it is the list of what a proxy actually asks of HTTP/3, and it is
+//! short.
 //!
-//! Types that are not HTTP/3-specific -- `http::Request`, `http::StatusCode`,
-//! `bytes::Bytes` -- are passed through unchanged; isolating those would buy
-//! nothing.
+//! The vocabulary of an HTTP message -- [`Request`], [`Status`], [`Fields`] --
+//! is [`crate::h3::message`]'s and is re-exported here rather than wrapped: a
+//! status is a status, and a second type in front of it would say nothing the
+//! first does not. The rule is about *where they are named*, and it is
+//! unchanged: nothing outside [`crate::h3`] reaches into it, so this module is
+//! the one place that has to be read to know what the rest of the crate may
+//! assume about HTTP/3.
 //!
 //! Inbound HTTP Datagrams (RFC 9297) are named here too, because the routing
 //! they need is *per request stream*: a datagram carries the Quarter Stream ID
@@ -22,14 +26,12 @@
 //! packet.
 
 use bytes::Bytes;
-use http::Request;
 
 pub use crate::h3::connection::{Connection, DatagramReceiver};
 pub use crate::h3::error::{Code, ConnectionError, StreamError};
+pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};
 pub use crate::h3::stream::{Reader, Resolver, Stream, Writer};
 pub use crate::h3::MAX_FIELD_SECTION_SIZE;
-
-use crate::h3::stream::Protocol;
 
 /// The buffer type carried over HTTP/3 streams.
 pub type Buffer = Bytes;
@@ -82,11 +84,11 @@ pub enum ConnectProtocol<'a> {
 }
 
 /// Reads the `:protocol` pseudo-header of a request.
-pub fn connect_protocol(req: &Request<()>) -> ConnectProtocol<'_> {
-    match req.extensions().get::<Protocol>() {
+pub fn connect_protocol(req: &Request) -> ConnectProtocol<'_> {
+    match req.protocol.as_deref() {
         None => ConnectProtocol::Absent,
-        Some(protocol) if protocol.as_str() == CONNECT_UDP => ConnectProtocol::ConnectUdp,
-        Some(protocol) => ConnectProtocol::Unsupported(protocol.as_str()),
+        Some(CONNECT_UDP) => ConnectProtocol::ConnectUdp,
+        Some(protocol) => ConnectProtocol::Unsupported(protocol),
     }
 }
 
@@ -149,17 +151,11 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
 mod tests {
     use super::*;
     use crate::h3::error::Violation;
-    use http::Method;
 
-    fn request_with_protocol(protocol: Option<&str>) -> Request<()> {
-        let mut req = Request::builder()
-            .method(Method::CONNECT)
-            .uri("https://example.com/")
-            .body(())
-            .expect("request");
-        if let Some(protocol) = protocol {
-            req.extensions_mut().insert(Protocol::new(protocol));
-        }
+    fn request_with_protocol(protocol: Option<&str>) -> Request {
+        let mut req = Request::new(Method::Connect);
+        req.authority = Some("example.com".into());
+        req.protocol = protocol.map(Into::into);
         req
     }
 

@@ -7,13 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
-use crate::h3api::{self, ConnectProtocol, Stream};
+use crate::h3api::{self, ConnectProtocol, FieldValue, Fields, Method, Request, Status, Stream};
 use crate::policy::{self, Policy};
 
 /// How a request should be handled.
@@ -33,8 +32,8 @@ pub enum Route<'a> {
 }
 
 /// Classifies a request by method and `:protocol`.
-pub fn route(req: &Request<()>) -> Route<'_> {
-    if req.method() != Method::CONNECT {
+pub fn route(req: &Request) -> Route<'_> {
+    if req.method != Method::Connect {
         return Route::NotConnect;
     }
 
@@ -422,13 +421,13 @@ pub(crate) async fn admit_target(
     ctx: &Context,
     stream: &mut Stream,
     stream_id: u64,
-    accepted_headers: impl FnOnce() -> HeaderMap,
+    accepted_headers: impl FnOnce() -> Fields,
 ) -> Option<Vec<std::net::SocketAddr>> {
     if !ctx.policy.allows_port(port) {
         debug!(stream_id, host, port, "target port denied by policy");
         refuse_because(
             stream,
-            StatusCode::FORBIDDEN,
+            Status::FORBIDDEN,
             ProxyError::HttpRequestDenied,
             stream_id,
         )
@@ -470,7 +469,7 @@ pub(crate) async fn admit_target(
         );
         refuse_because(
             stream,
-            StatusCode::FORBIDDEN,
+            Status::FORBIDDEN,
             ProxyError::DestinationIpProhibited,
             stream_id,
         )
@@ -499,14 +498,11 @@ impl ProxyError {
         }
     }
 
-    /// This error as a response header map.
-    pub fn headers(self) -> HeaderMap {
-        let mut headers = HeaderMap::with_capacity(1);
-        headers.insert(
-            HeaderName::from_static("proxy-status"),
-            HeaderValue::from_static(self.field_value()),
-        );
-        headers
+    /// This error as the field lines of a response.
+    pub fn headers(self) -> Fields {
+        let mut fields = Fields::new();
+        fields.append(PROXY_STATUS, FieldValue::from_static(self.field_value()));
+        fields
     }
 
     /// Whether this error may name the address it happened on.
@@ -536,7 +532,7 @@ impl ProxyError {
     ///
     /// The address is dropped unless `Self::discloses_next_hop` allows it, so a
     /// caller cannot leak one by passing it to the wrong error type.
-    pub fn headers_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> HeaderMap {
+    pub fn headers_with_next_hop(self, next_hop: Option<std::net::SocketAddr>) -> Fields {
         let Some(address) = next_hop.filter(|_| self.discloses_next_hop()) else {
             return self.headers();
         };
@@ -550,17 +546,17 @@ impl ProxyError {
             sf_string(&address.to_string())
         );
 
-        let mut headers = HeaderMap::with_capacity(1);
-        headers.insert(
-            HeaderName::from_static("proxy-status"),
+        let mut fields = Fields::new();
+        fields.append(
+            PROXY_STATUS,
             // A rendered socket address is printable ASCII, so this cannot fail;
             // falling back to the parameterless value keeps that from being a
             // panic if it ever somehow did, which is the property the whole
             // refusal path is built on: refusing must never itself fail.
-            HeaderValue::from_str(&value)
-                .unwrap_or_else(|_| HeaderValue::from_static(self.field_value())),
+            FieldValue::parse(value.as_bytes())
+                .unwrap_or_else(|| FieldValue::from_static(self.field_value())),
         );
-        headers
+        fields
     }
 
     /// The error type that best describes a failure to reach a target.
@@ -592,17 +588,20 @@ impl ProxyError {
     /// `accept_then_close` — and carries no `Proxy-Status` field, because
     /// nothing about it is this proxy's verdict. Every refusal that is actually
     /// sent still follows the table below.
-    pub fn recommended_status(self) -> StatusCode {
+    pub fn recommended_status(self) -> Status {
         match self {
-            Self::DnsError | Self::ConnectionRefused => StatusCode::BAD_GATEWAY,
-            Self::DnsTimeout | Self::ConnectionTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::DnsError | Self::ConnectionRefused => Status::BAD_GATEWAY,
+            Self::DnsTimeout | Self::ConnectionTimeout => Status::GATEWAY_TIMEOUT,
             Self::DestinationUnavailable | Self::ConnectionLimitReached => {
-                StatusCode::SERVICE_UNAVAILABLE
+                Status::SERVICE_UNAVAILABLE
             }
-            Self::DestinationIpProhibited | Self::HttpRequestDenied => StatusCode::FORBIDDEN,
+            Self::DestinationIpProhibited | Self::HttpRequestDenied => Status::FORBIDDEN,
         }
     }
 }
+
+/// The field an RFC 9209 refusal explains itself in.
+const PROXY_STATUS: &str = "proxy-status";
 
 /// Renders `value` as a structured field String (RFC 8941 §3.3.3).
 ///
@@ -628,14 +627,14 @@ fn sf_string(value: &str) -> String {
 ///
 /// Any request body is unwanted, so the client is told to stop sending before
 /// the status goes out.
-pub(crate) async fn refuse(stream: &mut Stream, status: StatusCode, stream_id: u64) {
-    refuse_with(stream, status, HeaderMap::new(), stream_id).await;
+pub(crate) async fn refuse(stream: &mut Stream, status: Status, stream_id: u64) {
+    refuse_with(stream, status, Fields::new(), stream_id).await;
 }
 
 /// Refuses a request, explaining why in an RFC 9209 `Proxy-Status` field.
 pub(crate) async fn refuse_because(
     stream: &mut Stream,
-    status: StatusCode,
+    status: Status,
     error: ProxyError,
     stream_id: u64,
 ) {
@@ -662,13 +661,13 @@ pub(crate) async fn refuse_unreachable(stream: &mut Stream, failure: &Unreachabl
 /// Refuses a request with an explicit set of response headers.
 pub(crate) async fn refuse_with(
     stream: &mut Stream,
-    status: StatusCode,
-    headers: HeaderMap,
+    status: Status,
+    fields: Fields,
     stream_id: u64,
 ) {
     stream.stop_receiving(h3api::NO_ERROR);
 
-    if let Err(error) = stream.respond_with(status, headers).await {
+    if let Err(error) = stream.respond_with(status, fields).await {
         debug!(stream_id, %error, "failed to send error response");
         return;
     }
@@ -680,7 +679,7 @@ pub(crate) async fn refuse_with(
 /// Accepts a request with a 200 and closes the tunnel again immediately.
 ///
 /// **Not a refusal, and deliberately not named like one.** The response carries
-/// no `Proxy-Status` field and says nothing about a failure; `headers` is
+/// no `Proxy-Status` field and says nothing about a failure; `fields` is
 /// whatever an accepted response of that tunnel type has to carry — nothing for
 /// a TCP tunnel, the RFC 9297 `Capsule-Protocol` field for CONNECT-UDP.
 ///
@@ -713,10 +712,10 @@ pub(crate) async fn refuse_with(
 /// (it resets within a round trip either way) and production kept failing under
 /// the drain, so the simpler shape came back. That fault is on the client's
 /// side and does not depend on what this close sends.
-pub(crate) async fn accept_then_close(stream: &mut Stream, headers: HeaderMap, stream_id: u64) {
+pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields, stream_id: u64) {
     stream.stop_receiving(h3api::NO_ERROR);
 
-    if let Err(error) = stream.respond_with(StatusCode::OK, headers).await {
+    if let Err(error) = stream.respond_with(Status::OK, fields).await {
         debug!(stream_id, %error, "failed to send 200 for a tunnel closed on the spot");
         return;
     }
@@ -749,9 +748,9 @@ mod tests {
             // parameter names the failure.
             assert_eq!(value, format!("volto; error={expected}"));
 
-            let headers = error.headers();
+            let fields = error.headers();
             assert_eq!(
-                headers.get("proxy-status").and_then(|v| v.to_str().ok()),
+                fields.get(PROXY_STATUS).and_then(FieldValue::to_str),
                 Some(value)
             );
         }
@@ -763,20 +762,20 @@ mod tests {
     #[test]
     fn every_error_type_carries_its_recommended_status() {
         for (error, expected) in [
-            (ProxyError::DnsError, StatusCode::BAD_GATEWAY),
-            (ProxyError::DnsTimeout, StatusCode::GATEWAY_TIMEOUT),
-            (ProxyError::ConnectionRefused, StatusCode::BAD_GATEWAY),
-            (ProxyError::ConnectionTimeout, StatusCode::GATEWAY_TIMEOUT),
+            (ProxyError::DnsError, Status::BAD_GATEWAY),
+            (ProxyError::DnsTimeout, Status::GATEWAY_TIMEOUT),
+            (ProxyError::ConnectionRefused, Status::BAD_GATEWAY),
+            (ProxyError::ConnectionTimeout, Status::GATEWAY_TIMEOUT),
             (
                 ProxyError::DestinationUnavailable,
-                StatusCode::SERVICE_UNAVAILABLE,
+                Status::SERVICE_UNAVAILABLE,
             ),
             (
                 ProxyError::ConnectionLimitReached,
-                StatusCode::SERVICE_UNAVAILABLE,
+                Status::SERVICE_UNAVAILABLE,
             ),
-            (ProxyError::HttpRequestDenied, StatusCode::FORBIDDEN),
-            (ProxyError::DestinationIpProhibited, StatusCode::FORBIDDEN),
+            (ProxyError::HttpRequestDenied, Status::FORBIDDEN),
+            (ProxyError::DestinationIpProhibited, Status::FORBIDDEN),
         ] {
             assert_eq!(
                 error.recommended_status(),
@@ -792,7 +791,7 @@ mod tests {
     fn connect_failures_do_not_collapse_onto_one_status() {
         use std::io::{Error, ErrorKind};
 
-        let statuses: Vec<StatusCode> = [
+        let statuses: Vec<Status> = [
             ErrorKind::ConnectionRefused,
             ErrorKind::TimedOut,
             ErrorKind::PermissionDenied,
@@ -804,9 +803,9 @@ mod tests {
         assert_eq!(
             statuses,
             vec![
-                StatusCode::BAD_GATEWAY,
-                StatusCode::GATEWAY_TIMEOUT,
-                StatusCode::SERVICE_UNAVAILABLE
+                Status::BAD_GATEWAY,
+                Status::GATEWAY_TIMEOUT,
+                Status::SERVICE_UNAVAILABLE
             ]
         );
     }
@@ -830,10 +829,10 @@ mod tests {
     }
 
     /// Reads the `Proxy-Status` field out of a header map.
-    fn proxy_status(headers: &HeaderMap) -> String {
-        headers
-            .get("proxy-status")
-            .and_then(|value| value.to_str().ok())
+    fn proxy_status(fields: &Fields) -> String {
+        fields
+            .get(PROXY_STATUS)
+            .and_then(FieldValue::to_str)
             .expect("every refusal carries a Proxy-Status field")
             .to_owned()
     }
@@ -895,8 +894,8 @@ mod tests {
             ProxyError::DestinationUnavailable,
         ] {
             assert_eq!(
-                error.headers_with_next_hop(None).get("proxy-status"),
-                error.headers().get("proxy-status")
+                error.headers_with_next_hop(None).get(PROXY_STATUS),
+                error.headers().get(PROXY_STATUS)
             );
         }
     }
@@ -948,7 +947,7 @@ mod tests {
         assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
         assert_eq!(
             failure.proxy_error().recommended_status(),
-            StatusCode::GATEWAY_TIMEOUT
+            Status::GATEWAY_TIMEOUT
         );
         assert!(elapsed >= budget, "returned early, after {elapsed:?}");
     }
@@ -984,14 +983,14 @@ mod tests {
         assert_eq!(failed.proxy_error(), ProxyError::DnsError);
         assert_eq!(
             failed.proxy_error().recommended_status(),
-            StatusCode::BAD_GATEWAY
+            Status::BAD_GATEWAY
         );
 
         let timed_out = ResolveFailure::TimedOut(Duration::from_secs(10));
         assert_eq!(timed_out.proxy_error(), ProxyError::DnsTimeout);
         assert_eq!(
             timed_out.proxy_error().recommended_status(),
-            StatusCode::GATEWAY_TIMEOUT
+            Status::GATEWAY_TIMEOUT
         );
     }
 
