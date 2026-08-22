@@ -118,33 +118,46 @@ impl Resolver {
 
 /// Reads the first frame of a request stream and turns it into a request.
 async fn read_request(frames: &mut FrameReader) -> Result<Request<()>, frame::Error> {
-    let block = match frames.next().await? {
-        Some(Item::Frame(Frame::Headers(block))) => block,
+    let block = loop {
+        match frames.next().await? {
+            Some(Item::Frame(Frame::Headers(block))) => break block,
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-        //# Receipt of an invalid sequence of frames MUST be treated as a
-        //# connection error of type H3_FRAME_UNEXPECTED.
-        Some(_) => {
-            return Err(Violation::connection(
-                Code::H3_FRAME_UNEXPECTED,
-                "a request stream that does not begin with HEADERS",
-            )
-            .into())
-        }
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+            //# Implementations MUST ignore unknown or unsupported values in all
+            //# extensible protocol elements.
+            //
+            // Including before the request: a client greasing its request
+            // stream is testing exactly this, and the frame is skipped rather
+            // than counted as the stream's first.
+            Some(Item::Skipped { .. }) => {}
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-        //# If a client-initiated stream terminates without enough of the HTTP
-        //# message to provide a complete response, the server SHOULD abort its
-        //# response stream with the error code H3_REQUEST_INCOMPLETE.
-        //
-        // A SHOULD, and this server takes it: the RESET_STREAM that
-        // `Resolver::resolve` sends for a stream-class violation is that abort.
-        None => {
-            return Err(Violation::stream(
-                Code::H3_REQUEST_INCOMPLETE,
-                "the request stream ended before its HEADERS frame",
-            )
-            .into())
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# Receipt of an invalid sequence of frames MUST be treated as a
+            //# connection error of type H3_FRAME_UNEXPECTED.
+            Some(_) => {
+                return Err(Violation::connection(
+                    Code::H3_FRAME_UNEXPECTED,
+                    "a request stream that does not begin with HEADERS",
+                )
+                .into())
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+            //# If a client-initiated stream terminates without enough of the
+            //# HTTP message to provide a complete response, the server SHOULD
+            //# abort its response stream with the error code
+            //# H3_REQUEST_INCOMPLETE.
+            //
+            // A SHOULD, and this server takes it: the RESET_STREAM that
+            // `Resolver::resolve` sends for a stream-class violation is that
+            // abort.
+            None => {
+                return Err(Violation::stream(
+                    Code::H3_REQUEST_INCOMPLETE,
+                    "the request stream ended before its HEADERS frame",
+                )
+                .into())
+            }
         }
     };
 
@@ -248,9 +261,25 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
             //# On requests that contain the :protocol pseudo-header field, the
             //# :scheme and :path pseudo-header fields of the target URI [...]
             //# MUST also be included.
-            authority
+            let authority = authority
                 .as_deref()
-                .ok_or_else(|| malformed("an extended CONNECT request without :authority"))?
+                .ok_or_else(|| malformed("an extended CONNECT request without :authority"))?;
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+            //# If both fields are present, they MUST contain the same value.
+            //
+            // RFC 8441 §4 makes :authority mandatory here rather than optional,
+            // which settles where the authority comes from -- and settles
+            // nothing about a Host field that contradicts it. That rule is
+            // §4.3.1's, and an extended CONNECT is still an HTTP/3 request.
+            if headers
+                .get(http::header::HOST)
+                .is_some_and(|host| host.as_bytes() != authority)
+            {
+                return Err(malformed(":authority and Host disagree"));
+            }
+
+            authority
         } else {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
             //# If the :scheme pseudo-header field identifies a scheme that has a
@@ -495,6 +524,18 @@ impl Reader {
             };
 
             match item {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+                //# Implementations MUST ignore unknown or unsupported values in
+                //# all extensible protocol elements.
+                Item::Skipped { .. } => {}
+
+                // An empty DATA frame is legal and says nothing, so it must not
+                // surface as `Some(empty)`: a caller relaying the body would
+                // put a zero-length packet on the far side of the tunnel, and a
+                // caller counting chunks would count one that carried nothing.
+                // The frame is still a DATA frame for the rule below.
+                Item::Data(data) if !self.trailers && data.is_empty() => {}
+
                 Item::Data(data) if !self.trailers => return Ok(Some(data)),
 
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -688,6 +729,12 @@ mod tests {
             field(":path", "/"),
             field("host", "other.example"),
         ]);
+
+        // A Host field that says the same thing is not a disagreement, on an
+        // ordinary request or an extended CONNECT.
+        let mut agreeing = connect_udp();
+        agreeing.push(field("host", "proxy.example:443"));
+        assert!(build_request(agreeing).is_ok());
     }
 
     /// The table of malformed requests, each naming the rule it breaks.
@@ -713,6 +760,12 @@ mod tests {
                 .collect();
             refused(fields);
         }
+
+        // RFC 9114 §4.3.1: the agreement rule holds for an extended CONNECT
+        // too, where :authority is mandatory rather than optional.
+        let mut disagreeing = connect_udp();
+        disagreeing.push(field("host", "other.example:443"));
+        refused(disagreeing);
 
         // RFC 9114 §4.3 with RFC 8441 §4: :protocol is defined for the
         // extended CONNECT method only, so anywhere else it is an undefined

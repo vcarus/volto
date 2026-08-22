@@ -308,6 +308,19 @@ pub fn client_endpoint_with_stream_window(
 ) -> quinn::Endpoint {
     let mut transport = quinn::TransportConfig::default();
     transport.stream_receive_window(window.into());
+    client_endpoint_with_transport(ca, alpn, transport)
+}
+
+/// [`client_endpoint`] built on transport parameters the caller chose.
+///
+/// The escape hatch for tests whose subject is what the *peer's* transport
+/// parameters do to the server — a client that grants no unidirectional
+/// streams, say, which is a legal QUIC peer and an impossible HTTP/3 one.
+pub fn client_endpoint_with_transport(
+    ca: &CertificateDer<'static>,
+    alpn: &[&str],
+    transport: quinn::TransportConfig,
+) -> quinn::Endpoint {
     client_endpoint_with(ca, alpn, Some(transport))
 }
 

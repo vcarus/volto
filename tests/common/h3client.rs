@@ -345,14 +345,21 @@ impl ClientStream {
 
     /// Reads the response, which is the first frame the server sends.
     pub async fn recv_response(&mut self) -> Result<Response<()>, StreamError> {
-        let block = match self.frames.next().await.map_err(convert)? {
-            Some(Item::Frame(Frame::Headers(block))) => block,
+        let block = loop {
+            match self.frames.next().await.map_err(convert)? {
+                Some(Item::Frame(Frame::Headers(block))) => break block,
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-            //# Receipt of an invalid sequence of frames MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
-            Some(_) => return Err(unexpected("a response that does not begin with HEADERS")),
-            None => return Err(unexpected("a stream that ended before the response")),
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+                //# Implementations MUST ignore unknown or unsupported values in
+                //# all extensible protocol elements.
+                Some(Item::Skipped { .. }) => {}
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+                //# Receipt of an invalid sequence of frames MUST be treated as a
+                //# connection error of type H3_FRAME_UNEXPECTED.
+                Some(_) => return Err(unexpected("a response that does not begin with HEADERS")),
+                None => return Err(unexpected("a stream that ended before the response")),
+            }
         };
 
         // No limit: this client advertises none, so nothing the server sends can
@@ -370,6 +377,16 @@ impl ClientStream {
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, StreamError> {
         loop {
             match self.frames.next().await.map_err(convert)? {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+                //# Implementations MUST ignore unknown or unsupported values in
+                //# all extensible protocol elements.
+                Some(Item::Skipped { .. }) => {}
+
+                // An empty DATA frame carries nothing, and `Some(empty)` is not
+                // how a reader of a tunnel spells that: it keeps reading. The
+                // frame is still a DATA frame for the rule below.
+                Some(Item::Data(data)) if !self.trailers && data.is_empty() => {}
+
                 Some(Item::Data(data)) if !self.trailers => return Ok(Some(data)),
                 Some(Item::Data(_)) => {
                     return Err(unexpected("a DATA frame after the trailer section"))

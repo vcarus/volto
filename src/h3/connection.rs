@@ -33,6 +33,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::task::{JoinHandle, JoinSet};
@@ -80,6 +81,20 @@ pub(crate) struct Shared {
     decoder_seen: AtomicBool,
 }
 
+impl Shared {
+    /// Records why this endpoint is closing the connection, keeping the first
+    /// reason, and reports the one that was kept.
+    ///
+    /// The return value is what the CONNECTION_CLOSE must carry. Two tasks can
+    /// find a violation at the same moment -- the control stream reader and a
+    /// request stream, say -- and only one of them wins the `OnceLock`; closing
+    /// with the loser's code would then contradict the reason
+    /// [`Connection::accept`] goes on to report.
+    fn record(&self, violation: Violation) -> Violation {
+        self.local_error.get_or_init(|| violation).clone()
+    }
+}
+
 /// A cheap handle to the connection, held by every stream and task on it.
 ///
 /// Cloning is two refcount bumps: `quinn::Connection` is itself a handle.
@@ -100,12 +115,15 @@ impl Handle {
         debug!(%violation, "closing the connection on a protocol violation");
 
         // Only the first violation is kept: it is the one that caused the
-        // close, and anything after it is a consequence.
-        let _ = self.shared.local_error.set(violation.clone());
+        // close, and anything after it is a consequence. Everything below uses
+        // the violation that was *stored* rather than the one passed in, so the
+        // code on the wire, the reason in the log and the error this returns
+        // cannot disagree when two tasks fail at once.
+        let stored = self.shared.record(violation);
         self.quic
-            .close(varint(violation.code()), violation.to_string().as_bytes());
+            .close(varint(stored.code()), stored.to_string().as_bytes());
 
-        ConnectionError::Local(violation)
+        ConnectionError::Local(stored)
     }
 
     /// Interprets a QUIC connection failure, restoring our own reason if the
@@ -128,6 +146,31 @@ impl Handle {
         send.write_all(&header).await.map_err(critical_write)?;
 
         Ok(send)
+    }
+
+    /// Opens this endpoint's three critical streams: control, then the QPACK
+    /// pair.
+    ///
+    /// Every await here is on the peer: `open_uni` waits for the stream credit
+    /// its transport parameters grant, and the writes wait for flow control. A
+    /// peer that grants neither parks this forever, which is why
+    /// [`Connection::handshake`] runs it under a deadline.
+    async fn open_critical_streams(&self) -> Result<[quinn::SendStream; 3], ConnectionError> {
+        // The control stream goes out first, so that a peer reading streams in
+        // the order they arrive sees SETTINGS before anything else.
+        let settings = frame::settings_payload();
+        let mut preface = BytesMut::with_capacity(settings.len() + 2 * MAX_VARINT);
+        put_varint(&mut preface, STREAM_CONTROL);
+        frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
+        preface.extend_from_slice(&settings);
+
+        let mut control = self.quic.open_uni().await?;
+        control.write_all(&preface).await.map_err(critical_write)?;
+
+        let encoder = self.open_typed(STREAM_QPACK_ENCODER).await?;
+        let decoder = self.open_typed(STREAM_QPACK_DECODER).await?;
+
+        Ok([control, encoder, decoder])
     }
 }
 
@@ -162,25 +205,48 @@ impl Connection {
     /// will not be used"). Nothing is ever written to them; they exist because
     /// every deployed stack opens them, and interoperating with one particular
     /// client is this server's whole purpose.
-    pub async fn handshake(quic: quinn::Connection) -> Result<Self, ConnectionError> {
+    ///
+    /// # The deadline
+    ///
+    /// `within` bounds all of that, and it has to: opening three unidirectional
+    /// streams is the peer's decision, not this endpoint's. Transport
+    /// parameters that allow fewer than three of them -- or no data on them --
+    /// park the handshake with no way out, and the QUIC idle timeout is no
+    /// backstop, because [`crate::quic`] enables a keep-alive whose PINGs the
+    /// peer's stack answers without any application ever being involved. Each
+    /// such connection would hold a `max_connections` slot for as long as the
+    /// peer cares to keep the socket open.
+    ///
+    /// One idle timeout is the bound the caller passes, and it is generous by
+    /// construction: a peer that cannot complete a three-stream handshake in
+    /// the time it is allowed to say nothing at all is not going to complete
+    /// it.
+    pub async fn handshake(
+        quic: quinn::Connection,
+        within: Duration,
+    ) -> Result<Self, ConnectionError> {
         let handle = Handle {
             quic,
             shared: Arc::default(),
         };
 
-        // The control stream goes out first, so that a peer reading streams in
-        // the order they arrive sees SETTINGS before anything else.
-        let settings = frame::settings_payload();
-        let mut preface = BytesMut::with_capacity(settings.len() + 2 * MAX_VARINT);
-        put_varint(&mut preface, STREAM_CONTROL);
-        frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
-        preface.extend_from_slice(&settings);
+        let opened = tokio::time::timeout(within, handle.open_critical_streams()).await;
 
-        let mut control = handle.quic.open_uni().await?;
-        control.write_all(&preface).await.map_err(critical_write)?;
-
-        let encoder = handle.open_typed(STREAM_QPACK_ENCODER).await?;
-        let decoder = handle.open_typed(STREAM_QPACK_DECODER).await?;
+        // Our own rule, not the RFC's: nothing in RFC 9114 says what to do
+        // about a peer that will not let these streams be created, because
+        // nothing in it obliges a peer to allow them. H3_STREAM_CREATION_ERROR
+        // is the closest registered code -- §8.1 gives it for a stream that
+        // could not be created, which is exactly what happened -- and it tells
+        // the peer which half of the handshake it failed.
+        let [control, encoder, decoder] = match opened {
+            Ok(streams) => streams?,
+            Err(_) => {
+                return Err(handle.fail(Violation::connection(
+                    Code::H3_STREAM_CREATION_ERROR,
+                    "the HTTP/3 handshake did not complete within one idle timeout",
+                )))
+            }
+        };
 
         let unidirectional = tokio::spawn(serve_unidirectional(handle.clone()));
 
@@ -272,9 +338,7 @@ impl Connection {
     /// connection stays usable afterwards. Deciding when the existing tunnels
     /// are done is the caller's job.
     pub async fn shutdown(&mut self) -> Result<(), ConnectionError> {
-        let next = self
-            .last_accepted
-            .map_or(0, |id| id.saturating_add(REQUEST_STREAM_STEP));
+        let next = next_request_id(self.last_accepted);
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
         //# An endpoint MAY send multiple GOAWAY frames indicating different
@@ -311,6 +375,21 @@ impl Drop for Connection {
         );
         self.unidirectional.abort();
     }
+}
+
+/// The stream id four past `last_accepted`, or zero if nothing was accepted.
+///
+/// The GOAWAY identifier this server sends: the first request it will not
+/// serve. Clamped to [`crate::datagram::VARINT_MAX`] because the sum is written
+/// as a QUIC varint and nothing above that is representable -- RFC 9000 §2.1
+/// bounds a stream id by the same value, so no legitimate peer can reach the
+/// clamp, and a saturating `u64::MAX` would be an assertion failure rather than
+/// a GOAWAY.
+fn next_request_id(last_accepted: Option<u64>) -> u64 {
+    last_accepted.map_or(0, |id| {
+        id.saturating_add(REQUEST_STREAM_STEP)
+            .min(crate::datagram::VARINT_MAX)
+    })
 }
 
 /// A write to one of this endpoint's critical streams failed.
@@ -422,14 +501,10 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
         let item = match frames.next().await {
             Ok(Some(item)) => item,
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-            //# If either control stream is closed at any point, this MUST be
-            //# treated as a connection error of type H3_CLOSED_CRITICAL_STREAM.
             Ok(None) => {
-                handle.fail(Violation::connection(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    "the peer closed its control stream",
-                ));
+                if let Some(violation) = control_stream_finished(handle.quic.close_reason()) {
+                    handle.fail(violation);
+                }
                 return;
             }
 
@@ -466,6 +541,32 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
     }
 }
 
+/// What a clean end of the peer's control stream means, given `close_reason`.
+///
+/// `close_reason` is [`quinn::Connection::close_reason`]: `Some` once the
+/// connection is over, whoever ended it.
+///
+/// The rule below is not negotiable. What is negotiable is whether reaching its
+/// verdict is worth anything on a connection that has already ended: a peer
+/// tearing one down finishes its send streams and sends CONNECTION_CLOSE in the
+/// same breath, and the two can be read here in either order. Answering an
+/// ordinary goodbye with a protocol error would turn that race into a fault in
+/// the operator's log, on behalf of a connection there is nothing left to
+/// protect -- the same reasoning [`drain`] records for the QPACK streams.
+fn control_stream_finished(close_reason: Option<quinn::ConnectionError>) -> Option<Violation> {
+    if close_reason.is_some() {
+        return None;
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# If either control stream is closed at any point, this MUST be treated
+    //# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+    Some(Violation::connection(
+        Code::H3_CLOSED_CRITICAL_STREAM,
+        "the peer closed its control stream",
+    ))
+}
+
 /// The control stream's frame rules (RFC 9114 §6.2.1).
 ///
 /// Separated from the reading loop so the rules can be tested as a table rather
@@ -481,14 +582,38 @@ struct Control {
 impl Control {
     /// Applies one item from the control stream.
     fn accept(&mut self, item: Item, shared: &Shared) -> Result<(), Violation> {
-        let Item::Frame(frame) = item else {
+        let frame = match item {
+            Item::Frame(frame) => frame,
+
             // DATA on the control stream is a frame that does not belong there,
-            // and as the first thing on it, it is simply not SETTINGS.
-            return Err(if self.settings {
-                unexpected("a DATA frame on the control stream")
-            } else {
-                missing_settings()
-            });
+            // and as the first thing on it, it is simply not SETTINGS. An empty
+            // one is no different: §6.2.1 asks which frame *type* came first,
+            // and a DATA frame that carries nothing is still a DATA frame.
+            Item::Data(_) => {
+                return Err(if self.settings {
+                    unexpected("a DATA frame on the control stream")
+                } else {
+                    missing_settings()
+                })
+            }
+
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+            //# Implementations MUST ignore unknown or unsupported values in all
+            //# extensible protocol elements.
+            //
+            // Ignored -- but only after SETTINGS. A grease frame sent first is
+            // still "any other frame type" below, and the greasing endpoint is
+            // precisely the one testing whether this server enforces that.
+            Item::Skipped { kind } => {
+                if !self.settings {
+                    return Err(missing_settings());
+                }
+                debug!(
+                    frame_type = kind,
+                    "ignoring a frame of an unknown type on the control stream"
+                );
+                return Ok(());
+            }
         };
 
         match (frame, self.settings) {
@@ -627,6 +752,12 @@ mod tests {
             Item::Frame(Frame::Goaway(0)),
             Item::Frame(Frame::MaxPushId(0)),
             Item::Data(Bytes::from_static(b"nope")),
+            // A frame carrying nothing, and a frame this server cannot read,
+            // are both frames: neither is SETTINGS.
+            Item::Data(Bytes::new()),
+            Item::Skipped {
+                kind: 0x1f * 3 + 0x21,
+            },
         ] {
             let error = Control::default()
                 .accept(first, &shared)
@@ -636,6 +767,43 @@ mod tests {
         }
 
         assert!(Control::default().accept(settings(true), &shared).is_ok());
+    }
+
+    /// RFC 9114 §9 once the connection is up: an unknown frame type on the
+    /// control stream is ignored, and greasing peers send them on purpose.
+    #[test]
+    fn an_unknown_frame_after_settings_is_ignored() {
+        let shared = Shared::default();
+        let mut control = Control::default();
+        control.accept(settings(true), &shared).expect("accepted");
+
+        control
+            .accept(
+                Item::Skipped {
+                    kind: 0x1f * 6 + 0x21,
+                },
+                &shared,
+            )
+            .expect("ignored");
+
+        // And the stream carries on working afterwards.
+        control
+            .accept(Item::Frame(Frame::Goaway(4)), &shared)
+            .expect("accepted");
+    }
+
+    /// An empty DATA frame after SETTINGS is a DATA frame like any other, and
+    /// RFC 9114 §7.2.1 does not allow one here.
+    #[test]
+    fn an_empty_data_frame_after_settings_is_still_unexpected() {
+        let shared = Shared::default();
+        let mut control = Control::default();
+        control.accept(settings(true), &shared).expect("accepted");
+
+        let error = control
+            .accept(Item::Data(Bytes::new()), &shared)
+            .expect_err("refused");
+        assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
     }
 
     /// The whole reason the control stream is read in its own task: the flag
@@ -721,10 +889,72 @@ mod tests {
     /// of four, so "the next one" is four past the last (RFC 9000 §2.1).
     #[test]
     fn the_goaway_identifier_is_the_first_request_not_served() {
-        let step = REQUEST_STREAM_STEP;
-        assert_eq!(step, 4);
-        assert_eq!(None::<u64>.map_or(0, |id: u64| id + step), 0);
-        assert_eq!(Some(0u64).map_or(0, |id| id + step), 4);
-        assert_eq!(Some(16u64).map_or(0, |id| id + step), 20);
+        assert_eq!(REQUEST_STREAM_STEP, 4);
+        assert_eq!(next_request_id(None), 0);
+        assert_eq!(next_request_id(Some(0)), 4);
+        assert_eq!(next_request_id(Some(16)), 20);
+    }
+
+    /// The identifier is written as a QUIC varint, so the arithmetic must stay
+    /// inside one however absurd the stream id it starts from. A saturating
+    /// `u64::MAX` would reach `put_varint`'s assertion instead of the wire.
+    #[test]
+    fn the_goaway_identifier_stays_inside_a_varint() {
+        let max = crate::datagram::VARINT_MAX;
+
+        for last_accepted in [max - REQUEST_STREAM_STEP, max, u64::MAX] {
+            let identifier = next_request_id(Some(last_accepted));
+            assert!(
+                identifier <= max,
+                "{last_accepted} produced {identifier}, past the varint maximum"
+            );
+            // Encodable is the property that matters: this is the call
+            // `shutdown` makes.
+            let mut buf = BytesMut::new();
+            put_varint(&mut buf, identifier);
+        }
+
+        assert_eq!(next_request_id(Some(max - REQUEST_STREAM_STEP)), max);
+    }
+
+    /// Two tasks can reach a violation at the same moment; only one of them
+    /// wins, and the winner has to be the one the close and the report agree
+    /// on.
+    #[test]
+    fn only_the_first_violation_is_kept_and_it_is_the_one_reported() {
+        let shared = Shared::default();
+
+        let first = Violation::connection(Code::H3_FRAME_UNEXPECTED, "the first one");
+        let second = Violation::connection(Code::H3_ID_ERROR, "the second one");
+
+        assert_eq!(shared.record(first.clone()), first);
+        // The second caller is told what will actually be on the wire, not what
+        // it asked for.
+        let reported = shared.record(second);
+        assert_eq!(reported, first);
+        assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
+    }
+
+    /// RFC 9114 §6.2.1 stands while the connection does; once it is over, the
+    /// same FIN is the peer saying goodbye a packet early.
+    #[test]
+    fn a_control_stream_fin_is_a_fault_only_while_the_connection_lives() {
+        let violation = control_stream_finished(None).expect("a live connection must report it");
+        assert_eq!(violation.code(), Code::H3_CLOSED_CRITICAL_STREAM);
+        assert!(violation.is_connection_error());
+
+        for closed in [
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0),
+                reason: Bytes::new(),
+            }),
+            quinn::ConnectionError::TimedOut,
+            quinn::ConnectionError::LocallyClosed,
+        ] {
+            assert!(
+                control_stream_finished(Some(closed.clone())).is_none(),
+                "a connection already closed by {closed} needs no fault report"
+            );
+        }
     }
 }

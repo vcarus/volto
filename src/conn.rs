@@ -55,7 +55,14 @@ pub async fn handle(
     // connection directly.
     let datagrams = quic.clone();
 
-    let mut connection = h3api::Connection::handshake(quic).await?;
+    // The HTTP/3 handshake opens three unidirectional streams, which is the
+    // peer's decision to allow or withhold, so it is given a deadline: one idle
+    // timeout, the same value `quic.rs` puts in this connection's transport
+    // parameters. Without it a peer whose transport parameters permit fewer
+    // than three of them parks this task -- and holds a `max_connections` slot
+    // -- for as long as it keeps answering keep-alives.
+    let mut connection =
+        h3api::Connection::handshake(quic, config.limits.max_idle_timeout()).await?;
 
     // The peer's datagram flag is the connection's own, not a copy of it: the
     // task that reads the peer's control stream writes it, and every session on

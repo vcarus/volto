@@ -177,6 +177,74 @@ async fn server_advertises_max_datagram_frame_size() {
     );
 }
 
+/// H3_MISSING_SETTINGS (RFC 9114 §8.1).
+const H3_MISSING_SETTINGS: u64 = 0x10a;
+
+/// The control stream must *open* with SETTINGS — a frame the server skips is
+/// still a frame, and so is one that carries nothing.
+///
+/// Both shapes used to slip through, because neither produced anything for the
+/// control stream's rules to be applied to: an unknown type was discarded inside
+/// the frame decoder, and a zero-length DATA frame left no payload behind. A
+/// peer greasing its control stream is testing exactly this rule, so the two
+/// cases that escaped it are the two a greasing peer is most likely to send.
+#[tokio::test]
+async fn a_frame_before_settings_ends_the_connection() {
+    /// A reserved "grease" frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
+    const GREASE: u64 = 0x1f * 4 + 0x21;
+
+    for (name, first) in [
+        ("a grease frame", frame_bytes(GREASE, b"skip me")),
+        // Empty on purpose: the decoder's "no bytes yet" state and an empty
+        // frame are the same `remaining == 0`, and telling them apart is what
+        // makes this case reportable at all.
+        ("an empty DATA frame", frame_bytes(FRAME_DATA, b"")),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        let mut control = connection
+            .open_uni()
+            .await
+            .expect("open the control stream");
+
+        let mut stream = BytesMut::new();
+        datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
+        stream.extend_from_slice(&first);
+        // A perfectly good SETTINGS frame, second. The rule is about order, and
+        // sending nothing after the offending frame would leave the server
+        // waiting rather than deciding.
+        stream.extend_from_slice(&settings_frame());
+        control
+            .write_all(&stream)
+            .await
+            .expect("send the control stream");
+
+        let error = tokio::time::timeout(TIMEOUT, connection.closed())
+            .await
+            .unwrap_or_else(|_| panic!("{name} before SETTINGS must end the connection"));
+
+        match error {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                close.error_code.into_inner(),
+                H3_MISSING_SETTINGS,
+                "{name} before SETTINGS must be H3_MISSING_SETTINGS; reason was {:?}",
+                String::from_utf8_lossy(&close.reason)
+            ),
+            other => panic!("{name}: expected an application close, got {other}"),
+        }
+    }
+}
+
+/// Encodes one HTTP/3 frame: type, length, payload (RFC 9114 §7).
+fn frame_bytes(kind: u64, payload: &[u8]) -> Vec<u8> {
+    let mut frame = BytesMut::new();
+    datagram::put_varint(&mut frame, kind);
+    datagram::put_varint(&mut frame, payload.len() as u64);
+    frame.extend_from_slice(payload);
+    frame.to_vec()
+}
+
 /// Finds the control stream and returns the settings it carries.
 async fn read_settings(connection: &quinn::Connection) -> HashMap<u64, u64> {
     for _ in 0..MAX_UNI_STREAMS {
@@ -421,16 +489,18 @@ fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<u8> 
 
 /// The bytes of a client control stream whose SETTINGS enable HTTP Datagrams.
 fn control_stream_with_datagrams_enabled() -> Vec<u8> {
+    let mut stream = BytesMut::new();
+    datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
+    stream.extend_from_slice(&settings_frame());
+    stream.to_vec()
+}
+
+/// A SETTINGS frame enabling HTTP Datagrams (RFC 9297 §2.1.1).
+fn settings_frame() -> Vec<u8> {
     let mut settings = BytesMut::new();
     datagram::put_varint(&mut settings, SETTINGS_H3_DATAGRAM);
     datagram::put_varint(&mut settings, 1);
-
-    let mut stream = BytesMut::new();
-    datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
-    datagram::put_varint(&mut stream, FRAME_SETTINGS);
-    datagram::put_varint(&mut stream, settings.len() as u64);
-    stream.extend_from_slice(&settings);
-    stream.to_vec()
+    frame_bytes(FRAME_SETTINGS, &settings)
 }
 
 /// Reads one HTTP/3 frame from a raw request stream.

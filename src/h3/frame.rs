@@ -31,6 +31,8 @@
 //! by dropping the future. `tunnel::udp` reads request streams inside a
 //! `select!` with a timeout, so that property is load-bearing.
 
+use std::collections::HashSet;
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::datagram::{peek_varint, put_varint, varint_len};
@@ -120,10 +122,22 @@ pub enum Item {
     /// Payload of a DATA frame, in the chunk it arrived in.
     ///
     /// One frame may produce several of these, and a chunk never spans two
-    /// frames.
+    /// frames. An empty DATA frame produces exactly one, carrying no bytes:
+    /// a frame that arrived has to be reported even when it says nothing, or
+    /// the rules about *which frame came first* cannot be applied to it.
     Data(Bytes),
     /// A complete frame of any other type this server acts on.
     Frame(Frame),
+    /// A frame of an unknown type, skipped in full (RFC 9114 §9).
+    ///
+    /// Reported rather than swallowed for the same reason as an empty DATA
+    /// frame: RFC 9114 §6.2.1 asks what the first frame on the control stream
+    /// was, and a frame this server did not understand is still a frame. Every
+    /// other reader ignores it, which is what §9 requires.
+    Skipped {
+        /// The frame type that was skipped.
+        kind: u64,
+    },
 }
 
 /// A fully received non-DATA frame.
@@ -176,6 +190,8 @@ enum State {
     },
     /// Discarding the payload of a frame type this server does not know.
     Skipping {
+        /// Which frame is being skipped, kept so its end can be announced.
+        kind: u64,
         /// Payload bytes still to discard.
         remaining: u64,
     },
@@ -246,8 +262,13 @@ impl FrameDecoder {
 
                 // An empty DATA frame is legal and carries nothing; the two
                 // arms are separate so it cannot be mistaken for "no bytes have
-                // arrived yet", which is the same `take == 0` below.
-                State::Data { remaining: 0 } => self.state = State::Header,
+                // arrived yet", which is the same `take == 0` below. It still
+                // produces an item, because a caller applying RFC 9114's rules
+                // about frame *order* has to be told a DATA frame arrived.
+                State::Data { remaining: 0 } => {
+                    self.state = State::Header;
+                    return Ok(Some(Item::Data(Bytes::new())));
+                }
 
                 State::Data { remaining } => {
                     let take = remaining.min(self.chunk.len() as u64) as usize;
@@ -283,14 +304,20 @@ impl FrameDecoder {
                     return Ok(Some(Item::Frame(parse(kind, payload)?)));
                 }
 
-                State::Skipping { remaining } => {
+                State::Skipping { kind, remaining } => {
                     let take = remaining.min(self.chunk.len() as u64) as usize;
                     self.chunk.advance(take);
 
                     match remaining - take as u64 {
-                        0 => self.state = State::Header,
+                        0 => {
+                            self.state = State::Header;
+                            return Ok(Some(Item::Skipped { kind }));
+                        }
                         left => {
-                            self.state = State::Skipping { remaining: left };
+                            self.state = State::Skipping {
+                                kind,
+                                remaining: left,
+                            };
                             return Ok(None);
                         }
                     }
@@ -411,7 +438,13 @@ fn begin(kind: u64, length: u64) -> Result<State, Error> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-9
         //# Implementations MUST ignore unknown or unsupported values in all
         //# extensible protocol elements.
-        _ => State::Skipping { remaining: length },
+        //
+        // Ignoring is what every reader does with the `Item::Skipped` this ends
+        // up producing; the payload is discarded here and never buffered.
+        _ => State::Skipping {
+            kind,
+            remaining: length,
+        },
     })
 }
 
@@ -447,7 +480,13 @@ fn single_varint(kind: u64, payload: &[u8]) -> Result<u64, Violation> {
 /// Parses a SETTINGS payload (RFC 9114 §7.2.4).
 fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
     let mut settings = Settings::default();
-    let mut seen = Vec::new();
+
+    // A set rather than a list: the payload is bounded by `MAX_BUFFERED_FRAME`,
+    // not by anything the peer has earned, and 64 KiB holds some sixteen
+    // thousand distinct identifiers -- a quadratic scan over which is work an
+    // unauthenticated peer can ask for, on a request stream as well as here,
+    // since the frame is parsed before the stream layer can refuse it.
+    let mut seen = HashSet::new();
 
     while !payload.is_empty() {
         let (identifier, used) = peek_varint(payload).ok_or_else(truncated_settings)?;
@@ -467,12 +506,11 @@ fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
         //# The same setting identifier MUST NOT occur more than once in the
         //# SETTINGS frame.
-        if seen.contains(&identifier) {
+        if !seen.insert(identifier) {
             return Err(settings_error(format!(
                 "setting {identifier:#x} occurs more than once"
             )));
         }
-        seen.push(identifier);
 
         match identifier {
             // RFC 9297 §2.1.1: "The value of the SETTINGS_H3_DATAGRAM setting
@@ -751,7 +789,8 @@ mod tests {
     }
 
     /// RFC 9114 §9: unknown types, grease included, are skipped by their
-    /// declared length and never buffered.
+    /// declared length and never buffered -- but their arrival is announced,
+    /// because a reader applying §6.2.1's "first frame" rule has to see them.
     #[test]
     fn unknown_frame_types_are_skipped() {
         for kind in [0x21u64, 0x1f * 7 + 0x21, 0x4242] {
@@ -759,19 +798,45 @@ mod tests {
             wire.extend_from_slice(&frame(DATA, b"body"));
 
             let items = decode_bytewise(&wire).expect("decodes");
-            let payload: Vec<u8> = items
+            let (skipped, body) = items.split_first().expect("at least the skipped frame");
+
+            assert!(
+                matches!(skipped, Item::Skipped { kind: skipped } if *skipped == kind),
+                "grease type {kind:#x} must be announced once, got {items:?}"
+            );
+            let payload: Vec<u8> = body
                 .iter()
                 .flat_map(|item| match item {
                     Item::Data(chunk) => chunk.clone(),
-                    other => panic!("expected only DATA, got {other:?}"),
+                    other => panic!("expected only DATA after it, got {other:?}"),
                 })
                 .collect();
             assert_eq!(payload, b"body", "grease type {kind:#x}");
         }
     }
 
+    /// The skipped frame is announced once it is *spent*, not when it starts:
+    /// a reader must not act on a frame whose payload is still arriving.
+    #[test]
+    fn a_skipped_frame_is_announced_only_once_it_is_complete() {
+        // Type, length and all but the last payload byte: still nothing.
+        let wire = frame(0x21, b"payload");
+        let mut decoder = FrameDecoder::new();
+        decoder.push(Bytes::copy_from_slice(&wire[..wire.len() - 1]));
+        assert!(decoder.next_item().expect("decodes").is_none());
+        assert!(!decoder.at_frame_boundary());
+
+        decoder.push(Bytes::copy_from_slice(&wire[wire.len() - 1..]));
+        assert!(matches!(
+            decoder.next_item().expect("decodes"),
+            Some(Item::Skipped { kind: 0x21 })
+        ));
+        assert!(decoder.at_frame_boundary());
+    }
+
     /// An empty frame of either kind must not stall the decoder waiting for a
-    /// payload that will never come.
+    /// payload that will never come -- and must still be reported, so that a
+    /// caller can tell "a DATA frame arrived" from "nothing arrived".
     #[test]
     fn zero_length_frames_do_not_stall_the_decoder() {
         let mut wire = frame(DATA, b"");
@@ -779,7 +844,17 @@ mod tests {
         wire.extend_from_slice(&frame(HEADERS, b""));
 
         let items = decode_bytewise(&wire).expect("decodes");
-        assert!(matches!(&items[..], [Item::Frame(Frame::Headers(block))] if block.is_empty()));
+        assert!(
+            matches!(
+                &items[..],
+                [
+                    Item::Data(empty),
+                    Item::Skipped { kind: 0x21 },
+                    Item::Frame(Frame::Headers(block))
+                ] if empty.is_empty() && block.is_empty()
+            ),
+            "got {items:?}"
+        );
     }
 
     /// RFC 9114 §7.2.8: the types HTTP/2 used and HTTP/3 does not are a
