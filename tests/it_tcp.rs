@@ -13,7 +13,7 @@ use common::{
     ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use volto::h3api::{Method, Request, Status};
+use volto::h3api::{FieldValue, Method, Request, Status};
 
 /// H3_CONNECT_ERROR (RFC 9114 §8.1).
 const H3_CONNECT_ERROR: u64 = 0x010f;
@@ -379,6 +379,47 @@ async fn refuses_an_authority_without_a_port() {
     assert!(
         end.is_none(),
         "a 400 carries no body: the next read is the end of the stream"
+    );
+}
+
+/// RFC 9114 §4.2: "any message containing connection-specific fields MUST be
+/// treated as malformed". The answer is a 400 rather than a reset, which RFC
+/// 9114 §4.1.2 allows. The target is a working echo server and the same request
+/// without the offending field is accepted at the end, so the refusals cannot be
+/// coming from anything else about the request.
+#[tokio::test]
+async fn refuses_connection_specific_fields() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for (name, value) in [
+        ("proxy-connection", "keep-alive"),
+        ("keep-alive", "timeout=5"),
+        ("transfer-encoding", "chunked"),
+        ("upgrade", "websocket"),
+    ] {
+        let mut request = connect_request(&target.to_string());
+        request.fields.append(name, FieldValue::from_static(value));
+
+        let (response, mut stream) = send_and_respond(&mut client, request).await;
+        assert_eq!(
+            response.status,
+            Status::BAD_REQUEST,
+            "{name}: {value} must be refused"
+        );
+        let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+            .await
+            .expect("the stream ended promptly")
+            .expect("a refusal must end cleanly, not with a stream error");
+        assert!(end.is_none(), "{name}: a 400 carries no body");
+    }
+
+    let response = respond_to(&mut client, connect_request(&target.to_string())).await;
+    assert_eq!(
+        response.status,
+        Status::OK,
+        "the same request without a connection-specific field must be accepted"
     );
 }
 

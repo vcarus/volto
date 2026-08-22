@@ -316,6 +316,18 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // got, not requests it made (D72).
     context.tunnels.fetch_add(1, Ordering::Relaxed);
 
+    // Judged before routing because the rule is about the message, not the
+    // tunnel type: RFC 9114 §4.2 makes a request carrying a connection-specific
+    // field malformed whatever it asks for.
+    if let Some(field) = tunnel::connection_specific_field(&req) {
+        debug!(
+            stream_id,
+            field, "request carries a connection-specific field"
+        );
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+        return;
+    }
+
     match tunnel::route(&req) {
         Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {

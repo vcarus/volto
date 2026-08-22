@@ -44,6 +44,33 @@ pub fn route(req: &Request) -> Route<'_> {
     }
 }
 
+/// The field, if any, that makes `req` malformed under RFC 9114 §4.2.
+///
+/// RFC 9114 §4.2's rule -- quoted in full in `crate::h3::stream`, where the
+/// `Connection` field itself is refused at decode time -- is that "any message
+/// containing connection-specific fields MUST be treated as malformed". The
+/// fields RFC 9110 §7.6.1 names as connection-specific beyond `Connection`
+/// itself are judged here rather than in the codec so that the answer can be a
+/// 400 instead of a reset: RFC 9114 §4.1.2 lets a server "send an HTTP response
+/// indicating the error prior to closing or resetting the stream", and a client
+/// is told more by a status than by `H3_MESSAGE_ERROR`.
+///
+/// Named one at a time so the log says which field was the problem.
+pub(crate) fn connection_specific_field(req: &Request) -> Option<&'static str> {
+    CONNECTION_SPECIFIC_FIELDS
+        .iter()
+        .copied()
+        .find(|name| req.fields.contains(name))
+}
+
+/// RFC 9110 §7.6.1's connection-specific fields other than `Connection`.
+const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
+    "proxy-connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Cloned per request — the cost is a handful of refcount bumps. The UDP-specific
@@ -727,6 +754,30 @@ pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields, strea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_connection_specific_field_is_named_and_a_clean_request_is_not() {
+        let mut clean = Request::new(Method::Connect);
+        clean.authority = Some("example.com:443".into());
+        clean
+            .fields
+            .append("te", FieldValue::from_static("trailers"));
+        assert_eq!(connection_specific_field(&clean), None);
+
+        for name in [
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            let mut request = Request::new(Method::Connect);
+            request.authority = Some("example.com:443".into());
+            request
+                .fields
+                .append(name, FieldValue::from_static("anything"));
+            assert_eq!(connection_specific_field(&request), Some(name), "{name}");
+        }
+    }
 
     #[test]
     fn proxy_status_values_are_rfc_9209_shaped() {

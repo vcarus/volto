@@ -272,18 +272,18 @@ starts can reach it — a CONNECT request with credentials is a few hundred byte
 so every request stream the transport allows could be mid-HEADERS at once and
 still be well inside it.
 
-Two deviations are taken knowingly:
+One choice here is worth stating, though it is within the RFC: a malformed
+request is answered with a bare **400 and a clean stream close** rather than a
+reset wherever the fault is visible at the tunnel layer -- a CONNECT-UDP request
+carrying `Content-Length` or `Content-Type` (RFC 9297 §3.2), or any request
+carrying one of the connection-specific fields RFC 9114 §4.2 forbids
+(`Proxy-Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`). RFC 9114
+§4.1.2 lets a server "send an HTTP response indicating the error prior to
+closing or resetting the stream", and `it_tcp` and `it_udp` pin the 400. The
+`Connection` field itself is refused at decode time with `H3_MESSAGE_ERROR`.
 
-- A CONNECT-UDP request carrying `Content-Length`, `Content-Type` or
-  `Transfer-Encoding` is answered with a bare **400 and a clean stream close**
-  (RFC 9297 §3.2 makes such a request malformed) rather than reset. That much is
-  within RFC 9114 §4.1.2, which lets a server "send an HTTP response indicating
-  the error prior to closing or resetting the stream", and `it_udp` pins the 400.
-  The deviation proper is narrower: on a plain CONNECT, `Transfer-Encoding`,
-  `Keep-Alive`, `Proxy-Connection` and `Upgrade` — the connection-specific
-  fields RFC 9114 §4.2 says make a message malformed — are not rejected at all,
-  since a tunnel has no use for them. The `Connection` field itself is still
-  treated as malformed.
+One deviation is taken knowingly:
+
 - A peer that closes its QPACK encoder or decoder stream is **not** treated as
   `H3_CLOSED_CRITICAL_STREAM`, which RFC 9204 §4.2 requires. With a zero table
   capacity those streams carry nothing, so nothing is lost when they end — and a

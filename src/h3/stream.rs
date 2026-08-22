@@ -517,12 +517,12 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //# connection-specific fields; any message containing connection-specific
     //# fields MUST be treated as malformed.
     //
-    // Only the Connection field itself is enforced. RFC 9110 §7.6.1's wider
-    // list -- Proxy-Connection, Keep-Alive, Transfer-Encoding, Upgrade -- is
-    // deliberately left out: this proxy already answers a CONNECT-UDP request
-    // carrying content framing with a 400 (RFC 9297 §3.2), which tells the
-    // client rather more than a bare stream reset would, and `it_udp` pins that
-    // answer.
+    // Only the Connection field itself is refused here, with the stream reset
+    // a malformed request gets. RFC 9110 §7.6.1's wider list -- Proxy-Connection,
+    // Keep-Alive, Transfer-Encoding, Upgrade -- is judged in
+    // `crate::tunnel::connection_specific_field`, where the answer can be a 400
+    // (RFC 9114 §4.1.2 allows a response before the stream is closed), which
+    // tells the client rather more than a bare reset would.
     if name == "connection" {
         return Err(malformed(
             "the Connection field, which HTTP/3 has no use for",

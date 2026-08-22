@@ -794,9 +794,9 @@ fn validate(req: &Request) -> Result<(), &'static str> {
     if req.fields.contains("content-type") {
         return Err("content-type is forbidden on a capsule stream");
     }
-    if req.fields.contains("transfer-encoding") {
-        return Err("transfer-encoding is forbidden on a capsule stream");
-    }
+    // Transfer-Encoding is the third field RFC 9297 §3.2 forbids here; it is
+    // connection-specific under RFC 9114 §4.2 as well, and is refused for every
+    // request before routing, so it never reaches this point.
 
     Ok(())
 }
@@ -991,7 +991,6 @@ mod tests {
             ("content-length", "0"),
             ("content-length", "42"),
             ("content-type", "application/octet-stream"),
-            ("transfer-encoding", "chunked"),
         ] {
             let mut request = connect_udp_request();
             request.fields.append(name, FieldValue::from_static(value));
