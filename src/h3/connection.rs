@@ -52,7 +52,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -163,8 +163,17 @@ impl Shared {
     /// routinely when a session closes with packets still in flight.
     fn deliver(&self, decoded: datagram::Datagram) {
         if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
-            // RFC 9298 §5: an unknown context must be dropped silently, never
-            // treated as an error.
+            //= https://www.rfc-editor.org/rfc/rfc9298#section-5
+            //# If an HTTP/3 Datagram that carries an unknown Context ID is
+            //# received, the receiver SHALL either drop that datagram silently
+            //# or buffer it temporarily (on the order of a round trip) while
+            //# awaiting the registration of the corresponding Context ID.
+            //
+            // Two ways to comply and this is the first: we drop. RFC 9298 §4
+            // reserves Context ID 0 for UDP payloads and leaves every non-zero
+            // one to a future extension, and this proxy implements none, so
+            // buffering would be holding packets for a registration that has no
+            // way to arrive.
             debug!(
                 quarter_stream_id = decoded.quarter_stream_id,
                 context_id = decoded.context_id,
@@ -197,9 +206,7 @@ impl Shared {
     /// operation, so a panic elsewhere in the process says nothing about the
     /// state of this map.
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, mpsc::Sender<Bytes>>> {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -691,14 +698,30 @@ async fn serve_peer(handle: Handle) {
 /// * a datagram whose Context ID is truncated or unknown is likewise dropped.
 ///
 /// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
-/// stream "that cannot be created due to the peer's stream limits" SHOULD draw
-/// H3_ID_ERROR. RFC 9297 §2.1 grants the exemption this router relies on —
+/// stream "that cannot be created due to client-initiated bidirectional stream
+/// limits" SHOULD draw H3_ID_ERROR. Those are this endpoint's limits, not the
+/// peer's — `initial_max_streams_bidi` is a transport parameter a receiver
+/// advertises — and RFC 9297 §2.1 grants the exemption this router relies on:
 /// "Generating an error is not mandatory because the QUIC stream limit might be
-/// unknown to the HTTP/3 layer" — and it is unknown to this one: the limit is a
-/// transport parameter [`crate::quic`] sets, which nothing here reads, so a
-/// Quarter Stream ID past it cannot be told apart from a session that has
+/// unknown to the HTTP/3 layer". It is unknown to this one. The limit is set by
+/// [`crate::quic`] from `[limits] max_streams_bidi` and nothing here reads it,
+/// so a Quarter Stream ID past it cannot be told apart from a session that has
 /// already closed.
 fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
+    //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
+    //# The largest legal QUIC stream ID value is 2^62-1, so the largest legal
+    //# value of the Quarter Stream ID field is 2^60-1. Receipt of an HTTP/3
+    //# Datagram that includes a larger value MUST be treated as an HTTP/3
+    //# connection error of type H3_DATAGRAM_ERROR (0x33).
+
+    //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
+    //# Receipt of a QUIC DATAGRAM frame whose payload is too short to allow
+    //# parsing the Quarter Stream ID field MUST be treated as an HTTP/3
+    //# connection error of type H3_DATAGRAM_ERROR (0x33).
+    //
+    // Both are decided by `datagram::decode` and reported by
+    // `DecodeError::is_connection_error`; the arm below is where they are
+    // acted on, so this is the one copy of them (D74).
     match datagram::decode(datagram) {
         Ok(decoded) => {
             handle.shared.deliver(decoded);

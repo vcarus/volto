@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -249,7 +249,7 @@ impl Server {
         // is an immutable `Arc`, so it cannot be observed half-written.
         self.config
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -618,10 +618,7 @@ impl ReloadHandle {
 
         // Past this point nothing can fail, so the two swaps cannot half-apply.
         self.endpoint.set_server_config(Some(quic_config));
-        *self
-            .config
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = config.clone();
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
 
         info!(
             path = %path.display(),

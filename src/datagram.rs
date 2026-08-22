@@ -57,7 +57,10 @@ impl DecodeError {
     /// Two MUSTs, both about the Quarter Stream ID field: a datagram carrying a
     /// value above 2^60-1, and one "whose payload is too short to allow parsing
     /// the Quarter Stream ID field", must each "be treated as an HTTP/3
-    /// connection error of type H3_DATAGRAM_ERROR (0x33)".
+    /// connection error of type H3_DATAGRAM_ERROR (0x33)". Both are quoted
+    /// verbatim, with their machine-readable anchors, where they are acted on --
+    /// `h3::connection::route_datagram` -- and this is the pointer to them
+    /// rather than a second copy (D74).
     ///
     /// A truncated Context ID is deliberately *not* one of them. Nothing in
     /// RFC 9298 §5 says what to do with it, so dropping the datagram is
