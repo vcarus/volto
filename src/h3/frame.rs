@@ -6,7 +6,7 @@
 //! Type (varint) | Length (varint) | Frame Payload (Length bytes)
 //! ```
 //!
-//! Two properties decide the design of [`FrameDecoder`], and they pull in
+//! Two properties decide the design of `FrameDecoder`, and they pull in
 //! opposite directions:
 //!
 //! * **DATA must not be buffered.** A CONNECT tunnel's payload arrives as DATA
@@ -33,9 +33,9 @@
 
 use std::collections::HashSet;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
-use crate::datagram::{peek_varint, put_varint, varint_len};
+use crate::datagram::{peek_varint, put_varint};
 
 use super::error::{Code, StreamError, Violation};
 use super::MAX_FIELD_SECTION_SIZE;
@@ -238,11 +238,19 @@ enum State {
 /// decoder has to be a state machine that can be fed a byte at a time -- which
 /// is exactly how the tests below feed it.
 #[derive(Debug)]
-pub struct FrameDecoder {
+pub(super) struct FrameDecoder {
     /// The chunk last pushed, with the consumed prefix removed.
     chunk: Bytes,
     /// Frame header bytes carried over from earlier chunks.
-    header: BytesMut,
+    ///
+    /// A fixed array rather than a growable buffer, so that constructing a
+    /// decoder allocates nothing: one is built per stream, and a peer opening
+    /// streams is not otherwise paying for a heap allocation each time. It
+    /// cannot overflow -- [`Self::take_frame_header`] stops as soon as two
+    /// varints have arrived, and RFC 9000 §16 bounds each at eight bytes.
+    header: [u8; MAX_FRAME_HEADER],
+    /// How many bytes of [`Self::header`] have arrived.
+    header_len: usize,
     /// Payload of the frame currently being buffered.
     payload: BytesMut,
     state: State,
@@ -256,10 +264,11 @@ impl Default for FrameDecoder {
 
 impl FrameDecoder {
     /// A decoder positioned at the start of a stream's frame sequence.
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             chunk: Bytes::new(),
-            header: BytesMut::with_capacity(MAX_FRAME_HEADER),
+            header: [0; MAX_FRAME_HEADER],
+            header_len: 0,
             payload: BytesMut::new(),
             state: State::Header,
         }
@@ -269,7 +278,7 @@ impl FrameDecoder {
     ///
     /// Only legal once [`Self::next_item`] has asked for more, which is the only
     /// state in which the previous chunk is spent.
-    pub fn push(&mut self, chunk: Bytes) {
+    pub(super) fn push(&mut self, chunk: Bytes) {
         debug_assert!(self.chunk.is_empty(), "the previous chunk is not consumed");
         self.chunk = chunk;
     }
@@ -279,12 +288,12 @@ impl FrameDecoder {
     /// RFC 9114 §7.1: "When a stream terminates cleanly, if the last frame on
     /// the stream was truncated, this MUST be treated as a connection error of
     /// type H3_FRAME_ERROR."
-    pub fn at_frame_boundary(&self) -> bool {
-        matches!(self.state, State::Header) && self.header.is_empty()
+    pub(super) fn at_frame_boundary(&self) -> bool {
+        matches!(self.state, State::Header) && self.header_len == 0
     }
 
     /// The next item, or `None` when more bytes are needed.
-    pub fn next_item(&mut self) -> Result<Option<Item>, Error> {
+    pub(super) fn next_item(&mut self) -> Result<Option<Item>, Error> {
         loop {
             match self.state {
                 State::Header => {
@@ -363,25 +372,27 @@ impl FrameDecoder {
     /// Reads a frame type and length, or `None` if not all of it has arrived.
     ///
     /// Byte at a time because a header is at most [`MAX_FRAME_HEADER`] bytes and
-    /// may straddle any number of chunks; the copy is into a buffer that never
-    /// grows past that.
+    /// may straddle any number of chunks; the copy is into a fixed array of
+    /// exactly that size.
     fn take_frame_header(&mut self) -> Option<(u64, u64)> {
         loop {
-            if let Some((kind, used)) = peek_varint(&self.header) {
-                if let Some((length, _)) = peek_varint(&self.header[used..]) {
-                    self.header.clear();
+            let header = &self.header[..self.header_len];
+            if let Some((kind, used)) = peek_varint(header) {
+                if let Some((length, _)) = peek_varint(&header[used..]) {
+                    self.header_len = 0;
                     return Some((kind, length));
                 }
             }
 
             let byte = *self.chunk.first()?;
             self.chunk.advance(1);
-            self.header.put_u8(byte);
+            self.header[self.header_len] = byte;
+            self.header_len += 1;
         }
     }
 }
 
-/// A [`FrameDecoder`] wired to a QUIC receive stream.
+/// A `FrameDecoder` wired to a QUIC receive stream.
 ///
 /// All of the awaiting happens in one place -- [`quinn::RecvStream::read_chunk`]
 /// -- and every byte it produces is accounted for in the decoder before this
@@ -469,12 +480,10 @@ fn begin(kind: u64, length: u64) -> Result<State, Error> {
             }
         }
 
-        //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-        //# Implementations MUST ignore unknown or unsupported values in all
-        //# extensible protocol elements.
-        //
-        // Ignoring is what every reader does with the `Item::Skipped` this ends
-        // up producing; the payload is discarded here and never buffered.
+        // RFC 9114 §9's rule that unknown values are ignored, quoted in full in
+        // `super`'s module comment. Ignoring is what every reader does with the
+        // `Item::Skipped` this ends up producing; the payload is discarded here
+        // and never buffered.
         _ => State::Skipping {
             kind,
             remaining: length,
@@ -615,7 +624,6 @@ fn settings_error(detail: impl Into<std::borrow::Cow<'static, str>>) -> Violatio
 
 /// Writes a frame header: type and payload length.
 pub fn put_header(out: &mut BytesMut, kind: u64, length: u64) {
-    out.reserve(varint_len(kind) + varint_len(length));
     put_varint(out, kind);
     put_varint(out, length);
 }
@@ -633,6 +641,10 @@ pub fn settings_payload() -> BytesMut {
     /// One reserved identifier of the form 0x1f * N + 0x21, which RFC 9114
     /// §7.2.4.1 says endpoints SHOULD send so that peers keep exercising the
     /// rule that unknown identifiers are ignored.
+    ///
+    /// N is arbitrary: every value of it names a reserved identifier, and the
+    /// test client and `it_settings` pick different ones only so that the three
+    /// greases can be told apart in a packet capture.
     const GREASE: u64 = 0x1f * 8 + 0x21;
 
     let mut payload = BytesMut::new();

@@ -55,6 +55,17 @@ pub mod stream;
 
 use error::Code;
 
+// The one rule with no single owner among the modules above, so it is quoted
+// here once and named rather than repeated at each place that obeys it: `frame`
+// skips a frame type it does not know and ignores a SETTINGS identifier it has
+// never seen, while `stream` and `connection` pass the `Item::Skipped` that
+// produces straight over. The test client obeys the same rule for what this
+// server sends.
+//
+//= https://www.rfc-editor.org/rfc/rfc9114#section-9
+//# Implementations MUST ignore unknown or unsupported values in all
+//# extensible protocol elements.
+
 /// Longest a QUIC varint can be (RFC 9000 §16), for sizing scratch buffers.
 const MAX_VARINT: usize = 8;
 
@@ -74,6 +85,9 @@ pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 /// RFC 9114 §8 defines the two to be the same number; every registered code is
 /// far below the varint maximum, so the conversion cannot fail for anything
 /// this server sends.
-fn varint(code: Code) -> quinn::VarInt {
+///
+/// Public because the suite's client resets streams with the same codes and had
+/// grown a byte-identical copy of this.
+pub fn varint(code: Code) -> quinn::VarInt {
     quinn::VarInt::from_u64(code.value()).unwrap_or(quinn::VarInt::MAX)
 }

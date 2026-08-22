@@ -1,17 +1,11 @@
 //! The HTTP/3 handshake is bounded, because the peer decides whether it can
 //! finish at all.
 //!
-//! Opening the three unidirectional streams RFC 9114 §6.2 asks for is not
-//! something a server can do on its own: `open_uni` waits for stream credit the
-//! peer's transport parameters grant, and a peer may grant none. That is a legal
-//! QUIC connection and an impossible HTTP/3 one, and it used to park the
-//! connection task forever.
-//!
-//! The QUIC idle timeout is not the backstop it looks like, which is why this
-//! file exists rather than a comment saying the timeout will handle it: the
-//! client here answers keep-alives, and every ACK restarts the idle timer. The
-//! connection would stay open — holding a `max_connections` slot — for as long
-//! as the peer cared to keep its socket open.
+//! Why that bound has to exist is on `h3api::Connection::handshake`. What this
+//! file adds is the proof on the wire, and the reason it is a test rather than a
+//! comment: the clients here answer keep-alives, so the QUIC idle timeout never
+//! fires and the handshake's own deadline is the only thing that can end the
+//! connection.
 //!
 //! The rest of the file is the other half of the same problem (D76): a peer that
 //! completes both handshakes and then says nothing, or sends a request it never
@@ -27,8 +21,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use common::{
     auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport,
-    connect_request, open_tcp_tunnel, read_at_least, send_and_respond, spawn_echo_target, H3Client,
-    TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    connect_request, finish_connect, open_tcp_tunnel, read_at_least, send_and_respond,
+    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
 use http::{header, StatusCode};
 use volto::datagram;
@@ -73,15 +67,9 @@ async fn a_peer_that_permits_no_unidirectional_streams_is_hung_up_on() {
     transport.keep_alive_interval(Some(Duration::from_millis(100)));
 
     let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
-    let connection = tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("handshake did not time out")
-    .expect("the QUIC handshake itself must succeed");
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("the QUIC handshake itself must succeed");
 
     // Generous against the server's 1s bound, and far short of forever.
     let error = tokio::time::timeout(Duration::from_secs(5), connection.closed())
@@ -145,15 +133,9 @@ async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
     // While they hold both slots, nobody else gets in. This is the symptom the
     // bound exists to end, asserted rather than described.
     let refused = client_endpoint(&server.ca, &["h3"]);
-    let error = tokio::time::timeout(
-        TIMEOUT,
-        refused
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("a refusal must not take ten seconds")
-    .expect_err("the server is at its connection limit");
+    let error = finish_connect(&refused, server.addr)
+        .await
+        .expect_err("the server is at its connection limit");
     assert!(
         matches!(
             error,
@@ -310,15 +292,9 @@ fn silent_peer(server: &TestServer) -> impl Future<Output = (quinn::Endpoint, qu
         transport.keep_alive_interval(Some(Duration::from_millis(100)));
 
         let endpoint = client_endpoint_with_transport(&ca, &["h3"], transport);
-        let connection = tokio::time::timeout(
-            TIMEOUT,
-            endpoint
-                .connect(addr, "localhost")
-                .expect("start connecting"),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("the handshake at {caller} timed out"))
-        .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
+        let connection = finish_connect(&endpoint, addr)
+            .await
+            .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
 
         (endpoint, connection)
     }

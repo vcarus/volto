@@ -47,14 +47,7 @@ async fn the_connection_cap_refuses_further_connections() {
 
     // The third is refused during the handshake.
     let endpoint = common::client_endpoint(&server.ca, &["h3"]);
-    let result = tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("the attempt finished");
+    let result = common::finish_connect(&endpoint, server.addr).await;
 
     assert!(
         result.is_err(),
@@ -92,14 +85,7 @@ async fn a_closed_connection_frees_its_slot() {
     // Retried because the reap happens a moment after the peer goes away.
     for attempt in 0..40 {
         let endpoint = common::client_endpoint(&server.ca, &["h3"]);
-        let result = tokio::time::timeout(
-            TIMEOUT,
-            endpoint
-                .connect(server.addr, "localhost")
-                .expect("start connecting"),
-        )
-        .await
-        .expect("the attempt finished");
+        let result = common::finish_connect(&endpoint, server.addr).await;
 
         if result.is_ok() {
             return;

@@ -264,10 +264,8 @@ impl Connection {
     ///
     /// RFC 9297 §2.1.1 forbids sending HTTP Datagrams before this is true, and
     /// a CONNECT-UDP session falls back to capsules on the request stream while
-    /// it is not. Handed out rather than sampled on purpose: the answer is
-    /// written by the task that read the peer's control stream, so a session
-    /// holding this flag starts using datagrams the instant the peer allows
-    /// them -- with no window in which the setting is known here but not there.
+    /// it is not. The flag is handed out rather than sampled, for the reason
+    /// the module documentation gives.
     ///
     /// Until the peer's SETTINGS arrive it reads `false`, which is the safe
     /// direction to be wrong in.
@@ -516,7 +514,9 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
             Ok(Some(item)) => item,
 
             Ok(None) => {
-                if let Some(violation) = control_stream_finished(handle.quic.close_reason()) {
+                if let Some(violation) =
+                    control_stream_finished(handle.quic.close_reason().as_ref())
+                {
                     handle.fail(violation);
                 }
                 return;
@@ -566,8 +566,8 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
 /// same breath, and the two can be read here in either order. Answering an
 /// ordinary goodbye with a protocol error would turn that race into a fault in
 /// the operator's log, on behalf of a connection there is nothing left to
-/// protect -- the same reasoning [`drain`] records for the QPACK streams.
-fn control_stream_finished(close_reason: Option<quinn::ConnectionError>) -> Option<Violation> {
+/// protect -- the same reasoning [`serve_qpack`] records for the QPACK streams.
+fn control_stream_finished(close_reason: Option<&quinn::ConnectionError>) -> Option<Violation> {
     if close_reason.is_some() {
         return None;
     }
@@ -616,13 +616,11 @@ impl Control {
                 })
             }
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-            //# Implementations MUST ignore unknown or unsupported values in all
-            //# extensible protocol elements.
-            //
-            // Ignored -- but only after SETTINGS. A grease frame sent first is
-            // still "any other frame type" below, and the greasing endpoint is
-            // precisely the one testing whether this server enforces that.
+            // RFC 9114 §9's rule that unknown values are ignored, quoted in
+            // full in `super`. Ignored -- but only after SETTINGS. A grease
+            // frame sent first is still "any other frame type" below, and the
+            // greasing endpoint is precisely the one testing whether this
+            // server enforces that.
             Item::Skipped { kind } => {
                 if !self.settings {
                     return Err(missing_settings());
@@ -1197,7 +1195,7 @@ mod tests {
             quinn::ConnectionError::LocallyClosed,
         ] {
             assert!(
-                control_stream_finished(Some(closed.clone())).is_none(),
+                control_stream_finished(Some(&closed)).is_none(),
                 "a connection already closed by {closed} needs no fault report"
             );
         }

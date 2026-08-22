@@ -467,7 +467,7 @@ impl Session {
         // go together. The socket closes when `self` drops; the stream needs
         // saying explicitly.
         self.reader.stop_receiving(h3api::NO_ERROR);
-        if let Err(error) = self.writer.finish().await {
+        if let Err(error) = self.writer.finish() {
             debug!(stream_id, %error, "failed to finish the connect-udp stream");
         }
     }

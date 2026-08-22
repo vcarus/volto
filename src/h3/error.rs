@@ -57,7 +57,7 @@ codes! {
     (0x100, H3_NO_ERROR);
     /// A protocol violation with no more specific code (RFC 9114 §8.1).
     (0x101, H3_GENERAL_PROTOCOL_ERROR);
-    /// A fault inside this HTTP/3 stack rather than in the peer's message.
+    /// A fault inside this HTTP/3 layer rather than in the peer's message.
     (0x102, H3_INTERNAL_ERROR);
     /// The peer created a stream this endpoint will not accept (RFC 9114 §6.2).
     (0x103, H3_STREAM_CREATION_ERROR);

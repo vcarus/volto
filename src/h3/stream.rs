@@ -137,53 +137,79 @@ impl Resolver {
                     header: BytesMut::with_capacity(2 * MAX_VARINT),
                 },
             )),
-            Err(error) => Err(match error {
-                frame::Error::Stream(error) => error,
-                frame::Error::Protocol(violation) if violation.is_connection_error() => {
-                    StreamError::Connection(handle.fail(violation))
-                }
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
+            //# A server that receives a larger header section than it is
+            //# willing to handle can send an HTTP 431 (Request Header
+            //# Fields Too Large) status code ([RFC6585]).
+            //
+            // Which is worth the two extra lines: a client that has overshot
+            // the limit this server advertised is told which of its requests to
+            // fix, where a bare RESET_STREAM leaves it guessing. The answer goes
+            // out first and that side is finished cleanly; the receiving side is
+            // then stopped with the code, because the rest of the section is
+            // precisely what this server has declined to read.
+            // H3_EXCESSIVE_LOAD reaches this arm only from the frame layer's
+            // buffering limit, which is the same 64 KiB the peer was told about
+            // in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and only ever as a
+            // stream-class violation -- a connection-class one is `answer`'s.
+            Err(frame::Error::Protocol(violation))
+                if violation.code() == Code::H3_EXCESSIVE_LOAD
+                    && !violation.is_connection_error() =>
+            {
+                let mut stream = Stream {
+                    handle,
+                    send,
+                    frames,
+                    header: BytesMut::with_capacity(2 * MAX_VARINT),
+                };
+                let _ = stream
+                    .respond(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
+                    .await;
+                let _ = stream.finish();
+                stream.stop_receiving(violation.code());
+                Err(StreamError::Local(violation))
+            }
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
-                //# A server that receives a larger header section than it is
-                //# willing to handle can send an HTTP 431 (Request Header
-                //# Fields Too Large) status code ([RFC6585]).
-                //
-                // Which is worth the two extra lines: a client that has
-                // overshot the limit this server advertised is told which of
-                // its requests to fix, where a bare RESET_STREAM leaves it
-                // guessing. The answer goes out first and that side is finished
-                // cleanly; the receiving side is then stopped with the code,
-                // because the rest of the section is precisely what this server
-                // has declined to read. H3_EXCESSIVE_LOAD reaches this arm only
-                // from the frame layer's buffering limit, which is the same
-                // 64 KiB the peer was told about in
-                // `SETTINGS_MAX_FIELD_SECTION_SIZE`.
-                frame::Error::Protocol(violation)
-                    if violation.code() == Code::H3_EXCESSIVE_LOAD =>
-                {
-                    let mut stream = Stream {
-                        handle,
-                        send,
-                        frames,
-                        header: BytesMut::with_capacity(2 * MAX_VARINT),
-                    };
-                    let _ = stream
-                        .respond(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE)
-                        .await;
-                    let _ = stream.finish().await;
-                    stream.stop_receiving(violation.code());
-                    StreamError::Local(violation)
-                }
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //# Malformed requests or responses that are detected MUST be
+            //# treated as a stream error of type H3_MESSAGE_ERROR.
+            //
+            // The response side is reset as well as the request side stopped:
+            // this request will never be answered, and a peer left waiting for
+            // a response that is not coming learns nothing.
+            Err(error) => Err(answer(&handle, &mut frames, Some(&mut send), error)),
+        }
+    }
+}
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
-                //# Malformed requests or responses that are detected MUST be
-                //# treated as a stream error of type H3_MESSAGE_ERROR.
-                frame::Error::Protocol(violation) => {
-                    let _ = send.reset(varint(violation.code()));
-                    frames.stop(violation.code());
-                    StreamError::Local(violation)
-                }
-            }),
+/// Answers a frame-layer failure and reports it as a stream error.
+///
+/// A violation that RFC 9114 makes a *connection* error closes the connection,
+/// which is what makes every operation on it fail; a stream-class one stops the
+/// receiving side, because the rest of what the peer is sending is precisely
+/// what has been refused.
+///
+/// Whether the *sending* side is reset as well is the caller's, which is why it
+/// is a parameter: a request that was never understood will never be answered,
+/// while a [`Reader`] is only half a stream and the tunnels decide the other
+/// half differently for a client abort than for a target failure.
+fn answer(
+    handle: &Handle,
+    frames: &mut FrameReader,
+    send: Option<&mut quinn::SendStream>,
+    error: frame::Error,
+) -> StreamError {
+    match error {
+        frame::Error::Stream(error) => error,
+        frame::Error::Protocol(violation) if violation.is_connection_error() => {
+            StreamError::Connection(handle.fail(violation))
+        }
+        frame::Error::Protocol(violation) => {
+            if let Some(send) = send {
+                let _ = send.reset(varint(violation.code()));
+            }
+            frames.stop(violation.code());
+            StreamError::Local(violation)
         }
     }
 }
@@ -194,18 +220,16 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request<()>, frame::Er
         match frames.next().await? {
             Some(Item::Frame(Frame::Headers(block))) => break block,
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-            //# Implementations MUST ignore unknown or unsupported values in all
-            //# extensible protocol elements.
-            //
-            // Including before the request: a client greasing its request
-            // stream is testing exactly this, and the frame is skipped rather
-            // than counted as the stream's first.
+            // RFC 9114 §9's rule that unknown values are ignored, quoted in
+            // full in `super`. It applies before the request as much as during
+            // it: a client greasing its request stream is testing exactly this,
+            // and the frame is skipped rather than counted as the stream's
+            // first.
             Some(Item::Skipped { .. }) => {}
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-            //# Receipt of an invalid sequence of frames MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
+            // RFC 9114 §4.1's rule about an invalid sequence of frames, quoted
+            // in full on `Reader::recv_data`, where the rest of a request
+            // stream's frame order is judged.
             Some(_) => {
                 return Err(Violation::connection(
                     Code::H3_FRAME_UNEXPECTED,
@@ -325,51 +349,36 @@ fn build_request(fields: Vec<Field>) -> Result<Request<()>, Violation> {
     } else {
         // Extended CONNECT and ordinary requests are built the same way; only
         // where the authority may come from differs.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+        //# On requests that contain the :protocol pseudo-header field, the
+        //# :scheme and :path pseudo-header fields of the target URI [...]
+        //# MUST also be included.
         let scheme = scheme.ok_or_else(|| malformed("a request without :scheme"))?;
         let path = path.ok_or_else(|| malformed("a request without :path"))?;
 
-        let authority = if protocol.is_some() {
-            //= https://www.rfc-editor.org/rfc/rfc8441#section-4
-            //# On requests that contain the :protocol pseudo-header field, the
-            //# :scheme and :path pseudo-header fields of the target URI [...]
-            //# MUST also be included.
-            let authority = authority
-                .as_deref()
-                .ok_or_else(|| malformed("an extended CONNECT request without :authority"))?;
-
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
-            //# If both fields are present, they MUST contain the same value.
-            //
-            // RFC 8441 §4 makes :authority mandatory here rather than optional,
-            // which settles where the authority comes from -- and settles
-            // nothing about a Host field that contradicts it. That rule is
-            // §4.3.1's, and an extended CONNECT is still an HTTP/3 request.
-            if headers
-                .get(http::header::HOST)
-                .is_some_and(|host| host.as_bytes() != authority)
-            {
-                return Err(malformed(":authority and Host disagree"));
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+        //# If the :scheme pseudo-header field identifies a scheme that has a
+        //# mandatory authority component [...] the request MUST contain
+        //# either an :authority pseudo-header field or a Host header field.
+        //# If these fields are present, they MUST NOT be empty. If both
+        //# fields are present, they MUST contain the same value.
+        //
+        // One table for both request shapes, because §4.3.1's agreement rule is
+        // the same rule either way -- an extended CONNECT is still an HTTP/3
+        // request. RFC 8441 §4 changes one row of it and no more: on a request
+        // carrying :protocol the authority is mandatory rather than one of two
+        // ways to name the target, so a Host field cannot stand in for it.
+        let authority = match (authority.as_deref(), headers.get(http::header::HOST)) {
+            (Some(authority), Some(host)) if authority != host.as_bytes() => {
+                return Err(malformed(":authority and Host disagree"))
             }
-
-            authority
-        } else {
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
-            //# If the :scheme pseudo-header field identifies a scheme that has a
-            //# mandatory authority component [...] the request MUST contain
-            //# either an :authority pseudo-header field or a Host header field.
-            //# If these fields are present, they MUST NOT be empty. If both
-            //# fields are present, they MUST contain the same value.
-            match (authority.as_deref(), headers.get(http::header::HOST)) {
-                (Some(authority), None) => authority,
-                (None, Some(host)) => host.as_bytes(),
-                (Some(authority), Some(host)) if authority != host.as_bytes() => {
-                    return Err(malformed(":authority and Host disagree"))
-                }
-                (Some(authority), Some(_)) => authority,
-                (None, None) => {
-                    return Err(malformed("a request with neither :authority nor Host"))
-                }
+            (Some(authority), _) => authority,
+            (None, _) if protocol.is_some() => {
+                return Err(malformed("an extended CONNECT request without :authority"))
             }
+            (None, Some(host)) => host.as_bytes(),
+            (None, None) => return Err(malformed("a request with neither :authority nor Host")),
         };
 
         Uri::builder()
@@ -522,7 +531,12 @@ impl Stream {
     }
 
     /// Ends the sending side cleanly (a QUIC stream FIN).
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
+    ///
+    /// Not `async`: [`quinn::SendStream::finish`] records that the stream is
+    /// over and returns, and the FIN travels with the bytes already queued.
+    /// There is nothing to wait for, and a caller that wants the peer's
+    /// acknowledgement is asking a different question.
+    pub fn finish(&mut self) -> Result<(), StreamError> {
         self.send.finish()?;
         Ok(())
     }
@@ -571,8 +585,10 @@ impl Writer {
         Ok(())
     }
 
-    /// Ends the sending side cleanly (a QUIC stream FIN).
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
+    /// Ends the sending side cleanly (a QUIC stream FIN), without awaiting.
+    ///
+    /// Synchronous for the reason [`Stream::finish`] gives.
+    pub fn finish(&mut self) -> Result<(), StreamError> {
         self.send.finish()?;
         Ok(())
     }
@@ -611,9 +627,8 @@ impl Reader {
             };
 
             match item {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-                //# Implementations MUST ignore unknown or unsupported values in
-                //# all extensible protocol elements.
+                // RFC 9114 §9's rule that unknown values are ignored, quoted in
+                // full in `super`.
                 Item::Skipped { .. } => {}
 
                 // An empty DATA frame is legal and says nothing, so it must not
@@ -676,20 +691,12 @@ impl Reader {
     }
 
     /// Answers a frame-layer failure and reports it as a stream error.
+    ///
+    /// Only the receiving half is here, so nothing resets the response side:
+    /// that is the caller's decision, and the tunnels make it differently for a
+    /// client abort than for a target failure.
     fn report(&mut self, error: frame::Error) -> StreamError {
-        match error {
-            frame::Error::Stream(error) => error,
-            frame::Error::Protocol(violation) if violation.is_connection_error() => {
-                StreamError::Connection(self.handle.fail(violation))
-            }
-            // Only the receiving half is here; whether the response side is also
-            // reset is the caller's decision, and the tunnels make it
-            // differently for a client abort than for a target failure.
-            frame::Error::Protocol(violation) => {
-                self.frames.stop(violation.code());
-                StreamError::Local(violation)
-            }
-        }
+        answer(&self.handle, &mut self.frames, None, error)
     }
 }
 

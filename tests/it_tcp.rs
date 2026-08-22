@@ -7,24 +7,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    closed_address, connect_request, open_tcp_tunnel, read_at_least, read_to_end, respond_to,
-    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    assert_peer_reset, closed_address, connect_request, open_tcp_tunnel, read_at_least,
+    read_to_end, respond_to, send_and_respond, spawn_drain_then_reply_target, spawn_echo_target,
+    spawn_end_reporting_target, spawn_flood_then_reset_target, spawn_reset_after_read_target,
+    ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{Method, Request, StatusCode};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 /// H3_CONNECT_ERROR (RFC 9114 §8.1).
 const H3_CONNECT_ERROR: u64 = 0x010f;
-
-/// The code a peer-initiated reset carries, or a panic naming what arrived.
-fn remote_terminate_code(error: &volto::h3api::StreamError) -> u64 {
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => code.value(),
-        other => panic!("expected a remote stream reset, got {other:?}"),
-    }
-}
 
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
@@ -71,7 +63,7 @@ async fn client_half_close_still_receives_remaining_target_data() {
         .expect("send payload");
 
     // Client FIN. The target must see EOF, not a reset.
-    stream.finish().await.expect("finish the sending side");
+    stream.finish().expect("finish the sending side");
 
     // The target's remaining data must arrive, followed by a clean stream end
     // once the target closes (target EOF -> we finish our sending side).
@@ -114,11 +106,7 @@ async fn target_reset_becomes_h3_connect_error() {
         Err(error) => error,
     };
 
-    assert_eq!(
-        remote_terminate_code(&error),
-        H3_CONNECT_ERROR,
-        "expected H3_CONNECT_ERROR on the response side, got {error:?}"
-    );
+    assert_peer_reset(&error, H3_CONNECT_ERROR);
 }
 
 /// The same target reset, noticed by the *write* pump instead.
@@ -166,11 +154,7 @@ async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
         .expect("the upload task");
 
     let send_error = send_error.expect("the client's upload must be stopped by the target's reset");
-    assert_eq!(
-        remote_terminate_code(&send_error),
-        H3_CONNECT_ERROR,
-        "expected H3_CONNECT_ERROR on the sending side, got {send_error:?}"
-    );
+    assert_peer_reset(&send_error, H3_CONNECT_ERROR);
 
     // Drain what the target managed to send before the reset; the flood is there
     // to pin the read pump, not to be checked. What matters is how it ends.
@@ -189,11 +173,7 @@ async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     .await
     .expect("the reset arrived");
 
-    assert_eq!(
-        remote_terminate_code(&error),
-        H3_CONNECT_ERROR,
-        "expected H3_CONNECT_ERROR on the response side, got {error:?}"
-    );
+    assert_peer_reset(&error, H3_CONNECT_ERROR);
 }
 
 /// RFC 9114 §4.4: "if the underlying TCP implementation permits it, the proxy
@@ -239,7 +219,7 @@ async fn a_clean_client_close_still_reaches_the_target_as_eof() {
         .send_data(Bytes::from_static(b"hello"))
         .await
         .expect("send payload");
-    stream.finish().await.expect("finish the sending side");
+    stream.finish().expect("finish the sending side");
 
     let end = tokio::time::timeout(TIMEOUT, ended.recv())
         .await

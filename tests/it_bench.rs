@@ -579,7 +579,7 @@ async fn tcp_upload(total: usize) -> Rep {
             .expect("write into the tunnel");
         left -= take;
     }
-    stream.finish().await.expect("finish the request stream");
+    stream.finish().expect("finish the request stream");
 
     // The transfer is over when the *target* has it, not when the client handed
     // it to quinn: everything still in flight is work this process has not done.
@@ -808,7 +808,7 @@ async fn tcp_churn(count: u64) -> Rep {
         // Closing without a round trip would measure a tunnel that may never
         // have reached its target; a FIN answered by the target's EOF proves the
         // whole path was built and torn down.
-        stream.finish().await.expect("finish the request stream");
+        stream.finish().expect("finish the request stream");
         while stream.recv_data().await.expect("read the tunnel").is_some() {}
     }
     let totals = window.close();
@@ -827,7 +827,7 @@ async fn udp_churn(count: u64) -> Rep {
     let window = Window::open();
     for _ in 0..count {
         let (_qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
-        stream.finish().await.expect("finish the request stream");
+        stream.finish().expect("finish the request stream");
         while stream.recv_data().await.expect("read the stream").is_some() {}
     }
     let totals = window.close();
@@ -855,7 +855,7 @@ async fn concurrent_tunnels(count: usize) -> (Rep, Rep) {
 
     let closing = Window::open();
     for stream in &mut streams {
-        stream.finish().await.expect("finish the request stream");
+        stream.finish().expect("finish the request stream");
     }
     for stream in &mut streams {
         while stream.recv_data().await.expect("read the tunnel").is_some() {}

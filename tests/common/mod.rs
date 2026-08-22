@@ -367,17 +367,55 @@ pub async fn connect_quic_with_ca(
     ca: CertificateDer<'static>,
 ) -> (quinn::Endpoint, quinn::Connection) {
     let endpoint = client_endpoint(&ca, &["h3"]);
-    let connection = tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("handshake did not time out")
-    .expect("handshake");
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
 
     (endpoint, connection)
+}
+
+/// Drives one QUIC handshake to `addr` to whatever end it reaches.
+///
+/// The handshake's *outcome* is returned rather than asserted, because several
+/// tests are about one that must fail — a connection past `max_connections`, a
+/// client left trusting a certificate that has been replaced. Only taking longer
+/// than [`TIMEOUT`] is a failure of the test rather than a result, and that is
+/// what panics.
+///
+/// Written as a synchronous function returning a future so that
+/// `#[track_caller]` survives to the poll that panics (D66).
+#[track_caller]
+pub fn finish_connect(
+    endpoint: &quinn::Endpoint,
+    addr: SocketAddr,
+) -> impl Future<Output = Result<quinn::Connection, quinn::ConnectionError>> + '_ {
+    let caller = Location::caller();
+    async move {
+        let connecting = endpoint
+            .connect(addr, "localhost")
+            .expect("start connecting");
+
+        tokio::time::timeout(TIMEOUT, connecting)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the handshake to {addr} started at {caller} took longer than {TIMEOUT:?}")
+            })
+    }
+}
+
+/// Asserts that `error` is the peer resetting the stream, with `code`.
+///
+/// The failure worth describing is the one where a stream ended the wrong way
+/// altogether — cleanly, or with a local error — which is why this reports what
+/// arrived rather than only that the code differed. Which code a reset carries
+/// is what most of the tests reaching for this are about.
+#[track_caller]
+pub fn assert_peer_reset(error: &volto::h3api::StreamError, code: u64) {
+    assert_eq!(
+        volto::h3api::peer_reset_code(error),
+        Some(code),
+        "expected the peer to reset the stream with {code:#x}, got {error:?}"
+    );
 }
 
 /// Builds a classic CONNECT request: authority-form URI, no `:protocol`.

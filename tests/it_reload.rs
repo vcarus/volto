@@ -17,7 +17,7 @@ mod common;
 use bytes::Bytes;
 use common::{
     auth_section, basic_credentials, connect_request, read_at_least, respond_to, send_and_respond,
-    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
 };
 use http::{HeaderName, Response, StatusCode};
 
@@ -139,15 +139,7 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
 /// fails rather than producing a connection that is then unusable.
 async fn connect_attempt(server: &TestServer) -> bool {
     let endpoint = common::client_endpoint(&server.ca, &["h3"]);
-    tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("the attempt finished")
-    .is_ok()
+    common::finish_connect(&endpoint, server.addr).await.is_ok()
 }
 
 /// `max_connections` is read per accepted connection, so a reload moves it.
@@ -384,14 +376,7 @@ async fn reloading_swaps_the_certificate() {
 
     // A client trusting only the old CA can no longer complete the handshake.
     let endpoint = common::client_endpoint(&server.ca, &["h3"]);
-    let result = tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("the attempt finished");
+    let result = common::finish_connect(&endpoint, server.addr).await;
     assert!(
         result.is_err(),
         "after the swap, the old CA must no longer validate the server"

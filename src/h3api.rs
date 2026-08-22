@@ -1,8 +1,8 @@
-//! The public face of the HTTP/3 layer.
+//! The facade over the HTTP/3 layer.
 //!
 //! Everything the rest of the crate needs from HTTP/3 is named here, and only
 //! here: `conn`, `quic` and the tunnels use `http`, `bytes` and `quinn` types
-//! plus the handful of wrappers below. That boundary began as insulation from
+//! plus the handful of wrappers below. That facade began as insulation from
 //! the `h3` crate; it survives the move to [`crate::h3`] because it is worth
 //! having on its own terms -- it is the list of what a proxy actually asks of
 //! HTTP/3, and it is short.

@@ -91,7 +91,7 @@ async fn tcp_churn(cycles: usize) {
 
         // Half-close, then wait for the server's own FIN: the tunnel is fully
         // over, and its slot must come back.
-        stream.finish().await.expect("finish the request stream");
+        stream.finish().expect("finish the request stream");
         read_to_end(&mut stream).await;
     }
 }
@@ -129,7 +129,7 @@ async fn udp_churn(cycles: usize) {
         assert_eq!(String::from_utf8_lossy(&decoded.payload), payload);
 
         // Closing the stream ends the session, deregisters it, and frees its slot.
-        stream.finish().await.expect("finish the request stream");
+        stream.finish().expect("finish the request stream");
         read_to_end(&mut stream).await;
     }
 }

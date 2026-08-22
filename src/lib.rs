@@ -15,7 +15,7 @@
 //! * [`shutdown`] — the graceful-shutdown signal shared by endpoint and connections.
 //! * [`h3`] — HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
 //!   stream, request streams.
-//! * [`h3api`] — the public face of that layer, and the only HTTP/3 vocabulary
+//! * [`h3api`] — the facade over that layer, and the only HTTP/3 vocabulary
 //!   the rest of the crate uses.
 //! * [`conn`] — per-connection driving, request dispatch, and the datagram
 //!   router shared by every UDP session on the connection.

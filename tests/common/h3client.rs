@@ -57,7 +57,6 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
-use quinn::VarInt;
 use rustls::pki_types::CertificateDer;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -65,10 +64,13 @@ use volto::datagram::{peek_varint, put_varint};
 use volto::h3::error::Violation;
 use volto::h3::frame::{self, Frame, FrameReader, Item};
 use volto::h3::qpack::{self, Field};
+use volto::h3::varint;
 use volto::h3api::{Code, StreamError};
 
 use super::huffman;
-use super::{client_endpoint_with_stream_window, connect_quic, connect_quic_with_ca};
+use super::{
+    client_endpoint_with_stream_window, connect_quic, connect_quic_with_ca, finish_connect,
+};
 use super::{TestServer, TIMEOUT};
 
 /// Unidirectional stream types this client opens (RFC 9114 §6.2, RFC 9204 §4.2).
@@ -79,8 +81,11 @@ const STREAM_QPACK_DECODER: u64 = 0x03;
 /// Largest control-stream frame payload this client will buffer.
 ///
 /// The server's SETTINGS and GOAWAY are a few dozen bytes; anything claiming
-/// more is not worth allocating for in a test harness.
-const MAX_CONTROL_FRAME: u64 = 64 * 1024;
+/// more is not worth allocating for in a test harness. Spelled as the server's
+/// own advertised limit rather than as a second copy of 64 KiB: it is the same
+/// bound `volto::h3::frame` puts on every frame it buffers, so a server that
+/// outgrew what it will itself accept is refused at both ends.
+const MAX_CONTROL_FRAME: u64 = volto::h3::MAX_FIELD_SECTION_SIZE;
 
 /// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
 ///
@@ -189,7 +194,7 @@ pub struct H3Client {
     pub quic: quinn::Connection,
     // Both are kept alive for as long as the client is: dropping the endpoint or
     // stopping the driver would tear the connection down.
-    _endpoint: quinn::Endpoint,
+    endpoint: quinn::Endpoint,
     /// This client's control and QPACK streams.
     ///
     /// Held, never written to again. RFC 9114 §6.2.1 makes closing the control
@@ -239,15 +244,9 @@ impl H3Client {
         window: u32,
     ) -> Self {
         let endpoint = client_endpoint_with_stream_window(&server.ca, &["h3"], window);
-        let connection = tokio::time::timeout(
-            TIMEOUT,
-            endpoint
-                .connect(server.addr, "localhost")
-                .expect("start connecting"),
-        )
-        .await
-        .expect("handshake did not time out")
-        .expect("handshake");
+        let connection = finish_connect(&endpoint, server.addr)
+            .await
+            .expect("handshake");
 
         Self::from_quic(endpoint, connection, false).await
     }
@@ -262,7 +261,7 @@ impl H3Client {
     /// server must treat it as a QUIC migration (RFC 9000 §9), not a new peer.
     pub fn rebind(&self) {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a fresh client socket");
-        self._endpoint
+        self.endpoint
             .rebind(socket)
             .expect("rebind the client endpoint");
     }
@@ -348,7 +347,7 @@ impl H3Client {
                 huffman: false,
             },
             quic: connection,
-            _endpoint: endpoint,
+            endpoint,
             _streams: [control, encoder, decoder],
             driver,
         }
@@ -378,6 +377,9 @@ pub struct SendRequest {
 
 impl SendRequest {
     /// Opens a request stream and sends the request as one HEADERS frame.
+    ///
+    /// `&mut self` although nothing here mutates: it mirrors the `h3` handle
+    /// this replaces, and every test holds its client by `&mut` because of it.
     ///
     /// Fails without touching the network once the server has sent GOAWAY: RFC
     /// 9114 §5.2 says requests from there on are rejected, and a client that
@@ -463,9 +465,8 @@ pub struct ClientStream {
 }
 
 impl ClientStream {
-    /// The QUIC stream id.
-    ///
-    /// The Quarter Stream ID of RFC 9297 is this value divided by four.
+    /// The QUIC stream id, which `volto::datagram::quarter_stream_id` turns
+    /// into the Quarter Stream ID a datagram for this session carries.
     pub fn id(&self) -> u64 {
         self.id
     }
@@ -476,14 +477,12 @@ impl ClientStream {
             match self.frames.next().await.map_err(convert)? {
                 Some(Item::Frame(Frame::Headers(block))) => break block,
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-                //# Implementations MUST ignore unknown or unsupported values in
-                //# all extensible protocol elements.
+                // RFC 9114 §9's rule that unknown values are ignored, quoted
+                // in full in `volto::h3`.
                 Some(Item::Skipped { .. }) => {}
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
-                //# Receipt of an invalid sequence of frames MUST be treated as a
-                //# connection error of type H3_FRAME_UNEXPECTED.
+                // RFC 9114 §4.1's rule about an invalid sequence of frames,
+                // quoted in full on `volto::h3::stream::Reader::recv_data`.
                 Some(_) => return Err(unexpected("a response that does not begin with HEADERS")),
                 None => return Err(unexpected("a stream that ended before the response")),
             }
@@ -509,9 +508,8 @@ impl ClientStream {
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, StreamError> {
         loop {
             match self.frames.next().await.map_err(convert)? {
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-9
-                //# Implementations MUST ignore unknown or unsupported values in
-                //# all extensible protocol elements.
+                // RFC 9114 §9's rule that unknown values are ignored, quoted
+                // in full in `volto::h3`.
                 Some(Item::Skipped { .. }) => {}
 
                 // An empty DATA frame carries nothing, and `Some(empty)` is not
@@ -552,7 +550,11 @@ impl ClientStream {
     }
 
     /// Ends the sending side cleanly (a QUIC stream FIN).
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
+    ///
+    /// Synchronous for the same reason the server's is: `quinn`'s `finish`
+    /// records that the stream is over and returns, with the FIN travelling
+    /// alongside the bytes already queued.
+    pub fn finish(&mut self) -> Result<(), StreamError> {
         self.send.finish()?;
         Ok(())
     }
@@ -736,8 +738,11 @@ fn build_response(fields: Vec<Field>) -> Result<Response<()>, StreamError> {
 /// encoder from using one (RFC 9204 §3.2.3, §2.1.2). The grease pair is there to
 /// exercise RFC 9114 §7.2.4's rule that unknown identifiers are ignored on every
 /// connection this suite opens.
-fn control_preface(datagrams: bool) -> Vec<u8> {
+fn control_preface(datagrams: bool) -> BytesMut {
     /// One reserved identifier of the form 0x1f * N + 0x21 (RFC 9114 §7.2.4.1).
+    ///
+    /// N is arbitrary; this one differs from the server's only so that the two
+    /// greases can be told apart in a packet capture.
     const GREASE: u64 = 0x1f * 5 + 0x21;
 
     let mut settings = BytesMut::new();
@@ -759,7 +764,7 @@ fn control_preface(datagrams: bool) -> Vec<u8> {
     put_varint(&mut preface, STREAM_CONTROL);
     frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
     preface.extend_from_slice(&settings);
-    preface.to_vec()
+    preface
 }
 
 /// Opens a unidirectional stream and writes its type (RFC 9114 §6.2).
@@ -935,31 +940,26 @@ fn max_field_section_size(mut payload: &[u8]) -> Option<u64> {
 }
 
 /// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
+///
+/// Only the length has to be worked out here -- it is in the first byte's two
+/// most significant bits -- after which the bytes go to `peek_varint`, the same
+/// shape the server's own `read_stream_type` uses. `it_settings` keeps a reader
+/// of its own that decodes independently, for the frame Surge disconnects over.
 async fn read_varint(recv: &mut quinn::RecvStream) -> Option<u64> {
-    let mut first = [0u8; 1];
-    recv.read_exact(&mut first).await.ok()?;
+    let mut buf = [0u8; 8];
+    recv.read_exact(&mut buf[..1]).await.ok()?;
 
-    // The two most significant bits encode the length as a power of two.
-    let length = 1usize << (first[0] >> 6);
-    let mut value = u64::from(first[0] & 0x3f);
-
-    let mut tail = vec![0u8; length - 1];
-    recv.read_exact(&mut tail).await.ok()?;
-    for byte in tail {
-        value = (value << 8) | u64::from(byte);
+    let length = 1usize << (buf[0] >> 6);
+    if length > 1 {
+        recv.read_exact(&mut buf[1..length]).await.ok()?;
     }
 
-    Some(value)
+    peek_varint(&buf[..length]).map(|(value, _)| value)
 }
 
 /// Reads a stream to its end, discarding everything on it.
 async fn drain(mut recv: quinn::RecvStream) {
     while let Ok(Some(_)) = recv.read_chunk(usize::MAX, true).await {}
-}
-
-/// An HTTP/3 error code as the QUIC application error code that carries it.
-fn varint(code: Code) -> VarInt {
-    VarInt::from_u64(code.value()).unwrap_or(VarInt::MAX)
 }
 
 /// Reports a frame-layer failure as a stream error.

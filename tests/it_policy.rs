@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    auth_section, basic_credentials, connect_request, connect_udp_request, open_tcp_tunnel,
-    open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
-    spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    assert_peer_reset, auth_section, basic_credentials, connect_request, connect_udp_request,
+    open_tcp_tunnel, open_udp_session, read_at_least, respond_to, send_and_respond,
+    spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, H3Client, TestServer,
+    ALLOW_PRIVATE, TIMEOUT,
 };
 use http::{HeaderName, Request, Response, StatusCode};
 use volto::datagram;
@@ -436,15 +437,7 @@ async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
         }
     };
 
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
-            code.value(),
-            H3_NO_ERROR,
-            "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",
-            code.value()
-        ),
-        other => panic!("expected the peer to stop the stream, got {other:?}"),
-    }
+    assert_peer_reset(&error, H3_NO_ERROR);
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the stop must be asked for up front, not after a wait; it took {:?}",
@@ -607,7 +600,7 @@ async fn a_finished_tunnel_returns_its_slot() {
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Close the tunnel from the client side and let it drain.
-    stream.finish().await.expect("finish the request stream");
+    stream.finish().expect("finish the request stream");
     common::read_to_end(&mut stream).await;
 
     // The slot is released when the server-side task ends, a moment after the

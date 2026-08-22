@@ -187,15 +187,11 @@ Treating the stream bytes as opaque is a worse trap than the Quarter Stream ID:
 the decoder desynchronizes on the first capsule that arrives.
 
 RFC 9297 §2.1.1 also forbids sending QUIC datagrams before the peer has
-advertised `SETTINGS_H3_DATAGRAM`. volto tracks this per connection rather than
-snapshotting it at handshake time, because the peer's SETTINGS frame usually
-arrives after the handshake completes — and a request can be accepted before the
-control stream carrying it has been read, so a connection whose only session was
-opened that early would stay on the capsule fallback for its whole life. The
-flag is one shared atomic: the task that reads the peer's control stream writes
-it, and every session reads it once per packet, so a session already open moves
-onto QUIC datagrams the moment the SETTINGS arrive, with no sampling step in
-between to get wrong.
+advertised `SETTINGS_H3_DATAGRAM`. The flag is one shared atomic rather than a
+value each session snapshots: the task that reads the peer's control stream
+writes it and every session reads it once per packet, so a session opened before
+the SETTINGS arrived moves onto QUIC datagrams the moment they do. The module
+comment on `src/h3/connection.rs` records what the sampled version cost.
 
 ## The HTTP/3 layer
 
@@ -314,12 +310,12 @@ workaround described below. Two things do not work while it is in place:
   with that one `source` line rewritten back to the registry — which is sound
   precisely because the version is the upstream tag.
 
-## The h3api boundary
+## The h3api facade
 
 `src/h3api.rs` is the facade over `src/h3`: the only module allowed to name a
 type from it, so that everything else — `conn`, `quic`, the tunnels — sees
 `http`, `bytes` and `quinn` types plus the handful of wrappers it exports. The
-boundary began as insulation from a 0.0.x dependency's API churn and was kept on
+facade began as insulation from a 0.0.x dependency's API churn and was kept on
 its own terms: it is the list of what a proxy actually asks of HTTP/3, and it is
 short enough to read in one sitting.
 

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
-    spawn_flooding_udp_target, spawn_large_reply_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
+    assert_peer_reset, closed_udp_address, connect_udp_request, open_udp_session,
+    open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
+    spawn_tagged_udp_target, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
 };
 use http::StatusCode;
 use volto::datagram;
@@ -355,7 +355,7 @@ async fn closing_the_request_stream_ends_the_session() {
         b"before"
     );
 
-    stream.finish().await.expect("finish the request stream");
+    stream.finish().expect("finish the request stream");
 
     // Give the server a moment to tear the session down, then confirm nothing
     // is routed any more.
@@ -461,7 +461,7 @@ async fn a_truncated_capsule_is_rejected() {
         .send_data(encoded.slice(..encoded.len() - 4))
         .await
         .expect("send a partial capsule");
-    stream.finish().await.expect("finish mid-capsule");
+    stream.finish().expect("finish mid-capsule");
 
     // The server must reset the stream rather than treat this as a clean close.
     let error = loop {
@@ -475,15 +475,8 @@ async fn a_truncated_capsule_is_rejected() {
         }
     };
 
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
-            code.value(),
-            0x010e,
-            "expected H3_MESSAGE_ERROR (0x10e), got {code:?} = {:#x}",
-            code.value()
-        ),
-        other => panic!("expected a stream reset, got {other:?}"),
-    }
+    // H3_MESSAGE_ERROR (RFC 9114 §8.1): a message this server will not process.
+    assert_peer_reset(&error, 0x010e);
 }
 
 /// A DATAGRAM capsule declaring more bytes than a UDP payload can hold is a
@@ -528,15 +521,7 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
         }
     };
 
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
-            code.value(),
-            H3_DATAGRAM_ERROR,
-            "expected H3_DATAGRAM_ERROR (0x33), got {code:?} = {:#x}",
-            code.value()
-        ),
-        other => panic!("expected a stream reset, got {other:?}"),
-    }
+    assert_peer_reset(&error, H3_DATAGRAM_ERROR);
 }
 
 /// A session accepted and closed on the spot asks the client to stop sending
@@ -584,15 +569,7 @@ async fn a_session_closed_on_the_spot_stops_the_client_with_no_error() {
         }
     };
 
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
-            code.value(),
-            H3_NO_ERROR,
-            "expected H3_NO_ERROR (0x100), got {code:?} = {:#x}",
-            code.value()
-        ),
-        other => panic!("expected the peer to stop the stream, got {other:?}"),
-    }
+    assert_peer_reset(&error, H3_NO_ERROR);
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the stop must be asked for up front, not after a wait; it took {:?}",
@@ -778,14 +755,7 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     .await
     .expect("the server must end the stalled stream on its own");
 
-    match error {
-        volto::h3api::StreamError::RemoteTerminate { code } => assert_eq!(
-            code.value(),
-            H3_REQUEST_CANCELLED,
-            "expected H3_REQUEST_CANCELLED, got {code:?}"
-        ),
-        other => panic!("expected a stream reset, got {other:?}"),
-    }
+    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
 
     // The connection itself must be untouched: one stalled response is a stream
     // error, never a connection error.

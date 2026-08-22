@@ -56,7 +56,7 @@ async fn an_established_tunnel_survives_goaway_and_finishes() {
 
     // Once the client is done, the server should finish its side and stop —
     // well inside the default grace period.
-    stream.finish().await.expect("finish the request stream");
+    stream.finish().expect("finish the request stream");
     common::read_to_end(&mut stream).await;
 
     server.wait_until_stopped(STOP_TIMEOUT).await;
@@ -87,7 +87,7 @@ async fn an_established_udp_session_survives_goaway() {
     assert_eq!(&decoded.payload[..], b"still here");
 
     // Closing the stream ends the session, which lets the server finish.
-    stream.finish().await.expect("finish the request stream");
+    stream.finish().expect("finish the request stream");
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
@@ -175,7 +175,7 @@ async fn a_request_stream_past_the_goaway_identifier_is_rejected() {
         .expect("the held tunnel still works");
     assert_eq!(&read_at_least(&mut held, 5).await, b"alive");
 
-    held.finish().await.expect("finish");
+    held.finish().expect("finish");
     common::read_to_end(&mut held).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
@@ -252,7 +252,7 @@ async fn new_requests_are_refused_after_goaway() {
         .expect("the held tunnel still works");
     assert_eq!(&read_at_least(&mut held, 5).await, b"alive");
 
-    held.finish().await.expect("finish");
+    held.finish().expect("finish");
     common::read_to_end(&mut held).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }

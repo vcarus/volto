@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::{
-    client_endpoint_with_transport, connect_quic, spawn_udp_echo_target, TestServer, TIMEOUT,
+    client_endpoint_with_transport, connect_quic, finish_connect, spawn_udp_echo_target,
+    TestServer, TIMEOUT,
 };
 use volto::capsule::{Capsule, CapsuleDecoder};
 use volto::datagram;
@@ -260,6 +261,9 @@ const H3_MISSING_SETTINGS: u64 = 0x10a;
 #[tokio::test]
 async fn a_frame_before_settings_ends_the_connection() {
     /// A reserved "grease" frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
+    ///
+    /// N is arbitrary; this one differs from the server's and the test client's
+    /// only so that the three greases can be told apart in a packet capture.
     const GREASE: u64 = 0x1f * 4 + 0x21;
 
     for (name, first) in [
@@ -365,29 +369,26 @@ fn parse_settings(payload: &[u8]) -> HashMap<u64, u64> {
 }
 
 /// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
+///
+/// Only the length is worked out here -- the first byte's two most significant
+/// bits give it -- and `decode_varint` does the rest, so this file holds exactly
+/// one varint decoder and it is the independent one.
 async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
-    let mut first = [0u8; 1];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut first))
+    let mut buf = [0u8; 8];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[..1]))
         .await
         .expect("varint arrived")
         .expect("varint first byte");
 
-    // The two most significant bits encode the length as a power of two.
-    let length = 1usize << (first[0] >> 6);
-    let mut value = u64::from(first[0] & 0x3f);
-
+    let length = 1usize << (buf[0] >> 6);
     if length > 1 {
-        let mut tail = vec![0u8; length - 1];
-        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut tail))
+        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[1..length]))
             .await
             .expect("varint tail arrived")
             .expect("varint tail");
-        for byte in tail {
-            value = (value << 8) | u64::from(byte);
-        }
     }
 
-    value
+    decode_varint(&buf[..length]).expect("a complete varint").0
 }
 
 /// Decodes a variable-length integer from a buffer, returning its byte length.
@@ -420,13 +421,10 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
 /// A CONNECT-UDP session opened before the peer's SETTINGS were processed must
 /// still move onto QUIC datagrams once they arrive.
 ///
-/// The server's copy of the peer's datagram setting used to be refreshed only
-/// when a *request* was accepted. A session started before that point therefore
-/// stayed on the RFC 9297 capsule fallback for target-to-client traffic until
-/// another request happened along, which on a connection that opens one tunnel
-/// and keeps it is never. The flag is now written by the task that reads the
-/// peer's control stream and read by every session per packet, so there is no
-/// sampling step left to get wrong.
+/// The regression is the one `volto::h3::connection`'s module documentation
+/// describes: a datagram flag each session sampled rather than shared, which
+/// left a session opened before the peer's SETTINGS on the capsule fallback for
+/// the life of the connection.
 ///
 /// The shared test client cannot produce that ordering: it sends SETTINGS as
 /// part of connection setup, before any request can be made. So the client here
@@ -610,15 +608,9 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(None);
     let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
-    let connection = tokio::time::timeout(
-        TIMEOUT,
-        endpoint
-            .connect(server.addr, "localhost")
-            .expect("start connecting"),
-    )
-    .await
-    .expect("handshake did not time out")
-    .expect("handshake");
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
     // quinn ties the two directions together, so this client can neither
     // receive QUIC datagrams nor send them, and everything travels as capsules.
     // What the server sees is the part that matters: SETTINGS_H3_DATAGRAM = 1

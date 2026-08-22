@@ -69,20 +69,15 @@ pub async fn handle(
     // connection directly.
     let datagrams = quic.clone();
 
-    // The HTTP/3 handshake opens three unidirectional streams, which is the
-    // peer's decision to allow or withhold, so it is given a deadline: one idle
-    // timeout, the same value `quic.rs` puts in this connection's transport
-    // parameters. Without it a peer whose transport parameters permit fewer
-    // than three of them parks this task -- and holds a `max_connections` slot
-    // -- for as long as it keeps answering keep-alives.
+    // One idle timeout for the whole HTTP/3 handshake -- the same value
+    // `quic.rs` puts in this connection's transport parameters. Why a handshake
+    // needs a deadline of its own is on `h3api::Connection::handshake`.
     let mut connection =
         h3api::Connection::handshake(quic, config.limits.max_idle_timeout()).await?;
 
-    // The peer's datagram flag is the connection's own, not a copy of it: the
-    // task that reads the peer's control stream writes it, and every session on
-    // this connection reads that same flag on every packet. So a SETTINGS frame
-    // that arrives after a session has started is honoured by that session at
-    // once -- nothing to sample, and no window in which the two disagree.
+    // The datagram flag handed to the context is the connection's own rather
+    // than a copy of it; `crate::h3::connection`'s module documentation says
+    // what the copy cost.
     let context = Context::new(
         &config,
         datagrams.clone(),

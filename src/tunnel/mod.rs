@@ -60,10 +60,9 @@ pub struct Context {
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
     /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
-    /// sessions fall back to DATAGRAM capsules on the request stream. Owned by
-    /// the HTTP/3 connection and written by the task that reads the peer's
-    /// control stream, so a SETTINGS frame that arrives after a session has
-    /// started is picked up by that session on its very next packet.
+    /// sessions fall back to DATAGRAM capsules on the request stream. Shared
+    /// with the HTTP/3 connection rather than copied from it, for the reason
+    /// [`crate::h3::connection`] gives.
     pub peer_datagrams: Arc<AtomicBool>,
     /// The credentials every request is checked against.
     pub auth: Arc<Authenticator>,
@@ -671,7 +670,7 @@ pub(crate) async fn refuse_with(
         debug!(stream_id, %error, "failed to send error response");
         return;
     }
-    if let Err(error) = stream.finish().await {
+    if let Err(error) = stream.finish() {
         debug!(stream_id, %error, "failed to finish error response");
     }
 }
@@ -719,7 +718,7 @@ pub(crate) async fn accept_then_close(stream: &mut Stream, headers: HeaderMap, s
         debug!(stream_id, %error, "failed to send 200 for a tunnel closed on the spot");
         return;
     }
-    if let Err(error) = stream.finish().await {
+    if let Err(error) = stream.finish() {
         debug!(stream_id, %error, "failed to close a tunnel after its 200");
     }
 }

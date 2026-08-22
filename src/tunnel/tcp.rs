@@ -332,7 +332,7 @@ async fn target_to_client(
             // Target EOF: finish our sending side only. The client may still
             // have data for the target.
             Ok(0) => {
-                if let Err(error) = writer.finish().await {
+                if let Err(error) = writer.finish() {
                     debug!(%error, "failed to finish the response stream");
                 }
                 return;
