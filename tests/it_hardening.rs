@@ -23,6 +23,16 @@ const FRAME_HEADERS: u64 = 0x01;
 /// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
 const H3_EXCESSIVE_LOAD: u64 = 0x107;
 
+/// H3_REQUEST_CANCELLED (RFC 9114 §8.1).
+const H3_REQUEST_CANCELLED: u64 = 0x10c;
+
+/// A 2s idle timeout, which is also how long an answer to a request may take.
+///
+/// Long enough that a deadline lapsing is a deliberate act rather than a slow
+/// machine, and short enough to wait out twice: the connection-level bound of
+/// D76 is two of these, so a test can tell one deadline from the other.
+const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+
 /// A CONNECT attempt with the given credentials, returning the status.
 async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
     let mut request = connect_request(authority);
@@ -132,6 +142,113 @@ async fn repeated_authentication_failures_close_the_connection() {
     tokio::time::timeout(TIMEOUT, client.quic.closed())
         .await
         .expect("the connection must be closed after the failure budget is spent");
+}
+
+/// A peer that will not read its 407 must still spend the budget.
+///
+/// The failure is counted before the answer goes out, and the answer itself is
+/// bounded: a peer that grants a window smaller than a 407 used to leave the
+/// count on the unreachable side of a write that never completed, which turned
+/// "N guesses cost a handshake" into "guess once per stream, forever" — and left
+/// a parked task holding the whole decoded request behind each of them
+/// (review H1/H2).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
+    let server = TestServer::start_with(&format!(
+        "{DELIBERATE}{}[security]\nmax_auth_failures = 3\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let mut client = H3Client::connect_with_transport(&server, deaf_transport()).await;
+
+    // Eight guesses, none of them read: `send_request` returns the stream and
+    // nothing here ever asks it for the response, so every 407 is stuck on the
+    // window the client refused to grow.
+    let mut unread = Vec::new();
+    for _ in 0..8 {
+        let mut request = connect_request("192.0.2.1:443");
+        request.fields.append(
+            "proxy-authorization",
+            FieldValue::parse(basic_credentials("user1", "wrong").as_bytes()).expect("credentials"),
+        );
+        unread.push(
+            client
+                .send
+                .send_request(request)
+                .await
+                .expect("send a guess"),
+        );
+    }
+
+    let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("a peer that will not read its answers must still run out of guesses");
+
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+            close.error_code.into_inner(),
+            volto::h3api::AUTH_FAILURE_LIMIT_CODE.into_inner(),
+            "the budget must be what closed this connection, not the D76 bound; \
+             reason was {:?}",
+            String::from_utf8_lossy(&close.reason)
+        ),
+        other => panic!("expected an application close, got {other}"),
+    }
+}
+
+/// A refusal the peer will not take is abandoned, and only that stream suffers.
+///
+/// The request task ends either way; what is asserted here is the signal it
+/// leaves, because that is what returns the stream. RFC 9114 §8.1's
+/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// response) is cancelled", and a reset is the only end that reaches a peer
+/// granting no window at all — a FIN would wait behind bytes that cannot be
+/// sent (review H1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_the_peer_will_not_take_is_reset() {
+    // No `[auth]` section, so the first request authenticates and the D76 bound
+    // on the connection is out of the way: what is under test is the stream.
+    let server = TestServer::start_with(DELIBERATE).await;
+    let mut client = H3Client::connect_with_transport(&server, deaf_transport()).await;
+
+    // Port 25 is on the default deny list and is checked before the resolver
+    // runs, so the 403 arrives without touching the network — and it carries an
+    // RFC 9209 `Proxy-Status` field, which puts it well past the window.
+    let mut stream = client
+        .send
+        .send_request(connect_request("192.0.2.1:25"))
+        .await
+        .expect("send a request that will be refused");
+
+    // Past the server's idle timeout, without reading a byte: reading is what
+    // would grow the window and let the answer through.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the server must not wait for a window that is not coming")
+        .expect_err("an answer the peer would not take must end in a reset");
+    common::assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+
+    // One abandoned answer is not a reason to drop everything else.
+    assert!(
+        client.quic.close_reason().is_none(),
+        "the connection must survive a stream it could not answer"
+    );
+}
+
+/// Transport parameters for a peer that takes an answer and then stops reading.
+///
+/// 24 bytes is under every response this server sends and over the 19-byte
+/// SETTINGS frame the handshake needs, so the connection is built normally and
+/// only the answers are stuck. The keep-alive is what makes the test about the
+/// application's deadlines: with it, the transport's own idle timeout can never
+/// be the thing that ends anything.
+fn deaf_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(24u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    transport
 }
 
 /// Correct credentials are unaffected by the cap, however many times they are

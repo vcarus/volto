@@ -12,7 +12,8 @@
 //! `username` is the exception that proves the rule: its bytes are the peer's, so
 //! "the value" is the quoted, Debug-escaped spelling tracing gives every `str`
 //! field — `username="user1"` — and the test below also pins that a newline or
-//! an escape sequence smuggled into a user-id cannot forge a log line.
+//! an escape sequence smuggled into a user-id cannot forge a log line, and that
+//! a user-id the size of a field section cannot buy a log line of its own size.
 //!
 //! The absent half of each field is unit-tested in `volto::logfmt` instead: a
 //! handshake without ALPN cannot complete against this server, and a socket whose
@@ -149,8 +150,35 @@ async fn operator_facing_fields_print_values_not_options() {
         );
     }
     assert!(
-        logged.contains(r#"username="evil\nWARN volto - authentication failed"#),
-        "the peer-chosen text must print quoted and Debug-escaped; log was:\n{logged}"
+        logged.contains(r#"username="evil\nWARN volto - authentication... <truncated from "#),
+        "the peer-chosen text must print quoted, Debug-escaped and cut to the \
+         bound; log was:\n{logged}"
+    );
+
+    // The length of a claimed user-id is the peer's choice as much as its bytes
+    // are: it is everything before the first colon of a base64 blob that may be
+    // a whole field section. Unbounded, one guess bought a 288 KB WARN line for
+    // 57 KB of upstream — five times the attacker's cost, aimed at the journal
+    // that is this server's only forensic channel (review H3).
+    let mut request = connect_request("192.0.2.1:443");
+    request.fields.append(
+        "proxy-authorization",
+        common::field_value(&basic_credentials(&"u".repeat(48_000), "wrong-guess")),
+    );
+    let response = respond_to(&mut caller, request).await;
+    assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
+
+    let logged = buffer.contents();
+    let bloated = logged
+        .lines()
+        .find(|line| line.contains("truncated from 48000 bytes"))
+        .unwrap_or_else(|| {
+            panic!("the huge user-id must be logged, cut short; log was:\n{logged}")
+        });
+    assert!(
+        bloated.len() < 1024,
+        "a 48 KB user-id must not buy a log line of its own size; the line was {} bytes",
+        bloated.len()
     );
 
     // The point of the whole exercise: no `Option` reaches an operator's eyes.

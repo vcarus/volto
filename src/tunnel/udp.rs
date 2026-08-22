@@ -52,7 +52,13 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context) {
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+        tunnel::refuse(
+            &mut stream,
+            Status::BAD_REQUEST,
+            stream_id,
+            ctx.max_idle_timeout,
+        )
+        .await;
         return;
     }
 
@@ -61,7 +67,13 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, path, reason, "malformed connect-udp request");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+            tunnel::refuse(
+                &mut stream,
+                Status::BAD_REQUEST,
+                stream_id,
+                ctx.max_idle_timeout,
+            )
+            .await;
             return;
         }
     };
@@ -91,7 +103,13 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
             stream_id,
             "the datagrams of this stream are already claimed"
         );
-        tunnel::refuse(&mut stream, Status::INTERNAL_SERVER_ERROR, stream_id).await;
+        tunnel::refuse(
+            &mut stream,
+            Status::INTERNAL_SERVER_ERROR,
+            stream_id,
+            ctx.max_idle_timeout,
+        )
+        .await;
         return;
     };
 
@@ -127,7 +145,8 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
                 error = %failure.error,
                 "failed to open target UDP socket"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
+            tunnel::refuse_unreachable(&mut stream, &failure, stream_id, ctx.max_idle_timeout)
+                .await;
             return;
         }
     };

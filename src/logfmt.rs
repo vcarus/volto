@@ -21,11 +21,79 @@
 //! or a terminal escape sequence inside it stays on the one line, spelled out.
 //! systemd splits a service's stdout on `\n`, so an unescaped newline would
 //! otherwise hand an unauthenticated client a journal entry of its own.
+//!
+//! The fourth rule is about *size*: several of those peer-chosen values are a
+//! whole field section's worth of bytes, so [`bounded`] caps what any one of
+//! them can write into the journal. Length and provenance are separate
+//! concerns, and both apply to the same fields -- `bounded` does not escape
+//! anything, and recording its result with `%` would undo the third rule.
 
+use std::borrow::Cow;
 use std::fmt;
 
 /// What an absent value prints as.
 pub const ABSENT: &str = "-";
+
+/// Longest peer-chosen token echoed into a log line whole.
+///
+/// `connect-udp` is 11 bytes and a plausible user-id is shorter still, so
+/// nothing this server expects to see is ever cut.
+const MAX_TOKEN: usize = 32;
+
+/// Caps a peer-chosen token at what a log line can afford to carry.
+///
+/// Some of the tokens that reach a log line are a field section's worth of
+/// bytes -- up to [`crate::h3api::MAX_FIELD_SECTION_SIZE`] -- from a peer that
+/// has not authenticated: the `:protocol` of an extended CONNECT, the user-id
+/// of a rejected credential. Logging one whole puts tens of kilobytes in the
+/// journal per request, for free, and journald's rate limiting counts lines
+/// rather than bytes, so it is no backstop. The routing decision and the
+/// response still see the whole value; only the log is bounded.
+///
+/// The length is kept because a token cut short is otherwise indistinguishable
+/// from a short one, and the cut lands on a character boundary because slicing
+/// a `str` anywhere else panics.
+///
+/// This bounds **length only**. Escaping is the recording sigil's job: the
+/// result goes into a line as a `str` field or with `?`, never with `%`, or a
+/// newline inside it forges a journal entry exactly as the third rule above
+/// describes.
+///
+/// ```
+/// # use volto::logfmt::bounded;
+/// assert_eq!(bounded("connect-udp"), "connect-udp");
+/// ```
+pub fn bounded(token: &str) -> Cow<'_, str> {
+    if token.len() <= MAX_TOKEN {
+        return Cow::Borrowed(token);
+    }
+
+    let mut end = MAX_TOKEN;
+    while !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(truncated(&token[..end], token.len()))
+}
+
+/// [`bounded`] for bytes that are not known to be UTF-8.
+///
+/// The cut happens before the decoding rather than after it, so a user-id the
+/// size of a field section is never allocated whole just to be thrown away.
+/// Whatever character the cut lands inside becomes U+FFFD, which is what every
+/// other byte an invalid user-id is made of becomes anyway.
+pub fn bounded_bytes(token: &[u8]) -> Cow<'_, str> {
+    if token.len() <= MAX_TOKEN {
+        return String::from_utf8_lossy(token);
+    }
+
+    let head = String::from_utf8_lossy(&token[..MAX_TOKEN]);
+    Cow::Owned(truncated(&head, token.len()))
+}
+
+/// How a token that had to be cut is spelled: its head, and its real length.
+fn truncated(head: &str, whole: usize) -> String {
+    format!("{head}... <truncated from {whole} bytes>")
+}
 
 /// Formats an optional log field: the value itself, or [`ABSENT`].
 ///
@@ -53,7 +121,7 @@ pub fn or_dash<T: fmt::Display>(value: Option<T>) -> impl fmt::Display {
 
 #[cfg(test)]
 mod tests {
-    use super::{or_dash, ABSENT};
+    use super::{bounded, bounded_bytes, or_dash, ABSENT};
     use std::net::SocketAddr;
 
     /// A value present prints as itself, with no wrapper and no quotes.
@@ -82,5 +150,57 @@ mod tests {
     #[test]
     fn the_placeholder_is_a_single_dash() {
         assert_eq!(ABSENT, "-");
+    }
+
+    /// An unauthenticated peer can name a 64 KiB `:protocol`; the log gets the
+    /// head of it and the length, not the whole thing.
+    #[test]
+    fn a_logged_token_is_bounded() {
+        assert_eq!(bounded("connect-udp"), "connect-udp");
+        assert_eq!(bounded(""), "");
+        // Exactly at the bound is still echoed whole.
+        let full = "p".repeat(32);
+        assert_eq!(bounded(&full), full);
+
+        let long = "p".repeat(64 * 1024);
+        let logged = bounded(&long);
+        assert_eq!(
+            logged,
+            format!("{full}... <truncated from 65536 bytes>"),
+            "the head and the real length, and nothing else"
+        );
+        assert!(logged.len() < 80, "{logged}");
+    }
+
+    /// Truncation must land on a character boundary, or slicing panics.
+    #[test]
+    fn a_multibyte_token_is_cut_on_a_boundary() {
+        // Ten three-byte characters: the 32-byte cut falls inside the eleventh.
+        let token = "\u{20ac}".repeat(20);
+        let logged = bounded(&token);
+        assert!(
+            logged.starts_with(&"\u{20ac}".repeat(10)),
+            "expected ten whole characters, got {logged}"
+        );
+        assert!(logged.contains("truncated from 60 bytes"), "{logged}");
+    }
+
+    /// The same bound on bytes that were never promised to be text, which is
+    /// what a claimed user-id is.
+    #[test]
+    fn a_logged_byte_string_is_bounded_and_decoded_leniently() {
+        assert_eq!(bounded_bytes(b"user1"), "user1");
+        // Invalid bytes are replaced rather than losing the whole value: who
+        // was guessed at is the diagnostic point.
+        assert_eq!(bounded_bytes(&[0xff, 0xfe]), "\u{fffd}\u{fffd}");
+
+        let long = vec![b'u'; 48_000];
+        let logged = bounded_bytes(&long);
+        assert_eq!(
+            logged,
+            format!("{}... <truncated from 48000 bytes>", "u".repeat(32)),
+            "a huge user-id costs a bounded log line, and says how huge it was"
+        );
+        assert!(logged.len() < 80, "{logged}");
     }
 }

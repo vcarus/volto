@@ -69,7 +69,8 @@ use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
 
 use super::huffman;
 use super::{
-    client_endpoint_with_stream_window, connect_quic, connect_quic_with_ca, finish_connect,
+    client_endpoint_with_stream_window, client_endpoint_with_transport, connect_quic,
+    connect_quic_with_ca, finish_connect,
 };
 use super::{TestServer, TIMEOUT};
 
@@ -238,6 +239,24 @@ impl H3Client {
     /// the session has to fall back to DATAGRAM capsules on the request stream.
     pub async fn connect_without_datagrams(server: &TestServer) -> Self {
         Self::connect_with_datagrams(server, false).await
+    }
+
+    /// [`H3Client::connect`] on a peer whose transport parameters the test chose.
+    ///
+    /// The escape hatch for tests whose subject is what the *client's* transport
+    /// parameters do to the server -- one that grants a window too small for the
+    /// answer it asked for, say, which is a legal QUIC peer and an impossible
+    /// HTTP client.
+    pub async fn connect_with_transport(
+        server: &TestServer,
+        transport: quinn::TransportConfig,
+    ) -> Self {
+        let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
+        let connection = finish_connect(&endpoint, server.addr)
+            .await
+            .expect("handshake");
+
+        Self::from_quic(endpoint, connection, true).await
     }
 
     /// [`H3Client::connect_without_datagrams`] with a per-stream receive window

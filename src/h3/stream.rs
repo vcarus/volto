@@ -659,6 +659,21 @@ impl Stream {
         self.frames.stop(code);
     }
 
+    /// Abruptly ends the sending side with an error code.
+    ///
+    /// The counterpart to [`Stream::finish`], and the only one of the two that
+    /// gets through to a peer that has stopped granting flow-control credit: a
+    /// FIN travels at the end of the bytes already queued and so waits for a
+    /// window that may never come, while a reset is a frame of its own and
+    /// leaves at once. That is what makes this the way to abandon a response
+    /// nobody is reading -- and abandoning it is what ends the stream, and
+    /// returns the peer's allowance of streams with it.
+    pub fn reset(&mut self, code: Code) {
+        // Fails only if the stream is already finished or reset, which needs no
+        // reporting: either way nothing more will be sent on it.
+        let _ = self.send.reset(varint(code));
+    }
+
     /// Splits the stream so each direction can be pumped independently.
     ///
     /// This is what makes TCP half-close expressible: one direction can finish

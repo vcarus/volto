@@ -45,6 +45,11 @@ const FRAME_HEADERS: u64 = 0x01;
 /// outside: the third client is refused while the first two are alive.
 const TWO_SLOTS: &str = "max_connections = 2\n";
 
+/// Room for one connection at a time, so a slot held is a slot everyone can see
+/// is gone: the second client is refused while the first holds it, and admitted
+/// once it does not.
+const ONE_SLOT: &str = "max_connections = 1\n";
+
 /// The credentials the tests that configure authentication use.
 const USER: (&str, &str) = ("user1", "s3cret");
 
@@ -224,6 +229,63 @@ async fn an_authenticated_connection_is_not_bounded() {
         .await
         .expect("send payload");
     assert_eq!(read_at_least(&mut second, 10).await, b"still here");
+}
+
+/// Opening request streams must not buy a peer more time to authenticate in.
+///
+/// The bound is a deadline measured from the handshake, not a timer restarted by
+/// every wait, and this is the difference between the two. `accept()` returns the
+/// moment the peer *opens* a stream, so a peer that opened one every other idle
+/// timeout — a byte apiece, never a whole request, never a credential — used to
+/// rearm the wait before it could expire and so held its slot for as long as it
+/// cared to, which is the very symptom D76 exists to end (review C1').
+///
+/// Each of those streams is reset on its own after an idle timeout, and the
+/// stream allowance comes back, so the peer can keep this up for nothing.
+#[tokio::test]
+async fn opening_request_streams_does_not_extend_the_bound() {
+    let server = TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}")).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    // 1.2s apart, comfortably inside the 2s bound.
+    let poking = tokio::spawn({
+        let connection = connection.clone();
+        async move {
+            // Held open on purpose: a stream that is finished is a request that
+            // ended, and what is under test is a stream that merely started.
+            let mut open = Vec::new();
+            while let Ok((mut send, recv)) = connection.open_bi().await {
+                if send.write_all(&[0x01]).await.is_err() {
+                    break;
+                }
+                open.push((send, recv));
+                tokio::time::sleep(Duration::from_millis(1_200)).await;
+            }
+        }
+    });
+
+    // The slot is genuinely occupied while this goes on.
+    let refused = client_endpoint(&server.ca, &["h3"]);
+    let error = finish_connect(&refused, server.addr)
+        .await
+        .expect_err("the server is at its connection limit");
+    assert!(
+        matches!(
+            error,
+            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
+        ),
+        "expected the connection to be refused, got {error}"
+    );
+
+    // Two idle timeouts after the handshake, and not two after the last stream.
+    assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
+    poking.abort();
+
+    let (_endpoint, admitted) = common::connect_quic(&server).await;
+    assert!(
+        admitted.close_reason().is_none(),
+        "the slot must come back once the peer that never authenticated is gone"
+    );
 }
 
 /// A request stream that stalls before its HEADERS costs one stream, not the

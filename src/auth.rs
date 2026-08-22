@@ -64,6 +64,12 @@ pub enum Denied {
     Rejected {
         /// The user-id the client claimed. Not a secret, and the only way to tell
         /// a typo apart from a scan in the logs.
+        ///
+        /// Bounded by [`crate::logfmt::bounded_bytes`] where it is built rather
+        /// than where it is logged: the peer chooses its length as well as its
+        /// bytes, and a user-id is everything before the first colon of a whole
+        /// field section, so an unbounded one costs a 49 KB allocation on the
+        /// way to a log line five times that size (review H3).
         username: String,
     },
 }
@@ -155,7 +161,7 @@ impl Authenticator {
 
         self.verify(username, password)
             .ok_or_else(|| Denied::Rejected {
-                username: String::from_utf8_lossy(username).into_owned(),
+                username: crate::logfmt::bounded_bytes(username).into_owned(),
             })
     }
 

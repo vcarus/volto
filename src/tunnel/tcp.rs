@@ -71,7 +71,13 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, authority, reason, "malformed CONNECT authority");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+            tunnel::refuse(
+                &mut stream,
+                Status::BAD_REQUEST,
+                stream_id,
+                ctx.max_idle_timeout,
+            )
+            .await;
             return;
         }
     };
@@ -101,7 +107,8 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
                 error = %failure.error,
                 "failed to connect to target"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
+            tunnel::refuse_unreachable(&mut stream, &failure, stream_id, ctx.max_idle_timeout)
+                .await;
             return;
         }
     };
