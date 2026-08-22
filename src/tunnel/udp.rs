@@ -829,7 +829,9 @@ fn validate(req: &Request) -> Result<(), &'static str> {
 /// Parsing is deliberately lenient about the things clients disagree on — the
 /// trailing slash is optional, and an IPv6 literal is accepted both in the
 /// RFC 9298 §3.1 form (bare, only the colons escaped) and bracketed — while
-/// staying strict about anything ambiguous.
+/// staying strict about anything ambiguous. What comes out is a host, with the
+/// brackets of the second form already off: [`crate::net::resolve`] resolves
+/// names and literals, not URI components.
 pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'static str> {
     // A query string would make the URI something other than the template.
     if query.is_some_and(|query| !query.is_empty()) {
@@ -857,6 +859,21 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         return Err("empty target_host");
     }
 
+    // The brackets belong to this template and come off here. RFC 9298 §3.1
+    // writes an IPv6 literal bare, with only its colons escaped, but some
+    // clients send the bracketed form and it costs nothing to accept -- and
+    // taking them off is this parser's job rather than the resolver's, which is
+    // handed a host and not a piece of URI syntax.
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .filter(|literal| !literal.is_empty())
+        .map(str::to_owned);
+    let host = match unbracketed {
+        Some(literal) => literal,
+        None => host.into_owned(),
+    };
+
     let port = percent_decode_str(port)
         .decode_utf8()
         .map_err(|_| "target_port is not valid UTF-8")?;
@@ -865,7 +882,7 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         return Err("target_port must not be zero");
     }
 
-    Ok((host.into_owned(), port))
+    Ok((host, port))
 }
 
 #[cfg(test)]
@@ -914,12 +931,13 @@ mod tests {
         );
     }
 
-    /// Not the standard form, but cheap to accept and some clients send it.
+    /// Not the standard form, but cheap to accept and some clients send it. The
+    /// brackets are this template's syntax, so they come off with it.
     #[test]
     fn tolerates_bracketed_ipv6_literals() {
         assert_eq!(
             parse("/.well-known/masque/udp/%5B2001%3Adb8%3A%3A1%5D/53/"),
-            Ok(("[2001:db8::1]".to_owned(), 53))
+            Ok(("2001:db8::1".to_owned(), 53))
         );
     }
 

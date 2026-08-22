@@ -778,6 +778,12 @@ proptest! {
         host in "\\PC{1,32}",
         port in 1u16..=u16::MAX,
     ) {
+        // The IP-literal spelling is the one shape the template does not hand
+        // back unchanged, because its brackets are the template's syntax rather
+        // than part of the host; `the_template_round_trips_ip_literals` is where
+        // that shape is pinned.
+        prop_assume!(!(host.starts_with('[') && host.ends_with(']')));
+
         let path = format!("{PREFIX}{}/{port}/", percent_encode_all(host.as_bytes()));
         prop_assert_eq!(parse_target(&path, None), Ok((host, port)));
     }
@@ -803,10 +809,12 @@ proptest! {
             Ok((v6.clone(), port))
         );
 
+        // The bracketed spelling reaches the same host as the bare one: the
+        // brackets are the template's syntax and come off with it.
         let bracketed = format!("[{v6}]").replace(':', "%3A");
         prop_assert_eq!(
             parse_target(&format!("{PREFIX}{bracketed}/{port}/"), None),
-            Ok((format!("[{v6}]"), port))
+            Ok((v6, port))
         );
     }
 

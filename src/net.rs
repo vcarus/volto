@@ -41,14 +41,14 @@ pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreferenc
 
 /// Resolves `host`/`port` to a non-empty list of socket addresses.
 ///
-/// An IP literal resolves to itself without consulting the resolver. Both
-/// bracketed and bare IPv6 literals are accepted; RFC 9298 uses the bare form.
+/// An IP literal resolves to itself without consulting the resolver, and an IPv6
+/// one is written bare: the brackets belong to the syntax a target arrived in,
+/// and each of the two places a target arrives has already taken them off --
+/// `tunnel::tcp` splitting an RFC 3986 authority, `tunnel::udp` decoding an
+/// RFC 9298 template, which carries them bare to begin with. Stripping them here
+/// as well would mean accepting a host neither of those produced, and answering
+/// `example.com]:443` by dialling `example.com`.
 pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    // `lookup_host` wants the bracketed form for IPv6 literals, while RFC 9298
-    // templates carry them bare.
-    let host = host.strip_prefix('[').unwrap_or(host);
-    let host = host.strip_suffix(']').unwrap_or(host);
-
     let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         vec![SocketAddr::new(ip, port)]
     } else {
@@ -178,15 +178,14 @@ mod tests {
         assert_eq!(addresses, vec!["192.0.2.1:443".parse().unwrap()]);
     }
 
+    /// Bare, which is the only form that reaches here: `tunnel::tcp` takes the
+    /// brackets off an RFC 3986 authority and RFC 9298's template never has
+    /// them. A bracketed literal is a host name with characters no host name may
+    /// contain, and is left to fail as one.
     #[tokio::test]
-    async fn resolves_bare_and_bracketed_ipv6_literals() {
-        // RFC 9298 templates carry IPv6 literals without brackets.
+    async fn resolves_bare_ipv6_literals() {
         let bare = resolve("2001:db8::1", 53).await.expect("bare literal");
-        let bracketed = resolve("[2001:db8::1]", 53)
-            .await
-            .expect("bracketed literal");
         assert_eq!(bare, vec!["[2001:db8::1]:53".parse().unwrap()]);
-        assert_eq!(bare, bracketed);
     }
 
     #[tokio::test]

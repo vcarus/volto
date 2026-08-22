@@ -450,6 +450,14 @@ fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
                 // Ambiguous with host:port; brackets are mandatory.
                 return Err("unbracketed IPv6 literal");
             }
+            if host.contains(['[', ']']) {
+                // A bracket that did not open the authority is not part of any
+                // host: RFC 3986 §3.2.2 gives them to the IP-literal form alone,
+                // which the arm above is. Refused rather than tolerated because
+                // the host is what gets dialled and what gets logged, and
+                // `example.com]` must not quietly become `example.com`.
+                return Err("stray bracket in host");
+            }
             (host.to_owned(), port)
         }
     };
@@ -616,5 +624,18 @@ mod tests {
         assert!(split_authority("2001:db8::1:443").is_err());
         assert!(split_authority("[2001:db8::1:443").is_err());
         assert!(split_authority("user:pass@example.com:443").is_err());
+    }
+
+    /// A bracket anywhere but around the whole host is not part of a host.
+    ///
+    /// `uri_authority` passes them through wherever RFC 3986 allows the
+    /// character, so this is where the shape is judged -- and `example.com]`
+    /// must not become `example.com` on the way to the resolver (review M3).
+    #[test]
+    fn rejects_a_stray_bracket_in_a_host() {
+        assert!(split_authority("example.com]:443").is_err());
+        assert!(split_authority("example.com[:443").is_err());
+        assert!(split_authority("[example.com:443").is_err());
+        assert!(split_authority("exa]mple.com:443").is_err());
     }
 }

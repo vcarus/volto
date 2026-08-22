@@ -388,6 +388,37 @@ async fn refuses_an_authority_without_a_port() {
     );
 }
 
+/// A bracket that did not open the authority is not part of a host (review M3).
+///
+/// RFC 3986 gives "[" and "]" to the IP-literal form alone, but they are legal
+/// *characters* in an authority, so the codec passes them through and the split
+/// is where the shape is judged. Until it did, `127.0.0.1]:P` opened a tunnel to
+/// `127.0.0.1:P` -- the resolver took the bracket off on its way past -- so the
+/// connection went somewhere the request log did not name.
+#[tokio::test]
+async fn refuses_an_authority_with_a_stray_bracket() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // The same target the tunnel would have reached, so what is under test is
+    // the bracket and nothing about the destination.
+    let authority = format!("127.0.0.1]:{}", target.port());
+    let (response, mut stream) = send_and_respond(&mut client, connect_request(&authority)).await;
+
+    assert_eq!(
+        response.status,
+        Status::BAD_REQUEST,
+        "a host with a stray bracket is not the host without it"
+    );
+
+    let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .expect("the stream ended promptly")
+        .expect("a refusal must end cleanly, not with a stream error");
+    assert!(end.is_none(), "a 400 carries no body");
+}
+
 /// RFC 9114 §4.2: "any message containing connection-specific fields MUST be
 /// treated as malformed". The answer is a 400 rather than a reset, which RFC
 /// 9114 §4.1.2 allows.
