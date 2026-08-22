@@ -1,12 +1,18 @@
 # Dependabot only touches registry dependencies and action versions.
 #
+# Three ecosystems are watched below: the crates in `Cargo.toml`, the pinned
+# GitHub Actions, and the Go module the `interop` job drives the server with.
+# The last one matters as much as the first: masque-go is the only independent
+# implementation this project is checked against, so an unwatched copy of it
+# would quietly age into agreeing with us by being too old to disagree.
+#
 # The `[patch.crates-io]` entry redirecting `quinn-proto` at a git commit is
 # outside its reach: Dependabot ignores git dependencies. It is meant to be
 # temporary — the commit is moved by hand until an upstream 0.11.x release
 # carries the MTU black-hole detector fix, at which point the whole stanza goes
 # away. Both the patch and its exit condition are documented in
-# docs/architecture.md. It is the only dependency in the tree that Dependabot
-# cannot see.
+# docs/architecture.md. With the three ecosystems below covered, it is the only
+# dependency left in the tree that Dependabot cannot see.
 #
 # Every dependency PR must pass the full CI suite, on Linux and macOS, before it
 # is merged.
@@ -22,5 +28,14 @@ updates:
   # Dependabot updates the SHA and the comment together.
   - package-ecosystem: github-actions
     directory: "/"
+    schedule:
+      interval: weekly
+
+  # The masque-go client behind the `interop` job. This go.mod is also where
+  # that job reads its Go toolchain version from (`go-version-file:
+  # tests/interop/go.mod` in ci.yml), so a bump of the `go` directive is picked
+  # up by the runner too, not just the module requirements.
+  - package-ecosystem: gomod
+    directory: "/tests/interop"
     schedule:
       interval: weekly

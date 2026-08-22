@@ -42,10 +42,13 @@ panel.
 ## Quickstart
 
 Grab a static binary from the [releases page](https://github.com/vcarus/volto/releases)
-(`x86_64` and `aarch64` musl builds), or build from source with Rust 1.85+:
+(`x86_64` and `aarch64` musl builds), or build from source with Rust 1.85+.
+Every cargo command below passes `--locked`: `Cargo.lock` is committed and
+redirects `quinn-proto` at a patched commit, so a build without it is not the
+same build (see [docs/deployment.md](docs/deployment.md#building)).
 
 ```sh
-cargo build --release      # target/release/volto
+cargo build --release --locked      # target/release/volto
 ```
 
 The fastest way to a working server is the self-signed installer, which creates
@@ -87,7 +90,7 @@ immediately. For a domain certificate from a public CA instead, see
 Run it by hand during development:
 
 ```sh
-cargo run -- --config config.toml
+cargo run --locked -- --config config.toml
 ```
 
 ## Documentation
@@ -107,9 +110,9 @@ A commented example configuration ships in
 ## Testing
 
 ```sh
-cargo test                                   # unit + integration
-cargo test --test it_policy                  # authentication / ACL / quotas
-cargo test --test it_stress -- --ignored     # heavy load tier
+cargo test --locked                                # unit + integration
+cargo test --locked --test it_policy               # authentication / ACL / quotas
+cargo test --locked --test it_stress -- --ignored  # heavy load tier
 ```
 
 Integration tests assert on-wire behaviour — status codes, response headers, the
