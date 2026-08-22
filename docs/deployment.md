@@ -275,11 +275,31 @@ A cloud provider's security group needs the same rule, on UDP.
 ## File-descriptor budget
 
 Each tunnel — TCP or UDP — costs one descriptor, and one client multiplexes many
-onto a single QUIC connection. `limits.max_targets_per_conn` and the unit's
-`LimitNOFILE` are therefore two halves of one budget, and the shipped defaults
-line up: 256 connections × 256 tunnels = 65536 = `LimitNOFILE`. volto checks
-`RLIMIT_NOFILE` at startup and warns when the margin is thin, which is worth
-heeding rather than silencing.
+onto a single QUIC connection. The quota is per connection, so the number the
+process has to have descriptors for is the **product**:
+
+```
+limits.max_connections × limits.max_targets_per_conn
+```
+
+The shipped defaults make that 256 × 256 = 65536, which is exactly the
+`LimitNOFILE` the unit sets — equal, not comfortably under. Clients at their
+quotas can consume every descriptor the process has, and there is none left for
+the listening socket, for the certificate a `SIGHUP` re-reads, or for anything
+else. Fd exhaustion is not a crash here (a tunnel whose `socket()` fails is
+refused with a 502) but it is a degradation that hits every connection at once.
+
+Leave headroom in whichever direction suits the host: raise `LimitNOFILE` — the
+drop-in below doubles it — or lower `limits.max_connections`, which is also the
+knob that bounds memory. volto compares the product against `RLIMIT_NOFILE` at
+startup and warns when it does not fit, which is worth heeding rather than
+silencing.
+
+```ini
+# /etc/systemd/system/volto.service.d/nofile.conf
+[Service]
+LimitNOFILE=131072
+```
 
 ## UDP socket buffers
 

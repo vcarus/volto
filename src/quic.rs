@@ -82,6 +82,10 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     let mut transport = quinn::TransportConfig::default();
     transport.max_concurrent_bidi_streams(VarInt::from_u32(limits.max_streams_bidi));
 
+    // Stated rather than inherited: HTTP/3 needs three of these and quinn's
+    // default allows a hundred; see [`MAX_PEER_UNI_STREAMS`].
+    transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_PEER_UNI_STREAMS));
+
     // The bound on what an unauthenticated peer can make this process hold,
     // where quinn's default is no aggregate bound at all; the arithmetic is in
     // [`CONNECTION_RECEIVE_WINDOW`].
@@ -208,7 +212,7 @@ impl Server {
         )
         .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
 
-        warn_if_fd_budget_is_tight(config.limits.max_targets_per_conn);
+        warn_if_fd_budget_is_tight(&config.limits);
 
         let (trigger, shutdown) = shutdown::channel();
 
@@ -348,6 +352,25 @@ impl Server {
     ///
     /// Split out of the accept loop so it can be a `'static` future for the
     /// `JoinSet`: everything it needs is cloned up front.
+    ///
+    /// # The handshake deadline
+    ///
+    /// The `max_connections` slot is taken by the `spawn` above, before the QUIC
+    /// and TLS handshake this starts with has happened — so the cap counts
+    /// handshakes in progress as well as connections, and something has to bound
+    /// the first of those. quinn has no handshake-specific timer: its idle
+    /// timeout is reset by any authenticated packet in any packet number space,
+    /// so a peer that sends an Initial-space PING every `max_idle_timeout` and
+    /// never completes the handshake holds a slot for as long as it likes, and
+    /// makes this endpoint retransmit its handshake flight on every PTO
+    /// meanwhile (review M6). `Connection::handshake`'s deadline is no help
+    /// either: it starts one layer later, once there is a connection at all.
+    ///
+    /// One idle timeout bounds it, for the same reason it bounds the HTTP/3
+    /// handshake: a peer that cannot finish a handshake in the time it is
+    /// allowed to say nothing at all is not going to finish it. Dropping the
+    /// future refuses the connection at the QUIC layer and frees the slot with
+    /// it.
     fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> {
         // Snapshotted per connection, not read live: a reload changes what new
         // connections get, while a connection already running keeps the
@@ -357,13 +380,25 @@ impl Server {
         let shutdown = self.shutdown.clone();
         let remote = incoming.remote_address();
 
+        let handshake_deadline = config.limits.max_idle_timeout();
+
         async move {
-            let quic = match incoming.await {
-                Ok(quic) => quic,
-                Err(error) => {
+            let quic = match tokio::time::timeout(handshake_deadline, incoming).await {
+                Ok(Ok(quic)) => quic,
+                Ok(Err(error)) => {
                     // A failed handshake is routine on a public port: scanners,
                     // version negotiation, stale retries.
                     debug!(%remote, %error, "QUIC handshake failed");
+                    return;
+                }
+                // Equally routine, and logged at the same level for the same
+                // reason: a flood is exactly when this fires.
+                Err(_elapsed) => {
+                    debug!(
+                        %remote,
+                        timeout_secs = handshake_deadline.as_secs(),
+                        "QUIC handshake did not complete in time"
+                    );
                     return;
                 }
             };
@@ -604,34 +639,55 @@ impl ReloadHandle {
 
 /// Warns when the fd limit leaves no room for the configured tunnel quota.
 ///
-/// One connection at its quota needs `max_targets_per_conn` descriptors, plus the
-/// endpoint's own socket and the request streams. If the soft limit is not
-/// comfortably above the quota, a single busy client can exhaust the process —
-/// and fd exhaustion is not a graceful failure mode, it breaks everything at once
-/// (spec §5.2).
-fn warn_if_fd_budget_is_tight(max_targets_per_conn: u32) {
+/// Every tunnel costs one descriptor, and the quota is per connection, so the
+/// budget the process actually has to meet is
+/// `max_connections * max_targets_per_conn` — not one connection's share of it.
+/// The two keys are halves of one number and only their product can be compared
+/// against `RLIMIT_NOFILE`; checking one connection's worth was checking a bound
+/// no adversary is under, since a client holding credentials may open
+/// `max_connections` of them (review M7).
+///
+/// fd exhaustion is not a graceful failure mode. It degrades rather than
+/// crashes here — a `socket()` that fails becomes one refused tunnel — but it
+/// does so for every connection at once and for anything else the process needs
+/// a descriptor for, a certificate reload included (spec §5.2).
+fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
     let Some(limit) = crate::net::fd_soft_limit() else {
         debug!("could not read RLIMIT_NOFILE; skipping the fd budget check");
         return;
     };
 
-    if fd_budget_is_tight(limit, max_targets_per_conn) {
+    if fd_budget_is_tight(limit, limits.max_connections, limits.max_targets_per_conn) {
         warn!(
             fd_soft_limit = limit,
-            max_targets_per_conn,
-            "RLIMIT_NOFILE leaves no room for limits.max_targets_per_conn: one busy \
-             connection can exhaust the process. Raise LimitNOFILE (systemd) or lower \
-             the quota."
+            max_connections = limits.max_connections,
+            max_targets_per_conn = limits.max_targets_per_conn,
+            needed = fd_budget(limits.max_connections, limits.max_targets_per_conn),
+            "RLIMIT_NOFILE leaves no room for limits.max_connections x \
+             limits.max_targets_per_conn: clients at their quotas can exhaust the \
+             process. Raise LimitNOFILE (systemd) or lower either limit."
         );
     }
 }
 
-/// Whether `limit` descriptors are too few for a connection at its full quota.
+/// Whether `limit` descriptors are too few for every connection at its full
+/// quota.
 ///
 /// Split out from the warning so the arithmetic is testable without changing the
 /// process's actual limit.
-fn fd_budget_is_tight(limit: u64, max_targets_per_conn: u32) -> bool {
-    limit < u64::from(max_targets_per_conn) + FD_HEADROOM
+fn fd_budget_is_tight(limit: u64, max_connections: u32, max_targets_per_conn: u32) -> bool {
+    limit < fd_budget(max_connections, max_targets_per_conn)
+}
+
+/// Descriptors the configured limits allow to be open at once.
+///
+/// `max_connections = 0` means no cap on connections at all, which makes the
+/// product meaningless; the check falls back to one connection's quota there,
+/// which is the weakest claim that is still true. `Config::warnings` already
+/// says what removing that cap costs, and this is not the place to say it twice.
+fn fd_budget(max_connections: u32, max_targets_per_conn: u32) -> u64 {
+    let connections = u64::from(max_connections.max(1));
+    connections * u64::from(max_targets_per_conn) + FD_HEADROOM
 }
 
 /// One direction of the endpoint socket's buffer, with the names its messages
@@ -866,10 +922,27 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// default) in exchange for throughput we cannot measure a need for.
 const SEND_WINDOW: u64 = 10_000_000;
 
-/// Descriptors assumed to be needed beyond one connection's full tunnel quota:
-/// the endpoint socket, the request streams, stdio, and the start of a second
-/// connection.
+/// Descriptors assumed to be needed beyond the tunnel quota: the endpoint
+/// socket, the request streams, stdio, and the certificate reads a reload does.
 const FD_HEADROOM: u64 = 64;
+
+/// Unidirectional streams a peer may have open on one connection at a time.
+///
+/// HTTP/3 gives a client exactly three of them — the control stream and the
+/// QPACK encoder/decoder pair (RFC 9114 §6.2, RFC 9204 §4.2) — and Surge opens
+/// those three and nothing else. Everything past them is either an unknown type,
+/// which RFC 9114 §6.2 has this server abort rather than reject, or a second
+/// stream of a kind that may only be opened once, which is a connection error.
+/// So no client that behaves needs a fourth, and a peer that opens them anyway
+/// costs a task each while it says nothing.
+///
+/// Sixteen rather than three: this is a transport parameter, so exceeding it is
+/// a QUIC-level failure with no application-level explanation attached, and the
+/// margin means an ordinary client can only meet it by doing something the
+/// HTTP/3 layer would refuse anyway. The number this replaces is quinn's own
+/// default of 100, which this server had never taken a position on — the bidi
+/// limit beside it has been a configuration key all along (review L3).
+const MAX_PEER_UNI_STREAMS: u32 = 16;
 
 /// How long to wait for `CONNECTION_CLOSE` frames to be flushed on shutdown.
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
@@ -974,6 +1047,13 @@ mod tests {
             "{rendered}"
         );
         assert!(
+            rendered.contains(&format!(
+                "max_concurrent_uni_streams: {MAX_PEER_UNI_STREAMS}"
+            )),
+            "the peer's unidirectional stream limit is ours to state, not quinn's \
+             to default (review L3): {rendered}"
+        );
+        assert!(
             rendered.contains("1350"),
             "the initial MTU must apply: {rendered}"
         );
@@ -986,11 +1066,38 @@ mod tests {
     /// The check has to fire on the configuration that actually bites: a macOS
     /// default limit of 256 with the default quota of 256, where one connection
     /// at its quota consumes every descriptor the process has.
+    ///
+    /// And on the shipped one, which is the case that made the old
+    /// single-connection arithmetic wrong (review M7): 256 connections x 256
+    /// tunnels is exactly the `LimitNOFILE` the systemd unit sets, so the
+    /// defaults leave not one descriptor of headroom and the check said nothing.
     #[test]
     fn a_tight_fd_budget_is_recognised() {
-        assert!(fd_budget_is_tight(256, 256), "the macOS default pairing");
-        assert!(fd_budget_is_tight(1024, 1024));
-        assert!(fd_budget_is_tight(64, 1));
+        assert!(fd_budget_is_tight(256, 1, 256), "the macOS default pairing");
+        assert!(fd_budget_is_tight(1024, 1, 1024));
+        assert!(fd_budget_is_tight(64, 1, 1));
+
+        let defaults = crate::config::Limits::default();
+        assert!(
+            fd_budget_is_tight(
+                65536,
+                defaults.max_connections,
+                defaults.max_targets_per_conn
+            ),
+            "the shipped defaults against the shipped LimitNOFILE: {} x {} leaves \
+             nothing over",
+            defaults.max_connections,
+            defaults.max_targets_per_conn
+        );
+    }
+
+    /// `max_connections = 0` is "no cap", which has no product to check, so the
+    /// budget falls back to one connection's quota rather than to zero.
+    #[test]
+    fn an_uncapped_connection_count_falls_back_to_one_connection() {
+        assert_eq!(fd_budget(0, 256), fd_budget(1, 256));
+        assert!(!fd_budget_is_tight(1024, 0, 256));
+        assert!(fd_budget_is_tight(256, 0, 256));
     }
 
     /// The read-back convention differs by platform, so the judgement is written
@@ -1148,11 +1255,17 @@ mod tests {
 
     #[test]
     fn a_roomy_fd_budget_is_left_alone() {
-        // The Ubuntu default, and the dev host.
-        assert!(!fd_budget_is_tight(1024, 256));
-        assert!(!fd_budget_is_tight(1_048_576, 256));
+        // The Ubuntu default, and the dev host, against a single connection.
+        assert!(!fd_budget_is_tight(1024, 1, 256));
+        assert!(!fd_budget_is_tight(1_048_576, 1, 256));
         // Exactly the headroom, and one better.
-        assert!(!fd_budget_is_tight(FD_HEADROOM + 8, 8));
-        assert!(fd_budget_is_tight(FD_HEADROOM + 7, 8));
+        assert!(!fd_budget_is_tight(FD_HEADROOM + 8, 1, 8));
+        assert!(fd_budget_is_tight(FD_HEADROOM + 7, 1, 8));
+        // The product is what the limit is compared against: eight connections
+        // of eight tunnels need eight times as many descriptors as one does.
+        assert!(!fd_budget_is_tight(FD_HEADROOM + 64, 8, 8));
+        assert!(fd_budget_is_tight(FD_HEADROOM + 63, 8, 8));
+        // The shipped defaults, with the headroom the docs ask an operator for.
+        assert!(!fd_budget_is_tight(131_072, 256, 256));
     }
 }

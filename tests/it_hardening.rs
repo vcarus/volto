@@ -26,6 +26,9 @@ const H3_EXCESSIVE_LOAD: u64 = 0x107;
 /// H3_REQUEST_CANCELLED (RFC 9114 §8.1).
 const H3_REQUEST_CANCELLED: u64 = 0x10c;
 
+/// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1).
+const H3_STREAM_CREATION_ERROR: u32 = 0x103;
+
 /// A 2s idle timeout, which is also how long an answer to a request may take.
 ///
 /// Long enough that a deadline lapsing is a deliberate act rather than a slow
@@ -372,6 +375,61 @@ async fn a_zero_budget_disables_the_cap() {
             .is_err(),
         "with the cap disabled the connection must stay up"
     );
+}
+
+/// A unidirectional stream that never says what it is costs one stream, not the
+/// connection.
+///
+/// Reading the stream type is the one wait in the HTTP/3 layer with no protocol
+/// answer behind it: until the varint arrives there is nothing to say about the
+/// stream at all. A peer that opens streams and writes half a varint on each
+/// used to park a task apiece for the life of the connection, and the transport
+/// could not end it either, since the keep-alive here is answered by the
+/// client's own stack (review L3).
+///
+/// The bound is per stream and so is the answer. The 2s deadline is
+/// `DELIBERATE`'s idle timeout, and the connection is still serving requests
+/// afterwards.
+#[tokio::test]
+async fn a_unidirectional_stream_that_never_names_its_type_is_abandoned() {
+    let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+
+    let mut transport = quinn::TransportConfig::default();
+    // `DELIBERATE` switches the server's keep-alive off, so the client supplies
+    // one: without it the transport would close the connection at about the
+    // moment the deadline fires and this would prove nothing.
+    transport.keep_alive_interval(Some(Duration::from_millis(200)));
+    let mut client = H3Client::connect_with_transport(&server, transport).await;
+
+    let mut stalled = client
+        .quic
+        .open_uni()
+        .await
+        .expect("open a unidirectional stream");
+    // 0x40 opens a two-byte varint (RFC 9000 §16), so the type is one byte short
+    // of complete and the server is left reading for the rest of it.
+    stalled
+        .write_all(&[0x40])
+        .await
+        .expect("send half a stream type");
+
+    let stopped = tokio::time::timeout(TIMEOUT, stalled.stopped())
+        .await
+        .expect("the server must not read for a stream type indefinitely")
+        .expect("the stalled stream must be stopped, not broken");
+    assert_eq!(
+        stopped,
+        Some(quinn::VarInt::from_u32(H3_STREAM_CREATION_ERROR)),
+        "a stream that never declared itself is aborted the way an unknown one is"
+    );
+
+    assert!(
+        client.quic.close_reason().is_none(),
+        "abandoning one unidirectional stream must not end the connection"
+    );
+    // And it is still a working connection, not merely an unclosed one.
+    let _tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
 }
 
 /// Field sections of the largest advertised size one connection may hold

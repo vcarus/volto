@@ -15,6 +15,7 @@
 mod common;
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;
 
@@ -336,6 +337,84 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
     let (frame_type, payload) = read_frame(&mut recv).await;
     assert_eq!(frame_type, FRAME_HEADERS);
     assert_eq!(status_of(&payload), "403");
+}
+
+/// A QUIC handshake that never finishes must not sit on a connection slot.
+///
+/// One layer below everything else in this file. The slot is taken when the
+/// accept loop spawns the connection task, which is *before* the QUIC and TLS
+/// handshake happens, and quinn has no handshake-specific timer — any
+/// authenticated packet in any packet number space refreshes its idle timer, so
+/// a peer that keeps sending Initials and never completes the handshake keeps
+/// the slot (review M6).
+///
+/// The half-finished handshake is produced by relaying the client's packets to
+/// the server and dropping the server's answers, which is the shape without
+/// writing QUIC packets by hand: the server accepts a well-formed Initial and
+/// answers into a void, while the client's retransmissions keep arriving.
+///
+/// What the second client proves is the whole point: it connects *directly*,
+/// once the deadline has passed, and it can only be admitted if the slot came
+/// back. Refusal is immediate rather than a timeout, so this does not depend on
+/// how fast the machine running it is.
+#[tokio::test]
+async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
+    let server = TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}")).await;
+    let relay = one_way_relay(server.addr).await;
+
+    let mut transport = quinn::TransportConfig::default();
+    // Retransmit briskly, so the server keeps receiving Initials and its idle
+    // timer keeps being refreshed. Without this the transport's own timeout
+    // would end the connection at about the same moment the deadline does, and
+    // the test would pass whether the deadline existed or not.
+    transport.initial_rtt(Duration::from_millis(20));
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
+
+    // Started and deliberately not awaited: this handshake cannot complete.
+    // Dropping the `Connecting` would close it, which is exactly what must not
+    // happen while the server is being watched.
+    let _stalled = endpoint
+        .connect(relay, "localhost")
+        .expect("start a handshake that cannot finish");
+
+    // Comfortably past the server's 1s deadline, and comfortably short of the
+    // idle timeout the retransmissions above keep pushing out.
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+    let admitted = client_endpoint(&server.ca, &["h3"]);
+    let connection = finish_connect(&admitted, server.addr)
+        .await
+        .expect("the slot must come back once the stalled handshake is abandoned");
+    assert!(
+        connection.close_reason().is_none(),
+        "the second client must be admitted, not refused"
+    );
+}
+
+/// Carries packets one way only: client to `server`, and nothing back.
+///
+/// The socket hears both ends — the client sends to it, and the server answers
+/// to it, since that is the address its packets came from — so the direction is
+/// decided by who a packet came from.
+async fn one_way_relay(server: SocketAddr) -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay socket");
+    let addr = socket.local_addr().expect("the relay's address");
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
+            if from == server {
+                // The server's half of the handshake goes nowhere, which is
+                // what leaves it half-finished.
+                continue;
+            }
+            let _ = socket.send_to(&buf[..read], server).await;
+        }
+    });
+
+    addr
 }
 
 /// Opens a QUIC connection that keeps itself alive and never says anything.

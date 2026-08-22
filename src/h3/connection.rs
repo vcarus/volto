@@ -278,6 +278,13 @@ impl Drop for DatagramReceiver {
 pub(crate) struct Handle {
     /// The QUIC connection underneath.
     pub(crate) quic: quinn::Connection,
+    /// The connection's idle timeout, as [`Connection::handshake`] was given it.
+    ///
+    /// Carried because it is the only clock this layer has for the waits that
+    /// nothing else bounds: `crate::quic` owns the transport parameter and
+    /// quinn's own idle timer is no help while the peer keeps a keep-alive
+    /// answered. [`serve_stream`] is the one such wait.
+    idle: Duration,
     shared: Arc<Shared>,
 }
 
@@ -418,6 +425,7 @@ impl Connection {
     ) -> Result<Self, ConnectionError> {
         let handle = Handle {
             quic,
+            idle: within,
             shared: Arc::default(),
         };
 
@@ -718,16 +726,45 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
 }
 
 /// Dispatches one unidirectional stream by its type (RFC 9114 §6.2).
+///
+/// # The deadline on the type
+///
+/// A stream that has been opened but whose type varint has not arrived is a
+/// stream this endpoint can say nothing about: the type is what decides whether
+/// it is the control stream, a QPACK stream, or something to abort. Reading it
+/// is therefore the one wait here with no protocol answer to it, and a peer that
+/// opens streams and writes half a varint on each parks a task apiece for as
+/// long as the connection lives -- which is as long as it likes, since the QUIC
+/// idle timeout is fed by a keep-alive its own stack answers (review L3).
+///
+/// One idle timeout bounds it, matching [`Connection::handshake`]'s. What
+/// follows is a `stop`, not a connection error: nothing was violated, the
+/// stream simply never said what it was, and the peer keeps every stream it has
+/// underway. H3_STREAM_CREATION_ERROR is this endpoint's own choice of code and
+/// not the RFC's -- RFC 9114 §8.1 gives it for a stream that could not be
+/// created, which is the nearest registered thing to a stream that never
+/// declared itself, and it is what an unknown stream type is aborted with three
+/// arms below.
 async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
-    let stream_type = match read_stream_type(&mut recv).await {
-        Ok(Some(stream_type)) => stream_type,
+    let typed = tokio::time::timeout(handle.idle, read_stream_type(&mut recv)).await;
+
+    let stream_type = match typed {
+        Ok(Ok(Some(stream_type))) => stream_type,
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# A receiver MUST tolerate unidirectional streams being closed or reset
         //# prior to the reception of the unidirectional stream header.
-        Ok(None) => return,
-        Err(error) => {
+        Ok(Ok(None)) => return,
+        Ok(Err(error)) => {
             debug!(%error, "a unidirectional stream failed before its type arrived");
+            return;
+        }
+        Err(_elapsed) => {
+            debug!(
+                timeout_secs = handle.idle.as_secs(),
+                "abandoning a unidirectional stream whose type never arrived"
+            );
+            let _ = recv.stop(varint(Code::H3_STREAM_CREATION_ERROR));
             return;
         }
     };
