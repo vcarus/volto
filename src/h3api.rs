@@ -1,47 +1,36 @@
-//! Convergence layer over `h3` / `h3-quinn`.
+//! The public face of the HTTP/3 layer.
 //!
-//! This is the **only** module that may name types from `h3` or `h3-quinn`.
-//! Everything else in the crate goes through the wrappers below, so swapping the
-//! HTTP/3 implementation (the planned fallback is `quiche`) means rewriting this
-//! file and nothing else.
+//! Everything the rest of the crate needs from HTTP/3 is named here, and only
+//! here: `conn`, `quic` and the tunnels use `http`, `bytes` and `quinn` types
+//! plus the handful of wrappers below. That boundary began as insulation from
+//! the `h3` crate; it survives the move to [`crate::h3`] because it is worth
+//! having on its own terms -- it is the list of what a proxy actually asks of
+//! HTTP/3, and it is short.
 //!
-//! Types that are not HTTP/3-specific — `http::Request`, `http::StatusCode`,
-//! `bytes::Bytes` — are passed through unchanged; isolating those would buy
+//! Types that are not HTTP/3-specific -- `http::Request`, `http::StatusCode`,
+//! `bytes::Bytes` -- are passed through unchanged; isolating those would buy
 //! nothing.
 //!
 //! One deliberate exception: HTTP Datagrams (RFC 9297) are sent and received
-//! straight through `quinn::Connection`, not through this module. They are a QUIC
-//! transport facility rather than an `h3` one, and `h3-datagram` is excluded on
-//! purpose (see `Cargo.toml`). A backend swap therefore has to port the datagram
-//! task in `conn.rs` as well as this file.
+//! straight through `quinn::Connection`, not through this module. They are a
+//! QUIC transport facility rather than an HTTP/3 one, and the routing they need
+//! is per-session rather than per-connection, so the datagram task in `conn.rs`
+//! owns them end to end.
 
-use bytes::{Buf, Bytes};
-use http::{HeaderMap, Request, Response, StatusCode};
+use bytes::Bytes;
+use http::Request;
 
-/// Largest header section this server will decode, in bytes.
-///
-/// `h3` defaults this to `VarInt::MAX`, i.e. no limit, which means an
-/// unauthenticated peer's header block is buffered and QPACK-decoded in full
-/// before we can look at it. A CONNECT request's headers are a couple of hundred
-/// bytes, so 64 KiB is three hundred times the room anything legitimate needs.
-///
-/// The value is also advertised in SETTINGS, so a well-behaved client will not
-/// send more in the first place.
-const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
+pub use crate::h3::connection::Connection;
+pub use crate::h3::error::{Code, ConnectionError, StreamError};
+pub use crate::h3::stream::{Reader, Resolver, Stream, Writer};
+pub use crate::h3::MAX_FIELD_SECTION_SIZE;
+
+use crate::h3::stream::Protocol;
 
 /// The buffer type carried over HTTP/3 streams.
 pub type Buffer = Bytes;
 
-/// Error affecting a single request stream.
-pub type StreamError = h3::error::StreamError;
-
-/// Error affecting the whole HTTP/3 connection.
-pub type ConnectionError = h3::error::ConnectionError;
-
-/// An HTTP/3 error code.
-pub type Code = h3::error::Code;
-
-/// No error — a clean teardown.
+/// No error -- a clean teardown.
 pub const NO_ERROR: Code = Code::H3_NO_ERROR;
 
 /// The proxy's connection to the target failed or was reset (RFC 9114 §8.1).
@@ -79,36 +68,29 @@ pub const DATAGRAM_ERROR_CLOSE: quinn::VarInt =
 /// so the peer sees something meaningful in the CONNECTION_CLOSE frame.
 pub const AUTH_FAILURE_LIMIT_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x10b);
 
-type QuicConnection = h3_quinn::Connection;
-type BidiStream = h3_quinn::BidiStream<Buffer>;
+/// The `:protocol` token of RFC 9298's CONNECT-UDP.
+const CONNECT_UDP: &str = "connect-udp";
 
-/// The value of the `:protocol` pseudo-header, normalized away from `h3`.
+/// The value of the `:protocol` pseudo-header, classified.
+///
+/// [`ConnectProtocol::Unsupported`] borrows the token from the request, so the
+/// name that reaches the log and the 501 is the one the client actually sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectProtocol {
+pub enum ConnectProtocol<'a> {
     /// No `:protocol` pseudo-header: a classic CONNECT request (RFC 9114 §4.4).
     Absent,
-    /// `connect-udp` — a UDP tunnel (RFC 9298).
+    /// `connect-udp` -- a UDP tunnel (RFC 9298).
     ConnectUdp,
     /// A protocol this proxy does not implement. The payload is the wire name.
-    Unsupported(&'static str),
+    Unsupported(&'a str),
 }
 
 /// Reads the `:protocol` pseudo-header of a request.
-///
-/// Note a limitation of the current `h3` revision: a `:protocol` value it does
-/// not recognise is rejected as a malformed request (H3_MESSAGE_ERROR) before
-/// the request ever reaches us, so [`ConnectProtocol::Unsupported`] can only
-/// ever carry a protocol `h3` knows about.
-pub fn connect_protocol(req: &Request<()>) -> ConnectProtocol {
-    use h3::ext::Protocol;
-
+pub fn connect_protocol(req: &Request<()>) -> ConnectProtocol<'_> {
     match req.extensions().get::<Protocol>() {
         None => ConnectProtocol::Absent,
-        Some(p) if *p == Protocol::CONNECT_UDP => ConnectProtocol::ConnectUdp,
-        Some(p) if *p == Protocol::CONNECT_IP => ConnectProtocol::Unsupported("connect-ip"),
-        Some(p) if *p == Protocol::WEB_TRANSPORT => ConnectProtocol::Unsupported("webtransport"),
-        Some(p) if *p == Protocol::WEBSOCKET => ConnectProtocol::Unsupported("websocket"),
-        Some(_) => ConnectProtocol::Unsupported("unknown"),
+        Some(protocol) if protocol.as_str() == CONNECT_UDP => ConnectProtocol::ConnectUdp,
+        Some(protocol) => ConnectProtocol::Unsupported(protocol.as_str()),
     }
 }
 
@@ -134,28 +116,23 @@ pub enum BenignClose {
 ///
 /// The judgement is made on the error *value* on purpose. The obvious
 /// alternative — asking `quinn::Connection::close_reason()` afterwards — cannot
-/// work: dropping the `h3` connection closes the QUIC connection with
+/// work: dropping the HTTP/3 connection closes the QUIC connection with
 /// H3_NO_ERROR, and quinn's close path unconditionally overwrites whatever
 /// reason was stored with `LocallyClosed`. By the time a caller could ask, the
 /// real reason is gone. An error value, by contrast, is immutable and independent
 /// of drop order.
 pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
-    use h3::quic::ConnectionErrorIncoming;
-
     match error {
-        // `h3-quinn` maps `quinn::ConnectionError::TimedOut` onto this variant
-        // one-to-one, so it means exactly "the idle timeout expired". Clients
-        // that abandon a connection without a CONNECTION_CLOSE — Surge does this
-        // on a network switch or app exit — all end up here.
-        ConnectionError::Timeout { .. } => Some(BenignClose::Idle),
+        // The QUIC idle timeout, and nothing else. Clients that abandon a
+        // connection without a CONNECTION_CLOSE — Surge does this on a network
+        // switch or app exit — all end up here.
+        ConnectionError::Timeout => Some(BenignClose::Idle),
 
         // 0x0 is the application error code Surge actually sends when it closes
         // a connection cleanly; H3_NO_ERROR (0x100) is what RFC 9114 §8.1
         // defines for the same intent. Both mean the peer simply left. Any other
         // code is the peer reporting a problem and stays a warning.
-        ConnectionError::Remote(ConnectionErrorIncoming::ApplicationClose { error_code }, ..)
-            if *error_code == 0 || *error_code == NO_ERROR.value() =>
-        {
+        ConnectionError::ApplicationClose { code } if code.value() == 0 || *code == NO_ERROR => {
             Some(BenignClose::PeerClosed)
         }
 
@@ -163,182 +140,94 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
     }
 }
 
-/// An accepted HTTP/3 connection.
-pub struct Connection {
-    inner: h3::server::Connection<QuicConnection, Buffer>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Method;
 
-impl Connection {
-    /// Performs the HTTP/3 handshake on an established QUIC connection.
-    ///
-    /// Both settings below are **required** for Surge to accept the server: it
-    /// validates the SETTINGS frame and disconnects if either is missing. `h3`
-    /// defaults both to false, so they must be set explicitly.
-    pub async fn handshake(quic: quinn::Connection) -> Result<Self, ConnectionError> {
-        let mut builder = h3::server::builder();
-        builder
-            // SETTINGS_ENABLE_CONNECT_PROTOCOL (0x08) = 1
-            .enable_extended_connect(true)
-            // SETTINGS_H3_DATAGRAM (0x33) = 1
-            .enable_datagram(true)
-            // SETTINGS_MAX_FIELD_SECTION_SIZE (0x06)
-            .max_field_section_size(MAX_FIELD_SECTION_SIZE);
-
-        let inner = builder.build(h3_quinn::Connection::new(quic)).await?;
-        Ok(Self { inner })
-    }
-
-    /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
-    ///
-    /// RFC 9297 §2.1.1 forbids sending HTTP Datagrams before this is known to be
-    /// true. Until the peer's SETTINGS frame arrives this reports `false`, which
-    /// is the safe direction to be wrong in.
-    pub fn peer_datagrams_enabled(&self) -> bool {
-        use h3::ConnectionState as _;
-        self.inner.settings().enable_datagram()
-    }
-
-    /// Waits for the next request stream.
-    ///
-    /// `Ok(None)` means the peer will not send further requests.
-    pub async fn accept(&mut self) -> Result<Option<Resolver>, ConnectionError> {
-        Ok(self.inner.accept().await?.map(|inner| Resolver { inner }))
-    }
-
-    /// Starts a graceful shutdown by sending GOAWAY (RFC 9114 §5.2).
-    ///
-    /// The frame names the last request this connection will serve, so the client
-    /// knows to take new ones elsewhere while the ones in flight are allowed to
-    /// finish. Requests arriving after it are rejected by `h3` itself with
-    /// H3_REQUEST_REJECTED, which is the signal a client may safely retry on.
-    ///
-    /// Note what this does *not* do: it does not wait for anything, and the
-    /// connection stays usable afterwards. Deciding when the existing tunnels are
-    /// done is the caller's job — `accept()` will not report it, because at this
-    /// revision `h3` only reports completion once the *client* has sent a GOAWAY
-    /// too.
-    pub async fn shutdown(&mut self) -> Result<(), ConnectionError> {
-        // Zero further requests beyond the last one already accepted.
-        self.inner.shutdown(0).await
-    }
-}
-
-/// An accepted request stream whose headers have not been read yet.
-pub struct Resolver {
-    inner: h3::server::RequestResolver<QuicConnection, Buffer>,
-}
-
-impl Resolver {
-    /// Reads and decodes the request headers.
-    pub async fn resolve(self) -> Result<(Request<()>, Stream), StreamError> {
-        let (req, inner) = self.inner.resolve_request().await?;
-        Ok((req, Stream { inner }))
-    }
-}
-
-/// A bidirectional request stream.
-pub struct Stream {
-    inner: h3::server::RequestStream<BidiStream, Buffer>,
-}
-
-impl Stream {
-    /// The QUIC stream id.
-    ///
-    /// M2 needs this for the Quarter Stream ID of RFC 9297, which is this value
-    /// divided by four.
-    pub fn id(&self) -> u64 {
-        self.inner.id().into_inner()
-    }
-
-    /// Sends a response consisting of just a status line.
-    ///
-    /// A 2xx response to CONNECT must not carry Content-Length or
-    /// Transfer-Encoding (RFC 9114 §4.4); this sends no field lines at all.
-    pub async fn respond(&mut self, status: StatusCode) -> Result<(), StreamError> {
-        self.respond_with(status, HeaderMap::new()).await
-    }
-
-    /// Sends a response with `headers` and no body.
-    ///
-    /// Only the field lines given are sent — nothing synthesises a
-    /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
-    /// capsule-carrying response.
-    pub async fn respond_with(
-        &mut self,
-        status: StatusCode,
-        headers: HeaderMap,
-    ) -> Result<(), StreamError> {
-        let mut response = Response::builder()
-            .status(status)
+    fn request_with_protocol(protocol: Option<&str>) -> Request<()> {
+        let mut req = Request::builder()
+            .method(Method::CONNECT)
+            .uri("https://example.com/")
             .body(())
-            .expect("a status-only response is always valid");
-        *response.headers_mut() = headers;
-        self.inner.send_response(response).await
+            .expect("request");
+        if let Some(protocol) = protocol {
+            req.extensions_mut().insert(Protocol::new(protocol));
+        }
+        req
     }
 
-    /// Ends the sending side cleanly (a QUIC stream FIN).
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.inner.finish().await
+    #[test]
+    fn the_protocol_pseudo_header_is_classified() {
+        assert_eq!(
+            connect_protocol(&request_with_protocol(None)),
+            ConnectProtocol::Absent
+        );
+        assert_eq!(
+            connect_protocol(&request_with_protocol(Some("connect-udp"))),
+            ConnectProtocol::ConnectUdp
+        );
+        // The wire name survives, which is what makes a truthful 501 possible.
+        assert_eq!(
+            connect_protocol(&request_with_protocol(Some("connect-ip"))),
+            ConnectProtocol::Unsupported("connect-ip")
+        );
+        assert_eq!(
+            connect_protocol(&request_with_protocol(Some("webtransport"))),
+            ConnectProtocol::Unsupported("webtransport")
+        );
     }
 
-    /// Asks the peer to stop sending on this stream.
-    pub fn stop_receiving(&mut self, code: Code) {
-        self.inner.stop_sending(code);
+    #[test]
+    fn a_peer_reset_is_told_apart_from_every_other_failure() {
+        assert_eq!(
+            peer_reset_code(&StreamError::RemoteTerminate {
+                code: CONNECT_ERROR
+            }),
+            Some(0x10f)
+        );
+        assert_eq!(
+            peer_reset_code(&StreamError::Connection(ConnectionError::Timeout)),
+            None
+        );
     }
 
-    /// Splits the stream so each direction can be pumped independently.
-    ///
-    /// This is what makes TCP half-close expressible: one direction can finish
-    /// while the other keeps flowing.
-    pub fn split(self) -> (Writer, Reader) {
-        let (send, recv) = self.inner.split();
-        (Writer { inner: send }, Reader { inner: recv })
-    }
-}
-
-/// The sending half of a split request stream.
-pub struct Writer {
-    inner: h3::server::RequestStream<h3_quinn::SendStream<Buffer>, Buffer>,
-}
-
-impl Writer {
-    /// Sends body data, applying the peer's flow-control backpressure.
-    pub async fn send_data(&mut self, data: Buffer) -> Result<(), StreamError> {
-        self.inner.send_data(data).await
-    }
-
-    /// Ends the sending side cleanly (a QUIC stream FIN).
-    pub async fn finish(&mut self) -> Result<(), StreamError> {
-        self.inner.finish().await
-    }
-
-    /// Abruptly resets the sending side with an error code.
-    pub fn reset(&mut self, code: Code) {
-        self.inner.stop_stream(code);
-    }
-}
-
-/// The receiving half of a split request stream.
-pub struct Reader {
-    inner: h3::server::RequestStream<h3_quinn::RecvStream, Buffer>,
-}
-
-impl Reader {
-    /// Reads the next chunk of body data.
-    ///
-    /// `Ok(None)` means the peer finished its sending side — for a CONNECT
-    /// tunnel, the client's FIN.
-    pub async fn recv_data(&mut self) -> Result<Option<Buffer>, StreamError> {
-        match self.inner.recv_data().await? {
-            // The backend hands us an opaque `Buf`. For h3-quinn it is already
-            // `Bytes`, so taking all of it is a refcount bump, not a copy.
-            Some(mut buf) => Ok(Some(buf.copy_to_bytes(buf.remaining()))),
-            None => Ok(None),
+    /// The grading `quic.rs` logs by: two endings are routine, the rest warn.
+    #[test]
+    fn routine_endings_are_graded_as_such() {
+        assert_eq!(
+            benign_close(&ConnectionError::Timeout),
+            Some(BenignClose::Idle)
+        );
+        for code in [Code::new(0), NO_ERROR] {
+            assert_eq!(
+                benign_close(&ConnectionError::ApplicationClose { code }),
+                Some(BenignClose::PeerClosed),
+                "{code}"
+            );
         }
     }
 
-    /// Asks the peer to stop sending on this stream.
-    pub fn stop_receiving(&mut self, code: Code) {
-        self.inner.stop_sending(code);
+    #[test]
+    fn a_reported_problem_still_warns() {
+        assert_eq!(
+            benign_close(&ConnectionError::ApplicationClose {
+                code: Code::new(42)
+            }),
+            None
+        );
+        assert_eq!(
+            benign_close(&ConnectionError::Transport(
+                quinn::ConnectionError::LocallyClosed
+            )),
+            None
+        );
+    }
+
+    /// The two derived constants must stay equal to what they are derived from.
+    #[test]
+    fn the_datagram_close_code_matches_the_stream_code() {
+        assert_eq!(DATAGRAM_ERROR_CLOSE.into_inner(), DATAGRAM_ERROR.value());
+        assert_eq!(AUTH_FAILURE_LIMIT_CODE.into_inner(), 0x10b);
     }
 }

@@ -1,0 +1,872 @@
+//! The HTTP/3 frame layer (RFC 9114 §7).
+//!
+//! Every HTTP/3 stream carries the same shape:
+//!
+//! ```text
+//! Type (varint) | Length (varint) | Frame Payload (Length bytes)
+//! ```
+//!
+//! Two properties decide the design of [`FrameDecoder`], and they pull in
+//! opposite directions:
+//!
+//! * **DATA must not be buffered.** A CONNECT tunnel's payload arrives as DATA
+//!   frames, and this proxy exists to move them: a reader that accumulated a
+//!   whole frame before handing it on would add a copy and a latency step to
+//!   every packet. So DATA payload is handed out in exactly the chunks quinn
+//!   delivered it in, as [`Bytes`] slices of those chunks.
+//! * **Everything else must be buffered**, because it cannot be acted on
+//!   piecewise, and its declared length is a varint that may claim 2^62 bytes.
+//!   `MAX_BUFFERED_FRAME` is what stops a peer naming a length this server
+//!   would then allocate for.
+//!
+//! Unknown frame types are skipped by their declared length without being
+//! buffered at all (RFC 9114 §9). That is what lets the protocol be extended,
+//! and it is exercised on every connection: clients send reserved "grease"
+//! types precisely to catch a peer that cannot skip them.
+//!
+//! The decoder is pure: it holds every byte of state, and [`FrameReader`] is
+//! the twenty lines that feed it from a QUIC stream. That split is what makes
+//! the frame layer testable a byte at a time, and what makes [`FrameReader`]
+//! cancel-safe -- the only await is the read, and nothing it produces is lost
+//! by dropping the future. `tunnel::udp` reads request streams inside a
+//! `select!` with a timeout, so that property is load-bearing.
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::datagram::{peek_varint, put_varint, varint_len};
+
+use super::error::{Code, StreamError, Violation};
+use super::MAX_FIELD_SECTION_SIZE;
+
+/// DATA (RFC 9114 §7.2.1).
+pub const DATA: u64 = 0x00;
+/// HEADERS (RFC 9114 §7.2.2).
+pub const HEADERS: u64 = 0x01;
+/// CANCEL_PUSH (RFC 9114 §7.2.3).
+pub const CANCEL_PUSH: u64 = 0x03;
+/// SETTINGS (RFC 9114 §7.2.4).
+pub const SETTINGS: u64 = 0x04;
+/// PUSH_PROMISE (RFC 9114 §7.2.5).
+pub const PUSH_PROMISE: u64 = 0x05;
+/// GOAWAY (RFC 9114 §7.2.6).
+pub const GOAWAY: u64 = 0x07;
+/// MAX_PUSH_ID (RFC 9114 §7.2.7).
+pub const MAX_PUSH_ID: u64 = 0x0d;
+
+/// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
+///
+/// §7.2.8 makes their receipt a connection error rather than something to skip:
+/// a peer sending one has mistaken this connection for an HTTP/2 one, and
+/// nothing good follows from carrying on.
+const RESERVED_HTTP2_TYPES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
+
+/// `SETTINGS_QPACK_MAX_TABLE_CAPACITY` (RFC 9204 §5).
+pub const SETTING_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
+/// `SETTINGS_MAX_FIELD_SECTION_SIZE` (RFC 9114 §7.2.4.1).
+pub const SETTING_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
+/// `SETTINGS_QPACK_BLOCKED_STREAMS` (RFC 9204 §5).
+pub const SETTING_QPACK_BLOCKED_STREAMS: u64 = 0x07;
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 9220 §3).
+pub const SETTING_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
+/// `SETTINGS_H3_DATAGRAM` (RFC 9297 §2.1.1).
+pub const SETTING_H3_DATAGRAM: u64 = 0x33;
+
+/// Setting identifiers RFC 9114 §11.2.2 reserves because HTTP/2 used them.
+const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
+
+/// Largest payload this reader will buffer for one non-DATA frame.
+///
+/// A HEADERS frame is the only buffered frame a peer controls the size of, and
+/// its encoded form is always smaller than the field section it decodes to --
+/// which [`MAX_FIELD_SECTION_SIZE`] already bounds. So this cannot refuse
+/// anything the advertised limit would have allowed, and it refuses it before
+/// a single byte is allocated rather than after 2^62 were promised.
+const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
+
+/// Longest frame header there can be: a type and a length, both varints.
+const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
+
+/// Why the frame reader stopped.
+#[derive(Debug)]
+pub enum Error {
+    /// The QUIC stream failed under the reader: a peer reset, or the
+    /// connection it belongs to.
+    Stream(StreamError),
+    /// The peer broke one of RFC 9114 §7's rules.
+    Protocol(Violation),
+}
+
+impl From<StreamError> for Error {
+    fn from(error: StreamError) -> Self {
+        Self::Stream(error)
+    }
+}
+
+impl From<Violation> for Error {
+    fn from(violation: Violation) -> Self {
+        Self::Protocol(violation)
+    }
+}
+
+impl From<quinn::ReadError> for Error {
+    fn from(error: quinn::ReadError) -> Self {
+        Self::Stream(error.into())
+    }
+}
+
+/// What [`FrameReader::next`] produces.
+#[derive(Debug)]
+pub enum Item {
+    /// Payload of a DATA frame, in the chunk it arrived in.
+    ///
+    /// One frame may produce several of these, and a chunk never spans two
+    /// frames.
+    Data(Bytes),
+    /// A complete frame of any other type this server acts on.
+    Frame(Frame),
+}
+
+/// A fully received non-DATA frame.
+#[derive(Debug)]
+pub enum Frame {
+    /// An encoded field section (RFC 9114 §7.2.2), still QPACK-encoded.
+    Headers(Bytes),
+    /// The peer's settings, reduced to the one this server acts on.
+    Settings(Settings),
+    /// GOAWAY with the identifier the peer will not serve past.
+    Goaway(u64),
+    /// CANCEL_PUSH, which a server that never pushes has nothing to do about.
+    CancelPush(u64),
+    /// MAX_PUSH_ID, likewise.
+    MaxPushId(u64),
+    /// PUSH_PROMISE, which a server must never receive (RFC 9114 §7.2.5).
+    PushPromise,
+}
+
+/// The peer's SETTINGS, reduced to what this server acts on.
+///
+/// Only one setting changes any behaviour here: RFC 9297 §2.1.1 forbids sending
+/// HTTP Datagrams until the peer has advertised support for them, and a
+/// CONNECT-UDP session falls back to capsules on the request stream until it
+/// has. Everything else is validated as the RFC requires and then dropped,
+/// because keeping a value nothing reads is how a setting silently stops being
+/// honoured.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `SETTINGS_H3_DATAGRAM = 1`.
+    pub datagrams: bool,
+}
+
+/// Where the decoder is in the frame sequence.
+#[derive(Debug, Clone, Copy)]
+enum State {
+    /// Between frames, assembling a type and length.
+    Header,
+    /// Inside a DATA frame, with `remaining` payload bytes to hand out.
+    Data {
+        /// Payload bytes of this frame not yet delivered.
+        remaining: u64,
+    },
+    /// Buffering the payload of a frame that has to be seen whole.
+    Buffering {
+        /// Which frame is being buffered.
+        kind: u64,
+        /// Payload bytes still to arrive.
+        remaining: usize,
+    },
+    /// Discarding the payload of a frame type this server does not know.
+    Skipping {
+        /// Payload bytes still to discard.
+        remaining: u64,
+    },
+}
+
+/// An incremental frame decoder, fed chunks as they arrive.
+///
+/// Written the same way as [`crate::capsule::CapsuleDecoder`], and for the same
+/// reason: frames do not align with stream chunks in either direction, so the
+/// decoder has to be a state machine that can be fed a byte at a time -- which
+/// is exactly how the tests below feed it.
+#[derive(Debug)]
+pub struct FrameDecoder {
+    /// The chunk last pushed, with the consumed prefix removed.
+    chunk: Bytes,
+    /// Frame header bytes carried over from earlier chunks.
+    header: BytesMut,
+    /// Payload of the frame currently being buffered.
+    payload: BytesMut,
+    state: State,
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameDecoder {
+    /// A decoder positioned at the start of a stream's frame sequence.
+    pub fn new() -> Self {
+        Self {
+            chunk: Bytes::new(),
+            header: BytesMut::with_capacity(MAX_FRAME_HEADER),
+            payload: BytesMut::new(),
+            state: State::Header,
+        }
+    }
+
+    /// Hands the decoder the next chunk of stream.
+    ///
+    /// Only legal once [`Self::next_item`] has asked for more, which is the only
+    /// state in which the previous chunk is spent.
+    pub fn push(&mut self, chunk: Bytes) {
+        debug_assert!(self.chunk.is_empty(), "the previous chunk is not consumed");
+        self.chunk = chunk;
+    }
+
+    /// Whether the stream could end here without truncating a frame.
+    ///
+    /// RFC 9114 §7.1: "When a stream terminates cleanly, if the last frame on
+    /// the stream was truncated, this MUST be treated as a connection error of
+    /// type H3_FRAME_ERROR."
+    pub fn at_frame_boundary(&self) -> bool {
+        matches!(self.state, State::Header) && self.header.is_empty()
+    }
+
+    /// The next item, or `None` when more bytes are needed.
+    pub fn next_item(&mut self) -> Result<Option<Item>, Error> {
+        loop {
+            match self.state {
+                State::Header => {
+                    let Some((kind, length)) = self.take_frame_header() else {
+                        return Ok(None);
+                    };
+                    self.state = begin(kind, length)?;
+                }
+
+                // An empty DATA frame is legal and carries nothing; the two
+                // arms are separate so it cannot be mistaken for "no bytes have
+                // arrived yet", which is the same `take == 0` below.
+                State::Data { remaining: 0 } => self.state = State::Header,
+
+                State::Data { remaining } => {
+                    let take = remaining.min(self.chunk.len() as u64) as usize;
+                    if take == 0 {
+                        return Ok(None);
+                    }
+                    // A slice of quinn's own buffer: a refcount bump, not a copy.
+                    let data = self.chunk.split_to(take);
+                    // Back to `Header` as soon as the frame is spent, so the end
+                    // of a frame and the end of a stream agree about where a
+                    // boundary is.
+                    self.state = match remaining - take as u64 {
+                        0 => State::Header,
+                        left => State::Data { remaining: left },
+                    };
+                    return Ok(Some(Item::Data(data)));
+                }
+
+                State::Buffering { kind, remaining } => {
+                    let take = remaining.min(self.chunk.len());
+                    self.payload.extend_from_slice(&self.chunk[..take]);
+                    self.chunk.advance(take);
+
+                    if take < remaining {
+                        self.state = State::Buffering {
+                            kind,
+                            remaining: remaining - take,
+                        };
+                        return Ok(None);
+                    }
+                    self.state = State::Header;
+                    let payload = self.payload.split().freeze();
+                    return Ok(Some(Item::Frame(parse(kind, payload)?)));
+                }
+
+                State::Skipping { remaining } => {
+                    let take = remaining.min(self.chunk.len() as u64) as usize;
+                    self.chunk.advance(take);
+
+                    match remaining - take as u64 {
+                        0 => self.state = State::Header,
+                        left => {
+                            self.state = State::Skipping { remaining: left };
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reads a frame type and length, or `None` if not all of it has arrived.
+    ///
+    /// Byte at a time because a header is at most [`MAX_FRAME_HEADER`] bytes and
+    /// may straddle any number of chunks; the copy is into a buffer that never
+    /// grows past that.
+    fn take_frame_header(&mut self) -> Option<(u64, u64)> {
+        loop {
+            if let Some((kind, used)) = peek_varint(&self.header) {
+                if let Some((length, _)) = peek_varint(&self.header[used..]) {
+                    self.header.clear();
+                    return Some((kind, length));
+                }
+            }
+
+            let byte = *self.chunk.first()?;
+            self.chunk.advance(1);
+            self.header.put_u8(byte);
+        }
+    }
+}
+
+/// A [`FrameDecoder`] wired to a QUIC receive stream.
+///
+/// All of the awaiting happens in one place -- [`quinn::RecvStream::read_chunk`]
+/// -- and every byte it produces is accounted for in the decoder before this
+/// returns, which is what makes [`Self::next`] cancel-safe. `tunnel::udp` reads
+/// request streams inside a `select!` with a timeout, so a dropped read future
+/// must never lose a parsed frame header.
+pub struct FrameReader {
+    recv: quinn::RecvStream,
+    decoder: FrameDecoder,
+    /// Set once the peer has finished its sending side.
+    finished: bool,
+}
+
+impl FrameReader {
+    /// A reader positioned at the start of a stream's frame sequence.
+    pub fn new(recv: quinn::RecvStream) -> Self {
+        Self {
+            recv,
+            decoder: FrameDecoder::new(),
+            finished: false,
+        }
+    }
+
+    /// Asks the peer to stop sending on this stream.
+    pub fn stop(&mut self, code: Code) {
+        // Fails only if the stream is already closed, which needs no reporting.
+        let _ = self.recv.stop(super::varint(code));
+    }
+
+    /// Reads the next item, or `None` once the peer has finished cleanly.
+    pub async fn next(&mut self) -> Result<Option<Item>, Error> {
+        loop {
+            if let Some(item) = self.decoder.next_item()? {
+                return Ok(Some(item));
+            }
+            if self.finished {
+                return Ok(None);
+            }
+
+            match self.recv.read_chunk(usize::MAX, true).await? {
+                Some(chunk) => self.decoder.push(chunk.bytes),
+                None => {
+                    self.finished = true;
+                    if !self.decoder.at_frame_boundary() {
+                        return Err(Violation::connection(
+                            Code::H3_FRAME_ERROR,
+                            "the stream ended part-way through a frame",
+                        )
+                        .into());
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
+/// Decides what to do with a frame that has just been announced.
+fn begin(kind: u64, length: u64) -> Result<State, Error> {
+    if RESERVED_HTTP2_TYPES.contains(&kind) {
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
+        //# These frame types MUST NOT be sent, and their receipt MUST be
+        //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+        return Err(Violation::connection(
+            Code::H3_FRAME_UNEXPECTED,
+            format!("frame type {kind:#x} is reserved for HTTP/2"),
+        )
+        .into());
+    }
+
+    Ok(match kind {
+        DATA => State::Data { remaining: length },
+
+        HEADERS | SETTINGS | GOAWAY | CANCEL_PUSH | MAX_PUSH_ID | PUSH_PROMISE => {
+            if length > MAX_BUFFERED_FRAME {
+                return Err(Violation::stream(
+                    Code::H3_EXCESSIVE_LOAD,
+                    format!("a {length}-byte frame is past what this server buffers"),
+                )
+                .into());
+            }
+            State::Buffering {
+                kind,
+                remaining: length as usize,
+            }
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-9
+        //# Implementations MUST ignore unknown or unsupported values in all
+        //# extensible protocol elements.
+        _ => State::Skipping { remaining: length },
+    })
+}
+
+/// Parses a buffered frame payload.
+fn parse(kind: u64, payload: Bytes) -> Result<Frame, Violation> {
+    match kind {
+        HEADERS => Ok(Frame::Headers(payload)),
+        SETTINGS => parse_settings(&payload).map(Frame::Settings),
+        GOAWAY => single_varint(GOAWAY, &payload).map(Frame::Goaway),
+        CANCEL_PUSH => single_varint(CANCEL_PUSH, &payload).map(Frame::CancelPush),
+        MAX_PUSH_ID => single_varint(MAX_PUSH_ID, &payload).map(Frame::MaxPushId),
+        PUSH_PROMISE => Ok(Frame::PushPromise),
+        // `begin` only buffers the types above.
+        other => unreachable!("frame type {other:#x} is not buffered"),
+    }
+}
+
+/// Reads a payload that is exactly one varint (GOAWAY, CANCEL_PUSH,
+/// MAX_PUSH_ID).
+///
+/// RFC 9114 §7.1: a payload with bytes left over, or one that ends early, is a
+/// connection error of type H3_FRAME_ERROR.
+fn single_varint(kind: u64, payload: &[u8]) -> Result<u64, Violation> {
+    match peek_varint(payload) {
+        Some((value, used)) if used == payload.len() => Ok(value),
+        _ => Err(Violation::connection(
+            Code::H3_FRAME_ERROR,
+            format!("frame type {kind:#x} does not carry exactly one varint"),
+        )),
+    }
+}
+
+/// Parses a SETTINGS payload (RFC 9114 §7.2.4).
+fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
+    let mut settings = Settings::default();
+    let mut seen = Vec::new();
+
+    while !payload.is_empty() {
+        let (identifier, used) = peek_varint(payload).ok_or_else(truncated_settings)?;
+        payload = &payload[used..];
+        let (value, used) = peek_varint(payload).ok_or_else(truncated_settings)?;
+        payload = &payload[used..];
+
+        if RESERVED_HTTP2_SETTINGS.contains(&identifier) {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4.1
+            //# These reserved settings MUST NOT be sent, and their receipt MUST
+            //# be treated as a connection error of type H3_SETTINGS_ERROR.
+            return Err(settings_error(format!(
+                "setting {identifier:#x} is reserved for HTTP/2"
+            )));
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+        //# The same setting identifier MUST NOT occur more than once in the
+        //# SETTINGS frame.
+        if seen.contains(&identifier) {
+            return Err(settings_error(format!(
+                "setting {identifier:#x} occurs more than once"
+            )));
+        }
+        seen.push(identifier);
+
+        match identifier {
+            // RFC 9297 §2.1.1: "The value of the SETTINGS_H3_DATAGRAM setting
+            // MUST be either 0 or 1."
+            SETTING_H3_DATAGRAM => settings.datagrams = boolean(identifier, value)?,
+            // RFC 9220 §3 gives this setting the semantics it has in HTTP/2,
+            // where RFC 8441 §3 says "The value of the parameter MUST be 0
+            // or 1."
+            SETTING_ENABLE_CONNECT_PROTOCOL => {
+                boolean(identifier, value)?;
+            }
+            // Everything else is ignored: RFC 9114 §7.2.4 for an identifier
+            // this server does not understand, §7.2.4.1 for a reserved one.
+            _ => {}
+        }
+    }
+
+    Ok(settings)
+}
+
+/// Reads a setting whose value the RFC restricts to 0 or 1.
+fn boolean(identifier: u64, value: u64) -> Result<bool, Violation> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(settings_error(format!(
+            "setting {identifier:#x} must be 0 or 1, not {other}"
+        ))),
+    }
+}
+
+/// A SETTINGS payload that ends in the middle of a pair.
+fn truncated_settings() -> Violation {
+    settings_error("the SETTINGS payload ends mid-pair")
+}
+
+/// Every SETTINGS fault is the same connection error (RFC 9114 §7.2.4.1).
+fn settings_error(detail: impl Into<std::borrow::Cow<'static, str>>) -> Violation {
+    Violation::connection(Code::H3_SETTINGS_ERROR, detail)
+}
+
+/// Writes a frame header: type and payload length.
+pub fn put_header(out: &mut BytesMut, kind: u64, length: u64) {
+    out.reserve(varint_len(kind) + varint_len(length));
+    put_varint(out, kind);
+    put_varint(out, length);
+}
+
+/// The SETTINGS frame this server sends, payload only.
+///
+/// The two that Surge validates and disconnects without --
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` and `SETTINGS_H3_DATAGRAM` -- are the
+/// reason this server exists at all. The two QPACK settings are sent as zeroes
+/// on purpose: they are what makes a static-table-only decoder correct rather
+/// than merely adequate (see [`super::qpack`]), and they bind the peer's
+/// encoder: RFC 9204 §3.2.3 for the dynamic table capacity, §2.1.2 for the
+/// number of streams it may let block.
+pub fn settings_payload() -> BytesMut {
+    /// One reserved identifier of the form 0x1f * N + 0x21, which RFC 9114
+    /// §7.2.4.1 says endpoints SHOULD send so that peers keep exercising the
+    /// rule that unknown identifiers are ignored.
+    const GREASE: u64 = 0x1f * 8 + 0x21;
+
+    let mut payload = BytesMut::new();
+    for (identifier, value) in [
+        (SETTING_QPACK_MAX_TABLE_CAPACITY, 0),
+        (SETTING_QPACK_BLOCKED_STREAMS, 0),
+        (SETTING_MAX_FIELD_SECTION_SIZE, MAX_FIELD_SECTION_SIZE),
+        (SETTING_ENABLE_CONNECT_PROTOCOL, 1),
+        (SETTING_H3_DATAGRAM, 1),
+        (GREASE, 0),
+    ] {
+        put_varint(&mut payload, identifier);
+        put_varint(&mut payload, value);
+    }
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(pairs: &[(u64, u64)]) -> Vec<u8> {
+        let mut payload = BytesMut::new();
+        for (identifier, value) in pairs {
+            put_varint(&mut payload, *identifier);
+            put_varint(&mut payload, *value);
+        }
+        payload.to_vec()
+    }
+
+    #[test]
+    fn the_advertised_settings_are_the_ones_surge_checks_for() {
+        let payload = settings_payload();
+        let mut rest = &payload[..];
+        let mut found = std::collections::HashMap::new();
+
+        while !rest.is_empty() {
+            let (identifier, used) = peek_varint(rest).expect("identifier");
+            rest = &rest[used..];
+            let (value, used) = peek_varint(rest).expect("value");
+            rest = &rest[used..];
+            assert!(found.insert(identifier, value).is_none(), "duplicate");
+        }
+
+        assert_eq!(found.get(&SETTING_ENABLE_CONNECT_PROTOCOL), Some(&1));
+        assert_eq!(found.get(&SETTING_H3_DATAGRAM), Some(&1));
+        assert_eq!(
+            found.get(&SETTING_MAX_FIELD_SECTION_SIZE),
+            Some(&MAX_FIELD_SECTION_SIZE)
+        );
+        assert_eq!(found.get(&SETTING_QPACK_MAX_TABLE_CAPACITY), Some(&0));
+        assert_eq!(found.get(&SETTING_QPACK_BLOCKED_STREAMS), Some(&0));
+    }
+
+    /// What this server sends must survive its own parser, reserved-identifier
+    /// and duplicate rules included.
+    #[test]
+    fn our_own_settings_parse() {
+        let parsed = parse_settings(&settings_payload()).expect("parses");
+        assert!(parsed.datagrams);
+    }
+
+    #[test]
+    fn a_peer_that_enables_datagrams_is_recognised() {
+        assert!(
+            parse_settings(&settings(&[(SETTING_H3_DATAGRAM, 1)]))
+                .expect("parses")
+                .datagrams
+        );
+        assert!(
+            !parse_settings(&settings(&[(SETTING_H3_DATAGRAM, 0)]))
+                .expect("parses")
+                .datagrams
+        );
+        // Absent means absent: RFC 9297 §2.1.1 defaults it to off.
+        assert!(!parse_settings(&[]).expect("parses").datagrams);
+    }
+
+    #[test]
+    fn unknown_and_grease_settings_are_ignored() {
+        let parsed = parse_settings(&settings(&[
+            (0x1f * 3 + 0x21, 0),
+            (0x4242, 99),
+            (SETTING_H3_DATAGRAM, 1),
+        ]))
+        .expect("parses");
+        assert!(parsed.datagrams);
+    }
+
+    #[test]
+    fn reserved_http2_setting_identifiers_are_refused() {
+        for identifier in RESERVED_HTTP2_SETTINGS {
+            let error = parse_settings(&settings(&[(identifier, 0)])).expect_err("refused");
+            assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+            assert!(error.is_connection_error());
+        }
+    }
+
+    #[test]
+    fn a_repeated_setting_identifier_is_refused() {
+        let error = parse_settings(&settings(&[
+            (SETTING_H3_DATAGRAM, 1),
+            (SETTING_H3_DATAGRAM, 1),
+        ]))
+        .expect_err("refused");
+        assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+    }
+
+    #[test]
+    fn a_boolean_setting_with_another_value_is_refused() {
+        for identifier in [SETTING_H3_DATAGRAM, SETTING_ENABLE_CONNECT_PROTOCOL] {
+            let error = parse_settings(&settings(&[(identifier, 2)])).expect_err("refused");
+            assert_eq!(error.code(), Code::H3_SETTINGS_ERROR);
+        }
+        // A setting whose value this server does not constrain is untouched.
+        assert!(parse_settings(&settings(&[(SETTING_MAX_FIELD_SECTION_SIZE, 1 << 40)])).is_ok());
+    }
+
+    #[test]
+    fn a_settings_payload_that_ends_mid_pair_is_refused() {
+        let mut payload = settings(&[(SETTING_H3_DATAGRAM, 1)]);
+        payload.pop();
+        assert_eq!(
+            parse_settings(&payload).expect_err("refused").code(),
+            Code::H3_SETTINGS_ERROR
+        );
+    }
+
+    #[test]
+    fn goaway_carries_exactly_one_varint() {
+        assert_eq!(single_varint(GOAWAY, &[0x04]).expect("parses"), 4);
+        // Trailing bytes and a truncated varint are both H3_FRAME_ERROR.
+        for payload in [&[0x04, 0x00][..], &[][..], &[0xc0][..]] {
+            let error = single_varint(GOAWAY, payload).expect_err("refused");
+            assert_eq!(error.code(), Code::H3_FRAME_ERROR);
+            assert!(error.is_connection_error());
+        }
+    }
+
+    /// Encodes a frame with `kind` and `payload` for the decoder tests.
+    fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = BytesMut::new();
+        put_header(&mut out, kind, payload.len() as u64);
+        out.extend_from_slice(payload);
+        out.to_vec()
+    }
+
+    /// Feeds `wire` to a decoder one byte at a time and collects what comes out.
+    ///
+    /// A byte at a time on purpose: it is the worst case a real stream can
+    /// produce, and the only way to prove a frame header straddling chunks is
+    /// reassembled rather than mis-parsed.
+    fn decode_bytewise(wire: &[u8]) -> Result<Vec<Item>, Error> {
+        let mut decoder = FrameDecoder::new();
+        let mut items = Vec::new();
+
+        for byte in wire {
+            decoder.push(Bytes::copy_from_slice(&[*byte]));
+            while let Some(item) = decoder.next_item()? {
+                items.push(item);
+            }
+        }
+        Ok(items)
+    }
+
+    #[test]
+    fn a_headers_frame_split_across_chunks_is_reassembled() {
+        // A length that needs a two-byte varint, so the header itself straddles.
+        let block = vec![0x5au8; 200];
+        let items = decode_bytewise(&frame(HEADERS, &block)).expect("decodes");
+
+        assert_eq!(items.len(), 1);
+        let Item::Frame(Frame::Headers(decoded)) = &items[0] else {
+            panic!("expected HEADERS, got {items:?}")
+        };
+        assert_eq!(&decoded[..], &block[..]);
+    }
+
+    /// DATA is handed out in the chunks it arrived in, never accumulated.
+    #[test]
+    fn data_payload_is_handed_out_as_it_arrives() {
+        let items = decode_bytewise(&frame(DATA, b"hello")).expect("decodes");
+
+        let payload: Vec<u8> = items
+            .iter()
+            .flat_map(|item| match item {
+                Item::Data(chunk) => chunk.clone(),
+                other => panic!("expected DATA, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(payload, b"hello");
+        assert_eq!(items.len(), 5, "one item per arriving byte");
+    }
+
+    /// One chunk holding several frames must produce all of them, and a chunk
+    /// never spans two frames.
+    #[test]
+    fn several_frames_in_one_chunk_all_come_out() {
+        let mut wire = frame(DATA, b"abc");
+        wire.extend_from_slice(&frame(HEADERS, b"block"));
+        wire.extend_from_slice(&frame(DATA, b"de"));
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(Bytes::from(wire));
+
+        let mut items = Vec::new();
+        while let Some(item) = decoder.next_item().expect("decodes") {
+            items.push(item);
+        }
+
+        assert!(matches!(&items[0], Item::Data(chunk) if &chunk[..] == b"abc"));
+        assert!(matches!(&items[1], Item::Frame(Frame::Headers(block)) if &block[..] == b"block"));
+        assert!(matches!(&items[2], Item::Data(chunk) if &chunk[..] == b"de"));
+        assert_eq!(items.len(), 3);
+    }
+
+    /// RFC 9114 §9: unknown types, grease included, are skipped by their
+    /// declared length and never buffered.
+    #[test]
+    fn unknown_frame_types_are_skipped() {
+        for kind in [0x21u64, 0x1f * 7 + 0x21, 0x4242] {
+            let mut wire = frame(kind, b"whatever this is");
+            wire.extend_from_slice(&frame(DATA, b"body"));
+
+            let items = decode_bytewise(&wire).expect("decodes");
+            let payload: Vec<u8> = items
+                .iter()
+                .flat_map(|item| match item {
+                    Item::Data(chunk) => chunk.clone(),
+                    other => panic!("expected only DATA, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(payload, b"body", "grease type {kind:#x}");
+        }
+    }
+
+    /// An empty frame of either kind must not stall the decoder waiting for a
+    /// payload that will never come.
+    #[test]
+    fn zero_length_frames_do_not_stall_the_decoder() {
+        let mut wire = frame(DATA, b"");
+        wire.extend_from_slice(&frame(0x21, b""));
+        wire.extend_from_slice(&frame(HEADERS, b""));
+
+        let items = decode_bytewise(&wire).expect("decodes");
+        assert!(matches!(&items[..], [Item::Frame(Frame::Headers(block))] if block.is_empty()));
+    }
+
+    /// RFC 9114 §7.2.8: the types HTTP/2 used and HTTP/3 does not are a
+    /// connection error, not something to skip.
+    #[test]
+    fn reserved_http2_frame_types_end_the_connection() {
+        for kind in RESERVED_HTTP2_TYPES {
+            let Err(Error::Protocol(violation)) = begin(kind, 0) else {
+                panic!("frame type {kind:#x} must be refused")
+            };
+            assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
+            assert!(violation.is_connection_error());
+        }
+    }
+
+    #[test]
+    fn a_frame_past_the_buffer_limit_is_refused_before_it_is_allocated() {
+        let Err(Error::Protocol(violation)) = begin(HEADERS, MAX_BUFFERED_FRAME + 1) else {
+            panic!("an oversized frame must be refused")
+        };
+        assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+        assert!(
+            !violation.is_connection_error(),
+            "one oversized frame is a stream problem, not a connection one"
+        );
+
+        assert!(begin(HEADERS, MAX_BUFFERED_FRAME).is_ok());
+        // DATA is never buffered, so no declared length can be too large.
+        assert!(begin(DATA, crate::datagram::VARINT_MAX).is_ok());
+    }
+
+    /// RFC 9114 §7.1: a stream that ends inside a frame is an error, and one
+    /// that ends between them is the ordinary end of a request body.
+    #[test]
+    fn a_frame_boundary_is_where_a_stream_may_end() {
+        let mut decoder = FrameDecoder::new();
+        assert!(decoder.at_frame_boundary());
+
+        decoder.push(Bytes::from(frame(DATA, b"abcd")));
+        assert!(matches!(
+            decoder.next_item().expect("decodes"),
+            Some(Item::Data(_))
+        ));
+        assert!(decoder.at_frame_boundary());
+
+        // Half a frame header, then half a payload: neither is a place to stop.
+        let mut decoder = FrameDecoder::new();
+        decoder.push(Bytes::from_static(&[0x00]));
+        assert!(decoder.next_item().expect("decodes").is_none());
+        assert!(!decoder.at_frame_boundary());
+
+        let mut decoder = FrameDecoder::new();
+        decoder.push(Bytes::from_static(&[0x00, 0x04, b'a']));
+        assert!(decoder.next_item().expect("decodes").is_some());
+        assert!(!decoder.at_frame_boundary());
+    }
+
+    /// The decoder reads bytes from an unauthenticated peer, so it may reject
+    /// anything but must never panic.
+    #[test]
+    fn arbitrary_bytes_never_panic_the_frame_decoder() {
+        proptest::proptest!(|(wire: Vec<u8>)| {
+            let mut decoder = FrameDecoder::new();
+            decoder.push(Bytes::from(wire));
+            while let Ok(Some(_)) = decoder.next_item() {}
+        });
+    }
+
+    #[test]
+    fn frame_headers_round_trip() {
+        for (kind, length) in [(DATA, 0u64), (HEADERS, 63), (SETTINGS, 16_384), (0x1f21, 1)] {
+            let mut buf = BytesMut::new();
+            put_header(&mut buf, kind, length);
+
+            let (decoded_kind, used) = peek_varint(&buf).expect("type");
+            let (decoded_length, used_more) = peek_varint(&buf[used..]).expect("length");
+            assert_eq!((decoded_kind, decoded_length), (kind, length));
+            assert_eq!(used + used_more, buf.len());
+        }
+    }
+
+    /// The parser is fed bytes from an unauthenticated peer, so it may reject
+    /// anything but must never panic.
+    #[test]
+    fn arbitrary_bytes_never_panic_the_settings_parser() {
+        proptest::proptest!(|(payload: Vec<u8>)| {
+            let _ = parse_settings(&payload);
+        });
+    }
+}

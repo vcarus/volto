@@ -21,23 +21,6 @@ use crate::shutdown::Shutdown;
 use crate::tunnel::{self, udp, Context, ProxyError, Route};
 use crate::{auth, h3api};
 
-/// How often the peer's SETTINGS are re-read while datagram support is unknown.
-///
-/// Doubles as the bound on how long the first CONNECT-UDP session of a
-/// connection can spend on the capsule fallback waiting for them.
-const SETTINGS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// How many times those SETTINGS are re-read before the answer is taken as final.
-///
-/// RFC 9114 §6.2.1 makes SETTINGS the first frame on the control stream, and
-/// §7.2.4 forbids reducing a setting later, so the answer is settled one round
-/// trip into the connection and cannot change afterwards. At
-/// [`SETTINGS_POLL_INTERVAL`] this is ten seconds of grace — orders of magnitude
-/// past any real path — after which a peer that still has not enabled datagrams
-/// never will, and the branch retires rather than ticking for the life of a
-/// connection that was never going to use them.
-const SETTINGS_POLLS: u32 = 100;
-
 /// Drives one QUIC connection until the peer stops sending requests.
 ///
 /// Returns `Err` only for connection-level failures; per-request problems are
@@ -52,11 +35,11 @@ const SETTINGS_POLLS: u32 = 100;
 /// until its tunnels finish, so an in-flight page load or call is not cut off
 /// mid-sentence. Two details make that work:
 ///
-/// * dropping the `h3` connection closes the QUIC connection, so returning early
-///   would kill the very tunnels being drained — the loop has to stay;
-/// * `accept()` cannot report the end of the drain, because at this `h3` revision
-///   it only does so once the *client* has also sent a GOAWAY. The tunnel quota
-///   going idle is the signal instead.
+/// * dropping the HTTP/3 connection closes the QUIC connection, so returning
+///   early would kill the very tunnels being drained — the loop has to stay;
+/// * `accept()` cannot report the end of the drain: a client GOAWAY says nothing
+///   about the requests already in flight, so [`crate::h3api::Connection::accept`]
+///   never reports one. The tunnel quota going idle is the signal instead.
 ///
 /// The wait is deliberately unbounded here: the grace period belongs to the
 /// endpoint ([`crate::quic`]), which closes everything when it expires. Bounding
@@ -67,26 +50,30 @@ pub async fn handle(
     mut shutdown: Shutdown,
     tunnels: Arc<AtomicU64>,
 ) -> Result<(), h3api::ConnectionError> {
-    // Cloned before the handshake: `h3` takes ownership of the connection, but
-    // HTTP Datagrams bypass `h3` entirely and need the QUIC connection directly.
+    // Cloned before the handshake: the HTTP/3 layer takes ownership of the
+    // connection, but HTTP Datagrams bypass it entirely and need the QUIC
+    // connection directly.
     let datagrams = quic.clone();
 
     let mut connection = h3api::Connection::handshake(quic).await?;
-    let context = Context::new(&config, datagrams.clone(), tunnels);
+
+    // The peer's datagram flag is the connection's own, not a copy of it: the
+    // task that reads the peer's control stream writes it, and every session on
+    // this connection reads that same flag on every packet. So a SETTINGS frame
+    // that arrives after a session has started is honoured by that session at
+    // once -- nothing to sample, and no window in which the two disagree.
+    let context = Context::new(
+        &config,
+        datagrams.clone(),
+        connection.peer_datagrams(),
+        tunnels,
+    );
 
     // One reader per connection, demultiplexing datagrams to sessions by
     // Quarter Stream ID.
     let router = tokio::spawn(udp::route_datagrams(datagrams, context.sessions.clone()));
 
     let mut going_away = false;
-
-    // The peer's SETTINGS frame is processed by `h3` whenever the accept future
-    // is polled, which is not the same moment as a request arriving. Sampling it
-    // only when a request arrives leaves the first CONNECT-UDP session on this
-    // connection reading a flag that is still false, and the branch below is what
-    // catches up with it — see the `settings` arm of the loop.
-    let mut settings = tokio::time::interval(SETTINGS_POLL_INTERVAL);
-    let mut settings_polls = 0;
 
     let result = loop {
         tokio::select! {
@@ -120,12 +107,6 @@ pub async fn handle(
 
             accepted = connection.accept() => match accepted {
                 Ok(Some(resolver)) => {
-                    // Refreshed on every request: at handshake time the peer's
-                    // SETTINGS frame has usually not been processed yet.
-                    if connection.peer_datagrams_enabled() {
-                        context.peer_datagrams.store(true, Ordering::Relaxed);
-                    }
-
                     tokio::spawn(handle_request(resolver, context.clone()));
                 }
                 // The peer will send no further requests.
@@ -133,30 +114,6 @@ pub async fn handle(
                 Err(error) => break Err(error),
             },
 
-            // Sampling the peer's SETTINGS until they are known to allow
-            // datagrams. Refreshing only on an accepted request is not enough:
-            // `h3` reads the control stream whenever the accept future is
-            // polled, so a request that arrives in the same breath as the
-            // handshake is dispatched with the flag still false, and a UDP
-            // session started from it stays on the RFC 9297 capsule fallback for
-            // target-to-client traffic until *another* request happens along —
-            // permanently, on a connection that opens one tunnel and keeps it.
-            //
-            // Guarded like `going_away` above, so the branch retires as soon as
-            // there is nothing left to learn — the moment datagrams are known to
-            // be enabled, which cannot be taken back (RFC 9114 §7.2.4 forbids
-            // reducing a setting), or once the grace period is spent on a peer
-            // that never enabled them. A connection past either point pays
-            // nothing for this at all. Placed after the accept arm, so a waiting
-            // request is never made to lose a race with a timer tick.
-            _ = settings.tick(), if !context.datagrams_allowed() && settings_polls < SETTINGS_POLLS => {
-                settings_polls += 1;
-
-                if connection.peer_datagrams_enabled() {
-                    debug!("the peer's SETTINGS enable datagrams");
-                    context.peer_datagrams.store(true, Ordering::Relaxed);
-                }
-            }
         }
     };
 

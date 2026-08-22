@@ -13,8 +13,10 @@
 //! * [`tls`] — certificate/key loading and the rustls server configuration.
 //! * [`quic`] — the QUIC endpoint, transport parameters and the accept loop.
 //! * [`shutdown`] — the graceful-shutdown signal shared by endpoint and connections.
-//! * [`h3api`] — the *only* module allowed to name `h3`/`h3-quinn` types. It
-//!   exists so the HTTP/3 backend stays replaceable.
+//! * [`h3`] — HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
+//!   stream, request streams.
+//! * [`h3api`] — the public face of that layer, and the only HTTP/3 vocabulary
+//!   the rest of the crate uses.
 //! * [`conn`] — per-connection driving, request dispatch, and the datagram
 //!   router shared by every UDP session on the connection.
 //! * [`capsule`] — the Capsule Protocol (RFC 9297 §3) incremental decoder.
@@ -41,6 +43,7 @@ pub mod capsule;
 pub mod config;
 pub mod conn;
 pub mod datagram;
+pub mod h3;
 pub mod h3api;
 pub mod logfmt;
 pub mod net;

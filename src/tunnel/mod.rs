@@ -18,19 +18,22 @@ use crate::policy::{self, Policy};
 
 /// How a request should be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Route {
+pub enum Route<'a> {
     /// CONNECT with no `:protocol`: a TCP tunnel (RFC 9114 §4.4).
     Tcp,
     /// CONNECT with `:protocol = connect-udp`: a UDP tunnel (RFC 9298).
     ConnectUdp,
     /// CONNECT with a `:protocol` this proxy does not implement.
-    UnsupportedProtocol(&'static str),
+    ///
+    /// Borrowed from the request, so the name logged and refused is the token
+    /// the client actually sent rather than one of a fixed few.
+    UnsupportedProtocol(&'a str),
     /// Not a CONNECT request at all. This server is a proxy, not an origin.
     NotConnect,
 }
 
 /// Classifies a request by method and `:protocol`.
-pub fn route(req: &Request<()>) -> Route {
+pub fn route(req: &Request<()>) -> Route<'_> {
     if req.method() != Method::CONNECT {
         return Route::NotConnect;
     }
@@ -57,8 +60,10 @@ pub struct Context {
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
     /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
-    /// sessions fall back to DATAGRAM capsules on the request stream. Shared with
-    /// the connection so a late SETTINGS frame is still picked up.
+    /// sessions fall back to DATAGRAM capsules on the request stream. Owned by
+    /// the HTTP/3 connection and written by the task that reads the peer's
+    /// control stream, so a SETTINGS frame that arrives after a session has
+    /// started is picked up by that session on its very next packet.
     pub peer_datagrams: Arc<AtomicBool>,
     /// The credentials every request is checked against.
     pub auth: Arc<Authenticator>,
@@ -105,17 +110,23 @@ pub struct Context {
 impl Context {
     /// Builds the context for one accepted connection.
     ///
-    /// `tunnels` is the connection's tunnel counter, created by [`crate::quic`]
-    /// so that it outlives this context and can be read once the connection is
-    /// over.
-    pub fn new(config: &Config, datagrams: quinn::Connection, tunnels: Arc<AtomicU64>) -> Self {
+    /// `peer_datagrams` comes from the HTTP/3 connection, which keeps writing
+    /// to it; `tunnels` is the connection's tunnel counter, created by
+    /// [`crate::quic`] so that it outlives this context and can be read once
+    /// the connection is over.
+    pub fn new(
+        config: &Config,
+        datagrams: quinn::Connection,
+        peer_datagrams: Arc<AtomicBool>,
+        tunnels: Arc<AtomicU64>,
+    ) -> Self {
         Self {
             remote: datagrams.remote_address(),
             auth_failures: Arc::new(AtomicU32::new(0)),
             max_auth_failures: config.security.max_auth_failures,
             datagrams,
             sessions: Arc::new(udp::SessionRegistry::default()),
-            peer_datagrams: Arc::new(AtomicBool::new(false)),
+            peer_datagrams,
             auth: Arc::new(Authenticator::new(&config.auth)),
             policy: Arc::new(Policy::new(&config.security)),
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
