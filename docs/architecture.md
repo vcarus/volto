@@ -245,6 +245,17 @@ more, and enforced on receipt so one that does not gets no further. The frame
 layer refuses an oversized non-DATA frame from its declared length, before a byte
 is allocated for it.
 
+That bound is per frame, and a peer may open as many streams as its transport
+parameters allow. What one connection may hold in frames it has announced but not
+finished is therefore bounded separately, at 1 MiB summed over every stream on it,
+the control stream included: a frame is charged for the length it announced the
+moment the decoder commits to buffering it, and the charge is returned when the
+frame completes or when the stream carrying it ends. Going past that is a
+connection error of type `H3_EXCESSIVE_LOAD`. No client that finishes what it
+starts can reach it — a CONNECT request with credentials is a few hundred bytes,
+so every request stream the transport allows could be mid-HEADERS at once and
+still be well inside it.
+
 Two deviations are taken knowingly:
 
 - A CONNECT-UDP request carrying `Content-Length`, `Content-Type` or

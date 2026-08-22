@@ -68,10 +68,11 @@ pub struct Resolver {
 
 impl Resolver {
     pub(crate) fn new(handle: Handle, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        let frames = FrameReader::new(recv, handle.budget());
         Self {
             handle,
             send,
-            frames: FrameReader::new(recv),
+            frames,
         }
     }
 
@@ -148,10 +149,13 @@ impl Resolver {
             // out first and that side is finished cleanly; the receiving side is
             // then stopped with the code, because the rest of the section is
             // precisely what this server has declined to read.
-            // H3_EXCESSIVE_LOAD reaches this arm only from the frame layer's
-            // buffering limit, which is the same 64 KiB the peer was told about
-            // in `SETTINGS_MAX_FIELD_SECTION_SIZE`, and only ever as a
-            // stream-class violation -- a connection-class one is `answer`'s.
+            // H3_EXCESSIVE_LOAD reaches this arm only as a stream-class
+            // violation, which is what both of its stream-class sources are:
+            // the per-frame buffering limit and a field section that decoded
+            // past what `SETTINGS_MAX_FIELD_SECTION_SIZE` told the peer to
+            // send, the same 64 KiB either way. The connection-wide buffering
+            // budget (D77) carries the same code as a connection-class
+            // violation, and that one is `answer`'s.
             Err(frame::Error::Protocol(violation))
                 if violation.code() == Code::H3_EXCESSIVE_LOAD
                     && !violation.is_connection_error() =>

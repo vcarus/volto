@@ -17,7 +17,8 @@
 //! * **Everything else must be buffered**, because it cannot be acted on
 //!   piecewise, and its declared length is a varint that may claim 2^62 bytes.
 //!   `MAX_BUFFERED_FRAME` is what stops a peer naming a length this server
-//!   would then allocate for.
+//!   would then allocate for, and [`BufferBudget`] is what stops it naming an
+//!   allowed length on every stream at once (D77).
 //!
 //! Unknown frame types are skipped by their declared length without being
 //! buffered at all (RFC 9114 §9). That is what lets the protocol be extended,
@@ -32,13 +33,15 @@
 //! `select!` with a timeout, so that property is load-bearing.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 
 use crate::datagram::{peek_varint, put_varint};
 
 use super::error::{Code, StreamError, Violation};
-use super::MAX_FIELD_SECTION_SIZE;
+use super::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
 
 /// DATA (RFC 9114 §7.2.1).
 pub const DATA: u64 = 0x00;
@@ -100,6 +103,84 @@ const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
 /// Longest frame header there can be: a type and a length, both varints.
 const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
+
+/// What one connection may hold in `FrameDecoder` payload buffers, as a
+/// counter every decoder on it shares (D77).
+///
+/// `MAX_BUFFERED_FRAME` is per frame and so per stream; this is the sum over
+/// the streams, which is the number a peer opening many of them actually
+/// controls. [`super::HEADERS_BUFFER_BUDGET`] says why that distinction is
+/// worth a counter and how the value was chosen.
+///
+/// Every decoder on a connection holds the same one -- the control stream's and
+/// one per request stream -- so a share taken on any of them is a share the
+/// others cannot take. Charging happens when a decoder commits to buffering a
+/// frame and releasing when that frame completes or its decoder is dropped, so
+/// the counter reads zero on a connection with nothing half-received on it.
+#[derive(Debug, Default)]
+pub struct BufferBudget {
+    /// Bytes announced by the frames currently being buffered.
+    ///
+    /// `Relaxed` throughout: nothing is published through this counter, and no
+    /// other memory is ordered against it. Each charge is a single
+    /// read-modify-write on the counter alone, and each release is a
+    /// subtraction of what that charge added.
+    held: AtomicUsize,
+}
+
+impl BufferBudget {
+    /// Takes `bytes` from the budget, or reports that the connection is past
+    /// it.
+    ///
+    /// A connection error rather than a stream one, because the peer at fault
+    /// is not identifiable stream by stream: every stream involved may be
+    /// within [`MAX_BUFFERED_FRAME`], and the one that happens to arrive last
+    /// has done nothing the others did not. RFC 9114 §8.1 defines
+    /// H3_EXCESSIVE_LOAD for a peer "exhibiting a behavior that might be
+    /// generating excessive load", which is what holding a connection's whole
+    /// buffering allowance in frames it never finishes is -- the same reading
+    /// [`super::qpack`] takes of the same code.
+    ///
+    /// `fetch_update` rather than an add-then-check: a rejected charge must
+    /// leave the counter untouched, or two streams failing at once would each
+    /// see the other's rolled-back bytes and the bound would hold only on
+    /// average.
+    fn charge(&self, bytes: usize) -> Result<(), Violation> {
+        self.held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                let wanted = held.saturating_add(bytes);
+                (wanted <= HEADERS_BUFFER_BUDGET).then_some(wanted)
+            })
+            .map_err(|held| {
+                Violation::connection(
+                    Code::H3_EXCESSIVE_LOAD,
+                    format!(
+                        "buffering another {bytes} bytes would put this connection past the \
+                         {HEADERS_BUFFER_BUDGET} it may hold in unfinished frames, of which \
+                         {held} are already held"
+                    ),
+                )
+            })?;
+        Ok(())
+    }
+
+    /// Gives `bytes` back to the budget.
+    fn release(&self, bytes: usize) {
+        if bytes > 0 {
+            self.held.fetch_sub(bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// Bytes currently charged to this connection.
+    ///
+    /// For the tests that assert the accounting: what is charged and released
+    /// is not visible on the wire until the budget is spent, and a share that
+    /// is never returned would show up only as a connection that eventually
+    /// refuses a request it should have served.
+    pub fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+}
 
 /// Why the frame reader stopped.
 #[derive(Debug)]
@@ -253,23 +334,35 @@ pub(super) struct FrameDecoder {
     header_len: usize,
     /// Payload of the frame currently being buffered.
     payload: BytesMut,
+    /// The connection's buffering budget, shared with every other decoder on
+    /// it (D77).
+    ///
+    /// Held as an `Arc` rather than a borrow because a decoder outlives no
+    /// scope in particular: it belongs to a stream, and the streams of a
+    /// connection end in any order. Cloning one is a refcount bump, so
+    /// [`Self::new`] still allocates nothing.
+    budget: Arc<BufferBudget>,
+    /// Bytes charged to that budget for the frame being buffered, if any.
+    ///
+    /// The full length the frame announced, which is what this decoder has
+    /// committed to holding -- not what has arrived so far. Returned by
+    /// [`Self::release`] on the two ways a commitment ends: the frame
+    /// completes, or the decoder is dropped with it half-received.
+    charged: usize,
     state: State,
 }
 
-impl Default for FrameDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FrameDecoder {
-    /// A decoder positioned at the start of a stream's frame sequence.
-    pub(super) fn new() -> Self {
+    /// A decoder positioned at the start of a stream's frame sequence, drawing
+    /// on `budget` for whatever it has to buffer.
+    pub(super) fn new(budget: Arc<BufferBudget>) -> Self {
         Self {
             chunk: Bytes::new(),
             header: [0; MAX_FRAME_HEADER],
             header_len: 0,
             payload: BytesMut::new(),
+            budget,
+            charged: 0,
             state: State::Header,
         }
     }
@@ -300,7 +393,19 @@ impl FrameDecoder {
                     let Some((kind, length)) = self.take_frame_header() else {
                         return Ok(None);
                     };
-                    self.state = begin(kind, length)?;
+                    let next = begin(kind, length)?;
+
+                    // Charged on the announcement rather than on arrival: the
+                    // announcement is the moment this decoder commits to
+                    // holding that many bytes, and holding them is what the
+                    // peer gets out of never sending them (D77). The state is
+                    // entered only once the charge is in, so a refused frame
+                    // leaves nothing to release.
+                    if let State::Buffering { remaining, .. } = next {
+                        self.budget.charge(remaining)?;
+                        self.charged = remaining;
+                    }
+                    self.state = next;
                 }
 
                 // An empty DATA frame is legal and carries nothing; the two
@@ -344,6 +449,9 @@ impl FrameDecoder {
                     }
                     self.state = State::Header;
                     let payload = self.payload.split().freeze();
+                    // Before the parse, which may fail: the frame is no longer
+                    // being held either way.
+                    self.release();
                     return Ok(Some(Item::Frame(parse(kind, payload)?)));
                 }
 
@@ -390,6 +498,29 @@ impl FrameDecoder {
             self.header_len += 1;
         }
     }
+
+    /// Gives back whatever this decoder had charged to the connection's budget.
+    ///
+    /// Idempotent, because it is called from two places that can both be right:
+    /// the end of a buffered frame, and [`Drop`].
+    fn release(&mut self) {
+        self.budget.release(std::mem::take(&mut self.charged));
+    }
+}
+
+impl Drop for FrameDecoder {
+    /// Returns the budget a half-received frame was holding (D77).
+    ///
+    /// The guard that makes the accounting sound: a stream can end at any
+    /// point, and most of the ways it ends are the peer's to choose -- a
+    /// RESET_STREAM, a `STOP_SENDING` answered, the request deadline of D76
+    /// expiring, the connection going away. None of them reaches the decoding
+    /// loop, and a share not returned on any one of them would be a slow leak
+    /// of the connection's own allowance, ending in a peer being refused a
+    /// request it was entitled to.
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 
 /// A `FrameDecoder` wired to a QUIC receive stream.
@@ -408,10 +539,12 @@ pub struct FrameReader {
 
 impl FrameReader {
     /// A reader positioned at the start of a stream's frame sequence.
-    pub fn new(recv: quinn::RecvStream) -> Self {
+    ///
+    /// `budget` is the connection's, not this stream's: see [`BufferBudget`].
+    pub fn new(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
         Self {
             recv,
-            decoder: FrameDecoder::new(),
+            decoder: FrameDecoder::new(budget),
             finished: false,
         }
     }
@@ -815,13 +948,19 @@ mod tests {
         out.to_vec()
     }
 
+    /// A decoder with a budget of its own, for the tests that are not about
+    /// the budget.
+    fn fresh_decoder() -> FrameDecoder {
+        FrameDecoder::new(Arc::new(BufferBudget::default()))
+    }
+
     /// Feeds `wire` to a decoder one byte at a time and collects what comes out.
     ///
     /// A byte at a time on purpose: it is the worst case a real stream can
     /// produce, and the only way to prove a frame header straddling chunks is
     /// reassembled rather than mis-parsed.
     fn decode_bytewise(wire: &[u8]) -> Result<Vec<Item>, Error> {
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         let mut items = Vec::new();
 
         for byte in wire {
@@ -870,7 +1009,7 @@ mod tests {
         wire.extend_from_slice(&frame(HEADERS, b"block"));
         wire.extend_from_slice(&frame(DATA, b"de"));
 
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         decoder.push(Bytes::from(wire));
 
         let mut items = Vec::new();
@@ -917,7 +1056,7 @@ mod tests {
     fn a_skipped_frame_is_announced_only_once_it_is_complete() {
         // Type, length and all but the last payload byte: still nothing.
         let wire = frame(0x21, b"payload");
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         decoder.push(Bytes::copy_from_slice(&wire[..wire.len() - 1]));
         assert!(decoder.next_item().expect("decodes").is_none());
         assert!(!decoder.at_frame_boundary());
@@ -982,11 +1121,101 @@ mod tests {
         assert!(begin(DATA, crate::datagram::VARINT_MAX).is_ok());
     }
 
+    /// D77: the connection's budget is charged for what a frame *announces*,
+    /// and given back on both of the ways a frame stops being held -- it
+    /// completes, or the stream carrying it dies half-way through.
+    #[test]
+    fn a_buffered_frame_holds_budget_until_it_completes_or_is_dropped() {
+        let budget = Arc::new(BufferBudget::default());
+        let mut decoder = FrameDecoder::new(budget.clone());
+
+        // The header alone commits the connection to the whole length.
+        let mut wire = BytesMut::new();
+        put_header(&mut wire, HEADERS, 1000);
+        wire.extend_from_slice(&[0x5a; 400]);
+        decoder.push(wire.freeze());
+        assert!(decoder.next_item().expect("decodes").is_none());
+        assert_eq!(
+            budget.held(),
+            1000,
+            "the announced length is charged, not the 400 bytes that have arrived"
+        );
+
+        // Completing it hands the payload on and returns every byte.
+        decoder.push(Bytes::from(vec![0x5a; 600]));
+        assert!(matches!(
+            decoder.next_item().expect("decodes"),
+            Some(Item::Frame(Frame::Headers(block))) if block.len() == 1000
+        ));
+        assert_eq!(budget.held(), 0);
+
+        // A stream abandoned mid-frame returns its share as well, which is the
+        // only thing standing between a peer that resets streams in a loop and
+        // a connection that has spent its budget on nothing.
+        let mut wire = BytesMut::new();
+        put_header(&mut wire, HEADERS, 1000);
+        decoder.push(wire.freeze());
+        assert!(decoder.next_item().expect("decodes").is_none());
+        assert_eq!(budget.held(), 1000);
+
+        drop(decoder);
+        assert_eq!(budget.held(), 0);
+    }
+
+    /// D77: frames each within [`MAX_BUFFERED_FRAME`] still end the connection
+    /// once their sum is past what one connection may hold.
+    #[test]
+    fn frames_past_the_connection_budget_end_the_connection() {
+        /// A decoder that has announced a full-sized frame and sent none of it.
+        fn announce(budget: &Arc<BufferBudget>) -> (FrameDecoder, Result<Option<Item>, Error>) {
+            let mut decoder = FrameDecoder::new(budget.clone());
+            let mut wire = BytesMut::new();
+            put_header(&mut wire, HEADERS, MAX_BUFFERED_FRAME);
+            decoder.push(wire.freeze());
+            let outcome = decoder.next_item();
+            (decoder, outcome)
+        }
+
+        let budget = Arc::new(BufferBudget::default());
+        let fits = HEADERS_BUFFER_BUDGET / MAX_BUFFERED_FRAME as usize;
+
+        let mut streams = Vec::new();
+        for stream in 0..fits {
+            let (decoder, outcome) = announce(&budget);
+            assert!(
+                matches!(outcome, Ok(None)),
+                "stream {stream} is within the budget"
+            );
+            streams.push(decoder);
+        }
+        assert_eq!(budget.held(), fits * MAX_BUFFERED_FRAME as usize);
+
+        // One more, and no stream has broken a rule of its own.
+        let (_decoder, outcome) = announce(&budget);
+        let Err(Error::Protocol(violation)) = outcome else {
+            panic!("a frame past the connection budget must be refused")
+        };
+        assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+        assert!(
+            violation.is_connection_error(),
+            "the peer is at fault, not any one of its streams"
+        );
+        assert_eq!(
+            budget.held(),
+            fits * MAX_BUFFERED_FRAME as usize,
+            "a refused charge must leave the counter where it was"
+        );
+
+        // And the connection is whole again once the streams are gone.
+        drop(streams);
+        assert_eq!(budget.held(), 0);
+    }
+
     /// RFC 9114 §7.1: a stream that ends inside a frame is an error, and one
     /// that ends between them is the ordinary end of a request body.
     #[test]
     fn a_frame_boundary_is_where_a_stream_may_end() {
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         assert!(decoder.at_frame_boundary());
 
         decoder.push(Bytes::from(frame(DATA, b"abcd")));
@@ -997,12 +1226,12 @@ mod tests {
         assert!(decoder.at_frame_boundary());
 
         // Half a frame header, then half a payload: neither is a place to stop.
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         decoder.push(Bytes::from_static(&[0x00]));
         assert!(decoder.next_item().expect("decodes").is_none());
         assert!(!decoder.at_frame_boundary());
 
-        let mut decoder = FrameDecoder::new();
+        let mut decoder = fresh_decoder();
         decoder.push(Bytes::from_static(&[0x00, 0x04, b'a']));
         assert!(decoder.next_item().expect("decodes").is_some());
         assert!(!decoder.at_frame_boundary());
@@ -1013,7 +1242,7 @@ mod tests {
     #[test]
     fn arbitrary_bytes_never_panic_the_frame_decoder() {
         proptest::proptest!(|(wire: Vec<u8>)| {
-            let mut decoder = FrameDecoder::new();
+            let mut decoder = fresh_decoder();
             decoder.push(Bytes::from(wire));
             while let Ok(Some(_)) = decoder.next_item() {}
         });

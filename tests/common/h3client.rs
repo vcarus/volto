@@ -62,7 +62,7 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use volto::datagram::{peek_varint, put_varint};
 use volto::h3::error::Violation;
-use volto::h3::frame::{self, Frame, FrameReader, Item};
+use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use volto::h3::qpack::{self, Field};
 use volto::h3::varint;
 use volto::h3api::{Code, StreamError};
@@ -345,6 +345,7 @@ impl H3Client {
                 quic: connection.clone(),
                 peer,
                 huffman: false,
+                budget: Arc::new(BufferBudget::default()),
             },
             quic: connection,
             endpoint,
@@ -367,6 +368,14 @@ impl Drop for H3Client {
 pub struct SendRequest {
     quic: quinn::Connection,
     peer: Arc<Peer>,
+    /// This connection's frame-buffering budget (D77), shared by every request
+    /// stream opened on it.
+    ///
+    /// The client half of the same bound the server keeps. Nothing in the suite
+    /// approaches it -- a response is a status line and two short fields -- and
+    /// it is here because [`FrameReader`] takes one: a client that shares the
+    /// server's codec shares its accounting too.
+    budget: Arc<BufferBudget>,
     /// Whether field names and values go on the wire Huffman-coded.
     ///
     /// Set by [`H3Client::connect_huffman`] and nothing else: the default is
@@ -439,7 +448,7 @@ impl SendRequest {
 
         Ok(ClientStream {
             send,
-            frames: FrameReader::new(recv),
+            frames: FrameReader::new(recv, self.budget.clone()),
             id,
             header: BytesMut::new(),
             trailers: false,

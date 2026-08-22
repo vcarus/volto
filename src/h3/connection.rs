@@ -42,7 +42,7 @@ use tracing::debug;
 use crate::datagram::{peek_varint, put_varint, varint_len};
 
 use super::error::{Code, ConnectionError, StreamError, Violation};
-use super::frame::{self, Frame, FrameReader, Item};
+use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use super::stream::Resolver;
 use super::{varint, MAX_VARINT};
 
@@ -71,6 +71,14 @@ pub(crate) struct Shared {
     /// read it per packet, so the moment the control stream reports it, every
     /// session on the connection is already looking at the new value.
     peer_datagrams: Arc<AtomicBool>,
+    /// What this connection may hold in half-received frames at once (D77).
+    ///
+    /// Its own `Arc` for the same reason `peer_datagrams` has one: it is held
+    /// by things that outlive no single scope. Every [`FrameReader`] on the
+    /// connection draws on this one -- the peer's control stream and one per
+    /// request stream -- which is what makes the bound a property of the
+    /// connection rather than of each stream separately.
+    buffered: Arc<BufferBudget>,
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
     /// Whether a control stream has already been accepted (RFC 9114 §6.2.1).
@@ -106,6 +114,12 @@ pub(crate) struct Handle {
 }
 
 impl Handle {
+    /// The connection's frame-buffering budget, for a stream about to start
+    /// reading frames (D77).
+    pub(crate) fn budget(&self) -> Arc<BufferBudget> {
+        self.shared.buffered.clone()
+    }
+
     /// Ends the connection because the peer broke a rule (RFC 9114 §8).
     ///
     /// The reason is recorded before the close so that [`Connection::accept`],
@@ -506,7 +520,7 @@ async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
 
 /// Reads the peer's control stream until the connection ends.
 async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
-    let mut frames = FrameReader::new(recv);
+    let mut frames = FrameReader::new(recv, handle.budget());
     let mut control = Control::default();
 
     loop {

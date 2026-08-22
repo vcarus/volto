@@ -80,6 +80,33 @@ const MAX_VARINT: usize = 8;
 /// bytes for each field.
 pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
+/// Most encoded frame payload one connection may hold buffered at once, in
+/// bytes (D77).
+///
+/// [`MAX_FIELD_SECTION_SIZE`] bounds one frame; this bounds their sum, and the
+/// two are reached by different peers. A client held to the per-frame bound may
+/// still open every request stream its transport parameters allow -- 1024 by
+/// default -- announce a 64 KiB HEADERS frame on each and stop one byte short
+/// of finishing any of them. Nothing in that is a rule broken on any single
+/// stream, and the frames are held because they cannot be acted on piecewise:
+/// 64 MiB of a connection's memory, from a peer that has not authenticated, for
+/// as long as the transport is willing to call it alive, and available again
+/// the moment the streams are reset. Multiplied by `limits.max_connections` it
+/// is the whole of the machine. D76 bounds how long one stream may wait; this
+/// bounds how much waiting costs.
+///
+/// A megabyte is sixteen frames of the largest size this server will buffer at
+/// all, and some four thousand of the size a real one is -- a CONNECT request
+/// carrying Basic credentials is under 300 bytes, so every stream the transport
+/// allows could be mid-HEADERS at once and still be a third of the way in. No
+/// client that finishes what it starts can reach it, which is why the value is
+/// a constant here rather than a knob in `[limits]`.
+///
+/// The unit is encoded octets as they arrived, the same count
+/// `frame::MAX_BUFFERED_FRAME` applies per frame -- not RFC 9114 §4.2.2's
+/// field-section size, which is what [`MAX_FIELD_SECTION_SIZE`] measures.
+pub const HEADERS_BUFFER_BUDGET: usize = 1024 * 1024;
+
 /// An HTTP/3 error code as the QUIC application error code that carries it.
 ///
 /// RFC 9114 §8 defines the two to be the same number; every registered code is
