@@ -54,7 +54,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 /// ALPN protocol identifiers advertised when the config does not say otherwise.
@@ -581,11 +581,15 @@ impl Default for Log {
 
 impl Config {
     /// Reads and validates the configuration at `path`.
+    ///
+    /// A parse failure is rendered by [`parse_error`] rather than carried in the
+    /// error chain, because this file holds passwords and the `toml` crate's own
+    /// `Display` prints the offending source line.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config: Config = toml::from_str(&text)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        let config: Config =
+            toml::from_str(&text).map_err(|error| parse_error(path, &text, &error))?;
         config
             .validate()
             .with_context(|| format!("invalid config file {}", path.display()))?;
@@ -859,6 +863,58 @@ impl Config {
 /// file descriptors on any realistic host, so it is more likely a typo.
 const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 
+/// Renders a TOML parse failure without the source line it points at.
+///
+/// The `toml` crate's `Display` for a deserialization error prints the offending
+/// line under a caret, the way a compiler does. That is the wrong shape for this
+/// file, and only for this file: a syntax error on a `password = ...` line puts
+/// the password on stderr at startup and into the journal on every `SIGHUP`
+/// reload, where `Restart=on-failure` reprints it every few seconds until
+/// somebody notices. So the error never reaches the chain at all — what is
+/// reported is the parser's own message plus the position it points at, and the
+/// configuration text is not in scope for either.
+///
+/// The operator loses nothing they need: the file, the line and the column are
+/// all still named, which is what it takes to find a typo. What the message
+/// carries is the parser's account of what it found and what it expected there,
+/// rather than a copy of what was written.
+fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
+    let Some(span) = error.span() else {
+        return anyhow!(
+            "failed to parse config file {}: {}",
+            path.display(),
+            error.message()
+        );
+    };
+
+    let (line, column) = line_and_column(text, span.start);
+    anyhow!(
+        "failed to parse config file {} at line {line}, column {column}: {}",
+        path.display(),
+        error.message()
+    )
+}
+
+/// The 1-based line and column of a byte offset into `text`.
+///
+/// The `toml` crate reports a span and renders the position itself, but only as
+/// part of the caret block [`parse_error`] exists to avoid, so the arithmetic is
+/// repeated here. Columns are counted in characters rather than bytes, which is
+/// what an editor shows.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    // An offset past the end, or one landing inside a multi-byte character,
+    // cannot be placed: the position is a convenience on the way to an error
+    // message and must not become a panic of its own.
+    let Some(before) = text.get(..offset) else {
+        return (1, 1);
+    };
+
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+
+    (line, column)
+}
+
 /// Levels accepted as a bare `log.level`.
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
 
@@ -992,6 +1048,53 @@ mod tests {
             assert!(
                 msg.contains("server.cert") || msg.contains("server.key"),
                 "{context} should be valid, but: {msg}"
+            );
+        }
+    }
+
+    /// A syntax error must name where it is, and must not quote what is there.
+    ///
+    /// The `toml` crate renders a parse error as the offending source line under
+    /// a caret, so a typo on a `password = ...` line used to print the password
+    /// on stderr at startup and into the journal on every `SIGHUP` reload — and
+    /// `Restart=on-failure` makes the startup path repeat every few seconds. The
+    /// missing quotes below are that typo, and both renderings of an `anyhow`
+    /// error are checked because the two print different things: `{:#}` walks
+    /// the chain of messages, `{:?}` adds the sources and any backtrace.
+    #[test]
+    fn a_syntax_error_does_not_echo_the_line_it_is_on() {
+        const SECRET: &str = "correct-horse-battery-staple";
+
+        let path = std::env::temp_dir().join(format!(
+            "volto-config-syntax-error-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "[server]\n\
+                 listen = \"127.0.0.1:4433\"\n\
+                 cert = \"/tmp/c.pem\"\n\
+                 key = \"/tmp/k.pem\"\n\
+                 [auth]\n\
+                 users = [\n\
+                 {{ username = \"user1\", password = {SECRET} }},\n\
+                 ]\n"
+            ),
+        )
+        .expect("write the broken config");
+
+        let error = Config::load(&path).expect_err("an unquoted value must not load");
+        let _ = std::fs::remove_file(&path);
+
+        for rendered in [format!("{error:#}"), format!("{error:?}")] {
+            assert!(
+                !rendered.contains(SECRET),
+                "the password on the offending line leaked: {rendered}"
+            );
+            assert!(
+                rendered.contains("line 7"),
+                "the operator still has to be told where the mistake is: {rendered}"
             );
         }
     }
