@@ -815,7 +815,7 @@ fn validate(req: &Request) -> Result<(), &'static str> {
 ///
 /// Parsing is deliberately lenient about the things clients disagree on — the
 /// trailing slash is optional, and an IPv6 literal is accepted both in the
-/// RFC 9298 §3.1 form (bare, only the colons escaped) and bracketed — while
+/// RFC 9298 §3 form (bare, only the colons escaped) and bracketed — while
 /// staying strict about anything ambiguous. What comes out is a host, with the
 /// brackets of the second form already off: [`crate::net::resolve`] resolves
 /// names and literals, not URI components.
@@ -846,7 +846,7 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         return Err("empty target_host");
     }
 
-    // The brackets belong to this template and come off here. RFC 9298 §3.1
+    // The brackets belong to this template and come off here. RFC 9298 §3
     // writes an IPv6 literal bare, with only its colons escaped, but some
     // clients send the bracketed form and it costs nothing to accept -- and
     // taking them off is this parser's job rather than the resolver's, which is
@@ -916,7 +916,7 @@ mod tests {
         );
     }
 
-    /// RFC 9298 §3.1: an IPv6 literal appears with its colons escaped and no
+    /// RFC 9298 §3: an IPv6 literal appears with its colons escaped and no
     /// brackets.
     #[test]
     fn parses_bare_ipv6_literals() {

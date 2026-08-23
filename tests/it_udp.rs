@@ -311,7 +311,7 @@ async fn refuses_an_invalid_port_in_the_template() {
 
 /// A bracket that is not the enclosing pair is not part of a host (review M3).
 ///
-/// RFC 9298 §3.1 writes an IPv6 literal bare and the bracketed form is accepted
+/// RFC 9298 §3 writes an IPv6 literal bare and the bracketed form is accepted
 /// only as a courtesy, so a bracket left over once that pair comes off is syntax
 /// this template has no use for. `it_tcp::refuses_an_authority_with_a_stray_bracket`
 /// pins the same answer on the other route; before this the two disagreed, and a

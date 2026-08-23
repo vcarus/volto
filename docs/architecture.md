@@ -138,7 +138,7 @@ https://$PROXY_HOST:$PROXY_PORT/.well-known/masque/udp/{target_host}/{target_por
 Parsing is deliberately lenient: percent-decoding, an optional trailing slash, a
 port in 1..=65535 and an empty query. IPv6 literals arrive **without** brackets,
 with the colons escaped (`2001:db8::42` → `2001%3Adb8%3A%3A42`) per RFC 9298
-§3.1; the bracketed form is also accepted.
+§3; the bracketed form is also accepted.
 
 Two ordering rules that are easy to get wrong:
 
@@ -164,8 +164,9 @@ and each one's type has to arrive within an idle timeout. Routing is per
 *request stream*, which is why it lives in the HTTP/3 layer: a session claims
 its Quarter Stream ID by asking its stream for a `DatagramReceiver` and holds
 the claim exactly as long as it holds that receiver, so a session that ends —
-however it ends — takes its routing entry with it. Sending is the other half and stays outside: a UDP session writes its
-datagrams straight onto the `quinn::Connection`.
+however it ends — takes its routing entry with it. Sending is the other half
+and stays outside: a UDP session writes its datagrams straight onto the
+`quinn::Connection`.
 
 Two fields decide where a packet goes, and getting either subtly wrong is
 silent:
