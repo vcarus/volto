@@ -26,7 +26,7 @@
 //! types precisely to catch a peer that cannot skip them.
 //!
 //! A frame's *type* is judged before its length, and which verdict it earns
-//! depends on the stream it arrived on ([`StreamKind`]). SETTINGS on a request
+//! depends on the stream it arrived on. SETTINGS on a request
 //! stream is a connection error at any size, so refusing it for being large
 //! would be answering a question the peer did not ask -- and charging the
 //! buffering budget for a frame that was never allowed there would let a peer
@@ -634,8 +634,8 @@ impl FrameReader {
     /// That is the peer's control stream: RFC 9114 §6.2.1 makes it the stream
     /// SETTINGS, GOAWAY, CANCEL_PUSH and MAX_PUSH_ID belong on, and which of
     /// them may arrive *when* is [`super::connection`]'s to judge rather than
-    /// the framing layer's. A request stream is read through
-    /// [`Self::on_request_stream`], where those four -- and PUSH_PROMISE -- are
+    /// the framing layer's. A request stream is read through the crate-internal
+    /// `on_request_stream` instead, where those four -- and PUSH_PROMISE -- are
     /// refused from the frame header.
     ///
     /// It is also what a *client* wants for a response stream, which is why this
