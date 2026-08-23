@@ -103,11 +103,22 @@ takes the slot of the oldest connection that has never authenticated and admits
 the newcomer, and only refuses when every live connection has authenticated. The
 evicted connection is closed with `H3_NO_ERROR` — nothing about it failed — and
 logged like the other idle endings, with `reason=evicted`; one whose QUIC
-handshake had not finished is refused at the transport layer instead. A
+handshake had not finished has already been accepted at the transport layer, so
+what its peer receives is a `CONNECTION_CLOSE` carrying `APPLICATION_ERROR` and
+an empty reason rather than the `CONNECTION_REFUSED` a refusal sends. A
 connection that has authenticated is never a candidate, and below the cap
 nothing of this runs. There is no sub-quota for unauthenticated connections
 because it would not help: a legitimate client is unauthenticated at accept time
 too, so it would be squeezed by exactly the pool it is trying to join.
+
+Evicting on the word of an unverified source address would be worse than the
+problem: a spoofed Initial costs an attacker one datagram and no return path, so
+a flood of them would empty the roster and start a TLS server flight per packet.
+At the cap, a newcomer whose address QUIC has not yet validated is therefore
+answered with a Retry (RFC 9000 §8.1) — it takes no slot and no crypto — and
+only the newcomer that comes back with the token may evict anybody. The cost to
+a client with credentials is one extra round trip, paid only while the server is
+full; below the cap no Retry is sent and the handshake is what it always was.
 
 ### Target address selection
 

@@ -496,6 +496,79 @@ async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
     );
 }
 
+/// A newcomer may only evict once it has proved it can receive at the address
+/// it claims.
+///
+/// Eviction turns an unverified source address into a way of closing other
+/// people's connections, and a spoofed Initial costs an attacker one datagram
+/// with no return path. So at the cap the answer to an unvalidated newcomer is a
+/// Retry, which takes no slot and no crypto; the token it comes back with is
+/// what buys it the right to take somebody else's place.
+///
+/// Read off the wire rather than out of the server: quinn's client handles a
+/// Retry without telling anybody, so the relay in between is what sees it.
+#[tokio::test]
+async fn a_full_server_makes_a_newcomer_validate_its_address_before_it_evicts() {
+    let server = TestServer::start_with(&format!("[limits]\n{ONE_SLOT}")).await;
+
+    // Holds the only slot and has never authenticated, so it is exactly what
+    // the newcomer below is entitled to displace.
+    let parked = H3Client::connect(&server).await;
+
+    let (relay, retries) = retry_counting_relay(server.addr).await;
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
+    let connection = finish_connect(&endpoint, relay)
+        .await
+        .expect("a client that answers the Retry must still be admitted");
+
+    assert!(
+        connection.close_reason().is_none(),
+        "the newcomer must end up admitted, not refused"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        1,
+        "a full server must answer an unvalidated newcomer with exactly one Retry"
+    );
+    // And the Retry really is a step on the way to eviction rather than a
+    // substitute for it: the slot changed hands.
+    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+}
+
+/// Below the cap the extra round trip must not be charged to anybody.
+///
+/// The negation of the test above, on the same observation: one of two slots is
+/// taken, so there is nothing to evict and nothing to prove, and Surge's
+/// handshake has to stay the one round trip it always was.
+#[tokio::test]
+async fn a_server_with_room_asks_no_newcomer_to_validate_its_address() {
+    let server = TestServer::start_with(&format!("[limits]\n{TWO_SLOTS}")).await;
+
+    let parked = H3Client::connect(&server).await;
+
+    let (relay, retries) = retry_counting_relay(server.addr).await;
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
+    let connection = finish_connect(&endpoint, relay)
+        .await
+        .expect("there is room, so the newcomer is simply admitted");
+
+    assert!(
+        connection.close_reason().is_none(),
+        "the newcomer must be admitted"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "a server with a free slot must not make a client pay a round trip for it"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), parked.quic.closed())
+            .await
+            .is_err(),
+        "with room to spare nobody's slot is taken"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 0-RTT is off, and pinned off rather than inherited
 // ---------------------------------------------------------------------------
@@ -676,6 +749,61 @@ async fn one_way_relay(server: SocketAddr) -> SocketAddr {
     });
 
     addr
+}
+
+/// Carries packets both ways between one client and `server`, counting the
+/// Retry packets the server sends.
+///
+/// A Retry is the one server packet a test can recognise without any keys,
+/// which is what makes this an on-wire observation rather than a reading of the
+/// server's own state — and it has to be observed here, because quinn's client
+/// answers a Retry without telling the application anything at all.
+async fn retry_counting_relay(server: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay socket");
+    let addr = socket.local_addr().expect("the relay's address");
+
+    let retries = Arc::new(AtomicUsize::new(0));
+    let counter = retries.clone();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        // Learned from the first packet that is not the server's, so the
+        // answers have somewhere to go.
+        let mut client: Option<SocketAddr> = None;
+
+        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
+            let datagram = &buf[..read];
+
+            if from == server {
+                if is_retry(datagram) {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(client) = client {
+                    let _ = socket.send_to(datagram, client).await;
+                }
+            } else {
+                client = Some(from);
+                let _ = socket.send_to(datagram, server).await;
+            }
+        }
+    });
+
+    (addr, retries)
+}
+
+/// Whether `datagram` starts with a QUIC version 1 Retry packet.
+///
+/// RFC 9000 §17.2.5 gives a Retry a long header — "Header Form (1) = 1, Fixed
+/// Bit (1) = 1, Long Packet Type (2) = 3" — with four Unused bits below them, so
+/// the first byte is `0b1111xxxx`; the version follows, and the type bits only
+/// mean what §17.2's Table 5 says they mean in version 1. RFC 9000 §12.2 puts a
+/// Retry last in its datagram, and this server sends it alone, so the first
+/// packet is the only one worth looking at.
+fn is_retry(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(first) if first & 0xf0 == 0xf0)
+        && matches!(datagram.get(1..5), Some([0x00, 0x00, 0x00, 0x01]))
 }
 
 /// Opens a QUIC connection that keeps itself alive and never says anything.

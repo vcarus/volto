@@ -450,7 +450,7 @@ impl Server {
                 () = shutdown.fired() => break,
 
                 incoming = self.endpoint.accept() => {
-                    let Some(incoming) = incoming else {
+                    let Some(mut incoming) = incoming else {
                         // The endpoint was closed from elsewhere.
                         break;
                     };
@@ -470,6 +470,77 @@ impl Server {
                     // draining, and its length trails the roster by however
                     // many finished tasks have not been reaped yet.
                     if max_connections > 0 && self.roster.len() >= max_connections as usize {
+                        // Read before `retry()` or `refuse()` consumes the
+                        // `Incoming`, so either branch can still name the peer.
+                        let remote = incoming.remote_address();
+                        let live = self.roster.len();
+
+                        // Taking somebody else's slot is a privilege, and a
+                        // source address that has proved nothing does not have
+                        // it: one spoofed Initial per datagram, from addresses
+                        // that never have to receive anything, would otherwise
+                        // walk the whole roster out of the door -- and every one
+                        // of those datagrams would start a TLS server flight,
+                        // since `serve` accepts the connection eagerly. So at
+                        // the cap the unvalidated newcomer is asked to come back
+                        // with a token instead, which costs this server no
+                        // crypto and no slot, and is what QUIC provides for the
+                        // purpose.
+                        //
+                        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+                        //# A server might wish to validate the client address
+                        //# before starting the cryptographic handshake.  QUIC
+                        //# uses a token in the Initial packet to provide
+                        //# address validation prior to completing the
+                        //# handshake.
+                        //
+                        // What it costs a client with credentials is one round
+                        // trip, and only while the server is full: below the cap
+                        // this branch is not entered at all, so an ordinary
+                        // Surge handshake is untouched.
+                        if !incoming.remote_address_validated() {
+                            if incoming.may_retry() {
+                                match incoming.retry() {
+                                    Ok(()) => {
+                                        // DEBUG for the same reason the refusal
+                                        // below is: a flood is exactly when this
+                                        // fires.
+                                        debug!(
+                                            %remote,
+                                            live,
+                                            max_connections,
+                                            "the server is full: asking an unvalidated address \
+                                             to prove itself before it may take a slot"
+                                        );
+                                        continue;
+                                    }
+                                    // Unreachable as quinn stands -- it
+                                    // documents `may_retry()` as guaranteed true
+                                    // whenever the address is unvalidated -- and
+                                    // handled rather than unwrapped because the
+                                    // fallback is the safe one either way.
+                                    //
+                                    //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                                    //# In response to processing an Initial packet
+                                    //# containing a token that was provided in a Retry
+                                    //# packet, a server cannot send another Retry
+                                    //# packet; it can only refuse the connection or
+                                    //# permit it to proceed.
+                                    Err(error) => incoming = error.into_incoming(),
+                                }
+                            }
+
+                            debug!(
+                                %remote,
+                                live,
+                                max_connections,
+                                "refusing a connection: the server is full and this address \
+                                 cannot be asked to validate itself"
+                            );
+                            incoming.refuse();
+                            continue;
+                        }
+
                         match self.roster.evict_oldest_unauthenticated() {
                             // A connection that has never had a request pass the
                             // credentials check is not owed the slot it is
@@ -541,19 +612,29 @@ impl Server {
     /// One idle timeout bounds it, for the same reason it bounds the HTTP/3
     /// handshake: a peer that cannot finish a handshake in the time it is
     /// allowed to say nothing at all is not going to finish it. Dropping the
-    /// future refuses the connection at the QUIC layer and frees the slot with
-    /// it.
+    /// future ends the connection and frees the slot with it.
+    ///
+    /// What that drop is *not* is a refusal. `tokio::time::timeout` takes its
+    /// argument by `IntoFuture`, and `Incoming`'s implementation of that calls
+    /// `Incoming::accept()`, so by the time either arm of the select below can
+    /// run there is a `Connecting` rather than an `Incoming`: quinn has answered
+    /// the client's Initial and the TLS server flight is already on its way.
+    /// Dropping a `Connecting` closes the connection the way an application
+    /// close does, and RFC 9000 §10.2.3 has an application close sent before the
+    /// handshake completes go out as a transport one, so what the peer receives
+    /// is `CONNECTION_CLOSE` with APPLICATION_ERROR and an empty reason — not
+    /// the CONNECTION_REFUSED that `Incoming::refuse` sends, and not silence.
     ///
     /// # Eviction
     ///
     /// The same drop is what an eviction uses. A connection that has never
     /// authenticated may have its slot taken by a newcomer once the server is
     /// full ([`Roster`]), and the signal reaches it here: whichever stage it is
-    /// in, its work is dropped. Before the handshake that refuses the
-    /// connection at the QUIC layer; after it, dropping `conn::handle`'s future
-    /// drops the HTTP/3 connection, whose own `Drop` closes the QUIC connection
-    /// with H3_NO_ERROR — nothing went wrong, the slot was simply owed to
-    /// somebody else.
+    /// in, its work is dropped. Before the handshake completes that is the
+    /// `Connecting` close described above; after it, dropping `conn::handle`'s
+    /// future drops the HTTP/3 connection, whose own `Drop` closes the QUIC
+    /// connection with H3_NO_ERROR — nothing went wrong, the slot was simply
+    /// owed to somebody else.
     fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> {
         // Snapshotted per connection, not read live: a reload changes what new
         // connections get, while a connection already running keeps the
@@ -579,8 +660,11 @@ impl Server {
 
             let quic = tokio::select! {
                 () = evicted.notified() => {
-                    // Dropping `incoming` refuses the connection at the QUIC
-                    // layer, exactly as letting the deadline below lapse does.
+                    // Dropping the half-built connection ends it, exactly as
+                    // letting the deadline below lapse does -- with the
+                    // `CONNECTION_CLOSE(APPLICATION_ERROR)` and empty reason
+                    // this function's documentation describes, since the
+                    // `Incoming` was accepted before either arm could run.
                     // DEBUG rather than the INFO the established case gets:
                     // there is no connection yet, so there is nothing to report
                     // about one.
