@@ -12,9 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
-use crate::h3api::{
-    self, ConnectProtocol, FieldValue, Fields, Method, Request, RespondError, Status, Stream,
-};
+use crate::h3api::{self, FieldValue, Fields, Method, Request, RespondError, Status, Stream};
 use crate::policy::{self, Policy};
 
 /// How a request should be handled.
@@ -34,15 +32,20 @@ pub enum Route<'a> {
 }
 
 /// Classifies a request by method and `:protocol`.
+///
+/// The pseudo-header is read straight off the [`Request`], as the tunnels read
+/// every other field of one (D78). It used to arrive through a classifier in
+/// [`crate::h3api`], but that enum was this one's three variants under other
+/// names and existed only to be translated into them on the next line.
 pub fn route(req: &Request) -> Route<'_> {
     if req.method != Method::Connect {
         return Route::NotConnect;
     }
 
-    match h3api::connect_protocol(req) {
-        ConnectProtocol::Absent => Route::Tcp,
-        ConnectProtocol::ConnectUdp => Route::ConnectUdp,
-        ConnectProtocol::Unsupported(name) => Route::UnsupportedProtocol(name),
+    match req.protocol.as_deref() {
+        None => Route::Tcp,
+        Some(udp::CONNECT_UDP) => Route::ConnectUdp,
+        Some(protocol) => Route::UnsupportedProtocol(protocol),
     }
 }
 
@@ -783,6 +786,36 @@ pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields, strea
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connect_with_protocol(protocol: Option<&str>) -> Request {
+        let mut req = Request::new(Method::Connect);
+        req.authority = Some("example.com".into());
+        req.protocol = protocol.map(Into::into);
+        req
+    }
+
+    #[test]
+    fn the_protocol_pseudo_header_picks_the_tunnel() {
+        assert_eq!(route(&connect_with_protocol(None)), Route::Tcp);
+        assert_eq!(
+            route(&connect_with_protocol(Some("connect-udp"))),
+            Route::ConnectUdp
+        );
+        // The wire name survives, which is what makes a truthful 501 possible.
+        assert_eq!(
+            route(&connect_with_protocol(Some("connect-ip"))),
+            Route::UnsupportedProtocol("connect-ip")
+        );
+        assert_eq!(
+            route(&connect_with_protocol(Some("webtransport"))),
+            Route::UnsupportedProtocol("webtransport")
+        );
+        // The method is judged first: this server proxies and does not serve.
+        assert_eq!(
+            route(&Request::new(Method::Other("GET".into()))),
+            Route::NotConnect
+        );
+    }
 
     #[test]
     fn a_connection_specific_field_is_named_and_a_clean_request_is_not() {

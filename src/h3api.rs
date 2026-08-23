@@ -66,32 +66,6 @@ pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
 /// so the peer sees something meaningful in the CONNECTION_CLOSE frame.
 pub const AUTH_FAILURE_LIMIT_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x10b);
 
-/// The `:protocol` token of RFC 9298's CONNECT-UDP.
-const CONNECT_UDP: &str = "connect-udp";
-
-/// The value of the `:protocol` pseudo-header, classified.
-///
-/// [`ConnectProtocol::Unsupported`] borrows the token from the request, so the
-/// name that reaches the log and the 501 is the one the client actually sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectProtocol<'a> {
-    /// No `:protocol` pseudo-header: a classic CONNECT request (RFC 9114 §4.4).
-    Absent,
-    /// `connect-udp` -- a UDP tunnel (RFC 9298).
-    ConnectUdp,
-    /// A protocol this proxy does not implement. The payload is the wire name.
-    Unsupported(&'a str),
-}
-
-/// Reads the `:protocol` pseudo-header of a request.
-pub fn connect_protocol(req: &Request) -> ConnectProtocol<'_> {
-    match req.protocol.as_deref() {
-        None => ConnectProtocol::Absent,
-        Some(CONNECT_UDP) => ConnectProtocol::ConnectUdp,
-        Some(protocol) => ConnectProtocol::Unsupported(protocol),
-    }
-}
-
 /// The reset code the peer used, if this error is a peer-initiated reset.
 pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
     match error {
@@ -151,34 +125,6 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
 mod tests {
     use super::*;
     use crate::h3::error::Violation;
-
-    fn request_with_protocol(protocol: Option<&str>) -> Request {
-        let mut req = Request::new(Method::Connect);
-        req.authority = Some("example.com".into());
-        req.protocol = protocol.map(Into::into);
-        req
-    }
-
-    #[test]
-    fn the_protocol_pseudo_header_is_classified() {
-        assert_eq!(
-            connect_protocol(&request_with_protocol(None)),
-            ConnectProtocol::Absent
-        );
-        assert_eq!(
-            connect_protocol(&request_with_protocol(Some("connect-udp"))),
-            ConnectProtocol::ConnectUdp
-        );
-        // The wire name survives, which is what makes a truthful 501 possible.
-        assert_eq!(
-            connect_protocol(&request_with_protocol(Some("connect-ip"))),
-            ConnectProtocol::Unsupported("connect-ip")
-        );
-        assert_eq!(
-            connect_protocol(&request_with_protocol(Some("webtransport"))),
-            ConnectProtocol::Unsupported("webtransport")
-        );
-    }
 
     #[test]
     fn a_peer_reset_is_told_apart_from_every_other_failure() {

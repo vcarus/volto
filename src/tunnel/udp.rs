@@ -48,6 +48,12 @@ use crate::{net, tunnel};
 /// Path prefix of the RFC 9298 §2 default URI template.
 pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 
+/// The `:protocol` token that asks for a UDP tunnel (RFC 9298 §3).
+///
+/// Next to the template prefix because the two are the same RFC's wire syntax
+/// for the same request, and [`super::route`] is the one place that reads it.
+pub(super) const CONNECT_UDP: &str = "connect-udp";
+
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context) {
     if let Err(reason) = validate(req) {

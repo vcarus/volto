@@ -11,7 +11,6 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
-use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -420,11 +419,10 @@ fn log_request(req: &Request, stream_id: u64) {
         })
         .collect();
 
-    let protocol = match h3api::connect_protocol(req) {
-        h3api::ConnectProtocol::Absent => None,
-        h3api::ConnectProtocol::ConnectUdp => Some(Cow::Borrowed("connect-udp")),
-        h3api::ConnectProtocol::Unsupported(name) => Some(bounded(name)),
-    };
+    // Every `:protocol` token alike, through `bounded` for the reason the 501
+    // path gives: the token is the peer's bytes and only checked for being
+    // UTF-8, so a newline in one must not forge a journal line.
+    let protocol = req.protocol.as_deref().map(bounded);
 
     debug!(
         stream_id,
