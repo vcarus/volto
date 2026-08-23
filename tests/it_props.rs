@@ -732,7 +732,7 @@ fn the_decoder_resumes_at_the_next_capsule_after_an_error() {
 // ---------------------------------------------------------------------------
 
 /// Percent-encodes every byte, which is always a legal spelling of a segment
-/// and is how an IPv6 literal reaches the server in the RFC 9298 §3.1 form.
+/// and is how an IPv6 literal reaches the server in the RFC 9298 §3 form.
 fn percent_encode_all(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("%{byte:02X}")).collect()
 }
@@ -771,7 +771,7 @@ proptest! {
     }
 
     /// The same for a percent-encoded host, which is the only way to spell a
-    /// bare IPv6 literal (RFC 9298 §3.1 escapes the colons) or anything else
+    /// bare IPv6 literal (RFC 9298 §3 escapes the colons) or anything else
     /// that would otherwise break the path apart.
     #[test]
     fn the_template_round_trips_a_percent_encoded_host(

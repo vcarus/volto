@@ -440,7 +440,7 @@ pub fn authorized_connect(authority: &str, username: &str, password: &str) -> Re
 
 /// Builds a CONNECT-UDP request for `target` using the RFC 9298 §2 template.
 ///
-/// `target_host` is percent-encoded per RFC 9298 §3.1, so an IPv6 literal
+/// `target_host` is percent-encoded per RFC 9298 §3, so an IPv6 literal
 /// arrives with escaped colons and no brackets.
 pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request {
     let encoded_host: String = host

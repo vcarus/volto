@@ -401,7 +401,7 @@ Two tests are load-bearing beyond their names:
   pins QUIC connection migration against an accidental `migration(false)` or an
   upstream regression. What makes migration work behind NAT at all is quinn's
   non-zero-length server connection IDs (8 bytes by default) — the property
-  RFC 9308 §2 strongly recommends for exactly this reason — so any future
+  RFC 9308 §9 strongly recommends for exactly this reason — so any future
   endpoint tuning must not shorten them to zero.
 
 `it_stress` keeps a heavy tier behind `#[ignore]` (500 concurrent tunnels, 10000
