@@ -304,9 +304,14 @@ fn every_short_varint_and_every_class_boundary_round_trips() {
 // API GAP: `frame::FrameDecoder` -- the pure state machine, the thing that can
 // be fed a byte at a time in process -- is `pub(super)`. The only public way
 // into the frame layer from a test binary is `FrameReader::new(recv, budget)`,
-// which needs a live `quinn::RecvStream`. So the properties below drive a real
-// loopback QUIC connection: one stream per case, the bytes written on it, the
-// items read back off it. That is slower than calling the decoder directly and
+// which needs a live `quinn::RecvStream`. That constructor is also the
+// permissive kind -- the one the peer's control stream gets, where no frame type
+// is refused for where it is -- so the request-stream and tunnel verdicts that
+// refuse SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE and a
+// post-CONNECT HEADERS from the frame header are not reachable here; they are
+// pinned by the decoder's unit tests and by `it_hostile`. So the properties
+// below drive a real loopback QUIC connection: one stream per case, the bytes
+// written on it, the items read back off it. That is slower than calling the decoder directly and
 // it gives up exact control of where the chunk boundaries fall -- quinn decides
 // how the writes are packetised -- but it is what the public API offers, and
 // making the decoder `pub` would be a `src` change.

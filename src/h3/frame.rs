@@ -880,8 +880,9 @@ fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
     // A set rather than a list: the payload is bounded by `MAX_BUFFERED_FRAME`,
     // not by anything the peer has earned, and 64 KiB holds some sixteen
     // thousand distinct identifiers -- a quadratic scan over which is work an
-    // unauthenticated peer can ask for, on a request stream as well as here,
-    // since the frame is parsed before the stream layer can refuse it.
+    // unauthenticated peer can ask for on its control stream. (A SETTINGS frame
+    // on a request stream is refused in `begin` from its header and never
+    // reaches this parser.)
     let mut seen = HashSet::new();
 
     while !payload.is_empty() {

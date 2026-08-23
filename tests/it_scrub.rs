@@ -36,16 +36,24 @@ fn repo_root() -> PathBuf {
 
 /// Ranges that no tracked file may contain.
 ///
-/// CJK punctuation, kana, both common ideograph blocks, Hangul syllables, and
-/// fullwidth/halfwidth forms — so the check covers the scripts the notes are
-/// written in and their neighbours, not only Han characters.
-const CJK_RANGES: [(char, char); 6] = [
-    ('\u{3000}', '\u{303f}'),
-    ('\u{3040}', '\u{30ff}'),
+/// The enclosed alphanumerics (the circled digits used as markers in notes),
+/// Hangul Jamo, the whole CJK run from the symbols and punctuation block
+/// through the compatibility block (so kana, Bopomofo, enclosed CJK forms and
+/// the like are all inside it), the three common ideograph blocks including the
+/// compatibility ideographs, Hangul syllables, fullwidth/halfwidth forms, and
+/// the supplementary ideograph planes — so the check covers the scripts the
+/// notes are written in, their neighbours and their markers, not only Han
+/// characters.
+const CJK_RANGES: [(char, char); 9] = [
+    ('\u{1100}', '\u{11ff}'),
+    ('\u{2460}', '\u{24ff}'),
+    ('\u{3000}', '\u{33ff}'),
     ('\u{3400}', '\u{4dbf}'),
     ('\u{4e00}', '\u{9fff}'),
     ('\u{ac00}', '\u{d7af}'),
+    ('\u{f900}', '\u{faff}'),
     ('\u{ff00}', '\u{ffef}'),
+    ('\u{20000}', '\u{2fa1f}'),
 ];
 
 fn is_cjk(ch: char) -> bool {

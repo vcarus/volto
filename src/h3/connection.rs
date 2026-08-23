@@ -368,6 +368,11 @@ impl Handle {
     //# If either control stream is closed at any point, this MUST be treated
     //# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
     ///
+    /// The same verdict covers the two QPACK streams this endpoint opens, on the
+    /// strength of RFC 9204 §4.2 rather than this sentence (the reasoning is on
+    /// [`Connection::_qpack`]); three of this endpoint's streams write through
+    /// here and all three are critical.
+    ///
     /// Routed through [`Self::fail`] rather than merely returned, because a
     /// connection error in this layer *is* the CONNECTION_CLOSE that carries the
     /// code (RFC 9114 §8). Returning the violation on its own left the peer
