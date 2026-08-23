@@ -760,10 +760,21 @@ pub(crate) async fn refuse_with(
 /// reset** — RFC 9114 §4.4 reserves an abruptly terminated stream for a failure
 /// of the target connection (H3_CONNECT_ERROR), which this is not, and a reset
 /// would also be the one signal a client is entitled to read as "the proxy
-/// broke". A clean FIN is what RFC 9297 §3.3 treats as the normal end of a
-/// capsule stream, and on the CONNECT-UDP path it also settles RFC 9298 §3.1's
-/// pairing of socket and request stream in the only way available here: there
-/// is no socket, so no request stream is left open waiting for one.
+/// broke".
+///
+/// The FIN that follows is this server's own choice rather than a rule read off
+/// a spec. RFC 9297 §3.3 mentions a cleanly terminated capsule stream only to
+/// rule on what a truncated last capsule means then — "If the receive side of a
+/// stream carrying Capsules is terminated cleanly (for example, in HTTP/3 this
+/// is defined as receiving a QUIC STREAM frame with the FIN bit set) and the
+/// last Capsule on the stream was truncated, this MUST be treated as if it were
+/// a malformed or incomplete message" — and says nothing about ending one on
+/// purpose. RFC 9298 §3.1 ties the request stream to a socket that exists: a
+/// UDP proxy "MUST keep the socket open while the request stream is open", and
+/// when it closes a socket it "MUST close the request stream". No socket is
+/// ever opened here, so neither sentence reaches this case. So this is this
+/// server's own, and the FIN is what it picks: the ending an established
+/// session gets, and the only one that says nothing went wrong.
 ///
 /// The STOP_SENDING up front is the shape to keep. RFC 9114 §4.1 leaves the
 /// choice open — a server may abort reading the request, or leave the client to

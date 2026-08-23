@@ -12,6 +12,22 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# `bloom` is a behaviour switch, not a passive dependency, so it is listed here
+# deliberately: it selects what quinn-proto's `ValidationTokenConfig` defaults
+# to. With it the server sends 2 NEW_TOKEN frames to every client whose path it
+# has validated and keeps a `BloomTokenLog` of the tokens that come back, so a
+# returning client skips address validation and a replayed token is still
+# caught. Without it the log is `NoneTokenLog` and `sent` is 0: no NEW_TOKEN
+# frames at all, and every returning client pays the extra round trip again.
+#
+# Its memory is bounded rather than growing with traffic, which is worth knowing
+# before reading a heap profile: `BloomTokenLog::default` is
+# `new_expected_items(DEFAULT_MAX_BYTES, DEFAULT_EXPECTED_HITS)`, where
+# `DEFAULT_MAX_BYTES` is `10 << 20` split evenly between the two filters it
+# keeps for the two token-expiry periods that can be live at once (the default
+# token lifetime being two weeks). It also starts as a hash set and becomes a
+# bloom filter only once that set grows, so an early profile shows far less than
+# the bound and a later one shows the bound. Neither is a leak.
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
     "rustls-ring",

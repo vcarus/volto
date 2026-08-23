@@ -431,9 +431,13 @@ fn log_request(req: &Request, stream_id: u64) {
         })
         .collect();
 
-    // Every `:protocol` token alike, through `bounded` for the reason the 501
-    // path gives: the token is the peer's bytes and only checked for being
-    // UTF-8, so a newline in one must not forge a journal line.
+    // Every `:protocol` token alike, through `bounded`, which cuts the length
+    // and nothing else: a token may be a whole field section's worth of bytes.
+    // What keeps a newline in one from forging a journal line is the `?` it is
+    // recorded with below -- a `:protocol` token is only checked for being
+    // UTF-8, and Debug formatting escapes control characters, which is the same
+    // division of labour the 501 path above states for the `str` it logs. See
+    // `logfmt`.
     let protocol = req.protocol.as_deref().map(bounded);
 
     debug!(

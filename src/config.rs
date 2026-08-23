@@ -596,7 +596,7 @@ impl Default for Log {
 impl Config {
     /// Reads and validates the configuration at `path`.
     ///
-    /// A parse failure is rendered by [`parse_error`] rather than carried in the
+    /// A parse failure is rendered by `parse_error` rather than carried in the
     /// error chain, because this file holds passwords and the `toml` crate's own
     /// `Display` prints the offending source line.
     pub fn load(path: &Path) -> Result<Self> {
