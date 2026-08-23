@@ -68,10 +68,7 @@ use volto::h3::varint;
 use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
 
 use super::huffman;
-use super::{
-    client_endpoint_with_stream_window, client_endpoint_with_transport, connect_quic,
-    connect_quic_with_ca, finish_connect,
-};
+use super::{client_endpoint_with_transport, connect_quic, connect_quic_with_ca, finish_connect};
 use super::{TestServer, TIMEOUT};
 
 /// Unidirectional stream types this client opens (RFC 9114 §6.2, RFC 9204 §4.2).
@@ -94,6 +91,11 @@ const MAX_CONTROL_FRAME: u64 = volto::h3::MAX_FIELD_SECTION_SIZE;
 /// corresponding HTTP/3 frame have also been reserved (Section 11.2.1). These
 /// frame types MUST NOT be sent, and their receipt MUST be treated as a
 /// connection error of type H3_FRAME_UNEXPECTED."
+///
+/// Transcribed from that section rather than shared with the server's own list:
+/// what this sends is what the RFC reserves, so a type the server has forgotten
+/// fails the test instead of quietly agreeing with it. Same reasoning as
+/// [`super::huffman`].
 const RESERVED_HTTP2_FRAMES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
 
 /// Sentinel for "the server has not sent GOAWAY yet".
@@ -261,11 +263,17 @@ impl H3Client {
 
     /// [`H3Client::connect_without_datagrams`] with a per-stream receive window
     /// of `window` bytes, so a server writing capsules blocks after that much.
+    ///
+    /// quinn's default window is 1.25 MB, which is a lot of data to push through
+    /// a tunnel before a write to the client blocks on it: a test that wants the
+    /// server *parked* on flow control shrinks the window instead of flooding.
     pub async fn connect_without_datagrams_with_stream_window(
         server: &TestServer,
         window: u32,
     ) -> Self {
-        let endpoint = client_endpoint_with_stream_window(&server.ca, &["h3"], window);
+        let mut transport = quinn::TransportConfig::default();
+        transport.stream_receive_window(window.into());
+        let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
         let connection = finish_connect(&endpoint, server.addr)
             .await
             .expect("handshake");
@@ -286,14 +294,6 @@ impl H3Client {
         self.endpoint
             .rebind(socket)
             .expect("rebind the client endpoint");
-    }
-
-    /// Opens a request stream and sends the request's HEADERS frame.
-    ///
-    /// The same shape as `client.send.send_request(..)`, for call sites that
-    /// have the client rather than its sender.
-    pub async fn send_request(&mut self, request: Request) -> Result<ClientStream, StreamError> {
-        self.send.send_request(request).await
     }
 
     /// The identifier of the server's GOAWAY, if one has arrived.
@@ -611,11 +611,6 @@ impl ClientStream {
         // reporting: either way nothing more will be sent on it.
         let _ = self.send.reset(varint(code));
     }
-
-    /// Asks the server to stop sending on this stream.
-    pub fn stop_sending(&mut self, code: Code) {
-        self.frames.stop(code);
-    }
 }
 
 /// Turns a request into the field lines that carry it (RFC 9114 §4.3).
@@ -702,6 +697,11 @@ fn put_huffman_string(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: &[
 /// RFC 7541 §5.1's encoding, transcribed here rather than borrowed from the
 /// server: these bytes are what the server is asked to parse, so a shared
 /// mistake would be invisible.
+///
+/// That independence covers the Huffman path and nothing else. [`put_huffman_string`]
+/// is the only caller -- a Huffman literal has to declare the length of what it
+/// encoded -- while an ordinary request is encoded by `qpack::encode`, the
+/// server's own encoder.
 fn put_prefixed_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
     // Computed in `u16` so a full eight-bit prefix does not shift by the width
     // of the type it is shifting.
@@ -727,6 +727,11 @@ fn put_prefixed_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64)
 /// "The size of a field list is calculated based on the uncompressed size of
 /// fields, including the length of the name and value in bytes plus an overhead
 /// of 32 bytes for each field."
+///
+/// The 32 is written out here rather than shared with `volto::h3::qpack`,
+/// deliberately: this arithmetic is what holds the server to the limit it
+/// advertises, and a constant common to both ends could drift from the RFC
+/// without either noticing. Same reasoning as [`super::huffman`].
 fn section_size(fields: &[(Vec<u8>, Vec<u8>)]) -> u64 {
     fields
         .iter()

@@ -49,7 +49,7 @@ use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
-use common::{open_tcp_tunnel, open_udp_session, H3Client, TestServer, ALLOW_PRIVATE};
+use common::{open_tcp_tunnel, open_udp_session, read_to_end, H3Client, TestServer, ALLOW_PRIVATE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
@@ -809,7 +809,7 @@ async fn tcp_churn(count: u64) -> Rep {
         // have reached its target; a FIN answered by the target's EOF proves the
         // whole path was built and torn down.
         stream.finish().expect("finish the request stream");
-        while stream.recv_data().await.expect("read the tunnel").is_some() {}
+        read_to_end(&mut stream).await;
     }
     let totals = window.close();
 
@@ -828,7 +828,7 @@ async fn udp_churn(count: u64) -> Rep {
     for _ in 0..count {
         let (_qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
         stream.finish().expect("finish the request stream");
-        while stream.recv_data().await.expect("read the stream").is_some() {}
+        read_to_end(&mut stream).await;
     }
     let totals = window.close();
 
@@ -858,7 +858,7 @@ async fn concurrent_tunnels(count: usize) -> (Rep, Rep) {
         stream.finish().expect("finish the request stream");
     }
     for stream in &mut streams {
-        while stream.recv_data().await.expect("read the tunnel").is_some() {}
+        read_to_end(stream).await;
     }
     let close_totals = closing.close();
 

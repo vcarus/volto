@@ -299,21 +299,6 @@ pub fn client_endpoint(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::En
     client_endpoint_with(ca, alpn, None)
 }
 
-/// [`client_endpoint`] with a per-stream receive window of `window` bytes.
-///
-/// quinn's default is 1.25 MB, which is a lot of data to push through a tunnel
-/// before a server's write to the client blocks on it. Tests that need the
-/// server *parked* on flow control shrink it instead of flooding.
-pub fn client_endpoint_with_stream_window(
-    ca: &CertificateDer<'static>,
-    alpn: &[&str],
-    window: u32,
-) -> quinn::Endpoint {
-    let mut transport = quinn::TransportConfig::default();
-    transport.stream_receive_window(window.into());
-    client_endpoint_with_transport(ca, alpn, transport)
-}
-
 /// [`client_endpoint`] built on transport parameters the caller chose.
 ///
 /// The escape hatch for tests whose subject is what the *peer's* transport
