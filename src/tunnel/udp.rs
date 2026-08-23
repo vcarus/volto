@@ -40,7 +40,8 @@ use tracing::{debug, info, warn};
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{
-    self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
+    self, DatagramReceiver, FieldValue, Fields, Reader, Request, RespondError, Status, Stream,
+    Writer,
 };
 use crate::tunnel::{Context, Unreachable};
 use crate::{net, tunnel};
@@ -138,9 +139,26 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         }
     };
 
-    if let Err(error) = stream.respond_with(Status::OK, capsule_fields()).await {
-        debug!(stream_id, %error, "failed to send 200 for connect-udp");
-        return;
+    // Bounded exactly as every refusal is, and for the same reason
+    // ([`h3api::Stream::respond_within`]): a peer that grants no flow-control
+    // credit never takes even the few bytes of a 200, and nothing else would
+    // ever end the wait -- the session below does not exist until this write
+    // returns. On expiry the stream has already been reset with
+    // H3_REQUEST_CANCELLED, and returning here drops the socket and the
+    // Quarter Stream ID claim with it.
+    match stream.respond_within(Status::OK, capsule_fields()).await {
+        Ok(()) => {}
+        Err(RespondError::Failed(error)) => {
+            debug!(stream_id, %error, "failed to send 200 for connect-udp");
+            return;
+        }
+        Err(RespondError::Expired) => {
+            debug!(
+                stream_id,
+                "gave up on a 200 for connect-udp the peer would not take"
+            );
+            return;
+        }
     }
 
     let target = socket.peer_addr().ok();

@@ -6,12 +6,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::assert_closed_with;
+use common::rawstream::{assert_closed_with, connect_headers_frame};
 use common::{
-    assert_peer_reset, closed_address, connect_request, open_tcp_tunnel, read_at_least,
-    read_to_end, respond_to, send_and_respond, spawn_drain_then_reply_target, spawn_echo_target,
-    spawn_end_reporting_target, spawn_flood_then_reset_target, spawn_reset_after_read_target,
-    ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
+    finish_connect, open_tcp_tunnel, read_at_least, read_to_end, respond_to, send_and_respond,
+    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
+    TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -24,6 +25,32 @@ const H3_MESSAGE_ERROR: u64 = 0x010e;
 
 /// H3_FRAME_UNEXPECTED (RFC 9114 §8.1), the answer to a frame out of place.
 const H3_FRAME_UNEXPECTED: u64 = 0x0105;
+
+/// H3_REQUEST_CANCELLED (RFC 9114 §8.1): "The request or its response
+/// (including pushed response) is cancelled."
+const H3_REQUEST_CANCELLED: u64 = 0x010c;
+
+/// A 2s idle timeout, which is also how long any one response may take.
+///
+/// Long enough that a deadline lapsing is a deliberate act rather than a slow
+/// machine, and short enough for a test to wait out.
+const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+
+/// Transport parameters for a peer that leaves no room for an answer.
+///
+/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
+/// the handshake needs and under what the handshake plus any response costs;
+/// nothing reads the server's control stream here, so the allowance is spent by
+/// the handshake and never returned. The keep-alive is what makes the test
+/// about the application's deadline: with it, the transport's own idle timeout
+/// can never be the thing that ends anything.
+fn windowless_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(24u32.into());
+    transport.stream_receive_window(24u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    transport
+}
 
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
@@ -238,6 +265,57 @@ async fn a_clean_client_close_still_reaches_the_target_as_eof() {
         ConnectionEnd::Eof,
         "a clean half-close must stay a FIN: RFC 9114 §4.4 half-close semantics \
          depend on the target seeing an ordinary end of stream"
+    );
+}
+
+/// The 200 that opens a tunnel is bounded like every refusal.
+///
+/// It is the one response written after a target connection exists, which used
+/// to be the argument for exempting it — but the pumps that would notice the
+/// client giving up are started by the line *after* this write, so a peer that
+/// grants no flow-control credit parks the request task with the target socket
+/// in its hand for as long as the connection lasts. RFC 9114 §8.1's
+/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// response) is cancelled", and a reset is the only end that reaches a peer
+/// granting no window at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_200_the_peer_will_not_take_is_reset() {
+    let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send a CONNECT that will be accepted");
+
+    // Past the server's idle timeout, without reading a byte: reading is what
+    // would grow the window and let the 200 through.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(4096))
+        .await
+        .expect("the server must not wait for a window that is not coming")
+        .expect_err("a 200 the peer would not take must end in a reset");
+
+    match error {
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_CANCELLED,
+            "an abandoned 200 is a cancelled request"
+        ),
+        other => panic!("expected the response side to be reset, got {other}"),
+    }
+
+    // One tunnel that could not be opened is not a reason to drop everything
+    // else on the connection.
+    assert!(
+        connection.close_reason().is_none(),
+        "the connection must survive a tunnel whose 200 could not be delivered"
     );
 }
 

@@ -34,7 +34,7 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::h3api::{self, Buffer, Fields, Reader, Status, Stream, Writer};
+use crate::h3api::{self, Buffer, Fields, Reader, RespondError, Status, Stream, Writer};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
@@ -140,10 +140,26 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     let target = tcp.peer_addr().ok();
 
-    if let Err(error) = stream.respond(Status::OK).await {
-        debug!(stream_id, %error, "failed to send 200 for CONNECT");
-        // Dropping `tcp` closes the connection we just opened.
-        return;
+    // Bounded exactly as every refusal is, and for the same reason
+    // ([`h3api::Stream::respond_within`]): a peer that grants no flow-control
+    // credit never takes even the few bytes of a 200, and nothing else would
+    // ever end the wait -- the pumps below do not exist until this write
+    // returns. On expiry the stream has already been reset with
+    // H3_REQUEST_CANCELLED, and returning here drops `tcp`, closing the target
+    // connection that will now carry nothing.
+    match stream.respond_within(Status::OK, Fields::new()).await {
+        Ok(()) => {}
+        Err(RespondError::Failed(error)) => {
+            debug!(stream_id, %error, "failed to send 200 for CONNECT");
+            return;
+        }
+        Err(RespondError::Expired) => {
+            debug!(
+                stream_id,
+                authority, "gave up on a 200 for CONNECT the peer would not take"
+            );
+            return;
+        }
     }
 
     info!(

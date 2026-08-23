@@ -67,15 +67,17 @@ Every wait that stands between a packet arriving and a tunnel opening is bounded
 by `limits.max_idle_timeout`, whatever the connection's authentication state:
 the QUIC/TLS handshake in `quic.rs`, the HTTP/3 handshake and the read of each
 peer unidirectional stream's type in `h3/connection.rs`, the read of a request
-stream's HEADERS in `Resolver::resolve`, and every refusal this server writes —
-400, 403, 407, 431, 501 and the 5xx family, plus the 200 that closes on the spot
-— in `Stream::respond_within`. The bound is needed because the keep-alive PINGs
+stream's HEADERS in `Resolver::resolve`, and every response this server writes
+before a tunnel starts relaying — 400, 403, 407, 431, 501 and the 5xx family,
+the 200 that closes on the spot, and the 200 that opens a tunnel — in
+`Stream::respond_within`. The bound is needed because the keep-alive PINGs
 this server sends are answered by the peer's QUIC stack with no application ever
 involved, so the transport's own idle timer never fires on a peer that is
 present but says nothing; the response writes need it because a peer that grants
 no flow-control window never takes even the fifty-odd bytes of a 407. A tunnel's
-own 200 is not bounded here: by then there is a target on the other side and the
-pumps have their own ending.
+own 200 is bounded like the rest: the pumps that would otherwise end the wait do
+not exist until that write returns, and a lapsed one resets the stream and drops
+the target socket the request had already opened.
 
 One further bound applies until a request on a connection has passed the
 credentials check: twice `limits.max_idle_timeout` for one request to

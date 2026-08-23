@@ -9,7 +9,7 @@ use bytes::Bytes;
 use common::{
     assert_peer_reset, closed_udp_address, connect_udp_request, open_udp_session,
     open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
-    spawn_tagged_udp_target, spawn_udp_echo_target, H3Client, TestServer, TIMEOUT,
+    spawn_tagged_udp_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -766,6 +766,84 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     // error, never a connection error.
     let echo = spawn_udp_echo_target().await;
     let (_, _second) = open_udp_session(&mut client, &server, echo).await;
+}
+
+/// A 2s idle timeout, which is also how long any one response may take.
+///
+/// Long enough that a deadline lapsing is a deliberate act rather than a slow
+/// machine, and short enough for a test to wait out.
+const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+
+/// Transport parameters for a peer that leaves no room for an answer.
+///
+/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
+/// the handshake needs and under what the handshake plus any response costs;
+/// nothing reads the server's control stream here, so the allowance is spent by
+/// the handshake and never returned. The keep-alive is what makes the test
+/// about the application's deadline: with it, the transport's own idle timeout
+/// can never be the thing that ends anything.
+fn windowless_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(24u32.into());
+    transport.stream_receive_window(24u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    transport
+}
+
+/// The 200 that opens a session is bounded like every refusal.
+///
+/// The socket is already bound by the time this write happens, which used to be
+/// the argument for exempting it — but the session loop that would notice the
+/// client giving up is started by the line *after* this write, so a peer that
+/// grants no flow-control credit parks the request task with the target socket
+/// and the Quarter Stream ID claim in its hand. RFC 9114 §8.1's
+/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// response) is cancelled", and a reset is the only end that reaches a peer
+/// granting no window at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_200_the_peer_will_not_take_is_reset() {
+    let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
+    let target = spawn_udp_echo_target().await;
+
+    let endpoint =
+        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&common::rawstream::connect_udp_headers_frame(
+        &server.addr.to_string(),
+        "127.0.0.1",
+        target.port(),
+    ))
+    .await
+    .expect("send a connect-udp request that will be accepted");
+
+    // Past the server's idle timeout, without reading a byte: reading is what
+    // would grow the window and let the 200 through.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(4096))
+        .await
+        .expect("the server must not wait for a window that is not coming")
+        .expect_err("a 200 the peer would not take must end in a reset");
+
+    match error {
+        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_CANCELLED,
+            "an abandoned 200 is a cancelled request"
+        ),
+        other => panic!("expected the response side to be reset, got {other}"),
+    }
+
+    // One session that could not be opened is not a reason to drop everything
+    // else on the connection.
+    assert!(
+        connection.close_reason().is_none(),
+        "the connection must survive a session whose 200 could not be delivered"
+    );
 }
 
 /// An unreachable target must close the session, not leave it hanging.
