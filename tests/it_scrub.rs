@@ -10,8 +10,9 @@
 //!
 //! Two checks over `git ls-files`:
 //!
-//! * CJK characters, which are self-describing and can be spelled out here as
-//!   escapes, so this file stays clean of them itself.
+//! * CJK characters and the scripts written alongside them, which are
+//!   self-describing and can be spelled out here as escapes, so this file stays
+//!   clean of them itself.
 //! * A list of private literals, which cannot be written down in a public
 //!   repository at all. They come from outside the tree: `VOLTO_SCRUB_PATTERNS`
 //!   (`|`-separated, from a repository secret in CI) and, on the dev host, the
@@ -33,12 +34,17 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Ranges that no tracked file may contain: CJK punctuation, both common
-/// ideograph blocks, and fullwidth/halfwidth forms.
-const CJK_RANGES: [(char, char); 4] = [
+/// Ranges that no tracked file may contain.
+///
+/// CJK punctuation, kana, both common ideograph blocks, Hangul syllables, and
+/// fullwidth/halfwidth forms — so the check covers the scripts the notes are
+/// written in and their neighbours, not only Han characters.
+const CJK_RANGES: [(char, char); 6] = [
     ('\u{3000}', '\u{303f}'),
+    ('\u{3040}', '\u{30ff}'),
     ('\u{3400}', '\u{4dbf}'),
     ('\u{4e00}', '\u{9fff}'),
+    ('\u{ac00}', '\u{d7af}'),
     ('\u{ff00}', '\u{ffef}'),
 ];
 
