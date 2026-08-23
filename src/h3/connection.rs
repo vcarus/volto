@@ -220,14 +220,26 @@ impl Shared {
 ///
 /// # What this costs at the configured limits
 ///
-/// Worst case is `depth x payload x max_targets_per_conn x max_connections`.
-/// Only the payload needs care: a QUIC DATAGRAM frame cannot be fragmented, so a
-/// datagram never exceeds the `max_udp_payload_size` this server advertises
-/// (quinn's default, 1472 bytes) even though RFC 9298 §5 permits a 65527-byte UDP
-/// payload in principle. With the shipped defaults (`INBOUND_QUEUE_DEPTH` = 64,
-/// `max_targets_per_conn` = 256, `max_connections` = 256) that is ~92 KiB per
-/// session, ~23 MiB per connection and ~5.8 GiB across a server saturated at both
-/// limits — an operator lowering either limit lowers it proportionally.
+/// A session holds two buffers, and this constant sizes only the first of them.
+///
+/// The queue is `depth x payload`. Only the payload needs care: a QUIC DATAGRAM
+/// frame cannot be fragmented, so a datagram never exceeds the
+/// `max_udp_payload_size` this server advertises (quinn's default, 1472 bytes)
+/// even though RFC 9298 §5 permits a 65527-byte UDP payload in principle. At
+/// `INBOUND_QUEUE_DEPTH` = 64 that is ~92 KiB.
+///
+/// The second is the buffer a running session reads its *target* socket into
+/// ([`crate::tunnel`]'s UDP path), one per session and sized for the largest UDP
+/// payload there can be — the whole 65527 bytes, ~64 KiB — because a packet that
+/// has arrived must fit somewhere before its length is known. Unlike the queue it
+/// exists only once the session loop is running, so a session refused before its
+/// socket is bound never allocates one.
+///
+/// A session therefore costs ~156 KiB, and the worst case is that times
+/// `max_targets_per_conn` times `max_connections`. With the shipped defaults
+/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~39 MiB per
+/// connection and ~9.8 GiB across a server saturated at both limits — an operator
+/// lowering either limit lowers it proportionally.
 ///
 /// Registering a session before its target socket exists does **not** raise that
 /// ceiling: the queue is the same size in both phases, sessions are still capped
