@@ -59,9 +59,12 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 
 **The fd budget is one number split in two.** Every tunnel costs one file
 descriptor, so `max_targets_per_conn` and systemd's `LimitNOFILE` are two halves
-of the same budget. The defaults line up deliberately: 256 connections × 256
-tunnels = 65536, the `LimitNOFILE` in the shipped unit. volto warns at startup
-when `RLIMIT_NOFILE` leaves no margin.
+of the same budget. What volto compares against `RLIMIT_NOFILE` at startup is
+`max_connections` × `max_targets_per_conn` **plus 64 descriptors of headroom**
+for the listening socket, the request streams and a certificate reload — 65600
+for the defaults, which the shipped unit's `LimitNOFILE=131072` has room for.
+Raise either limit past that point and `LimitNOFILE` has to go up with it, or
+the startup warning fires.
 
 **`connect_timeout` is spent per request, not per connection.** Without it a
 target that silently drops SYNs holds a tunnel slot and its file descriptor for

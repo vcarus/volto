@@ -41,9 +41,11 @@ RestartSec=5s
 
 # --- File descriptors -------------------------------------------------------
 # Every tunnel costs one descriptor, and one client multiplexes many onto a single
-# QUIC connection. This must stay well above limits.max_targets_per_conn times the
-# number of concurrent clients; volto warns at startup if the margin is thin.
-LimitNOFILE=65536
+# QUIC connection. What volto checks at startup is limits.max_connections times
+# limits.max_targets_per_conn plus 64 descriptors of headroom, against RLIMIT_NOFILE;
+# the shipped defaults need 65600, so this leaves room for them. Raise either limit
+# past this and raise LimitNOFILE with a drop-in too, or expect the startup warning.
+LimitNOFILE=131072
 
 # --- Privileges -------------------------------------------------------------
 # Runs unprivileged. Binding 443 needs a capability rather than root: this grants

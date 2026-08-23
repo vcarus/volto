@@ -1064,10 +1064,12 @@ mod tests {
     /// default limit of 256 with the default quota of 256, where one connection
     /// at its quota consumes every descriptor the process has.
     ///
-    /// And on the shipped one, which is the case that made the old
-    /// single-connection arithmetic wrong (review M7): 256 connections x 256
-    /// tunnels is exactly the `LimitNOFILE` the systemd unit sets, so the
-    /// defaults leave not one descriptor of headroom and the check said nothing.
+    /// And on the shipped quotas under a 65536-descriptor limit, which is the
+    /// case that made the old single-connection arithmetic wrong (review M7):
+    /// 256 connections x 256 tunnels is that limit exactly, so the defaults
+    /// leave not one descriptor of headroom and the check said nothing. That
+    /// pairing is synthetic now that the shipped unit sets 131072, and is kept
+    /// because the product landing on the limit is the tightest case there is.
     #[test]
     fn a_tight_fd_budget_is_recognised() {
         assert!(fd_budget_is_tight(256, 1, 256), "the macOS default pairing");
@@ -1081,8 +1083,8 @@ mod tests {
                 defaults.max_connections,
                 defaults.max_targets_per_conn
             ),
-            "the shipped defaults against the shipped LimitNOFILE: {} x {} leaves \
-             nothing over",
+            "the shipped quotas against a limit their product meets exactly: {} \
+             x {} leaves nothing over",
             defaults.max_connections,
             defaults.max_targets_per_conn
         );

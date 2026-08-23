@@ -63,9 +63,10 @@ users = [
 # Simultaneously open QUIC connections; 0 removes the limit.
 #
 # Beyond this, new connections are refused during the handshake -- before any
-# per-connection state exists on this side. The default lines up with the rest of
-# the budget: 256 connections x 256 tunnels = 65536, the LimitNOFILE the shipped
-# systemd unit grants.
+# per-connection state exists on this side. The default is sized against the rest
+# of the budget: what volto checks at startup is 256 connections x 256 tunnels plus
+# 64 descriptors of headroom = 65600, and the shipped systemd unit grants
+# LimitNOFILE=131072. Raising either limit past that means raising LimitNOFILE too.
 # Default: 256
 #max_connections = 256
 

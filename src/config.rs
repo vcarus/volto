@@ -86,9 +86,12 @@ pub const DEFAULT_UDP_SESSION_TIMEOUT: u64 = 180;
 
 /// Default cap on simultaneously open QUIC connections.
 ///
-/// Chosen to line up with the rest of the budget rather than picked at random:
-/// `max_connections * max_targets_per_conn` is 256 * 256 = 65536, which is the
-/// `LimitNOFILE` the shipped systemd unit sets.
+/// Sized against the rest of the budget rather than picked at random: what the
+/// startup check compares against `RLIMIT_NOFILE` is
+/// `max_connections * max_targets_per_conn` plus 64 descriptors of headroom,
+/// which is 256 * 256 + 64 = 65600 here, against the `LimitNOFILE=131072` the
+/// shipped systemd unit sets. Raising either limit past that point means raising
+/// `LimitNOFILE` with it.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 
 /// Default budget for reaching a target, in seconds.
@@ -922,8 +925,8 @@ mod tests {
         );
         assert_eq!(cfg.limits.max_streams_bidi, 1024);
         assert_eq!(cfg.security.max_auth_failures, 5);
-        // The connection cap and the tunnel quota multiply out to the fd budget
-        // the shipped systemd unit grants.
+        // The connection cap and the tunnel quota multiply out to the product
+        // the startup fd check adds its headroom to.
         assert_eq!(
             cfg.limits.max_connections as u64 * cfg.limits.max_targets_per_conn as u64,
             65536
