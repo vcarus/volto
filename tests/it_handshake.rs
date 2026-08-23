@@ -23,6 +23,8 @@ mod common;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::Location;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -35,6 +37,13 @@ use common::{
     client_endpoint_with_transport, finish_connect, open_tcp_tunnel, read_at_least,
     send_and_respond, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
+use quinn::crypto::rustls::QuicClientConfig;
+use rustls::client::{
+    ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
+    Tls13ClientSessionValue,
+};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::NamedGroup;
 use volto::h3api::Status;
 
 /// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1), the code the server hangs up with.
@@ -485,6 +494,162 @@ async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
             .is_err(),
         "only one slot was needed, so the younger parked connection must keep its own"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 0-RTT is off, and pinned off rather than inherited
+// ---------------------------------------------------------------------------
+
+/// The server must not let a returning client send early data.
+///
+/// `src/tls.rs` builds the rustls `ServerConfig` by hand, so
+/// `max_early_data_size` is whatever is set there — quinn's own
+/// `with_single_cert` sets `u32::MAX`, and rustls' default is 0. The value is
+/// pinned to 0 for the reason RFC 9001 §9.2 gives, and this is what says so from
+/// the wire.
+///
+/// The client is as willing as a client can be: `enable_early_data`, a session
+/// store it keeps, and a first connection whose ticket has demonstrably arrived
+/// before the second one starts. Without that wait the assertion would hold for
+/// the wrong reason — a client with nothing to resume cannot offer 0-RTT
+/// whatever the server permits.
+#[tokio::test]
+async fn the_server_does_not_permit_zero_rtt() {
+    let server = TestServer::start().await;
+    let (endpoint, tickets) = resuming_client_endpoint(&server.ca);
+
+    // Held open: the ticket arrives on this connection, after its handshake.
+    let _first = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("the first handshake must succeed");
+    await_ticket(&tickets).await;
+
+    let second = endpoint
+        .connect(server.addr, "localhost")
+        .expect("start the second handshake");
+    let Err(second) = second.into_0rtt() else {
+        panic!("the server offered 0-RTT: RFC 9001 section 9.2 has this proxy disable it");
+    };
+
+    // What was refused is the early data and not the connection: the ordinary
+    // handshake still completes on the ticket the client kept.
+    let second = tokio::time::timeout(TIMEOUT, second)
+        .await
+        .expect("the second handshake must not hang")
+        .expect("the second handshake must succeed without 0-RTT");
+    assert!(
+        second.close_reason().is_none(),
+        "the resumed connection must be usable"
+    );
+}
+
+/// Waits until the server has sent a TLS 1.3 session ticket, or gives up.
+///
+/// The ticket is what a resumption is built on and it arrives after the
+/// handshake, so this is the difference between asserting that 0-RTT was refused
+/// and asserting that there was nothing to offer.
+async fn await_ticket(tickets: &AtomicUsize) {
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    while tickets.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server sent no session ticket within {TIMEOUT:?}, so there was never \
+             anything to resume"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A client endpoint that keeps session tickets and is willing to use them for
+/// early data.
+///
+/// Built here rather than through `common::client_endpoint` because it differs
+/// from every other client in this suite in exactly the way this one test needs.
+/// rustls leaves `enable_early_data` off, and quinn only sets it on the client
+/// configs it builds itself, so the shared helper's client would never offer
+/// 0-RTT and would agree with the server for the wrong reason.
+fn resuming_client_endpoint(ca: &CertificateDer<'static>) -> (quinn::Endpoint, Arc<AtomicUsize>) {
+    let tickets = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(CountingSessionStore {
+        // rustls' own default size, and not a number to shrink for tidiness:
+        // its cache divides the figure by the tickets it keeps per server and
+        // then evicts when the resulting deque is at capacity, so a small size
+        // drops the very entry it has just stored and no resumption is ever
+        // possible.
+        inner: ClientSessionMemoryCache::new(256),
+        tickets: tickets.clone(),
+    });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.clone()).expect("trust the test CA");
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+    crypto.resumption = Resumption::store(store);
+    crypto.enable_early_data = true;
+
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto).expect("quic tls"),
+    ));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
+    endpoint.set_default_client_config(client_config);
+
+    (endpoint, tickets)
+}
+
+/// rustls' own in-memory session cache, with a count of the tickets that reach
+/// it.
+///
+/// Every method delegates; the count is the only thing added, and it is what
+/// [`await_ticket`] waits on.
+#[derive(Debug)]
+struct CountingSessionStore {
+    inner: ClientSessionMemoryCache,
+    tickets: Arc<AtomicUsize>,
+}
+
+impl ClientSessionStore for CountingSessionStore {
+    fn set_kx_hint(&self, server_name: ServerName<'static>, group: NamedGroup) {
+        self.inner.set_kx_hint(server_name, group);
+    }
+
+    fn kx_hint(&self, server_name: &ServerName<'_>) -> Option<NamedGroup> {
+        self.inner.kx_hint(server_name)
+    }
+
+    fn set_tls12_session(&self, server_name: ServerName<'static>, value: Tls12ClientSessionValue) {
+        self.inner.set_tls12_session(server_name, value);
+    }
+
+    fn tls12_session(&self, server_name: &ServerName<'_>) -> Option<Tls12ClientSessionValue> {
+        self.inner.tls12_session(server_name)
+    }
+
+    fn remove_tls12_session(&self, server_name: &ServerName<'static>) {
+        self.inner.remove_tls12_session(server_name);
+    }
+
+    fn insert_tls13_ticket(
+        &self,
+        server_name: ServerName<'static>,
+        value: Tls13ClientSessionValue,
+    ) {
+        self.tickets.fetch_add(1, Ordering::Relaxed);
+        self.inner.insert_tls13_ticket(server_name, value);
+    }
+
+    fn take_tls13_ticket(
+        &self,
+        server_name: &ServerName<'static>,
+    ) -> Option<Tls13ClientSessionValue> {
+        self.inner.take_tls13_ticket(server_name)
+    }
 }
 
 /// Carries packets one way only: client to `server`, and nothing back.

@@ -32,6 +32,23 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
         .with_single_cert(certs, key)
         .context("server.cert and server.key do not form a usable certificate/key pair")?;
 
+    // Stated rather than inherited. rustls already defaults this to 0, so not a
+    // byte on the wire changes, and QUIC allows only 0 or `u32::MAX` anyway --
+    // but a security property that holds because nobody set it is one nobody
+    // notices losing, and quinn's own `ServerConfig::with_single_cert` sets the
+    // other value. RFC 9001 §9.2 puts the choice on the application protocol:
+    // one that uses QUIC "MUST describe how the protocol uses 0-RTT and the
+    // measures that are employed to protect against replay attack". This one
+    // does not use it. Every request here is a CONNECT carrying credentials,
+    // and the resumption that matters to a mobile client -- not paying for a
+    // full handshake after a network switch -- is ordinary 1-RTT resumption,
+    // which this leaves untouched.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
+    //# Disabling 0-RTT entirely is the most effective defense against replay
+    //# attack.
+    crypto.max_early_data_size = 0;
+
     crypto.alpn_protocols = server.alpn_wire();
 
     if config.log.keylog {
