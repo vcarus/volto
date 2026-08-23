@@ -32,6 +32,8 @@
 //! | i2 | Opens a second control stream, a client-initiated push stream, or closes its control stream cleanly | RFC 9114 §6.2.1/§6.2.2 (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR for the first two, H3_CLOSED_CRITICAL_STREAM (0x104) for the third | [`unidirectional_streams_that_break_a_critical_stream_rule_end_the_connection`] |
 //! | j | Sends a frame type reserved for HTTP/2 (0x02, 0x06, 0x08, 0x09) | `RESERVED_HTTP2_TYPES` (`src/h3/frame.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), whatever stream it arrives on | [`frame_types_reserved_for_http2_end_the_connection`] |
 //! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream | RFC 9114 §6.2.1 first-frame rule (`Control::accept`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a) | `it_settings::a_frame_before_settings_ends_the_connection` |
+//! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431, and nothing charged to the buffering budget on the way | [`control_stream_frames_on_a_request_stream_end_the_connection`], [`a_frame_refused_for_its_type_is_never_charged_for`] |
+//! | j6 | Announces a HEADERS frame on a tunnel whose CONNECT has been answered, and never finishes it | RFC 9114 §4.4, decided from the frame header rather than after the payload (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105); the announcement never reaches the budget, so tunnels cannot pin it between them | [`a_field_section_on_an_established_tunnel_ends_the_connection`] |
 //! | j3 | Sends a second SETTINGS, or HEADERS/DATA/PUSH_PROMISE, on the control stream after SETTINGS | `Control::accept` (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED | [`frames_the_control_stream_may_not_carry_end_the_connection`] |
 //! | j4 | Sends CANCEL_PUSH, or a MAX_PUSH_ID that shrinks | RFC 9114 §7.2.3/§7.2.7 (`Control::accept`) | CONNECTION_CLOSE H3_ID_ERROR (0x108) | `it_critical_streams::a_cancel_push_is_an_id_error`, `it_critical_streams::a_shrinking_max_push_id_is_an_id_error` |
 //! | k | References the QPACK dynamic table in a field section | `QPACK_MAX_TABLE_CAPACITY = 0` is advertised, so there is no entry to name (`src/h3/qpack.rs`) | CONNECTION_CLOSE QPACK_DECOMPRESSION_FAILED (0x200) | `it_extended_connect::a_dynamic_table_reference_closes_the_connection` |
@@ -97,6 +99,8 @@ use volto::datagram;
 const FRAME_DATA: u64 = 0x00;
 /// HEADERS frame type (RFC 9114 §7.2.2).
 const FRAME_HEADERS: u64 = 0x01;
+/// CANCEL_PUSH frame type (RFC 9114 §7.2.3).
+const FRAME_CANCEL_PUSH: u64 = 0x03;
 /// SETTINGS frame type (RFC 9114 §7.2.4).
 const FRAME_SETTINGS: u64 = 0x04;
 /// PUSH_PROMISE frame type (RFC 9114 §7.2.5).
@@ -214,6 +218,29 @@ async fn announce_full_sized_headers(
     send.write_all(&announcement)
         .await
         .expect("announce a full-sized field section");
+
+    (send, recv)
+}
+
+/// Opens a request stream and writes a frame header for `kind` declaring
+/// `length` bytes, without a byte of the payload behind it.
+///
+/// The header alone is the whole of the case for the tests below: a verdict that
+/// waited for the payload would never be reached, so one that arrives proves the
+/// frame was judged from its type and its declared length alone.
+async fn announce_frame(
+    connection: &quinn::Connection,
+    kind: u64,
+    length: u64,
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
+
+    let mut announcement = BytesMut::new();
+    datagram::put_varint(&mut announcement, kind);
+    datagram::put_varint(&mut announcement, length);
+    // A write that fails is the connection already gone, which is one of the
+    // answers these tests wait for rather than a failure of the test.
+    let _ = send.write_all(&announcement).await;
 
     (send, recv)
 }
@@ -512,6 +539,157 @@ async fn frames_the_control_stream_may_not_carry_end_the_connection() {
             "{name} on the control stream; the reason was {reason:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// j5, j6: a frame's type is judged before its length
+// ---------------------------------------------------------------------------
+
+/// The frames that belong on the control stream are a connection error on a
+/// request stream, whatever length they declare.
+///
+/// The declared length is the point. 100000 bytes is past `MAX_BUFFERED_FRAME`,
+/// so a decoder that checked the length first would answer with the 431 and the
+/// stream reset a field section too large to hold gets -- a nonsensical reply to
+/// a frame that is not a field section at all, and one that leaves the
+/// connection running after a MUST-close. Not a byte of payload is sent, so the
+/// verdict cannot have waited for one.
+#[tokio::test]
+async fn control_stream_frames_on_a_request_stream_end_the_connection() {
+    /// Past the largest frame this server will buffer, so the per-frame cap
+    /// would have something to say about it.
+    const PAST_ONE_FRAME: u64 = 100_000;
+
+    for (name, kind, length) in [
+        ("SETTINGS", FRAME_SETTINGS, PAST_ONE_FRAME),
+        ("GOAWAY", FRAME_GOAWAY, PAST_ONE_FRAME),
+        ("CANCEL_PUSH", FRAME_CANCEL_PUSH, PAST_ONE_FRAME),
+        ("MAX_PUSH_ID", FRAME_MAX_PUSH_ID, PAST_ONE_FRAME),
+        ("PUSH_PROMISE", FRAME_PUSH_PROMISE, PAST_ONE_FRAME),
+        // The same verdict at a length the cap allows: what is judged is the
+        // type, and it is judged the same way on either side of the bound.
+        ("SETTINGS", FRAME_SETTINGS, 0),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        // Held rather than dropped: dropping the sending half finishes the
+        // stream, and a stream that ends mid-frame has a verdict of its own
+        // (H3_FRAME_ERROR) that would race this one.
+        let (_held, mut recv) = announce_frame(&connection, kind, length).await;
+        let answered = tokio::spawn(async move { recv.read_to_end(4096).await });
+
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_FRAME_UNEXPECTED,
+            "{name} declaring {length} bytes on a request stream; the reason was {reason:?}"
+        );
+
+        let answered = answered.await.expect("the response reader");
+        assert!(
+            answered.as_deref().unwrap_or(&[]).is_empty(),
+            "{name}: a frame that is not a field section must not be answered like one, \
+             got {answered:?}"
+        );
+    }
+}
+
+/// A frame refused for its type is refused before the connection is charged for
+/// it.
+///
+/// Seventeen full-sized announcements is one past the connection's whole HEADERS
+/// budget (D77), so a decoder that charged a PUSH_PROMISE the way it charges a
+/// HEADERS would answer the last of them with a 431 and carry on. None of them
+/// is charged: the first is a connection error the moment its header lands, and
+/// no answer of any kind reaches the peer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_refused_for_its_type_is_never_charged_for() {
+    let server = TestServer::start().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    // Every stream is opened before any of them says anything: the first
+    // announcement ends the connection, and `open_bi` with it.
+    let mut streams = Vec::new();
+    for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
+        streams.push(connection.open_bi().await.expect("open a request stream"));
+    }
+
+    let mut announcement = BytesMut::new();
+    datagram::put_varint(&mut announcement, FRAME_PUSH_PROMISE);
+    datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
+
+    let (answers, mut answered) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
+    let mut held = Vec::new();
+    for (mut send, mut recv) in streams {
+        // A write that fails is the connection already ended, which is the
+        // answer this test is waiting for.
+        let _ = send.write_all(&announcement).await;
+        held.push(send);
+
+        let answers = answers.clone();
+        tokio::spawn(async move {
+            if let Ok(response) = recv.read_to_end(4096).await {
+                let _ = answers.send(response).await;
+            }
+        });
+    }
+    drop(answers);
+
+    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+    assert_eq!(
+        closed_with, H3_FRAME_UNEXPECTED,
+        "a PUSH_PROMISE on a request stream; the reason was {reason:?}"
+    );
+
+    while let Some(response) = answered.recv().await {
+        assert!(
+            response.is_empty(),
+            "a frame refused for its type must not be charged for: one announcement was \
+             answered {}",
+            status_of_response(&response)
+        );
+    }
+}
+
+/// A field section announced on an established tunnel is a connection error
+/// decided from the frame header, not after payload that never comes.
+///
+/// RFC 9114 §4.4 permits only DATA once the CONNECT method has completed, and
+/// the length here is exactly the largest frame this server will buffer -- inside
+/// the per-frame cap, so a decoder that reached the length check would accept the
+/// announcement, charge the connection's budget for it and wait. Sixteen tunnels
+/// doing that pin the whole budget with five bytes apiece.
+#[tokio::test]
+async fn a_field_section_on_an_established_tunnel_ends_the_connection() {
+    let server = TestServer::start().await;
+    let echo = spawn_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&echo.to_string()))
+        .await
+        .expect("send a CONNECT request");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(
+        status_of(&payload),
+        "200",
+        "the tunnel must be established before the frame arrives"
+    );
+
+    let mut announcement = BytesMut::new();
+    datagram::put_varint(&mut announcement, FRAME_HEADERS);
+    datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
+    send.write_all(&announcement)
+        .await
+        .expect("announce a field section on the tunnel");
+
+    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+    assert_eq!(
+        closed_with, H3_FRAME_UNEXPECTED,
+        "a HEADERS frame once the CONNECT had completed; the reason was {reason:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -47,7 +47,7 @@ pub struct Resolver {
 
 impl Resolver {
     pub(crate) fn new(handle: Handle, send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
-        let frames = FrameReader::new(recv, handle.budget());
+        let frames = FrameReader::on_request_stream(recv, handle.budget());
         Self {
             handle,
             send,
@@ -729,7 +729,16 @@ impl Stream {
     ///
     /// This is what makes TCP half-close expressible: one direction can finish
     /// while the other keeps flowing.
+    ///
+    /// Both tunnels call this immediately after answering the CONNECT with a
+    /// 2xx, so this is also where "the CONNECT method has completed" happens:
+    /// from here the reader applies RFC 9114 §4.4's rule that only DATA may
+    /// follow, deciding it from each frame's header rather than after its
+    /// payload.
     pub fn split(self) -> (Writer, Reader) {
+        let mut frames = self.frames;
+        frames.connect_completed();
+
         (
             Writer {
                 send: self.send,
@@ -737,7 +746,7 @@ impl Stream {
             },
             Reader {
                 handle: self.handle,
-                frames: self.frames,
+                frames,
             },
         )
     }
@@ -853,22 +862,19 @@ impl Reader {
 
                 Item::Data(data) => return Ok(Some(data)),
 
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
-                //# Once the CONNECT method has completed, only DATA frames are
-                //# permitted to be sent on the stream. Extension frames MAY be
-                //# used if specifically permitted by the definition of the
-                //# extension. Receipt of any other known frame type MUST be
-                //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+                // RFC 9114 §4.4's rule -- once the CONNECT method has completed
+                // only DATA may follow, and any other known frame type is a
+                // connection error of type H3_FRAME_UNEXPECTED -- is applied a
+                // layer down, by `frame::misplaced`, so that it is decided from
+                // a frame's header rather than after its payload has been
+                // buffered and charged for. [`Stream::split`] is what puts this
+                // reader's decoder into that mode, and a [`Reader`] exists only
+                // through it.
                 //
-                // A [`Reader`] exists only once this server has answered a
-                // CONNECT with a 200, so that sentence is the whole of the
-                // frame rule for the rest of the stream -- a trailer section
-                // included. There is no representation on a tunnel for a
-                // trailer to describe, and RFC 9220 §3 extends CONNECT to
-                // other protocols by pointing at this same section rather than
-                // by reopening it. The exception the sentence makes is the one
-                // RFC 9114 §9 makes for unknown types, and those are skipped
-                // above; every known one arrives here.
+                // So nothing reaches this arm. It repeats the verdict rather
+                // than relaying an unexpected frame into a tunnel, because
+                // which mode a decoder is in is not something the type system
+                // knows.
                 Item::Frame(_) => {
                     return Err(self.report(
                         Violation::connection(

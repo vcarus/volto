@@ -239,7 +239,11 @@ is what a CONNECT proxy needs, and it is stated in full:
 - **Framing** (RFC 9114 §7) — an incremental decoder that hands DATA payload on
   in the chunks quinn delivered it in, buffers every other frame because none of
   them can be acted on piecewise, and skips an unknown frame type by its declared
-  length without allocating for it.
+  length without allocating for it. A frame's *type* is judged before its
+  length: the decoder knows which of the three kinds of stream it is reading —
+  the peer's control stream, a request stream, or a request stream whose CONNECT
+  has been answered — and a frame type that may not appear there is a connection
+  error at any size.
 - **QPACK** (RFC 9204) against the static table, including Huffman decoding
   (RFC 7541 Appendix B).
 - **The control stream** — SETTINGS, GOAWAY, and the rules about what may appear
@@ -283,6 +287,16 @@ fail on its own, so only the *reason* is recorded on the way past — quinn
 overwrites its own stored reason with "closed locally" — and read back by the
 accept loop.
 
+Which frame types may appear is decided first, and from the frame header alone.
+SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID and PUSH_PROMISE on a request stream
+are a connection error of type `H3_FRAME_UNEXPECTED` whatever length they declare
+(RFC 9114 §7.2.3–§7.2.7, and §4.1 for GOAWAY, whose "wrong stream" rule §7.2.6
+states for a client only). Once a CONNECT has been answered, RFC 9114 §4.4
+narrows the stream to DATA and unknown types, so a HEADERS frame there is a
+connection error too. Ordering these ahead of the size checks is what keeps a
+`431` from being the answer to something that is not a field section, and what
+stops a frame the peer was never allowed to send from being charged for.
+
 Field sections are bounded at 64 KiB, advertised as
 `SETTINGS_MAX_FIELD_SECTION_SIZE` so a peer that respects SETTINGS never sends
 more, and enforced on receipt so one that does not gets no further. The frame
@@ -301,7 +315,10 @@ are untouched. A CONNECT request with credentials is a few hundred bytes, so
 every request stream the transport allows could be mid-HEADERS at once and still
 be using a tenth of the budget — what reaches it is sixteen field sections of the
 largest advertised size in flight together, and the seventeenth of those is what
-is refused. The peer's control stream is not counted in it: there is one of it
+is refused. Only frames that are legal where they arrived are counted, since the
+type verdict comes first: a peer cannot hold the budget with PUSH_PROMISE frames
+on request streams, nor with field sections announced on tunnels that may carry
+none. The peer's control stream is not counted in it either: there is one of it
 per connection, it buffers one frame at a time, and nothing on it can be refused
 stream by stream.
 
