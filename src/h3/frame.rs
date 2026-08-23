@@ -990,7 +990,10 @@ pub fn put_header(out: &mut BytesMut, kind: u64, length: u64) {
 /// than merely adequate (see [`super::qpack`]), and they bind the peer's
 /// encoder: RFC 9204 §3.2.3 for the dynamic table capacity, §2.1.2 for the
 /// number of streams it may let block.
-pub fn settings_payload() -> BytesMut {
+///
+/// Not public: [`super::connection`] is the one caller there will ever be, since
+/// what a server sends in its SETTINGS is this layer's own business.
+pub(super) fn settings_payload() -> BytesMut {
     /// One reserved identifier of the form 0x1f * N + 0x21, which RFC 9114
     /// §7.2.4.1 says endpoints SHOULD send so that peers keep exercising the
     /// rule that unknown identifiers are ignored.

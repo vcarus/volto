@@ -153,7 +153,11 @@ impl Violation {
     /// Every stream the connection depends on takes this route: RFC 9114 §6.2.1
     /// makes any failure of a critical stream fatal, whatever the underlying
     /// rule would have been on a request stream.
-    pub fn into_fatal(self) -> Self {
+    ///
+    /// Not public: escalating someone else's verdict is a judgement only the
+    /// reader of a critical stream is entitled to make, and all of those are in
+    /// [`super::connection`].
+    pub(super) fn into_fatal(self) -> Self {
         Self {
             fatal: true,
             ..self
