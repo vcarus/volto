@@ -346,13 +346,41 @@ impl Handle {
         }
     }
 
+    /// Answers a failed write to one of this endpoint's critical streams.
+    ///
+    /// RFC 9114 §6.2.1 forbids a peer from resetting or stopping the control
+    /// stream, so anything other than the connection going away is the peer
+    /// breaking that rule:
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# If either control stream is closed at any point, this MUST be treated
+    //# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+    ///
+    /// Routed through [`Self::fail`] rather than merely returned, because a
+    /// connection error in this layer *is* the CONNECTION_CLOSE that carries the
+    /// code (RFC 9114 §8). Returning the violation on its own left the peer
+    /// seeing whatever came next -- in practice the H3_NO_ERROR that
+    /// [`Connection`]'s `Drop` sends -- which is this endpoint saying nothing
+    /// was wrong about the one thing the RFC names a MUST here.
+    fn critical_write(&self, error: quinn::WriteError) -> ConnectionError {
+        match error {
+            quinn::WriteError::ConnectionLost(error) => error.into(),
+            other => self.fail(Violation::connection(
+                Code::H3_CLOSED_CRITICAL_STREAM,
+                other.to_string(),
+            )),
+        }
+    }
+
     /// Opens a unidirectional stream and writes its type (RFC 9114 §6.2).
     async fn open_typed(&self, stream_type: u64) -> Result<quinn::SendStream, ConnectionError> {
         let mut send = self.quic.open_uni().await?;
 
         let mut header = BytesMut::with_capacity(varint_len(stream_type));
         put_varint(&mut header, stream_type);
-        send.write_all(&header).await.map_err(critical_write)?;
+        send.write_all(&header)
+            .await
+            .map_err(|error| self.critical_write(error))?;
 
         Ok(send)
     }
@@ -374,7 +402,10 @@ impl Handle {
         preface.extend_from_slice(&settings);
 
         let mut control = self.quic.open_uni().await?;
-        control.write_all(&preface).await.map_err(critical_write)?;
+        control
+            .write_all(&preface)
+            .await
+            .map_err(|error| self.critical_write(error))?;
 
         let encoder = self.open_typed(STREAM_QPACK_ENCODER).await?;
         let decoder = self.open_typed(STREAM_QPACK_DECODER).await?;
@@ -561,10 +592,10 @@ impl Connection {
         frame::put_header(&mut goaway, frame::GOAWAY, varint_len(identifier) as u64);
         put_varint(&mut goaway, identifier);
 
-        self.control
-            .write_all(&goaway)
-            .await
-            .map_err(critical_write)
+        // Written before the answer is judged, so the borrow of `self.control`
+        // is over by the time `self.handle` is asked what a failure means.
+        let written = self.control.write_all(&goaway).await;
+        written.map_err(|error| self.handle.critical_write(error))
     }
 
     /// Ends the connection because this endpoint is done with it, not because
@@ -623,21 +654,6 @@ fn next_request_id(last_accepted: Option<u64>) -> u64 {
         id.saturating_add(REQUEST_STREAM_STEP)
             .min(crate::datagram::VARINT_MAX)
     })
-}
-
-/// A write to one of this endpoint's critical streams failed.
-///
-/// RFC 9114 §6.2.1 forbids a peer from resetting or stopping the control
-/// stream, so anything other than the connection going away is the peer
-/// breaking that rule.
-fn critical_write(error: quinn::WriteError) -> ConnectionError {
-    match error {
-        quinn::WriteError::ConnectionLost(error) => error.into(),
-        other => ConnectionError::Local(Violation::connection(
-            Code::H3_CLOSED_CRITICAL_STREAM,
-            other.to_string(),
-        )),
-    }
 }
 
 /// Serves what the peer sends outside its request streams, for the life of the

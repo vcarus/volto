@@ -247,7 +247,11 @@ is what a CONNECT proxy needs, and it is stated in full:
 - **QPACK** (RFC 9204) against the static table, including Huffman decoding
   (RFC 7541 Appendix B).
 - **The control stream** — SETTINGS, GOAWAY, and the rules about what may appear
-  there, read by a task of its own for as long as the connection lasts.
+  there, read by a task of its own for as long as the connection lasts. RFC 9114
+  §6.2.1 makes a control stream that is closed at any point a connection error,
+  and that holds in both directions: a peer that finishes its own, and a peer
+  that stops this endpoint's with STOP_SENDING, are each answered with a
+  CONNECTION_CLOSE carrying `H3_CLOSED_CRITICAL_STREAM`.
 - **Request validation** — RFC 9114 §4.1.2, §4.3 and §4.4 plus RFC 8441 §4: the
   point at which a field section becomes a request or is refused as malformed.
 - **The message vocabulary** — a status, a method, a request and a list of field
