@@ -797,6 +797,12 @@ impl Stream {
 /// peer and leave the stream in different states: a failed write is a stream
 /// that has already ended, while a lapsed deadline is a peer that is still
 /// there and simply will not read what it asked for.
+///
+/// Its [`Display`](std::fmt::Display) and [`std::error::Error`] impls have no
+/// caller in this tree and are kept anyway: they are what makes a public error
+/// type usable at all -- `?` into a `Box<dyn Error>` or an `anyhow::Error`, and
+/// a `source()` chain that reaches the [`StreamError`] underneath -- and a
+/// caller outside the crate has no other way to add them.
 #[derive(Debug)]
 pub enum RespondError {
     /// The write failed: the peer reset or stopped the stream, or the
