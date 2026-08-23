@@ -53,7 +53,9 @@ ignored.
 
 Authentication deliberately runs *before* routing, so an unauthenticated client
 gets 407 rather than learning from a 501 which `:protocol` values this server
-implements.
+implements — but *after* the connection-specific-field check described below, so
+a peer that sends one of those fields gets 400 whether or not it has
+credentials.
 
 That 501 is a real one for every `:protocol` value, not only the ones this
 server has heard of. The token is carried through as the bytes that arrived, so
@@ -61,21 +63,34 @@ server has heard of. The token is carried through as the bytes that arrived, so
 RFC 9220 asks for and logged under the name the client actually sent, rather
 than being refused as malformed before anything can look at them.
 
-Until a request on a connection has passed the credentials check, two of that
-loop's waits are bounded: the wait for the next request stream, and the wait for
-an open stream's HEADERS frame. Both bounds come from `limits.max_idle_timeout`
-— the connection one is two of them, so that the transport's own idle timeout
-stays the first thing to fire on a peer that has simply gone away — and both are
-lifted for the life of the connection the moment one request authenticates, so a
-client reusing an idle connection between requests is untouched. Without them a
-peer that finishes the QUIC handshake and then says nothing holds a
-`max_connections` slot for as long as it keeps its socket open, because the
-keep-alive PINGs this server sends are answered by the peer's QUIC stack with no
-application ever involved and the idle timeout therefore never fires. A lapsed
-connection bound closes the connection with `H3_NO_ERROR`, which is not an error
-and is logged as the idle ending it is; a lapsed stream bound resets that one
-stream with `H3_REQUEST_INCOMPLETE` and leaves everything else on the connection
-running.
+Every wait that stands between a packet arriving and a tunnel opening is bounded
+by `limits.max_idle_timeout`, whatever the connection's authentication state:
+the QUIC/TLS handshake in `quic.rs`, the HTTP/3 handshake and the read of each
+peer unidirectional stream's type in `h3/connection.rs`, the read of a request
+stream's HEADERS in `Resolver::resolve`, and every refusal this server writes —
+400, 403, 407, 431, 501 and the 5xx family, plus the 200 that closes on the spot
+— in `Stream::respond_within`. The bound is needed because the keep-alive PINGs
+this server sends are answered by the peer's QUIC stack with no application ever
+involved, so the transport's own idle timer never fires on a peer that is
+present but says nothing; the response writes need it because a peer that grants
+no flow-control window never takes even the fifty-odd bytes of a 407. A tunnel's
+own 200 is not bounded here: by then there is a target on the other side and the
+pumps have their own ending.
+
+One further bound applies until a request on a connection has passed the
+credentials check: twice `limits.max_idle_timeout` for one request to
+authenticate. It is armed once at the handshake and never re-armed by a new
+stream, so what it bounds is the connection rather than a pause in it; twice, so
+that the transport's own idle timeout stays the first thing to fire on a peer
+that has simply gone away. Without it a peer that finishes the QUIC handshake
+and then says nothing holds a `max_connections` slot for as long as it keeps its
+socket open. It is lifted for the life of the connection the moment one request
+authenticates, so a client reusing an idle connection between requests is
+untouched. A lapsed connection bound closes the connection with `H3_NO_ERROR`,
+which is not an error and is logged as the idle ending it is; a lapsed HEADERS
+bound resets that one stream with `H3_REQUEST_INCOMPLETE` and a lapsed response
+write resets it with `H3_REQUEST_CANCELLED`, leaving everything else on the
+connection running.
 
 ### Target address selection
 
@@ -143,11 +158,13 @@ for at least 120), and closing the socket must also close the request stream.
 Each connection routes inbound datagrams to per-session channels from its own
 background task, in `src/h3/connection.rs` — the same task that reads the peer's
 unidirectional streams, since both belong to the connection and both end with
-it. Routing is per *request stream*, which is why it lives in the HTTP/3 layer:
-a session claims its Quarter Stream ID by asking its stream for a
-`DatagramReceiver` and holds the claim exactly as long as it holds that
-receiver, so a session that ends — however it ends — takes its routing entry
-with it. Sending is the other half and stays outside: a UDP session writes its
+it. A peer may hold sixteen of those open at once (`MAX_PEER_UNI_STREAMS`, a
+transport parameter rather than a configuration key) where HTTP/3 needs three,
+and each one's type has to arrive within an idle timeout. Routing is per
+*request stream*, which is why it lives in the HTTP/3 layer: a session claims
+its Quarter Stream ID by asking its stream for a `DatagramReceiver` and holds
+the claim exactly as long as it holds that receiver, so a session that ends —
+however it ends — takes its routing entry with it. Sending is the other half and stays outside: a UDP session writes its
 datagrams straight onto the `quinn::Connection`.
 
 Two fields decide where a packet goes, and getting either subtly wrong is
@@ -285,7 +302,11 @@ carrying one of the connection-specific fields RFC 9114 §4.2 forbids
 (`Proxy-Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`). RFC 9114
 §4.1.2 lets a server "send an HTTP response indicating the error prior to
 closing or resetting the stream", and `it_tcp` and `it_udp` pin the 400. The
-`Connection` field itself is refused at decode time with `H3_MESSAGE_ERROR`.
+`Connection` field itself is refused at decode time with `H3_MESSAGE_ERROR`,
+earlier still. The four-field check runs before the credentials check rather
+than after it, unlike the routing it precedes: a message carrying one is
+malformed whoever sent it, and judging it afterwards answered that MUST with a
+407 to an unauthenticated peer and a 400 to an authenticated one.
 
 One deviation is taken knowingly:
 

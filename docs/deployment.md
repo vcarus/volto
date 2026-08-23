@@ -290,9 +290,9 @@ operators who raise either limit past that point: at `max_connections = 512` the
 number needed is 512 × 256 + 64 = 131136, past what the unit grants, and clients
 at their quotas can then consume every descriptor the process has, leaving none
 for the listening socket, for the certificate a `SIGHUP` re-reads, or for
-anything else. Fd exhaustion is not a crash here (a tunnel whose `socket()`
-fails is refused with a 502) but it is a degradation that hits every connection
-at once.
+anything else. Fd exhaustion is not a crash here — a tunnel whose `socket()`
+fails is refused with a 503 and `error=destination_unavailable` — but it is a
+degradation that hits every connection at once.
 
 volto compares that number against `RLIMIT_NOFILE` at startup and warns when it
 does not fit, which is worth heeding rather than silencing. Take the headroom in

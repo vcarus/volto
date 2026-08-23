@@ -45,8 +45,8 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit. Excess connections are refused during the handshake, before any per-connection state exists here |
 | `connect_timeout` | seconds | `10` | Budget for reaching a target; `0` disables it. Spent twice per request and separately — once on name resolution, once on the whole list of addresses it resolved to — so a request holds its tunnel slot for at most twice this before any byte flows. A lookup that runs out answers 504 with `Proxy-Status: volto; error=dns_timeout`, a connect that runs out answers 504 with `error=connection_timeout` |
 | `ip_family_preference` | string | `"ipv4"` | Which address family a resolved target name is tried on first: `ipv4`, `ipv6` or `system` (the resolver's own RFC 6724 order). Applies to both tunnel kinds |
-| `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel. quinn's own default of 100 runs out during ordinary browsing |
-| `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600. It also bounds two application-level waits, but only while a connection has never had a request pass the credentials check: twice this for the next request stream to arrive, and once this for an open stream to deliver its HEADERS. Both are lifted for good once a request authenticates, so a client that keeps an idle connection between requests is unaffected |
+| `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel. quinn's own default of 100 runs out during ordinary browsing. The peer's *unidirectional* streams are not a key: they are fixed at 16 (`MAX_PEER_UNI_STREAMS` in `quic.rs`), where HTTP/3 needs exactly three — the control stream and the QPACK encoder/decoder pair, RFC 9114 §6.2 and RFC 9204 §4.2. Exceeding a transport parameter is a QUIC-level failure with no HTTP-level explanation attached, which is why there is margin rather than three |
+| `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600. It also bounds every application-level wait that precedes a tunnel, whatever the connection's authentication state: the QUIC/TLS handshake, the HTTP/3 handshake, the read of each peer unidirectional stream's type, the read of a request stream's HEADERS, and every refusal this proxy writes. A separate bound of twice this applies only while a connection has never had a request pass the credentials check — counted from the handshake and never re-armed by a new stream, so it bounds the connection rather than a pause in it — and is lifted for good once a request authenticates, so a client that keeps an idle connection between requests is unaffected |
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
@@ -134,8 +134,10 @@ therefore that heuristic firing, not the path changing.
 **Those lines also report what the connection carried.** Alongside `rtt_ms=`
 and `mtu=` they carry `tunnels=`, how many requests on that connection were
 granted a tunnel slot — TCP CONNECT and CONNECT-UDP draw on the same budget, and
-a request turned away before it (407, the tunnel limit, a destination the policy
-rejects) is not counted — and four transport counters. `tx_bytes=` and
+a request turned away before the slot (407, a malformed message, the tunnel
+limit itself) is not counted, while a destination the policy rejects and a
+target that could not be reached both are, since the slot is taken before the
+target is judged — and four transport counters. `tx_bytes=` and
 `rx_bytes=` are UDP-level byte counts: everything this server put on or took off
 the wire for that connection, QUIC and HTTP/3 framing, retransmissions,
 acknowledgements and padding included. They are neither tunnel payload, which is
