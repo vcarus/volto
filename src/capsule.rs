@@ -126,8 +126,12 @@ impl CapsuleDecoder {
     }
 
     /// Adds received bytes. Any number, split anywhere.
-    pub fn push(&mut self, chunk: Bytes) {
-        self.buffer.extend_from_slice(&chunk);
+    ///
+    /// Taken by slice because that is all this does with them: the bytes are
+    /// copied into the decoder's own buffer, where the next capsule is cut out
+    /// of them, so nothing is gained by owning the chunk they arrived in.
+    pub fn push(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
     }
 
     /// Whether the sequence is currently between capsules.
@@ -255,7 +259,7 @@ mod tests {
     #[test]
     fn decodes_a_single_datagram_capsule() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(encode_datagram(0, b"hello"));
+        decoder.push(&encode_datagram(0, b"hello"));
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -272,7 +276,7 @@ mod tests {
         buf.extend_from_slice(&encode_datagram(0, b"three"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(buf.freeze());
+        decoder.push(&buf.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -298,7 +302,7 @@ mod tests {
         let mut decoded = Vec::new();
 
         for index in 0..wire.len() {
-            decoder.push(wire.slice(index..index + 1));
+            decoder.push(&wire.slice(index..index + 1));
             decoded.extend(drain(&mut decoder).expect("decodes"));
         }
 
@@ -324,9 +328,9 @@ mod tests {
 
         for split in 0..=wire.len() {
             let mut decoder = CapsuleDecoder::new();
-            decoder.push(wire.slice(..split));
+            decoder.push(&wire.slice(..split));
             let mut decoded = drain(&mut decoder).expect("decodes");
-            decoder.push(wire.slice(split..));
+            decoder.push(&wire.slice(split..));
             decoded.extend(drain(&mut decoder).expect("decodes"));
 
             assert_eq!(decoded, expected, "split at {split}");
@@ -341,7 +345,7 @@ mod tests {
         wire.extend_from_slice(&encode_datagram(0, b"kept"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(wire.freeze());
+        decoder.push(&wire.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -356,7 +360,7 @@ mod tests {
         wire.extend_from_slice(&encode_datagram(0, b"kept"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(wire.freeze());
+        decoder.push(&wire.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -374,11 +378,11 @@ mod tests {
         datagram::put_varint(&mut header, 10_000_000);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(header.freeze());
+        decoder.push(&header.freeze());
         assert_eq!(decoder.next_capsule().unwrap(), None);
 
         for _ in 0..100 {
-            decoder.push(Bytes::from_static(&[0u8; 1024]));
+            decoder.push(&Bytes::from_static(&[0u8; 1024]));
             assert_eq!(decoder.next_capsule().unwrap(), None);
             assert!(
                 decoder.buffer.len() < 4096,
@@ -395,7 +399,7 @@ mod tests {
         // Every strict prefix leaves the decoder mid-capsule.
         for length in 0..wire.len() {
             let mut decoder = CapsuleDecoder::new();
-            decoder.push(wire.slice(..length));
+            decoder.push(&wire.slice(..length));
             drain(&mut decoder).expect("a prefix is not yet an error");
 
             if length == 0 {
@@ -410,7 +414,7 @@ mod tests {
 
         // The whole thing is complete.
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(wire);
+        decoder.push(&wire);
         drain(&mut decoder).expect("decodes");
         assert!(decoder.at_capsule_boundary());
     }
@@ -422,7 +426,7 @@ mod tests {
         datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(header.freeze());
+        decoder.push(&header.freeze());
 
         assert_eq!(
             decoder.next_capsule(),
@@ -440,7 +444,7 @@ mod tests {
         datagram::put_varint(&mut wire, 0);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(wire.freeze());
+        decoder.push(&wire.freeze());
 
         assert_eq!(decoder.next_capsule(), Err(Error::MalformedDatagram));
     }
@@ -448,7 +452,7 @@ mod tests {
     #[test]
     fn an_empty_udp_payload_round_trips() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(encode_datagram(0, b""));
+        decoder.push(&encode_datagram(0, b""));
 
         assert_eq!(drain(&mut decoder).unwrap(), vec![datagram_capsule(0, b"")]);
     }
@@ -456,7 +460,7 @@ mod tests {
     #[test]
     fn non_zero_context_ids_are_preserved_for_the_caller_to_drop() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(encode_datagram(42, b"other context"));
+        decoder.push(&encode_datagram(42, b"other context"));
 
         assert_eq!(
             drain(&mut decoder).unwrap(),

@@ -432,7 +432,7 @@ async fn capsules_carry_payloads_when_datagrams_are_unavailable() {
             .expect("read succeeded")
             .expect("the stream must not end before the reply");
 
-        decoder.push(Bytes::copy_from_slice(bytes::Buf::chunk(&chunk)));
+        decoder.push(&Bytes::copy_from_slice(bytes::Buf::chunk(&chunk)));
     };
 
     assert_eq!(&payload[..], b"over capsules");

@@ -522,7 +522,7 @@ impl Session {
     ) -> Step {
         match chunk {
             Ok(Some(data)) => {
-                self.decoder.push(data);
+                self.decoder.push(&data);
 
                 loop {
                     match self.decoder.next_capsule() {

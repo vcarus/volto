@@ -410,7 +410,7 @@ fn drive(chunks: &[Bytes]) -> Outcome {
     let mut errors = Vec::new();
 
     for chunk in chunks {
-        decoder.push(chunk.clone());
+        decoder.push(chunk);
         loop {
             match decoder.next_capsule() {
                 Ok(Some(capsule)) => capsules.push(capsule),
@@ -486,7 +486,7 @@ proptest! {
         let mut decoder = CapsuleDecoder::new();
         for prefix_len in 0..=bytes.len() {
             if prefix_len > 0 {
-                decoder.push(bytes.slice(prefix_len - 1..prefix_len));
+                decoder.push(&bytes[prefix_len - 1..prefix_len]);
             }
             while decoder.next_capsule().expect("well-formed input").is_some() {}
             prop_assert_eq!(
@@ -510,7 +510,7 @@ proptest! {
         let cut = usize::from(cut) % (bytes.len() + 1);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(bytes.slice(..cut));
+        decoder.push(&bytes[..cut]);
         let mut decoded = Vec::new();
         while let Some(capsule) = decoder.next_capsule().expect("a prefix is not an error") {
             decoded.push(capsule);
@@ -522,7 +522,7 @@ proptest! {
             cut
         );
 
-        decoder.push(bytes.slice(cut..));
+        decoder.push(&bytes[cut..]);
         while let Some(capsule) = decoder.next_capsule().expect("the whole thing decodes") {
             decoded.push(capsule);
         }
@@ -591,7 +591,7 @@ proptest! {
         datagram::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(header.freeze());
+        decoder.push(&header.freeze());
 
         prop_assert_eq!(
             decoder.next_capsule(),
@@ -603,7 +603,7 @@ proptest! {
         // the rejected capsule's value. (`tunnel::udp` resets the stream on this
         // error and never pushes again -- this only pins that the rejection
         // costs no buffering, whatever the declared length claimed.)
-        decoder.push(capsule::encode_datagram(0, b"next"));
+        decoder.push(&capsule::encode_datagram(0, b"next"));
         prop_assert_eq!(
             decoder.next_capsule(),
             Ok(Some(Capsule::Datagram {
@@ -632,7 +632,7 @@ proptest! {
         datagram::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(header.freeze());
+        decoder.push(&header.freeze());
         prop_assert_eq!(decoder.next_capsule(), Ok(None));
     }
 }
@@ -659,7 +659,7 @@ fn a_datagram_capsule_at_exactly_the_maximum_decodes() {
     );
 
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(encoded);
+    decoder.push(&encoded);
     assert_eq!(
         decoder.next_capsule(),
         Ok(Some(Capsule::Datagram {
@@ -688,7 +688,7 @@ fn the_decoder_resumes_at_the_next_capsule_after_an_error() {
     wire.extend_from_slice(&capsule::encode_datagram(9, b"still readable"));
 
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(wire.freeze());
+    decoder.push(&wire.freeze());
 
     assert_eq!(
         decoder.next_capsule(),
@@ -722,7 +722,7 @@ fn the_decoder_resumes_at_the_next_capsule_after_an_error() {
     datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
 
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(header.freeze());
+    decoder.push(&header.freeze());
     assert!(decoder.next_capsule().is_err());
     assert!(decoder.at_capsule_boundary());
 }

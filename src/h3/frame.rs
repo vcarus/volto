@@ -140,7 +140,11 @@ impl BufferBudget {
     /// could not be the stream-class one a charge past the budget hands out,
     /// since closing the control stream is itself a connection error
     /// (RFC 9114 §6.2.1, quoted in [`super::connection`]).
-    pub fn unshared() -> Arc<Self> {
+    ///
+    /// Not public: the one reader that needs it lives in [`super::connection`],
+    /// and a budget shared with nothing is this layer's own arrangement rather
+    /// than something a caller of the crate has any use for.
+    pub(super) fn unshared() -> Arc<Self> {
         Arc::new(Self::default())
     }
 

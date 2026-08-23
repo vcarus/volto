@@ -472,7 +472,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
         "the capsule stream travels in DATA frames"
     );
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(Bytes::from(payload));
+    decoder.push(&Bytes::from(payload));
     match decoder.next_capsule().expect("well-formed capsules") {
         Some(Capsule::Datagram {
             context_id,
@@ -653,7 +653,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
         );
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(Bytes::from(payload));
+        decoder.push(&Bytes::from(payload));
         match decoder.next_capsule().expect("well-formed capsules") {
             Some(Capsule::Datagram {
                 context_id,
