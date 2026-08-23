@@ -526,10 +526,28 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     let name = message::field_name(name)
         .ok_or_else(|| malformed("a field name that is uppercase or not a token"))?;
 
+    //= https://www.rfc-editor.org/rfc/rfc9110#section-5.5
+    //# A field value does not include leading or trailing whitespace. When a
+    //# specific version of HTTP allows such whitespace to appear in a message,
+    //# a field parsing implementation MUST exclude such whitespace prior to
+    //# evaluating the field value.
+    //
+    // HTTP/3 is one of the versions that allows it: SP and HTAB are ordinary
+    // field-value octets on the wire (`FieldValue::parse` accepts them, and
+    // refusing a stray leading space would turn a request every other stack
+    // serves into a stream error). Excluding it *here* is what makes every
+    // reading below evaluate the same value the RFC says was sent -- the
+    // agreement between `:authority` and Host, and `crate::auth`, which would
+    // otherwise see " Basic ..." as a credential with no scheme and answer a
+    // well-formed request with a 407 that costs the peer an attempt.
+    //
+    // Only SP and HTAB are stripped, and only from the ends. Trimming the wider
+    // ASCII whitespace set would strip a leading CR or LF as well, and those are
+    // exactly the octets §10.3 refuses below.
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
     //# Any request or response that contains a character not permitted in a
     //# field value MUST be treated as malformed.
-    let value = FieldValue::parse(value)
+    let value = FieldValue::parse(trim_optional_whitespace(value))
         .ok_or_else(|| malformed("a field value with a forbidden character"))?;
 
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
@@ -574,6 +592,27 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
 
     fields.append(name, value);
     Ok(())
+}
+
+/// Drops the leading and trailing SP and HTAB RFC 9110 §5.5 excludes from a
+/// field value.
+///
+/// A value that is nothing but whitespace becomes the empty string, which is a
+/// field value like any other.
+fn trim_optional_whitespace(value: &[u8]) -> &[u8] {
+    let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t');
+
+    let start = value.iter().position(|byte| !whitespace(byte));
+    let Some(start) = start else {
+        return &[];
+    };
+    // There is a non-whitespace octet at `start`, so there is a last one too.
+    let end = value
+        .iter()
+        .rposition(|byte| !whitespace(byte))
+        .unwrap_or(start);
+
+    &value[start..=end]
 }
 
 /// A message this server will not process (RFC 9114 §4.1.2).
@@ -1128,6 +1167,47 @@ mod tests {
         let mut te = connect();
         te.push(field("te", "gzip"));
         refused(te);
+    }
+
+    /// RFC 9110 §5.5: the whitespace around a field value is not part of the
+    /// value, so what every reading below sees is what was sent rather than how
+    /// it was padded.
+    #[test]
+    fn optional_whitespace_is_excluded_from_a_field_value() {
+        for (padded, value) in [
+            (&b" \tvalue \t"[..], &b"value"[..]),
+            (b"value", b"value"),
+            (b" \t ", b""),
+            (b"", b""),
+            // Only the ends: whitespace inside a value is part of it.
+            (b" a b ", b"a b"),
+        ] {
+            assert_eq!(trim_optional_whitespace(padded), value, "{padded:?}");
+        }
+
+        // The field this most matters for: `auth` reads a scheme and a token,
+        // and a leading space would leave it reading a scheme that is empty.
+        let mut padded = connect();
+        padded.push(field("proxy-authorization", " Basic dXNlcjE6czNjcmV0\t"));
+        let request = build_request(padded).expect("accepted");
+        assert_eq!(
+            request
+                .fields
+                .get("proxy-authorization")
+                .map(FieldValue::as_bytes),
+            Some(&b"Basic dXNlcjE6czNjcmV0"[..])
+        );
+
+        // And the :authority/Host agreement of RFC 9114 §4.3.1 is judged on the
+        // values rather than on their padding.
+        assert!(build_request(vec![
+            field(":method", "GET"),
+            field(":scheme", "https"),
+            field(":authority", "example.com"),
+            field(":path", "/"),
+            field("host", "  example.com "),
+        ])
+        .is_ok());
     }
 
     /// The one exception §4.2 makes for TE.
