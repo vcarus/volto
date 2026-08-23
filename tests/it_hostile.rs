@@ -708,25 +708,58 @@ async fn the_bidirectional_stream_limit_caps_what_one_peer_can_open() {
 /// nothing has to: what a stream costs while it lives is bounded, and this is
 /// the proof that it costs nothing once it is gone.
 ///
-/// Each stream in the storm announces the largest field section the server will
-/// buffer and then dies, so the connection's whole budget passes through the
-/// charge path two hundred times. If a single charge were left behind, the
-/// sixteen full-sized announcements afterwards could not all fit -- which is
-/// exactly what the last block measures.
+/// Each round of the storm fills the budget exactly -- sixteen announcements of
+/// the largest field section the server will buffer -- and then resets every
+/// one of them, so the connection's whole budget passes through the charge path
+/// a dozen times. If a single charge were left behind, the sixteen full-sized
+/// announcements afterwards could not all fit -- which is exactly what the last
+/// block measures.
+///
+/// A round does not reset until the server has been seen to refuse a
+/// seventeenth announcement: that refusal is the only on-wire proof that the
+/// sixteen were read and charged before they died. Without it the resets win
+/// the race every time -- a `RESET_STREAM` that overtakes three bytes of
+/// announcement is read by nobody -- and the storm would pass through the
+/// charge path not once (mutation check, 2026-08-23).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
-    /// One leaked charge in all of these is enough to be caught below; the
+    /// One leaked charge in any of these is enough to be caught below; the
     /// repetitions are for the leak that only happens on an unlucky
-    /// interleaving. Few enough to stay inside the default `max_streams_bidi`.
-    const STORM: usize = 200;
+    /// interleaving.
+    const ROUNDS: usize = 12;
 
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
-    for _ in 0..STORM {
-        let (mut send, recv) = announce_full_sized_headers(&connection).await;
-        let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED));
-        drop(recv);
+    for _ in 0..ROUNDS {
+        let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
+        let mut senders = Vec::new();
+        for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
+            let (send, mut recv) = announce_full_sized_headers(&connection).await;
+            senders.push(send);
+
+            let refusals = refusals.clone();
+            tokio::spawn(async move {
+                if let Ok(response) = recv.read_to_end(4096).await {
+                    let _ = refusals.send(response).await;
+                }
+            });
+        }
+        drop(refusals);
+
+        let response = tokio::time::timeout(TIMEOUT, refused.recv())
+            .await
+            .expect("one announcement past the budget must be refused")
+            .expect("the refusal arrives on a live stream");
+        assert_eq!(
+            status_of_response(&response),
+            "431",
+            "the budget is full, so every other announcement of this round is charged"
+        );
+
+        for mut send in senders {
+            let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED));
+        }
     }
 
     stays_open(&connection, Duration::from_millis(200)).await;
