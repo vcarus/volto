@@ -504,6 +504,17 @@ fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
             if host.is_empty() {
                 return Err("empty host");
             }
+            if host.contains(['[', ']']) {
+                // The same rule as the unbracketed arm below, and refused here
+                // for the same reason: RFC 3986 §3.2.2 gives "[" and "]" to the
+                // IP-literal form alone, so a bracket *inside* one is not part
+                // of the address it delimits. `[a[b]:443` must not be dialled
+                // as `a[b`. Written as the same two-character predicate rather
+                // than as a check for "[" only, so the two arms cannot drift:
+                // `]` cannot appear here, since the split above takes the first
+                // one, and asking about it costs nothing.
+                return Err("stray bracket in host");
+            }
             let port = rest
                 .strip_prefix(':')
                 .ok_or("missing port after IPv6 literal")?;
@@ -705,5 +716,15 @@ mod tests {
         assert!(split_authority("example.com[:443").is_err());
         assert!(split_authority("[example.com:443").is_err());
         assert!(split_authority("exa]mple.com:443").is_err());
+    }
+
+    /// The bracketed arm judges the same shape, which it used to wave through:
+    /// `[a[b]:443` opened a tunnel to the host `a[b` and came back a 502 from
+    /// the resolver rather than the 400 the unbracketed arm gives.
+    #[test]
+    fn rejects_a_stray_bracket_inside_an_ip_literal() {
+        assert!(split_authority("[a[b]:443").is_err());
+        assert!(split_authority("[2001:db8[::1]:443").is_err());
+        assert!(split_authority("[[2001:db8::1]:443").is_err());
     }
 }
