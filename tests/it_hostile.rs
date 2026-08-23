@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
     application_close, assert_closed_with, authenticated_connect_headers_frame,
-    connect_headers_frame, frame, read_frame, status_of,
+    connect_headers_frame, frame, open_uni_stream, read_frame, status_of,
 };
 use common::{
     auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport, connect_quic,
@@ -179,25 +179,6 @@ fn varint_frame(kind: u64, value: u64) -> Vec<u8> {
     let mut payload = BytesMut::new();
     datagram::put_varint(&mut payload, value);
     frame(kind, &payload)
-}
-
-/// Opens a unidirectional stream of `stream_type` and writes `bytes` after it.
-async fn open_uni_stream(
-    connection: &quinn::Connection,
-    stream_type: u64,
-    bytes: &[u8],
-) -> quinn::SendStream {
-    let mut stream = connection
-        .open_uni()
-        .await
-        .expect("open a unidirectional stream");
-
-    let mut wire = BytesMut::new();
-    datagram::put_varint(&mut wire, stream_type);
-    wire.extend_from_slice(bytes);
-    stream.write_all(&wire).await.expect("send the stream");
-
-    stream
 }
 
 /// Opens a request stream, announces a full-sized HEADERS frame and sends one

@@ -4,8 +4,9 @@
 //! cannot produce: a request on a stream that client would refuse to open, a
 //! field section larger than it will build, a control stream that breaks a rule
 //! it keeps. Those tests write frames by hand and read the server's answer off
-//! `quinn` directly, and everything in this module is that plumbing -- building
-//! a frame, reading one back, waiting for the connection to end.
+//! `quinn` directly, and everything in this module is that plumbing -- opening a
+//! stream and naming its type, building a frame, reading one back, waiting for
+//! the connection to end.
 //!
 //! What is *not* here is any assertion about what the server chose. The three
 //! this module does make are the ones that were written identically at every
@@ -89,6 +90,40 @@ pub fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<
         (b":authority", authority.as_bytes()),
         (b":path", path.as_bytes()),
     ])
+}
+
+/// Opens a unidirectional stream, names its type, and writes `bytes` after it.
+///
+/// RFC 9114 §6.2: "The purpose is indicated by a stream type, which is sent as
+/// a variable-length integer at the start of the stream." That varint is built
+/// here rather than taken from the server's own stream-type constants, for the
+/// reason the `HEADERS` constant above is spelled out: these are the bytes the
+/// server is asked to read.
+///
+/// The type and `bytes` leave in a single `write_all`, which is how every call
+/// site wrote it. A test whose subject is a type varint that arrives in pieces
+/// -- or never arrives at all -- writes its own bytes instead.
+///
+/// The stream is handed back rather than dropped: dropping a
+/// [`quinn::SendStream`] finishes it, and a peer that finishes its control
+/// stream is told H3_CLOSED_CRITICAL_STREAM (RFC 9114 §6.2.1), which is a
+/// different test from the one the caller is running.
+pub async fn open_uni_stream(
+    connection: &quinn::Connection,
+    stream_type: u64,
+    bytes: &[u8],
+) -> quinn::SendStream {
+    let mut stream = connection
+        .open_uni()
+        .await
+        .expect("open a unidirectional stream");
+
+    let mut wire = BytesMut::new();
+    datagram::put_varint(&mut wire, stream_type);
+    wire.extend_from_slice(bytes);
+    stream.write_all(&wire).await.expect("send the stream");
+
+    stream
 }
 
 /// Reads one HTTP/3 frame from a raw stream: type, length, payload.

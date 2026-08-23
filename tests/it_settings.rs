@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
-    self, connect_headers_frame, connect_udp_headers_frame, read_frame, status_of, stopped_code,
+    self, connect_headers_frame, connect_udp_headers_frame, open_uni_stream, read_frame, status_of,
+    stopped_code,
 };
 use common::{
     client_endpoint_with_transport, connect_quic, finish_connect, spawn_udp_echo_target,
@@ -231,22 +232,12 @@ async fn a_frame_before_settings_ends_the_connection() {
         let server = TestServer::start().await;
         let (_endpoint, connection) = connect_quic(&server).await;
 
-        let mut control = connection
-            .open_uni()
-            .await
-            .expect("open the control stream");
-
-        let mut stream = BytesMut::new();
-        datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
-        stream.extend_from_slice(&first);
+        let mut control = first;
         // A perfectly good SETTINGS frame, second. The rule is about order, and
         // sending nothing after the offending frame would leave the server
         // waiting rather than deciding.
-        stream.extend_from_slice(&settings_frame());
-        control
-            .write_all(&stream)
-            .await
-            .expect("send the control stream");
+        control.extend_from_slice(&settings_frame());
+        let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &control).await;
 
         let (code, reason) = rawstream::application_close(&connection, TIMEOUT).await;
         assert_eq!(
@@ -427,14 +418,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 
     // Only now does the peer say datagrams are allowed. The control stream is
     // kept open for the rest of the test: closing it is H3_CLOSED_CRITICAL_STREAM.
-    let mut control = connection
-        .open_uni()
-        .await
-        .expect("open the control stream");
-    control
-        .write_all(&control_stream_with_datagrams_enabled())
-        .await
-        .expect("send SETTINGS");
+    let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &settings_frame()).await;
 
     // From here the reply must arrive as a QUIC datagram. Retried rather than
     // slept on: the SETTINGS frame and this datagram are in flight at the same
@@ -468,14 +452,6 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
             Err(_) => continue,
         }
     }
-}
-
-/// The bytes of a client control stream whose SETTINGS enable HTTP Datagrams.
-fn control_stream_with_datagrams_enabled() -> Vec<u8> {
-    let mut stream = BytesMut::new();
-    datagram::put_varint(&mut stream, STREAM_TYPE_CONTROL);
-    stream.extend_from_slice(&settings_frame());
-    stream.to_vec()
 }
 
 /// A SETTINGS frame enabling HTTP Datagrams (RFC 9297 §2.1.1).
@@ -519,14 +495,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     // and no `max_datagram_frame_size` to send one with.
 
     // The contradiction, on the control stream: datagrams are welcome.
-    let mut control = connection
-        .open_uni()
-        .await
-        .expect("open the control stream");
-    control
-        .write_all(&control_stream_with_datagrams_enabled())
-        .await
-        .expect("send SETTINGS");
+    let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &settings_frame()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     send.write_all(&connect_udp_headers_frame(

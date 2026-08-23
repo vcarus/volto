@@ -13,7 +13,8 @@ mod common;
 
 use bytes::BytesMut;
 use common::rawstream::{
-    application_close, connect_headers_frame, frame, read_frame, read_varint, status_of,
+    application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
+    status_of,
 };
 use common::{connect_quic, TestServer, TIMEOUT};
 use volto::datagram;
@@ -69,14 +70,7 @@ async fn expect_close(name: &str, stream_type: u64, bytes: &[u8], code: u64, nam
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
-    let mut stream = connection
-        .open_uni()
-        .await
-        .expect("open a unidirectional stream");
-    let mut wire = BytesMut::new();
-    datagram::put_varint(&mut wire, stream_type);
-    wire.extend_from_slice(bytes);
-    stream.write_all(&wire).await.expect("send the stream");
+    let _stream = open_uni_stream(&connection, stream_type, bytes).await;
 
     let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
     assert_eq!(
