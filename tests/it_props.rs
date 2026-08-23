@@ -778,11 +778,11 @@ proptest! {
         host in "\\PC{1,32}",
         port in 1u16..=u16::MAX,
     ) {
-        // The IP-literal spelling is the one shape the template does not hand
-        // back unchanged, because its brackets are the template's syntax rather
-        // than part of the host; `the_template_round_trips_ip_literals` is where
-        // that shape is pinned.
-        prop_assume!(!(host.starts_with('[') && host.ends_with(']')));
+        // A bracket is the template's syntax rather than part of a host, so no
+        // host containing one round trips: the enclosing pair comes off, which
+        // `the_template_round_trips_ip_literals` pins, and any other bracket is
+        // refused outright.
+        prop_assume!(!host.contains(['[', ']']));
 
         let path = format!("{PREFIX}{}/{port}/", percent_encode_all(host.as_bytes()));
         prop_assert_eq!(parse_target(&path, None), Ok((host, port)));

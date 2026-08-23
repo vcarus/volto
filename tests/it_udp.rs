@@ -326,6 +326,34 @@ async fn refuses_an_invalid_port_in_the_template() {
     assert_eq!(response.status, Status::BAD_REQUEST);
 }
 
+/// A bracket that is not the enclosing pair is not part of a host (review M3).
+///
+/// RFC 9298 §3.1 writes an IPv6 literal bare and the bracketed form is accepted
+/// only as a courtesy, so a bracket left over once that pair comes off is syntax
+/// this template has no use for. `it_tcp::refuses_an_authority_with_a_stray_bracket`
+/// pins the same answer on the other route; before this the two disagreed, and a
+/// name with a bracket in it reached the resolver and came back a 502.
+#[tokio::test]
+async fn refuses_a_target_host_with_a_stray_bracket() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // The same target the tunnel would otherwise have reached, so what is under
+    // test is the bracket and nothing about the destination.
+    let response = respond_to(
+        &mut client,
+        connect_udp_request(server.addr, "127.0.0.1]", target.port()),
+    )
+    .await;
+
+    assert_eq!(
+        response.status,
+        Status::BAD_REQUEST,
+        "a host with a stray bracket is not the host without it"
+    );
+}
+
 /// A session ends when the client closes the request stream (RFC 9298 §3.1).
 ///
 /// Observable from outside: once the session is gone its Quarter Stream ID no

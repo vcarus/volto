@@ -861,6 +861,14 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         None => host.into_owned(),
     };
 
+    // A bracket that survived that pair is not part of any host, and is refused
+    // here for the reason `tcp::split_authority` gives on the other route. The
+    // two are the same malformation and now earn the same 400: until this,
+    // `example.com%5D` went on to the resolver and came back a 502 dns_error.
+    if host.contains(['[', ']']) {
+        return Err("stray bracket in host");
+    }
+
     let port = percent_decode_str(port)
         .decode_utf8()
         .map_err(|_| "target_port is not valid UTF-8")?;
@@ -916,6 +924,19 @@ mod tests {
             parse("/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/"),
             Ok(("2001:db8::1".to_owned(), 53))
         );
+    }
+
+    /// A bracket anywhere but around the whole host is not part of a host.
+    ///
+    /// `tcp::split_authority` refuses the same shape on the other route, and the
+    /// two must diagnose one malformed target the same way rather than one
+    /// answering 400 and the other letting the resolver answer 502.
+    #[test]
+    fn rejects_a_stray_bracket_in_the_target_host() {
+        assert!(parse("/.well-known/masque/udp/example.com%5D/53/").is_err());
+        assert!(parse("/.well-known/masque/udp/example.com%5B/53/").is_err());
+        assert!(parse("/.well-known/masque/udp/%5Bexample.com/53/").is_err());
+        assert!(parse("/.well-known/masque/udp/exa%5Dmple.com/53/").is_err());
     }
 
     /// Not the standard form, but cheap to accept and some clients send it. The
