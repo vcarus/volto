@@ -234,7 +234,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // `max_streams_bidi` parked tasks per connection, from a peer that has not
     // authenticated. On expiry the stream is reset with H3_REQUEST_INCOMPLETE
     // and the connection carries on (D76).
-    let (req, mut stream) = match resolver.resolve(context.max_idle_timeout).await {
+    let (req, mut stream) = match resolver.resolve().await {
         Ok(resolved) => resolved,
         Err(error) => {
             // Malformed headers, a client reset mid-headers, and similar. The
@@ -259,13 +259,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             stream_id,
             field, "request carries a connection-specific field"
         );
-        tunnel::refuse(
-            &mut stream,
-            Status::BAD_REQUEST,
-            stream_id,
-            context.max_idle_timeout,
-        )
-        .await;
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
         return;
     }
 
@@ -332,7 +326,6 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 Status::PROXY_AUTHENTICATION_REQUIRED,
                 auth::challenge_fields(),
                 stream_id,
-                context.max_idle_timeout,
             )
             .await;
             return;
@@ -348,13 +341,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             live = context.quota.live(),
             "connection is at its tunnel limit"
         );
-        tunnel::refuse_because(
-            &mut stream,
-            ProxyError::ConnectionLimitReached,
-            stream_id,
-            context.max_idle_timeout,
-        )
-        .await;
+        tunnel::refuse_because(&mut stream, ProxyError::ConnectionLimitReached, stream_id).await;
         return;
     };
 
@@ -372,13 +359,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             None => {
                 // RFC 9114 §4.4: a CONNECT request must carry :authority.
                 debug!(stream_id, "CONNECT request without :authority");
-                tunnel::refuse(
-                    &mut stream,
-                    Status::BAD_REQUEST,
-                    stream_id,
-                    context.max_idle_timeout,
-                )
-                .await;
+                tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
             }
         },
         Route::ConnectUdp => {
@@ -394,13 +375,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
-            tunnel::refuse(
-                &mut stream,
-                Status::NOT_IMPLEMENTED,
-                stream_id,
-                context.max_idle_timeout,
-            )
-            .await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
         }
         Route::NotConnect => {
             debug!(
@@ -408,13 +383,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 method = %req.method,
                 "not a CONNECT request; this server only proxies"
             );
-            tunnel::refuse(
-                &mut stream,
-                Status::NOT_IMPLEMENTED,
-                stream_id,
-                context.max_idle_timeout,
-            )
-            .await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
         }
     }
 }

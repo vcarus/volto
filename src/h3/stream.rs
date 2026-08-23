@@ -55,7 +55,8 @@ impl Resolver {
         }
     }
 
-    /// Reads and validates the request headers, giving up after `within`.
+    /// Reads and validates the request headers, giving up after one QUIC idle
+    /// timeout.
     ///
     /// On failure the stream has already been ended -- reset and stopped for a
     /// malformed request, or the whole connection closed for a frame sequence
@@ -66,24 +67,22 @@ impl Resolver {
     /// A peer opens a request stream by sending on it, and may then send one
     /// byte and stop. Nothing in HTTP/3 obliges it to finish the request, and
     /// the QUIC idle timeout is no backstop while [`crate::quic`]'s keep-alive
-    /// PINGs are being answered by its stack, so without `within` each such
+    /// PINGs are being answered by its stack, so without a deadline each such
     /// stream parks a task until the connection ends -- `max_streams_bidi` of
     /// them per connection, at a byte apiece, from a peer that has not
-    /// authenticated (D76).
+    /// authenticated (D76). The bound is the connection's own idle timeout,
+    /// which is the same value [`crate::quic`] put in its transport parameters.
     ///
     /// The stream is the only thing a lapsed deadline ends: it is reset and
     /// stopped, and the connection carries on serving everything else on it.
-    pub async fn resolve(
-        self,
-        within: std::time::Duration,
-    ) -> Result<(Request, Stream), StreamError> {
+    pub async fn resolve(self) -> Result<(Request, Stream), StreamError> {
         let Self {
             handle,
             mut send,
             mut frames,
         } = self;
 
-        let read = match tokio::time::timeout(within, read_request(&mut frames)).await {
+        let read = match tokio::time::timeout(handle.idle, read_request(&mut frames)).await {
             Ok(read) => read,
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
@@ -107,16 +106,15 @@ impl Resolver {
             }
         };
 
+        let mut stream = Stream {
+            handle,
+            send,
+            frames,
+            header: BytesMut::with_capacity(2 * MAX_VARINT),
+        };
+
         match read {
-            Ok(request) => Ok((
-                request,
-                Stream {
-                    handle,
-                    send,
-                    frames,
-                    header: BytesMut::with_capacity(2 * MAX_VARINT),
-                },
-            )),
+            Ok(request) => Ok((request, stream)),
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
             //# A server that receives a larger header section than it is
             //# willing to handle can send an HTTP 431 (Request Header
@@ -139,31 +137,19 @@ impl Resolver {
             // `is_connection_error` is what decides between answering and
             // closing everywhere else in this file, and a code is not a class.
             //
-            // The write is bounded for the reason `tunnel::refuse_with`'s
-            // documentation gives, and abandoned the same way: a peer that
-            // grants no flow-control window never takes these fifty-odd bytes,
-            // and a FIN would only queue behind them.
+            // The write is bounded and, when the bound lapses, abandoned with
+            // a reset: [`Stream::respond_within`] says why, and a peer that
+            // grants no flow-control window never takes these fifty-odd bytes.
             Err(frame::Error::Protocol(violation))
                 if violation.code() == Code::H3_EXCESSIVE_LOAD
                     && !violation.is_connection_error() =>
             {
-                let mut stream = Stream {
-                    handle,
-                    send,
-                    frames,
-                    header: BytesMut::with_capacity(2 * MAX_VARINT),
-                };
-                match tokio::time::timeout(
-                    within,
-                    stream.respond(Status::REQUEST_HEADER_FIELDS_TOO_LARGE),
-                )
-                .await
+                if stream
+                    .respond_within(Status::REQUEST_HEADER_FIELDS_TOO_LARGE, Fields::new())
+                    .await
+                    .is_ok()
                 {
-                    Ok(Ok(())) => {
-                        let _ = stream.finish();
-                    }
-                    Ok(Err(_refused)) => {}
-                    Err(_elapsed) => stream.reset(Code::H3_REQUEST_CANCELLED),
+                    let _ = stream.finish();
                 }
                 stream.stop_receiving(violation.code());
                 Err(StreamError::Local(violation))
@@ -176,7 +162,12 @@ impl Resolver {
             // The response side is reset as well as the request side stopped:
             // this request will never be answered, and a peer left waiting for
             // a response that is not coming learns nothing.
-            Err(error) => Err(answer(&handle, &mut frames, Some(&mut send), error)),
+            Err(error) => Err(answer(
+                &stream.handle,
+                &mut stream.frames,
+                Some(&mut stream.send),
+                error,
+            )),
         }
     }
 }
@@ -664,6 +655,45 @@ impl Stream {
         Ok(())
     }
 
+    /// Sends a response with `fields`, bounded by the connection's idle
+    /// timeout.
+    ///
+    /// # The deadline
+    ///
+    /// The write is the one step in answering a request that depends on the
+    /// peer: a client that grants no flow-control window never takes the
+    /// fifty-odd bytes of a 407, and without a deadline the task waits for that
+    /// window until the connection ends. Every such request leaves a task
+    /// holding the whole decoded request behind it, and the count of
+    /// authentication failures that is meant to cost a guesser a handshake is
+    /// recorded around one of these calls (review H1/H2).
+    ///
+    /// The bound is the connection's own idle timeout, read from the
+    /// connection rather than passed in: it is the same value [`crate::quic`]
+    /// put in this connection's transport parameters, and quinn's idle timer is
+    /// no backstop while the peer's stack answers our keep-alive PINGs.
+    ///
+    /// The lapsed answer is abandoned with a reset rather than left to a FIN
+    /// that cannot be sent either: the request will not be answered, and RFC
+    /// 9114 §8.1 gives H3_REQUEST_CANCELLED for "the request or its response
+    /// (including pushed response) is cancelled", which is exactly what has
+    /// happened. Only the stream ends; the connection carries on serving
+    /// everything else on it.
+    pub async fn respond_within(
+        &mut self,
+        status: Status,
+        fields: Fields,
+    ) -> Result<(), RespondError> {
+        match tokio::time::timeout(self.handle.idle, self.respond_with(status, fields)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(RespondError::Failed(error)),
+            Err(_elapsed) => {
+                self.reset(Code::H3_REQUEST_CANCELLED);
+                Err(RespondError::Expired)
+            }
+        }
+    }
+
     /// Ends the sending side cleanly (a QUIC stream FIN).
     ///
     /// Not `async`: [`quinn::SendStream::finish`] records that the stream is
@@ -710,6 +740,44 @@ impl Stream {
                 frames: self.frames,
             },
         )
+    }
+}
+
+/// Why a bounded response never reached the peer.
+///
+/// The two are worth telling apart because they say different things about the
+/// peer and leave the stream in different states: a failed write is a stream
+/// that has already ended, while a lapsed deadline is a peer that is still
+/// there and simply will not read what it asked for.
+#[derive(Debug)]
+pub enum RespondError {
+    /// The write failed: the peer reset or stopped the stream, or the
+    /// connection ended under it.
+    Failed(StreamError),
+    /// The deadline lapsed with the response unwritten.
+    ///
+    /// The stream has already been reset with H3_REQUEST_CANCELLED, so there is
+    /// nothing left to send or finish on it.
+    Expired,
+}
+
+impl std::fmt::Display for RespondError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(error) => write!(f, "{error}"),
+            Self::Expired => {
+                f.write_str("the peer did not take the response within one idle timeout")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RespondError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed(error) => Some(error),
+            Self::Expired => None,
+        }
     }
 }
 

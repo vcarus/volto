@@ -290,14 +290,18 @@ pub(crate) struct Handle {
     /// Carried because it is the only clock this layer has for the waits that
     /// nothing else bounds: `crate::quic` owns the transport parameter and
     /// quinn's own idle timer is no help while the peer keeps a keep-alive
-    /// answered. [`serve_stream`] is the one such wait.
-    idle: Duration,
+    /// answered. [`serve_stream`] and every bounded response write
+    /// ([`super::stream::Stream::respond_within`]) are those waits.
+    pub(super) idle: Duration,
     shared: Arc<Shared>,
 }
 
 impl Handle {
-    /// The connection's frame-buffering budget, for a stream about to start
-    /// reading frames (D77).
+    /// The connection's frame-buffering budget, for a request stream about to
+    /// start reading frames (D77).
+    ///
+    /// The peer's control stream is the one reader that does not draw on it;
+    /// [`BufferBudget::unshared`] says why.
     pub(crate) fn budget(&self) -> Arc<BufferBudget> {
         self.shared.buffered.clone()
     }

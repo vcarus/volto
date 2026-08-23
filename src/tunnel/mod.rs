@@ -12,7 +12,9 @@ use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
-use crate::h3api::{self, ConnectProtocol, FieldValue, Fields, Method, Request, Status, Stream};
+use crate::h3api::{
+    self, ConnectProtocol, FieldValue, Fields, Method, Request, RespondError, Status, Stream,
+};
 use crate::policy::{self, Policy};
 
 /// How a request should be handled.
@@ -138,13 +140,6 @@ pub struct Context {
     pub tunnels: Arc<AtomicU64>,
     /// How long a UDP session may sit idle.
     pub idle_timeout: Duration,
-    /// The connection's QUIC idle timeout, from `[limits] max_idle_timeout`.
-    ///
-    /// Carried here for the one thing a request handler does with it: bounding
-    /// how long a request stream may take to deliver its HEADERS frame (D76).
-    /// Distinct from [`Context::idle_timeout`], which is a UDP session's own and
-    /// unrelated budget.
-    pub max_idle_timeout: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///
     /// Spent twice per request and separately — once on name resolution, once on
@@ -186,7 +181,6 @@ impl Context {
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
             tunnels,
             idle_timeout: config.limits.udp_session_timeout(),
-            max_idle_timeout: config.limits.max_idle_timeout(),
             connect_timeout: config.limits.connect_timeout(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
@@ -462,13 +456,7 @@ pub(crate) async fn admit_target(
 ) -> Option<Vec<std::net::SocketAddr>> {
     if !ctx.policy.allows_port(port) {
         debug!(stream_id, host, port, "target port denied by policy");
-        refuse_because(
-            stream,
-            ProxyError::HttpRequestDenied,
-            stream_id,
-            ctx.max_idle_timeout,
-        )
-        .await;
+        refuse_because(stream, ProxyError::HttpRequestDenied, stream_id).await;
         return None;
     }
 
@@ -478,7 +466,7 @@ pub(crate) async fn admit_target(
         Err(failure) => {
             let error = failure.proxy_error();
             debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
-            refuse_because(stream, error, stream_id, ctx.max_idle_timeout).await;
+            refuse_because(stream, error, stream_id).await;
             return None;
         }
     };
@@ -493,7 +481,7 @@ pub(crate) async fn admit_target(
                 ?addresses,
                 "every address of the target is a DNS blackhole"
             );
-            accept_then_close(stream, accepted_fields(), stream_id, ctx.max_idle_timeout).await;
+            accept_then_close(stream, accepted_fields(), stream_id).await;
             return None;
         }
 
@@ -504,13 +492,7 @@ pub(crate) async fn admit_target(
             ?addresses,
             "every address of the target is prohibited by policy"
         );
-        refuse_because(
-            stream,
-            ProxyError::DestinationIpProhibited,
-            stream_id,
-            ctx.max_idle_timeout,
-        )
-        .await;
+        refuse_because(stream, ProxyError::DestinationIpProhibited, stream_id).await;
         return None;
     }
 
@@ -664,8 +646,8 @@ fn sf_string(value: &str) -> String {
 ///
 /// Any request body is unwanted, so the client is told to stop sending before
 /// the status goes out.
-pub(crate) async fn refuse(stream: &mut Stream, status: Status, stream_id: u64, within: Duration) {
-    refuse_with(stream, status, Fields::new(), stream_id, within).await;
+pub(crate) async fn refuse(stream: &mut Stream, status: Status, stream_id: u64) {
+    refuse_with(stream, status, Fields::new(), stream_id).await;
 }
 
 /// Refuses a request, explaining why in an RFC 9209 `Proxy-Status` field.
@@ -673,18 +655,12 @@ pub(crate) async fn refuse(stream: &mut Stream, status: Status, stream_id: u64, 
 /// The status is the error's own (`recommended_status`), so the table that
 /// argues for each pairing — including D11's departure from the registry — is
 /// the only thing that decides one.
-pub(crate) async fn refuse_because(
-    stream: &mut Stream,
-    error: ProxyError,
-    stream_id: u64,
-    within: Duration,
-) {
+pub(crate) async fn refuse_because(stream: &mut Stream, error: ProxyError, stream_id: u64) {
     refuse_with(
         stream,
         error.recommended_status(),
         error.fields(),
         stream_id,
-        within,
     )
     .await;
 }
@@ -695,61 +671,44 @@ pub(crate) async fn refuse_because(
 /// `io::Error` to a status and an RFC 9209 field is written once: the type
 /// decides the status (`recommended_status`) and whether the address may be
 /// disclosed (`discloses_next_hop`).
-pub(crate) async fn refuse_unreachable(
-    stream: &mut Stream,
-    failure: &Unreachable,
-    stream_id: u64,
-    within: Duration,
-) {
+pub(crate) async fn refuse_unreachable(stream: &mut Stream, failure: &Unreachable, stream_id: u64) {
     let error = ProxyError::from_connect_error(&failure.error);
     refuse_with(
         stream,
         error.recommended_status(),
         error.fields_with_next_hop(failure.next_hop),
         stream_id,
-        within,
     )
     .await;
 }
 
 /// Refuses a request with an explicit set of response fields.
 ///
-/// # The deadline
-///
-/// `within` is one QUIC idle timeout, and it bounds the *write*, which is the
-/// one step here that depends on the peer: a client that grants no flow-control
-/// window never takes the fifty-odd bytes of a 407, and without a deadline this
-/// task waits for that window until the connection ends. Every such request
-/// leaves a task holding the whole decoded request behind it, and the count of
-/// authentication failures that is meant to cost a guesser a handshake is
-/// recorded on the far side of this call (review H1/H2).
-///
-/// The lapsed answer is abandoned with a reset rather than left to a FIN that
-/// cannot be sent either: the request will not be answered, and RFC 9114 §8.1
-/// gives H3_REQUEST_CANCELLED for "the request or its response (including
-/// pushed response) is cancelled", which is exactly what has happened.
+/// The write is bounded by one QUIC idle timeout and a lapsed one is abandoned
+/// with a reset; [`h3api::Stream::respond_within`] carries the reasoning. It is
+/// also why the count of authentication failures that is meant to cost a guesser
+/// a handshake is recorded by the caller before this call rather than after it
+/// (review H1/H2).
 pub(crate) async fn refuse_with(
     stream: &mut Stream,
     status: Status,
     fields: Fields,
     stream_id: u64,
-    within: Duration,
 ) {
     stream.stop_receiving(h3api::NO_ERROR);
 
-    match tokio::time::timeout(within, stream.respond_with(status, fields)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    match stream.respond_within(status, fields).await {
+        Ok(()) => {}
+        Err(RespondError::Failed(error)) => {
             debug!(stream_id, %error, "failed to send error response");
             return;
         }
-        Err(_elapsed) => {
+        Err(RespondError::Expired) => {
             debug!(
                 stream_id,
                 status = status.as_str(),
                 "gave up on an error response the peer would not take"
             );
-            stream.reset(h3api::REQUEST_CANCELLED);
             return;
         }
     }
@@ -795,29 +754,23 @@ pub(crate) async fn refuse_with(
 /// (it resets within a round trip either way) and production kept failing under
 /// the drain, so the simpler shape came back. That fault is on the client's
 /// side and does not depend on what this close sends.
-pub(crate) async fn accept_then_close(
-    stream: &mut Stream,
-    fields: Fields,
-    stream_id: u64,
-    within: Duration,
-) {
+pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields, stream_id: u64) {
     stream.stop_receiving(h3api::NO_ERROR);
 
     // Bounded exactly as [`refuse_with`] is, and for the same reason: no tunnel
     // is opened here, so nothing but this write stands between the request task
     // and the end of its life.
-    match tokio::time::timeout(within, stream.respond_with(Status::OK, fields)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    match stream.respond_within(Status::OK, fields).await {
+        Ok(()) => {}
+        Err(RespondError::Failed(error)) => {
             debug!(stream_id, %error, "failed to send 200 for a tunnel closed on the spot");
             return;
         }
-        Err(_elapsed) => {
+        Err(RespondError::Expired) => {
             debug!(
                 stream_id,
                 "gave up on a 200 the peer would not take for a tunnel closed on the spot"
             );
-            stream.reset(h3api::REQUEST_CANCELLED);
             return;
         }
     }
