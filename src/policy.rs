@@ -24,10 +24,11 @@
 //!   all multicast. These are not unicast targets at all; sending to them is an
 //!   amplification primitive, so `allow_private_networks` does not unlock them.
 //! * **Private** — everything RFC 6890 calls special-purpose and this proxy
-//!   might actually reach: loopback, RFC 1918, link-local, shared address space,
-//!   the benchmarking and documentation ranges, reserved space, ULA and the
-//!   deprecated IPv4-compatible and IPv6 site-local spaces. Denied by default,
-//!   unlocked by `allow_private_networks`.
+//!   might actually reach: `0.0.0.0/8`, loopback, RFC 1918, link-local, shared
+//!   address space, the benchmarking and documentation ranges, reserved space,
+//!   6to4 relay anycast, ULA, ORCHID and the deprecated IPv4-compatible and
+//!   IPv6 site-local spaces. Denied by default, unlocked by
+//!   `allow_private_networks`.
 //!
 //! # Transition addresses are judged as IPv4
 //!
@@ -189,7 +190,12 @@ fn is_private(ip: IpAddr) -> bool {
 
             // `is_private` is 10/8, 172.16/12 and 192.168/16; `is_link_local` is
             // 169.254/16.
-            v4.is_loopback()
+            // 0.0.0.0/8 — "this host on this network" (RFC 6890 Table 1, from
+            // RFC 1122). Only the all-zero address at the bottom of the block is
+            // `is_never_allowed`, and that check runs first; the rest of it is a
+            // source address a host uses before it has one, never a destination.
+            (octets[0] == 0)
+                || v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 // 100.64.0.0/10 — shared address space (RFC 6598), i.e. the
@@ -199,6 +205,11 @@ fn is_private(ip: IpAddr) -> bool {
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
                 // 198.18.0.0/15 — benchmarking (RFC 2544).
                 || (octets[0] == 198 && octets[1] & 0xfe == 18)
+                // 192.88.99.0/24 — 6to4 relay anycast (RFC 6890 Table 10, from
+                // RFC 3068). RFC 7526 deprecated the relays and the registry
+                // kept the entry, so the prefix now reaches whoever still
+                // announces it rather than any relay this proxy meant to use.
+                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
                 // 240.0.0.0/4 — reserved (RFC 1112 §4). The broadcast address at
                 // the top of it is already `is_never_allowed`, which runs first.
                 || octets[0] & 0xf0 == 240
@@ -211,6 +222,8 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_site_local(v6)
                 || is_ipv4_compatible(v6)
                 || is_ipv6_documentation(v6)
+                || is_ipv6_benchmarking(v6)
+                || is_orchid(v6)
                 || is_discard_only(v6)
         }
     }
@@ -233,6 +246,28 @@ fn is_ipv4_documentation(octets: [u8; 4]) -> bool {
 fn is_ipv6_documentation(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
     segments[0] == 0x2001 && segments[1] == 0x0db8
+}
+
+/// `2001:2::/48` — the IPv6 benchmarking range (RFC 6890 Table 24, from
+/// RFC 5180).
+///
+/// The IPv6 counterpart of `198.18.0.0/15`, and there for the same reason: it is
+/// what a lab numbers a device under test with, so a request for it is either a
+/// misconfiguration or an attempt to reach that lab.
+fn is_ipv6_benchmarking(v6: Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000
+}
+
+/// `2001:10::/28` — ORCHID (RFC 6890 Table 26, from RFC 4843).
+///
+/// An ORCHID is a hash of a host identity, not a locator: nothing forwards one,
+/// so a tunnel to it can only ever hold a slot. The registry entry carries a
+/// termination date of March 2014 and its successor prefix `2001:20::/28` is not
+/// in RFC 6890, so only the original block is claimed here.
+fn is_orchid(v6: Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010
 }
 
 /// `100::/64` — the discard-only prefix (RFC 6666).
@@ -355,6 +390,10 @@ mod tests {
     /// Every range the spec names, in both address families.
     const PRIVATE: &[&str] = &[
         // IPv4
+        // RFC 6890 Table 1, "this host on this network". 0.0.0.0 itself is in
+        // NEVER, so the representative is the address above it.
+        "0.0.0.1",
+        "0.255.255.255",
         "127.0.0.1",
         "127.255.255.254",
         "10.0.0.1",
@@ -373,6 +412,9 @@ mod tests {
         // RFC 2544 benchmarking, which some networks number infrastructure with.
         "198.18.0.0",
         "198.19.255.255",
+        // RFC 6890 Table 10, 6to4 relay anycast, deprecated by RFC 7526.
+        "192.88.99.0",
+        "192.88.99.255",
         // RFC 5737 documentation.
         "192.0.2.1",
         "198.51.100.1",
@@ -394,6 +436,12 @@ mod tests {
         "2001:db8::1",
         "100::1",
         "100:0:0:0:ffff::",
+        // RFC 6890 Table 24, IPv6 benchmarking (RFC 5180).
+        "2001:2::1",
+        "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+        // RFC 6890 Table 26, ORCHID (RFC 4843).
+        "2001:10::1",
+        "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
     ];
 
     const PUBLIC: &[&str] = &[
@@ -411,6 +459,9 @@ mod tests {
         "192.0.1.1",      // just above 192.0.0/24, and not 192.0.2/24
         "198.17.255.255", // just below 198.18/15
         "198.20.0.0",     // just above it
+        "1.0.0.0",        // just above 0.0.0.0/8, which has nothing below it
+        "192.88.98.255",  // just below 192.88.99/24
+        "192.88.100.0",   // just above it
         "192.0.3.1",      // just above 192.0.2/24
         "198.51.101.1",   // just above 198.51.100/24
         "203.0.114.1",    // just above 203.0.113/24
@@ -423,6 +474,12 @@ mod tests {
         "fe7f::1",      // just below fe80::/10; above it fec0::/10 runs into ff00::/8
         "2001:db9::1",  // just above 2001:db8::/32
         "100:0:0:1::1", // just outside 100::/64
+        // Teredo is 2001::/32 and is unwrapped before the rules run, so the
+        // address just below 2001:2::/48 is taken from 2001:1::/32.
+        "2001:1:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:2::/48
+        "2001:2:1::1",                          // just above it
+        "2001:f:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:10::/28
+        "2001:20::1",                           // just above it, ORCHIDv2
     ];
 
     const NEVER: &[&str] = &[
@@ -524,6 +581,11 @@ mod tests {
         let strict = policy(false, &[]);
 
         for (last_public, first_private, last_private, first_public) in [
+            // 0.0.0.0/8 starts at the bottom of the address space, so it has no
+            // public neighbour below it and the address above it stands in for
+            // both ends. Its first address is `is_never_allowed`, which runs
+            // first, hence 0.0.0.1 as the first private one.
+            ("1.0.0.0", "0.0.0.1", "0.255.255.255", "1.0.0.0"),
             (
                 "100.63.255.255",
                 "100.64.0.0",
@@ -536,6 +598,12 @@ mod tests {
                 "198.18.0.0",
                 "198.19.255.255",
                 "198.20.0.0",
+            ),
+            (
+                "192.88.98.255",
+                "192.88.99.0",
+                "192.88.99.255",
+                "192.88.100.0",
             ),
             ("192.0.1.255", "192.0.2.0", "192.0.2.255", "192.0.3.0"),
             (
@@ -576,9 +644,12 @@ mod tests {
         }
 
         // The broadcast address is inside 240/4 but `is_never_allowed` wins, so
-        // opening private space does not open it.
+        // opening private space does not open it. The unspecified address sits
+        // the same way inside 0.0.0.0/8.
         assert!(!policy(true, &[]).allows_address(ip("255.255.255.255")));
         assert!(policy(true, &[]).allows_address(ip("240.0.0.1")));
+        assert!(!policy(true, &[]).allows_address(ip("0.0.0.0")));
+        assert!(policy(true, &[]).allows_address(ip("0.0.0.1")));
 
         // fec0::/10 has no public neighbour on either side: below it is fe80::/10
         // (link-local, private) and above it ff00::/8 (multicast, never), so the
@@ -601,6 +672,42 @@ mod tests {
             );
         }
         assert!(!policy(true, &[]).allows_address(ip("ff00::")));
+
+        // The two IPv6 blocks carved out of 2001::/23. Their neighbours are
+        // picked to miss Teredo (2001::/32), which is unwrapped before any of
+        // these rules run, and ORCHIDv2 (2001:20::/28) is deliberately public:
+        // RFC 6890's registry does not carry it.
+        for (last_public, first_private, last_private, first_public) in [
+            (
+                "2001:1:ffff:ffff:ffff:ffff:ffff:ffff",
+                "2001:2::",
+                "2001:2:0:ffff:ffff:ffff:ffff:ffff",
+                "2001:2:1::",
+            ),
+            (
+                "2001:f:ffff:ffff:ffff:ffff:ffff:ffff",
+                "2001:10::",
+                "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
+                "2001:20::",
+            ),
+        ] {
+            for public in [last_public, first_public] {
+                assert!(
+                    strict.allows_address(ip(public)),
+                    "{public} is outside the range and must stay reachable"
+                );
+            }
+            for private in [first_private, last_private] {
+                assert!(
+                    !strict.allows_address(ip(private)),
+                    "{private} is inside the range and must be denied"
+                );
+                assert!(
+                    policy(true, &[]).allows_address(ip(private)),
+                    "{private} must follow the switch"
+                );
+            }
+        }
     }
 
     /// NAT64, 6to4 and Teredo addresses are routes to an IPv4 address, so they

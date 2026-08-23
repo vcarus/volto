@@ -180,7 +180,7 @@ family, an IP literal above all, is unaffected by any of the three.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, the deprecated site-local `fec0::/10`, `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
+| `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: "this host on this network" (`0.0.0.0/8`), loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15` and `2001:2::/48`), 6to4 relay anycast (`192.88.99.0/24`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, ORCHID (`2001:10::/28`), the deprecated site-local `fec0::/10`, `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it |
