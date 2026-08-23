@@ -122,6 +122,12 @@ pub struct Context {
     /// A server with no users configured has nothing to check, so its first
     /// request sets this too -- the flag means "this peer got past the door",
     /// not "credentials were seen".
+    ///
+    /// Owned by [`crate::quic`] rather than allocated here, because it is read
+    /// from outside the connection as well: the accept loop needs to know which
+    /// of the connections it is holding has never got past the door, so that a
+    /// full server can take that slot back rather than refuse a client that has
+    /// credentials.
     pub authenticated: Arc<AtomicBool>,
     /// The peer's address, for logs that a fail2ban rule can act on.
     pub remote: std::net::SocketAddr,
@@ -163,20 +169,22 @@ impl Context {
     /// Builds the context for one accepted connection.
     ///
     /// `peer_datagrams` comes from the HTTP/3 connection, which keeps writing
-    /// to it; `tunnels` is the connection's tunnel counter, created by
-    /// [`crate::quic`] so that it outlives this context and can be read once
-    /// the connection is over.
+    /// to it; `tunnels` is the connection's tunnel counter and `authenticated`
+    /// its door flag, both created by [`crate::quic`] so that they outlive this
+    /// context — the first is read once the connection is over, the second
+    /// while it runs.
     pub fn new(
         config: &Config,
         datagrams: quinn::Connection,
         peer_datagrams: Arc<AtomicBool>,
         tunnels: Arc<AtomicU64>,
+        authenticated: Arc<AtomicBool>,
     ) -> Self {
         Self {
             remote: datagrams.remote_address(),
             auth_failures: Arc::new(AtomicU32::new(0)),
             max_auth_failures: config.security.max_auth_failures,
-            authenticated: Arc::new(AtomicBool::new(false)),
+            authenticated,
             datagrams,
             peer_datagrams,
             auth: Arc::new(Authenticator::new(&config.auth)),

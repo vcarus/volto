@@ -11,6 +11,12 @@
 //! completes both handshakes and then says nothing, or sends a request it never
 //! finishes. Both are bounded while the connection has never authenticated, and
 //! both bounds vanish the moment one has.
+//!
+//! Bounding one connection is not the same as bounding a poolful of them, and
+//! the last group of tests is that difference: at `max_connections` the oldest
+//! connection that has never authenticated loses its slot to the newcomer, so a
+//! peer that keeps handshaking and never sends a credential cannot hold the
+//! server shut against clients that have one.
 
 mod common;
 
@@ -120,10 +126,15 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
 ///
 /// The two silent peers here are exactly the shape the v0.4.0 review found: a
 /// plain QUIC connection, no request stream ever opened, kept alive by its own
-/// stack answering the packets that cross it. Under `max_connections = 2` they
-/// used to lock the server out for as long as they cared to stay, without ever
-/// authenticating — which is what the third client proves, first by being
-/// refused and then, once the bound has expired, by connecting.
+/// stack answering the packets that cross it. Each is closed by the bound alone,
+/// with nobody else arriving to prompt it.
+///
+/// Nothing here probes the connection cap any more, and that is deliberate: a
+/// newcomer at the cap now takes one of these very slots by eviction, so a
+/// refusal is no longer the symptom of a slot being held and an admission is no
+/// longer proof of one being returned. The cap is asserted at the end of this
+/// file instead; what is under test here is the bound each connection is under
+/// on its own, with or without anyone waiting for its slot.
 #[tokio::test]
 async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
     let server = TestServer::start_with(&format!("{IMPATIENT}{TWO_SLOTS}")).await;
@@ -131,26 +142,13 @@ async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
     let first = silent_peer(&server).await;
     let second = silent_peer(&server).await;
 
-    // While they hold both slots, nobody else gets in. This is the symptom the
-    // bound exists to end, asserted rather than described.
-    let refused = client_endpoint(&server.ca, &["h3"]);
-    let error = finish_connect(&refused, server.addr)
-        .await
-        .expect_err("the server is at its connection limit");
-    assert!(
-        matches!(
-            error,
-            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
-        ),
-        "expected the connection to be refused, got {error}"
-    );
-
     // Two idle timeouts later both are gone, with nothing to report: neither
     // peer broke a rule, they simply had nothing to say.
     assert_closed_with(&first.1, H3_NO_ERROR, Duration::from_secs(8)).await;
     assert_closed_with(&second.1, H3_NO_ERROR, Duration::from_secs(8)).await;
 
-    // And the slots really were returned, not merely reported closed.
+    // And the server is serving afterwards rather than merely reporting the two
+    // as closed.
     let (_endpoint, admitted) = common::connect_quic(&server).await;
     assert!(
         admitted.close_reason().is_none(),
@@ -260,27 +258,17 @@ async fn opening_request_streams_does_not_extend_the_bound() {
         }
     });
 
-    // The slot is genuinely occupied while this goes on.
-    let refused = client_endpoint(&server.ca, &["h3"]);
-    let error = finish_connect(&refused, server.addr)
-        .await
-        .expect_err("the server is at its connection limit");
-    assert!(
-        matches!(
-            error,
-            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
-        ),
-        "expected the connection to be refused, got {error}"
-    );
-
     // Two idle timeouts after the handshake, and not two after the last stream.
+    // Nobody else connects while this runs: at the cap a newcomer would take
+    // this slot by eviction, which closes the connection with the same code the
+    // bound does and would leave the two indistinguishable.
     assert_closed_with(&connection, H3_NO_ERROR, Duration::from_secs(8)).await;
     poking.abort();
 
     let (_endpoint, admitted) = common::connect_quic(&server).await;
     assert!(
         admitted.close_reason().is_none(),
-        "the slot must come back once the peer that never authenticated is gone"
+        "the server must still be serving once the peer that never authenticated is gone"
     );
 }
 
@@ -383,6 +371,119 @@ async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
     assert!(
         connection.close_reason().is_none(),
         "the second client must be admitted, not refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A full server takes the slot back rather than refusing the newcomer
+// ---------------------------------------------------------------------------
+
+/// At the cap, the connection that has never authenticated is the one that goes.
+///
+/// Each bound above is a bound on a single connection, and none of them bounds
+/// how many slots unauthenticated peers hold between them: a peer that completes
+/// a handshake about once a second and never sends a credential keeps every slot
+/// occupied for ever, legitimately, while every client that has credentials is
+/// refused. Here the parked peer is that peer, at a cap of one.
+///
+/// The idle timeouts are the shipped ones, so nothing in this test is waiting
+/// for a clock: the parked connection is minutes away from any bound of its own,
+/// and the only thing that can close it is the newcomer taking its slot.
+#[tokio::test]
+async fn a_full_server_evicts_the_connection_that_never_authenticated() {
+    let server = TestServer::start_with(&format!("[limits]\n{ONE_SLOT}{ALLOW_PRIVATE}")).await;
+    let echo = spawn_echo_target().await;
+
+    // Holds the only slot: both handshakes complete, no request ever sent, so
+    // nothing on it has been past the credentials check.
+    let parked = H3Client::connect(&server).await;
+
+    // The newcomer is admitted, and is a working client rather than merely a
+    // completed handshake.
+    let mut client = H3Client::connect(&server).await;
+    let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
+    tunnel
+        .send_data(Bytes::from_static(b"payload"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+
+    // And the peer whose slot it took was told, with nothing to report: it broke
+    // no rule, it simply had never asked this server for anything.
+    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+}
+
+/// A connection that has authenticated keeps its slot, and the newcomer is
+/// refused exactly as it always was.
+///
+/// The other half of the rule, and the one that keeps eviction from being a way
+/// to knock a paying client off: with no users configured the first request past
+/// the door counts as having got past it (D76), so one successful CONNECT is all
+/// it takes to stop being a candidate.
+#[tokio::test]
+async fn an_authenticated_connection_is_never_the_one_evicted() {
+    let server = TestServer::start_with(&format!("[limits]\n{ONE_SLOT}{ALLOW_PRIVATE}")).await;
+    let echo = spawn_echo_target().await;
+
+    let mut holder = H3Client::connect(&server).await;
+    let mut tunnel = open_tcp_tunnel(&mut holder, &echo.to_string()).await;
+
+    let refused = client_endpoint(&server.ca, &["h3"]);
+    let error = finish_connect(&refused, server.addr)
+        .await
+        .expect_err("an authenticated connection must not lose its slot to a newcomer");
+    assert!(
+        matches!(
+            error,
+            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
+        ),
+        "expected the connection to be refused, got {error}"
+    );
+
+    // The connection that kept its slot is untouched: the tunnel it already had
+    // still carries bytes, and it can still open another.
+    tunnel
+        .send_data(Bytes::from_static(b"payload"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+
+    let mut second = open_tcp_tunnel(&mut holder, &echo.to_string()).await;
+    second
+        .send_data(Bytes::from_static(b"still here"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut second, 10).await, b"still here");
+}
+
+/// Of two connections that have never authenticated, the older one goes.
+///
+/// Not a detail: eviction has to walk the pool in accept order, or a peer could
+/// keep handshaking and have its own oldest connection spared while the queue
+/// churns around it. Two parked peers and one arrival say which of the two was
+/// picked, which a single-slot test cannot.
+#[tokio::test]
+async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
+    let server = TestServer::start_with(&format!("[limits]\n{TWO_SLOTS}{ALLOW_PRIVATE}")).await;
+    let echo = spawn_echo_target().await;
+
+    let older = H3Client::connect(&server).await;
+    let younger = H3Client::connect(&server).await;
+
+    let mut client = H3Client::connect(&server).await;
+    let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
+    tunnel
+        .send_data(Bytes::from_static(b"payload"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+
+    assert_closed_with(&older.quic, H3_NO_ERROR, TIMEOUT).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), younger.quic.closed())
+            .await
+            .is_err(),
+        "only one slot was needed, so the younger parked connection must keep its own"
     );
 }
 

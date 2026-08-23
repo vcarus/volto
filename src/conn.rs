@@ -11,7 +11,7 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -65,11 +65,17 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 /// a credential — used to reset the timer for ever and hold the slot anyway
 /// (review C1'). Nothing legitimate is near it: a client that has just
 /// completed two handshakes sends its first request within a round trip.
+///
+/// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
+/// reason `tunnels` does: the accept loop reads it after this has been handed
+/// the connection, to decide which connection loses its slot when the server is
+/// full.
 pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
     mut shutdown: Shutdown,
     tunnels: Arc<AtomicU64>,
+    authenticated: Arc<AtomicBool>,
 ) -> Result<(), h3api::ConnectionError> {
     // Cloned before the handshake, which takes ownership of the connection: a
     // UDP session sends its datagrams on the QUIC connection itself, and asks it
@@ -87,7 +93,13 @@ pub async fn handle(
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
     // what the copy cost.
-    let context = Context::new(&config, datagrams, connection.peer_datagrams(), tunnels);
+    let context = Context::new(
+        &config,
+        datagrams,
+        connection.peer_datagrams(),
+        tunnels,
+        authenticated,
+    );
 
     let mut going_away = false;
     let silence = config.limits.max_idle_timeout() * SILENCE_FACTOR;

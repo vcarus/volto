@@ -1,15 +1,17 @@
 //! The QUIC endpoint: transport parameters, the accept loop and peer metadata.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
 use socket2::SockRef;
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -170,6 +172,144 @@ fn congestion_factory(
 /// await — only long enough to clone the `Arc`.
 type LiveConfig = Arc<RwLock<Arc<Config>>>;
 
+/// One connection this endpoint is serving.
+struct Slot {
+    /// The peer's address, so the eviction can say whose slot was taken.
+    remote: SocketAddr,
+    /// Whether a request on this connection has passed the credentials check.
+    ///
+    /// The very flag [`crate::tunnel::Context`] sets (D76), created here and
+    /// handed down, so that the accept loop can read it without reaching into
+    /// a connection it does not own.
+    authenticated: Arc<AtomicBool>,
+    /// Ends this connection. `notify_one` leaves a permit behind, so a slot
+    /// evicted before its task has run is still ended by it rather than
+    /// missing the signal.
+    evict: Arc<Notify>,
+}
+
+/// The connections this endpoint is serving, ordered by accept sequence.
+///
+/// What `max_connections` is decided against, and the reason it is a roster
+/// rather than a count: at the cap the newcomer is not the only candidate for
+/// refusal. Every bound an unauthenticated connection is under is a bound on
+/// *one* connection — one idle timeout for the QUIC handshake, one for the
+/// HTTP/3 handshake, then twice one for the first request to authenticate (D76)
+/// — and none of them bounds how many slots such connections may hold between
+/// them. A peer that completes a handshake about once a second and never sends
+/// a credential holds all 256 of the default slots for as long as it likes,
+/// each slot legitimately, while every client with credentials is refused
+/// (audit 2026-08-23).
+///
+/// So at the cap the oldest connection that has never authenticated loses its
+/// slot to the newcomer, and only a server whose every live connection *has*
+/// authenticated refuses. A sub-quota for unauthenticated connections would not
+/// do: a legitimate client is unauthenticated at accept time too, so it would be
+/// squeezed by the same pool it is trying to join. An authenticated connection
+/// is never a candidate, and below the cap none of this runs at all.
+///
+/// The lock is a `std::sync::Mutex` and is never held across an await — only
+/// long enough to walk a map that has at most `max_connections` entries.
+#[derive(Clone)]
+struct Roster {
+    /// Keyed by accept sequence, so the first entry is the oldest connection.
+    slots: Arc<Mutex<BTreeMap<u64, Slot>>>,
+    /// The sequence number the next registration takes.
+    next: Arc<AtomicU64>,
+}
+
+impl Roster {
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(Mutex::new(BTreeMap::new())),
+            next: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Poisoning would mean a panic while walking the map; every value in it is
+    /// a handle whose own state lives elsewhere, so there is nothing to observe
+    /// half-written.
+    fn slots(&self) -> MutexGuard<'_, BTreeMap<u64, Slot>> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many connections hold a slot right now.
+    fn len(&self) -> usize {
+        self.slots().len()
+    }
+
+    /// Enters a connection about to be served, returning its eviction signal
+    /// and the guard that takes it off the roster again.
+    fn register(
+        &self,
+        remote: SocketAddr,
+        authenticated: Arc<AtomicBool>,
+    ) -> (Arc<Notify>, Registration) {
+        let evict = Arc::new(Notify::new());
+        let sequence = self.next.fetch_add(1, Ordering::Relaxed);
+
+        self.slots().insert(
+            sequence,
+            Slot {
+                remote,
+                authenticated,
+                evict: evict.clone(),
+            },
+        );
+
+        (
+            evict,
+            Registration {
+                slots: self.slots.clone(),
+                sequence,
+            },
+        )
+    }
+
+    /// Evicts the oldest connection that has never authenticated, reporting
+    /// whose slot was taken.
+    ///
+    /// The victim is removed from the roster here rather than by its own task,
+    /// so that a burst of accepts at the cap evicts successive connections
+    /// instead of picking the same one over and over while it winds down.
+    /// `None` means every live connection has authenticated.
+    fn evict_oldest_unauthenticated(&self) -> Option<SocketAddr> {
+        let mut slots = self.slots();
+
+        let sequence = *slots
+            .iter()
+            .find(|(_, slot)| !slot.authenticated.load(Ordering::Relaxed))
+            .map(|(sequence, _)| sequence)?;
+
+        let slot = slots.remove(&sequence)?;
+        slot.evict.notify_one();
+
+        Some(slot.remote)
+    }
+}
+
+/// A connection's place on the [`Roster`], given up when its task ends.
+///
+/// A guard rather than a call at the end of the task, because the task has
+/// several endings — a refused handshake, an eviction, a panic — and a slot that
+/// outlived any one of them would be a slot nothing can ever give back.
+struct Registration {
+    slots: Arc<Mutex<BTreeMap<u64, Slot>>>,
+    sequence: u64,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        self.slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            // Already gone when an eviction took the entry out; sequence
+            // numbers are never reused, so this can only ever remove this
+            // connection's own slot.
+            .remove(&self.sequence);
+    }
+}
+
 /// A bound QUIC endpoint ready to accept connections.
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -177,6 +317,9 @@ pub struct Server {
     /// startup line. Fixed at bind time: nothing reloadable can change it.
     socket_buffers: SocketBuffers,
     config: LiveConfig,
+    /// The connections being served, in accept order, and what the accept loop
+    /// decides `max_connections` against; see [`Roster`].
+    roster: Roster,
     /// Fires the graceful shutdown. Handed to whoever watches for signals.
     trigger: Trigger,
     /// The other end of the same latch, cloned into every connection.
@@ -220,6 +363,7 @@ impl Server {
             endpoint,
             socket_buffers,
             config: Arc::new(RwLock::new(config)),
+            roster: Roster::new(),
             trigger,
             shutdown,
         })
@@ -319,19 +463,47 @@ impl Server {
                     // path that is already opening a QUIC connection.
                     let max_connections = self.config().limits.max_connections;
 
-                    if max_connections > 0 && connections.len() >= max_connections as usize {
-                        // Refused at the QUIC layer: the peer is told immediately
-                        // instead of timing out, and nothing per-connection is
-                        // built on our side. Logged at DEBUG because a flood is
-                        // exactly when this fires.
-                        debug!(
-                            remote = %incoming.remote_address(),
-                            live = connections.len(),
-                            max_connections,
-                            "refusing a connection: the server is at its connection limit"
-                        );
-                        incoming.refuse();
-                        continue;
+                    // The roster rather than the `JoinSet`: a slot is entered
+                    // before the QUIC handshake starts and left when the
+                    // connection's task ends, so the roster counts exactly the
+                    // connections that hold a slot. The set is kept for
+                    // draining, and its length trails the roster by however
+                    // many finished tasks have not been reaped yet.
+                    if max_connections > 0 && self.roster.len() >= max_connections as usize {
+                        match self.roster.evict_oldest_unauthenticated() {
+                            // A connection that has never had a request pass the
+                            // credentials check is not owed the slot it is
+                            // sitting on, and a peer that completes a handshake
+                            // a second and never authenticates would otherwise
+                            // hold every slot there is for as long as it cared
+                            // to -- each one bounded, all of them replaced
+                            // (audit 2026-08-23). At INFO because it is a real
+                            // event with an operator-visible cause, and not a
+                            // failure of either peer.
+                            Some(victim) => info!(
+                                evicted = %victim,
+                                remote = %incoming.remote_address(),
+                                max_connections,
+                                "the server is full: evicting the oldest connection that has \
+                                 not authenticated"
+                            ),
+                            // Every live connection has authenticated, so there
+                            // is nothing to take the slot from. Refused at the
+                            // QUIC layer: the peer is told immediately instead
+                            // of timing out, and nothing per-connection is built
+                            // on our side. Logged at DEBUG because a flood is
+                            // exactly when this fires.
+                            None => {
+                                debug!(
+                                    remote = %incoming.remote_address(),
+                                    live = self.roster.len(),
+                                    max_connections,
+                                    "refusing a connection: the server is at its connection limit"
+                                );
+                                incoming.refuse();
+                                continue;
+                            }
+                        }
                     }
 
                     connections.spawn(self.serve(incoming));
@@ -355,10 +527,10 @@ impl Server {
     ///
     /// # The handshake deadline
     ///
-    /// The `max_connections` slot is taken by the `spawn` above, before the QUIC
-    /// and TLS handshake this starts with has happened — so the cap counts
-    /// handshakes in progress as well as connections, and something has to bound
-    /// the first of those. quinn has no handshake-specific timer: its idle
+    /// The `max_connections` slot is taken by the roster registration below,
+    /// before the QUIC and TLS handshake this starts with has happened — so the
+    /// cap counts handshakes in progress as well as connections, and something
+    /// has to bound the first of those. quinn has no handshake-specific timer: its idle
     /// timeout is reset by any authenticated packet in any packet number space,
     /// so a peer that sends an Initial-space PING every `max_idle_timeout` and
     /// never completes the handshake holds a slot for as long as it likes, and
@@ -371,6 +543,17 @@ impl Server {
     /// allowed to say nothing at all is not going to finish it. Dropping the
     /// future refuses the connection at the QUIC layer and frees the slot with
     /// it.
+    ///
+    /// # Eviction
+    ///
+    /// The same drop is what an eviction uses. A connection that has never
+    /// authenticated may have its slot taken by a newcomer once the server is
+    /// full ([`Roster`]), and the signal reaches it here: whichever stage it is
+    /// in, its work is dropped. Before the handshake that refuses the
+    /// connection at the QUIC layer; after it, dropping `conn::handle`'s future
+    /// drops the HTTP/3 connection, whose own `Drop` closes the QUIC connection
+    /// with H3_NO_ERROR — nothing went wrong, the slot was simply owed to
+    /// somebody else.
     fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> {
         // Snapshotted per connection, not read live: a reload changes what new
         // connections get, while a connection already running keeps the
@@ -382,25 +565,51 @@ impl Server {
 
         let handshake_deadline = config.limits.max_idle_timeout();
 
+        // Entered here rather than inside the future: the accept loop decides
+        // on the roster's length, and a slot that only appeared when the task
+        // was first polled would let a burst of accepts all pass the same
+        // check and overshoot the cap.
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let (evicted, registration) = self.roster.register(remote, authenticated.clone());
+
         async move {
-            let quic = match tokio::time::timeout(handshake_deadline, incoming).await {
-                Ok(Ok(quic)) => quic,
-                Ok(Err(error)) => {
-                    // A failed handshake is routine on a public port: scanners,
-                    // version negotiation, stale retries.
-                    debug!(%remote, %error, "QUIC handshake failed");
-                    return;
-                }
-                // Equally routine, and logged at the same level for the same
-                // reason: a flood is exactly when this fires.
-                Err(_elapsed) => {
+            // Held for the whole connection: dropping it takes the slot off the
+            // roster, however this task ends.
+            let _registration = registration;
+
+            let quic = tokio::select! {
+                () = evicted.notified() => {
+                    // Dropping `incoming` refuses the connection at the QUIC
+                    // layer, exactly as letting the deadline below lapse does.
+                    // DEBUG rather than the INFO the established case gets:
+                    // there is no connection yet, so there is nothing to report
+                    // about one.
                     debug!(
                         %remote,
-                        timeout_secs = handshake_deadline.as_secs(),
-                        "QUIC handshake did not complete in time"
+                        "evicted before its QUIC handshake completed: the server is full"
                     );
                     return;
                 }
+
+                handshake = tokio::time::timeout(handshake_deadline, incoming) => match handshake {
+                    Ok(Ok(quic)) => quic,
+                    Ok(Err(error)) => {
+                        // A failed handshake is routine on a public port: scanners,
+                        // version negotiation, stale retries.
+                        debug!(%remote, %error, "QUIC handshake failed");
+                        return;
+                    }
+                    // Equally routine, and logged at the same level for the same
+                    // reason: a flood is exactly when this fires.
+                    Err(_elapsed) => {
+                        debug!(
+                            %remote,
+                            timeout_secs = handshake_deadline.as_secs(),
+                            "QUIC handshake did not complete in time"
+                        );
+                        return;
+                    }
+                },
             };
 
             let peer = peer_info(&quic);
@@ -470,19 +679,28 @@ impl Server {
             // back here, `close_reason()` reports that drop rather than whatever
             // actually ended the connection — which is precisely how the idle
             // timeout ended up logged as an error for a whole release cycle.
-            let closed = match conn::handle(quic, config, shutdown, tunnels.clone()).await {
-                // The accept loop ended on its own terms: the peer said it would
-                // send no further requests, or the GOAWAY drain completed.
-                Ok(()) => Ok("drained"),
-                Err(error) => match h3api::benign_close(&error) {
-                    // Surge abandons connections without a CONNECTION_CLOSE
-                    // (network switch, app exit), so letting one idle out is the
-                    // everyday goodbye, not a failure.
-                    Some(h3api::BenignClose::Idle) => Ok("idle"),
-                    // A peer that closed cleanly is equally routine.
-                    Some(h3api::BenignClose::PeerClosed) => Ok("peer_close"),
-                    None => Err(error),
-                },
+            let closed = tokio::select! {
+                // The newcomer that took this slot is already being served; all
+                // that is left here is to stop. Graded with the idle endings
+                // rather than as an error, because nothing about this
+                // connection failed.
+                () = evicted.notified() => Ok("evicted"),
+
+                handled = conn::handle(quic, config, shutdown, tunnels.clone(), authenticated) =>
+                    match handled {
+                        // The accept loop ended on its own terms: the peer said it would
+                        // send no further requests, or the GOAWAY drain completed.
+                        Ok(()) => Ok("drained"),
+                        Err(error) => match h3api::benign_close(&error) {
+                            // Surge abandons connections without a CONNECTION_CLOSE
+                            // (network switch, app exit), so letting one idle out is the
+                            // everyday goodbye, not a failure.
+                            Some(h3api::BenignClose::Idle) => Ok("idle"),
+                            // A peer that closed cleanly is equally routine.
+                            Some(h3api::BenignClose::PeerClosed) => Ok("peer_close"),
+                            None => Err(error),
+                        },
+                    },
             };
 
             // One snapshot for every transport field below, so they all

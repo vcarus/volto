@@ -94,6 +94,21 @@ bound resets that one stream with `H3_REQUEST_INCOMPLETE` and a lapsed response
 write resets it with `H3_REQUEST_CANCELLED`, leaving everything else on the
 connection running.
 
+That bound holds one connection; it does not bound how many of the
+`limits.max_connections` slots unauthenticated peers hold between them, and a
+peer that completes a handshake about once a second and never sends a credential
+would fill every one of them legitimately, each slot bounded, all of them
+replaced. So at the cap a new connection does not simply lose: the endpoint
+takes the slot of the oldest connection that has never authenticated and admits
+the newcomer, and only refuses when every live connection has authenticated. The
+evicted connection is closed with `H3_NO_ERROR` — nothing about it failed — and
+logged like the other idle endings, with `reason=evicted`; one whose QUIC
+handshake had not finished is refused at the transport layer instead. A
+connection that has authenticated is never a candidate, and below the cap
+nothing of this runs. There is no sub-quota for unauthenticated connections
+because it would not help: a legitimate client is unauthenticated at accept time
+too, so it would be squeezed by exactly the pool it is trying to join.
+
 ### Target address selection
 
 Both tunnel kinds resolve their target through one function in `tunnel/mod.rs`,
