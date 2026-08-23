@@ -38,8 +38,35 @@ use crate::h3api::{self, Buffer, Fields, Reader, Status, Stream, Writer};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
-/// Bytes read from the target per relay iteration.
+/// Smallest window `read_buf` is ever offered on the target → client relay.
+///
+/// The threshold half of the pair below: a block is kept in use until fewer
+/// than this many bytes are left in it, so every read still has at least 16 KiB
+/// of room. It is also the size of the *first* allocation a tunnel makes, so a
+/// tunnel that never carries a byte costs 16 KiB rather than a whole block.
 const RELAY_BUF_SIZE: usize = 16 * 1024;
+
+/// The block reads are cut from once the initial 16 KiB is used up.
+///
+/// # Why a block rather than a buffer
+///
+/// `BytesMut::split` hands the filled bytes on without copying them, which is
+/// what keeps the relay allocation-light — but the piece handed on and the
+/// piece kept share one heap block, and quinn holds its piece until the segment
+/// carrying it has been acknowledged. So the memory a tunnel occupies is
+/// *blocks* × block size, while the only thing bounding it — quinn's
+/// `send_window`, 10 MB per connection — counts bytes. Reserving a fresh
+/// [`RELAY_BUF_SIZE`] block per read made every read, however small, pin 16 KiB:
+/// 11.7x amplification for MTU-sized reads and 238x for 64-byte ones.
+///
+/// # The arithmetic
+///
+/// A block is abandoned only once its remaining capacity falls below
+/// [`RELAY_BUF_SIZE`], so at least `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` = 48 KiB
+/// of it has been handed to the client by then. Worst-case amplification is
+/// therefore 64 / 48 = 1.33x whatever the read sizes are, against a factor that
+/// grew without bound as reads got smaller.
+const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Why the tunnel is being torn down, carried on the teardown channel.
 ///
@@ -305,7 +332,16 @@ async fn target_to_client(
     loop {
         // Keep a full-size window available. Without this, `read_buf` reserves
         // only 64 bytes at a time once the initial capacity is used up.
-        buf.reserve(RELAY_BUF_SIZE);
+        //
+        // Reserved a block at a time rather than a window at a time: after the
+        // `split` below, what is left of the block is shared with the `Bytes`
+        // quinn is holding, so a `reserve` that cannot be satisfied from it
+        // allocates a whole new one. Asking only when fewer than a window
+        // remains is what lets consecutive reads come out of the same block --
+        // see [`RELAY_BLOCK_SIZE`] for the arithmetic.
+        if buf.capacity() < RELAY_BUF_SIZE {
+            buf.reserve(RELAY_BLOCK_SIZE);
+        }
 
         let read = tokio::select! {
             biased;
