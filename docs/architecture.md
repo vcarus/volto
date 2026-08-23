@@ -121,11 +121,19 @@ RFC 9114 §4.4 half-close semantics:
 | client finishes the stream | `shutdown(Write)` on the target socket, **not** a full close |
 | target EOF | finish the send side of the response stream |
 | target RST or error | reset the stream with `H3_CONNECT_ERROR` |
-| client resets the stream | close the TCP connection |
+| client resets the stream, or stops reading it | close the TCP connection with a reset, and cancel the direction the client left alone with `H3_REQUEST_CANCELLED` |
 
 Collapsing this into "one side closes, everything closes" breaks every protocol
 that depends on half-close. The abnormal paths coordinate through a sticky
 `watch` teardown channel so that neither pump can strand the other.
+
+The last row cancels both directions because RFC 9114 §4.4 asks for it: "If the
+stream is reset or reading is aborted by the client, a proxy SHOULD perform the
+same operation on the other direction in order to ensure that both directions of
+the stream are cancelled." Without it a client that reset only its sending side
+had the response direction finished with a clean FIN, so a truncated response
+read as a complete one, and a client that sent STOP_SENDING had its own sending
+side stopped with code 0 rather than with an HTTP/3 code.
 
 ### UDP tunnels
 

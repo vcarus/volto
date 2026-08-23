@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::{assert_closed_with, connect_headers_frame};
+use common::rawstream::{assert_closed_with, connect_headers_frame, frame, read_frame, status_of};
 use common::{
     assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
     finish_connect, open_tcp_tunnel, read_at_least, read_to_end, respond_to, send_and_respond,
@@ -29,6 +29,12 @@ const H3_FRAME_UNEXPECTED: u64 = 0x0105;
 /// H3_REQUEST_CANCELLED (RFC 9114 §8.1): "The request or its response
 /// (including pushed response) is cancelled."
 const H3_REQUEST_CANCELLED: u64 = 0x010c;
+
+/// DATA frame type (RFC 9114 §7.2.1).
+const FRAME_DATA: u64 = 0x00;
+
+/// HEADERS frame type (RFC 9114 §7.2.2).
+const FRAME_HEADERS: u64 = 0x01;
 
 /// A 2s idle timeout, which is also how long any one response may take.
 ///
@@ -235,6 +241,102 @@ async fn client_reset_aborts_the_target_connection() {
         end,
         ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
         "an aborted tunnel must reach the target as a reset, not as a clean EOF"
+    );
+}
+
+/// RFC 9114 §4.4: "If the stream is reset or reading is aborted by the client,
+/// a proxy SHOULD perform the same operation on the other direction in order to
+/// ensure that both directions of the stream are cancelled."
+///
+/// A client that resets only its *sending* side used to have the response
+/// direction finished with a clean FIN, because a dropped `quinn::SendStream`
+/// finishes rather than resets — so whatever the target had still to say read to
+/// the client as a complete response rather than as a cancelled one. It is now
+/// reset with H3_REQUEST_CANCELLED, RFC 9114 §8.1's "the request or its response
+/// (including pushed response) is cancelled", and the target still sees the RST
+/// the same paragraph of §4.4 asks for.
+#[tokio::test]
+async fn a_client_reset_cancels_the_response_direction_too() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    // Only the sending side, and the stream is kept rather than dropped: the
+    // response direction stays open, which is the half under test.
+    stream.stop_stream(volto::h3api::Code::H3_REQUEST_CANCELLED);
+
+    let error = match tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .expect("the server must end the response direction promptly")
+    {
+        Ok(Some(_)) => panic!("this target never writes, so there is nothing to read"),
+        Ok(None) => panic!(
+            "a cancelled request reached the client as a clean end of stream: a truncated \
+             response is indistinguishable from a complete one"
+        ),
+        Err(error) => error,
+    };
+    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+
+    // And the other operation §4.4 asks for on a client abort is unchanged.
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target connection must be closed after a client reset")
+        .expect("close notification");
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "an aborted tunnel must still reach the target as a reset"
+    );
+}
+
+/// The other half of the same sentence: a client that aborts *reading* must have
+/// its own sending direction cancelled with an HTTP/3 code.
+///
+/// Left to the `Reader` being dropped, quinn stops the peer with code 0 — so the
+/// two halves of one cancelled request ended under two different verdicts. The
+/// server notices the client's STOP_SENDING when it next writes to the response
+/// direction, which is what the echoed byte below arranges.
+///
+/// Driven on a raw QUIC stream because the shared client has no way to abort
+/// reading while keeping its sending side open, which is precisely the shape
+/// under test.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_stop_sending_cancels_the_request_direction_too() {
+    let server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let (mut send, mut recv) = client.quic.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send the CONNECT request");
+
+    let (kind, payload) = read_frame(&mut recv).await;
+    assert_eq!(kind, FRAME_HEADERS, "the tunnel must open with a response");
+    assert_eq!(status_of(&payload), "200", "the tunnel must be accepted");
+
+    // Abort reading the response direction. The code a client picks is its own
+    // business; what is under test is the code the server answers with.
+    recv.stop(quinn::VarInt::from_u32(0))
+        .expect("stop reading the response direction");
+
+    // The echo comes back on a direction nobody is reading, which is where the
+    // server meets the STOP_SENDING.
+    send.write_all(&frame(FRAME_DATA, b"echo me"))
+        .await
+        .expect("send payload");
+
+    let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+        .await
+        .expect("the server must cancel the request direction")
+        .expect("stop code");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(H3_REQUEST_CANCELLED),
+        "both directions of a cancelled request must carry the same verdict"
     );
 }
 

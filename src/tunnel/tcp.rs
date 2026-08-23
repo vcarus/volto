@@ -11,14 +11,14 @@
 //! | client finishes its sending side (FIN) | shut down **only** the write side of the TCP socket, keep reading from the target |
 //! | target reaches EOF | finish our sending side, keep reading from the client |
 //! | target resets or errors | reset the request stream with `H3_CONNECT_ERROR`, whichever direction noticed |
-//! | client resets the request stream, or stops reading it | close the TCP connection with a reset |
+//! | client resets the request stream, or stops reading it | close the TCP connection with a reset, and cancel the direction the client left alone with `H3_REQUEST_CANCELLED` |
 //!
 //! The two directions therefore run as independent pumps that are joined, plus a
 //! sticky teardown signal for the abnormal cases where one direction failing
 //! must stop the other. The signal carries *why* the tunnel is being torn down —
-//! see `Teardown` below — because the two reasons need opposite things from the pump
-//! that did not see the failure: a target error has to be spelled out on that
-//! half too, whereas a client abort has already been spelled out by the client.
+//! see `Teardown` below — because the code the pump that did not see the failure
+//! has to put on its own half follows from the reason: `H3_CONNECT_ERROR` when
+//! the target failed, `H3_REQUEST_CANCELLED` when the client cancelled.
 //!
 //! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
@@ -80,8 +80,13 @@ const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 ///
 /// With the reason attached, a target error reaches the client as
 /// `H3_CONNECT_ERROR` whichever pump noticed it (RFC 9114 §4.4), and a client
-/// abort still leaves both halves alone, since the client is the one that closed
-/// them.
+/// abort cancels the direction the client left alone. §4.4 asks for that
+/// second one in as many words: "If the stream is reset or reading is aborted
+/// by the client, a proxy SHOULD perform the same operation on the other
+/// direction in order to ensure that both directions of the stream are
+/// cancelled." Leaving it alone was the older reading, and it left a client
+/// that reset only its sending side reading a truncated response as a complete
+/// one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Teardown {
     /// Nothing has gone wrong; both directions are still relaying.
@@ -278,21 +283,29 @@ async fn client_to_target(
             // is the wrong signal for every path that gets here — and would
             // overtake the reset when the other pump armed one.
             reason = torn_down(&mut teardown_rx) => {
-                // The other pump found the target broken and reset its half with
-                // H3_CONNECT_ERROR. Ask for the same code here rather than
-                // letting the `Reader` drop stop the client with code 0, which
-                // would leave the two halves carrying different verdicts on the
-                // same failure.
+                // Whatever ended the tunnel is spelled out on this half too,
+                // rather than left to the `Reader` drop to stop the client with
+                // code 0 -- which would leave the two halves carrying different
+                // verdicts on the same event.
+                //
+                // A target error is `H3_CONNECT_ERROR`, the code the other pump
+                // put on the response direction (RFC 9114 §4.4). A client abort
+                // is `H3_REQUEST_CANCELLED`: §4.4 asks a proxy to "perform the
+                // same operation on the other direction in order to ensure that
+                // both directions of the stream are cancelled", and §8.1 gives
+                // that code for "the request or its response (including pushed
+                // response) is cancelled".
                 //
                 // The ask reaches the wire here and not later: `stop_receiving`
                 // is `quinn::RecvStream::stop`, which queues STOP_SENDING at the
-                // point of call. It is dropped only when this direction has
-                // already ended, and then there is nothing left to stop. The
-                // response direction, which is the one that could truncate data,
-                // is reset unconditionally by the other pump either way.
-                if reason == Teardown::TargetError {
-                    reader.stop_receiving(h3api::CONNECT_ERROR);
-                }
+                // point of call. On the half a client has already closed it is a
+                // no-op -- quinn answers `ClosedStream`, which `FrameReader::stop`
+                // discards, because a stream that is already over has nothing
+                // left to stop.
+                reader.stop_receiving(match reason {
+                    Teardown::TargetError => h3api::CONNECT_ERROR,
+                    _ => h3api::REQUEST_CANCELLED,
+                });
                 tcp_write.forget();
                 return;
             }
@@ -362,18 +375,26 @@ async fn target_to_client(
         let read = tokio::select! {
             biased;
             reason = torn_down(&mut teardown_rx) => {
-                // The write pump found the target broken. RFC 9114 §4.4 makes
-                // that a stream error of type H3_CONNECT_ERROR, and returning
-                // without saying so would drop the `Writer` — and a dropped
-                // `quinn::SendStream` finishes rather than resets, so the client
-                // would read a truncated response as a complete one.
+                // Returning without saying anything would drop the `Writer` —
+                // and a dropped `quinn::SendStream` finishes rather than resets,
+                // so whatever of the target's answer had not been sent would
+                // reach the client as a complete response. Both reasons are
+                // therefore spelled out here; only the code differs.
                 //
-                // A client abort needs nothing from this side: the client has
-                // already reset the stream or stopped reading it, and answering
-                // its own close with a reset only adds a second signal.
-                if reason == Teardown::TargetError {
-                    writer.reset(h3api::CONNECT_ERROR);
-                }
+                // The write pump finding the target broken is a stream error of
+                // type H3_CONNECT_ERROR (RFC 9114 §4.4). A client abort is
+                // H3_REQUEST_CANCELLED, because §4.4 asks that "if the stream is
+                // reset or reading is aborted by the client, a proxy SHOULD
+                // perform the same operation on the other direction in order to
+                // ensure that both directions of the stream are cancelled" —
+                // and §8.1 defines that code as "the request or its response
+                // (including pushed response) is cancelled". A client that reset
+                // only its sending side is exactly the case that used to be told
+                // its truncated response was complete.
+                writer.reset(match reason {
+                    Teardown::TargetError => h3api::CONNECT_ERROR,
+                    _ => h3api::REQUEST_CANCELLED,
+                });
                 return;
             }
             read = tcp_read.read_buf(&mut buf) => read,
@@ -459,7 +480,9 @@ async fn torn_down(teardown_rx: &mut watch::Receiver<Teardown>) -> Teardown {
         }
         // The sender outlives both pumps, so this cannot actually fail; treat a
         // closed channel as a teardown anyway. Reported as a client abort,
-        // which is the reason that asks nothing of the waking pump.
+        // which is the reason that blames nothing: no pump saw the target fail,
+        // so the waking half is cancelled rather than told there was an error
+        // upstream.
         if teardown_rx.changed().await.is_err() {
             return Teardown::ClientAbort;
         }
