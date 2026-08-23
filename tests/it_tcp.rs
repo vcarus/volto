@@ -14,6 +14,7 @@ use common::{
     spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
     TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
 
@@ -337,6 +338,115 @@ async fn a_client_stop_sending_cancels_the_request_direction_too() {
         stopped.map(quinn::VarInt::into_inner),
         Some(H3_REQUEST_CANCELLED),
         "both directions of a cancelled request must carry the same verdict"
+    );
+}
+
+/// A TCP target that never reads and writes until it cannot, reporting how its
+/// connection ended.
+///
+/// The shape needed to park *both* of the proxy's pumps at once. Never reading
+/// fills every buffer between the client and the target, so the proxy's
+/// client → target pump ends up inside `write_all`; writing without ever being
+/// read — the client under test does not read the tunnel either — fills the
+/// other direction, so the target → client pump ends up inside `send_data`,
+/// which is the only place it can notice a client's STOP_SENDING.
+///
+/// The end is reported from the blocked write rather than from a read, because
+/// reading is exactly what this target must not do: an abortive close makes a
+/// blocked write fail with `ConnectionReset` or `BrokenPipe`, and a proxy that
+/// never closed the socket leaves it blocked for ever, which is the failure this
+/// reports by silence.
+async fn spawn_deaf_flooding_target(
+) -> (SocketAddr, tokio::sync::mpsc::Receiver<std::io::ErrorKind>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let payload = vec![0x5au8; 64 * 1024];
+                loop {
+                    if let Err(error) = socket.write_all(&payload).await {
+                        let _ = tx.send(error.kind()).await;
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    (addr, rx)
+}
+
+/// A teardown must not wait behind a write to a target that stopped reading.
+///
+/// RFC 9114 §4.4: "if a proxy detects an error with the stream or the QUIC
+/// connection, it MUST close the TCP connection." With the write outside the
+/// pump's `select!`, that close waited for `write_all` to finish — which, on a
+/// target that never reads, is never: the client's STOP_SENDING was noticed by
+/// the other pump, the teardown was raised, and nothing acted on it, so the
+/// target socket stayed open for the life of the process.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_abort_closes_a_target_that_stopped_reading() {
+    /// How long the close may take once the client has aborted. Two orders of
+    /// magnitude under the wait a stalled `write_all` would impose, which is
+    /// unbounded.
+    const CLOSE_WITHIN: Duration = Duration::from_secs(2);
+
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_deaf_flooding_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let (mut send, mut recv) = client.quic.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send the CONNECT request");
+
+    let (kind, payload) = read_frame(&mut recv).await;
+    assert_eq!(kind, FRAME_HEADERS, "the tunnel must open with a response");
+    assert_eq!(status_of(&payload), "200", "the tunnel must be accepted");
+
+    // Upload until a write no longer completes. Loopback buffers on macOS are
+    // large and the server's own stream window is 2 MB, so the stall is found by
+    // writing rather than by predicting how much it takes.
+    let chunk = vec![0xa5u8; 64 * 1024];
+    let mut stalled = false;
+    for _ in 0..512 {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            send.write_all(&frame(FRAME_DATA, &chunk)),
+        )
+        .await
+        {
+            Ok(result) => result.expect("the upload must not fail before it stalls"),
+            Err(_) => {
+                stalled = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        stalled,
+        "the upload never stalled, so the proxy was never parked in its write"
+    );
+
+    // Abort reading the response direction: the other pump meets this inside
+    // `send_data` and raises the teardown the write pump has to act on.
+    recv.stop(quinn::VarInt::from_u32(0))
+        .expect("stop reading the response direction");
+
+    let end = tokio::time::timeout(CLOSE_WITHIN, ended.recv())
+        .await
+        .expect("the target socket must be closed once the client aborts")
+        .expect("close notification");
+    assert!(
+        matches!(
+            end,
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ),
+        "the target must see the connection go away, got {end:?}"
     );
 }
 

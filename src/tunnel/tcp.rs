@@ -275,46 +275,41 @@ async fn client_to_target(
     teardown: &watch::Sender<Teardown>,
     mut teardown_rx: watch::Receiver<Teardown>,
 ) {
-    loop {
+    // The two places that can notice a teardown — the wait for the client's
+    // next chunk and the write of the one already in hand — end this direction
+    // identically, and `OwnedWriteHalf::forget` consumes the half, so the
+    // reason is carried out of the loop and acted on once below.
+    let reason = loop {
         let chunk = tokio::select! {
             biased;
-            // The other direction ended the tunnel abnormally. Shutting the
-            // write side down on the way out would put a FIN on the wire, which
-            // is the wrong signal for every path that gets here — and would
-            // overtake the reset when the other pump armed one.
-            reason = torn_down(&mut teardown_rx) => {
-                // Whatever ended the tunnel is spelled out on this half too,
-                // rather than left to the `Reader` drop to stop the client with
-                // code 0 -- which would leave the two halves carrying different
-                // verdicts on the same event.
-                //
-                // A target error is `H3_CONNECT_ERROR`, the code the other pump
-                // put on the response direction (RFC 9114 §4.4). A client abort
-                // is `H3_REQUEST_CANCELLED`: §4.4 asks a proxy to "perform the
-                // same operation on the other direction in order to ensure that
-                // both directions of the stream are cancelled", and §8.1 gives
-                // that code for "the request or its response (including pushed
-                // response) is cancelled".
-                //
-                // The ask reaches the wire here and not later: `stop_receiving`
-                // is `quinn::RecvStream::stop`, which queues STOP_SENDING at the
-                // point of call. On the half a client has already closed it is a
-                // no-op -- quinn answers `ClosedStream`, which `FrameReader::stop`
-                // discards, because a stream that is already over has nothing
-                // left to stop.
-                reader.stop_receiving(match reason {
-                    Teardown::TargetError => h3api::CONNECT_ERROR,
-                    _ => h3api::REQUEST_CANCELLED,
-                });
-                tcp_write.forget();
-                return;
-            }
+            reason = torn_down(&mut teardown_rx) => break reason,
             chunk = reader.recv_data() => chunk,
         };
 
         match chunk {
             Ok(Some(data)) => {
-                if let Err(error) = tcp_write.write_all(&data).await {
+                // The write is under the same signal as the read, because it is
+                // the half that can park indefinitely: a target that has stopped
+                // reading fills every buffer between here and it, and a teardown
+                // raised by the other pump would otherwise wait for that write
+                // to finish before the socket could be closed at all —
+                // RFC 9114 §4.4's "if a proxy detects an error with the stream
+                // or the QUIC connection, it MUST close the TCP connection"
+                // delayed for as long as a target chooses to stall.
+                //
+                // Abandoning `write_all` part-way is acceptable here and only
+                // here. Every path that raises a teardown ends with the target
+                // socket reset or dropped, so the target never sees a truncated
+                // chunk followed by more of the tunnel: it sees the end of the
+                // connection. Resource bounds are unchanged — `data` is dropped
+                // with this arm either way.
+                let written = tokio::select! {
+                    biased;
+                    reason = torn_down(&mut teardown_rx) => break reason,
+                    written = tcp_write.write_all(&data) => written,
+                };
+
+                if let Err(error) = written {
                     // The target is gone (RST, EPIPE): the tunnel is broken.
                     debug!(%error, "write to target failed");
                     reader.stop_receiving(h3api::CONNECT_ERROR);
@@ -346,7 +341,34 @@ async fn client_to_target(
                 return;
             }
         }
-    }
+    };
+
+    // The other direction ended the tunnel abnormally. Whatever ended it is
+    // spelled out on this half too, rather than left to the `Reader` drop to
+    // stop the client with code 0 — which would leave the two halves carrying
+    // different verdicts on the same event.
+    //
+    // A target error is `H3_CONNECT_ERROR`, the code the other pump put on the
+    // response direction (RFC 9114 §4.4). A client abort is
+    // `H3_REQUEST_CANCELLED`: §4.4 asks a proxy to "perform the same operation
+    // on the other direction in order to ensure that both directions of the
+    // stream are cancelled", and §8.1 gives that code for "the request or its
+    // response (including pushed response) is cancelled".
+    //
+    // The ask reaches the wire here and not later: `stop_receiving` is
+    // `quinn::RecvStream::stop`, which queues STOP_SENDING at the point of call.
+    // On the half a client has already closed it is a no-op — quinn answers
+    // `ClosedStream`, which `FrameReader::stop` discards, because a stream that
+    // is already over has nothing left to stop.
+    reader.stop_receiving(match reason {
+        Teardown::TargetError => h3api::CONNECT_ERROR,
+        _ => h3api::REQUEST_CANCELLED,
+    });
+
+    // Forgotten rather than dropped: shutting the write side down on the way out
+    // would put a FIN on the wire, which is the wrong signal for every path that
+    // gets here — and would overtake the reset when the other pump armed one.
+    tcp_write.forget();
 }
 
 /// Pumps target → client.
