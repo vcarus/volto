@@ -23,7 +23,7 @@
 //! max_streams_bidi     = 1024
 //! max_idle_timeout     = 60    # seconds
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
-//! initial_mtu          = 1200  # bytes, at least 1200
+//! initial_mtu          = 1200  # bytes, 1200..1500
 //! mtu_discovery        = true
 //! congestion_control   = "bbr" # bbr | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
@@ -155,6 +155,20 @@ pub const DEFAULT_INITIAL_MTU: u16 = 1200;
 
 /// The smallest `initial_mtu` QUIC permits (RFC 9000 §14).
 pub const MIN_INITIAL_MTU: u16 = 1200;
+
+/// The largest `initial_mtu` this server accepts, in bytes.
+///
+/// An Ethernet frame's payload, and the point past which no internet path
+/// carries a packet at all. There is no floor to fall back to if this is wrong:
+/// quinn applies the value with a `max()` against the 1200-byte minimum and no
+/// `min()` above it, so the handshake flight goes out in packets the path drops
+/// and the server is simply unreachable. Its black-hole detector is no help
+/// either -- that runs inside an established connection, and with this wrong
+/// there is never one. A reload applies the value to connections accepted from
+/// then on, which is what makes the mistake worth rejecting rather than
+/// tolerating: a `SIGHUP` with a typo here turns a running server into one that
+/// still answers `systemctl status` and nothing else (audit 2026-08-23).
+pub const MAX_INITIAL_MTU: u16 = 1500;
 
 /// Default round-trip time assumed before the first measurement, in milliseconds.
 ///
@@ -384,7 +398,7 @@ pub struct Limits {
     /// Must be below half of [`Limits::max_idle_timeout`]; see
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL`] for why.
     pub keep_alive_interval: u64,
-    /// Size of the first QUIC packets, in bytes. At least 1200.
+    /// Size of the first QUIC packets, in bytes. Between 1200 and 1500.
     pub initial_mtu: u16,
     /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
     ///
@@ -677,6 +691,15 @@ impl Config {
                 "limits.initial_mtu = {} is below the {MIN_INITIAL_MTU} bytes QUIC \
                  requires (RFC 9000 §14); a smaller value cannot carry a QUIC \
                  handshake packet",
+                self.limits.initial_mtu
+            );
+        }
+
+        if self.limits.initial_mtu > MAX_INITIAL_MTU {
+            bail!(
+                "limits.initial_mtu = {} is above the {MAX_INITIAL_MTU} bytes this \
+                 server allows; no path carries more than an Ethernet frame, and a \
+                 handshake sent in packets the path drops has nothing to fall back to",
                 self.limits.initial_mtu
             );
         }
@@ -1271,10 +1294,33 @@ mod tests {
             assert!(msg.contains("1200"), "the floor must be named: {msg}");
         }
 
-        // The floor itself and above it are accepted.
-        for value in [1200, 1500, 9000] {
+        // The floor itself, and the range above it up to the ceiling.
+        for value in [1200, 1350, 1500] {
             let cfg = parse(&format!("[limits]\ninitial_mtu = {value}"));
             assert_valid_apart_from_certs(&cfg, &format!("initial_mtu = {value}"));
+        }
+    }
+
+    /// The other end of the same range, and the dangerous one.
+    ///
+    /// Below the floor quinn silently clamps up, so the worst a missing check
+    /// costs is a value that is not the one configured. Above the ceiling there
+    /// is no clamp at all: the handshake goes out in packets no path delivers,
+    /// the black-hole detector never runs because no connection is ever
+    /// established, and a reload makes that the state of a server that was
+    /// working a moment ago.
+    #[test]
+    fn an_initial_mtu_above_the_ethernet_ceiling_is_rejected() {
+        for value in [1501, 9000, u16::MAX] {
+            let err = parse(&format!("[limits]\ninitial_mtu = {value}"))
+                .validate()
+                .expect_err("must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("initial_mtu"), "{msg}");
+            assert!(
+                msg.contains(&MAX_INITIAL_MTU.to_string()),
+                "the ceiling must be named: {msg}"
+            );
         }
     }
 
