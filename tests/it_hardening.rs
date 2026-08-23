@@ -349,6 +349,53 @@ async fn successful_authentication_does_not_consume_the_budget() {
     );
 }
 
+/// A success clears the failures behind it, so they cannot add up over hours.
+///
+/// The cap is meant to price guessing, and a guesser never gets a success in
+/// between. A long-lived client does: a password rotated at one end, an app that
+/// omits the header on some request, and the count creeps to the cap over hours
+/// — at which point the connection goes, every live tunnel with it. Two failures
+/// with a success between them are exactly that shape at `max_auth_failures = 2`.
+#[tokio::test]
+async fn a_success_clears_the_failures_before_it() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    assert_eq!(
+        attempt(&mut client, &target.to_string(), "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "the first failure must be answered"
+    );
+    assert_eq!(
+        attempt(&mut client, &target.to_string(), "s3cret").await,
+        Some(Status::OK),
+        "the credentials in between are the right ones"
+    );
+    assert_eq!(
+        attempt(&mut client, &target.to_string(), "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "this is the first failure since the success, not the second of two"
+    );
+
+    // The connection is still there, and still serving.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), client.quic.closed())
+            .await
+            .is_err(),
+        "two failures with a success between them must not spend the budget"
+    );
+    assert_eq!(
+        attempt(&mut client, &target.to_string(), "s3cret").await,
+        Some(Status::OK),
+        "and the client must still be able to open a tunnel"
+    );
+}
+
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.
 #[tokio::test]
 async fn a_zero_budget_disables_the_cap() {

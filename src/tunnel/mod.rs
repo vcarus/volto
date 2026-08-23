@@ -201,7 +201,7 @@ impl Context {
     /// Records an authentication failure, reporting whether that was one too many.
     ///
     /// Counts across the whole connection, so opening more streams does not reset
-    /// the budget.
+    /// the budget. A request that *succeeds* does — see [`Self::mark_authenticated`].
     pub(crate) fn record_auth_failure(&self) -> bool {
         let failures = self.auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
         self.max_auth_failures > 0 && failures >= self.max_auth_failures
@@ -212,9 +212,19 @@ impl Context {
         self.peer_datagrams.load(Ordering::Relaxed)
     }
 
-    /// Records that a request on this connection got past the credentials check.
+    /// Records that a request on this connection got past the credentials check,
+    /// and clears the failures behind it.
+    ///
+    /// The counter is what makes guessing cost a handshake every
+    /// `max_auth_failures` attempts, and a guesser never arrives here — so the
+    /// reset takes nothing away from that. What it stops is the counter adding
+    /// up over the life of a connection that *is* authenticated: a client whose
+    /// password was rotated, or an app that omits the header on some request,
+    /// spends the budget a failure at a time over hours and then loses every
+    /// live tunnel to a cap meant for an attacker.
     pub(crate) fn mark_authenticated(&self) {
         self.authenticated.store(true, Ordering::Relaxed);
+        self.auth_failures.store(0, Ordering::Relaxed);
     }
 
     /// Whether any request on this connection has (D76).
