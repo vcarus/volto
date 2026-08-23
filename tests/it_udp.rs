@@ -30,14 +30,7 @@ const H3_REQUEST_CANCELLED: u64 = 0x10c;
 /// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
 /// frame carrying this code is exactly what the RFC requires the peer to see.
 async fn close_code(quic: &quinn::Connection) -> u64 {
-    let error = tokio::time::timeout(TIMEOUT, quic.closed())
-        .await
-        .expect("the server must close the connection");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => close.error_code.into_inner(),
-        other => panic!("expected an application close, got {other:?}"),
-    }
+    common::rawstream::application_close(quic, TIMEOUT).await.0
 }
 
 /// Reads datagrams until one arrives for `quarter_stream_id`, returning its

@@ -19,13 +19,16 @@ use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use common::rawstream::{
+    assert_closed_with, authenticated_connect_headers_frame, connect_headers_frame, read_frame,
+    status_of,
+};
 use common::{
     auth_section, authorized_connect, basic_credentials, client_endpoint,
     client_endpoint_with_transport, finish_connect, open_tcp_tunnel, read_at_least,
     send_and_respond, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
-use volto::datagram;
 use volto::h3api::Status;
 
 /// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1), the code the server hangs up with.
@@ -77,23 +80,15 @@ async fn a_peer_that_permits_no_unidirectional_streams_is_hung_up_on() {
         .await
         .expect("the QUIC handshake itself must succeed");
 
-    // Generous against the server's 1s bound, and far short of forever.
-    let error = tokio::time::timeout(Duration::from_secs(5), connection.closed())
-        .await
-        .expect("the server must not hold the connection open indefinitely");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
-            close.error_code.into_inner(),
-            H3_STREAM_CREATION_ERROR,
-            "the peer must be told which half of the handshake it failed; \
-             reason was {:?}",
-            String::from_utf8_lossy(&close.reason)
-        ),
-        // An idle timeout here would mean the keep-alive stopped working and
-        // this test stopped testing what it says it does.
-        other => panic!("expected the server to close the connection, got {other}"),
-    }
+    // Generous against the server's 1s bound, and far short of forever. The
+    // code is the assertion: the peer has to be told which half of the
+    // handshake it failed, rather than merely dropped.
+    assert_closed_with(
+        &connection,
+        H3_STREAM_CREATION_ERROR,
+        Duration::from_secs(5),
+    )
+    .await;
 }
 
 /// The deadline must not touch a client that behaves, however tight it is.
@@ -179,9 +174,9 @@ async fn a_peer_that_only_fails_authentication_gives_its_slot_back() {
     let (_endpoint, connection) = silent_peer(&server).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
-    send.write_all(&connect_headers_frame(
+    send.write_all(&authenticated_connect_headers_frame(
         "192.0.2.1:443",
-        Some(&basic_credentials(USER.0, "the wrong password")),
+        &basic_credentials(USER.0, "the wrong password"),
     ))
     .await
     .expect("send a CONNECT request");
@@ -330,7 +325,7 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
         .open_bi()
         .await
         .expect("the connection must still be usable");
-    send.write_all(&connect_headers_frame("192.0.2.1:25", None))
+    send.write_all(&connect_headers_frame("192.0.2.1:25"))
         .await
         .expect("send a CONNECT request");
 
@@ -441,38 +436,6 @@ fn silent_peer(server: &TestServer) -> impl Future<Output = (quinn::Endpoint, qu
     }
 }
 
-/// Waits for the server to close `connection`, asserting the code it used.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// reports the test rather than this line (D66).
-#[track_caller]
-fn assert_closed_with(
-    connection: &quinn::Connection,
-    expected: u64,
-    within: Duration,
-) -> impl Future<Output = ()> + '_ {
-    let caller = Location::caller();
-    async move {
-        let error = tokio::time::timeout(within, connection.closed())
-            .await
-            .unwrap_or_else(|_| {
-                panic!("the connection opened at {caller} was still open after {within:?}")
-            });
-
-        match error {
-            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
-                close.error_code.into_inner(),
-                expected,
-                "at {caller}: the server closed with the wrong code; reason was {:?}",
-                String::from_utf8_lossy(&close.reason)
-            ),
-            // An idle timeout here would mean the keep-alive stopped working
-            // and the test stopped testing what it says it does.
-            other => panic!("at {caller}: expected the server to close, got {other}"),
-        }
-    }
-}
-
 /// Opens a CONNECT tunnel carrying credentials, and asserts it was accepted.
 #[track_caller]
 fn authenticated_tunnel<'a>(
@@ -490,76 +453,4 @@ fn authenticated_tunnel<'a>(
         );
         stream
     }
-}
-
-/// Encodes a classic CONNECT request (RFC 9114 §4.4) as a HEADERS frame.
-///
-/// Hand-built because these tests drive raw QUIC streams: the point of most of
-/// them is what the server does with a peer the shared client cannot imitate.
-fn connect_headers_frame(authority: &str, credentials: Option<&str>) -> Vec<u8> {
-    let mut fields: Vec<(&[u8], &[u8])> = vec![
-        (b":method", b"CONNECT"),
-        (b":authority", authority.as_bytes()),
-    ];
-    if let Some(credentials) = credentials {
-        fields.push((b"proxy-authorization", credentials.as_bytes()));
-    }
-
-    let mut block = BytesMut::new();
-    volto::h3::qpack::encode(&mut block, fields);
-
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, block.len() as u64);
-    frame.extend_from_slice(&block);
-    frame.to_vec()
-}
-
-/// Reads one HTTP/3 frame from a raw request stream.
-async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
-    let frame_type = read_varint(recv).await;
-    let length = read_varint(recv).await;
-
-    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
-        .await
-        .expect("frame payload arrived")
-        .expect("frame payload");
-
-    (frame_type, payload)
-}
-
-/// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
-async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
-    let mut first = [0u8; 1];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut first))
-        .await
-        .expect("varint arrived")
-        .expect("varint first byte");
-
-    let length = 1usize << (first[0] >> 6);
-    let mut value = u64::from(first[0] & 0x3f);
-
-    if length > 1 {
-        let mut tail = vec![0u8; length - 1];
-        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut tail))
-            .await
-            .expect("varint tail arrived")
-            .expect("varint tail");
-        for byte in tail {
-            value = (value << 8) | u64::from(byte);
-        }
-    }
-
-    value
-}
-
-/// The `:status` of a response field section.
-fn status_of(block: &[u8]) -> String {
-    let fields = volto::h3::qpack::decode(block, 64 * 1024).expect("the response must decode");
-    let status = fields
-        .iter()
-        .find(|field| field.name.as_ref() == b":status")
-        .expect("a response carries :status");
-    String::from_utf8(status.value.to_vec()).expect("a numeric status")
 }

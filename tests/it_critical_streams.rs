@@ -12,6 +12,7 @@
 mod common;
 
 use bytes::BytesMut;
+use common::rawstream::{application_close, frame};
 use common::{connect_quic, TestServer, TIMEOUT};
 use volto::datagram;
 
@@ -36,15 +37,6 @@ const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
 /// QPACK_DECODER_STREAM_ERROR (RFC 9204 §6).
 const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
 
-/// A frame with its type, length and payload, as RFC 9114 §7.1 lays it out.
-fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
-    let mut out = BytesMut::new();
-    datagram::put_varint(&mut out, kind);
-    datagram::put_varint(&mut out, payload.len() as u64);
-    out.extend_from_slice(payload);
-    out.to_vec()
-}
-
 /// A frame whose whole payload is one varint: CANCEL_PUSH or MAX_PUSH_ID.
 fn push_id_frame(kind: u64, push_id: u64) -> Vec<u8> {
     let mut payload = BytesMut::new();
@@ -68,25 +60,15 @@ async fn expect_close(name: &str, stream_type: u64, bytes: &[u8], code: u64, nam
     wire.extend_from_slice(bytes);
     stream.write_all(&wire).await.expect("send the stream");
 
-    let error = tokio::time::timeout(TIMEOUT, connection.closed())
-        .await
-        .unwrap_or_else(|_| panic!("{name} must end the connection"));
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => {
-            let reason = String::from_utf8_lossy(&close.reason);
-            assert_eq!(
-                close.error_code.into_inner(),
-                code,
-                "{name}: wrong close code; reason was {reason:?}"
-            );
-            assert!(
-                reason.contains(names),
-                "{name}: the reason {reason:?} does not name the offending instruction"
-            );
-        }
-        other => panic!("{name}: expected an application close, got {other}"),
-    }
+    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+    assert_eq!(
+        closed_with, code,
+        "{name}: wrong close code; reason was {reason:?}"
+    );
+    assert!(
+        reason.contains(names),
+        "{name}: the reason {reason:?} does not name the offending instruction"
+    );
 }
 
 /// RFC 9114 §7.2.3: a CANCEL_PUSH for a push ID never mentioned by a

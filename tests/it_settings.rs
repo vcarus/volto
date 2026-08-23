@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
+use common::rawstream::{
+    self, connect_headers_frame, connect_udp_headers_frame, read_frame, status_of, stopped_code,
+};
 use common::{
     client_endpoint_with_transport, connect_quic, finish_connect, spawn_udp_echo_target,
     TestServer, TIMEOUT,
@@ -169,54 +172,6 @@ async fn an_oversized_header_section_is_refused() {
     assert_eq!(status_of(&payload), "403");
 }
 
-/// Encodes a classic CONNECT request (RFC 9114 §4.4) as a HEADERS frame.
-fn connect_headers_frame(authority: &str) -> Vec<u8> {
-    let fields: [(&[u8], &[u8]); 2] = [
-        (b":method", b"CONNECT"),
-        (b":authority", authority.as_bytes()),
-    ];
-
-    let mut block = BytesMut::new();
-    volto::h3::qpack::encode(&mut block, fields);
-
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, block.len() as u64);
-    frame.extend_from_slice(&block);
-    frame.to_vec()
-}
-
-/// The `:status` of a response field section.
-fn status_of(block: &[u8]) -> String {
-    let fields = volto::h3::qpack::decode(block, EXPECTED_MAX_FIELD_SECTION_SIZE)
-        .expect("the server's field section must decode");
-    let status = fields
-        .iter()
-        .find(|field| field.name.as_ref() == b":status")
-        .expect("a response carries :status");
-    String::from_utf8(status.value.to_vec()).expect("a numeric status")
-}
-
-/// Writes until the peer stops the stream, and reports the code it used.
-///
-/// Retried rather than written once: STOP_SENDING travels while the response is
-/// being read here, so a single write can still succeed before it lands.
-async fn stopped_code(send: &mut quinn::SendStream) -> u64 {
-    let stopped = async {
-        loop {
-            match send.write_all(&[0u8; 256]).await {
-                Ok(()) => continue,
-                Err(quinn::WriteError::Stopped(code)) => return code.into_inner(),
-                Err(other) => panic!("expected STOP_SENDING, got {other}"),
-            }
-        }
-    };
-
-    tokio::time::timeout(TIMEOUT, stopped)
-        .await
-        .expect("the server must stop the stream it refused to read")
-}
-
 #[tokio::test]
 async fn server_negotiates_the_h3_alpn() {
     let server = TestServer::start().await;
@@ -267,11 +222,11 @@ async fn a_frame_before_settings_ends_the_connection() {
     const GREASE: u64 = 0x1f * 4 + 0x21;
 
     for (name, first) in [
-        ("a grease frame", frame_bytes(GREASE, b"skip me")),
+        ("a grease frame", rawstream::frame(GREASE, b"skip me")),
         // Empty on purpose: the decoder's "no bytes yet" state and an empty
         // frame are the same `remaining == 0`, and telling them apart is what
         // makes this case reportable at all.
-        ("an empty DATA frame", frame_bytes(FRAME_DATA, b"")),
+        ("an empty DATA frame", rawstream::frame(FRAME_DATA, b"")),
     ] {
         let server = TestServer::start().await;
         let (_endpoint, connection) = connect_quic(&server).await;
@@ -293,29 +248,12 @@ async fn a_frame_before_settings_ends_the_connection() {
             .await
             .expect("send the control stream");
 
-        let error = tokio::time::timeout(TIMEOUT, connection.closed())
-            .await
-            .unwrap_or_else(|_| panic!("{name} before SETTINGS must end the connection"));
-
-        match error {
-            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
-                close.error_code.into_inner(),
-                H3_MISSING_SETTINGS,
-                "{name} before SETTINGS must be H3_MISSING_SETTINGS; reason was {:?}",
-                String::from_utf8_lossy(&close.reason)
-            ),
-            other => panic!("{name}: expected an application close, got {other}"),
-        }
+        let (code, reason) = rawstream::application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            code, H3_MISSING_SETTINGS,
+            "{name} before SETTINGS must be H3_MISSING_SETTINGS; reason was {reason:?}"
+        );
     }
-}
-
-/// Encodes one HTTP/3 frame: type, length, payload (RFC 9114 §7).
-fn frame_bytes(kind: u64, payload: &[u8]) -> Vec<u8> {
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, kind);
-    datagram::put_varint(&mut frame, payload.len() as u64);
-    frame.extend_from_slice(payload);
-    frame.to_vec()
 }
 
 /// Finds the control stream and returns the settings it carries.
@@ -368,11 +306,14 @@ fn parse_settings(payload: &[u8]) -> HashMap<u64, u64> {
     settings
 }
 
-/// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
+/// Reads one QUIC variable-length integer from the control stream (RFC 9000 §16).
 ///
 /// Only the length is worked out here -- the first byte's two most significant
-/// bits give it -- and `decode_varint` does the rest, so this file holds exactly
-/// one varint decoder and it is the independent one.
+/// bits give it -- and `decode_varint` does the rest, so the SETTINGS this file
+/// asserts on reach [`parse_settings`] through exactly one varint decoder and it
+/// is the independent one. Kept for that path alone: response frames are read
+/// with the shared `rawstream::read_frame`, which is scaffolding rather than the
+/// thing being checked.
 async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
     let mut buf = [0u8; 8];
     tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[..1]))
@@ -529,31 +470,6 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
     }
 }
 
-/// Encodes a CONNECT-UDP request (RFC 9298 §3) as an HTTP/3 HEADERS frame.
-///
-/// Hand-built because the point of the test above is an ordering the shared test
-/// client cannot produce. Only the QPACK static table and literals are used, so
-/// no encoder stream is needed.
-fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<u8> {
-    let path = format!("/.well-known/masque/udp/{host}/{port}/");
-    let fields: [(&[u8], &[u8]); 5] = [
-        (b":method", b"CONNECT"),
-        (b":protocol", b"connect-udp"),
-        (b":scheme", b"https"),
-        (b":authority", authority.as_bytes()),
-        (b":path", path.as_bytes()),
-    ];
-
-    let mut block = BytesMut::new();
-    volto::h3::qpack::encode(&mut block, fields);
-
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, block.len() as u64);
-    frame.extend_from_slice(&block);
-    frame.to_vec()
-}
-
 /// The bytes of a client control stream whose SETTINGS enable HTTP Datagrams.
 fn control_stream_with_datagrams_enabled() -> Vec<u8> {
     let mut stream = BytesMut::new();
@@ -567,21 +483,7 @@ fn settings_frame() -> Vec<u8> {
     let mut settings = BytesMut::new();
     datagram::put_varint(&mut settings, SETTINGS_H3_DATAGRAM);
     datagram::put_varint(&mut settings, 1);
-    frame_bytes(FRAME_SETTINGS, &settings)
-}
-
-/// Reads one HTTP/3 frame from a raw request stream.
-async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
-    let frame_type = read_varint(recv).await;
-    let length = read_varint(recv).await;
-
-    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
-        .await
-        .expect("frame payload arrived")
-        .expect("frame payload");
-
-    (frame_type, payload)
+    rawstream::frame(FRAME_SETTINGS, &settings)
 }
 
 /// A peer that says `SETTINGS_H3_DATAGRAM = 1` but never told QUIC how large a
@@ -639,7 +541,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     assert_eq!(frame_type, FRAME_HEADERS, "the session must be established");
 
     for round in 0..5 {
-        send.write_all(&frame_bytes(
+        send.write_all(&rawstream::frame(
             FRAME_DATA,
             &volto::capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, b"no frame size"),
         ))

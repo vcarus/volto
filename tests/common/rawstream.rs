@@ -1,0 +1,242 @@
+//! Scaffolding for the tests that drive raw QUIC streams.
+//!
+//! A test lands here when its subject is something the shared HTTP/3 client
+//! cannot produce: a request on a stream that client would refuse to open, a
+//! field section larger than it will build, a control stream that breaks a rule
+//! it keeps. Those tests write frames by hand and read the server's answer off
+//! `quinn` directly, and everything in this module is that plumbing -- building
+//! a frame, reading one back, waiting for the connection to end.
+//!
+//! What is *not* here is any assertion about what the server chose. The three
+//! this module does make are the ones that were written identically at every
+//! call site: a response carries `:status` ([`status_of`]), a stream the server
+//! refuses to read is stopped ([`stopped_code`]), and a connection the server
+//! ends is ended with a code the caller names ([`assert_closed_with`]).
+//!
+//! D66 shape: helpers that assert are synchronous functions returning a future,
+//! so `#[track_caller]` survives to the poll that panics.
+
+#![allow(dead_code)] // Each integration test binary uses a subset of this.
+
+use std::future::Future;
+use std::panic::Location;
+use std::time::Duration;
+
+use bytes::BytesMut;
+use volto::datagram;
+
+use super::TIMEOUT;
+
+/// HEADERS frame type (RFC 9114 §7.2.2).
+///
+/// Spelled out rather than taken from `volto::h3::frame`: these bytes are what
+/// the server is asked to parse, and a test that built them from the server's
+/// own constant would agree with it whatever it held.
+const HEADERS: u64 = 0x01;
+
+/// A frame with its type, length and payload, as RFC 9114 §7.1 lays it out.
+pub fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = BytesMut::new();
+    datagram::put_varint(&mut out, kind);
+    datagram::put_varint(&mut out, payload.len() as u64);
+    out.extend_from_slice(payload);
+    out.to_vec()
+}
+
+/// Encodes `fields` as a QPACK field section and wraps it in a HEADERS frame.
+///
+/// Only the static table and literals are used -- that is all
+/// `volto::h3::qpack::encode` emits -- so no encoder stream is needed for the
+/// server to read one of these.
+pub fn headers_frame<'a, I>(fields: I) -> Vec<u8>
+where
+    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    let mut block = BytesMut::new();
+    volto::h3::qpack::encode(&mut block, fields);
+    frame(HEADERS, &block)
+}
+
+/// A classic CONNECT request (RFC 9114 §4.4) as a HEADERS frame.
+///
+/// `:method` and `:authority`, and neither `:scheme` nor `:path`.
+pub fn connect_headers_frame(authority: &str) -> Vec<u8> {
+    headers_frame([
+        (b":method".as_slice(), b"CONNECT".as_slice()),
+        (b":authority", authority.as_bytes()),
+    ])
+}
+
+/// [`connect_headers_frame`] carrying HTTP Basic credentials.
+pub fn authenticated_connect_headers_frame(authority: &str, credentials: &str) -> Vec<u8> {
+    headers_frame([
+        (b":method".as_slice(), b"CONNECT".as_slice()),
+        (b":authority", authority.as_bytes()),
+        (b"proxy-authorization", credentials.as_bytes()),
+    ])
+}
+
+/// A CONNECT-UDP request (RFC 9298 §3) as a HEADERS frame.
+///
+/// `host` is placed in the RFC 9298 §2 template as given, so a caller that
+/// wants an escaped one escapes it.
+pub fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<u8> {
+    let path = format!("/.well-known/masque/udp/{host}/{port}/");
+    headers_frame([
+        (b":method".as_slice(), b"CONNECT".as_slice()),
+        (b":protocol", b"connect-udp"),
+        (b":scheme", b"https"),
+        (b":authority", authority.as_bytes()),
+        (b":path", path.as_bytes()),
+    ])
+}
+
+/// Reads one HTTP/3 frame from a raw stream: type, length, payload.
+pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
+    let frame_type = read_varint(recv).await;
+    let length = read_varint(recv).await;
+
+    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
+        .await
+        .expect("frame payload arrived")
+        .expect("frame payload");
+
+    (frame_type, payload)
+}
+
+/// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
+///
+/// One byte at a time to start with, because a stream carries no framing that
+/// would say how many are coming: the first byte's two most significant bits
+/// give the length, and the rest follow.
+pub async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
+    let mut buf = [0u8; 8];
+    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[..1]))
+        .await
+        .expect("varint arrived")
+        .expect("varint first byte");
+
+    let length = 1usize << (buf[0] >> 6);
+    if length > 1 {
+        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[1..length]))
+            .await
+            .expect("varint tail arrived")
+            .expect("varint tail");
+    }
+
+    let mut value = u64::from(buf[0] & 0x3f);
+    for byte in &buf[1..length] {
+        value = (value << 8) | u64::from(*byte);
+    }
+    value
+}
+
+/// The `:status` of a response field section.
+///
+/// Decoded against the limit the server itself advertises, which is the only
+/// section size a well-behaved peer may be asked to hold.
+pub fn status_of(block: &[u8]) -> String {
+    let fields = volto::h3::qpack::decode(block, volto::h3::MAX_FIELD_SECTION_SIZE)
+        .expect("the server's field section must decode");
+    let status = fields
+        .iter()
+        .find(|field| field.name.as_ref() == b":status")
+        .expect("a response carries :status");
+    String::from_utf8(status.value.to_vec()).expect("a numeric status")
+}
+
+/// Writes until the peer stops the stream, and reports the code it used.
+///
+/// Retried rather than written once: STOP_SENDING travels while the response is
+/// being read here, so a single write can still succeed before it lands.
+pub async fn stopped_code(send: &mut quinn::SendStream) -> u64 {
+    let stopped = async {
+        loop {
+            match send.write_all(&[0u8; 256]).await {
+                Ok(()) => continue,
+                Err(quinn::WriteError::Stopped(code)) => return code.into_inner(),
+                Err(other) => panic!("expected STOP_SENDING, got {other}"),
+            }
+        }
+    };
+
+    tokio::time::timeout(TIMEOUT, stopped)
+        .await
+        .expect("the server must stop the stream it refused to read")
+}
+
+/// Waits for the peer to close `connection`, returning the code and reason of
+/// the CONNECTION_CLOSE it sent.
+///
+/// Asserted on the wire rather than through server state: that frame is exactly
+/// what the RFC requires the peer to see. A connection that ends any other way
+/// -- an idle timeout, a transport error -- fails here rather than being
+/// reported as a code, since every test reaching for this is about a close the
+/// server decided to send.
+#[track_caller]
+pub fn application_close(
+    connection: &quinn::Connection,
+    within: Duration,
+) -> impl Future<Output = (u64, String)> + '_ {
+    closed(connection, within, Location::caller())
+}
+
+/// [`application_close`], asserting the code and handing back the reason phrase.
+#[track_caller]
+pub fn close_reason(
+    connection: &quinn::Connection,
+    expected: u64,
+    within: Duration,
+) -> impl Future<Output = String> + '_ {
+    closed_with(connection, expected, within, Location::caller())
+}
+
+/// Waits for the server to close `connection`, asserting the code it used.
+#[track_caller]
+pub fn assert_closed_with(
+    connection: &quinn::Connection,
+    expected: u64,
+    within: Duration,
+) -> impl Future<Output = ()> + '_ {
+    let close = closed_with(connection, expected, within, Location::caller());
+    async move {
+        close.await;
+    }
+}
+
+/// The body behind the two asserting helpers, with `caller` already captured.
+async fn closed_with(
+    connection: &quinn::Connection,
+    expected: u64,
+    within: Duration,
+    caller: &'static Location<'static>,
+) -> String {
+    let (code, reason) = closed(connection, within, caller).await;
+    assert_eq!(
+        code, expected,
+        "at {caller}: the server closed with the wrong code; reason was {reason:?}"
+    );
+    reason
+}
+
+/// The wait itself, with `caller` already captured.
+async fn closed(
+    connection: &quinn::Connection,
+    within: Duration,
+    caller: &'static Location<'static>,
+) -> (u64, String) {
+    let error = tokio::time::timeout(within, connection.closed())
+        .await
+        .unwrap_or_else(|_| panic!("the connection at {caller} was still open after {within:?}"));
+
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => (
+            close.error_code.into_inner(),
+            String::from_utf8_lossy(&close.reason).into_owned(),
+        ),
+        // An idle timeout here would mean the keep-alive stopped working and
+        // the test stopped testing what it says it does.
+        other => panic!("at {caller}: expected the server to close, got {other}"),
+    }
+}

@@ -11,6 +11,7 @@
 
 pub mod h3client;
 pub mod huffman;
+pub mod rawstream;
 
 pub use h3client::{ClientStream, H3Client, Response, CONNECT_UDP};
 

@@ -8,12 +8,12 @@ mod common;
 
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use common::rawstream::connect_headers_frame;
 use common::{
     connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
     spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
 };
-use volto::h3::{frame, qpack};
 
 /// H3_REQUEST_REJECTED, RFC 9114 §8.1: "A server rejected a request without
 /// performing any application processing."
@@ -178,27 +178,6 @@ async fn a_request_stream_past_the_goaway_identifier_is_rejected() {
     held.finish().expect("finish");
     common::read_to_end(&mut held).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
-}
-
-/// One CONNECT request as an HTTP/3 HEADERS frame.
-///
-/// Hand-built because the test above needs a request on a stream the client's
-/// own `send_request` would refuse to open.
-fn connect_headers_frame(authority: &str) -> Vec<u8> {
-    // RFC 9114 §4.4: a classic CONNECT carries :method and :authority, and
-    // neither :scheme nor :path.
-    let fields: [(&[u8], &[u8]); 2] = [
-        (b":method", b"CONNECT"),
-        (b":authority", authority.as_bytes()),
-    ];
-
-    let mut block = BytesMut::new();
-    qpack::encode(&mut block, fields);
-
-    let mut request = BytesMut::new();
-    frame::put_header(&mut request, frame::HEADERS, block.len() as u64);
-    request.extend_from_slice(&block);
-    request.to_vec()
 }
 
 /// After the GOAWAY, the client stops opening requests of its own accord.

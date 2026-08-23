@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::rawstream::assert_closed_with;
 use common::{
     assert_peer_reset, closed_address, connect_request, open_tcp_tunnel, read_at_least,
     read_to_end, respond_to, send_and_respond, spawn_drain_then_reply_target, spawn_echo_target,
@@ -618,19 +619,7 @@ async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
         .await
         .expect("send a trailer section");
 
-    let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a trailer section must end the connection");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => {
-            let reason = String::from_utf8_lossy(&close.reason);
-            assert_eq!(
-                close.error_code.into_inner(),
-                H3_FRAME_UNEXPECTED,
-                "the peer must be told which rule it broke; reason was {reason:?}"
-            );
-        }
-        other => panic!("expected an application close, got {other}"),
-    }
+    // A trailer section must end the connection, with the code that tells the
+    // peer which rule it broke.
+    assert_closed_with(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
 }

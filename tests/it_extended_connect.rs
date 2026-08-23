@@ -10,6 +10,7 @@
 mod common;
 
 use bytes::{Bytes, BytesMut};
+use common::rawstream::close_reason;
 use common::{
     auth_section, authorize, basic_credentials, connect_request, read_at_least, respond_to,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
@@ -90,25 +91,13 @@ async fn a_dynamic_table_reference_closes_the_connection() {
         .await
         .expect("send the HEADERS frame");
 
-    let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a dynamic table reference must end the connection");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => {
-            let reason = String::from_utf8_lossy(&close.reason).into_owned();
-            assert_eq!(
-                close.error_code.into_inner(),
-                QPACK_DECOMPRESSION_FAILED,
-                "expected QPACK_DECOMPRESSION_FAILED (0x200); reason was {reason:?}"
-            );
-            assert!(
-                reason.contains("Required Insert Count"),
-                "the close reason should say what was wrong, got {reason:?}"
-            );
-        }
-        other => panic!("expected an application close, got {other}"),
-    }
+    // A dynamic table reference must end the connection, and the code has to say
+    // why: this server advertises no dynamic table at all.
+    let reason = close_reason(&client.quic, QPACK_DECOMPRESSION_FAILED, TIMEOUT).await;
+    assert!(
+        reason.contains("Required Insert Count"),
+        "the close reason should say what was wrong, got {reason:?}"
+    );
 }
 
 /// An extended CONNECT for `connect-ip`, authenticated.

@@ -10,6 +10,7 @@ mod common;
 use std::time::Duration;
 
 use bytes::BytesMut;
+use common::rawstream::{assert_closed_with, read_frame, status_of, stopped_code};
 use common::{
     auth_section, authorized_connect, connect_quic, connect_request, open_tcp_tunnel,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
@@ -178,20 +179,14 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     }
 
     let started = std::time::Instant::now();
-    let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
-        .await
-        .expect("a peer that will not read its answers must still run out of guesses");
-
-    match error {
-        quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
-            close.error_code.into_inner(),
-            volto::h3api::AUTH_FAILURE_LIMIT_CODE.into_inner(),
-            "the budget must be what closed this connection, not the D76 bound; \
-             reason was {:?}",
-            String::from_utf8_lossy(&close.reason)
-        ),
-        other => panic!("expected an application close, got {other}"),
-    }
+    // The code is the assertion: what ends this connection has to be the failure
+    // budget rather than the D76 bound, and the two close with different codes.
+    assert_closed_with(
+        &client.quic,
+        volto::h3api::AUTH_FAILURE_LIMIT_CODE.into_inner(),
+        TIMEOUT,
+    )
+    .await;
 
     // The close is decided before the 407 is written, so it does not wait on
     // the bounded write: the last guess ends the connection at once, not one
@@ -611,11 +606,7 @@ async fn a_request_past_the_buffering_budget_costs_only_that_request() {
     let (_endpoint, connection) = connect_quic(&server).await;
 
     let block = full_sized_connect_section(&target.to_string());
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, block.len() as u64);
-    frame.extend_from_slice(&block);
-    let frame = frame.to_vec();
+    let frame = common::rawstream::frame(FRAME_HEADERS, &block);
 
     let budget = volto::h3::HEADERS_BUFFER_BUDGET;
     let section = block.len();
@@ -712,33 +703,6 @@ async fn a_request_past_the_buffering_budget_costs_only_that_request() {
     );
 }
 
-/// Reads one HTTP/3 frame from a raw request stream.
-async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
-    let mut header = Vec::new();
-    let (frame_type, length) = loop {
-        let mut byte = [0u8; 1];
-        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut byte))
-            .await
-            .expect("a frame header arrived")
-            .expect("a frame header");
-        header.push(byte[0]);
-
-        if let Some((frame_type, used)) = datagram::peek_varint(&header) {
-            if let Some((length, _)) = datagram::peek_varint(&header[used..]) {
-                break (frame_type, length);
-            }
-        }
-    };
-
-    let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
-        .await
-        .expect("the frame payload arrived")
-        .expect("the frame payload");
-
-    (frame_type, payload)
-}
-
 /// The `:status` of a response read whole from a raw request stream.
 fn status_of_response(response: &[u8]) -> String {
     let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
@@ -752,35 +716,4 @@ fn status_of_response(response: &[u8]) -> String {
         "the response is the whole of what the stream carried"
     );
     status_of(payload)
-}
-
-/// The `:status` of a response field section.
-fn status_of(block: &[u8]) -> String {
-    let fields = volto::h3::qpack::decode(block, volto::h3::MAX_FIELD_SECTION_SIZE)
-        .expect("the server's field section must decode");
-    let status = fields
-        .iter()
-        .find(|field| field.name.as_ref() == b":status")
-        .expect("a response carries :status");
-    String::from_utf8(status.value.to_vec()).expect("a numeric status")
-}
-
-/// Writes until the peer stops the stream, and reports the code it used.
-///
-/// Retried rather than written once: STOP_SENDING travels while the response is
-/// being read here, so a single write can still succeed before it lands.
-async fn stopped_code(send: &mut quinn::SendStream) -> u64 {
-    let stopped = async {
-        loop {
-            match send.write_all(&[0u8; 256]).await {
-                Ok(()) => continue,
-                Err(quinn::WriteError::Stopped(code)) => return code.into_inner(),
-                Err(other) => panic!("expected STOP_SENDING, got {other}"),
-            }
-        }
-    };
-
-    tokio::time::timeout(TIMEOUT, stopped)
-        .await
-        .expect("the server must stop the stream it refused to read")
 }
