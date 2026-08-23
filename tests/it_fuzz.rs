@@ -606,6 +606,9 @@ struct FrameSpec {
     payload: Vec<u8>,
 }
 
+/// Encodes them with the crate's own `frame::put_header`, unlike the raw-stream
+/// helpers, which hand-write their varints: this is a round trip through the
+/// codec under test and the encoder is deliberately half of it.
 fn frame_bytes(specs: &[FrameSpec]) -> Vec<u8> {
     let mut out = BytesMut::new();
     for spec in specs {
