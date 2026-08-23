@@ -263,6 +263,13 @@ impl Session {
     /// Pumps the session until it closes, one direction at a time.
     async fn run(&mut self, stream_id: u64) {
         // A UDP datagram can be at most this big, so one buffer serves forever.
+        // It cannot be smaller: `UdpSocket::recv` truncates a longer packet
+        // silently rather than reporting it, and the capsule fallback forwards
+        // packets up to this size. The ~64 KiB is held for the life of the
+        // session, and is one of the two per-session terms in the memory
+        // product `docs/configuration.md` gives for `max_connections` x
+        // `max_targets_per_conn`; the other is the inbound datagram queue,
+        // `INBOUND_QUEUE_DEPTH` in `crate::h3::connection`.
         let mut packet = vec![0u8; MAX_UDP_PAYLOAD];
 
         loop {

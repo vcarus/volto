@@ -66,6 +66,20 @@ for the defaults, which the shipped unit's `LimitNOFILE=131072` has room for.
 Raise either limit past that point and `LimitNOFILE` has to go up with it, or
 the startup warning fires.
 
+**A CONNECT-UDP session costs memory as well as a descriptor**, and only the
+descriptors are checked at startup. Each session holds two buffers for its whole
+life: a 64 KiB receive buffer for the packets it reads off its target socket —
+it cannot be smaller, because a `recv` into a short buffer truncates the packet
+silently — and an inbound datagram queue of 64 entries, each at most the
+1472-byte `max_udp_payload_size` this server advertises, so about 92 KiB. That
+is roughly 156 KiB per session, 39 MiB per connection at
+`max_targets_per_conn = 256`, and about 9.8 GiB across a server saturated at
+both defaults. Lowering either limit lowers it proportionally. Two things keep
+that number a ceiling rather than a resting size: the queue is only full while a
+client sends faster than the proxy forwards, and a TCP tunnel pays none of it —
+its relay buffer starts at 16 KiB, and what it holds beyond that is bounded by
+quinn's per-connection send window.
+
 **`connect_timeout` is spent per request, not per connection.** Without it a
 target that silently drops SYNs holds a tunnel slot and its file descriptor for
 as long as the operating system keeps retrying — around two minutes on Linux —
