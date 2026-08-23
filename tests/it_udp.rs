@@ -50,17 +50,7 @@ async fn recv_payload_for(
     }
 
     loop {
-        let raw = tokio::time::timeout(TIMEOUT, quic.read_datagram())
-            .await
-            .expect("a datagram arrived")
-            .expect("datagram");
-
-        let decoded = datagram::decode(raw).expect("server datagrams must be well formed");
-        assert_eq!(
-            decoded.context_id,
-            datagram::CONTEXT_ID_UDP_PAYLOAD,
-            "a UDP payload must use context 0"
-        );
+        let decoded = common::recv_datagram(quic).await;
 
         if decoded.quarter_stream_id == quarter_stream_id {
             return decoded.payload;

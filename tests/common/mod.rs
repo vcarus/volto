@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -601,6 +602,73 @@ async fn udp_session(
     (quarter_stream_id, stream)
 }
 
+/// Sends one datagram into a CONNECT-UDP session and returns what comes back.
+///
+/// The round trip every UDP test opens with: a payload out on
+/// `quarter_stream_id`, the target's answer back on the same one. That the
+/// answer really is on the same one is asserted here rather than left to each
+/// caller -- a payload delivered under another session's id is the Quarter
+/// Stream ID class of bug this suite exists to catch, and no caller means to
+/// allow it.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66).
+#[track_caller]
+pub fn udp_round_trip<'a>(
+    client: &'a H3Client,
+    quarter_stream_id: u64,
+    payload: &'a [u8],
+) -> impl Future<Output = Bytes> + 'a {
+    let caller = Location::caller();
+    async move {
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(quarter_stream_id, payload))
+            .unwrap_or_else(|error| {
+                panic!("the datagram sent at {caller} was not queued: {error}")
+            });
+
+        let answer = read_datagram(&client.quic, caller).await;
+        assert_eq!(
+            answer.quarter_stream_id, quarter_stream_id,
+            "the answer to the datagram sent at {caller} arrived on another session"
+        );
+        answer.payload
+    }
+}
+
+/// Reads one HTTP/3 datagram off `quic` and decodes it.
+///
+/// The context id is checked here because RFC 9298 §5 gives a UDP payload
+/// exactly one: a datagram under any other context is not a packet from the
+/// target, whatever else it may be. Which session it belongs to is left to the
+/// caller, for the tests that interleave several.
+#[track_caller]
+pub fn recv_datagram(quic: &quinn::Connection) -> impl Future<Output = datagram::Datagram> + '_ {
+    read_datagram(quic, Location::caller())
+}
+
+/// The body behind both, with `caller` already captured.
+async fn read_datagram(
+    quic: &quinn::Connection,
+    caller: &'static Location<'static>,
+) -> datagram::Datagram {
+    let raw = tokio::time::timeout(TIMEOUT, quic.read_datagram())
+        .await
+        .unwrap_or_else(|_| panic!("no datagram reached {caller} within {TIMEOUT:?}"))
+        .unwrap_or_else(|error| {
+            panic!("the connection read at {caller} carries no datagrams: {error}")
+        });
+
+    let decoded = datagram::decode(raw).expect("server datagrams must be well formed");
+    assert_eq!(
+        decoded.context_id,
+        datagram::CONTEXT_ID_UDP_PAYLOAD,
+        "a UDP payload must use context 0; read at {caller}"
+    );
+    decoded
+}
+
 /// A UDP target on an ephemeral loopback port that answers with `reply`.
 ///
 /// `reply` is handed each packet as it arrives and decides what goes back:
@@ -963,6 +1031,21 @@ pub async fn closed_address() -> SocketAddr {
 pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
 impl SharedBuffer {
+    /// Installs a process-wide subscriber at `filter`, writing into a new buffer.
+    ///
+    /// Once per test binary, because `init` panics on the second call in a
+    /// process -- which is why every binary that reads log lines runs all its
+    /// scenarios inside one `#[tokio::test]`.
+    pub fn install(filter: &str) -> Self {
+        let buffer = Self::default();
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .init();
+        buffer
+    }
+
     /// Everything logged so far.
     pub fn contents(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()

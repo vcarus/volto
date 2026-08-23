@@ -21,12 +21,7 @@ use common::{closed_address, connect_request, respond_to, H3Client, SharedBuffer
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {
-    let buffer = SharedBuffer::default();
-    tracing_subscriber::fmt()
-        .with_env_filter("volto=debug")
-        .with_writer(buffer.clone())
-        .with_ansi(false)
-        .init();
+    let buffer = SharedBuffer::install("volto=debug");
 
     let server = TestServer::start().await;
     // Nothing needs to be listening: the request is logged before we dial out.

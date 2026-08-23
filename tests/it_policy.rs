@@ -14,7 +14,7 @@ use common::{
     assert_peer_reset, auth_section, authorize, authorized_connect, basic_credentials,
     connect_request, connect_udp_request, open_tcp_tunnel, open_udp_session, read_at_least,
     respond_to, send_and_respond, spawn_echo_target, spawn_silent_udp_target,
-    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Request, Status};
@@ -644,30 +644,16 @@ async fn the_cap_is_lifted_once_the_target_answers() {
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     // The one packet the budget allows, and its echo: that reply lifts the cap.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"first"))
-        .expect("send datagram");
-    let echoed = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-        .await
-        .expect("the first packet is answered")
-        .expect("datagram");
-    let decoded = datagram::decode(echoed).expect("well formed");
-    assert_eq!(&decoded.payload[..], b"first");
+    let echoed = udp_round_trip(&client, qsid, b"first").await;
+    assert_eq!(&echoed[..], b"first", "the first packet is answered");
 
     // Everything after it flows normally.
     for i in 0..5u8 {
         let payload = [b'x', i];
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, &payload))
-            .expect("send datagram");
-
-        let reply = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-            .await
-            .expect("the cap must be lifted after the first reply")
-            .expect("datagram");
-        let decoded = datagram::decode(reply).expect("well formed");
-        assert_eq!(&decoded.payload[..], &payload);
+        assert_eq!(
+            &udp_round_trip(&client, qsid, &payload).await[..],
+            &payload,
+            "the cap must be lifted after the first reply"
+        );
     }
 }

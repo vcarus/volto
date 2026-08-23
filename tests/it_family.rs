@@ -17,12 +17,11 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use common::{
-    open_tcp_tunnel, open_udp_session_to, read_at_least, H3Client, TestServer, ALLOW_PRIVATE,
-    TIMEOUT,
+    open_tcp_tunnel, open_udp_session_to, read_at_least, udp_round_trip, H3Client, TestServer,
+    ALLOW_PRIVATE,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use volto::datagram;
 
 /// Selects the non-default preference, so the same targets prove both branches.
 const IPV6_FIRST: &str = "[limits]\nip_family_preference = \"ipv6\"\n";
@@ -125,21 +124,9 @@ async fn tag_through_udp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
     let (quarter_stream_id, _stream) =
         open_udp_session_to(&mut client, server, "localhost", port).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(quarter_stream_id, b"which?"))
-        .expect("send datagram");
-
-    loop {
-        let raw = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-            .await
-            .expect("a datagram arrived")
-            .expect("datagram");
-        let decoded = datagram::decode(raw).expect("server datagrams must be well formed");
-        if decoded.quarter_stream_id == quarter_stream_id {
-            return decoded.payload.to_vec();
-        }
-    }
+    udp_round_trip(&client, quarter_stream_id, b"which?")
+        .await
+        .to_vec()
 }
 
 /// Why the environment cannot run these tests.

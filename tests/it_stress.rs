@@ -18,9 +18,8 @@ mod common;
 use bytes::Bytes;
 use common::{
     open_tcp_tunnel, open_udp_session, read_at_least, read_to_end, spawn_echo_target,
-    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE,
 };
-use volto::datagram;
 
 /// Slots to run the churn tests with.
 ///
@@ -110,23 +109,12 @@ async fn udp_churn(cycles: usize) {
         let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
         // A round trip proves the session is really wired up, so the churn is
-        // over live sessions rather than over refusals.
+        // over live sessions rather than over refusals. The helper asserts the
+        // answer came back on this session's quarter stream id, which is what a
+        // datagram still routed to a previous session would fail.
         let payload = format!("session-{i}");
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, payload.as_bytes()))
-            .expect("send datagram");
-
-        let echoed = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-            .await
-            .expect("the session answers")
-            .expect("datagram");
-        let decoded = datagram::decode(echoed).expect("well formed");
-        assert_eq!(
-            decoded.quarter_stream_id, qsid,
-            "a datagram from a previous session must not still be routed"
-        );
-        assert_eq!(String::from_utf8_lossy(&decoded.payload), payload);
+        let echoed = udp_round_trip(&client, qsid, payload.as_bytes()).await;
+        assert_eq!(String::from_utf8_lossy(&echoed), payload);
 
         // Closing the stream ends the session, deregisters it, and frees its slot.
         stream.finish().expect("finish the request stream");

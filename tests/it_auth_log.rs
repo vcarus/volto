@@ -19,12 +19,7 @@ const PASSWORD: &str = "unlikely-plaintext-password";
 
 #[tokio::test]
 async fn a_rejected_password_is_never_logged() {
-    let buffer = SharedBuffer::default();
-    tracing_subscriber::fmt()
-        .with_env_filter("volto=debug")
-        .with_writer(buffer.clone())
-        .with_ansi(false)
-        .init();
+    let buffer = SharedBuffer::install("volto=debug");
 
     let server = TestServer::start_with(&auth_section(&[(USERNAME, PASSWORD)])).await;
     let mut client = H3Client::connect(&server).await;

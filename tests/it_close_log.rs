@@ -44,12 +44,7 @@ fn numeric_field(line: &str, name: &str) -> u64 {
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
 #[tokio::test]
 async fn close_logs_are_graded_by_how_the_connection_ended() {
-    let buffer = SharedBuffer::default();
-    tracing_subscriber::fmt()
-        .with_env_filter("volto=info")
-        .with_writer(buffer.clone())
-        .with_ansi(false)
-        .init();
+    let buffer = SharedBuffer::install("volto=info");
 
     let mut server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
     let echo = spawn_echo_target().await;

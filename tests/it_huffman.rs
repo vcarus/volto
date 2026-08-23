@@ -17,10 +17,9 @@ mod common;
 use bytes::{Bytes, BytesMut};
 use common::{
     auth_section, authorized_connect, huffman, open_tcp_tunnel, open_udp_session, read_at_least,
-    respond_to, spawn_echo_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
-    TIMEOUT,
+    respond_to, spawn_echo_target, spawn_udp_echo_target, udp_round_trip, H3Client, TestServer,
+    ALLOW_PRIVATE, TIMEOUT,
 };
-use volto::datagram;
 use volto::h3::frame;
 use volto::h3api::Status;
 
@@ -129,18 +128,8 @@ async fn a_huffman_coded_connect_udp_opens_a_session() {
 
     let (quarter_stream_id, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(quarter_stream_id, b"hello"))
-        .expect("send a UDP payload");
-
-    let echoed = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-        .await
-        .expect("the target answered")
-        .expect("datagram");
-    let decoded = datagram::decode(echoed).expect("well formed");
-    assert_eq!(decoded.quarter_stream_id, quarter_stream_id);
-    assert_eq!(&decoded.payload[..], b"hello");
+    let echoed = udp_round_trip(&client, quarter_stream_id, b"hello").await;
+    assert_eq!(&echoed[..], b"hello");
 }
 
 /// Credentials survive the round trip byte for byte.

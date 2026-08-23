@@ -12,7 +12,8 @@ use bytes::Bytes;
 use common::rawstream::connect_headers_frame;
 use common::{
     connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
-    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
+    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT,
+    TIMEOUT,
 };
 
 /// H3_REQUEST_REJECTED, RFC 9114 §8.1: "A server rejected a request without
@@ -75,16 +76,12 @@ async fn an_established_udp_session_survives_goaway() {
 
     // Datagrams still flow: they do not go through the request stream at all, so
     // this is a genuinely separate path from the TCP case above.
-    client
-        .quic
-        .send_datagram(volto::datagram::encode_udp_payload(qsid, b"still here"))
-        .expect("send datagram");
-    let echoed = tokio::time::timeout(TIMEOUT, client.quic.read_datagram())
-        .await
-        .expect("the session still works after GOAWAY")
-        .expect("datagram");
-    let decoded = volto::datagram::decode(echoed).expect("well formed");
-    assert_eq!(&decoded.payload[..], b"still here");
+    let echoed = udp_round_trip(&client, qsid, b"still here").await;
+    assert_eq!(
+        &echoed[..],
+        b"still here",
+        "the session still works after GOAWAY"
+    );
 
     // Closing the stream ends the session, which lets the server finish.
     stream.finish().expect("finish the request stream");
