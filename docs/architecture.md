@@ -116,9 +116,13 @@ problem: a spoofed Initial costs an attacker one datagram and no return path, so
 a flood of them would empty the roster and start a TLS server flight per packet.
 At the cap, a newcomer whose address QUIC has not yet validated is therefore
 answered with a Retry (RFC 9000 §8.1) — it takes no slot and no crypto — and
-only the newcomer that comes back with the token may evict anybody. The cost to
-a client with credentials is one extra round trip, paid only while the server is
-full; below the cap no Retry is sent and the handshake is what it always was.
+only the newcomer that comes back with the token may evict anybody. The extra
+round trip is charged to an address the server holds no token from: quinn's
+`bloom` feature is on, so the server sends NEW_TOKEN frames on every connection
+it validates (RFC 9000 §8.1.3) and a client that kept one comes back already
+validated and evicts without a Retry — first contact, a token past its two-week
+lifetime, or a token sealed before the last restart or `SIGHUP` are what pay.
+Below the cap no Retry is sent at all and the handshake is what it always was.
 
 ### Target address selection
 

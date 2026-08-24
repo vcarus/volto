@@ -569,6 +569,61 @@ async fn a_server_with_room_asks_no_newcomer_to_validate_its_address() {
     );
 }
 
+/// A client that has been here before evicts without paying the round trip.
+///
+/// A Retry is not the only way an address gets validated. quinn's `bloom`
+/// feature is on (`Cargo.toml`), so this server sends NEW_TOKEN frames on every
+/// connection whose path it validated — RFC 9000 §8.1 calls that the second way
+/// the token is delivered — and quinn's client keeps them. So the client that
+/// comes back is already validated when its Initial arrives, and the extra round
+/// trip lands only on an address the server holds no token from.
+///
+/// Both connections go through the same relay so the server sees one address:
+/// the token names the IP it was issued for and is refused for any other.
+#[tokio::test]
+async fn a_client_that_has_connected_before_evicts_without_a_retry() {
+    let server = TestServer::start_with(&format!("[limits]\n{ONE_SLOT}")).await;
+
+    let (relay, retries) = retry_counting_relay(server.addr).await;
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
+
+    // First contact, on a server with its slot free: nothing to evict, no Retry,
+    // and the completed handshake is what earns the tokens.
+    let first = finish_connect(&endpoint, relay)
+        .await
+        .expect("the first connection is simply admitted");
+    // The NEW_TOKEN frames are queued the moment the server processes the
+    // client's Handshake packet, which is before the HTTP/3 layer has opened
+    // anything — so the arrival of the server's control stream is proof that the
+    // packet carrying them has been processed too.
+    tokio::time::timeout(TIMEOUT, first.accept_uni())
+        .await
+        .expect("the server's control stream must arrive")
+        .expect("the server's control stream must open");
+    first.close(0u32.into(), b"");
+    drop(first);
+
+    // Refill the one slot with a peer that has never authenticated, so there is
+    // something for the returning client to take.
+    let parked = H3Client::connect(&server).await;
+
+    let second = finish_connect(&endpoint, relay)
+        .await
+        .expect("a client holding a token must be admitted straight away");
+
+    assert!(
+        second.close_reason().is_none(),
+        "the returning client must end up admitted, not refused"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "an address the server has already issued a token to must not be asked to prove \
+         itself again"
+    );
+    assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
+}
+
 // ---------------------------------------------------------------------------
 // 0-RTT is off, and pinned off rather than inherited
 // ---------------------------------------------------------------------------

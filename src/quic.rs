@@ -492,12 +492,27 @@ impl Server {
                         //# before starting the cryptographic handshake.  QUIC
                         //# uses a token in the Initial packet to provide
                         //# address validation prior to completing the
-                        //# handshake.
+                        //# handshake.  This token is delivered to the client
+                        //# during connection establishment with a Retry packet
+                        //# (see Section 8.1.2) or in a previous connection
+                        //# using the NEW_TOKEN frame (see Section 8.1.3).
                         //
-                        // What it costs a client with credentials is one round
-                        // trip, and only while the server is full: below the cap
-                        // this branch is not entered at all, so an ordinary
-                        // Surge handshake is untouched.
+                        // The second of those is why the round trip is rarer
+                        // than it looks. quinn's `bloom` feature is on (see
+                        // `Cargo.toml`), so this server sends two NEW_TOKEN
+                        // frames on every connection whose path it validated,
+                        // and a client that keeps them -- quinn's own default
+                        // token store does -- comes back already validated and
+                        // evicts without a Retry. What pays the extra round trip
+                        // is an address this server holds no token from: a first
+                        // contact, a token past its two-week lifetime, or one
+                        // sealed by a key this process no longer has, since
+                        // `ServerConfig::with_crypto` draws a fresh one every
+                        // time `server_config` builds a config -- at startup and
+                        // again on every `SIGHUP`. And it is paid only while the
+                        // server is full: below the cap this branch is not
+                        // entered at all, so an ordinary Surge handshake is
+                        // untouched.
                         if !incoming.remote_address_validated() {
                             if incoming.may_retry() {
                                 match incoming.retry() {
