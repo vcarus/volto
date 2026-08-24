@@ -83,35 +83,73 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "upgrade",
 ];
 
-/// A run of authentication failures on one connection, and whose they are.
+/// The authentication failures one connection has run up, in buckets.
 ///
-/// The pair is what makes the reset on success honest. `auth.users` is a list,
-/// so a peer can hold one valid credential and guess at another user's password
-/// with it: with the whole counter cleared by any success, it interleaves a good
-/// request between guesses and never reaches `max_auth_failures`. Charging the
-/// run to a user-id and clearing it only for that user-id closes that, and
-/// leaves the case the reset exists for — one client, one credential, an app
+/// Which bucket a failure lands in is what makes clearing them on success
+/// honest. `auth.users` is a list, so a peer can hold one valid credential and
+/// guess at another user's password with it: with one counter cleared by any
+/// success, it interleaves a good request between guesses and never reaches
+/// `max_auth_failures`. One counter *per user-id guessed at* closes that, and
+/// leaves the case the clearing exists for — one client, one credential, an app
 /// that drops the header now and then — exactly as it was.
+///
+/// A single run charged to the first failure that named somebody was the earlier
+/// answer and was not enough: the peer opens each cycle with a deliberate
+/// failure as *itself*, which claims the run, and its success as itself then
+/// clears the whole thing, guesses at everybody else included.
+///
+/// The cap is on the **total** across the buckets, not on any one of them. A
+/// per-bucket cap would hand a guesser `max_auth_failures - 1` free guesses for
+/// every configured user rather than that many for the whole connection.
+///
+/// One connection holds at most `|configured users| + 2` counters, and every key
+/// is a copy of a name from the configuration file, so a peer cannot grow this
+/// by inventing user-ids however many it invents.
 #[derive(Default)]
 pub struct AuthFailures {
-    /// Failures recorded since the last reset.
-    count: u32,
-    /// The user-id the run is charged to.
+    /// One counter per configured user-id a failure has named, created when
+    /// that name is first guessed at.
     ///
-    /// The first failure of the run that *named* a user claims it, and no later
-    /// failure can re-aim it at a name that is easier to clear. Failures that
-    /// name nobody never claim a run: they carried no user-id this server could
-    /// read — no credentials field at all, or one it could not parse — so they
-    /// are the benign case, and a run that only ever holds those stays `None`
-    /// and is cleared by any success. It is only *not* claiming that makes them
-    /// benign: were the first of them to claim the run as `None`, a peer could
-    /// open every cycle with one credential-less request and go on guessing at a
-    /// second user for ever, for the price of one extra request.
+    /// A success as that user clears its counter and nothing else. Keyed by a
+    /// name that compared equal to a configured one, so the key's length comes
+    /// from the configuration file rather than from the peer — a user-id too
+    /// long to log is truncated by [`crate::auth::Denied::username`] (review
+    /// H3) and therefore matches nothing here, which lands its guesses in
+    /// `unconfigured` below.
+    configured: std::collections::HashMap<String, u32>,
+    /// Failures naming a user-id nobody has.
     ///
-    /// Only ever a value [`crate::auth::Denied::username`] produced, so its
-    /// length is already bounded where it is built (review H3) and one
-    /// connection holds at most one of them.
-    charged_to: Option<String>,
+    /// One bucket for all of them, and no success ever clears it: succeeding as
+    /// a user that does not exist is not a thing that can happen, so a success
+    /// says nothing about these at all. This is where a scan lands.
+    unconfigured: u32,
+    /// Failures that named nobody.
+    ///
+    /// They carried no user-id this server could read — no credentials field at
+    /// all, or one it could not parse — so they are the benign case: the app
+    /// that dropped the header, not the peer that guessed. Any success clears
+    /// this one, because any success is a client proving it is that client.
+    ///
+    /// It cannot be used to launder a guess: a guess names somebody and is
+    /// charged to that name's bucket however many credential-less requests are
+    /// sent around it.
+    anonymous: u32,
+}
+
+impl AuthFailures {
+    /// Failures across every bucket, which is what the cap is measured against.
+    ///
+    /// Saturating rather than wrapping: `max_auth_failures = 0` disables the cap
+    /// and nothing then ever clears a bucket, so a connection left open long
+    /// enough could otherwise overflow the sum. Saturated is the honest answer —
+    /// a total that large is over any cap there could be.
+    fn total(&self) -> u32 {
+        self.configured
+            .values()
+            .copied()
+            .chain([self.unconfigured, self.anonymous])
+            .fold(0u32, u32::saturating_add)
+    }
 }
 
 /// Everything a request handler needs from the connection it arrived on.
@@ -137,14 +175,14 @@ pub struct Context {
     pub peer_datagrams: Arc<AtomicBool>,
     /// The credentials every request is checked against.
     pub auth: Arc<Authenticator>,
-    /// Authentication failures seen on this connection so far, and who they are
-    /// charged to.
+    /// Authentication failures seen on this connection so far, bucketed by who
+    /// they were aimed at.
     ///
     /// Connection-scoped on purpose: no shared table across connections means no
     /// eviction policy and no memory that an attacker can grow. The lock is a
-    /// `std::sync::Mutex`, held for two field accesses and never across an
-    /// await; it is here rather than an atomic because the count and the user-id
-    /// it belongs to have to move together.
+    /// `std::sync::Mutex`, held for a bucket lookup and a sum and never across
+    /// an await; it is here rather than an atomic because the buckets and the
+    /// total taken from them have to move together.
     pub auth_failures: Arc<Mutex<AuthFailures>>,
     /// Failures tolerated before the connection is closed. Zero disables it.
     pub max_auth_failures: u32,
@@ -236,30 +274,36 @@ impl Context {
     /// Records an authentication failure, reporting whether that was one too many.
     ///
     /// Counts across the whole connection, so opening more streams does not reset
-    /// the budget. A request that succeeds *as `username`* does — see
+    /// the budget, and the answer is about the *total* of every bucket. A request
+    /// that succeeds *as `username`* clears one of them — see
     /// [`Self::mark_authenticated`] and [`AuthFailures`].
     ///
     /// `username` is the user-id the failing request claimed, or `None` when it
-    /// carried none this server could read. The run is claimed by the first
-    /// failure that names somebody, which is not always the first failure: a
-    /// credential-less request adds to the count and claims nothing, so a named
-    /// guess behind it still charges the run to the name it guessed at.
-    /// Whoever claims it keeps it — a later failure adds to the count and leaves
-    /// the name alone.
+    /// carried none this server could read. Which of the three kinds of bucket
+    /// it lands in is decided here, by asking the connection's own
+    /// [`Authenticator`] whether that name is one the operator configured.
     pub(crate) fn record_auth_failure(&self, username: Option<&str>) -> bool {
         let mut failures = self.auth_failures();
 
-        if failures.charged_to.is_none() {
-            failures.charged_to = username.map(str::to_owned);
+        match username {
+            // A name that exists: its own bucket, which only a success as that
+            // user clears.
+            Some(username) if self.auth.is_configured(username) => {
+                let bucket = failures.configured.entry(username.to_owned()).or_default();
+                *bucket = bucket.saturating_add(1);
+            }
+            // A name nobody has, so nobody can ever succeed as it.
+            Some(_) => failures.unconfigured = failures.unconfigured.saturating_add(1),
+            // Nobody named at all: the benign case, cleared by any success.
+            None => failures.anonymous = failures.anonymous.saturating_add(1),
         }
-        failures.count += 1;
 
-        self.max_auth_failures > 0 && failures.count >= self.max_auth_failures
+        self.max_auth_failures > 0 && failures.total() >= self.max_auth_failures
     }
 
-    /// Poisoning would mean a panic between the two field writes above; both are
-    /// plain values with nothing to observe half-written, and the alternative is
-    /// a panic on a path whose job is to answer 407.
+    /// Poisoning would mean a panic between the bucket writes above; every one
+    /// of them is a plain counter with nothing to observe half-written, and the
+    /// alternative is a panic on a path whose job is to answer 407.
     fn auth_failures(&self) -> MutexGuard<'_, AuthFailures> {
         self.auth_failures
             .lock()
@@ -272,34 +316,33 @@ impl Context {
     }
 
     /// Records that a request on this connection got past the credentials check,
-    /// and clears the failures that were charged to whoever it got past as.
+    /// and clears the failures that success answers for.
     ///
-    /// The counter is what makes guessing cost a handshake every
-    /// `max_auth_failures` attempts, and the reset is what stops it adding up
-    /// over the life of a connection that *is* authenticated: a client whose
+    /// The counters are what make guessing cost a handshake every
+    /// `max_auth_failures` attempts, and clearing them is what stops them adding
+    /// up over the life of a connection that *is* authenticated: a client whose
     /// password was rotated, or an app that omits the header on some request,
     /// would otherwise spend the budget a failure at a time over hours and then
     /// lose every live tunnel to a cap meant for an attacker.
     ///
-    /// It clears only the run charged to `username`, because a guesser *can*
-    /// arrive here: `auth.users` is a list, and one valid credential is enough
-    /// to interleave a success between guesses at a second user's password. See
+    /// Exactly two buckets are answered for: `username`'s own, and the one for
+    /// failures that named nobody. Nothing else, because a guesser *can* arrive
+    /// here — `auth.users` is a list, and one valid credential is enough to
+    /// interleave a success between guesses at a second user's password. See
     /// [`AuthFailures`]. `None` means there was nothing to check — no users are
-    /// configured — and there is then no run for anyone to be charged with.
+    /// configured — so there is no user's bucket to clear, and no failure can
+    /// have been recorded either.
     pub(crate) fn mark_authenticated(&self, username: Option<&str>) {
         self.authenticated.store(true, Ordering::Relaxed);
 
         let mut failures = self.auth_failures();
-        let clears = match failures.charged_to.as_deref() {
-            // Failures nobody was named for: the request that forgot its header
-            // rather than the one that guessed. Any success answers for those.
-            None => true,
-            Some(charged_to) => Some(charged_to) == username,
-        };
 
-        if clears {
-            failures.count = 0;
-            failures.charged_to = None;
+        // The request that forgot its header rather than the one that guessed:
+        // any success answers for those.
+        failures.anonymous = 0;
+
+        if let Some(username) = username {
+            failures.configured.remove(username);
         }
     }
 

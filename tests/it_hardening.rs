@@ -499,52 +499,174 @@ async fn a_success_does_not_clear_another_users_failures() {
         .expect("a success as one user must not buy another user's guesses a reprieve");
 }
 
-/// A credential-less request at the head of a run does not launder the rest.
+/// The interleave that a single run of failures could not stop.
 ///
-/// The run is charged to the first failure that *names* somebody, not to the
-/// first failure. Charging it to the first would hand the interleaving back: a
-/// peer opens each cycle with one request that carries no credentials field at
-/// all, and because that failure names nobody the whole run reads as the benign
-/// case, which any success clears -- so the guesses behind it cost one extra
-/// request each and nothing else.
+/// A peer holding one valid credential opens every cycle with a deliberate
+/// failure as *itself*. With one run charged to the first failure that named
+/// somebody, that claimed the run for a name the peer can clear at will, so the
+/// success at the end of the cycle wiped the guesses at the second user out with
+/// it -- measured against that version at `max_auth_failures = 5`: eight rounds,
+/// twenty-four guesses, connection never closed.
 ///
-/// Four requests at `max_auth_failures = 3`. Nobody is named by the first, user2
-/// is guessed at twice, and the success in between is user1's.
+/// With a bucket per user-id the success clears the peer's own and nothing else,
+/// so the guesses stand and the *total* reaches the cap in the second round.
 #[tokio::test]
-async fn a_credential_less_request_does_not_launder_a_run_of_guesses() {
+async fn an_interleaved_cycle_of_guesses_still_reaches_the_cap() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 5\n",
+        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let authority = target.to_string();
+    let mut client = H3Client::connect(&server).await;
+
+    // Round one, exactly as the attack runs it: the failure that used to claim
+    // the run, three guesses at the other user, then the good request. Totals of
+    // 1, 2, 3, 4 -- and 3 once the success has cleared user1's bucket.
+    assert_eq!(
+        attempt_as(&mut client, &authority, "user1", "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "the failure that opens the cycle is answered like any other"
+    );
+    for guess in 0..3 {
+        assert_eq!(
+            attempt_as(&mut client, &authority, "user2", &format!("guess-{guess}")).await,
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+            "guess {guess} is inside the budget and must be answered"
+        );
+    }
+    assert_eq!(
+        attempt_as(&mut client, &authority, "user1", "s3cret").await,
+        Some(Status::OK),
+        "the peer's own credentials still work"
+    );
+
+    // Round two. The total is at three, so the fourth failure is still answered
+    // and the fifth is the whole budget.
+    assert_eq!(
+        attempt_as(&mut client, &authority, "user1", "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "the fourth failure of the connection is one short of the cap"
+    );
+
+    // The request that brings the total to five. Whether its 407 lands before
+    // the close is a race, as it is in the tests above, so the outcome is what
+    // is asserted.
+    let _ = attempt_as(&mut client, &authority, "user2", "guess-3").await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("a success as one user must not buy a second user's guesses another round");
+}
+
+/// A guess at a user-id nobody has is never cleared by anything.
+///
+/// Succeeding as a user that does not exist is not a thing that can happen, so a
+/// success says nothing about such a guess and clears none of them. That bucket
+/// is where a scan for user-ids lands, and it is the one a peer with a valid
+/// credential cannot drain.
+///
+/// Two invented names either side of a success, at `max_auth_failures = 5`: the
+/// fifth guess is the fifth failure whatever the success did.
+#[tokio::test]
+async fn a_success_never_clears_a_guess_at_a_user_that_does_not_exist() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 5\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let authority = target.to_string();
+    let mut client = H3Client::connect(&server).await;
+
+    for guess in 0..2 {
+        assert_eq!(
+            attempt_as(
+                &mut client,
+                &authority,
+                "mallory",
+                &format!("guess-{guess}")
+            )
+            .await,
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+            "a guess at an unconfigured name is answered like any other"
+        );
+    }
+    assert_eq!(
+        attempt_as(&mut client, &authority, "user1", "s3cret").await,
+        Some(Status::OK),
+        "the peer's own credentials still work"
+    );
+
+    // A second invented name, sharing the one bucket the success did not reach:
+    // the totals are three and four.
+    for guess in 0..2 {
+        assert_eq!(
+            attempt_as(&mut client, &authority, "eve", &format!("guess-{guess}")).await,
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+            "the budget must still hold two more failures"
+        );
+    }
+
+    let _ = attempt_as(&mut client, &authority, "eve", "guess-2").await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("guesses at a user that does not exist must survive a success as one that does");
+}
+
+/// A success clears the failures that named nobody, and only those.
+///
+/// The credential-less request is the benign case the clearing exists for -- the
+/// app that dropped its header -- and any success answers for it. What must not
+/// travel with it is a guess: that names somebody, so it is charged to that
+/// name's bucket and stays there however many credential-less requests are sent
+/// around it.
+///
+/// Five requests at `max_auth_failures = 3` pin both halves. If the success left
+/// the credential-less failure standing, the fourth request would be the third
+/// failure and the connection would go one request early; if it cleared the
+/// guesses too, the fifth would be the second and it would never go at all.
+#[tokio::test]
+async fn a_success_clears_credential_less_failures_and_nothing_else() {
     let server = TestServer::start_with(&format!(
         "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
         auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
     ))
     .await;
     let target = spawn_echo_target().await;
+    let authority = target.to_string();
     let mut client = H3Client::connect(&server).await;
 
     assert_eq!(
-        attempt_anonymously(&mut client, &target.to_string()).await,
+        attempt_anonymously(&mut client, &authority).await,
         Some(Status::PROXY_AUTHENTICATION_REQUIRED),
         "a request with no credentials is answered like any other failure"
     );
     assert_eq!(
-        attempt_as(&mut client, &target.to_string(), "user2", "wrong").await,
+        attempt_as(&mut client, &authority, "user2", "wrong").await,
         Some(Status::PROXY_AUTHENTICATION_REQUIRED),
-        "the guess behind it is what claims the run"
+        "the guess beside it is charged to the name it guessed at"
     );
     assert_eq!(
-        attempt_as(&mut client, &target.to_string(), "user1", "s3cret").await,
+        attempt_as(&mut client, &authority, "user1", "s3cret").await,
         Some(Status::OK),
         "the peer's own credentials still work"
     );
+    assert_eq!(
+        attempt_as(&mut client, &authority, "user2", "wrong-again").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "with the credential-less failure cleared, this is the second of three"
+    );
 
-    // The third failure of a run charged to user2, so it spends the budget. As
-    // in the tests above, whether the 407 lands before the close is a race.
-    let _ = attempt_as(&mut client, &target.to_string(), "user2", "wrong-again").await;
+    // The third failure still standing against user2, so it spends the budget.
+    // As in the tests above, whether the 407 lands before the close is a race.
+    let _ = attempt_as(&mut client, &authority, "user2", "wrong-once-more").await;
 
     tokio::time::timeout(TIMEOUT, client.quic.closed())
         .await
-        .expect(
-            "an unnamed failure in front of the guesses must not make them anybody's but user2's",
-        );
+        .expect("a success must not clear a guess along with the request that named nobody");
 }
 
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.

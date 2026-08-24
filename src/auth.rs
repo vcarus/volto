@@ -115,6 +115,28 @@ impl Authenticator {
         self.users.is_empty()
     }
 
+    /// Whether `username` is one of the configured user-ids.
+    ///
+    /// What a failure is charged to depends on this: a guess at a user that
+    /// exists goes in that user's own bucket, and a guess at a name nobody has
+    /// goes in the one no success ever clears (see [`crate::tunnel::Context`]).
+    ///
+    /// Compared the way [`Self::verify`] compares, and for the reason the module
+    /// header gives: [`subtle::ConstantTimeEq`] over every configured user, with
+    /// no early exit, so how long a refused request takes does not say whether
+    /// the user-id it named exists. That is the only thing this could leak — the
+    /// response is a 407 either way — and it is what turns a wrong password into
+    /// a directory of user-ids.
+    pub(crate) fn is_configured(&self, username: &str) -> bool {
+        let mut configured = subtle::Choice::from(0u8);
+
+        for user in &self.users {
+            configured |= user.username.as_bytes().ct_eq(username.as_bytes());
+        }
+
+        bool::from(configured)
+    }
+
     /// Authenticates a request's headers.
     ///
     /// `Ok(None)` means authentication is disabled, `Ok(Some(username))` names the
@@ -423,6 +445,22 @@ mod tests {
             let fields = fields(&[(PROXY_AUTHORIZATION, basic(username, password))]);
             let denied = auth.authenticate(&fields).expect_err("must be rejected");
             assert_eq!(denied.username(), Some(username), "{denied:?}");
+        }
+    }
+
+    /// The classification a failure's bucket is chosen by: a user-id the
+    /// operator configured, or a name nobody has.
+    #[test]
+    fn only_configured_user_ids_are_recognised() {
+        let auth = authenticator(&[("user1", "s3cret"), ("user2", "hunter2")]);
+
+        assert!(auth.is_configured("user1"));
+        assert!(auth.is_configured("user2"));
+
+        // Exact, the way a password comparison is: a near miss is a name
+        // nobody has, and its guesses are charged where they cannot be cleared.
+        for name in ["", "user", "user3", "USER1", "user1 ", " user1"] {
+            assert!(!auth.is_configured(name), "{name:?} is nobody");
         }
     }
 
