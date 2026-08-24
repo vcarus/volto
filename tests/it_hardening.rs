@@ -205,6 +205,44 @@ async fn repeated_authentication_failures_close_the_connection() {
         .expect("the connection must be closed after the failure budget is spent");
 }
 
+/// Failures that name nobody spend the budget too, on their own.
+///
+/// The three buckets are summed for the cap, and only this one is reachable
+/// without ever naming a user-id: a peer that sends no credentials field at all
+/// costs the server a decoded request and a 407 apiece, exactly as a guess does,
+/// so a bucket left out of that sum would be free guessing down one connection.
+/// The tests around this one always reach the cap through a *named* failure, so
+/// the credential-less bucket could be dropped from the total with the whole
+/// suite still green.
+#[tokio::test]
+async fn credential_less_failures_alone_close_the_connection() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // The first two are answered normally: no credentials is an authentication
+    // failure like any other, and the 407 says so.
+    for i in 0..2 {
+        assert_eq!(
+            attempt_anonymously(&mut client, &target.to_string()).await,
+            Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+            "credential-less attempt {i} should still be answered"
+        );
+    }
+
+    // The third exhausts the budget. Whether it is answered before the close
+    // lands is a race, so what is asserted is the outcome: the connection goes.
+    let _ = attempt_anonymously(&mut client, &target.to_string()).await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("credential-less failures must count against the failure budget");
+}
+
 /// A peer that will not read its 407 must still spend the budget.
 ///
 /// The failure is counted before the answer goes out, and the answer itself is
