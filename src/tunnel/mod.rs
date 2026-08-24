@@ -221,7 +221,7 @@ pub struct Context {
     /// ever reads it back.
     pub tunnels: Arc<AtomicU64>,
     /// How long a UDP session may sit idle, and how long a write in a
-    /// half-closed TCP tunnel's surviving direction may make no progress.
+    /// half-closed TCP tunnel's surviving direction has to complete in.
     pub idle_timeout: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///

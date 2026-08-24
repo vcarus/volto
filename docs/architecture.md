@@ -169,16 +169,26 @@ The first two rows above are the endings that take the watchdog away, because
 they end a direction without a teardown. So from the moment one direction has
 ended cleanly, each write in the surviving direction is bounded by `[limits]
 udp_session_timeout` — the same knob a CONNECT-UDP session's idle bound comes
-from — and a write that makes no progress for a whole one of those cuts the
-tunnel: the request stream is reset (`H3_REQUEST_CANCELLED` when it is the
-client that stopped reading after its own FIN, `H3_CONNECT_ERROR` when it is the
-target that stopped reading after its own EOF) and the target socket is closed
-with a reset. Progress rearms the bound, so a client that keeps reading may take
-hours to drain a download after its FIN; a tunnel whose two directions are both
-still open is never on a timer at all, however long a write parks. Without it, a
-half-closed tunnel whose surviving peer went quiet held the target socket, its
-file descriptor and the tunnel slot until the QUIC connection ended — which this
-server's own keep-alives can postpone indefinitely.
+from — and a write that does not *complete* within one of those cuts the tunnel:
+the request stream is reset (`H3_REQUEST_CANCELLED` when it is the client that
+stopped reading after its own FIN, `H3_CONNECT_ERROR` when it is the target that
+stopped reading after its own EOF) and the target socket is closed with a reset.
+Every write gets its own budget, so a client that keeps reading may take hours to
+drain a download after its FIN — but progress alone does not save a write that
+never finishes, which puts a floor of roughly one 64 KiB relay chunk per budget
+under how slowly a half-closed download may be drained (about one 1.4 KB piece
+per budget in the other direction). A tunnel whose two directions are both still
+open is never on a timer at all, however long a write parks.
+
+The bound covers the parked *write* half of the problem and only that. A
+half-closed tunnel whose surviving direction is parked in a **read** — no bytes
+in either direction — is deliberately left alone, because a target that has taken
+the client's FIN may legitimately take minutes to answer and cutting it would
+break the half-closes this proxy exists to carry; what limits those is capacity
+rather than time, `max_connections` × `max_targets_per_conn` sockets. Without the
+write bound, a half-closed tunnel whose surviving peer stopped taking bytes held
+the target socket, its file descriptor and the tunnel slot until the QUIC
+connection ended — which this server's own keep-alives can postpone indefinitely.
 
 The last row cancels both directions because RFC 9114 §4.4 asks for it: "If the
 stream is reset or reading is aborted by the client, a proxy SHOULD perform the

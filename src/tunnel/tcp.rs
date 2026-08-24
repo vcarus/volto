@@ -42,12 +42,25 @@
 //!
 //! So from the moment one direction has ended cleanly, each write in the
 //! surviving direction is bounded by `[limits] udp_session_timeout`, the same
-//! knob a CONNECT-UDP session's idle bound comes from. Progress rearms it --
-//! each write gets its own budget -- so a client that keeps reading may take
-//! hours to drain a download after its FIN; only a write that makes no progress
-//! at all for a whole one of those trips it. A tunnel whose two directions are
-//! both still open is untouched however long a write parks, because there the
-//! other pump is still the watchdog.
+//! knob a CONNECT-UDP session's idle bound comes from. Each write gets its own
+//! budget, so a client that keeps reading may take hours to drain a download
+//! after its FIN. What the budget bounds is the *completion* of one write
+//! rather than progress on it, though: a peer that takes a few bytes every so
+//! often, and never enough to finish the write it woke, is cut once that one
+//! write has been outstanding for a whole budget. So there is a floor under how
+//! slowly a half-closed tunnel may be drained -- one relay chunk, up to
+//! `RELAY_BLOCK_SIZE`, per budget on the target -> client side and one of
+//! quinn's ~1.4 KB pieces per budget on the other -- which at the default 180 s
+//! is orders of magnitude under any real client. A tunnel whose two directions
+//! are both still open is untouched however long a write parks, because there
+//! the other pump is still the watchdog.
+//!
+//! What nothing bounds is the surviving direction parked in a *read*. A target
+//! that has taken the client's FIN may legitimately take minutes to answer, and
+//! a bound there would cut the very half-closes this proxy exists to carry, so a
+//! half-closed tunnel with no traffic at all on it is deliberately left to run.
+//! What limits that is capacity rather than time: `max_connections` x
+//! `max_targets_per_conn` sockets, the product the fd budget is sized from.
 
 use std::io;
 use std::net::SocketAddr;
@@ -153,7 +166,7 @@ struct HalfClose {
     mine: watch::Sender<bool>,
     /// The other direction's flag.
     other: watch::Receiver<bool>,
-    /// How long a write may make no progress once `other` is set.
+    /// How long a write has to complete in, once `other` is set.
     budget: Duration,
 }
 
@@ -165,15 +178,21 @@ impl HalfClose {
         let _ = self.mine.send(true);
     }
 
-    /// Resolves once the other direction has ended cleanly and this one has
-    /// then made no progress for a whole budget.
+    /// Resolves once the other direction has ended cleanly and a whole budget
+    /// has then passed without this direction's write completing.
+    ///
+    /// A write that is progressing but not finishing is cut like any other: the
+    /// budget is per write and starts when the write does, so what it measures
+    /// is how long that one write has been outstanding, not how long the peer
+    /// has been silent.
     ///
     /// Cancel-safe by construction rather than by care: the caller builds a
     /// fresh one of these per write, so the sleep it ends with is the budget
-    /// for *that* write and progress on the previous one has already reset it.
-    /// Awaiting the flag before the sleep is what also catches a FIN that lands
-    /// while a write is already parked -- the arm is armed at the write's first
-    /// poll, whether or not the other direction has ended by then.
+    /// for *that* write and the previous write having completed has already
+    /// reset it. Awaiting the flag before the sleep is what also catches a FIN
+    /// that lands while a write is already parked -- the arm is armed at the
+    /// write's first poll, whether or not the other direction has ended by
+    /// then.
     async fn stalled(&mut self) {
         while !*self.other.borrow_and_update() {
             if self.other.changed().await.is_err() {
