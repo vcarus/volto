@@ -1080,25 +1080,48 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
 /// observable from out here: a probe that could see the roster would have to
 /// arrive at it, and an arrival at a full roster is the very thing that takes
 /// the parked peer's slot. So the round below is not waited out with a sleep
-/// long enough for the slowest machine — it is retried until it holds or
-/// `TIMEOUT` runs out, giving the server longer to reap each time. One round
-/// wins on an unloaded host; a machine slow enough to lose one costs the run a
-/// round rather than a failure, and a slot that is never returned loses every
-/// round there is.
+/// long enough for the slowest machine — it is retried, giving the server longer
+/// to reap each time, and the next round is started only if it can still finish
+/// inside `TIMEOUT`. One round wins on an unloaded host; a machine slow enough
+/// to lose one costs the run a round rather than a failure, and a slot that is
+/// never returned loses every round there is.
 #[tokio::test]
 async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
     let deadline = Instant::now() + TIMEOUT;
     let mut settling = Duration::from_millis(50);
 
-    while !a_newcomer_finds_room(settling).await {
+    loop {
+        // Checked *before* the round rather than after it, so `TIMEOUT` bounds
+        // the test rather than the moment the last round happened to start: a
+        // round costs `settling` plus the window it watches the parked peer for,
+        // and both are known here.
         assert!(
-            Instant::now() < deadline,
+            Instant::now() + settling + EVICTION_VISIBLE < deadline,
             "the closer's slot was never returned: the parked peer lost it to the \
              newcomer in every round"
         );
+
+        if a_newcomer_finds_room(settling).await {
+            return;
+        }
         settling *= 2;
     }
 }
+
+/// How long a round watches the parked peer before calling it a survivor.
+///
+/// The round turns on telling "the newcomer found room" from "the newcomer made
+/// room", and the second of those is only visible as the parked peer's
+/// CONNECTION_CLOSE arriving. Too short a window reports an eviction that is
+/// merely in flight as a survival — and, under the failure this test hunts,
+/// that is a green run: every round evicts, and one round whose close is slow
+/// ends the retry loop with a pass.
+///
+/// So the window is generous rather than tight. It costs an unloaded host
+/// nothing (the first round wins and never waits it out) and it is two orders
+/// of magnitude over a loopback CONNECTION_CLOSE, so a peer still open at the
+/// end of it was not evicted at all.
+const EVICTION_VISIBLE: Duration = Duration::from_secs(2);
 
 /// One round of it: with a peer parked in front of a connection that closed at
 /// once, does the next arrival find room rather than make it?
@@ -1137,8 +1160,10 @@ async fn a_newcomer_finds_room(settling: Duration) -> bool {
 
     // The observation: the newcomer found room rather than making it. Not
     // `stays_open`, because a round that lost is a round to run again rather
-    // than a failure to report.
-    tokio::time::timeout(Duration::from_millis(300), parked.quic.closed())
+    // than a failure to report — and it is waited out for [`EVICTION_VISIBLE`]
+    // rather than for a moment, so an eviction that is merely slow to arrive
+    // cannot be counted as a survival.
+    tokio::time::timeout(EVICTION_VISIBLE, parked.quic.closed())
         .await
         .is_err()
 }
