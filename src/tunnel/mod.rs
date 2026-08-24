@@ -3,8 +3,8 @@
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -83,6 +83,32 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "upgrade",
 ];
 
+/// A run of authentication failures on one connection, and whose they are.
+///
+/// The pair is what makes the reset on success honest. `auth.users` is a list,
+/// so a peer can hold one valid credential and guess at another user's password
+/// with it: with the whole counter cleared by any success, it interleaves a good
+/// request between guesses and never reaches `max_auth_failures`. Charging the
+/// run to a user-id and clearing it only for that user-id closes that, and
+/// leaves the case the reset exists for — one client, one credential, an app
+/// that drops the header now and then — exactly as it was.
+#[derive(Default)]
+pub struct AuthFailures {
+    /// Failures recorded since the last reset.
+    count: u32,
+    /// The user-id the run is charged to.
+    ///
+    /// The one the run's *first* failure claimed, so a peer cannot re-aim a run
+    /// at a name it can clear. `None` when that failure carried no user-id this
+    /// server could read — no credentials field at all, or one it could not
+    /// parse — which is the benign case any success clears.
+    ///
+    /// Only ever a value [`crate::auth::Denied::username`] produced, so its
+    /// length is already bounded where it is built (review H3) and one
+    /// connection holds at most one of them.
+    charged_to: Option<String>,
+}
+
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Cloned per request — the cost is a handful of refcount bumps. The UDP-specific
@@ -106,11 +132,15 @@ pub struct Context {
     pub peer_datagrams: Arc<AtomicBool>,
     /// The credentials every request is checked against.
     pub auth: Arc<Authenticator>,
-    /// Authentication failures seen on this connection so far.
+    /// Authentication failures seen on this connection so far, and who they are
+    /// charged to.
     ///
     /// Connection-scoped on purpose: no shared table across connections means no
-    /// lock, no eviction policy and no memory that an attacker can grow.
-    pub auth_failures: Arc<AtomicU32>,
+    /// eviction policy and no memory that an attacker can grow. The lock is a
+    /// `std::sync::Mutex`, held for two field accesses and never across an
+    /// await; it is here rather than an atomic because the count and the user-id
+    /// it belongs to have to move together.
+    pub auth_failures: Arc<Mutex<AuthFailures>>,
     /// Failures tolerated before the connection is closed. Zero disables it.
     pub max_auth_failures: u32,
     /// Whether any request on this connection has passed the credentials check.
@@ -182,7 +212,7 @@ impl Context {
     ) -> Self {
         Self {
             remote: datagrams.remote_address(),
-            auth_failures: Arc::new(AtomicU32::new(0)),
+            auth_failures: Arc::new(Mutex::new(AuthFailures::default())),
             max_auth_failures: config.security.max_auth_failures,
             authenticated,
             datagrams,
@@ -201,10 +231,31 @@ impl Context {
     /// Records an authentication failure, reporting whether that was one too many.
     ///
     /// Counts across the whole connection, so opening more streams does not reset
-    /// the budget. A request that *succeeds* does — see [`Self::mark_authenticated`].
-    pub(crate) fn record_auth_failure(&self) -> bool {
-        let failures = self.auth_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        self.max_auth_failures > 0 && failures >= self.max_auth_failures
+    /// the budget. A request that succeeds *as `username`* does — see
+    /// [`Self::mark_authenticated`] and [`AuthFailures`].
+    ///
+    /// `username` is the user-id the failing request claimed, or `None` when it
+    /// carried none this server could read. It is remembered only when it opens
+    /// a run: a later failure adds to the count and leaves the name alone, so
+    /// what the run is charged to is the first name that spent it.
+    pub(crate) fn record_auth_failure(&self, username: Option<&str>) -> bool {
+        let mut failures = self.auth_failures();
+
+        if failures.count == 0 {
+            failures.charged_to = username.map(str::to_owned);
+        }
+        failures.count += 1;
+
+        self.max_auth_failures > 0 && failures.count >= self.max_auth_failures
+    }
+
+    /// Poisoning would mean a panic between the two field writes above; both are
+    /// plain values with nothing to observe half-written, and the alternative is
+    /// a panic on a path whose job is to answer 407.
+    fn auth_failures(&self) -> MutexGuard<'_, AuthFailures> {
+        self.auth_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Whether QUIC datagrams may be sent to the peer right now.
@@ -213,18 +264,35 @@ impl Context {
     }
 
     /// Records that a request on this connection got past the credentials check,
-    /// and clears the failures behind it.
+    /// and clears the failures that were charged to whoever it got past as.
     ///
     /// The counter is what makes guessing cost a handshake every
-    /// `max_auth_failures` attempts, and a guesser never arrives here — so the
-    /// reset takes nothing away from that. What it stops is the counter adding
-    /// up over the life of a connection that *is* authenticated: a client whose
+    /// `max_auth_failures` attempts, and the reset is what stops it adding up
+    /// over the life of a connection that *is* authenticated: a client whose
     /// password was rotated, or an app that omits the header on some request,
-    /// spends the budget a failure at a time over hours and then loses every
-    /// live tunnel to a cap meant for an attacker.
-    pub(crate) fn mark_authenticated(&self) {
+    /// would otherwise spend the budget a failure at a time over hours and then
+    /// lose every live tunnel to a cap meant for an attacker.
+    ///
+    /// It clears only the run charged to `username`, because a guesser *can*
+    /// arrive here: `auth.users` is a list, and one valid credential is enough
+    /// to interleave a success between guesses at a second user's password. See
+    /// [`AuthFailures`]. `None` means there was nothing to check — no users are
+    /// configured — and there is then no run for anyone to be charged with.
+    pub(crate) fn mark_authenticated(&self, username: Option<&str>) {
         self.authenticated.store(true, Ordering::Relaxed);
-        self.auth_failures.store(0, Ordering::Relaxed);
+
+        let mut failures = self.auth_failures();
+        let clears = match failures.charged_to.as_deref() {
+            // Failures nobody was named for: the request that forgot its header
+            // rather than the one that guessed. Any success answers for those.
+            None => true,
+            Some(charged_to) => Some(charged_to) == username,
+        };
+
+        if clears {
+            failures.count = 0;
+            failures.charged_to = None;
+        }
     }
 
     /// Whether any request on this connection has (D76).

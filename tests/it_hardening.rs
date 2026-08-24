@@ -37,9 +37,22 @@ const H3_STREAM_CREATION_ERROR: u32 = 0x103;
 /// D76 is two of these, so a test can tell one deadline from the other.
 const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
 
-/// A CONNECT attempt with the given credentials, returning the status.
+/// A CONNECT attempt as `user1` with the given password, returning the status.
 async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
-    let request = authorized_connect(authority, "user1", password);
+    attempt_as(client, authority, "user1", password).await
+}
+
+/// [`attempt`] under a user-id of the caller's choosing.
+///
+/// Which user a failure names is what the budget is charged against, so a test
+/// about that has to be able to name a second one.
+async fn attempt_as(
+    client: &mut H3Client,
+    authority: &str,
+    username: &str,
+    password: &str,
+) -> Option<Status> {
+    let request = authorized_connect(authority, username, password);
 
     let mut stream = client.send.send_request(request).await.ok()?;
     let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
@@ -394,6 +407,48 @@ async fn a_success_clears_the_failures_before_it() {
         Some(Status::OK),
         "and the client must still be able to open a tunnel"
     );
+}
+
+/// A success clears only the failures charged to the user it succeeded as.
+///
+/// `auth.users` is a list, so "a success clears the failures behind it" hands a
+/// peer holding one valid credential a way out of the cap: guess at user2, spend
+/// a good request as user1, guess again, and the count never reaches the limit
+/// however long it goes on. The same three requests as
+/// `a_success_clears_the_failures_before_it`, with the failures aimed at a user
+/// the success is not for — and the opposite outcome.
+#[tokio::test]
+async fn a_success_does_not_clear_another_users_failures() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
+        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    assert_eq!(
+        attempt_as(&mut client, &target.to_string(), "user2", "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "the first guess at the second user must be answered"
+    );
+    // The credential the peer actually holds, used exactly as a working client
+    // would use it.
+    assert_eq!(
+        attempt_as(&mut client, &target.to_string(), "user1", "s3cret").await,
+        Some(Status::OK),
+        "the peer's own credentials still work"
+    );
+
+    // The second guess at user2 is the second failure charged to user2, so it
+    // spends the budget. Whether the 407 lands before the close is a race, as it
+    // is in `repeated_authentication_failures_close_the_connection`, so the
+    // outcome is what is asserted.
+    let _ = attempt_as(&mut client, &target.to_string(), "user2", "wrong-again").await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("a success as one user must not buy another user's guesses a reprieve");
 }
 
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.

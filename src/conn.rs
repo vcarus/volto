@@ -282,14 +282,14 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             // Lifts D76's bound for the rest of this connection's life: the peer
             // has proved who it is, and may now hold the connection idle for as
             // long as the transport allows.
-            context.mark_authenticated();
+            context.mark_authenticated(Some(username));
             debug!(stream_id, username, "request authenticated");
         }
         // No users configured: an open proxy, as warned about at startup. There
         // is no door to get past, so the first request past this point counts as
         // having got past it -- otherwise every connection to an unauthenticated
         // proxy would be living under D76's bound, tunnels and all.
-        Ok(None) => context.mark_authenticated(),
+        Ok(None) => context.mark_authenticated(None),
         Err(denied) => {
             // The attempted user-id is logged, never anything derived from the
             // password. `remote` is here so a fail2ban rule has something to act
@@ -319,7 +319,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             // here too, before the 407 is written: a peer that will not take
             // the answer must not keep the connection for another idle timeout
             // while the write waits on it (review H1, re-verification).
-            if context.record_auth_failure() {
+            if context.record_auth_failure(denied.username()) {
                 warn!(
                     remote = %context.remote,
                     failures = context.max_auth_failures,
