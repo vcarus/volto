@@ -123,10 +123,16 @@ impl Authenticator {
     ///
     /// Compared the way [`Self::verify`] compares, and for the reason the module
     /// header gives: [`subtle::ConstantTimeEq`] over every configured user, with
-    /// no early exit, so how long a refused request takes does not say whether
-    /// the user-id it named exists. That is the only thing this could leak — the
-    /// response is a 407 either way — and it is what turns a wrong password into
-    /// a directory of user-ids.
+    /// no early exit from the loop, so *which* configured user-id a guess
+    /// matched is not in how long the refusal took — the response is a 407
+    /// either way, and a name that can be found by timing is a directory of
+    /// user-ids.
+    ///
+    /// It claims no more than [`Self::verify`] does. `ct_eq` on two slices
+    /// answers immediately when their lengths differ, which is the module
+    /// header's caveat: what a clock can still separate is a guess whose length
+    /// no configured user-id shares from one whose length some user-id has. The
+    /// names themselves stay out of it.
     pub(crate) fn is_configured(&self, username: &str) -> bool {
         let mut configured = subtle::Choice::from(0u8);
 

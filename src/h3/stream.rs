@@ -998,8 +998,9 @@ impl Reader {
     /// bytes already buffered it returns at once -- which is precisely the state
     /// a stalled upload sits in -- so the wait there is a poll on a timer rather
     /// than a wake-up, and `RESET_PEEK_INTERVAL` -- 250 ms, documented where it
-    /// is defined -- bounds how late the reset is noticed. A reset that arrives while nothing is buffered needs no timer:
-    /// it wakes the parked read at once, as any read error would.
+    /// is defined -- bounds how late the reset is noticed. A reset that arrives
+    /// while nothing is buffered needs no timer: it wakes the parked read at
+    /// once, as any read error would.
     ///
     /// Cancel-safe, so a `select!` may poll it and drop it repeatedly.
     pub async fn reset_by_peer(&mut self) -> StreamError {

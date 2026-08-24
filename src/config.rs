@@ -825,7 +825,9 @@ impl Config {
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
                 "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
-                 recommends; long-lived UDP flows may be cut off",
+                 recommends; long-lived UDP flows may be cut off, and it is also how long \
+                 a write in a half-closed TCP tunnel has to complete in before that tunnel \
+                 is cut",
                 self.limits.udp_session_timeout
             ));
         }
