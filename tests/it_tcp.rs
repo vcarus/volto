@@ -218,6 +218,116 @@ async fn a_burst_upload_that_outruns_the_target_still_half_closes_cleanly() {
     );
 }
 
+/// A TCP target that stops reading until the whole upload has arrived, then
+/// drains it a sip at a time and answers with the byte count.
+///
+/// Both halves are aimed at one state of the relay: parked in a write to this
+/// socket with nothing left on the QUIC stream to read -- the client's last
+/// bytes and its FIN already taken off it.
+///
+/// * The freeze is what gets the upload and the FIN drained: the relay pulls
+///   what it can, fills every buffer between here and it, and parks with the
+///   rest waiting in quinn's receive buffer.
+/// * The sips are what keep it parked afterwards. A read frees room for the
+///   relay to write into, and reading less than the ~1.4 KB pieces quinn hands
+///   it means the room a read frees is never enough to finish the write it woke.
+///   The receive buffer is asked to be small for the same reason, since a
+///   kernel that honours the request opens its window a sip at a time rather
+///   than in one jump: Linux does, macOS clamps the value and widens the window
+///   in far larger steps, which leaves the relay free to finish the last piece.
+async fn spawn_stalling_counting_target() -> SocketAddr {
+    /// Read nothing at all for this long, so the whole upload lands and every
+    /// buffer between the proxy and here is full before the first read.
+    const FREEZE: Duration = Duration::from_millis(300);
+    /// A sip, under the size of a piece.
+    const READ: usize = 1024;
+
+    let socket = TcpSocket::new_v4().expect("target socket");
+    // Best-effort: what a kernel does with it is the kernel's business, and the
+    // test asserts nothing about the size it ends up with.
+    let _ = socket.set_recv_buffer_size(4 * 1024);
+    socket
+        .bind("127.0.0.1:0".parse().expect("bind address"))
+        .expect("bind target");
+    let listener = socket.listen(16).expect("listen");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; READ];
+                let mut counted = 0usize;
+                tokio::time::sleep(FREEZE).await;
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => counted += n,
+                        Err(_) => return,
+                    }
+                }
+                let _ = socket.write_all(counted.to_string().as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// A client FIN that has already been drained is not an abort, and the tunnel
+/// must finish the upload it is still carrying.
+///
+/// This is the state `Reader::reset_by_peer` keeps its "the peer finished and
+/// everything it sent has been read" arm for: the client's whole body and its
+/// FIN are off the QUIC stream, so the watcher a parked write polls can no
+/// longer be woken by anything -- there is no reset left to arrive on a stream
+/// the peer has already finished. Reporting the end of that stream as a reset
+/// instead would tear the tunnel down as a client abort, and the target would be
+/// cut off part-way through the upload it is still draining rather than seeing
+/// it out and answering.
+///
+/// Whether the relay is really left parked at that instant is the target's job
+/// to arrange, and it depends on how finely the kernel opens a receive window;
+/// see [`spawn_stalling_counting_target`]. The assertion below holds either way
+/// -- it is the ordinary stalled-upload half-close -- and it is what turns that
+/// arm answering "reset" into a failure wherever the state is reached.
+///
+/// The target's stall is two orders of magnitude under the tunnel's idle bound,
+/// so what this pins is the watcher and not that bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drained_client_fin_is_not_a_reset() {
+    /// Past what the buffers between the proxy and the target hold, so the
+    /// relay is parked in a write rather than done by the time the freeze ends.
+    const FRAMES: usize = 64;
+    const FRAME: usize = 16 * 1024;
+
+    let server = TestServer::start().await;
+    let target = spawn_stalling_counting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    let payload = Bytes::from(vec![0x7eu8; FRAME]);
+    for _ in 0..FRAMES {
+        stream
+            .send_data(payload.clone())
+            .await
+            .expect("send a chunk of the burst");
+    }
+    // Travels with the bytes already queued, so it is drained along with them
+    // rather than after a pause the relay could notice separately.
+    stream.finish().expect("finish the sending side");
+
+    let reply = tokio::time::timeout(TIMEOUT, read_to_end(&mut stream))
+        .await
+        .expect("the target's answer must arrive within the bound");
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        (FRAMES * FRAME).to_string(),
+        "the target must see every byte of the upload and a clean EOF, and its \
+         answer must reach the client"
+    );
+}
+
 /// A target that resets after the tunnel is up must surface as a stream reset
 /// with H3_CONNECT_ERROR, not as a clean end of stream.
 ///
