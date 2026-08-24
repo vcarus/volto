@@ -778,6 +778,9 @@ async fn a_clean_client_close_still_reaches_the_target_as_eof() {
 /// bound also comes from; one second is the smallest the config layer accepts.
 const HALF_CLOSED_TIMEOUT: &str = "[limits]\nudp_session_timeout = 1\n";
 
+/// The same number as a duration, for the tests that have to out-wait it.
+const HALF_CLOSED_BUDGET: Duration = Duration::from_secs(1);
+
 /// How long the tests below give a bound of one second to fire.
 ///
 /// Five times the bound, so only a tunnel that is never cut at all fails —
@@ -917,6 +920,70 @@ async fn a_tunnel_whose_client_has_not_finished_survives_a_long_stall() {
         received.len(),
         TOTAL,
         "a tunnel whose client has not half-closed must survive a stall and finish its download"
+    );
+}
+
+/// The other half of the bound: every write gets a budget of its own.
+///
+/// A client that half-closed and then drains a long download slowly is the
+/// benign shape the bound must not reach, and it is not covered by the stall
+/// test above: that one never lets a write finish at all. What this pins is the
+/// rearming. The tunnel spends well over five budgets in the half-closed state,
+/// but no single write is outstanding for one of them, and every byte has to
+/// arrive.
+///
+/// It is the mutation that shows what it is worth: turning the per-write sleep
+/// into one deadline for the whole half-closed life of the tunnel leaves every
+/// other test in the suite green and cuts this download at the first budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_tunnel_survives_a_download_taken_in_sips() {
+    /// Several times the client's 1.25 MB stream flow-control window, so the
+    /// proxy is parked in `send_data` through every pause below rather than
+    /// waiting on the target.
+    const TOTAL: usize = 4 * 1024 * 1024;
+    /// How much is taken before each pause. Comfortably over one relay chunk,
+    /// so the write the pause interrupted always completes when reading
+    /// resumes -- the floor the module doc describes.
+    const SIP: usize = 256 * 1024;
+    /// The pause between sips: under the budget, and sixteen of them are over
+    /// five of it.
+    const PAUSE: Duration = Duration::from_millis(400);
+
+    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let target = spawn_bounded_flood_target(TOTAL).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    // The half-close, which is what arms the bound at all.
+    stream.finish().expect("finish the sending side");
+
+    let started = std::time::Instant::now();
+    let mut received = 0usize;
+    let mut since_pause = 0usize;
+
+    while let Some(chunk) = tokio::time::timeout(TIMEOUT, stream.recv_data())
+        .await
+        .expect("the download must keep arriving")
+        .expect("a tunnel cut by the bound surfaces here as a reset")
+    {
+        received += chunk.len();
+        since_pause += chunk.len();
+        if since_pause >= SIP {
+            since_pause = 0;
+            tokio::time::sleep(PAUSE).await;
+        }
+    }
+
+    assert_eq!(
+        received, TOTAL,
+        "a half-closed tunnel drained in sips must deliver every byte and end cleanly"
+    );
+    // Without this the test could pass by being too fast to reach the bound at
+    // all, which is the one way it would prove nothing.
+    assert!(
+        started.elapsed() > 5 * HALF_CLOSED_BUDGET,
+        "the download must span several budgets to say anything: it took {:?}",
+        started.elapsed()
     );
 }
 
