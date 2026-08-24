@@ -663,8 +663,13 @@ impl Stream {
     /// Only the field lines given are sent -- nothing synthesises a
     /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
     /// capsule-carrying response. A 2xx answer to CONNECT must carry neither
-    /// Content-Length nor Transfer-Encoding (RFC 9114 §4.4), which a caller
-    /// meets by passing an empty [`Fields`].
+    /// Content-Length nor Transfer-Encoding, which a caller meets by passing an
+    /// empty [`Fields`]. The two rules live apart: RFC 9110 §8.6 has the first
+    /// -- "A server MUST NOT send a Content-Length header field in any 2xx
+    /// (Successful) response to a CONNECT request" -- while the second is RFC
+    /// 9114 §4.1's, and is about every HTTP/3 message rather than about CONNECT:
+    /// transfer codings "are not defined for HTTP/3; the Transfer-Encoding
+    /// header field MUST NOT be used".
     ///
     /// Private, and deliberately: it waits on the peer's flow-control window
     /// with nothing to end the wait, so [`Self::respond_within`] is the only way

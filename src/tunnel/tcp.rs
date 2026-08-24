@@ -482,6 +482,14 @@ async fn target_to_client(
                 // be written: the peer that reads the partial frame reads a
                 // RESET_STREAM behind it, which ends the stream as failed, so
                 // the truncation can never be mistaken for a complete response.
+                // RFC 9114 §7.1 says as much of the reader's side: "When a
+                // stream terminates cleanly, if the last frame on the stream was
+                // truncated, this MUST be treated as a connection error of type
+                // H3_FRAME_ERROR. Streams that terminate abruptly may be reset
+                // at any point in a frame." So the reset is not a way of tidying
+                // the truncation up after the fact -- it is what makes the
+                // truncation legal, and a FIN in its place would be the
+                // connection error that sentence names.
                 let sent = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
