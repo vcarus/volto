@@ -914,10 +914,10 @@ const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 /// The operator loses nothing they need: the file, the line and the column are
 /// all still named, which is what it takes to find a typo. What the message
 /// carries is the parser's account of what it found and what it expected there,
-/// rather than a copy of what was written — see [`redact_backticked`] for the
-/// half of that account which is a copy after all.
+/// rather than a copy of what was written — see [`redact_quoted`] for the half
+/// of that account which is a copy after all.
 fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
-    let message = redact_backticked(error.message());
+    let message = redact_quoted(error.message());
 
     // No span, or a span this text cannot place: the message is worth having
     // without a position, and a position that is not the mistake's is worse
@@ -935,36 +935,47 @@ fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Erro
     )
 }
 
-/// What a redacted backtick-quoted segment is replaced by.
+/// What a redacted quoted segment is replaced by.
 ///
 /// Backticks are kept around it so the sentence still reads the way the parser
-/// wrote it.
+/// wrote it, and they are kept whichever quotes the segment had: one marker to
+/// look for is worth more than a faithful copy of the punctuation around
+/// something that is no longer there.
 const REDACTED: &str = "`<redacted>`";
 
-/// Replaces every backtick-quoted segment of a parser message with [`REDACTED`].
+/// Replaces every quoted segment of a parser message with [`REDACTED`].
 ///
 /// Keeping the source line out of the error is not enough on its own, because
 /// `toml::de::Error::message` quotes the offending value itself whenever serde
-/// is the one that objected: `password = 8675309` renders as ``invalid type:
-/// integer `8675309`, expected a string``, and a boolean does the same. That is
-/// the password on stderr again, by a different route — and a route the shipped
-/// test missed, because the value it used was rejected by the lexer before serde
-/// ever saw one.
+/// is the one that objected. Which quotes it uses is decided by the type serde
+/// found, and both kinds carry a value: `password = 8675309` renders as
+/// ``invalid type: integer `8675309`, expected a string``, while anything serde
+/// reads as a string keeps its double quotes, so `users = ["user1:hunter2"]`
+/// renders as `invalid type: string "user1:hunter2", expected struct User` —
+/// credentials and all. Either way that is the password on stderr again by a
+/// different route, and the double-quoted route survived the first fix, which
+/// knew only about backticks.
 ///
-/// Backticks are what serde puts around a value, so every one of them goes.
+/// So both characters open a segment, and a segment ends at the same character
+/// that opened it: a backtick inside a double-quoted string belongs to the
+/// redaction rather than starting another one, which is what keeps a password
+/// containing a backtick from splitting its own rendering into "safe" halves.
 /// Keys are quoted the same way and are redacted with them; that costs the
 /// operator nothing the line and column do not still give them.
-fn redact_backticked(message: &str) -> String {
+fn redact_quoted(message: &str) -> String {
     let mut redacted = String::with_capacity(message.len());
     let mut rest = message;
 
-    while let Some(open) = rest.find('`') {
+    while let Some(open) = rest.find(is_quote) {
         redacted.push_str(&rest[..open]);
         redacted.push_str(REDACTED);
 
-        // An unpaired backtick opens a segment with no end, so everything after
-        // it is part of the redaction rather than part of the message.
-        let Some(close) = rest[open + 1..].find('`') else {
+        // Both quote characters are ASCII, so this byte is the whole character.
+        let quote = char::from(rest.as_bytes()[open]);
+
+        // An unpaired opening quote opens a segment with no end, so everything
+        // after it is part of the redaction rather than part of the message.
+        let Some(close) = rest[open + 1..].find(quote) else {
             return redacted;
         };
         rest = &rest[open + 1 + close + 1..];
@@ -972,6 +983,11 @@ fn redact_backticked(message: &str) -> String {
 
     redacted.push_str(rest);
     redacted
+}
+
+/// Whether `character` is one of the two a parser message quotes with.
+fn is_quote(character: char) -> bool {
+    character == '`' || character == '"'
 }
 
 /// The 1-based line and column of a byte offset into `text`, if it has one.
@@ -1155,9 +1171,9 @@ mod tests {
         }
     }
 
-    /// Wraps `password` in the smallest config that reaches the `[auth]` table,
-    /// with the password on line 7.
-    fn config_with_raw_password(password: &str) -> String {
+    /// Wraps `entry` in the smallest config that reaches the `[auth]` users
+    /// array, with the entry on line 7.
+    fn config_with_raw_user(entry: &str) -> String {
         format!(
             "[server]\n\
              listen = \"127.0.0.1:4433\"\n\
@@ -1165,8 +1181,33 @@ mod tests {
              key = \"/tmp/k.pem\"\n\
              [auth]\n\
              users = [\n\
-             {{ username = \"user1\", password = {password} }},\n\
+             {entry},\n\
              ]\n"
+        )
+    }
+
+    /// [`config_with_raw_user`] with `password` written into a user table, so
+    /// the password is the value serde rejects — on line 7.
+    fn config_with_raw_password(password: &str) -> String {
+        config_with_raw_user(&format!(
+            "{{ username = \"user1\", password = {password} }}"
+        ))
+    }
+
+    /// A secret written where an integer belongs, also on line 7.
+    ///
+    /// Nothing in `[limits]` is a credential, but what serde does with a string
+    /// does not depend on the key it was written under: this is the same leak in
+    /// a section an operator would never think to be careful in.
+    fn config_with_raw_max_connections(value: &str) -> String {
+        format!(
+            "[server]\n\
+             listen = \"127.0.0.1:4433\"\n\
+             cert = \"/tmp/c.pem\"\n\
+             key = \"/tmp/k.pem\"\n\
+             [limits]\n\
+             \n\
+             max_connections = {value}\n"
         )
     }
 
@@ -1177,7 +1218,7 @@ mod tests {
     /// on stderr at startup and into the journal on every `SIGHUP` reload — and
     /// `Restart=on-failure` makes the startup path repeat every few seconds.
     ///
-    /// Three ways of getting the quotes wrong, because they fail at different
+    /// Six ways of getting the quotes wrong, because they fail at different
     /// depths and only one of them was covered before. A bare word is rejected
     /// by the lexer, which never sees a value and so cannot quote one. An
     /// integer and a boolean are *valid* TOML values of the wrong type, and
@@ -1185,25 +1226,74 @@ mod tests {
     /// (``invalid type: integer `8675309`, expected a string``), which is the
     /// password on stderr by a route the caret block never touched.
     ///
+    /// The last three are the same objection about a value serde reads as a
+    /// *string*, which it renders in double quotes rather than backticks:
+    /// `invalid type: string "user1:hunter2", expected struct User`. A
+    /// redaction that knew only about backticks left every one of them
+    /// untouched, whatever section the mistake was in — and the third of them is
+    /// the case that decides where a segment ends, a secret with a backtick of
+    /// its own inside a double-quoted rendering.
+    ///
     /// Both renderings of an `anyhow` error are checked because the two print
     /// different things: `{:#}` walks the chain of messages, `{:?}` adds the
     /// sources and any backtrace.
     #[test]
     fn a_parse_error_does_not_echo_the_value_it_rejects() {
-        // A bare word, an integer and a boolean: the lexer's complaint and
-        // serde's two.
-        for (tag, secret) in [
-            ("bare", "correct-horse-battery-staple"),
-            ("integer", "8675309"),
-            ("boolean", "true"),
-        ] {
-            let file = TempConfig::write(tag, &config_with_raw_password(secret));
-            let error = Config::load(&file.0).expect_err("an unquoted password must not load");
+        // Tag, the broken config, what must not survive in the message, and
+        // whether the parser quoted a value at all: the lexer's complaint names
+        // none, so there is nothing there for the marker to replace.
+        let cases: [(&str, String, &[&str], bool); 6] = [
+            (
+                "bare",
+                config_with_raw_password("correct-horse-battery-staple"),
+                &["correct-horse-battery-staple"],
+                false,
+            ),
+            (
+                "integer",
+                config_with_raw_password("8675309"),
+                &["8675309"],
+                true,
+            ),
+            ("boolean", config_with_raw_password("true"), &["true"], true),
+            (
+                "string-for-struct",
+                config_with_raw_user("\"user1:hunter2\""),
+                &["hunter2"],
+                true,
+            ),
+            (
+                "string-for-integer",
+                config_with_raw_max_connections("\"correct-horse-battery-staple\""),
+                &["correct-horse-battery-staple"],
+                true,
+            ),
+            // A backtick inside the secret. With only backticks redacted, the
+            // one in the middle opened a segment that never closed and the
+            // message kept everything in front of it -- `hunter2` included.
+            (
+                "backticked-string",
+                config_with_raw_user("\"user1:hunter2`x\""),
+                &["hunter2"],
+                true,
+            ),
+        ];
+
+        for (tag, body, secrets, marked) in cases {
+            let file = TempConfig::write(tag, &body);
+            let error = Config::load(&file.0).expect_err("a mistyped value must not load");
 
             for rendered in [format!("{error:#}"), format!("{error:?}")] {
+                for secret in secrets {
+                    assert!(
+                        !rendered.contains(secret),
+                        "the {tag} value leaked {secret}: {rendered}"
+                    );
+                }
                 assert!(
-                    !rendered.contains(secret),
-                    "the {tag} password leaked: {rendered}"
+                    rendered.contains(REDACTED) == marked,
+                    "the {tag} value must {}leave a marker behind: {rendered}",
+                    if marked { "" } else { "not " }
                 );
                 assert!(
                     rendered.contains("line 7"),
