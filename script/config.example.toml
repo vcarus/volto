@@ -39,9 +39,10 @@ key = "/etc/volto/privkey.pem"
 # open proxy — anyone who can reach the port can use it. volto logs a warning at
 # startup when that is the case. Never expose it to the internet that way.
 #
-# The username may not contain a colon (RFC 7617). Comparison is constant-time.
-# Both `Proxy-Authorization` and `Authorization` are accepted, since Surge's
-# manual does not say which it sends.
+# The username may not contain a colon (RFC 7617) and may not be longer than
+# 32 bytes. Comparison is constant-time. Both `Proxy-Authorization` and
+# `Authorization` are accepted, since Surge's manual does not say which it
+# sends.
 users = [
   { username = "user1", password = "replace-me-with-something-long" },
   # { username = "user2", password = "..." },

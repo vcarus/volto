@@ -59,7 +59,8 @@ Options:
 Every option can also be given as an environment variable: BINARY, SNI, PORT,
 USERNAME, PASSWORD.
 
-The username must not contain a colon (RFC 7617). Neither the username nor the
+The username must not contain a colon (RFC 7617) and must be at most 32 bytes
+(volto refuses a longer one at startup). Neither the username nor the
 password may contain " \ | or &: the first two cannot be written into the
 generated TOML, and the other two are metacharacters of the substitution that
 writes it. Every other printable character is fine, and a generated password is
@@ -94,6 +95,15 @@ check_credentials() {
         *:*) die "username must not contain a colon (RFC 7617)" ;;
         '')  die "username must not be empty" ;;
     esac
+    # volto refuses a username longer than 32 bytes at startup (the length a
+    # user-id is carried at in the logs and the authentication failure
+    # counters). Catch it here so the service does not install and then loop
+    # under Restart=on-failure.
+    # Bytes, not characters: ${#var} counts characters in some shells, and the
+    # limit volto enforces is a byte length.
+    if [ "$(printf %s "$USERNAME" | wc -c)" -gt 32 ]; then
+        die "username must be at most 32 bytes"
+    fi
     case "$USERNAME$PASSWORD" in
         # Neither survives being written into a double-quoted TOML string.
         *'"'*|*\\*) die "username and password must not contain quotes or backslashes" ;;
