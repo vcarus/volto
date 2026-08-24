@@ -220,7 +220,8 @@ pub struct Context {
     /// the connection ends to report it on the closing line (D72); nothing here
     /// ever reads it back.
     pub tunnels: Arc<AtomicU64>,
-    /// How long a UDP session may sit idle.
+    /// How long a UDP session may sit idle, and how long a write in a
+    /// half-closed TCP tunnel's surviving direction may make no progress.
     pub idle_timeout: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///

@@ -610,6 +610,10 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 /// the request stream in that state, which is what the two tests below start
 /// from — they differ only in how the client then abandons it.
 ///
+/// One later caller has only one pump to park, its target having ended its own
+/// sending side before the upload begins. The upload loop is the same either
+/// way: what it needs of a target is that it does not read.
+///
 /// The two halves of the raw request stream come back still open.
 #[track_caller]
 fn park_both_pumps(
@@ -765,6 +769,240 @@ async fn a_clean_client_close_still_reaches_the_target_as_eof() {
         ConnectionEnd::Eof,
         "a clean half-close must stay a FIN: RFC 9114 §4.4 half-close semantics \
          depend on the target seeing an ordinary end of stream"
+    );
+}
+
+/// A one-second bound on a stalled write in a half-closed tunnel.
+///
+/// It is `[limits] udp_session_timeout`, which a CONNECT-UDP session's idle
+/// bound also comes from; one second is the smallest the config layer accepts.
+const HALF_CLOSED_TIMEOUT: &str = "[limits]\nudp_session_timeout = 1\n";
+
+/// How long the tests below give a bound of one second to fire.
+///
+/// Five times the bound, so only a tunnel that is never cut at all fails —
+/// never a slow machine.
+const CUT_WITHIN: Duration = Duration::from_secs(5);
+
+/// A client that finishes its sending side and then stops reading must not hold
+/// the tunnel open for the life of the connection.
+///
+/// The clean FIN ends the client → target pump through the one arm that raises
+/// no teardown, which is what leaves the surviving direction unwatched: it parks
+/// in `send_data` as soon as the client's flow-control window is spent, and
+/// nothing is left to raise a teardown that would end that wait. The target
+/// socket, its file descriptor and the tunnel slot were held until the QUIC
+/// connection ended — which this server's own keep-alives can postpone
+/// indefinitely.
+///
+/// Both halves of the cut are asserted: the target sees the connection go away,
+/// and the client sees its response direction cancelled rather than finished, so
+/// the download it abandoned cannot read back as a complete one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
+    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let (target, mut ended) = spawn_deaf_flooding_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    // The half-close, and then nothing: the target floods, the response
+    // direction's window is spent, and the proxy is parked in `send_data`.
+    // Reading here is what must not happen — a read would grant credit, the
+    // write would make progress, and its budget would start again.
+    stream.finish().expect("finish the sending side");
+
+    let end = tokio::time::timeout(CUT_WITHIN, ended.recv())
+        .await
+        .expect("a half-closed tunnel whose client stopped reading must be cut")
+        .expect("close notification");
+    assert!(
+        matches!(
+            end,
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ),
+        "the target must see the connection go away, got {end:?}"
+    );
+
+    // And the client's own half is cancelled rather than left to a FIN, which a
+    // truncated response would otherwise be indistinguishable from.
+    let error = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!(
+                    "an abandoned download reached the client as a clean end of stream: a \
+                     truncated response is indistinguishable from a complete one"
+                ),
+                Err(error) => return error,
+            }
+        }
+    })
+    .await
+    .expect("the reset arrived");
+    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+}
+
+/// A TCP target that writes `total` bytes, ends its sending side, and then
+/// drains whatever the client sends.
+///
+/// `total` is meant to be past the client's stream flow-control window, so the
+/// proxy is parked in `send_data` for as long as the client declines to read.
+/// Ending its own sending side afterwards is what lets the client tell a tunnel
+/// that survived from one that was cut: the bytes all arrive and the stream then
+/// ends cleanly.
+async fn spawn_bounded_flood_target(total: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let payload = vec![0x5au8; 64 * 1024];
+                let mut written = 0usize;
+                while written < total {
+                    let take = payload.len().min(total - written);
+                    if socket.write_all(&payload[..take]).await.is_err() {
+                        return;
+                    }
+                    written += take;
+                }
+                // EOF on this side only; the read side stays open so the
+                // half-close under test is the client's to make.
+                let _ = socket.shutdown().await;
+
+                let mut buf = [0u8; 4096];
+                while let Ok(read) = socket.read(&mut buf).await {
+                    if read == 0 {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+
+    addr
+}
+
+/// The pin on the bound above: a tunnel whose client has **not** finished its
+/// sending side is left alone, however long a write parks.
+///
+/// This is the case the bound must not reach, and the reason it is gated on the
+/// half-close rather than armed for every write. While both directions are live
+/// each pump is the other's watchdog — a client that has abandoned the stream is
+/// noticed by the read pump or by the reset watcher beside its write — so a
+/// stalled write there is a client that is merely slow, and cutting it would
+/// break every tunnel whose client pauses longer than an idle timeout before
+/// reading on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_whose_client_has_not_finished_survives_a_long_stall() {
+    /// Comfortably past the client's 1.25 MB stream flow-control window, so the
+    /// proxy really is parked in `send_data` during the stall below.
+    const TOTAL: usize = 4 * 1024 * 1024;
+
+    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let target = spawn_bounded_flood_target(TOTAL).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    // Not a byte read for well over the bound, and the sending side left open.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+
+    // The tunnel must still be there, and must still owe every byte.
+    let received = tokio::time::timeout(TIMEOUT, read_to_end(&mut stream))
+        .await
+        .expect("the download must finish within the bound");
+    assert_eq!(
+        received.len(),
+        TOTAL,
+        "a tunnel whose client has not half-closed must survive a stall and finish its download"
+    );
+}
+
+/// A TCP target that ends its sending side at once and then stops reading until
+/// it is told to look at the socket.
+///
+/// The mirror of [`spawn_deaf_flooding_target`]: there the *client* makes the
+/// clean end and stops reading, here the target does. Reading is deferred rather
+/// than merely slow because a read is exactly what must not happen while the
+/// proxy's write is meant to be stalling; the deferred read is what makes the
+/// end of the connection observable afterwards.
+async fn spawn_eof_then_deaf_target() -> (
+    SocketAddr,
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::mpsc::Receiver<ConnectionEnd>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+    let (look, told_to_look) = tokio::sync::oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        // The clean end this test is about: EOF on the target's sending side,
+        // with its receiving side still open.
+        let _ = socket.shutdown().await;
+
+        if told_to_look.await.is_err() {
+            return;
+        }
+
+        let mut buf = [0u8; 4096];
+        let end = loop {
+            match socket.read(&mut buf).await {
+                Ok(0) => break ConnectionEnd::Eof,
+                Ok(_) => {}
+                Err(error) => break ConnectionEnd::Failed(error.kind()),
+            }
+        };
+        let _ = tx.send(end).await;
+    });
+
+    (addr, look, rx)
+}
+
+/// The mirror of the bound above, in the other direction: a target that reaches
+/// EOF and then stops reading must not hold the tunnel open either.
+///
+/// Target EOF ends the target → client pump through its own no-teardown arm, so
+/// the client → target pump is the one left unwatched — parked in `write_all` on
+/// a target that has stopped taking bytes, with the client still uploading. The
+/// verdict differs from its mirror because the party at fault does: the target
+/// is, so the client's sending side is stopped with `H3_CONNECT_ERROR` rather
+/// than cancelled, and the target socket is closed with a reset.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_that_stops_reading_after_its_own_eof_is_cut() {
+    let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
+    let (target, look, mut ended) = spawn_eof_then_deaf_target().await;
+    let client = H3Client::connect(&server).await;
+
+    // Only one pump is left to park: the other returned at the target's EOF.
+    let (send, _recv) = park_both_pumps(&client.quic, target).await;
+
+    let stopped = tokio::time::timeout(CUT_WITHIN, send.stopped())
+        .await
+        .expect("a half-closed tunnel whose target stopped reading must be cut")
+        .expect("stop code");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(H3_CONNECT_ERROR),
+        "a target that stopped taking bytes is a failure of the target connection"
+    );
+
+    // The target's own end of it, once it finally looks: a reset rather than the
+    // FIN a tunnel that was seen through would leave.
+    look.send(()).expect("wake the target");
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target socket must not outlive the tunnel")
+        .expect("close notification");
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "a tunnel cut short must reach the target as a reset, not as a clean end of stream"
     );
 }
 

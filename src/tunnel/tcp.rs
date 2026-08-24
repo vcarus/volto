@@ -22,6 +22,32 @@
 //!
 //! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
+//!
+//! # What bounds the waits
+//!
+//! While both directions are live nothing here is on a timer, and nothing needs
+//! to be: each pump is the other's watchdog. A client that abandons the request
+//! stream is met by the read pump, or -- when that pump is parked in a write --
+//! by the `Reader::reset_by_peer` arm beside it; a target that fails is met by
+//! whichever pump touches the socket next. Every one of those raises a teardown,
+//! and a teardown is what ends the other pump's wait.
+//!
+//! The first two rows of the table above take that watchdog away, because they
+//! are the two endings that end a direction *without* a teardown: the pump
+//! returns, and the surviving direction is left with nobody watching it. A
+//! client that finishes its sending side and then stops granting flow-control
+//! credit, or a target that reaches EOF and then stops reading, would hold the
+//! target socket, its file descriptor and the tunnel slot for as long as the
+//! QUIC connection lasts -- which keep-alives can make indefinite.
+//!
+//! So from the moment one direction has ended cleanly, each write in the
+//! surviving direction is bounded by `[limits] udp_session_timeout`, the same
+//! knob a CONNECT-UDP session's idle bound comes from. Progress rearms it --
+//! each write gets its own budget -- so a client that keeps reading may take
+//! hours to drain a download after its FIN; only a write that makes no progress
+//! at all for a whole one of those trips it. A tunnel whose two directions are
+//! both still open is untouched however long a write parks, because there the
+//! other pump is still the watchdog.
 
 use std::io;
 use std::net::SocketAddr;
@@ -108,6 +134,59 @@ enum Teardown {
     ClientAbort,
     /// The connection to the target failed, in either direction.
     TargetError,
+}
+
+/// One direction's clean ending, and the bound it puts on the other's writes.
+///
+/// Deliberately *not* a [`Teardown`] variant. A clean FIN is not an abnormal
+/// end and must not reach the other pump as one: the teardown channel's whole
+/// job is to say which party failed, and a sticky "the client finished" on it
+/// would have every exit arm asking whether this teardown is really a teardown.
+/// A separate flag says only what it says, and only the two `select!` arms that
+/// need it ever look.
+struct HalfClose {
+    /// Raised when *this* direction reaches the ending that raises no teardown:
+    /// the client's FIN in one pump, the target's EOF in the other.
+    ///
+    /// The receiver keeps the value after this sender is dropped, which is what
+    /// lets the pump that raises it return immediately afterwards.
+    mine: watch::Sender<bool>,
+    /// The other direction's flag.
+    other: watch::Receiver<bool>,
+    /// How long a write may make no progress once `other` is set.
+    budget: Duration,
+}
+
+impl HalfClose {
+    /// Records that this direction has ended cleanly.
+    fn ended(&self) {
+        // Fails only if the other pump has already dropped its receiver, which
+        // means it has ended too and there is nothing left to bound.
+        let _ = self.mine.send(true);
+    }
+
+    /// Resolves once the other direction has ended cleanly and this one has
+    /// then made no progress for a whole budget.
+    ///
+    /// Cancel-safe by construction rather than by care: the caller builds a
+    /// fresh one of these per write, so the sleep it ends with is the budget
+    /// for *that* write and progress on the previous one has already reset it.
+    /// Awaiting the flag before the sleep is what also catches a FIN that lands
+    /// while a write is already parked -- the arm is armed at the write's first
+    /// poll, whether or not the other direction has ended by then.
+    async fn stalled(&mut self) {
+        while !*self.other.borrow_and_update() {
+            if self.other.changed().await.is_err() {
+                // The other pump dropped its sender without ever ending
+                // cleanly, so it ended some other way -- and every other way
+                // raises a teardown, which is the arm that acts on it. Nothing
+                // for this one to do but stay out of the way.
+                return std::future::pending().await;
+            }
+        }
+
+        tokio::time::sleep(self.budget).await;
+    }
 }
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
@@ -205,9 +284,33 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // The sender lives here, outliving both pumps.
     let (teardown, teardown_rx) = watch::channel(Teardown::Running);
 
+    // The two clean endings, each watched by the direction it leaves alone.
+    let (client_finished, client_finished_rx) = watch::channel(false);
+    let (target_eof, target_eof_rx) = watch::channel(false);
+
     tokio::join!(
-        client_to_target(reader, tcp_write, &teardown, teardown_rx.clone()),
-        target_to_client(writer, tcp_read, &teardown, teardown_rx),
+        client_to_target(
+            reader,
+            tcp_write,
+            &teardown,
+            teardown_rx.clone(),
+            HalfClose {
+                mine: client_finished,
+                other: target_eof_rx,
+                budget: ctx.idle_timeout,
+            },
+        ),
+        target_to_client(
+            writer,
+            tcp_read,
+            &teardown,
+            teardown_rx,
+            HalfClose {
+                mine: target_eof,
+                other: client_finished_rx,
+                budget: ctx.idle_timeout,
+            },
+        ),
     );
 
     debug!(stream_id, authority, "tcp tunnel closed");
@@ -298,7 +401,10 @@ async fn client_to_target(
     mut tcp_write: OwnedWriteHalf,
     teardown: &watch::Sender<Teardown>,
     mut teardown_rx: watch::Receiver<Teardown>,
+    mut half: HalfClose,
 ) {
+    let budget = half.budget;
+
     // The two places that can notice a teardown — the wait for the client's
     // next chunk and the write of the one already in hand — end this direction
     // identically, and `OwnedWriteHalf::forget` consumes the half, so the
@@ -356,6 +462,29 @@ async fn client_to_target(
                         client_aborted(&error, tcp_write, teardown);
                         return;
                     }
+                    // The mirror of the arm in `target_to_client`, and the same
+                    // argument in the other direction: once the target has sent
+                    // its EOF, the pump that would have noticed it stall is
+                    // gone, and a target that stops *reading* parks this write
+                    // for the life of the QUIC connection. It arms only after
+                    // that EOF, and it goes last for the reason the watcher
+                    // above does.
+                    () = half.stalled() => {
+                        debug!(
+                            timeout_secs = budget.as_secs(),
+                            "target stopped reading after its own EOF, cutting the tunnel"
+                        );
+                        // The target is the party at fault, which is what the
+                        // write-error arm below reports too. This one adds the
+                        // abortive close, because unlike there the socket is
+                        // still open: the target must not read a polite FIN off
+                        // a tunnel this server cut.
+                        reader.stop_receiving(h3api::CONNECT_ERROR);
+                        abort_target(tcp_write.as_ref());
+                        tcp_write.forget();
+                        let _ = teardown.send(Teardown::TargetError);
+                        return;
+                    }
                 };
 
                 if let Err(error) = written {
@@ -370,6 +499,11 @@ async fn client_to_target(
             // and leave the other direction running, so anything the target
             // still has to say reaches the client.
             Ok(None) => {
+                // Raised before the shutdown rather than after it, because this
+                // is the moment the other direction loses its watchdog: from
+                // here nothing but its own bound is left to notice a client
+                // that stops reading what it asked for.
+                half.ended();
                 if let Err(error) = tcp_write.shutdown().await {
                     debug!(%error, "failed to shut down the target write side");
                 }
@@ -440,7 +574,9 @@ async fn target_to_client(
     mut tcp_read: OwnedReadHalf,
     teardown: &watch::Sender<Teardown>,
     mut teardown_rx: watch::Receiver<Teardown>,
+    mut half: HalfClose,
 ) {
+    let budget = half.budget;
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
     // Both places that can notice a teardown -- the wait for the target's next
@@ -460,6 +596,10 @@ async fn target_to_client(
             // Target EOF: finish our sending side only. The client may still
             // have data for the target.
             Ok(0) => {
+                // As in the opposite pump: raised first, because this is the
+                // moment the client -> target direction is left with no
+                // watchdog but its own bound.
+                half.ended();
                 if let Err(error) = writer.finish() {
                     debug!(%error, "failed to finish the response stream");
                 }
@@ -494,6 +634,34 @@ async fn target_to_client(
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
                     sent = writer.send_data(data) => sent,
+                    // Once the client has finished its sending side, the pump
+                    // that would have noticed it stop reading is gone -- its
+                    // `Ok(None)` arm raises no teardown, by design -- so this
+                    // write is all that is left to notice, and it would
+                    // otherwise park until the connection ends. Last in the
+                    // order for the reason the watcher in `client_to_target`
+                    // is: a write that completes on its first poll never arms
+                    // the timer at all.
+                    () = half.stalled() => {
+                        debug!(
+                            timeout_secs = budget.as_secs(),
+                            "client stopped reading after its own FIN, cutting the tunnel"
+                        );
+                        // Reset rather than left to a FIN, and for the reason
+                        // the teardown arm below is: this write was abandoned
+                        // part-way, so the DATA frame on the wire is truncated
+                        // and only a RESET_STREAM behind it stops that
+                        // truncation reading as a complete response. The same
+                        // argument, with RFC 9114 §7.1 quoted, is above.
+                        writer.reset(h3api::REQUEST_CANCELLED);
+                        abort_target(tcp_read.as_ref());
+                        // Nobody is listening -- the other pump returned when
+                        // the client finished -- but every other exit from this
+                        // loop says why it left, and an exit that quietly did
+                        // not would be the one to misread later.
+                        let _ = teardown.send(Teardown::ClientAbort);
+                        return;
+                    }
                 };
 
                 if let Err(error) = sent {
@@ -575,11 +743,14 @@ fn ensure_window(buf: &mut BytesMut) {
 /// Setting the option has no effect until the socket is closed, so arming it on
 /// the way out cannot disturb anything still in flight.
 ///
-/// **This is only ever called on the two client-abort paths.** A clean client
-/// FIN, a target EOF, and a target that resets or errors all keep their existing
-/// FIN semantics — the half-close table at the top of this module is the
-/// behaviour this proxy exists to get right, and a reset is not a substitute for
-/// any of it.
+/// **This is only ever called on a path that cuts a live tunnel short**: the two
+/// client aborts, and the two bounds that fire when a half-closed tunnel's
+/// surviving direction stalls. A clean client FIN, a target EOF, and a target
+/// that resets or errors all keep their existing FIN semantics — the half-close
+/// table at the top of this module is the behaviour this proxy exists to get
+/// right, and a reset is not a substitute for any of it. The bounds are on the
+/// abortive side of that line because they leave a transfer unfinished: a FIN
+/// would tell the target the tunnel was seen through.
 ///
 /// `set_linger` is deprecated in tokio because `SO_LINGER` can make a close block
 /// the thread while the send buffer drains. That is the *non-zero* timeout; at

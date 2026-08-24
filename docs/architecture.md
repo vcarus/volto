@@ -162,6 +162,24 @@ Collapsing this into "one side closes, everything closes" breaks every protocol
 that depends on half-close. The abnormal paths coordinate through a sticky
 `watch` teardown channel so that neither pump can strand the other.
 
+While both directions are live, each pump is the other's watchdog and nothing in
+a tunnel is on a timer: whatever one pump notices — a reset stream, a target
+that fails — raises a teardown, and that teardown is what ends the other's wait.
+The first two rows above are the endings that take the watchdog away, because
+they end a direction without a teardown. So from the moment one direction has
+ended cleanly, each write in the surviving direction is bounded by `[limits]
+udp_session_timeout` — the same knob a CONNECT-UDP session's idle bound comes
+from — and a write that makes no progress for a whole one of those cuts the
+tunnel: the request stream is reset (`H3_REQUEST_CANCELLED` when it is the
+client that stopped reading after its own FIN, `H3_CONNECT_ERROR` when it is the
+target that stopped reading after its own EOF) and the target socket is closed
+with a reset. Progress rearms the bound, so a client that keeps reading may take
+hours to drain a download after its FIN; a tunnel whose two directions are both
+still open is never on a timer at all, however long a write parks. Without it, a
+half-closed tunnel whose surviving peer went quiet held the target socket, its
+file descriptor and the tunnel slot until the QUIC connection ended — which this
+server's own keep-alives can postpone indefinitely.
+
 The last row cancels both directions because RFC 9114 §4.4 asks for it: "If the
 stream is reset or reading is aborted by the client, a proxy SHOULD perform the
 same operation on the other direction in order to ensure that both directions of
