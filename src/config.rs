@@ -914,42 +914,85 @@ const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 /// The operator loses nothing they need: the file, the line and the column are
 /// all still named, which is what it takes to find a typo. What the message
 /// carries is the parser's account of what it found and what it expected there,
-/// rather than a copy of what was written.
+/// rather than a copy of what was written — see [`redact_backticked`] for the
+/// half of that account which is a copy after all.
 fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
-    let Some(span) = error.span() else {
-        return anyhow!(
-            "failed to parse config file {}: {}",
-            path.display(),
-            error.message()
-        );
+    let message = redact_backticked(error.message());
+
+    // No span, or a span this text cannot place: the message is worth having
+    // without a position, and a position that is not the mistake's is worse
+    // than none.
+    let Some((line, column)) = error
+        .span()
+        .and_then(|span| line_and_column(text, span.start))
+    else {
+        return anyhow!("failed to parse config file {}: {message}", path.display());
     };
 
-    let (line, column) = line_and_column(text, span.start);
     anyhow!(
-        "failed to parse config file {} at line {line}, column {column}: {}",
-        path.display(),
-        error.message()
+        "failed to parse config file {} at line {line}, column {column}: {message}",
+        path.display()
     )
 }
 
-/// The 1-based line and column of a byte offset into `text`.
+/// What a redacted backtick-quoted segment is replaced by.
+///
+/// Backticks are kept around it so the sentence still reads the way the parser
+/// wrote it.
+const REDACTED: &str = "`<redacted>`";
+
+/// Replaces every backtick-quoted segment of a parser message with [`REDACTED`].
+///
+/// Keeping the source line out of the error is not enough on its own, because
+/// `toml::de::Error::message` quotes the offending value itself whenever serde
+/// is the one that objected: `password = 8675309` renders as ``invalid type:
+/// integer `8675309`, expected a string``, and a boolean does the same. That is
+/// the password on stderr again, by a different route — and a route the shipped
+/// test missed, because the value it used was rejected by the lexer before serde
+/// ever saw one.
+///
+/// Backticks are what serde puts around a value, so every one of them goes.
+/// Keys are quoted the same way and are redacted with them; that costs the
+/// operator nothing the line and column do not still give them.
+fn redact_backticked(message: &str) -> String {
+    let mut redacted = String::with_capacity(message.len());
+    let mut rest = message;
+
+    while let Some(open) = rest.find('`') {
+        redacted.push_str(&rest[..open]);
+        redacted.push_str(REDACTED);
+
+        // An unpaired backtick opens a segment with no end, so everything after
+        // it is part of the redaction rather than part of the message.
+        let Some(close) = rest[open + 1..].find('`') else {
+            return redacted;
+        };
+        rest = &rest[open + 1 + close + 1..];
+    }
+
+    redacted.push_str(rest);
+    redacted
+}
+
+/// The 1-based line and column of a byte offset into `text`, if it has one.
 ///
 /// The `toml` crate reports a span and renders the position itself, but only as
 /// part of the caret block [`parse_error`] exists to avoid, so the arithmetic is
 /// repeated here. Columns are counted in characters rather than bytes, which is
 /// what an editor shows.
-fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
-    // An offset past the end, or one landing inside a multi-byte character,
-    // cannot be placed: the position is a convenience on the way to an error
-    // message and must not become a panic of its own.
-    let Some(before) = text.get(..offset) else {
-        return (1, 1);
-    };
+///
+/// `None` for an offset past the end of `text` or one landing inside a
+/// multi-byte character: the position is a convenience on the way to an error
+/// message, so it must not become a panic of its own — and it must not become a
+/// fabricated line 1, column 1 either, which would send the operator to a line
+/// that is not the one at fault.
+fn line_and_column(text: &str, offset: usize) -> Option<(usize, usize)> {
+    let before = text.get(..offset)?;
 
     let line = before.matches('\n').count() + 1;
     let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
 
-    (line, column)
+    Some((line, column))
 }
 
 /// Levels accepted as a bare `log.level`.
@@ -1089,51 +1132,124 @@ mod tests {
         }
     }
 
-    /// A syntax error must name where it is, and must not quote what is there.
+    /// A file that removes itself however the test ends.
+    ///
+    /// The test below writes a password into the system temp directory, and a
+    /// plain `remove_file` after the assertions only cleans up when they all
+    /// pass — the failing run, the one somebody is about to go and look at, is
+    /// exactly the run that would leave the file behind.
+    struct TempConfig(std::path::PathBuf);
+
+    impl TempConfig {
+        fn write(tag: &str, body: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("volto-config-{tag}-{}.toml", std::process::id()));
+            std::fs::write(&path, body).expect("write the broken config");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Wraps `password` in the smallest config that reaches the `[auth]` table,
+    /// with the password on line 7.
+    fn config_with_raw_password(password: &str) -> String {
+        format!(
+            "[server]\n\
+             listen = \"127.0.0.1:4433\"\n\
+             cert = \"/tmp/c.pem\"\n\
+             key = \"/tmp/k.pem\"\n\
+             [auth]\n\
+             users = [\n\
+             {{ username = \"user1\", password = {password} }},\n\
+             ]\n"
+        )
+    }
+
+    /// A parse error must name where it is, and must not quote what is there.
     ///
     /// The `toml` crate renders a parse error as the offending source line under
     /// a caret, so a typo on a `password = ...` line used to print the password
     /// on stderr at startup and into the journal on every `SIGHUP` reload — and
-    /// `Restart=on-failure` makes the startup path repeat every few seconds. The
-    /// missing quotes below are that typo, and both renderings of an `anyhow`
-    /// error are checked because the two print different things: `{:#}` walks
-    /// the chain of messages, `{:?}` adds the sources and any backtrace.
+    /// `Restart=on-failure` makes the startup path repeat every few seconds.
+    ///
+    /// Three ways of getting the quotes wrong, because they fail at different
+    /// depths and only one of them was covered before. A bare word is rejected
+    /// by the lexer, which never sees a value and so cannot quote one. An
+    /// integer and a boolean are *valid* TOML values of the wrong type, and
+    /// there serde is the one that objects — with the value in its message
+    /// (``invalid type: integer `8675309`, expected a string``), which is the
+    /// password on stderr by a route the caret block never touched.
+    ///
+    /// Both renderings of an `anyhow` error are checked because the two print
+    /// different things: `{:#}` walks the chain of messages, `{:?}` adds the
+    /// sources and any backtrace.
     #[test]
-    fn a_syntax_error_does_not_echo_the_line_it_is_on() {
-        const SECRET: &str = "correct-horse-battery-staple";
+    fn a_parse_error_does_not_echo_the_value_it_rejects() {
+        // A bare word, an integer and a boolean: the lexer's complaint and
+        // serde's two.
+        for (tag, secret) in [
+            ("bare", "correct-horse-battery-staple"),
+            ("integer", "8675309"),
+            ("boolean", "true"),
+        ] {
+            let file = TempConfig::write(tag, &config_with_raw_password(secret));
+            let error = Config::load(&file.0).expect_err("an unquoted password must not load");
 
-        let path = std::env::temp_dir().join(format!(
-            "volto-config-syntax-error-{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            format!(
-                "[server]\n\
-                 listen = \"127.0.0.1:4433\"\n\
-                 cert = \"/tmp/c.pem\"\n\
-                 key = \"/tmp/k.pem\"\n\
-                 [auth]\n\
-                 users = [\n\
-                 {{ username = \"user1\", password = {SECRET} }},\n\
-                 ]\n"
-            ),
-        )
-        .expect("write the broken config");
-
-        let error = Config::load(&path).expect_err("an unquoted value must not load");
-        let _ = std::fs::remove_file(&path);
-
-        for rendered in [format!("{error:#}"), format!("{error:?}")] {
-            assert!(
-                !rendered.contains(SECRET),
-                "the password on the offending line leaked: {rendered}"
-            );
-            assert!(
-                rendered.contains("line 7"),
-                "the operator still has to be told where the mistake is: {rendered}"
-            );
+            for rendered in [format!("{error:#}"), format!("{error:?}")] {
+                assert!(
+                    !rendered.contains(secret),
+                    "the {tag} password leaked: {rendered}"
+                );
+                assert!(
+                    rendered.contains("line 7"),
+                    "the operator still has to be told where the mistake is: {rendered}"
+                );
+            }
         }
+    }
+
+    /// The redaction has to leave the parser's account of the mistake behind.
+    ///
+    /// A message with the value cut out of it is only useful if what is left
+    /// still says what went wrong, so this pins the shape rather than only the
+    /// absence: the type serde found, the type it wanted, and a marker where the
+    /// value was.
+    #[test]
+    fn a_rejected_value_is_replaced_rather_than_dropped() {
+        let file = TempConfig::write("typed", &config_with_raw_password("8675309"));
+        let error = Config::load(&file.0).expect_err("an integer password must not load");
+        let rendered = format!("{error:#}");
+
+        assert!(
+            rendered.contains(REDACTED),
+            "the value must leave a marker behind: {rendered}"
+        );
+        assert!(
+            rendered.contains("invalid type") && rendered.contains("expected a string"),
+            "the parser's account of the mistake must survive: {rendered}"
+        );
+    }
+
+    /// A span the text cannot place must cost the position, not the message.
+    ///
+    /// `line_and_column` used to answer line 1, column 1 for an offset past the
+    /// end of the file or one landing inside a multi-byte character, which sends
+    /// the operator to a line that is not the one at fault.
+    #[test]
+    fn an_unplaceable_offset_has_no_position() {
+        let text = "a = \"é\"\n";
+
+        assert_eq!(line_and_column(text, 0), Some((1, 1)));
+        // Column 7 rather than the byte offset's 8: the accented character is
+        // two bytes and one column, which is what an editor shows.
+        assert_eq!(line_and_column(text, 7), Some((1, 7)));
+        assert_eq!(line_and_column(text, 6), None, "inside a character");
+        assert_eq!(line_and_column(text, 99), None, "past the end");
     }
 
     #[test]
