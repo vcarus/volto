@@ -31,7 +31,10 @@ whole and the running configuration keeps serving; see
 |---|---|---|---|
 | `users` | array of tables | `[]` | List of `{ username, password }`. **An empty list disables authentication and makes this an open proxy**; volto warns at startup when that is the case |
 
-A username may not contain a colon (RFC 7617). Credentials are compared in
+A username may not contain a colon (RFC 7617), and may not be longer than 32
+bytes — the length a user-id is carried at in a log line, and therefore the
+length authentication failures are bucketed under, so a longer name could never
+have its failures cleared by its own success. Credentials are compared in
 constant time. Both `Proxy-Authorization` (preferred) and `Authorization` are
 accepted, because Surge's manual does not say which it sends; a failed check is
 answered with 407 and `Proxy-Authenticate: Basic`.

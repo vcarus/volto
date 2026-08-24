@@ -741,6 +741,29 @@ impl Config {
                      in HTTP Basic credentials"
                 );
             }
+            if user.username.len() > crate::logfmt::MAX_TOKEN {
+                // A user-id this long is unusable in a subtler way. Failures are
+                // bucketed by the user-id the request claimed, in the form a log
+                // line carries it -- truncated at `logfmt::MAX_TOKEN` -- so a
+                // name past that bound never matches the configured one, and its
+                // failures land in the bucket no success can clear. The client
+                // that really does hold those credentials would then lose its
+                // connection at the `security.max_auth_failures`-th lifetime
+                // failure however often it authenticates in between. Refusing
+                // the name here is what makes that state unreachable.
+                //
+                // The name is not echoed: it is not a secret, but it lives in
+                // the same table as one, and nothing out of `[auth]` goes to
+                // stderr -- see `parse_error`. The index and the limit are what
+                // it takes to find and fix it.
+                bail!(
+                    "auth.users[{i}].username is {} bytes, over the {}-byte limit a user-id has \
+                     to stay within to be told apart in the logs and in the authentication \
+                     failure counters",
+                    user.username.len(),
+                    crate::logfmt::MAX_TOKEN
+                );
+            }
             if user.password.is_empty() {
                 bail!("auth.users[{i}].password is empty");
             }
@@ -1488,6 +1511,52 @@ mod tests {
             let err = parse(body).validate().expect_err("must be rejected");
             assert!(err.to_string().contains(expected), "{err}");
         }
+    }
+
+    /// A user-id longer than a log line carries whole is refused at load.
+    ///
+    /// Not a style rule: such a name can never be cleared by its own success.
+    /// A failure that names it is charged by the truncated copy the log format
+    /// hands out, which matches no configured user, so it lands in the bucket
+    /// no success ever clears — and the client that really does hold those
+    /// credentials loses the connection on the fifth lifetime failure however
+    /// often it authenticates in between. Refusing the configuration is what
+    /// makes that state unreachable.
+    ///
+    /// The limit is exactly the log format's, and the message must name it
+    /// without echoing the user-id: a name is not a password, but it sits next
+    /// to one in the same table, and this file's whole discipline is that
+    /// nothing out of `[auth]` reaches stderr.
+    #[test]
+    fn an_over_long_username_is_rejected_without_echoing_it() {
+        let username = "u".repeat(crate::logfmt::MAX_TOKEN + 1);
+        let err = parse(&format!(
+            "[auth]\nusers = [{{ username = \"{username}\", password = \"p\" }}]"
+        ))
+        .validate()
+        .expect_err("a user-id past the log bound must be rejected");
+        let rendered = err.to_string();
+
+        assert!(
+            rendered.contains("auth.users[0].username"),
+            "the operator has to be told which entry it is: {rendered}"
+        );
+        assert!(
+            rendered.contains(&crate::logfmt::MAX_TOKEN.to_string()),
+            "the message has to name the limit: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&username),
+            "the name itself must not be echoed: {rendered}"
+        );
+
+        // The limit itself is legal, so the rejection is of what is past it
+        // rather than of a length that merely approaches it.
+        let cfg = parse(&format!(
+            "[auth]\nusers = [{{ username = \"{}\", password = \"p\" }}]",
+            "u".repeat(crate::logfmt::MAX_TOKEN)
+        ));
+        assert_valid_apart_from_certs(&cfg, "a user-id exactly at the log bound");
     }
 
     #[test]

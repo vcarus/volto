@@ -38,7 +38,13 @@ pub const ABSENT: &str = "-";
 ///
 /// `connect-udp` is 11 bytes and a plausible user-id is shorter still, so
 /// nothing this server expects to see is ever cut.
-const MAX_TOKEN: usize = 32;
+///
+/// Visible to the crate because one thing depends on it beyond the shape of a
+/// log line: [`crate::config`] refuses a configured user-id longer than this,
+/// since a failure naming one would be charged under the truncated copy
+/// [`bounded_bytes`] hands out and could never be cleared by that user's own
+/// success. That rule and this bound have to be the same number.
+pub(crate) const MAX_TOKEN: usize = 32;
 
 /// Caps a peer-chosen token at what a log line can afford to carry.
 ///
