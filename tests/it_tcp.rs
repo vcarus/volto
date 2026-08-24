@@ -16,6 +16,7 @@ use common::{
     spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
     TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
+use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -273,23 +274,24 @@ async fn spawn_stalling_counting_target() -> SocketAddr {
     addr
 }
 
-/// A client FIN that has already been drained is not an abort, and the tunnel
-/// must finish the upload it is still carrying.
+/// A client FIN that arrives mid-upload is not an abort, and the tunnel must
+/// finish the upload it is still carrying.
 ///
-/// This is the state `Reader::reset_by_peer` keeps its "the peer finished and
-/// everything it sent has been read" arm for: the client's whole body and its
-/// FIN are off the QUIC stream, so the watcher a parked write polls can no
-/// longer be woken by anything -- there is no reset left to arrive on a stream
-/// the peer has already finished. Reporting the end of that stream as a reset
-/// instead would tear the tunnel down as a client abort, and the target would be
-/// cut off part-way through the upload it is still draining rather than seeing
-/// it out and answering.
+/// The sequence is the one a stalled upload produces: the client's body and its
+/// FIN are all inside quinn on the server, the relay is parked in a write to a
+/// target that is draining a sip at a time, and the watcher beside that write
+/// (`Reader::reset_by_peer`) is polled over and over while the reading half is
+/// nowhere near the end of the stream. A watcher that reported any of that as a
+/// reset would tear the tunnel down as a client abort, and the target would be
+/// cut off part-way through the upload rather than seeing it out and answering.
 ///
-/// Whether the relay is really left parked at that instant is the target's job
-/// to arrange, and it depends on how finely the kernel opens a receive window;
-/// see [`spawn_stalling_counting_target`]. The assertion below holds either way
-/// -- it is the ordinary stalled-upload half-close -- and it is what turns that
-/// arm answering "reset" into a failure wherever the state is reached.
+/// What it does *not* reliably reach is the watcher's drained arm -- the one for
+/// a stream whose bytes are all read and whose FIN is in. Whether the relay is
+/// ever left in that exact state depends on how finely the kernel opens a
+/// receive window (see [`spawn_stalling_counting_target`]), and on the hosts
+/// this suite runs on it never is: the last piece always completes. That arm is
+/// pinned directly instead, over a bare stream pair, by
+/// [`a_drained_stream_is_not_a_reset_to_the_watcher`].
 ///
 /// The target's stall is two orders of magnitude under the tunnel's idle bound,
 /// so what this pins is the watcher and not that bound.
@@ -325,6 +327,132 @@ async fn a_drained_client_fin_is_not_a_reset() {
         (FRAMES * FRAME).to_string(),
         "the target must see every byte of the upload and a clean EOF, and its \
          answer must reach the client"
+    );
+}
+
+/// A bare QUIC server endpoint with a self-signed certificate.
+///
+/// [`TestServer`] is the whole proxy and hands nothing of its HTTP/3 connection
+/// back; the test below needs the *server* side of one in its own hands, so it
+/// builds the endpoint itself. Everything else about it -- TLS 1.3, the `h3`
+/// ALPN, a loopback port -- is what `volto::tls` and `volto::quic` would have
+/// produced.
+fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate a self-signed certificate");
+    let certificate = issued.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .expect("a usable certificate and key");
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic tls"),
+    ));
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("bind address"))
+        .expect("bind the server endpoint");
+
+    (endpoint, certificate)
+}
+
+/// The watcher's drained arm: a stream the peer finished and this end has read
+/// out is not a reset, and never becomes one.
+///
+/// `Reader::reset_by_peer` is what a parked write selects on, and it must
+/// resolve for exactly one thing -- a RESET_STREAM from the peer. It watches by
+/// asking for a zero-length read, which parks while the stream has nothing to
+/// give; the case that needs deciding is the one where the stream *is* over,
+/// every byte read and the FIN taken, because there the read returns at once
+/// and there is nothing left to be woken by. The answer is that the wait simply
+/// never ends: the ending belongs to the reading half, and resolving here would
+/// turn a clean FIN into a client abort and cut a tunnel that was still working.
+///
+/// Pinned over a bare stream pair rather than through the relay because the
+/// relay cannot be steered into that state from outside: whether it is ever left
+/// parked with its request stream drained is a race between a kernel receive
+/// window and its own write, and on the hosts this suite runs on the last piece
+/// always completes. [`a_drained_client_fin_is_not_a_reset`] pins the sequence
+/// around it; this pins the arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drained_stream_is_not_a_reset_to_the_watcher() {
+    /// The body, sent up front so it and the FIN are inside quinn before the
+    /// server-side reader looks at either.
+    const BODY: &[u8] = b"the whole of the upload, and then the end of it";
+    /// How long the watcher has to stay parked. Twice the interval the watcher
+    /// re-checks on when a stream still has buffered bytes, so an arm that
+    /// merely takes its time would have resolved by now.
+    const PARKED_FOR: Duration = Duration::from_millis(500);
+
+    let (endpoint, ca) = h3_server_endpoint();
+    let addr = endpoint.local_addr().expect("server address");
+
+    let client = tokio::spawn(async move {
+        let endpoint = common::client_endpoint(&ca, &["h3"]);
+        let connection = finish_connect(&endpoint, addr)
+            .await
+            .expect("the QUIC handshake");
+        let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&connect_headers_frame("192.0.2.1:443"))
+            .await
+            .expect("send the CONNECT request");
+        send.write_all(&frame(FRAME_DATA, BODY))
+            .await
+            .expect("send the body");
+        // The FIN. Nothing can follow it, which is the whole point: a stream
+        // that ended cleanly can never afterwards be reset.
+        send.finish().expect("finish the sending side");
+
+        // Handed back rather than dropped: a client that went away would end
+        // the wait below as a lost connection instead of leaving it parked.
+        (endpoint, connection, send, recv)
+    });
+
+    let quic = endpoint
+        .accept()
+        .await
+        .expect("an incoming connection")
+        .await
+        .expect("the QUIC handshake");
+    let mut connection = volto::h3api::Connection::handshake(quic, TIMEOUT)
+        .await
+        .expect("the HTTP/3 handshake");
+    let (_request, stream) = connection
+        .accept()
+        .await
+        .expect("accept a request stream")
+        .expect("this server never reports the end of a connection as Ok(None)")
+        .resolve()
+        .await
+        .expect("the request must be well formed");
+    // Splitting is what puts the reader in the mode a live tunnel reads in.
+    let (_writer, mut reader) = stream.split();
+
+    let _client = client.await.expect("the client task");
+
+    // Drain to the end of the stream, which is the state under test: the FIN is
+    // taken, and quinn has nothing left to hand out.
+    let mut received = Vec::new();
+    while let Some(chunk) = reader
+        .recv_data()
+        .await
+        .expect("the body must arrive without error")
+    {
+        received.extend_from_slice(&chunk);
+    }
+    assert_eq!(received, BODY, "the whole body must be read first");
+
+    assert!(
+        tokio::time::timeout(PARKED_FOR, reader.reset_by_peer())
+            .await
+            .is_err(),
+        "a stream the peer finished and this end has drained must leave the watcher parked: \
+         resolving it would report a clean FIN as a client abort"
     );
 }
 
