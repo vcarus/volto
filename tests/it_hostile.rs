@@ -51,7 +51,7 @@
 //! | q3 | Points a CONNECT-UDP session at a target that never answers, and floods it | `[security] unanswered_packet_budget` (`src/tunnel/udp.rs`) | Packets past the budget are dropped; the budget is lifted once the target answers | `it_policy::packets_to_a_silent_target_are_capped`, `it_policy::the_cap_is_lifted_once_the_target_answers` |
 //! | q4 | Guesses with a user-id carrying a newline, a terminal escape, or 48 KB of text | `logfmt::bounded` cuts the peer's bytes to 32 and tracing escapes them, in a line that puts `remote=` first (`src/conn.rs`, `src/logfmt.rs`, review H3/M5) | A quoted, escaped, truncated `username=` field: no forged journal line, and no log amplification -- and never the attempted password | `it_log_fields::operator_facing_fields_print_values_not_options`, `it_auth_log::a_rejected_password_is_never_logged` |
 //! | r | Sends GOAWAY | RFC 9114 §5.2: a client's GOAWAY does not end the connection here; only an identifier that grows is an error | Nothing, and requests are still served; a growing identifier is CONNECTION_CLOSE H3_ID_ERROR | [`a_goaway_from_the_peer_does_not_end_the_connection`] |
-//! | r2 | Completes the QUIC handshake and closes at once, never a stream and never a byte of HTTP/3 | Nothing to bound: the connection task ends with the connection | Nothing; the `max_connections` slot comes back | [`a_peer_that_closes_before_it_says_anything_frees_its_slot`] |
+//! | r2 | Completes the QUIC handshake and closes at once, never a stream and never a byte of HTTP/3 | Nothing to bound: the connection task ends with the connection, and the `Registration` guard gives the slot back with it (`src/quic.rs`) | Nothing; the slot returns, so the next arrival finds room instead of evicting the oldest unauthenticated peer to make some | [`a_peer_that_closes_before_it_says_anything_frees_its_slot`] |
 //!
 //! # Reading the tests
 //!
@@ -1059,37 +1059,52 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
 /// A peer that closes the moment its QUIC handshake is done -- never a stream,
 /// never a byte of HTTP/3 -- must not take its connection slot with it.
 ///
-/// The slot is taken by the accept loop before either handshake, and the
-/// connection task is what gives it back, so the case worth pinning is the one
-/// where that task ends without ever having served anything.
-/// `max_connections = 1` is what makes the answer visible from outside.
+/// The slot is taken by the accept loop before either handshake and given back
+/// by the `Registration` guard when the connection task ends, so the case worth
+/// pinning is the one where that task ends without ever having served anything.
+///
+/// Watching the newcomer is not enough to pin it, and this test used to. Since
+/// a full server evicts rather than refuses, a newcomer gets in either way: a
+/// slot that was never given back is just a connection nobody is behind, and the
+/// next arrival takes it as readily as it would take a real one. With the guard's
+/// `Drop` gutted the test stayed green.
+///
+/// So what is watched is somebody else. The parked peer below is registered
+/// before the closer, which makes it the oldest connection that has never
+/// authenticated -- the first thing an eviction reaches for. With two slots and
+/// the closer's returned, the newcomer finds room and the parked peer is not
+/// touched; with the closer's slot still held, the roster is full when the
+/// newcomer arrives and the parked peer is what pays for it.
 #[tokio::test]
 async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
-    let server = TestServer::start_with("[limits]\nmax_connections = 1\n").await;
+    // Two, so that one slot can be held by the observer and the other is the one
+    // that has to come back.
+    let server = TestServer::start_with("[limits]\nmax_connections = 2\n").await;
+
+    // First on the roster, and never authenticated: the victim of any eviction
+    // the newcomer below turns out to need.
+    let parked = H3Client::connect(&server).await;
 
     let (endpoint, connection) = connect_quic(&server).await;
     connection.close(0u32.into(), b"nothing further");
-    // Delivers the CONNECTION_CLOSE rather than leaving it to a timeout, so what
-    // is measured below is the server reaping the task.
+    // Delivers the CONNECTION_CLOSE rather than leaving it to a timeout, so the
+    // server has the news before anything below is measured.
     endpoint.wait_idle().await;
     drop(endpoint);
 
-    // Retried because the reap happens a moment after the peer goes away, and
-    // driven through `finish_connect` rather than a client that asserts: a
-    // refusal here is a result to retry on, not a failure.
-    for attempt in 0..40 {
-        let admitted = client_endpoint(&server.ca, &["h3"]);
-        match finish_connect(&admitted, server.addr).await {
-            Ok(connection) => {
-                still_serving(&connection).await;
-                return;
-            }
-            Err(error) => {
-                assert!(attempt < 39, "the slot was never returned: {error}");
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
-    }
+    // The slot comes back when the connection task ends, which is a moment after
+    // the close lands and is not observable from out here. Long enough that a
+    // slot still held at the end of it is one that is never coming back.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let admitted = client_endpoint(&server.ca, &["h3"]);
+    let newcomer = finish_connect(&admitted, server.addr)
+        .await
+        .expect("the newcomer is admitted whether it finds room or makes it");
+    still_serving(&newcomer).await;
+
+    // The assertion: the newcomer found room rather than making it.
+    stays_open(&parked.quic, Duration::from_millis(300)).await;
 }
 
 // ---------------------------------------------------------------------------

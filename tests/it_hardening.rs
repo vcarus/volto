@@ -127,6 +127,42 @@ async fn a_closed_connection_frees_its_slot() {
     }
 }
 
+/// `max_connections = 0` means no cap: everybody is admitted and nobody is
+/// evicted.
+///
+/// The accept loop guards the whole roster comparison with `max_connections > 0`
+/// for this, and the guard had nothing holding it: without it, zero would be the
+/// tightest cap there is rather than no cap at all -- every roster is at or above
+/// zero -- and an operator who asked for no limit would get a server that refuses
+/// every connection it is offered.
+///
+/// Three unauthenticated peers, which is one more than the smallest cap that
+/// would let all three coexist, and none of them is disturbed by the next.
+#[tokio::test]
+async fn a_zero_connection_cap_admits_everyone_and_evicts_nobody() {
+    let server =
+        TestServer::start_with(&format!("[limits]\nmax_connections = 0\n{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+
+    let first = H3Client::connect(&server).await;
+    let second = H3Client::connect(&server).await;
+    let mut third = H3Client::connect(&server).await;
+
+    // None of the earlier ones lost its place to a later one. At any cap of one
+    // or two, the oldest of these would have been evicted by now.
+    for (name, client) in [("first", &first), ("second", &second)] {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.quic.closed())
+                .await
+                .is_err(),
+            "the {name} connection must not have been evicted"
+        );
+    }
+
+    // And the newest is a working connection rather than a refused one.
+    let _stream = open_tcp_tunnel(&mut third, &target.to_string()).await;
+}
+
 /// Repeated bad credentials cost a handshake: the connection is closed once the
 /// budget is spent, instead of allowing unlimited guesses down one connection.
 #[tokio::test]

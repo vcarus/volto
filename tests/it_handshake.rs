@@ -52,6 +52,11 @@ const H3_STREAM_CREATION_ERROR: u64 = 0x103;
 /// H3_NO_ERROR (RFC 9114 §8.1): a close with nothing to report.
 const H3_NO_ERROR: u64 = 0x100;
 
+/// APPLICATION_ERROR (RFC 9000 §20.1), the transport code a server sends when it
+/// closes for an application reason before the handshake has completed
+/// (RFC 9000 §10.2.3).
+const APPLICATION_ERROR: u64 = 0x0c;
+
 /// H3_REQUEST_INCOMPLETE (RFC 9114 §8.1).
 const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
 
@@ -624,6 +629,62 @@ async fn a_client_that_has_connected_before_evicts_without_a_retry() {
     assert_closed_with(&parked.quic, H3_NO_ERROR, TIMEOUT).await;
 }
 
+/// The eviction signal reaches a connection still inside its QUIC handshake.
+///
+/// The slot is taken before the handshake starts, so a peer that never finishes
+/// one is holding a slot that the roster can take back — and the branch that
+/// takes it is a `select!` arm racing the handshake itself, on a connection that
+/// has no `conn::handle` future to drop yet. Nothing had exercised that arm:
+/// replacing it with `std::future::pending()` left every eviction test green,
+/// because the roster frees the slot whether or not the victim ever hears about
+/// it.
+///
+/// So this watches the victim rather than the newcomer. The relay carries the
+/// client's first datagram and no more, so the server never sees the client's
+/// Finished and stays in `Connecting`, while the client — which completes on the
+/// server's flight — is left with a connection to watch. What arrives on it is
+/// the close the eviction sends, well inside the handshake deadline of one idle
+/// timeout.
+///
+/// It also settles what that close *is* (F4). An `Incoming` handed to
+/// `tokio::time::timeout` has already been accepted, so this is not
+/// `Incoming::refuse`'s CONNECTION_REFUSED: it is the application close that
+/// dropping a `Connecting` performs, which RFC 9000 §10.2.3 has a server send
+/// before the handshake completes as a transport close carrying APPLICATION_ERROR
+/// and no reason.
+#[tokio::test]
+async fn a_connection_still_handshaking_hears_about_its_eviction() {
+    let server = TestServer::start_with(&format!("[limits]\n{ONE_SLOT}")).await;
+
+    let relay = deaf_after_the_first_packet(server.addr).await;
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
+    let stalled = finish_connect(&endpoint, relay)
+        .await
+        .expect("the client finishes on the server's flight even though the server cannot");
+
+    // The only slot is the stalled peer's, and the newcomer is entitled to it:
+    // quinn answers the Retry for it, so it arrives validated.
+    let _newcomer = H3Client::connect(&server).await;
+
+    let error = tokio::time::timeout(TIMEOUT, stalled.closed())
+        .await
+        .expect("an evicted peer must be told at once, not left until the handshake deadline");
+
+    let quinn::ConnectionError::ConnectionClosed(close) = error else {
+        panic!("the eviction must arrive as a transport CONNECTION_CLOSE, got {error:?}");
+    };
+    assert_eq!(
+        u64::from(close.error_code),
+        APPLICATION_ERROR,
+        "a `Connecting` dropped before the handshake completes closes with APPLICATION_ERROR"
+    );
+    assert!(
+        close.reason.is_empty(),
+        "the close carries no reason: {:?}",
+        close.reason
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 0-RTT is off, and pinned off rather than inherited
 // ---------------------------------------------------------------------------
@@ -800,6 +861,46 @@ async fn one_way_relay(server: SocketAddr) -> SocketAddr {
                 continue;
             }
             let _ = socket.send_to(&buf[..read], server).await;
+        }
+    });
+
+    addr
+}
+
+/// Carries the client's first datagram to `server` and nothing after it, while
+/// carrying everything the server sends back.
+///
+/// The asymmetry is the point. The client's Initial gets through, so the server
+/// builds a connection and takes a slot for it; the client's Finished does not,
+/// so the server's handshake never completes and the slot stays held. The other
+/// direction is left open because the client is the observer here — a peer that
+/// cannot hear the server cannot report what the server did.
+async fn deaf_after_the_first_packet(server: SocketAddr) -> SocketAddr {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay socket");
+    let addr = socket.local_addr().expect("the relay's address");
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        let mut client: Option<SocketAddr> = None;
+        let mut forwarded = 0usize;
+
+        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
+            let datagram = &buf[..read];
+
+            if from == server {
+                if let Some(client) = client {
+                    let _ = socket.send_to(datagram, client).await;
+                }
+                continue;
+            }
+
+            client = Some(from);
+            if forwarded == 0 {
+                forwarded += 1;
+                let _ = socket.send_to(datagram, server).await;
+            }
         }
     });
 
