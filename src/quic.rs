@@ -208,6 +208,15 @@ struct Slot {
 /// squeezed by the same pool it is trying to join. An authenticated connection
 /// is never a candidate, and below the cap none of this runs at all.
 ///
+/// `max_connections` is a soft cap on tasks, and an exact one on slots. A victim
+/// leaves the roster the moment it is chosen, while its task takes as long to
+/// notice as one poll takes, so for that moment the process is running one more
+/// connection than the cap names. That is harmless: what a slot rations is the
+/// right to sit here unauthenticated, and a connection in that state holds no
+/// tunnel, no target socket and no file descriptor beyond the endpoint's — the
+/// resources worth rationing are behind [`crate::tunnel::Quota`], which counts
+/// per connection and is not touched by any of this.
+///
 /// The lock is a `std::sync::Mutex` and is never held across an await — only
 /// long enough to walk a map that has at most `max_connections` entries.
 #[derive(Clone)]
@@ -438,8 +447,11 @@ impl Server {
         loop {
             // Reap eagerly rather than only in the select below: with `biased`
             // ordering a steady stream of new connections would starve that
-            // branch, leaving finished tasks in the set and making the count
-            // below refuse connections that are no longer there.
+            // branch, and finished tasks would pile up in the set for as long as
+            // the stream lasted. Nothing about the cap rides on this any more --
+            // that is decided against the roster a few lines down -- so what is
+            // at stake is the memory of the join handles and the length of the
+            // walk `drain` does at shutdown.
             while connections.try_join_next().is_some() {}
 
             tokio::select! {
@@ -464,11 +476,14 @@ impl Server {
                     let max_connections = self.config().limits.max_connections;
 
                     // The roster rather than the `JoinSet`: a slot is entered
-                    // before the QUIC handshake starts and left when the
-                    // connection's task ends, so the roster counts exactly the
-                    // connections that hold a slot. The set is kept for
-                    // draining, and its length trails the roster by however
-                    // many finished tasks have not been reaped yet.
+                    // before the QUIC handshake starts and given up by a guard,
+                    // so the roster counts exactly the connections that hold
+                    // one. The set is kept for draining, and its length *leads*
+                    // the roster rather than trailing it -- a task that has
+                    // finished but not been reaped has already dropped its
+                    // registration, and an evicted one leaves the roster before
+                    // its task ends, so the set holds everything the roster does
+                    // and sometimes more.
                     if max_connections > 0 && self.roster.len() >= max_connections as usize {
                         // Read before `retry()` or `refuse()` consumes the
                         // `Incoming`, so either branch can still name the peer.
@@ -556,39 +571,59 @@ impl Server {
                             continue;
                         }
 
-                        match self.roster.evict_oldest_unauthenticated() {
+                        // A loop rather than a single eviction, because the cap
+                        // this is measured against can move. One victim is all a
+                        // server that has been sitting at a steady cap ever
+                        // needs; a `SIGHUP` that lowers `max_connections` below
+                        // the number of connections already live leaves the
+                        // roster over the new cap, and only this loop brings it
+                        // back down -- otherwise the reload would be honoured for
+                        // the newcomer and quietly ignored for everybody already
+                        // in, for the lifetime of those connections. It stops
+                        // when there is nothing left that may be taken, which is
+                        // the same condition the refusal below tests.
+                        while self.roster.len() >= max_connections as usize {
                             // A connection that has never had a request pass the
                             // credentials check is not owed the slot it is
                             // sitting on, and a peer that completes a handshake
                             // a second and never authenticates would otherwise
                             // hold every slot there is for as long as it cared
                             // to -- each one bounded, all of them replaced
-                            // (audit 2026-08-23). At INFO because it is a real
-                            // event with an operator-visible cause, and not a
-                            // failure of either peer.
-                            Some(victim) => info!(
+                            // (audit 2026-08-23).
+                            let Some(victim) = self.roster.evict_oldest_unauthenticated() else {
+                                break;
+                            };
+
+                            // DEBUG, not INFO: this fires once per arrival for
+                            // as long as a flood lasts, which is exactly the
+                            // shape the refusal beside it is DEBUG for. The
+                            // victim's own closing line stays at INFO -- that one
+                            // is once per connection actually lost, and it is
+                            // what an operator is looking for.
+                            debug!(
                                 evicted = %victim,
-                                remote = %incoming.remote_address(),
+                                %remote,
                                 max_connections,
                                 "the server is full: evicting the oldest connection that has \
                                  not authenticated"
-                            ),
-                            // Every live connection has authenticated, so there
-                            // is nothing to take the slot from. Refused at the
-                            // QUIC layer: the peer is told immediately instead
-                            // of timing out, and nothing per-connection is built
-                            // on our side. Logged at DEBUG because a flood is
-                            // exactly when this fires.
-                            None => {
-                                debug!(
-                                    remote = %incoming.remote_address(),
-                                    live = self.roster.len(),
-                                    max_connections,
-                                    "refusing a connection: the server is at its connection limit"
-                                );
-                                incoming.refuse();
-                                continue;
-                            }
+                            );
+                        }
+
+                        // Still full, so every live connection has authenticated
+                        // and there is nothing to take a slot from. Refused at
+                        // the QUIC layer: the peer is told immediately instead of
+                        // timing out, and nothing per-connection is built on our
+                        // side. Logged at DEBUG because a flood is exactly when
+                        // this fires.
+                        if self.roster.len() >= max_connections as usize {
+                            debug!(
+                                %remote,
+                                live = self.roster.len(),
+                                max_connections,
+                                "refusing a connection: the server is at its connection limit"
+                            );
+                            incoming.refuse();
+                            continue;
                         }
                     }
 
@@ -1566,6 +1601,155 @@ mod tests {
             controller_type_of(limits.congestion_control),
             "bbr",
             "the default limits must build a BBR controller, not quinn's CUBIC"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The roster
+    // -----------------------------------------------------------------------
+
+    /// A documentation address (RFC 5737 §3) with `n` in its last octet.
+    fn peer(n: u8) -> SocketAddr {
+        SocketAddr::from(([192, 0, 2, n], 443))
+    }
+
+    /// Registers `count` connections that have never authenticated, keeping the
+    /// registrations alive: dropping one gives its slot straight back.
+    fn park(roster: &Roster, count: u8) -> Vec<Registration> {
+        (0..count)
+            .map(|n| {
+                let (_evict, registration) =
+                    roster.register(peer(n), Arc::new(AtomicBool::new(false)));
+                registration
+            })
+            .collect()
+    }
+
+    /// The accept loop's condition, run to a standstill against a roster.
+    fn evict_down_to(roster: &Roster, max_connections: usize) -> Vec<SocketAddr> {
+        let mut victims = Vec::new();
+        while roster.len() >= max_connections {
+            let Some(victim) = roster.evict_oldest_unauthenticated() else {
+                break;
+            };
+            victims.push(victim);
+        }
+        victims
+    }
+
+    /// A cap that has just been lowered is caught up with, not lived over.
+    ///
+    /// One eviction per arrival is all a server sitting at a steady cap needs.
+    /// A `SIGHUP` that lowers `max_connections` below the number of connections
+    /// already live is the case that is not steady: `serve_forever` reads the cap
+    /// per accepted connection, so the newcomer is judged against the new value
+    /// while everybody already in was admitted under the old one, and without a
+    /// loop here the roster would sit above the new cap for as long as those
+    /// connections lasted.
+    ///
+    /// Five live and a cap of two leaves room for the newcomer, so four go: the
+    /// loop stops at one, and the arrival that runs it makes two.
+    #[test]
+    fn a_lowered_cap_evicts_until_there_is_room() {
+        let roster = Roster::new();
+        let _parked = park(&roster, 5);
+
+        assert_eq!(
+            evict_down_to(&roster, 2),
+            vec![peer(0), peer(1), peer(2), peer(3)],
+            "the victims must be the oldest four, oldest first"
+        );
+        assert_eq!(roster.len(), 1, "one slot is left for the newcomer");
+    }
+
+    /// The loop stops when there is nothing left it may take.
+    ///
+    /// An authenticated connection is never a candidate, so a roster of them is
+    /// what makes the accept loop refuse rather than spin.
+    #[test]
+    fn eviction_stops_when_every_connection_has_authenticated() {
+        let roster = Roster::new();
+
+        let mut held = Vec::new();
+        for n in 0..3 {
+            let (_evict, registration) = roster.register(peer(n), Arc::new(AtomicBool::new(true)));
+            held.push(registration);
+        }
+
+        assert!(
+            evict_down_to(&roster, 1).is_empty(),
+            "an authenticated connection must never lose its slot"
+        );
+        assert_eq!(roster.len(), 3, "and must still be on the roster");
+    }
+
+    /// Why the accept loop asks whether there is a cap before applying one.
+    ///
+    /// `max_connections = 0` means "no limit", and the guard in `serve_forever`
+    /// is the whole of that meaning. Handed to this arithmetic as a number, zero
+    /// is the harshest cap there could be -- every roster is at or above it -- so
+    /// each arrival would empty the roster and then be refused for finding it
+    /// still full. The configuration would mean the opposite of what it says.
+    #[test]
+    fn a_cap_of_zero_would_empty_the_roster_if_it_were_ever_applied() {
+        let roster = Roster::new();
+        let _parked = park(&roster, 3);
+
+        assert_eq!(evict_down_to(&roster, 0), vec![peer(0), peer(1), peer(2)]);
+        assert_eq!(
+            roster.len(),
+            0,
+            "and then there would be nobody left to refuse"
+        );
+    }
+
+    /// A signal sent before the victim is listening must not be lost.
+    ///
+    /// A slot is taken in `serve` before the connection's task has polled
+    /// anything, so an eviction can arrive between the registration and the
+    /// `select!` that waits on it. `Notify::notify_one` leaves a permit behind
+    /// for exactly that, and the whole pre-handshake eviction path rests on it:
+    /// with a plain channel send, or a `Notify` whose permit did not persist,
+    /// the victim would wait out its handshake deadline instead.
+    #[tokio::test]
+    async fn an_eviction_that_arrives_first_is_still_delivered() {
+        let roster = Roster::new();
+        let (evict, _registration) = roster.register(peer(0), Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+
+        // Nothing was awaiting the signal when it was sent, and it is still
+        // there to be collected.
+        tokio::time::timeout(std::time::Duration::from_secs(5), evict.notified())
+            .await
+            .expect("the permit `notify_one` stored must outlive the send");
+    }
+
+    /// A dropped registration gives the slot back, and takes nobody else's.
+    ///
+    /// The guard is what makes the cap survive the several ways a connection
+    /// task can end, and sequence numbers are never reused, so a late drop can
+    /// only ever remove its own entry — including after an eviction has already
+    /// removed it.
+    #[test]
+    fn a_registration_gives_back_only_its_own_slot() {
+        let roster = Roster::new();
+        let mut parked = park(&roster, 3);
+
+        // The middle one leaves of its own accord.
+        let middle = parked.remove(1);
+        drop(middle);
+        assert_eq!(roster.len(), 2);
+
+        // The oldest is evicted, and its guard is dropped afterwards: the entry
+        // is already gone, and the drop must not reach the third connection's.
+        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+        drop(parked.remove(0));
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            roster.evict_oldest_unauthenticated(),
+            Some(peer(2)),
+            "the survivor must be the one nobody gave up"
         );
     }
 
