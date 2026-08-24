@@ -172,7 +172,10 @@ udp_session_timeout` — the same knob a CONNECT-UDP session's idle bound comes
 from — and a write that does not *complete* within one of those cuts the tunnel:
 the request stream is reset (`H3_REQUEST_CANCELLED` when it is the client that
 stopped reading after its own FIN, `H3_CONNECT_ERROR` when it is the target that
-stopped reading after its own EOF) and the target socket is closed with a reset.
+stopped reading after its own EOF) and the target socket is closed abortively —
+though on the client-FIN path the proxy's clean FIN has already reached the
+target, and a kernel that does not reset from FIN_WAIT_2 (Linux) closes silently
+behind it, so only the resources are reclaimed there.
 Every write gets its own budget, so a client that keeps reading may take hours to
 drain a download after its FIN — but progress alone does not save a write that
 never finishes, which puts a floor of roughly one 64 KiB relay chunk per budget

@@ -771,6 +771,15 @@ fn ensure_window(buf: &mut BytesMut) {
 /// abortive side of that line because they leave a transfer unfinished: a FIN
 /// would tell the target the tunnel was seen through.
 ///
+/// On the FIN-then-stalled-client path that promise is only as good as the
+/// kernel makes it: the clean FIN went to the target when the client
+/// half-closed, so the socket is in FIN_WAIT_2 by cut time, and the armed reset
+/// can only chase a FIN the target already has. macOS sends that trailing RST;
+/// Linux's `tcp_need_reset()` does not include FIN_WAIT_2, so the close there
+/// is silent and the target learns nothing beyond the FIN — a SHOULD unmet, as
+/// below. The mirror path never sent a FIN, sits in ESTABLISHED or CLOSE_WAIT,
+/// and resets on every stack.
+///
 /// `set_linger` is deprecated in tokio because `SO_LINGER` can make a close block
 /// the thread while the send buffer drains. That is the *non-zero* timeout; at
 /// zero the close is by definition immediate, which is exactly why this is the
