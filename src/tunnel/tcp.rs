@@ -34,7 +34,9 @@ use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::h3api::{self, Buffer, Fields, Reader, RespondError, Status, Stream, Writer};
+use crate::h3api::{
+    self, Buffer, Fields, Reader, RespondError, Status, Stream, StreamError, Writer,
+};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
@@ -303,10 +305,35 @@ async fn client_to_target(
                 // chunk followed by more of the tunnel: it sees the end of the
                 // connection. Resource bounds are unchanged — `data` is dropped
                 // with this arm either way.
+                //
+                // The client's own RESET_STREAM is the third thing that can
+                // end the wait, and it needs a branch of its own: the read
+                // that would have met it as an error is not running while this
+                // write is, and a target that has stopped reading never ends
+                // the write. Without it, RFC 9114 §4.4's "If the proxy detects
+                // that the client has reset the stream or aborted reading from
+                // the stream, it MUST close the TCP connection" went unmet for
+                // the life of the QUIC connection -- the target socket, its
+                // file descriptor and the tunnel slot all held by a request the
+                // client had already abandoned.
+                //
+                // That branch goes *last*, which is the one thing the ordering
+                // here decides. `biased` polls in order and stops at the first
+                // arm that is ready, so a write that completes on its first
+                // poll -- the ordinary case, a target keeping up -- never polls
+                // the watcher at all, and never arms the timer
+                // `Reader::reset_by_peer` falls back on while the client's next
+                // chunks are already buffered. The watcher only starts costing
+                // anything once the write is genuinely parked, which is the
+                // only state it is there for.
                 let written = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
                     written = tcp_write.write_all(&data) => written,
+                    error = reader.reset_by_peer() => {
+                        client_aborted(&error, tcp_write, teardown);
+                        return;
+                    }
                 };
 
                 if let Err(error) = written {
@@ -327,17 +354,7 @@ async fn client_to_target(
                 return;
             }
             Err(error) => {
-                match h3api::peer_reset_code(&error) {
-                    Some(code) => debug!(code, "client reset the tunnel"),
-                    None => debug!(%error, "reading from the client failed"),
-                }
-                // The request stream is unusable: close the TCP connection by
-                // stopping the other pump, which drops the read half. The client
-                // aborted the tunnel, so that close is a reset (RFC 9114 §4.4)
-                // rather than the FIN a natural drop would produce.
-                abort_target(tcp_write.as_ref());
-                tcp_write.forget();
-                let _ = teardown.send(Teardown::ClientAbort);
+                client_aborted(&error, tcp_write, teardown);
                 return;
             }
         }
@@ -371,6 +388,30 @@ async fn client_to_target(
     tcp_write.forget();
 }
 
+/// Ends the client → target direction after the client abandoned the stream.
+///
+/// Shared by the two places that can notice it, because RFC 9114 §4.4 gives
+/// both the same answer: the read that fails with a reset, and the write that
+/// was parked when the RESET_STREAM landed. The two differ only in where the
+/// news came from.
+fn client_aborted(
+    error: &StreamError,
+    tcp_write: OwnedWriteHalf,
+    teardown: &watch::Sender<Teardown>,
+) {
+    match h3api::peer_reset_code(error) {
+        Some(code) => debug!(code, "client reset the tunnel"),
+        None => debug!(%error, "reading from the client failed"),
+    }
+    // The request stream is unusable: close the TCP connection by stopping the
+    // other pump, which drops the read half. The client aborted the tunnel, so
+    // that close is a reset (RFC 9114 §4.4) rather than the FIN a natural drop
+    // would produce.
+    abort_target(tcp_write.as_ref());
+    tcp_write.forget();
+    let _ = teardown.send(Teardown::ClientAbort);
+}
+
 /// Pumps target → client.
 async fn target_to_client(
     mut writer: Writer,
@@ -380,7 +421,11 @@ async fn target_to_client(
 ) {
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
-    loop {
+    // Both places that can notice a teardown -- the wait for the target's next
+    // read and the write of the bytes already in hand -- end this direction
+    // identically, so the reason is carried out of the loop and acted on once
+    // below, exactly as `client_to_target` does it.
+    let reason = loop {
         // Keep a full-size window available. Without this, `read_buf` reserves
         // only 64 bytes at a time once the initial capacity is used up.
         //
@@ -396,29 +441,7 @@ async fn target_to_client(
 
         let read = tokio::select! {
             biased;
-            reason = torn_down(&mut teardown_rx) => {
-                // Returning without saying anything would drop the `Writer` —
-                // and a dropped `quinn::SendStream` finishes rather than resets,
-                // so whatever of the target's answer had not been sent would
-                // reach the client as a complete response. Both reasons are
-                // therefore spelled out here; only the code differs.
-                //
-                // The write pump finding the target broken is a stream error of
-                // type H3_CONNECT_ERROR (RFC 9114 §4.4). A client abort is
-                // H3_REQUEST_CANCELLED, because §4.4 asks that "if the stream is
-                // reset or reading is aborted by the client, a proxy SHOULD
-                // perform the same operation on the other direction in order to
-                // ensure that both directions of the stream are cancelled" —
-                // and §8.1 defines that code as "the request or its response
-                // (including pushed response) is cancelled". A client that reset
-                // only its sending side is exactly the case that used to be told
-                // its truncated response was complete.
-                writer.reset(match reason {
-                    Teardown::TargetError => h3api::CONNECT_ERROR,
-                    _ => h3api::REQUEST_CANCELLED,
-                });
-                return;
-            }
+            reason = torn_down(&mut teardown_rx) => break reason,
             read = tcp_read.read_buf(&mut buf) => read,
         };
 
@@ -434,7 +457,27 @@ async fn target_to_client(
             Ok(_) => {
                 // `split` hands the filled bytes over without copying them.
                 let data: Buffer = buf.split().freeze();
-                if let Err(error) = writer.send_data(data).await {
+
+                // The write is under the same signal as the read, for the
+                // reason its opposite number in `client_to_target` is: a client
+                // that has stopped reading grants no more flow-control credit,
+                // so this write parks until the connection ends, and a teardown
+                // raised by the other pump would wait behind it -- the target
+                // socket held open for as long as the client cares to stall.
+                //
+                // Abandoning `send_data` part-way can leave a truncated DATA
+                // frame on the stream. That is harmless only because the
+                // teardown arm below resets the writer before anything else can
+                // be written: the peer that reads the partial frame reads a
+                // RESET_STREAM behind it, which ends the stream as failed, so
+                // the truncation can never be mistaken for a complete response.
+                let sent = tokio::select! {
+                    biased;
+                    reason = torn_down(&mut teardown_rx) => break reason,
+                    sent = writer.send_data(data) => sent,
+                };
+
+                if let Err(error) = sent {
                     match h3api::peer_reset_code(&error) {
                         Some(code) => debug!(code, "client reset the tunnel"),
                         None => debug!(%error, "sending to the client failed"),
@@ -457,7 +500,27 @@ async fn target_to_client(
                 return;
             }
         }
-    }
+    };
+
+    // Returning without saying anything would drop the `Writer` — and a dropped
+    // `quinn::SendStream` finishes rather than resets, so whatever of the
+    // target's answer had not been sent would reach the client as a complete
+    // response. Both reasons are therefore spelled out here; only the code
+    // differs.
+    //
+    // The write pump finding the target broken is a stream error of type
+    // H3_CONNECT_ERROR (RFC 9114 §4.4). A client abort is H3_REQUEST_CANCELLED,
+    // because §4.4 asks that "if the stream is reset or reading is aborted by
+    // the client, a proxy SHOULD perform the same operation on the other
+    // direction in order to ensure that both directions of the stream are
+    // cancelled" — and §8.1 defines that code as "the request or its response
+    // (including pushed response) is cancelled". A client that reset only its
+    // sending side is exactly the case that used to be told its truncated
+    // response was complete.
+    writer.reset(match reason {
+        Teardown::TargetError => h3api::CONNECT_ERROR,
+        _ => h3api::REQUEST_CANCELLED,
+    });
 }
 
 /// Arms an abortive close on the target connection (RFC 9114 §4.4).

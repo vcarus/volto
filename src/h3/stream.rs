@@ -509,6 +509,22 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
 ///
 /// Unreserved (RFC 3986 §2.3), the "%" of percent-encoding, sub-delims (§2.2),
 /// and the delimiters §3.2 gives the authority itself.
+/// How long [`Reader::reset_by_peer`] may take to notice a reset that arrived
+/// while the peer's bytes were already buffered.
+///
+/// Only that case costs anything: a zero-length read cannot park on a stream
+/// that has bytes to give, so the watcher has nothing to be woken by and looks
+/// again on a timer instead. A reset that lands while the stream is quiet wakes
+/// the parked read at once and never waits this long.
+///
+/// 250 ms is an order of magnitude under the bound the regression test holds the
+/// target's close to, and the wait it replaces was unbounded: a client that
+/// reset its request stream while its target had stopped reading used to hold
+/// the target socket, its file descriptor and the tunnel slot for the life of
+/// the QUIC connection. A peer cannot stretch it -- the timer is this server's,
+/// and sending more bytes only keeps the watcher on the timer it is already on.
+const RESET_PEEK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 const AUTHORITY_PUNCTUATION: &[u8] = b"-._~%!$&'()*+,;=:@[]";
 
 /// Whether `byte` is an RFC 3986 §3.3 `pchar`, or the "%" one begins with.
@@ -929,6 +945,90 @@ impl Reader {
                         .into(),
                     ))
                 }
+            }
+        }
+    }
+
+    /// Resolves when the peer resets this stream, with the reset as an error.
+    ///
+    /// [`Self::recv_data`] already reports a reset -- it is the `Err` a read
+    /// fails with -- but only to a caller that is reading. A CONNECT tunnel
+    /// spends much of its life not reading: with a chunk in hand and a target
+    /// that has stopped taking bytes, the pump is parked in a write instead,
+    /// and nothing there watches the request stream. This is what such a write
+    /// can select on.
+    ///
+    /// It reports *only* a reset, and never resolves for any other ending. A
+    /// clean FIN and a stream this endpoint stopped both belong to the reading
+    /// half, which is where a caller meets them; ending the wait here would
+    /// turn one of them into an abort.
+    ///
+    /// # Why not `quinn::RecvStream::received_reset`
+    ///
+    /// Because it borrows a slot it never gives back, and quinn asserts on that
+    /// slot being empty. quinn keeps **one** waker per stream for whoever is
+    /// waiting to read, and exactly three things take an entry out of it: a
+    /// `StreamEvent::Readable` for that stream, a `RecvStream::stop` while the
+    /// stream still exists at the protocol layer, and `RecvStream::drop` while
+    /// `all_data_read` is still false. A read that *succeeds* does not, so an
+    /// entry outlives every later read of the bytes it was waiting for. That
+    /// call writes into the slot on every poll that finds no reset, and a
+    /// `select!` which drops the arm leaves it behind.
+    ///
+    /// In release builds that is a leak -- one waker per tunnel, held until the
+    /// connection closes, keeping the finished task's cell alive with it. In
+    /// debug builds it is a panic, because `RecvStream::drop` debug-asserts the
+    /// slot is empty once the stream has been read to its end. An ordinary
+    /// upload trips it: the client sends chunk after chunk with its FIN behind
+    /// them, the pump is parked writing chunk *k* while *k+1* onwards are
+    /// already buffered, and every one of those iterations leaves another waker
+    /// behind. Nothing becomes readable after the FIN, so the last one is never
+    /// cleared, and the clean end of the stream then panics the tunnel's task
+    /// inside a destructor.
+    ///
+    /// So the wait is built on the zero-length read alone, which registers only
+    /// through quinn's own read path. That kind of entry is safe to abandon:
+    /// quinn takes it out again the moment the stream becomes readable, and a
+    /// stream cannot reach its end without becoming readable first, so there is
+    /// never one left when the reading half meets the FIN.
+    ///
+    /// # What that costs
+    ///
+    /// A zero-length read parks only while the stream has nothing to give. With
+    /// bytes already buffered it returns at once -- which is precisely the state
+    /// a stalled upload sits in -- so the wait there is a poll on a timer rather
+    /// than a wake-up, and `RESET_PEEK_INTERVAL` -- 250 ms, documented where it
+    /// is defined -- bounds how late the reset is noticed. A reset that arrives while nothing is buffered needs no timer:
+    /// it wakes the parked read at once, as any read error would.
+    ///
+    /// Cancel-safe, so a `select!` may poll it and drop it repeatedly.
+    pub async fn reset_by_peer(&mut self) -> StreamError {
+        loop {
+            match self.frames.readable().await {
+                // Bytes are waiting, so a read cannot park on this stream and
+                // there is nothing here to be woken by. Look again shortly.
+                Ok(true) => tokio::time::sleep(RESET_PEEK_INTERVAL).await,
+
+                // The peer finished and everything it sent has been read. That
+                // is not a reset and can no longer become one.
+                Ok(false) => std::future::pending().await,
+
+                Err(quinn::ReadError::Reset(code)) => {
+                    return StreamError::RemoteTerminate {
+                        code: Code::new(code.into_inner()),
+                    }
+                }
+
+                // The connection under the stream went away, which is an ending
+                // this half can report: no reader is left to meet it either.
+                Err(quinn::ReadError::ConnectionLost(error)) => {
+                    return StreamError::Connection(error.into())
+                }
+
+                // A stream this endpoint has already stopped or finished with,
+                // and the ordered/unordered mix-up that cannot happen here:
+                // nothing a tunnel acts on.
+                Err(_) => std::future::pending().await,
             }
         }
     }

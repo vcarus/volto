@@ -2,7 +2,9 @@
 
 mod common;
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,7 +16,7 @@ use common::{
     spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
     TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
 
@@ -112,6 +114,107 @@ async fn client_half_close_still_receives_remaining_target_data() {
     assert_eq!(
         &received, b"ping+TAIL",
         "expected the target's post-EOF reply to survive the client's half-close"
+    );
+}
+
+/// A TCP target that reads slowly and reports the total once it sees EOF.
+///
+/// The pause on every read is what keeps the proxy's client -> target pump
+/// parked in its write while the rest of the client's burst piles up behind it
+/// in quinn's receive buffers. That is the state the watcher on the request
+/// stream is polled in, and the state a burst-then-FIN client leaves the pump in
+/// for many iterations in a row.
+///
+/// Answering only after EOF makes the whole exchange observable from the client:
+/// a byte count that comes back short, or does not come back at all, is a tunnel
+/// whose task stopped running part-way.
+async fn spawn_slow_counting_target() -> SocketAddr {
+    /// Read nothing at all for this long after accepting, so the proxy's write
+    /// to this socket fills the kernel buffer and parks. That is what leaves
+    /// the whole burst -- and the FIN behind it -- sitting in the server's QUIC
+    /// receive buffers with the pump unable to drain them.
+    const BEFORE_FIRST_READ: Duration = Duration::from_millis(400);
+    /// Then drain slowly, so the pump stays behind for many iterations rather
+    /// than catching up in one.
+    const PER_READ: Duration = Duration::from_millis(20);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut counted = 0usize;
+                tokio::time::sleep(BEFORE_FIRST_READ).await;
+                loop {
+                    match socket.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            counted += n;
+                            tokio::time::sleep(PER_READ).await;
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let _ = socket.write_all(counted.to_string().as_bytes()).await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// An upload that arrives faster than the target drains it must still end in a
+/// clean half-close.
+///
+/// The shape is an ordinary one -- a client uploading on a fast link to a slower
+/// target, then finishing its sending side -- and it is what puts the request
+/// stream into the state the reset watcher has to survive: chunk after chunk
+/// already buffered while the pump is parked writing the one before it, then the
+/// FIN arriving with the last of them rather than after a pause.
+///
+/// It is a regression test for the watcher and not for the relay. A watcher that
+/// borrows quinn's per-stream reader slot leaves a waker in it that no later
+/// read takes out again, and the clean FIN at the end of this burst is what
+/// makes quinn notice: `RecvStream::drop` asserts the slot is empty once a
+/// stream has been read to its end, so the pump's task dies on the way out and
+/// the target's post-EOF reply never reaches the client.
+#[tokio::test]
+async fn a_burst_upload_that_outruns_the_target_still_half_closes_cleanly() {
+    /// Enough chunks that the pump is parked with more already buffered many
+    /// times over, which is what a single-chunk upload never does.
+    const FRAMES: usize = 64;
+    const FRAME: usize = 16 * 1024;
+
+    let server = TestServer::start().await;
+    let target = spawn_slow_counting_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    // A burst, with nothing read back in between: the point is for the frames to
+    // pile up in the server's receive buffers ahead of the pump.
+    let payload = Bytes::from(vec![0x7eu8; FRAME]);
+    for _ in 0..FRAMES {
+        stream
+            .send_data(payload.clone())
+            .await
+            .expect("send a chunk of the burst");
+    }
+
+    // The FIN travels with the bytes already queued, so it lands behind the last
+    // chunk rather than after a pause the pump could drain in.
+    stream.finish().expect("finish the sending side");
+
+    let reply = tokio::time::timeout(TIMEOUT, read_to_end(&mut stream))
+        .await
+        .expect("the target's answer must arrive within the bound");
+    assert_eq!(
+        String::from_utf8_lossy(&reply),
+        (FRAMES * FRAME).to_string(),
+        "the target must see every byte of the burst and a clean EOF, and its \
+         answer must reach the client"
     );
 }
 
@@ -380,6 +483,77 @@ async fn spawn_deaf_flooding_target(
     (addr, rx)
 }
 
+/// How long a target close may take once the client has aborted.
+///
+/// Two orders of magnitude under the wait a stalled `write_all` or `send_data`
+/// would impose, which is unbounded.
+const CLOSE_WITHIN: Duration = Duration::from_secs(2);
+
+/// Opens a tunnel to a deaf, flooding target and uploads into it until the
+/// client's own writes stall, which is when both of the proxy's pumps are
+/// parked.
+///
+/// The client → target pump ends up inside `write_all`, because the target
+/// never reads and every buffer between here and it is full; the target →
+/// client pump ends up inside `send_data`, because nothing here reads the
+/// response direction and its flow-control window is spent. Neither is reading
+/// the request stream in that state, which is what the two tests below start
+/// from — they differ only in how the client then abandons it.
+///
+/// The two halves of the raw request stream come back still open.
+#[track_caller]
+fn park_both_pumps(
+    connection: &quinn::Connection,
+    target: SocketAddr,
+) -> impl Future<Output = (quinn::SendStream, quinn::RecvStream)> + '_ {
+    let caller = Location::caller();
+    let request = connect_headers_frame(&target.to_string());
+
+    async move {
+        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&request)
+            .await
+            .expect("send the CONNECT request");
+
+        let (kind, payload) = read_frame(&mut recv).await;
+        assert_eq!(
+            kind, FRAME_HEADERS,
+            "at {caller}: the tunnel must open with a response"
+        );
+        assert_eq!(
+            status_of(&payload),
+            "200",
+            "at {caller}: the tunnel must be accepted"
+        );
+
+        // Upload until a write no longer completes. Loopback buffers on macOS
+        // are large and the server's own stream window is 2 MB, so the stall is
+        // found by writing rather than by predicting how much it takes.
+        let chunk = vec![0xa5u8; 64 * 1024];
+        let mut stalled = false;
+        for _ in 0..512 {
+            match tokio::time::timeout(
+                Duration::from_millis(200),
+                send.write_all(&frame(FRAME_DATA, &chunk)),
+            )
+            .await
+            {
+                Ok(result) => result.expect("the upload must not fail before it stalls"),
+                Err(_) => {
+                    stalled = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            stalled,
+            "at {caller}: the upload never stalled, so the proxy was never parked in its write"
+        );
+
+        (send, recv)
+    }
+}
+
 /// A teardown must not wait behind a write to a target that stopped reading.
 ///
 /// RFC 9114 §4.4: "if a proxy detects an error with the stream or the QUIC
@@ -390,47 +564,11 @@ async fn spawn_deaf_flooding_target(
 /// target socket stayed open for the life of the process.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_abort_closes_a_target_that_stopped_reading() {
-    /// How long the close may take once the client has aborted. Two orders of
-    /// magnitude under the wait a stalled `write_all` would impose, which is
-    /// unbounded.
-    const CLOSE_WITHIN: Duration = Duration::from_secs(2);
-
     let server = TestServer::start().await;
     let (target, mut ended) = spawn_deaf_flooding_target().await;
     let client = H3Client::connect(&server).await;
 
-    let (mut send, mut recv) = client.quic.open_bi().await.expect("open a request stream");
-    send.write_all(&connect_headers_frame(&target.to_string()))
-        .await
-        .expect("send the CONNECT request");
-
-    let (kind, payload) = read_frame(&mut recv).await;
-    assert_eq!(kind, FRAME_HEADERS, "the tunnel must open with a response");
-    assert_eq!(status_of(&payload), "200", "the tunnel must be accepted");
-
-    // Upload until a write no longer completes. Loopback buffers on macOS are
-    // large and the server's own stream window is 2 MB, so the stall is found by
-    // writing rather than by predicting how much it takes.
-    let chunk = vec![0xa5u8; 64 * 1024];
-    let mut stalled = false;
-    for _ in 0..512 {
-        match tokio::time::timeout(
-            Duration::from_millis(200),
-            send.write_all(&frame(FRAME_DATA, &chunk)),
-        )
-        .await
-        {
-            Ok(result) => result.expect("the upload must not fail before it stalls"),
-            Err(_) => {
-                stalled = true;
-                break;
-            }
-        }
-    }
-    assert!(
-        stalled,
-        "the upload never stalled, so the proxy was never parked in its write"
-    );
+    let (_send, mut recv) = park_both_pumps(&client.quic, target).await;
 
     // Abort reading the response direction: the other pump meets this inside
     // `send_data` and raises the teardown the write pump has to act on.
@@ -440,6 +578,46 @@ async fn a_client_abort_closes_a_target_that_stopped_reading() {
     let end = tokio::time::timeout(CLOSE_WITHIN, ended.recv())
         .await
         .expect("the target socket must be closed once the client aborts")
+        .expect("close notification");
+    assert!(
+        matches!(
+            end,
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        ),
+        "the target must see the connection go away, got {end:?}"
+    );
+}
+
+/// The other way a client abandons a stalled tunnel: RESET_STREAM rather than
+/// STOP_SENDING.
+///
+/// RFC 9114 §4.4 names both in one sentence — "If the proxy detects that the
+/// client has reset the stream or aborted reading from the stream, it MUST
+/// close the TCP connection" — and only the second half was detected. A reset
+/// reaches the proxy as an error on a *read* of the request stream, and with
+/// both pumps parked in writes nobody was reading: the client → target pump sat
+/// in `write_all` on a target that never reads, the target → client pump sat in
+/// `send_data` on a client that never reads, and neither ever looked again. The
+/// target socket, its file descriptor and the tunnel slot were held for the
+/// life of the QUIC connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_reset_closes_a_target_that_stopped_reading() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_deaf_flooding_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let (mut send, _recv) = park_both_pumps(&client.quic, target).await;
+
+    // The sending direction only, and the response direction is left open and
+    // unread: the client says "I will send no more" and nothing else. Reading
+    // the response would let `send_data` make progress and hand the other pump
+    // a chance to notice something, which is the case already covered above.
+    send.reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a valid code"))
+        .expect("reset the request direction");
+
+    let end = tokio::time::timeout(CLOSE_WITHIN, ended.recv())
+        .await
+        .expect("the target socket must be closed once the client resets the stream")
         .expect("close notification");
     assert!(
         matches!(

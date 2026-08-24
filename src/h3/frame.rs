@@ -673,6 +673,24 @@ impl FrameReader {
         let _ = self.recv.stop(super::varint(code));
     }
 
+    /// Whether the peer's next byte is already here, without taking it.
+    ///
+    /// `Ok(true)` means a read would return data now, `Ok(false)` that the peer
+    /// finished and every byte has been read; a reset arrives as
+    /// `quinn::ReadError::Reset`. A zero-length read is what asks the question:
+    /// `quinn::RecvStream::read_chunk(0, ..)` takes the ordinary read path, but
+    /// the assembler underneath copies out `min(0, available)` bytes, so the
+    /// decoder above stays authoritative for every byte of the stream.
+    ///
+    /// The one way to wait on a request stream without disturbing it, and the
+    /// only one [`super::stream::Reader::reset_by_peer`] is allowed to use --
+    /// its rustdoc has the reason `quinn::RecvStream::received_reset` is not.
+    ///
+    /// Cancel-safe, like the call underneath.
+    pub(super) async fn readable(&mut self) -> Result<bool, quinn::ReadError> {
+        Ok(self.recv.read_chunk(0, true).await?.is_some())
+    }
+
     /// Reads the next item, or `None` once the peer has finished cleanly.
     pub async fn next(&mut self) -> Result<Option<Item>, Error> {
         loop {
