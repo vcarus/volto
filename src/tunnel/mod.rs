@@ -98,10 +98,15 @@ pub struct AuthFailures {
     count: u32,
     /// The user-id the run is charged to.
     ///
-    /// The one the run's *first* failure claimed, so a peer cannot re-aim a run
-    /// at a name it can clear. `None` when that failure carried no user-id this
-    /// server could read — no credentials field at all, or one it could not
-    /// parse — which is the benign case any success clears.
+    /// The first failure of the run that *named* a user claims it, and no later
+    /// failure can re-aim it at a name that is easier to clear. Failures that
+    /// name nobody never claim a run: they carried no user-id this server could
+    /// read — no credentials field at all, or one it could not parse — so they
+    /// are the benign case, and a run that only ever holds those stays `None`
+    /// and is cleared by any success. It is only *not* claiming that makes them
+    /// benign: were the first of them to claim the run as `None`, a peer could
+    /// open every cycle with one credential-less request and go on guessing at a
+    /// second user for ever, for the price of one extra request.
     ///
     /// Only ever a value [`crate::auth::Denied::username`] produced, so its
     /// length is already bounded where it is built (review H3) and one
@@ -235,13 +240,16 @@ impl Context {
     /// [`Self::mark_authenticated`] and [`AuthFailures`].
     ///
     /// `username` is the user-id the failing request claimed, or `None` when it
-    /// carried none this server could read. It is remembered only when it opens
-    /// a run: a later failure adds to the count and leaves the name alone, so
-    /// what the run is charged to is the first name that spent it.
+    /// carried none this server could read. The run is claimed by the first
+    /// failure that names somebody, which is not always the first failure: a
+    /// credential-less request adds to the count and claims nothing, so a named
+    /// guess behind it still charges the run to the name it guessed at.
+    /// Whoever claims it keeps it — a later failure adds to the count and leaves
+    /// the name alone.
     pub(crate) fn record_auth_failure(&self, username: Option<&str>) -> bool {
         let mut failures = self.auth_failures();
 
-        if failures.count == 0 {
+        if failures.charged_to.is_none() {
             failures.charged_to = username.map(str::to_owned);
         }
         failures.count += 1;

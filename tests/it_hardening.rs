@@ -16,7 +16,7 @@ use common::{
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
-use volto::h3api::Status;
+use volto::h3api::{Request, Status};
 
 /// HEADERS frame type (RFC 9114 §7.2.2).
 const FRAME_HEADERS: u64 = 0x01;
@@ -52,8 +52,20 @@ async fn attempt_as(
     username: &str,
     password: &str,
 ) -> Option<Status> {
-    let request = authorized_connect(authority, username, password);
+    attempt_with(client, authorized_connect(authority, username, password)).await
+}
 
+/// [`attempt`] with no credentials field at all.
+///
+/// The request that forgot its header rather than the one that guessed: it fails
+/// authentication like the others, but names nobody for the failure to be
+/// charged to.
+async fn attempt_anonymously(client: &mut H3Client, authority: &str) -> Option<Status> {
+    attempt_with(client, connect_request(authority)).await
+}
+
+/// Sends `request` and returns the status it is answered with, if it is answered.
+async fn attempt_with(client: &mut H3Client, request: Request) -> Option<Status> {
     let mut stream = client.send.send_request(request).await.ok()?;
     let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
         .await
@@ -485,6 +497,54 @@ async fn a_success_does_not_clear_another_users_failures() {
     tokio::time::timeout(TIMEOUT, client.quic.closed())
         .await
         .expect("a success as one user must not buy another user's guesses a reprieve");
+}
+
+/// A credential-less request at the head of a run does not launder the rest.
+///
+/// The run is charged to the first failure that *names* somebody, not to the
+/// first failure. Charging it to the first would hand the interleaving back: a
+/// peer opens each cycle with one request that carries no credentials field at
+/// all, and because that failure names nobody the whole run reads as the benign
+/// case, which any success clears -- so the guesses behind it cost one extra
+/// request each and nothing else.
+///
+/// Four requests at `max_auth_failures = 3`. Nobody is named by the first, user2
+/// is guessed at twice, and the success in between is user1's.
+#[tokio::test]
+async fn a_credential_less_request_does_not_launder_a_run_of_guesses() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
+        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    assert_eq!(
+        attempt_anonymously(&mut client, &target.to_string()).await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "a request with no credentials is answered like any other failure"
+    );
+    assert_eq!(
+        attempt_as(&mut client, &target.to_string(), "user2", "wrong").await,
+        Some(Status::PROXY_AUTHENTICATION_REQUIRED),
+        "the guess behind it is what claims the run"
+    );
+    assert_eq!(
+        attempt_as(&mut client, &target.to_string(), "user1", "s3cret").await,
+        Some(Status::OK),
+        "the peer's own credentials still work"
+    );
+
+    // The third failure of a run charged to user2, so it spends the budget. As
+    // in the tests above, whether the 407 lands before the close is a race.
+    let _ = attempt_as(&mut client, &target.to_string(), "user2", "wrong-again").await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect(
+            "an unnamed failure in front of the guesses must not make them anybody's but user2's",
+        );
 }
 
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.
