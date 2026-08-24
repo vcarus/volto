@@ -1427,6 +1427,38 @@ mod tests {
         );
     }
 
+    /// Each quote kind is scanned by its own escape rules, and closing a
+    /// segment in the right place is what keeps the rest of the sentence alive.
+    ///
+    /// A backtick segment is a `{}` rendering with no escapes: a backslash
+    /// inside one is just a byte, and skipping the character behind it would
+    /// swallow the closing backtick and take the rest of the message with it.
+    /// A double-quoted segment is a `{:?}` rendering where `\\` must be
+    /// stepped over whole — a scan that read its second half as an escape
+    /// would run past the real closing quote and redact the `expected` clause,
+    /// which is the half of the message the operator fixes the typo by.
+    /// (Both halves were unpinned when the batch-10 verification mutated them.)
+    #[test]
+    fn each_quote_kind_is_scanned_by_its_own_rules() {
+        assert_eq!(
+            redact_quoted("expected `\\` at the start, kept `this` whole"),
+            format!("expected {REDACTED} at the start, kept {REDACTED} whole"),
+            "a backslash inside a backtick segment is a byte, not an escape"
+        );
+
+        let file = TempConfig::write(
+            "trailing-backslash-keeps-expected",
+            &config_with_raw_user("'user1:hunter2-TAILSECRET\\'"),
+        );
+        let error =
+            Config::load(&file.0).expect_err("a string where a table belongs must not load");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(", expected struct User"),
+            "the escape skip must close at the real quote, not run past it: {rendered}"
+        );
+    }
+
     /// A span the text cannot place must cost the position, not the message.
     ///
     /// `line_and_column` used to answer line 1, column 1 for an offset past the
