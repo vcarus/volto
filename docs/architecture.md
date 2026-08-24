@@ -63,21 +63,26 @@ server has heard of. The token is carried through as the bytes that arrived, so
 RFC 9220 asks for and logged under the name the client actually sent, rather
 than being refused as malformed before anything can look at them.
 
-Every wait that stands between a packet arriving and a tunnel opening is bounded
-by `limits.max_idle_timeout`, whatever the connection's authentication state:
+Every wait that stands between a packet arriving and a tunnel opening is
+bounded, whatever the connection's authentication state, and two limits share
+the job. All but two of those waits are bounded by `limits.max_idle_timeout`:
 the QUIC/TLS handshake in `quic.rs`, the HTTP/3 handshake and the read of each
 peer unidirectional stream's type in `h3/connection.rs`, the read of a request
 stream's HEADERS in `Resolver::resolve`, and every response this server writes
 before a tunnel starts relaying — 400, 403, 407, 431, 501 and the 5xx family,
 the 200 that closes on the spot, and the 200 that opens a tunnel — in
-`Stream::respond_within`. The bound is needed because the keep-alive PINGs
-this server sends are answered by the peer's QUIC stack with no application ever
-involved, so the transport's own idle timer never fires on a peer that is
-present but says nothing; the response writes need it because a peer that grants
-no flow-control window never takes even the fifty-odd bytes of a 407. A tunnel's
-own 200 is bounded like the rest: the pumps that would otherwise end the wait do
-not exist until that write returns, and a lapsed one resets the stream and drops
-the target socket the request had already opened.
+`Stream::respond_within`. The two exceptions are resolving the target's name and
+connecting to it, which draw on `limits.connect_timeout` instead: the lookup
+gets that budget once, the connect gets it once for the whole list of addresses
+rather than per address, and `0` hands both waits back to the operating system.
+The idle-timeout bound is needed because the keep-alive PINGs this server sends
+are answered by the peer's QUIC stack with no application ever involved, so the
+transport's own idle timer never fires on a peer that is present but says
+nothing; the response writes need it because a peer that grants no flow-control
+window never takes even the fifty-odd bytes of a 407. A tunnel's own 200 is
+bounded like the rest: the pumps that would otherwise end the wait do not exist
+until that write returns, and a lapsed one resets the stream and drops the
+target socket the request had already opened, with a reset rather than a FIN.
 
 One further bound applies until a request on a connection has passed the
 credentials check: twice `limits.max_idle_timeout` for one request to

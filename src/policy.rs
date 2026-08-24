@@ -183,6 +183,17 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// which is exactly why it is worth denying — a network that numbered its
 /// interior with it before 2004 still routes it, and nothing on the public
 /// internet answers there, so a request for it is either a mistake or a way in.
+///
+/// One entry is deliberately absent: `2001::/23`, RFC 6890 Table 22's IETF
+/// Protocol Assignments (from RFC 2928) — the IPv6 counterpart of the
+/// `192.0.0.0/24` this list does claim. Every one of its Source, Destination,
+/// Forwardable and Global attributes is "False[1]", and footnote [1] is "Unless
+/// allowed by a more specific allocation": inside the /23 sit allocations that
+/// are routed services rather than reserved space, `2001:1::1` and `2001:1::2`
+/// (the PCP and STUN anycast addresses) and `2001:4:112::/48` (AS112). Denying
+/// the whole block would take those with it, so it is left public and only the
+/// more-specific allocations worth denying are claimed one at a time — the
+/// benchmarking range, ORCHID and Teredo below.
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
