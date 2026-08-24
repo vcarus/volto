@@ -674,24 +674,18 @@ impl Stream {
             .register_datagrams(crate::datagram::quarter_stream_id(self.id()))
     }
 
-    /// Sends a response consisting of just a status line.
-    ///
-    /// A 2xx response to CONNECT must not carry Content-Length or
-    /// Transfer-Encoding (RFC 9114 §4.4); this sends no field lines at all.
-    pub async fn respond(&mut self, status: Status) -> Result<(), StreamError> {
-        self.respond_with(status, Fields::new()).await
-    }
-
     /// Sends a response with `fields` and no body.
     ///
     /// Only the field lines given are sent -- nothing synthesises a
     /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
-    /// capsule-carrying response.
-    pub async fn respond_with(
-        &mut self,
-        status: Status,
-        fields: Fields,
-    ) -> Result<(), StreamError> {
+    /// capsule-carrying response. A 2xx answer to CONNECT must carry neither
+    /// Content-Length nor Transfer-Encoding (RFC 9114 §4.4), which a caller
+    /// meets by passing an empty [`Fields`].
+    ///
+    /// Private, and deliberately: it waits on the peer's flow-control window
+    /// with nothing to end the wait, so [`Self::respond_within`] is the only way
+    /// out of this module to answer a request.
+    async fn respond_with(&mut self, status: Status, fields: Fields) -> Result<(), StreamError> {
         // RFC 9114 §4.3.2: `:status` is the one pseudo-header a response has,
         // and it comes before every regular field (§4.3).
         let mut block = BytesMut::new();
