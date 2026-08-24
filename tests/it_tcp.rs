@@ -787,6 +787,71 @@ const HALF_CLOSED_BUDGET: Duration = Duration::from_secs(1);
 /// never a slow machine.
 const CUT_WITHIN: Duration = Duration::from_secs(5);
 
+/// A per-stream receive window too small to take one relay chunk.
+///
+/// What it buys the test below is a proxy parked in `send_data` after a *short*
+/// burst from the target, rather than after the megabytes it would take to fill
+/// quinn's default 1.25 MB window. Short matters there: the bytes the proxy has
+/// not read off the target socket yet are what decide how its close looks on the
+/// wire.
+const CHUNKLESS_WINDOW: u32 = 4 * 1024;
+
+/// A TCP target that writes one short burst, says nothing more, and reports the
+/// first error a read of the socket gives it.
+///
+/// The shape [`spawn_deaf_flooding_target`] cannot have: it never stops writing,
+/// so the proxy's receive queue always holds bytes it has not read, and closing
+/// a socket with unread data in that queue sends an RST whether or not anything
+/// asked for one (RFC 1122 §4.2.2.13). A test built on it therefore cannot tell
+/// the abortive close this server arms from the ordinary close it would fall
+/// back to. One burst, sized so the proxy reads all of it and then parks in the
+/// write, leaves that queue empty and the close saying only what the proxy meant
+/// it to say.
+///
+/// Reads are polled rather than awaited once, because the half-close under test
+/// has already put a FIN on this socket: the first read returns a clean EOF that
+/// says nothing about the ending, and what the test is waiting for is the error
+/// a later one fails with. A tunnel closed politely never produces that error,
+/// and a test hunting an abortive close ends in the timeout it was given.
+async fn spawn_quiet_burst_target(
+    burst: usize,
+) -> (SocketAddr, tokio::sync::mpsc::Receiver<std::io::ErrorKind>) {
+    /// Between two polls of a socket that is only ever going to say `Ok(0)`.
+    const POLL: Duration = Duration::from_millis(20);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                // One write, so it reaches the proxy as one segment and one
+                // read. Nothing follows it: another burst would refill the
+                // receive queue this test needs empty.
+                if socket.write_all(&vec![0x5au8; burst]).await.is_err() {
+                    return;
+                }
+
+                let mut buf = [0u8; 1024];
+                loop {
+                    match socket.read(&mut buf).await {
+                        // The client's own half-close, arriving as it should.
+                        Ok(_) => tokio::time::sleep(POLL).await,
+                        Err(error) => {
+                            let _ = tx.send(error.kind()).await;
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    (addr, rx)
+}
+
 /// A client that finishes its sending side and then stops reading must not hold
 /// the tunnel open for the life of the connection.
 ///
@@ -798,33 +863,40 @@ const CUT_WITHIN: Duration = Duration::from_secs(5);
 /// connection ended — which this server's own keep-alives can postpone
 /// indefinitely.
 ///
-/// Both halves of the cut are asserted: the target sees the connection go away,
-/// and the client sees its response direction cancelled rather than finished, so
-/// the download it abandoned cannot read back as a complete one.
+/// Both halves of the cut are asserted: the target sees the connection go away
+/// *abortively*, the way the mirror test below asserts it, and the client sees
+/// its response direction cancelled rather than finished, so the download it
+/// abandoned cannot read back as a complete one. The reset is the half that
+/// needs arranging — see [`spawn_quiet_burst_target`] for why a flooding target
+/// produces one by accident and so pins nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
+    /// Over [`CHUNKLESS_WINDOW`] so the write parks, inside one loopback
+    /// segment and one relay read so nothing of it is left unread.
+    const BURST: usize = 8 * 1024;
+
     let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
-    let (target, mut ended) = spawn_deaf_flooding_target().await;
-    let mut client = H3Client::connect(&server).await;
+    let (target, mut ended) = spawn_quiet_burst_target(BURST).await;
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(CHUNKLESS_WINDOW.into());
+    let mut client = H3Client::connect_with_transport(&server, transport).await;
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    // The half-close, and then nothing: the target floods, the response
-    // direction's window is spent, and the proxy is parked in `send_data`.
-    // Reading here is what must not happen — a read would grant credit, the
-    // write would make progress, and its budget would start again.
+    // The half-close, and then nothing: the target's burst is more than the
+    // window allows, so the proxy is parked in `send_data`. Reading here is what
+    // must not happen — a read would grant credit, the write would complete, and
+    // the next one would start on a budget of its own.
     stream.finish().expect("finish the sending side");
 
     let end = tokio::time::timeout(CUT_WITHIN, ended.recv())
         .await
-        .expect("a half-closed tunnel whose client stopped reading must be cut")
+        .expect("a half-closed tunnel whose client stopped reading must be cut, and cut abortively")
         .expect("close notification");
-    assert!(
-        matches!(
-            end,
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-        ),
-        "the target must see the connection go away, got {end:?}"
+    assert_eq!(
+        end,
+        std::io::ErrorKind::ConnectionReset,
+        "a tunnel cut short must reach the target as a reset, not as a clean end of stream"
     );
 
     // And the client's own half is cancelled rather than left to a FIN, which a
