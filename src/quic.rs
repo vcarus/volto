@@ -295,6 +295,38 @@ impl Roster {
 
         Some(slot.remote)
     }
+
+    /// Evicts until the roster is below `cap`, naming the victims in the order
+    /// they were taken.
+    ///
+    /// A loop rather than a single eviction, because the cap it is measured
+    /// against can move. One victim is all a server that has been sitting at a
+    /// steady cap ever needs; a `SIGHUP` that lowers `max_connections` below the
+    /// number of connections already live leaves the roster over the new cap,
+    /// and only this brings it back down — otherwise the reload would be
+    /// honoured for the newcomer and quietly ignored for everybody already in,
+    /// for the lifetime of those connections.
+    ///
+    /// It stops when there is nothing left that may be taken, which is the same
+    /// condition the caller's refusal tests: an answer that leaves the roster at
+    /// the cap means every live connection has authenticated.
+    ///
+    /// A method rather than the loop written out at the accept path, so that
+    /// what the unit tests run is what the server runs (audit follow-up
+    /// 2026-08-24): the tests used to walk a copy of it, and changing the
+    /// server's own loop back to a single eviction left every one of them green.
+    fn evict_until_below(&self, cap: usize) -> Vec<SocketAddr> {
+        let mut victims = Vec::new();
+
+        while self.len() >= cap {
+            let Some(victim) = self.evict_oldest_unauthenticated() else {
+                break;
+            };
+            victims.push(victim);
+        }
+
+        victims
+    }
 }
 
 /// A connection's place on the [`Roster`], given up when its task ends.
@@ -572,28 +604,16 @@ impl Server {
                         }
 
                         // A loop rather than a single eviction, because the cap
-                        // this is measured against can move. One victim is all a
-                        // server that has been sitting at a steady cap ever
-                        // needs; a `SIGHUP` that lowers `max_connections` below
-                        // the number of connections already live leaves the
-                        // roster over the new cap, and only this loop brings it
-                        // back down -- otherwise the reload would be honoured for
-                        // the newcomer and quietly ignored for everybody already
-                        // in, for the lifetime of those connections. It stops
-                        // when there is nothing left that may be taken, which is
-                        // the same condition the refusal below tests.
-                        while self.roster.len() >= max_connections as usize {
-                            // A connection that has never had a request pass the
-                            // credentials check is not owed the slot it is
-                            // sitting on, and a peer that completes a handshake
-                            // a second and never authenticates would otherwise
-                            // hold every slot there is for as long as it cared
-                            // to -- each one bounded, all of them replaced
-                            // (audit 2026-08-23).
-                            let Some(victim) = self.roster.evict_oldest_unauthenticated() else {
-                                break;
-                            };
-
+                        // this is measured against can move; `evict_until_below`
+                        // carries the whole of that argument and is what the
+                        // roster's own tests run. A connection that has never
+                        // had a request pass the credentials check is not owed
+                        // the slot it is sitting on, and a peer that completes a
+                        // handshake a second and never authenticates would
+                        // otherwise hold every slot there is for as long as it
+                        // cared to -- each one bounded, all of them replaced
+                        // (audit 2026-08-23).
+                        for victim in self.roster.evict_until_below(max_connections as usize) {
                             // DEBUG, not INFO: this fires once per arrival for
                             // as long as a flood lasts, which is exactly the
                             // shape the refusal beside it is DEBUG for. The
@@ -1625,27 +1645,16 @@ mod tests {
             .collect()
     }
 
-    /// The accept loop's condition, run to a standstill against a roster.
-    fn evict_down_to(roster: &Roster, max_connections: usize) -> Vec<SocketAddr> {
-        let mut victims = Vec::new();
-        while roster.len() >= max_connections {
-            let Some(victim) = roster.evict_oldest_unauthenticated() else {
-                break;
-            };
-            victims.push(victim);
-        }
-        victims
-    }
-
     /// A cap that has just been lowered is caught up with, not lived over.
     ///
     /// One eviction per arrival is all a server sitting at a steady cap needs.
     /// A `SIGHUP` that lowers `max_connections` below the number of connections
     /// already live is the case that is not steady: `serve_forever` reads the cap
     /// per accepted connection, so the newcomer is judged against the new value
-    /// while everybody already in was admitted under the old one, and without a
-    /// loop here the roster would sit above the new cap for as long as those
-    /// connections lasted.
+    /// while everybody already in was admitted under the old one, and without
+    /// the loop inside `evict_until_below` -- the accept path's own, called here
+    /// rather than copied -- the roster would sit above the new cap for as long
+    /// as those connections lasted.
     ///
     /// Five live and a cap of two leaves room for the newcomer, so four go: the
     /// loop stops at one, and the arrival that runs it makes two.
@@ -1655,7 +1664,7 @@ mod tests {
         let _parked = park(&roster, 5);
 
         assert_eq!(
-            evict_down_to(&roster, 2),
+            roster.evict_until_below(2),
             vec![peer(0), peer(1), peer(2), peer(3)],
             "the victims must be the oldest four, oldest first"
         );
@@ -1677,7 +1686,7 @@ mod tests {
         }
 
         assert!(
-            evict_down_to(&roster, 1).is_empty(),
+            roster.evict_until_below(1).is_empty(),
             "an authenticated connection must never lose its slot"
         );
         assert_eq!(roster.len(), 3, "and must still be on the roster");
@@ -1695,7 +1704,7 @@ mod tests {
         let roster = Roster::new();
         let _parked = park(&roster, 3);
 
-        assert_eq!(evict_down_to(&roster, 0), vec![peer(0), peer(1), peer(2)]);
+        assert_eq!(roster.evict_until_below(0), vec![peer(0), peer(1), peer(2)]);
         assert_eq!(
             roster.len(),
             0,
