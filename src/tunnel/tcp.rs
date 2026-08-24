@@ -176,6 +176,17 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
                 stream_id,
                 authority, "gave up on a 200 for CONNECT the peer would not take"
             );
+            // The stream has already been reset with H3_REQUEST_CANCELLED, which
+            // is the client-abort half of RFC 9114 §4.4: "If the proxy detects
+            // that the client has reset the stream or aborted reading from the
+            // stream, it MUST close the TCP connection", and "In all these
+            // cases, if the underlying TCP implementation permits it, the proxy
+            // SHOULD send a TCP segment with the RST bit set." Returning drops
+            // `tcp` and closes it either way; arming the reset first is what
+            // makes it the abortive close the SHOULD asks for, so a target that
+            // has already accepted the connection is not left believing it was
+            // finished politely.
+            abort_target(&tcp);
             return;
         }
     }

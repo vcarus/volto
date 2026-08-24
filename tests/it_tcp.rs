@@ -709,6 +709,47 @@ async fn a_tunnel_200_the_peer_will_not_take_is_reset() {
     );
 }
 
+/// The target of a 200 that could not be delivered is closed with a reset, not
+/// a FIN.
+///
+/// The tunnel never opened, so the connection the proxy had already made to the
+/// target carries nothing and the client will never hear about it. RFC 9114
+/// §4.4: "if a proxy detects an error with the stream or the QUIC connection, it
+/// MUST close the TCP connection", and "In all these cases, if the underlying
+/// TCP implementation permits it, the proxy SHOULD send a TCP segment with the
+/// RST bit set." Dropping the socket satisfies the MUST on its own; the SHOULD
+/// is what stops a target from reading a polite goodbye off a request that was
+/// cancelled, and from holding a half-open connection until its own timeout.
+#[tokio::test]
+async fn the_target_of_a_200_the_peer_will_not_take_is_reset_too() {
+    let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    let (mut send, _recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send a CONNECT that will be accepted");
+
+    // Past the server's idle timeout, without reading a byte: reading is what
+    // would grow the window and let the 200 through.
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target socket must not outlive the 200 it was opened for")
+        .expect("close notification");
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "a target whose tunnel was cancelled must see a reset, not a clean end of stream"
+    );
+}
+
 #[tokio::test]
 async fn refuses_a_target_that_is_not_listening() {
     let server = TestServer::start().await;
