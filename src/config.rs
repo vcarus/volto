@@ -23,7 +23,7 @@
 //! max_streams_bidi     = 1024
 //! max_idle_timeout     = 60    # seconds
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
-//! initial_mtu          = 1200  # bytes, 1200..1500
+//! initial_mtu          = 1200  # bytes, 1200..1452
 //! mtu_discovery        = true
 //! congestion_control   = "bbr" # bbr | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
@@ -158,17 +158,27 @@ pub const MIN_INITIAL_MTU: u16 = 1200;
 
 /// The largest `initial_mtu` this server accepts, in bytes.
 ///
-/// An Ethernet frame's payload, and the point past which no internet path
-/// carries a packet at all. There is no floor to fall back to if this is wrong:
-/// quinn applies the value with a `max()` against the 1200-byte minimum and no
-/// `min()` above it, so the handshake flight goes out in packets the path drops
-/// and the server is simply unreachable. Its black-hole detector is no help
-/// either -- that runs inside an established connection, and with this wrong
-/// there is never one. A reload applies the value to connections accepted from
-/// then on, which is what makes the mistake worth rejecting rather than
-/// tolerating: a `SIGHUP` with a typo here turns a running server into one that
-/// still answers `systemctl status` and nothing else (audit 2026-08-23).
-pub const MAX_INITIAL_MTU: u16 = 1500;
+/// A *UDP payload* size rather than an IP packet size, which is what makes the
+/// ceiling 1452 and not 1500: quinn documents `initial_mtu` as "the initial
+/// value to be used as the maximum UDP payload size before running MTU
+/// discovery", and Ethernet's 1500-byte MTU leaves 1472 bytes of payload over
+/// IPv4 (20-byte header + 8-byte UDP) and 1452 over IPv6 (40 + 8). quinn's own
+/// MTU discovery stops at the same number for the same reason —
+/// `MtuDiscoveryConfig::upper_bound` "defaults to 1452, to stay within
+/// Ethernet's MTU when using IPv4 and IPv6" (quinn-proto `config/transport.rs`)
+/// — so anything above this is a starting point discovery itself would never
+/// probe up to.
+///
+/// There is no floor to fall back to if this is wrong: quinn applies the value
+/// with a `max()` against the 1200-byte minimum and no `min()` above it, so the
+/// handshake flight goes out in packets the path drops and the server is simply
+/// unreachable. Its black-hole detector is no help either -- that runs inside an
+/// established connection, and with this wrong there is never one. A reload
+/// applies the value to connections accepted from then on, which is what makes
+/// the mistake worth rejecting rather than tolerating: a `SIGHUP` with a typo
+/// here turns a running server into one that still answers `systemctl status`
+/// and nothing else (audit 2026-08-23).
+pub const MAX_INITIAL_MTU: u16 = 1452;
 
 /// Default round-trip time assumed before the first measurement, in milliseconds.
 ///
@@ -398,7 +408,10 @@ pub struct Limits {
     /// Must be below half of [`Limits::max_idle_timeout`]; see
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL`] for why.
     pub keep_alive_interval: u64,
-    /// Size of the first QUIC packets, in bytes. Between 1200 and 1500.
+    /// Size of the first QUIC packets, in bytes. Between 1200 and 1452.
+    ///
+    /// A UDP payload size rather than an IP packet size; see
+    /// [`MAX_INITIAL_MTU`] for where the upper end of that range comes from.
     pub initial_mtu: u16,
     /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
     ///
@@ -698,8 +711,9 @@ impl Config {
         if self.limits.initial_mtu > MAX_INITIAL_MTU {
             bail!(
                 "limits.initial_mtu = {} is above the {MAX_INITIAL_MTU} bytes this \
-                 server allows; no path carries more than an Ethernet frame, and a \
-                 handshake sent in packets the path drops has nothing to fall back to",
+                 server allows; the value is a UDP payload size, and an Ethernet \
+                 frame leaves that much of one over IPv6, so a handshake sent in \
+                 larger packets is dropped by the path with nothing to fall back to",
                 self.limits.initial_mtu
             );
         }
@@ -1295,7 +1309,7 @@ mod tests {
         }
 
         // The floor itself, and the range above it up to the ceiling.
-        for value in [1200, 1350, 1500] {
+        for value in [1200, 1350, MAX_INITIAL_MTU] {
             let cfg = parse(&format!("[limits]\ninitial_mtu = {value}"));
             assert_valid_apart_from_certs(&cfg, &format!("initial_mtu = {value}"));
         }
@@ -1309,9 +1323,13 @@ mod tests {
     /// the black-hole detector never runs because no connection is ever
     /// established, and a reload makes that the state of a server that was
     /// working a moment ago.
+    ///
+    /// 1453 is the first rejected value and 1500 is in the list because it is
+    /// the number the mistake reaches for: `initial_mtu` is a UDP payload size,
+    /// so an Ethernet frame's 1500 bytes is an IP packet, not a payload.
     #[test]
     fn an_initial_mtu_above_the_ethernet_ceiling_is_rejected() {
-        for value in [1501, 9000, u16::MAX] {
+        for value in [MAX_INITIAL_MTU + 1, 1500, 9000, u16::MAX] {
             let err = parse(&format!("[limits]\ninitial_mtu = {value}"))
                 .validate()
                 .expect_err("must be rejected");
