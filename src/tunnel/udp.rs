@@ -25,10 +25,11 @@
 //!   is refused.
 //! * An oversized outbound packet is **dropped**, never downgraded to a capsule
 //!   (RFC 9298 §6.1).
-//! * On the capsule fallback, a write to the client that makes no progress for a
-//!   whole idle timeout ends the session by **resetting** the request stream
-//!   rather than finishing it — see `Session::forward_to_client`, which is
-//!   also why the idle timeout covers only the wait for work and not the work.
+//! * On the capsule fallback, a write to the client that does not complete
+//!   within one idle timeout ends the session by **resetting** the request
+//!   stream rather than finishing it — see `Session::forward_to_client`, which
+//!   is also why the idle timeout covers only the wait for work and not the
+//!   work.
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
@@ -509,8 +510,10 @@ impl Session {
 
         // The one write in this session that can block for as long as the peer
         // likes: `send_data` applies the peer's flow control, so a client that
-        // stops reading the stream parks it indefinitely. A write that has made
-        // no progress for a whole idle timeout is that client.
+        // stops reading the stream parks it indefinitely. A write that has not
+        // completed within a whole idle timeout is that client — the bound is
+        // on the write finishing, not on progress inside it, the same reading
+        // the TCP half-close bound gives the same knob.
         //
         // It cannot simply be abandoned. A cancelled send leaves a partial DATA
         // frame on the stream, and the tidy `finish()` the session otherwise
