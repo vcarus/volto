@@ -1075,8 +1075,43 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
 /// the closer's returned, the newcomer finds room and the parked peer is not
 /// touched; with the closer's slot still held, the roster is full when the
 /// newcomer arrives and the parked peer is what pays for it.
+///
+/// The slot comes back a moment after the close lands, and that moment is not
+/// observable from out here: a probe that could see the roster would have to
+/// arrive at it, and an arrival at a full roster is the very thing that takes
+/// the parked peer's slot. So the round below is not waited out with a sleep
+/// long enough for the slowest machine — it is retried until it holds or
+/// `TIMEOUT` runs out, giving the server longer to reap each time. One round
+/// wins on an unloaded host; a machine slow enough to lose one costs the run a
+/// round rather than a failure, and a slot that is never returned loses every
+/// round there is.
 #[tokio::test]
 async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
+    let deadline = Instant::now() + TIMEOUT;
+    let mut settling = Duration::from_millis(50);
+
+    while !a_newcomer_finds_room(settling).await {
+        assert!(
+            Instant::now() < deadline,
+            "the closer's slot was never returned: the parked peer lost it to the \
+             newcomer in every round"
+        );
+        settling *= 2;
+    }
+}
+
+/// One round of it: with a peer parked in front of a connection that closed at
+/// once, does the next arrival find room rather than make it?
+///
+/// `settling` is how long the server is given to reap the closer before the
+/// newcomer arrives. `false` means the newcomer found the roster full and the
+/// parked peer paid for it — either the reap had not happened yet, or the slot
+/// is never coming back, which is what repeating the round tells apart.
+///
+/// A fresh server per round, because a round that loses leaves a roster this
+/// question cannot be asked of again: the parked peer is gone, and under the
+/// failure being hunted the newcomer's own slot is still held too.
+async fn a_newcomer_finds_room(settling: Duration) -> bool {
     // Two, so that one slot can be held by the observer and the other is the one
     // that has to come back.
     let server = TestServer::start_with("[limits]\nmax_connections = 2\n").await;
@@ -1092,10 +1127,7 @@ async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
     endpoint.wait_idle().await;
     drop(endpoint);
 
-    // The slot comes back when the connection task ends, which is a moment after
-    // the close lands and is not observable from out here. Long enough that a
-    // slot still held at the end of it is one that is never coming back.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(settling).await;
 
     let admitted = client_endpoint(&server.ca, &["h3"]);
     let newcomer = finish_connect(&admitted, server.addr)
@@ -1103,8 +1135,12 @@ async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
         .expect("the newcomer is admitted whether it finds room or makes it");
     still_serving(&newcomer).await;
 
-    // The assertion: the newcomer found room rather than making it.
-    stays_open(&parked.quic, Duration::from_millis(300)).await;
+    // The observation: the newcomer found room rather than making it. Not
+    // `stays_open`, because a round that lost is a round to run again rather
+    // than a failure to report.
+    tokio::time::timeout(Duration::from_millis(300), parked.quic.closed())
+        .await
+        .is_err()
 }
 
 // ---------------------------------------------------------------------------
