@@ -437,18 +437,7 @@ async fn target_to_client(
     // identically, so the reason is carried out of the loop and acted on once
     // below, exactly as `client_to_target` does it.
     let reason = loop {
-        // Keep a full-size window available. Without this, `read_buf` reserves
-        // only 64 bytes at a time once the initial capacity is used up.
-        //
-        // Reserved a block at a time rather than a window at a time: after the
-        // `split` below, what is left of the block is shared with the `Bytes`
-        // quinn is holding, so a `reserve` that cannot be satisfied from it
-        // allocates a whole new one. Asking only when fewer than a window
-        // remains is what lets consecutive reads come out of the same block --
-        // see [`RELAY_BLOCK_SIZE`] for the arithmetic.
-        if buf.capacity() < RELAY_BUF_SIZE {
-            buf.reserve(RELAY_BLOCK_SIZE);
-        }
+        ensure_window(&mut buf);
 
         let read = tokio::select! {
             biased;
@@ -532,6 +521,26 @@ async fn target_to_client(
         Teardown::TargetError => h3api::CONNECT_ERROR,
         _ => h3api::REQUEST_CANCELLED,
     });
+}
+
+/// Offers `buf` a full-sized window to read into, allocating a block at a time.
+///
+/// Without this, `read_buf` reserves only 64 bytes at a time once the initial
+/// capacity is used up.
+///
+/// Reserved a block at a time rather than a window at a time: after the `split`
+/// that hands filled bytes on, what is left of the block is shared with the
+/// `Bytes` quinn is holding, so a `reserve` that cannot be satisfied from it
+/// allocates a whole new one. Asking only when fewer than a window remains is
+/// what lets consecutive reads come out of the same block -- see
+/// [`RELAY_BLOCK_SIZE`] for the arithmetic, and the tests below for the two
+/// halves of it that are pinned: every read is offered [`RELAY_BUF_SIZE`], and
+/// a block carries at least `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` before it is
+/// replaced.
+fn ensure_window(buf: &mut BytesMut) {
+    if buf.capacity() < RELAY_BUF_SIZE {
+        buf.reserve(RELAY_BLOCK_SIZE);
+    }
 }
 
 /// Arms an abortive close on the target connection (RFC 9114 §4.4).
@@ -647,7 +656,10 @@ fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{connect_any_with, split_authority};
+    use super::{
+        connect_any_with, ensure_window, split_authority, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE,
+    };
+    use bytes::BytesMut;
     use std::io;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -822,5 +834,93 @@ mod tests {
         assert!(split_authority("[a[b]:443").is_err());
         assert!(split_authority("[2001:db8[::1]:443").is_err());
         assert!(split_authority("[[2001:db8::1]:443").is_err());
+    }
+
+    /// Every read is offered a full-sized window, whatever the reads before it
+    /// took out of the block.
+    ///
+    /// The sizes are the ones a relay meets: a one-byte push, a small record, an
+    /// MTU-sized segment, and a read that fills the window exactly. The frozen
+    /// pieces are held for the whole run because that is what a tunnel does --
+    /// quinn keeps each until the segment carrying it is acknowledged -- and
+    /// holding them is what stops `reserve` from quietly reusing the block they
+    /// came out of.
+    #[test]
+    fn every_read_is_offered_a_full_window() {
+        let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
+        let mut held = Vec::new();
+
+        for size in [1usize, 64, 100, 1460, RELAY_BUF_SIZE]
+            .into_iter()
+            .cycle()
+            .take(100)
+        {
+            ensure_window(&mut buf);
+            assert!(
+                buf.capacity() >= RELAY_BUF_SIZE,
+                "a read was offered {} bytes, under the {RELAY_BUF_SIZE}-byte window",
+                buf.capacity()
+            );
+
+            // Stands in for a read that filled `size` bytes of that window.
+            buf.resize(size, 0);
+            held.push(buf.split().freeze());
+        }
+    }
+
+    /// Consecutive reads come out of one block, so what a tunnel pins is bounded
+    /// by the bytes in flight rather than by how small its reads are.
+    ///
+    /// A hundred bytes a read is the shape that cost 238x before
+    /// [`RELAY_BLOCK_SIZE`] existed. Counting blocks by the pointer `reserve`
+    /// hands back is what catches a block replaced early, whichever of the two
+    /// constants moved to cause it.
+    #[test]
+    fn consecutive_reads_come_out_of_one_block() {
+        const READ: usize = 100;
+        const RELAYED: usize = 1024 * 1024;
+        /// What a block must carry before it may be replaced.
+        ///
+        /// Spelled out rather than taken from the constants on purpose: a bound
+        /// derived from `RELAY_BLOCK_SIZE` holds whatever that constant is set
+        /// to, and the size is half of what is being pinned here.
+        /// `it_relay_memory` counts allocations end to end and is content with a
+        /// 20 KiB block, which is the hole this closes.
+        const CARRIED: usize = 48 * 1024;
+
+        let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
+        let mut held = Vec::new();
+        let mut base = buf.as_ptr();
+        let mut blocks = 1usize;
+        let mut relayed = 0usize;
+
+        while relayed < RELAYED {
+            ensure_window(&mut buf);
+            if !std::ptr::eq(buf.as_ptr(), base) {
+                blocks += 1;
+            }
+
+            buf.resize(READ, 0);
+            held.push(buf.split().freeze());
+            // Where the next read will land: still inside this block until
+            // `ensure_window` has to go and find another one.
+            base = buf.as_ptr();
+            relayed += READ;
+        }
+
+        assert_eq!(
+            RELAY_BLOCK_SIZE - RELAY_BUF_SIZE,
+            CARRIED,
+            "a block no longer carries what the count below is measured against"
+        );
+
+        // Two blocks over the arithmetic: the 16 KiB one a tunnel starts with,
+        // and however far into the last one the run happened to stop.
+        let ceiling = RELAYED / CARRIED + 2;
+        assert!(
+            blocks <= ceiling,
+            "{RELAYED} bytes of {READ}-byte reads pinned {blocks} blocks, over the {ceiling} \
+             that carrying {CARRIED} bytes of each allows"
+        );
     }
 }
