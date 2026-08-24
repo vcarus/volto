@@ -74,11 +74,19 @@ silently — and an inbound datagram queue of 64 entries, each at most the
 1472-byte `max_udp_payload_size` this server advertises, so about 92 KiB. That
 is roughly 156 KiB per session, 39 MiB per connection at
 `max_targets_per_conn = 256`, and about 9.8 GiB across a server saturated at
-both defaults. Lowering either limit lowers it proportionally. Two things keep
-that number a ceiling rather than a resting size: the queue is only full while a
-client sends faster than the proxy forwards, and a TCP tunnel pays none of it —
-its relay buffer starts at 16 KiB, and what it holds beyond that is bounded by
-quinn's per-connection send window.
+both defaults. Lowering either limit lowers it proportionally. It is a ceiling
+rather than a resting size because the queue is only full while a client sends
+faster than the proxy forwards.
+
+**A TCP tunnel costs less, not nothing.** Its relay buffer starts at 16 KiB, and
+settles on a single 64 KiB block once the tunnel has relayed anything: reads are
+cut from one block until too little of it is left to offer a full-sized window,
+and that is also why the first 16 KiB is let go after the first read. So the
+saturation product for TCP is `max_connections` × `max_targets_per_conn` ×
+64 KiB = 4 GiB at the defaults, beside the 9.8 GiB of the UDP one. What a tunnel
+holds beyond that one block is bounded by quinn's per-connection send window:
+the pieces cut from a block share it, and each is held until the segment
+carrying it has been acknowledged, so the block outlives them all.
 
 **`connect_timeout` is spent per request, not per connection.** Without it a
 target that silently drops SYNs holds a tunnel slot and its file descriptor for

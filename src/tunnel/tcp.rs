@@ -68,6 +68,17 @@ const RELAY_BUF_SIZE: usize = 16 * 1024;
 /// of it has been handed to the client by then. Worst-case amplification is
 /// therefore 64 / 48 = 1.33x whatever the read sizes are, against a factor that
 /// grew without bound as reads got smaller.
+///
+/// # What it costs at rest
+///
+/// The trade is paid in resting size: a tunnel that has relayed a single byte
+/// holds one whole block across every wait from then on, so an idle tunnel
+/// costs 64 KiB rather than the 16 KiB it started with. Saturated at the
+/// default limits -- `max_connections` x `max_targets_per_conn` -- that is
+/// 4 GiB, and at the ~20 live tunnels per connection seen in production about
+/// 1.3 MB per connection. The amplification is what produces the memory peaks
+/// worth avoiding, and 1.33x beats 2x there; `docs/configuration.md` says the
+/// same to operators.
 const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Why the tunnel is being torn down, carried on the teardown channel.
