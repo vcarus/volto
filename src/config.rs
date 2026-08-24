@@ -962,6 +962,12 @@ const REDACTED: &str = "`<redacted>`";
 /// containing a backtick from splitting its own rendering into "safe" halves.
 /// Keys are quoted the same way and are redacted with them; that costs the
 /// operator nothing the line and column do not still give them.
+///
+/// A double quote inside the value is the same trap one level down. serde
+/// renders a string with `{:?}`, so `hun"ter2` arrives as `hun\"ter2`, and a
+/// scan that stops at the first `"` it sees closes the segment in the middle of
+/// the secret and puts the rest of it back in the sentence. Hence
+/// [`closing_quote`], which skips the character after every backslash.
 fn redact_quoted(message: &str) -> String {
     let mut redacted = String::with_capacity(message.len());
     let mut rest = message;
@@ -975,7 +981,7 @@ fn redact_quoted(message: &str) -> String {
 
         // An unpaired opening quote opens a segment with no end, so everything
         // after it is part of the redaction rather than part of the message.
-        let Some(close) = rest[open + 1..].find(quote) else {
+        let Some(close) = closing_quote(&rest[open + 1..], quote) else {
             return redacted;
         };
         rest = &rest[open + 1 + close + 1..];
@@ -983,6 +989,47 @@ fn redact_quoted(message: &str) -> String {
 
     redacted.push_str(rest);
     redacted
+}
+
+/// The offset of the character that closes a segment `quote` opened, if there
+/// is one, counted from the character after that opening quote.
+///
+/// Only a double-quoted segment has an escape convention to respect, because
+/// only it is a `{:?}` rendering: serde spells the value it rejected with
+/// `Debug`, so a double quote inside it arrives as `\"` and a backslash as
+/// `\\`. Skipping the character after every backslash is what keeps both from
+/// being read as the end of the segment -- and the last backslash before the
+/// real closing quote is `\\`'s second half, so the skip lands on that quote
+/// rather than over it.
+///
+/// A backtick segment is `{}`-rendered and has no escapes at all, so it is
+/// scanned as it always was: anything else would make a backslash in a value
+/// swallow the character behind it.
+///
+/// Bytes rather than characters throughout. Neither the backslash nor either
+/// quote can appear inside a multi-byte UTF-8 character, so a skip that lands
+/// mid-character cannot be mistaken for one of them, and the offset returned
+/// always points at an ASCII quote.
+fn closing_quote(rest: &str, quote: char) -> Option<usize> {
+    if quote != '"' {
+        return rest.find(quote);
+    }
+
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            // Past the end when the message ends in a lone backslash, which the
+            // loop condition answers with `None`: an opening quote with no
+            // close, redacted to the end.
+            b'\\' => index += 2,
+            b'"' => return Some(index),
+            _ => index += 1,
+        }
+    }
+
+    None
 }
 
 /// Whether `character` is one of the two a parser message quotes with.
@@ -1242,7 +1289,7 @@ mod tests {
         // Tag, the broken config, what must not survive in the message, and
         // whether the parser quoted a value at all: the lexer's complaint names
         // none, so there is nothing there for the marker to replace.
-        let cases: [(&str, String, &[&str], bool); 6] = [
+        let cases: [(&str, String, &[&str], bool); 9] = [
             (
                 "bare",
                 config_with_raw_password("correct-horse-battery-staple"),
@@ -1275,6 +1322,36 @@ mod tests {
                 "backticked-string",
                 config_with_raw_user("\"user1:hunter2`x\""),
                 &["hunter2"],
+                true,
+            ),
+            // A double quote inside the secret, which serde renders escaped
+            // (`{:?}`) and a scan for the closing quote used to stop on: the
+            // segment closed inside the secret and its tail went to stderr as
+            // if it were part of the parser's sentence. Written as a TOML
+            // literal string, which needs no escaping of its own to carry one.
+            (
+                "quote-in-secret",
+                config_with_raw_user("'user1:hun\"ter2-TAILSECRET'"),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            // The same character reached through a TOML basic string, so the
+            // file itself escapes it as well: the value serde sees is identical
+            // and so is the rendering.
+            (
+                "escaped-quote-in-secret",
+                config_with_raw_user("\"user1:hun\\\"ter2-TAILSECRET\""),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            // A secret ending in a backslash. Its rendering ends `\\"`, so a
+            // scan that skips the character after every backslash must not
+            // skip the closing quote itself -- and must not run off the end
+            // looking for another one.
+            (
+                "backslash-before-the-close",
+                config_with_raw_user("'user1:hunter2-TAILSECRET\\'"),
+                &["hunter2", "TAILSECRET"],
                 true,
             ),
         ];
