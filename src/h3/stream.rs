@@ -509,22 +509,6 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
 ///
 /// Unreserved (RFC 3986 §2.3), the "%" of percent-encoding, sub-delims (§2.2),
 /// and the delimiters §3.2 gives the authority itself.
-/// How long [`Reader::reset_by_peer`] may take to notice a reset that arrived
-/// while the peer's bytes were already buffered.
-///
-/// Only that case costs anything: a zero-length read cannot park on a stream
-/// that has bytes to give, so the watcher has nothing to be woken by and looks
-/// again on a timer instead. A reset that lands while the stream is quiet wakes
-/// the parked read at once and never waits this long.
-///
-/// 250 ms is an order of magnitude under the bound the regression test holds the
-/// target's close to, and the wait it replaces was unbounded: a client that
-/// reset its request stream while its target had stopped reading used to hold
-/// the target socket, its file descriptor and the tunnel slot for the life of
-/// the QUIC connection. A peer cannot stretch it -- the timer is this server's,
-/// and sending more bytes only keeps the watcher on the timer it is already on.
-const RESET_PEEK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-
 const AUTHORITY_PUNCTUATION: &[u8] = b"-._~%!$&'()*+,;=:@[]";
 
 /// Whether `byte` is an RFC 3986 §3.3 `pchar`, or the "%" one begins with.
@@ -943,6 +927,23 @@ impl Reader {
         }
     }
 
+    /// How long [`Reader::reset_by_peer`] may take to notice a reset that
+    /// arrived while the peer's bytes were already buffered.
+    ///
+    /// Only that case costs anything: a zero-length read cannot park on a
+    /// stream that has bytes to give, so the watcher has nothing to be woken by
+    /// and looks again on a timer instead. A reset that lands while the stream
+    /// is quiet wakes the parked read at once and never waits this long.
+    ///
+    /// 250 ms is an order of magnitude under the bound the regression test
+    /// holds the target's close to, and the wait it replaces was unbounded: a
+    /// client that reset its request stream while its target had stopped
+    /// reading used to hold the target socket, its file descriptor and the
+    /// tunnel slot for the life of the QUIC connection. A peer cannot stretch
+    /// it -- the timer is this server's, and sending more bytes only keeps the
+    /// watcher on the timer it is already on.
+    const RESET_PEEK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
     /// Resolves when the peer resets this stream, with the reset as an error.
     ///
     /// [`Self::recv_data`] already reports a reset -- it is the `Err` a read
@@ -1001,7 +1002,7 @@ impl Reader {
             match self.frames.readable().await {
                 // Bytes are waiting, so a read cannot park on this stream and
                 // there is nothing here to be woken by. Look again shortly.
-                Ok(true) => tokio::time::sleep(RESET_PEEK_INTERVAL).await,
+                Ok(true) => tokio::time::sleep(Self::RESET_PEEK_INTERVAL).await,
 
                 // The peer finished and everything it sent has been read. That
                 // is not a reset and can no longer become one.
