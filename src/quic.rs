@@ -118,7 +118,18 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     // quinn clamps this up to 1200 silently; `Config::validate` rejects anything
     // below instead, so a typo is reported rather than quietly corrected.
     transport.initial_mtu(limits.initial_mtu);
-    if !limits.mtu_discovery {
+    if limits.mtu_discovery {
+        // Everything except the search ceiling stays at quinn's defaults; the
+        // ceiling is the one discovery parameter safe to hand an operator,
+        // because a size is only ever adopted by probing it — a bound above
+        // what the path carries costs a handful of standalone PINGs whose loss
+        // is not a congestion signal, nothing more. quinn clamps absurd values
+        // itself, and `Config::validate` already rejected anything above the
+        // 1472 bytes IPv4 leaves of an Ethernet frame.
+        let mut mtud = quinn::MtuDiscoveryConfig::default();
+        mtud.upper_bound(limits.mtu_upper_bound);
+        transport.mtu_discovery_config(Some(mtud));
+    } else {
         // Stops the upward search, so packets start at `initial_mtu` and are
         // never probed larger: spec §5.4's conservative setting for a path that
         // black-holes large packets, where a stable small MTU beats an
@@ -1406,6 +1417,7 @@ mod tests {
         let limits = crate::config::Limits {
             max_streams_bidi: 7,
             initial_mtu: 1350,
+            mtu_upper_bound: 1464,
             initial_rtt_ms: 150,
             ..Default::default()
         };
@@ -1425,6 +1437,10 @@ mod tests {
         assert!(
             rendered.contains("1350"),
             "the initial MTU must apply: {rendered}"
+        );
+        assert!(
+            rendered.contains("upper_bound: 1464"),
+            "the discovery ceiling must apply: {rendered}"
         );
         assert!(
             rendered.contains("initial_rtt: 150ms"),

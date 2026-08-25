@@ -161,6 +161,16 @@ users = [
 # Default: true
 #mtu_discovery = true
 
+# Ceiling for path MTU discovery, in bytes — a UDP payload size like
+# initial_mtu. The default 1452 is safe over both IPv4 and IPv6 on Ethernet;
+# if you have measured your path (ping -M do / tracepath) you can claim what
+# IPv4 leaves above that, at most 1472. Overshooting is harmless — a size is
+# only adopted after a probe of that size is acknowledged — so unlike
+# initial_mtu this key is safe to raise on a hunch. No effect when
+# mtu_discovery is off.
+# Default: 1452
+#mtu_upper_bound = 1452
+
 # QUIC congestion controller: "bbr", "cubic" or "newreno".
 #
 # BBR by default, and it should usually stay that way. Over a long, lossy
