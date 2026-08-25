@@ -341,9 +341,12 @@ pub struct Settings {
 /// RFC 9114 states most of its frame rules as "on any other stream" or "once
 /// the CONNECT method has completed", so the same frame type is ordinary on one
 /// stream and a connection error on the next. This is what a decoder knows about
-/// which of the three it is serving, and [`misplaced`] is the whole of the rule.
+/// which of the three it is serving, and the module-private `misplaced` is the
+/// whole of the rule.
+///
+/// Public for the reason [`FrameDecoder`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamKind {
+pub enum StreamKind {
     /// The peer's control stream (RFC 9114 §6.2.1).
     ///
     /// Every frame type this server parses may legitimately arrive here, so
@@ -389,8 +392,18 @@ enum State {
 /// reason: frames do not align with stream chunks in either direction, so the
 /// decoder has to be a state machine that can be fed a byte at a time -- which
 /// is exactly how the tests below feed it.
+///
+/// Public, though nothing outside this module constructs one at run time:
+/// [`FrameReader`] is what the server uses, and `crate::h3api` deliberately
+/// re-exports neither. What needs this is `tests/it_fuzz.rs`, where the
+/// properties about chunk boundaries and about which frame type belongs on which
+/// stream are worth far more when they can be stated against the state machine
+/// itself -- a byte at a time, at chosen split points, on a [`StreamKind`] the
+/// test picks -- than against a loopback QUIC connection whose packetisation is
+/// quinn's to decide. It is documented rather than hidden because this module's
+/// own prose already names it as the design's centre.
 #[derive(Debug)]
-pub(super) struct FrameDecoder {
+pub struct FrameDecoder {
     /// The chunk last pushed, with the consumed prefix removed.
     chunk: Bytes,
     /// Frame header bytes carried over from earlier chunks.
@@ -432,7 +445,7 @@ pub(super) struct FrameDecoder {
 impl FrameDecoder {
     /// A decoder positioned at the start of a `stream`'s frame sequence, drawing
     /// on `budget` for whatever it has to buffer.
-    pub(super) fn new(stream: StreamKind, budget: Arc<BufferBudget>) -> Self {
+    pub fn new(stream: StreamKind, budget: Arc<BufferBudget>) -> Self {
         Self {
             chunk: Bytes::new(),
             header: [0; MAX_FRAME_HEADER],
@@ -449,7 +462,7 @@ impl FrameDecoder {
     ///
     /// Only legal once [`Self::next_item`] has asked for more, which is the only
     /// state in which the previous chunk is spent.
-    pub(super) fn push(&mut self, chunk: Bytes) {
+    pub fn push(&mut self, chunk: Bytes) {
         debug_assert!(self.chunk.is_empty(), "the previous chunk is not consumed");
         self.chunk = chunk;
     }
@@ -462,7 +475,7 @@ impl FrameDecoder {
     /// from its header rather than after its payload -- so a peer cannot hold
     /// the connection's buffering budget with field sections it was never
     /// allowed to send.
-    pub(super) fn connect_completed(&mut self) {
+    pub fn connect_completed(&mut self) {
         self.stream = StreamKind::Tunnel;
     }
 
@@ -471,12 +484,12 @@ impl FrameDecoder {
     /// RFC 9114 §7.1: "When a stream terminates cleanly, if the last frame on
     /// the stream was truncated, this MUST be treated as a connection error of
     /// type H3_FRAME_ERROR."
-    pub(super) fn at_frame_boundary(&self) -> bool {
+    pub fn at_frame_boundary(&self) -> bool {
         matches!(self.state, State::Header) && self.header_len == 0
     }
 
     /// The next item, or `None` when more bytes are needed.
-    pub(super) fn next_item(&mut self) -> Result<Option<Item>, Error> {
+    pub fn next_item(&mut self) -> Result<Option<Item>, Error> {
         loop {
             match self.state {
                 State::Header => {

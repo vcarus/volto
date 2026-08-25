@@ -21,13 +21,14 @@
 //!   direction, so the answer must not depend on where the reads fall. The
 //!   frame properties below therefore write the same bytes twice -- once whole,
 //!   once split at generated points -- and compare.
-//! * **No `src` change to reach anything.** Where a property would need an item
-//!   that is not `pub`, it is stated against what *is* public and the gap is
-//!   recorded in a comment rather than closed by widening the API. Two came up,
-//!   and both are marked "API GAP" where they bite: `frame::FrameDecoder` is
-//!   `pub(super)`, so the frame properties drive a real QUIC stream; and
-//!   `stream::build_request` is private, so RFC 9114 §4.3's rules about which
-//!   pseudo-headers a request may carry are not reachable in process.
+//! * **The pure state machines, driven directly.** `frame::FrameDecoder` is
+//!   `pub` so that the frame properties can feed it a chosen chunk sequence on
+//!   a chosen `StreamKind`, rather than reaching the codec through a loopback
+//!   QUIC connection that decides both for them. The properties that do put
+//!   bytes on a real stream stay alongside them, because that is where a peer
+//!   meets this code. One gap is left, and it is marked "API GAP" where it
+//!   bites: `stream::build_request` is private, so RFC 9114 §4.3's rules about
+//!   which pseudo-headers a request may carry are not reachable in process.
 //!
 //! Run it as a fuzzer with:
 //!
@@ -37,9 +38,9 @@
 //!
 //! `PROPTEST_CASES` is honoured by every property here; the per-property counts
 //! below are CI defaults, applied only when the variable is unset. The defaults
-//! run in about a second, 20000 cases in some twenty seconds and 300000 in five
-//! and a half minutes -- almost all of it in the four properties that put bytes
-//! on a QUIC stream, which is why their defaults are the low ones.
+//! run in about a second, and almost all of a long run is spent in the five
+//! properties that put bytes on a QUIC stream, which is why their defaults are
+//! the low ones.
 
 mod common;
 
@@ -54,7 +55,7 @@ use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use volto::capsule::{self, CapsuleDecoder};
 use volto::datagram::{self, DecodeError, VARINT_MAX};
 use volto::h3::error::Code;
-use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
+use volto::h3::frame::{self, BufferBudget, Frame, FrameDecoder, FrameReader, Item, StreamKind};
 use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
 use volto::h3::{huffman, MAX_FIELD_SECTION_SIZE};
@@ -298,29 +299,29 @@ fn every_short_varint_and_every_class_boundary_round_trips() {
 }
 
 // ---------------------------------------------------------------------------
-// The frame layer, over a real QUIC stream
+// The frame layer
 // ---------------------------------------------------------------------------
 //
-// API GAP: `frame::FrameDecoder` -- the pure state machine, the thing that can
-// be fed a byte at a time in process -- is `pub(super)`. The only public way
-// into the frame layer from a test binary is `FrameReader::new(recv, budget)`,
-// which needs a live `quinn::RecvStream`. That constructor is also the
-// permissive kind -- the one the peer's control stream gets, where no frame type
-// is refused for where it is -- so the request-stream and tunnel verdicts that
-// refuse SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE and a
-// post-CONNECT HEADERS from the frame header are not reachable here; they are
-// pinned by the decoder's unit tests and by `it_hostile`. So the properties
-// below drive a real loopback QUIC connection: one stream per case, the bytes
-// written on it, the items read back off it. That is slower than calling the decoder directly and
-// it gives up exact control of where the chunk boundaries fall -- quinn decides
-// how the writes are packetised -- but it is what the public API offers, and
-// making the decoder `pub` would be a `src` change.
+// Two ways in, and the properties below use both.
 //
-// The chunking properties are therefore stated as *write*-splitting invariance:
-// the same bytes handed to `write_all` once, and handed to it in generated
-// pieces, must produce the same item sequence. Both spellings reach the decoder
-// through whatever chunking quinn chose, and a decoder whose answer depended on
-// that would disagree between the two.
+// `frame::FrameDecoder` is the pure state machine: it holds every byte of its
+// own state, so a property can hand it a chunk sequence it chose -- one byte at
+// a time, or cut at generated offsets -- and can build it for any of the three
+// `StreamKind`s this server reads. Those are the two things a loopback
+// connection cannot give. quinn decides how a write is packetised, so a
+// *write*-splitting property only ever states that the answer survived whatever
+// chunking quinn picked; and `FrameReader::new` is the permissive constructor,
+// the one the peer's control stream gets, so the request-stream and tunnel
+// verdicts -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE and a
+// post-CONNECT HEADERS, each refused from the frame header alone -- are out of
+// its reach entirely.
+//
+// The properties that put bytes on a real QUIC stream stay. The decoder is only
+// half of what a peer meets: `FrameReader` is the other half, and it is what
+// turns the end of a stream into RFC 9114 §7.1's verdict. That the in-process
+// half really is the half the wire runs is itself a property --
+// `a_stream_reader_adds_only_the_end_of_stream_rule_to_the_decoder` -- so
+// neither side is trusted on its own.
 
 /// ALPN for the bare QUIC pair below; it speaks no protocol quinn knows about.
 const FUZZ_ALPN: &str = "volto-fuzz";
@@ -482,6 +483,14 @@ enum Step {
     PushPromise,
     /// The peer finished and the stream ended at a frame boundary.
     End,
+    /// The bytes ran out inside a frame.
+    ///
+    /// Only an in-process run can end here: a [`FrameDecoder`] is told nothing
+    /// about how the stream ends, so "no more input" and "the peer finished"
+    /// are the same state to it and [`FrameDecoder::at_frame_boundary`] is the
+    /// question a caller asks. On the wire that question has already been put,
+    /// and its answer is [`Step::Violation`] with H3_FRAME_ERROR.
+    Incomplete,
     /// The peer broke one of RFC 9114 §7's rules.
     Violation {
         code: u64,
@@ -602,6 +611,174 @@ fn drive_with(chunks: &[Vec<u8>], budget: &Arc<BufferBudget>) -> Vec<Step> {
 /// [`drive_with`] on a budget of this stream's own.
 fn drive(chunks: &[Vec<u8>]) -> Vec<Step> {
     drive_with(chunks, &Arc::new(BufferBudget::default()))
+}
+
+/// Pushes `chunks` through `decoder`, appending what comes out to `steps`.
+///
+/// `false` once the decoder has refused something, which is the end of what it
+/// has to say: the chunk it stopped in is not consumed, and pushing another
+/// would trip [`FrameDecoder::push`]'s debug assertion. Every other return
+/// leaves the decoder ready for more, which is what lets a caller feed it in
+/// stages -- a request, then the CONNECT being answered, then the tunnel.
+fn feed(decoder: &mut FrameDecoder, chunks: &[Vec<u8>], steps: &mut Vec<Step>) -> bool {
+    for chunk in chunks {
+        decoder.push(Bytes::from(chunk.clone()));
+        loop {
+            match decoder.next_item() {
+                Ok(Some(item)) => steps.push(Step::of(item)),
+                Ok(None) => break,
+                Err(error) => {
+                    steps.push(Step::of_error(&error));
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Where a decoder that has run out of input stands (RFC 9114 §7.1).
+fn terminal(decoder: &FrameDecoder) -> Step {
+    if decoder.at_frame_boundary() {
+        Step::End
+    } else {
+        Step::Incomplete
+    }
+}
+
+/// What a decoder for `kind` makes of `chunks`, in the vocabulary [`drive`]
+/// answers in.
+fn decode_chunks(kind: StreamKind, chunks: &[Vec<u8>]) -> Vec<Step> {
+    let mut decoder = FrameDecoder::new(kind, Arc::new(BufferBudget::default()));
+    let mut steps = Vec::new();
+    if feed(&mut decoder, chunks, &mut steps) {
+        steps.push(terminal(&decoder));
+    }
+    normalise(steps)
+}
+
+/// [`decode_chunks`] with every byte its own chunk.
+///
+/// The worst case a real stream can produce, and the one thing the wire cannot
+/// be asked for: it is where a frame header straddling chunks is either
+/// reassembled or mis-parsed.
+fn decode_bytewise(kind: StreamKind, bytes: &[u8]) -> Vec<Step> {
+    let chunks: Vec<Vec<u8>> = bytes.iter().map(|byte| vec![*byte]).collect();
+    decode_chunks(kind, &chunks)
+}
+
+/// Reads `request`, answers the CONNECT if `narrow`, then reads `tail`.
+///
+/// The transition RFC 9114 §4.4 turns on, which no constructor reaches: a
+/// stream that carried a field section a moment ago is a tunnel now.
+fn through_connect(narrow: bool, request: &[Vec<u8>], tail: &[Vec<u8>]) -> Vec<Step> {
+    let mut decoder = FrameDecoder::new(StreamKind::Request, Arc::new(BufferBudget::default()));
+    let mut steps = Vec::new();
+
+    if feed(&mut decoder, request, &mut steps) {
+        if narrow {
+            decoder.connect_completed();
+        }
+        if feed(&mut decoder, tail, &mut steps) {
+            steps.push(terminal(&decoder));
+        }
+    }
+    normalise(steps)
+}
+
+/// The frame types that may not appear on `kind` at all.
+///
+/// Written out here rather than asked of `frame`, where the rule is private
+/// anyway: a test that read the table the code enforces would agree with the
+/// code whatever the table held.
+fn refused_on(kind: StreamKind) -> &'static [u64] {
+    match kind {
+        // RFC 9114 §6.2.1 makes this the stream every one of them belongs on.
+        StreamKind::Control => &[],
+        StreamKind::Request => &[
+            frame::SETTINGS,
+            frame::GOAWAY,
+            frame::CANCEL_PUSH,
+            frame::MAX_PUSH_ID,
+            frame::PUSH_PROMISE,
+        ],
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+        //# Once the CONNECT method has completed, only DATA frames are permitted
+        //# to be sent on the stream.
+        StreamKind::Tunnel => &[
+            frame::HEADERS,
+            frame::SETTINGS,
+            frame::GOAWAY,
+            frame::CANCEL_PUSH,
+            frame::MAX_PUSH_ID,
+            frame::PUSH_PROMISE,
+        ],
+    }
+}
+
+/// The refusal every rule in [`refused_on`] hands out.
+fn frame_unexpected() -> Step {
+    Step::Violation {
+        code: Code::H3_FRAME_UNEXPECTED.value(),
+        connection: true,
+    }
+}
+
+/// A frame every stream kind may carry, for the bytes before the one under test.
+///
+/// DATA, or a type RFC 9114 §9 says to skip. Neither is refused anywhere, so a
+/// property about where the *next* frame may appear is not decided by these.
+fn any_allowed_frame_spec() -> impl Strategy<Value = FrameSpec> {
+    prop_oneof![
+        2 => payload(96).prop_map(|payload| FrameSpec { kind: frame::DATA, payload }),
+        1 => any_unknown_type().prop_flat_map(|kind| {
+            payload(96).prop_map(move |payload| FrameSpec { kind, payload })
+        }),
+    ]
+}
+
+/// What [`any_allowed_frame_spec`] frames must decode to, computed from the
+/// specs rather than from a run.
+fn expected_steps(specs: &[FrameSpec]) -> Vec<Step> {
+    normalise(
+        specs
+            .iter()
+            .map(|spec| match spec.kind {
+                frame::DATA => Step::Data(spec.payload.clone()),
+                kind => Step::Skipped(kind),
+            })
+            .collect(),
+    )
+}
+
+/// Whether `prefix` is what `whole` had answered by some point in its input.
+///
+/// Element-wise equality, except that the last entry may be a byte-prefix of its
+/// counterpart: DATA payload is handed out as it arrives, so a run whose bytes
+/// stopped inside a DATA frame has rightly reported fewer of them.
+fn is_answer_prefix(prefix: &[Step], whole: &[Step]) -> bool {
+    if prefix.len() > whole.len() {
+        return false;
+    }
+    let Some((last, rest)) = prefix.split_last() else {
+        return true;
+    };
+    if rest != &whole[..rest.len()] {
+        return false;
+    }
+    match (last, &whole[rest.len()]) {
+        (Step::Data(held), Step::Data(all)) => all.starts_with(held),
+        (left, right) => left == right,
+    }
+}
+
+/// Every stream kind a decoder can be built for.
+fn any_stream_kind() -> impl Strategy<Value = StreamKind> {
+    prop::sample::select(vec![
+        StreamKind::Control,
+        StreamKind::Request,
+        StreamKind::Tunnel,
+    ])
 }
 
 /// One frame to put on the wire.
@@ -909,6 +1086,263 @@ proptest! {
             started.elapsed() < WIRE_TIMEOUT,
             "the refusals took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// A `FrameReader` on a QUIC stream answers what its `FrameDecoder` did,
+    /// plus RFC 9114 §7.1's verdict on a stream that ended inside a frame.
+    ///
+    /// The bridge between the two halves of this section, and the reason the
+    /// in-process properties are allowed to stand for on-wire behaviour: the
+    /// same bytes go to a real stream and to a decoder built by hand, and the
+    /// only difference permitted between the two answers is the one thing a
+    /// decoder cannot know -- that the peer has finished sending.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-7.1
+    //# When a stream terminates cleanly, if the last frame on the stream was
+    //# truncated, this MUST be treated as a connection error of type
+    //# H3_FRAME_ERROR.
+    ///
+    /// `FrameReader::new` is the control stream's constructor, so
+    /// `StreamKind::Control` is the decoder this compares against; the other two
+    /// kinds have no on-wire spelling a test binary can reach, which is what
+    /// makes this property the whole of the tie between them.
+    #[test]
+    fn a_stream_reader_adds_only_the_end_of_stream_rule_to_the_decoder(
+        bytes in frame_ish_bytes(),
+    ) {
+        let decoded = decode_chunks(StreamKind::Control, std::slice::from_ref(&bytes));
+
+        let expected: Vec<Step> = decoded
+            .iter()
+            .map(|step| match step {
+                Step::Incomplete => Step::Violation {
+                    code: Code::H3_FRAME_ERROR.value(),
+                    connection: true,
+                },
+                other => other.clone(),
+            })
+            .collect();
+
+        prop_assert_eq!(drive(std::slice::from_ref(&bytes)), expected);
+    }
+}
+
+proptest! {
+    // No QUIC stream, no round trip: these run at the speed of the state
+    // machine, which is why the default is three orders of magnitude above the
+    // wire properties above.
+    #![proptest_config(config(4096))]
+
+    /// A frame type that may not appear on this stream is refused from its
+    /// header alone, at every length, wherever the chunk boundaries fall.
+    ///
+    /// The ordering is what this pins, and it is load-bearing in both
+    /// directions. A frame type refused for *where it is* is a connection error
+    /// (RFC 9114 §7.2.3, §7.2.4, §7.2.5, §7.2.7 and §4.1 each say so for one of
+    /// them, and §4.4 for a tunnel), while a declared length past what this
+    /// server buffers is a *stream* error answered with 431. So a SETTINGS frame
+    /// on a request stream declaring 2^62-1 bytes must earn the first verdict
+    /// and not the second: answering a MUST-close with a 431 would leave the
+    /// connection running, and the peer would have learnt that a frame it may
+    /// never send is merely too big.
+    ///
+    /// Not one byte of payload is ever written, so a decoder that waited for it
+    /// would answer `Incomplete` here rather than refusing.
+    #[test]
+    fn a_frame_the_stream_may_not_carry_is_refused_from_its_header(
+        kind in prop::sample::select(vec![StreamKind::Request, StreamKind::Tunnel]),
+        choice in any::<u8>(),
+        length in prop_oneof![
+            3 => any_varint(),
+            2 => prop::sample::select(vec![
+                0, 1, MAX_FIELD_SECTION_SIZE - 1, MAX_FIELD_SECTION_SIZE,
+                MAX_FIELD_SECTION_SIZE + 1, VARINT_MAX,
+            ]),
+        ],
+        before in prop::collection::vec(any_allowed_frame_spec(), 0..3),
+        cuts in prop::collection::vec(any::<u16>(), 0..6),
+    ) {
+        let refused = refused_on(kind);
+        let refused_kind = refused[usize::from(choice) % refused.len()];
+
+        let mut bytes = frame_bytes(&before);
+        let mut header = BytesMut::new();
+        frame::put_header(&mut header, refused_kind, length);
+        bytes.extend_from_slice(&header);
+
+        let mut expected = expected_steps(&before);
+        expected.push(frame_unexpected());
+        let expected = normalise(expected);
+
+        for (spelling, chunks) in [
+            ("whole", vec![bytes.clone()]),
+            ("byte at a time", bytes.iter().map(|byte| vec![*byte]).collect()),
+            ("cut", split_at(&bytes, &cuts)),
+        ] {
+            prop_assert_eq!(
+                decode_chunks(kind, &chunks),
+                expected.clone(),
+                "{:?}: type {:#x} of {} bytes, {}",
+                kind, refused_kind, length, spelling
+            );
+        }
+
+        // The complement, and the reason this is a rule about the stream rather
+        // than about the frame: the very same bytes on the peer's control stream
+        // are never refused for the type they name.
+        let control = decode_chunks(StreamKind::Control, &[bytes]);
+        prop_assert!(
+            !control.contains(&frame_unexpected()),
+            "type {:#x} of {} bytes belongs on the control stream: {:?}",
+            refused_kind, length, control
+        );
+    }
+
+    /// Answering the CONNECT narrows the stream to DATA, and does it from the
+    /// frame header.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# Receipt of any other known frame type MUST be treated as a connection
+    //# error of type H3_FRAME_UNEXPECTED.
+    ///
+    /// The transition is the subject, so the two runs share every byte and
+    /// differ only in whether the CONNECT was answered between them. HEADERS is
+    /// the type that tells them apart: a request stream is made of it, and a
+    /// tunnel may not carry one -- which is what stops a peer holding this
+    /// connection's buffering budget in field sections on a stream that is
+    /// carrying a socket.
+    #[test]
+    fn answering_the_connect_narrows_the_stream_to_data_frames(
+        kind in prop::sample::select(
+            KNOWN_TYPES.iter().copied().filter(|kind| *kind != frame::DATA).collect::<Vec<u64>>(),
+        ),
+        block in payload(96),
+        body in payload(96),
+        length in prop_oneof![
+            3 => any_varint(),
+            2 => prop::sample::select(vec![0, 1, MAX_FIELD_SECTION_SIZE, VARINT_MAX]),
+        ],
+        cuts in prop::collection::vec(any::<u16>(), 0..6),
+    ) {
+        let request = frame_bytes(&[FrameSpec { kind: frame::HEADERS, payload: block.clone() }]);
+
+        let mut tail = frame_bytes(&[FrameSpec { kind: frame::DATA, payload: body.clone() }]);
+        let mut header = BytesMut::new();
+        frame::put_header(&mut header, kind, length);
+        tail.extend_from_slice(&header);
+
+        let request = split_at(&request, &cuts);
+        let tail = split_at(&tail, &cuts);
+
+        prop_assert_eq!(
+            through_connect(true, &request, &tail),
+            vec![Step::Headers(block.clone()), Step::Data(body.clone()), frame_unexpected()],
+            "type {:#x} of {} bytes after the CONNECT completed",
+            kind, length
+        );
+
+        // Without the transition the same bytes get the request stream's rules,
+        // which refuse five of the six types and accept a field section.
+        let open = through_connect(false, &request, &tail);
+        if refused_on(StreamKind::Request).contains(&kind) {
+            prop_assert_eq!(
+                open,
+                vec![Step::Headers(block), Step::Data(body), frame_unexpected()],
+                "type {:#x} is refused on a request stream too",
+                kind
+            );
+        } else {
+            prop_assert!(
+                !open.contains(&frame_unexpected()),
+                "type {:#x} of {} bytes belongs on a request stream: {:?}",
+                kind, length, open
+            );
+        }
+    }
+
+    /// Where the chunks fall changes nothing, on any stream kind: the same bytes
+    /// whole, a byte at a time, and cut at generated offsets all decode alike.
+    ///
+    /// The property the wire runs could only approximate, since quinn chooses
+    /// how a write is packetised and a single `write_all` may still arrive in
+    /// pieces. Here the pieces are the test's, and "a byte at a time" is a
+    /// spelling the wire has no way to ask for -- which is the case where a
+    /// frame header straddles every boundary it has.
+    #[test]
+    fn frame_decoding_never_depends_on_where_the_chunks_fall(
+        bytes in frame_ish_bytes(),
+        kind in any_stream_kind(),
+        cuts in prop::collection::vec(any::<u16>(), 0..8),
+    ) {
+        let whole = decode_chunks(kind, std::slice::from_ref(&bytes));
+
+        prop_assert_eq!(decode_bytewise(kind, &bytes), whole.clone(), "{:?}", kind);
+        prop_assert_eq!(
+            decode_chunks(kind, &split_at(&bytes, &cuts)),
+            whole.clone(),
+            "{:?}, cuts {:?}",
+            kind, cuts
+        );
+
+        // A run says one terminal thing, at the end, whatever it was fed.
+        let terminal = whole
+            .iter()
+            .filter(|step| matches!(
+                step,
+                Step::End | Step::Incomplete | Step::Violation { .. } | Step::Broken
+            ))
+            .count();
+        prop_assert_eq!(terminal, 1, "{:?}", whole);
+
+        for step in &whole {
+            // Nothing handed back may be past the per-frame cap, which is on the
+            // *declared* length: a larger field section would mean the check
+            // that bounds an unauthenticated peer's memory had been skipped.
+            if let Step::Headers(block) = step {
+                prop_assert!(
+                    block.len() as u64 <= MAX_FIELD_SECTION_SIZE,
+                    "a {}-byte HEADERS frame came back",
+                    block.len()
+                );
+            }
+        }
+    }
+
+    /// What a decoder has already answered, more bytes never take back.
+    ///
+    /// An incremental decoder is only useful if its answers are final: this
+    /// server hands DATA payload straight into a socket as it arrives, and a
+    /// frame the decoder later decided it had misread is a frame whose bytes are
+    /// already gone. So every prefix of an input must answer a prefix of what
+    /// the whole input answers -- with the one allowance that a run cut inside a
+    /// DATA frame has reported fewer of that frame's bytes, which is the same
+    /// thing said about the payload rather than the item.
+    ///
+    /// It follows that a refusal is final too, which is the half that matters
+    /// for the connection errors above: bytes after a violation cannot turn it
+    /// into anything else, because the violation is the last thing either run
+    /// says.
+    #[test]
+    fn more_bytes_never_revoke_what_a_decoder_has_already_answered(
+        bytes in frame_ish_bytes(),
+        kind in any_stream_kind(),
+        cut in any::<u16>(),
+    ) {
+        let cut = usize::from(cut) % (bytes.len() + 1);
+        let whole = decode_chunks(kind, std::slice::from_ref(&bytes));
+
+        let mut answered = decode_chunks(kind, &[bytes[..cut].to_vec()]);
+        // `End` and `Incomplete` are statements about the input stopping where
+        // it did, not about the frames; they are what the extra bytes revise.
+        if matches!(answered.last(), Some(Step::End | Step::Incomplete)) {
+            answered.pop();
+        }
+
+        prop_assert!(
+            is_answer_prefix(&answered, &whole),
+            "{:?} cut at {}: {:?} is not what {:?} had said by then",
+            kind, cut, answered, whole
         );
     }
 }
