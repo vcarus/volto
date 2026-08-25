@@ -146,9 +146,17 @@ users = [
 #keep_alive_interval = 20
 
 # Size of the first QUIC packets, in bytes. Must be at least 1200 (RFC 9000 §14);
-# volto refuses to start below that rather than silently rounding up.
+# volto refuses to start below that rather than silently rounding up. The
+# program default is the conservative 1200; this file ships 1242, which keeps
+# the handshake inside a 1270-byte IPv4 packet — under the 1280 bytes any
+# practical path carries, and below what Chromium (1250) and quic-go (1280)
+# send everywhere. Two cautions: over IPv6 the same packets are 1290 bytes,
+# past the protocol's 1280-byte guarantee, so prefer 1200 if clients reach you
+# over IPv6; and unlike mtu_upper_bound this value is sent blind in the
+# handshake — a size the path cannot carry kills the connection with nothing
+# to fall back to, so raise it further only from a measurement.
 # Default: 1200
-#initial_mtu = 1200
+initial_mtu = 1242
 
 # Probe for a path MTU larger than initial_mtu (RFC 8899 DPLPMTUD).
 #
@@ -162,14 +170,15 @@ users = [
 #mtu_discovery = true
 
 # Ceiling for path MTU discovery, in bytes — a UDP payload size like
-# initial_mtu. The default 1452 is safe over both IPv4 and IPv6 on Ethernet;
-# if you have measured your path (ping -M do / tracepath) you can claim what
-# IPv4 leaves above that, at most 1472. Overshooting is harmless — a size is
-# only adopted after a probe of that size is acknowledged — so unlike
-# initial_mtu this key is safe to raise on a hunch. No effect when
-# mtu_discovery is off.
+# initial_mtu. The program default 1452 is safe over both IPv4 and IPv6 on
+# Ethernet; this file ships 1464, what an IPv4 uplink behind a 1492-byte
+# first-hop IP MTU (a single PPPoE-sized deduction) leaves, and the most a
+# measured path commonly yields. Overshooting is harmless — a size is only
+# adopted after a probe of that size is acknowledged — so unlike initial_mtu
+# this key is safe to raise on a hunch; 1472 (clean Ethernet over IPv4) is the
+# most volto accepts. No effect when mtu_discovery is off.
 # Default: 1452
-#mtu_upper_bound = 1452
+mtu_upper_bound = 1464
 
 # QUIC congestion controller: "bbr", "cubic" or "newreno".
 #
