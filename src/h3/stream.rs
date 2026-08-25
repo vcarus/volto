@@ -265,7 +265,16 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
 /// the order the RFC states them: field syntax (§4.2, §10.3), pseudo-header
 /// placement and identity (§4.3), then the per-method shape (§4.3.1, §4.4,
 /// RFC 8441 §4).
-fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
+///
+/// Public, though [`Resolver::resolve`] is the only caller the server has and
+/// `crate::h3api` re-exports neither: this is where every "malformed" verdict in
+/// the module doc above is actually decided, and reaching it needs nothing but a
+/// decoded field section -- so `tests/it_fuzz.rs` states properties over
+/// arbitrary pseudo-header *combinations* against it, which through a live
+/// request stream would be one QUIC connection per combination. Documented
+/// rather than hidden for the same reason: the rules it holds are what this
+/// module is about.
+pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;

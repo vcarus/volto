@@ -21,14 +21,15 @@
 //!   direction, so the answer must not depend on where the reads fall. The
 //!   frame properties below therefore write the same bytes twice -- once whole,
 //!   once split at generated points -- and compare.
-//! * **The pure state machines, driven directly.** `frame::FrameDecoder` is
-//!   `pub` so that the frame properties can feed it a chosen chunk sequence on
-//!   a chosen `StreamKind`, rather than reaching the codec through a loopback
-//!   QUIC connection that decides both for them. The properties that do put
-//!   bytes on a real stream stay alongside them, because that is where a peer
-//!   meets this code. One gap is left, and it is marked "API GAP" where it
-//!   bites: `stream::build_request` is private, so RFC 9114 §4.3's rules about
-//!   which pseudo-headers a request may carry are not reachable in process.
+//! * **The pure functions, called directly.** `frame::FrameDecoder` and
+//!   `stream::build_request` are `pub` so that the properties can feed the
+//!   decoder a chosen chunk sequence on a chosen `StreamKind`, and hand the
+//!   request validator a field section built pseudo-header by pseudo-header.
+//!   Reaching either through a live connection costs exactly what a property
+//!   wants to vary: quinn decides where the chunk boundaries fall, and a QUIC
+//!   stream per pseudo-header combination is not a thing to generate thousands
+//!   of. The properties that do put bytes on a real stream stay alongside them,
+//!   because that is where a peer meets this code.
 //!
 //! Run it as a fuzzer with:
 //!
@@ -44,6 +45,7 @@
 
 mod common;
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -58,6 +60,7 @@ use volto::h3::error::Code;
 use volto::h3::frame::{self, BufferBudget, Frame, FrameDecoder, FrameReader, Item, StreamKind};
 use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
+use volto::h3::stream::build_request;
 use volto::h3::{huffman, MAX_FIELD_SECTION_SIZE};
 
 /// A configuration with `cases` defaulted per property but still overridable.
@@ -2115,16 +2118,12 @@ proptest! {
     /// Arbitrary pseudo-headers on a [`Request`] never panic anything that reads
     /// one.
     ///
-    /// API GAP, and it is the interesting half: RFC 9114 §4.3's rules -- which
-    /// pseudo-headers a method requires, which it forbids, that they come before
-    /// the field lines, that `:authority` and Host agree -- live in
-    /// `stream::build_request`, which is private. The only public way to reach
-    /// them is `Resolver::resolve`, which needs a live request stream on a live
-    /// connection, so an in-process property over arbitrary pseudo-header
-    /// *combinations* is not reachable from a test binary without making that
-    /// function `pub`. What is left is that the type itself holds whatever a
-    /// parser would put in it: every field is `pub` and `Option<Box<str>>`, so
-    /// this pins that nothing downstream of the parse assumes more.
+    /// The complement of the `build_request` properties below, and the half they
+    /// cannot state: this is a [`Request`] nobody validated. Every field of the
+    /// type is `pub` and `Option<Box<str>>`, so a combination the validator
+    /// would never have produced -- a classic CONNECT carrying a path, a
+    /// `:protocol` on a GET -- can be built directly here, which pins that
+    /// nothing downstream of the parse assumes the parse happened.
     #[test]
     fn arbitrary_pseudo_headers_never_panic_the_message_layer(
         method in any_name_bytes(),
@@ -2156,5 +2155,522 @@ proptest! {
         let _ = request.fields.get("host");
         let _ = request.fields.get_all("proxy-authorization").count();
         let _ = request.clone();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Request validation
+// ---------------------------------------------------------------------------
+//
+// `stream::build_request` turns a decoded field section into a `Request` or says
+// why it cannot, and it is where RFC 9114 §4.1.2's "malformed" verdict is
+// reached. It takes a `Vec<qpack::Field>` and returns, so a property can put an
+// arbitrary *combination* of pseudo-headers through it -- which is what the
+// rules are about, and what a live request stream cannot supply at proptest's
+// rates. `src/h3/stream.rs`'s own tests are the table of named cases; these are
+// the combinations between them.
+//
+// The properties state what the function does, which is not always what the RFC
+// alone would suggest. Two places where they differ are worth naming: a classic
+// CONNECT never consults a Host field, because §4.4's branch is reached before
+// §4.3.1's agreement rule and reads only `:authority`; and the agreement itself
+// is judged after RFC 9110 §5.5's optional whitespace has been excluded from the
+// Host value, so " example.com " and "example.com" agree.
+
+/// The authority these requests name.
+const AUTHORITY: &str = "example.com:443";
+
+/// A different one, for the half of RFC 9114 §4.3.1's rule that disagrees.
+const OTHER_AUTHORITY: &str = "other.example:443";
+
+/// One field, in the vocabulary `qpack::decode` hands `build_request`.
+fn field(name: &[u8], value: &[u8]) -> Field {
+    Field {
+        name: Cow::Owned(name.to_vec()),
+        value: Cow::Owned(value.to_vec()),
+    }
+}
+
+/// A well-formed extended CONNECT: all five pseudo-headers, no regular field.
+///
+/// Every pseudo-header RFC 9114 §4.3 defines is already here, which is what
+/// makes [`any_extra_pseudo_header_field_is_malformed`] a statement about all of
+/// them: an extra one is either undefined or a repeat, and there is no third
+/// case.
+fn connect_udp_section() -> Vec<Field> {
+    vec![
+        field(b":method", b"CONNECT"),
+        field(b":protocol", b"connect-udp"),
+        field(b":scheme", b"https"),
+        field(b":authority", AUTHORITY.as_bytes()),
+        field(b":path", b"/.well-known/masque/udp/192.0.2.1/443/"),
+    ]
+}
+
+/// Methods worth telling apart: the one RFC 9114 §4.4 gives its own rules, ones
+/// it does not, and a token that differs from CONNECT only in case.
+fn any_method_bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        3 => prop::sample::select(vec![
+            b"CONNECT".to_vec(),
+            b"GET".to_vec(),
+            b"POST".to_vec(),
+            b"OPTIONS".to_vec(),
+            b"connect".to_vec(),
+        ]),
+        1 => "[A-Za-z]{1,8}".prop_map(String::into_bytes),
+    ]
+}
+
+/// Authorities that pass the RFC 3986 §3.2 syntax check `uri_authority` applies,
+/// so that only the agreement rule can decide the outcome.
+fn any_authority() -> impl Strategy<Value = String> {
+    "[a-z][a-z0-9.-]{0,10}(:[0-9]{1,5})?"
+}
+
+/// A well-formed classic CONNECT: RFC 9114 §4.4's two pseudo-headers and no
+/// more.
+fn classic_connect_section() -> Vec<Field> {
+    vec![
+        field(b":method", b"CONNECT"),
+        field(b":authority", AUTHORITY.as_bytes()),
+    ]
+}
+
+/// One of the two shapes this server serves, chosen by a generated flag.
+fn well_formed_section(extended: bool) -> Vec<Field> {
+    if extended {
+        connect_udp_section()
+    } else {
+        classic_connect_section()
+    }
+}
+
+/// A name that might be a pseudo-header: one of the five, one that only looks
+/// like them, or whatever [`any_name_bytes`] produces.
+fn any_field_name_bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        3 => prop::sample::select(vec![
+            b":method".to_vec(),
+            b":scheme".to_vec(),
+            b":authority".to_vec(),
+            b":path".to_vec(),
+            b":protocol".to_vec(),
+        ]),
+        1 => any_name_bytes().prop_map(|name| [b":".to_vec(), name].concat()),
+        3 => any_name_bytes(),
+    ]
+}
+
+/// A value one of those names might carry: one a client would send, or one no
+/// client would.
+fn any_field_value_bytes() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        3 => prop::sample::select(vec![
+            b"CONNECT".to_vec(),
+            b"GET".to_vec(),
+            b"https".to_vec(),
+            AUTHORITY.as_bytes().to_vec(),
+            OTHER_AUTHORITY.as_bytes().to_vec(),
+            b"/".to_vec(),
+            b"*".to_vec(),
+            b"connect-udp".to_vec(),
+            b"trailers".to_vec(),
+            Vec::new(),
+        ]),
+        2 => any_value_bytes(),
+    ]
+}
+
+/// Field sections aimed at every branch: requests a client could have sent,
+/// those requests with one field rewritten, and names and values related to
+/// nothing.
+///
+/// The middle arm is what most of the rules are actually about. A section built
+/// only out of arbitrary names and values almost never reaches the branch that
+/// *accepts* a request -- five pseudo-headers have to arrive together, each
+/// carrying a value of its own kind -- so the shape invariants this generator
+/// exists for would go unexercised. Starting from a well-formed request and
+/// changing one field lands next to every boundary instead.
+fn any_section() -> impl Strategy<Value = Vec<Field>> {
+    prop_oneof![
+        3 => (
+            any::<bool>(),
+            prop::collection::vec((any_name_bytes(), any_value_bytes()), 0..3),
+        ).prop_map(|(extended, extra)| {
+            let mut section = well_formed_section(extended);
+            section.extend(extra.iter().map(|(name, value)| field(name, value)));
+            section
+        }),
+        4 => (
+            any::<bool>(),
+            any::<u8>(),
+            any_field_name_bytes(),
+            any_field_value_bytes(),
+            any::<bool>(),
+        ).prop_map(|(extended, at, name, value, replace)| {
+            let mut section = well_formed_section(extended);
+            let at = usize::from(at) % (section.len() + 1);
+            if replace && at < section.len() {
+                section[at] = field(&name, &value);
+            } else {
+                section.insert(at, field(&name, &value));
+            }
+            section
+        }),
+        3 => prop::collection::vec((any_field_name_bytes(), any_field_value_bytes()), 0..8)
+            .prop_map(|pairs| {
+                pairs
+                    .iter()
+                    .map(|(name, value)| field(name, value))
+                    .collect()
+            }),
+    ]
+}
+
+proptest! {
+    #![proptest_config(config(2048))]
+
+    /// Which pseudo-headers a request must carry, and which it must not, is
+    /// decided by its method -- and the answer is recomputed here rather than
+    /// asked of the function under test.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+    //# A CONNECT request that does not conform to these restrictions is
+    //# malformed.
+    ///
+    /// The five pseudo-headers are switched on and off independently, so all
+    /// thirty-two combinations are reachable for each method, with and without a
+    /// Host field. That is the shape of the rule: a classic CONNECT is the one
+    /// request that must *omit* `:scheme` and `:path`, an extended CONNECT is an
+    /// ordinary request that additionally may not lean on Host for its
+    /// authority, and `:protocol` anywhere but a CONNECT is a pseudo-header
+    /// outside the context RFC 8441 §4 defined it in.
+    #[test]
+    fn which_pseudo_headers_a_request_needs_is_decided_by_its_method(
+        method in prop::option::of(any_method_bytes()),
+        scheme in any::<bool>(),
+        authority in any::<bool>(),
+        path in any::<bool>(),
+        protocol in any::<bool>(),
+        host in prop::option::of(prop::sample::select(vec![AUTHORITY, OTHER_AUTHORITY])),
+    ) {
+        let mut section = Vec::new();
+        if let Some(method) = &method {
+            section.push(field(b":method", method));
+        }
+        if scheme {
+            section.push(field(b":scheme", b"https"));
+        }
+        if authority {
+            section.push(field(b":authority", AUTHORITY.as_bytes()));
+        }
+        if path {
+            section.push(field(b":path", b"/"));
+        }
+        if protocol {
+            section.push(field(b":protocol", b"connect-udp"));
+        }
+        if let Some(host) = host {
+            section.push(field(b"host", host.as_bytes()));
+        }
+
+        let connect = method.as_deref() == Some(b"CONNECT".as_slice());
+        let classic = connect && !protocol;
+        let expected = if method.is_none() || (protocol && !connect) {
+            false
+        } else if classic {
+            // §4.4: the authority and nothing else. A Host field is not
+            // consulted on this branch at all, which is why `host` is absent
+            // from this arm.
+            authority && !scheme && !path
+        } else {
+            scheme && path && match (authority, host) {
+                (true, Some(host)) => host == AUTHORITY,
+                (true, None) => true,
+                // RFC 8441 §4 makes the authority mandatory on a request that
+                // carries :protocol, so Host cannot stand in for it.
+                (false, _) if protocol => false,
+                (false, Some(_)) => true,
+                (false, None) => false,
+            }
+        };
+
+        let built = build_request(section);
+        prop_assert_eq!(
+            built.is_ok(),
+            expected,
+            "method {:?}, scheme {}, authority {}, path {}, protocol {}, host {:?}: {:?}",
+            method, scheme, authority, path, protocol, host,
+            built.as_ref().err().map(ToString::to_string)
+        );
+
+        match built {
+            Ok(request) => {
+                prop_assert_eq!(request.protocol.is_some(), protocol);
+                // Whichever of the two named it: `:authority` when it is there,
+                // and the Host field standing in for it when it is not.
+                prop_assert_eq!(
+                    request.authority.as_deref(),
+                    if authority { Some(AUTHORITY) } else { host }
+                );
+                if classic {
+                    prop_assert_eq!(request.scheme, None);
+                    prop_assert_eq!(request.path, None);
+                } else {
+                    prop_assert_eq!(request.scheme.as_deref(), Some("https"));
+                    prop_assert_eq!(request.path.as_deref(), Some("/"));
+                }
+            }
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1.2
+            //# Malformed requests or responses that are detected MUST be treated
+            //# as a stream error of type H3_MESSAGE_ERROR.
+            Err(error) => {
+                prop_assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
+                prop_assert!(!error.is_connection_error(), "{}", error);
+            }
+        }
+    }
+
+    /// A pseudo-header field is malformed exactly when a regular field came
+    /// before it.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# All pseudo-header fields MUST appear in the header section before
+    //# regular header fields.
+    ///
+    /// The interleavings are generated rather than listed: several regular
+    /// fields are inserted at generated positions into a section that is
+    /// otherwise well-formed, and the verdict is computed from where they landed.
+    /// Their names all begin "x-", so none of them is the Host, TE or Connection
+    /// field that a rule of its own would have decided instead -- what is being
+    /// varied here is position, and nothing else.
+    #[test]
+    fn a_pseudo_header_after_a_regular_field_is_malformed(
+        regulars in prop::collection::vec(("x-[a-z-]{1,6}", "[\\x21-\\x7e]{0,8}"), 1..4),
+        positions in prop::collection::vec(any::<u8>(), 1..4),
+    ) {
+        let mut section = connect_udp_section();
+        for ((name, value), position) in regulars.iter().zip(positions.iter().cycle()) {
+            let at = usize::from(*position) % (section.len() + 1);
+            section.insert(at, field(name.as_bytes(), value.as_bytes()));
+        }
+
+        let first_regular = section.iter().position(|field| !field.name.starts_with(b":"));
+        let last_pseudo = section.iter().rposition(|field| field.name.starts_with(b":"));
+        let ordered = match (first_regular, last_pseudo) {
+            (Some(first), Some(last)) => first > last,
+            _ => true,
+        };
+
+        let names: Vec<String> = section
+            .iter()
+            .map(|field| String::from_utf8_lossy(&field.name).into_owned())
+            .collect();
+
+        let built = build_request(section);
+        prop_assert_eq!(built.is_ok(), ordered, "{:?}", names);
+
+        if let Err(error) = built {
+            prop_assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
+            prop_assert!(!error.is_connection_error(), "{}", error);
+        }
+    }
+
+    /// `:authority` and Host must say the same thing, and whichever of them is
+    /// there is the authority the request ends up with.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3.1
+    //# If the :scheme pseudo-header field identifies a scheme that has a
+    //# mandatory authority component [...] the request MUST contain either an
+    //# :authority pseudo-header field or a Host header field.  If these fields
+    //# are present, they MUST NOT be empty.  If both fields are present, they
+    //# MUST contain the same value.
+    ///
+    /// The Host value is padded with generated leading and trailing whitespace,
+    /// which RFC 9110 §5.5 excludes from a field value before anything evaluates
+    /// it -- so the padding must make no difference to the agreement, and the
+    /// authority the request carries must be the unpadded one. That is the
+    /// reading `add_field` implements, and it is what keeps a client whose
+    /// encoder pads a value from being told its request is malformed.
+    #[test]
+    fn authority_and_host_must_say_the_same_thing(
+        authority in prop::option::of(any_authority()),
+        host in prop::option::of((any_authority(), "[ \t]{0,3}", "[ \t]{0,3}")),
+        protocol in any::<bool>(),
+    ) {
+        let mut section = vec![field(
+            b":method",
+            if protocol { b"CONNECT".as_slice() } else { b"GET".as_slice() },
+        )];
+        if protocol {
+            section.push(field(b":protocol", b"connect-udp"));
+        }
+        section.push(field(b":scheme", b"https"));
+        if let Some(authority) = &authority {
+            section.push(field(b":authority", authority.as_bytes()));
+        }
+        section.push(field(b":path", b"/"));
+        if let Some((host, lead, trail)) = &host {
+            section.push(field(b"host", format!("{lead}{host}{trail}").as_bytes()));
+        }
+
+        let host = host.map(|(host, _, _)| host);
+        let expected = match (authority.as_deref(), host.as_deref()) {
+            (Some(authority), Some(host)) => authority == host,
+            (Some(_), None) => true,
+            (None, _) if protocol => false,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+
+        let built = build_request(section);
+        prop_assert_eq!(
+            built.is_ok(),
+            expected,
+            "authority {:?}, host {:?}, protocol {}",
+            authority, host, protocol
+        );
+
+        match built {
+            Ok(request) => {
+                prop_assert_eq!(
+                    request.authority.as_deref(),
+                    authority.as_deref().or(host.as_deref())
+                );
+                // The padding is gone from the field as well, which is what
+                // `crate::auth` and the agreement check above both read.
+                if let Some(host) = &host {
+                    prop_assert_eq!(
+                        request.fields.get("host").map(FieldValue::as_bytes),
+                        Some(host.as_bytes())
+                    );
+                }
+            }
+            Err(error) => {
+                prop_assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
+                prop_assert!(!error.is_connection_error(), "{}", error);
+            }
+        }
+    }
+
+    /// Any extra pseudo-header field on a complete request is malformed,
+    /// wherever it sits.
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# Endpoints MUST treat a request or response that contains undefined or
+    //# invalid pseudo-header fields as malformed.
+    ///
+    /// The base section already carries all five pseudo-headers RFC 9114 §4.3
+    /// defines, so a sixth is either one of the five again -- which §4.3.1's
+    /// "exactly one value" forbids -- or a name that is not defined for a
+    /// request, `:status` included. There is no third case, which is what lets
+    /// the name be generated rather than chosen: every byte string beginning ":"
+    /// falls into one or the other.
+    #[test]
+    fn any_extra_pseudo_header_field_is_malformed(
+        name in prop_oneof![
+            3 => "[a-z]{1,10}".prop_map(|name| format!(":{name}")),
+            2 => prop::sample::select(vec![
+                ":status", ":method", ":scheme", ":authority", ":path", ":protocol",
+                ":Path", ":", ":volto", ":method ",
+            ]).prop_map(str::to_owned),
+            1 => "[\\x21-\\x7e]{0,6}".prop_map(|rest| format!(":{rest}")),
+        ],
+        value in "[\\x21-\\x7e]{0,12}",
+        position in any::<u8>(),
+    ) {
+        let mut section = connect_udp_section();
+        let at = usize::from(position) % (section.len() + 1);
+        section.insert(at, field(name.as_bytes(), value.as_bytes()));
+
+        let error = build_request(section)
+            .map(|request| request.method)
+            .expect_err(&format!("{name:?} at {at} must be malformed"));
+        prop_assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
+        prop_assert!(!error.is_connection_error(), "{}", error);
+    }
+
+    /// Arbitrary field sections never panic the validator, every refusal costs
+    /// the stream and never the connection, and every acceptance has the shape
+    /// the rest of the server reads without checking.
+    ///
+    /// The invariants are the point, and each is something a caller downstream
+    /// relies on: `tunnel::tcp` resolves `request.authority` and would have
+    /// nothing to resolve without it; the router reads `request.protocol` and
+    /// answers a CONNECT that has none as a TCP tunnel; `auth` walks the fields;
+    /// and `tunnel::udp` parses the path against RFC 9298 §2's template. A
+    /// request that reached any of them missing what they assume would be a
+    /// panic or a wrong answer, in a task started by an unauthenticated peer.
+    ///
+    /// That every rejection is a *stream* error matters as much: a field section
+    /// is the first thing a peer sends, and a malformed one that ended the
+    /// connection would take every tunnel on it along.
+    #[test]
+    fn arbitrary_field_sections_are_refused_on_the_stream_or_accepted_whole(
+        section in any_section(),
+    ) {
+        const AUTHORITY_CHARACTERS: &[u8] = b"-._~%!$&'()*+,;=:@[]";
+
+        match build_request(section) {
+            Ok(request) => {
+                let classic = request.method == Method::Connect && request.protocol.is_none();
+
+                // RFC 9114 §4.4 for the classic form, §4.3.1 and RFC 8441 §4 for
+                // everything else.
+                if classic {
+                    prop_assert!(request.scheme.is_none(), "{:?}", request);
+                    prop_assert!(request.path.is_none(), "{:?}", request);
+                    prop_assert!(request.query.is_none(), "{:?}", request);
+                } else {
+                    prop_assert!(request.scheme.is_some(), "{:?}", request);
+                    prop_assert!(request.path.is_some(), "{:?}", request);
+                }
+                if request.protocol.is_some() {
+                    prop_assert_eq!(&request.method, &Method::Connect, "{:?}", request);
+                }
+
+                let authority = request.authority.as_deref().unwrap_or_else(|| {
+                    panic!("every accepted request names an authority: {request:?}")
+                });
+                prop_assert!(!authority.is_empty(), "{:?}", request);
+                prop_assert!(
+                    authority.bytes().all(|byte| byte.is_ascii_alphanumeric()
+                        || AUTHORITY_CHARACTERS.contains(&byte)),
+                    "{:?}",
+                    request
+                );
+
+                // The agreement of §4.3.1, from the other end: whatever Host
+                // survived says what the authority says. Except on a classic
+                // CONNECT, where §4.4's branch reads `:authority` alone and a
+                // Host field is an ordinary field like any other.
+                if !classic {
+                    if let Some(host) = request.fields.get("host") {
+                        prop_assert_eq!(host.as_bytes(), authority.as_bytes(), "{:?}", request);
+                    }
+                }
+                prop_assert!(request.fields.get_all("host").count() <= 1, "{:?}", request);
+
+                // §4.3.1's asterisk form is the one target that is not a path.
+                if let Some(path) = request.path.as_deref() {
+                    prop_assert!(path == "*" || path.starts_with('/'), "{:?}", request);
+                }
+
+                // RFC 9114 §4.2 on the regular fields that came through.
+                for (name, value) in request.fields.iter() {
+                    prop_assert!(!name.is_empty(), "{:?}", request);
+                    prop_assert!(!name.bytes().any(|byte| byte.is_ascii_uppercase()), "{}", name);
+                    prop_assert_ne!(name, "connection", "{:?}", request);
+                    if name == "te" {
+                        prop_assert_eq!(value.as_bytes(), b"trailers", "{:?}", request);
+                    }
+                }
+            }
+            Err(error) => {
+                prop_assert_eq!(error.code(), Code::H3_MESSAGE_ERROR);
+                prop_assert!(!error.is_connection_error(), "{}", error);
+            }
+        }
     }
 }
