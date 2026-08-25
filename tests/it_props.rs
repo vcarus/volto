@@ -775,15 +775,16 @@ proptest! {
     /// that would otherwise break the path apart.
     #[test]
     fn the_template_round_trips_a_percent_encoded_host(
-        host in "\\PC{1,32}",
-        port in 1u16..=u16::MAX,
-    ) {
         // A bracket is the template's syntax rather than part of a host, so no
         // host containing one round trips: the enclosing pair comes off, which
         // `the_template_round_trips_ip_literals` pins, and any other bracket is
-        // refused outright.
-        prop_assume!(!host.contains(['[', ']']));
-
+        // refused outright. Excluded by construction rather than by
+        // `prop_assume!`: the rejection budget is a constant 1024 while
+        // `PROPTEST_CASES` scales, so an assume that discards ~10% of inputs
+        // aborts any run long enough to be called a fuzzer.
+        host in "[^\\p{C}\\[\\]]{1,32}",
+        port in 1u16..=u16::MAX,
+    ) {
         let path = format!("{PREFIX}{}/{port}/", percent_encode_all(host.as_bytes()));
         prop_assert_eq!(parse_target(&path, None), Ok((host, port)));
     }
