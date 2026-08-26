@@ -30,10 +30,12 @@
 //! | h | Opens more than sixteen unidirectional streams | `MAX_PEER_UNI_STREAMS` = 16, a transport parameter (`src/quic.rs`) | The seventeenth is never granted: no credit, so no stream and nothing to refuse | [`sixteen_is_all_the_unidirectional_streams_a_peer_gets`] |
 //! | i | Opens a unidirectional stream of an unknown type | RFC 9114 §6.2: unknown types are aborted, never a connection error (`src/h3/connection.rs`) | STOP_SENDING H3_STREAM_CREATION_ERROR; the connection carries on | [`a_unidirectional_stream_of_an_unknown_type_costs_one_stream`] |
 //! | i2 | Opens a second control stream, a client-initiated push stream, or closes its control stream cleanly | RFC 9114 §6.2.1/§6.2.2 (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR for the first two, H3_CLOSED_CRITICAL_STREAM (0x104) for the third | [`unidirectional_streams_that_break_a_critical_stream_rule_end_the_connection`] |
+//! | i3 | Opens a second QPACK encoder or decoder stream | RFC 9204 §4.2: one of each per endpoint (`serve_qpack`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR (0x103) | [`a_second_qpack_stream_of_either_kind_ends_the_connection`] |
 //! | j | Sends a frame type reserved for HTTP/2 (0x02, 0x06, 0x08, 0x09) | `RESERVED_HTTP2_TYPES` (`src/h3/frame.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), whatever stream it arrives on | [`frame_types_reserved_for_http2_end_the_connection`] |
 //! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream | RFC 9114 §6.2.1 first-frame rule (`Control::accept`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a) | `it_settings::a_frame_before_settings_ends_the_connection` |
 //! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431, and nothing charged to the buffering budget on the way | [`control_stream_frames_on_a_request_stream_end_the_connection`], [`a_frame_refused_for_its_type_is_never_charged_for`] |
 //! | j6 | Announces a HEADERS frame on a tunnel whose CONNECT has been answered, and never finishes it | RFC 9114 §4.4, decided from the frame header rather than after the payload (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105); the announcement never reaches the budget, so tunnels cannot pin it between them | [`a_field_section_on_an_established_tunnel_ends_the_connection`] |
+//! | j7 | Opens a request stream with a DATA frame, before any HEADERS | RFC 9114 §4.1's rule about the *order* of a request's frames, which `frame::misplaced` leaves to the reader of the request (`Resolver::resolve`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105) | [`a_data_frame_before_any_headers_ends_the_connection`] |
 //! | j3 | Sends a second SETTINGS, or HEADERS/DATA/PUSH_PROMISE, on the control stream after SETTINGS | `Control::accept` (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED | [`frames_the_control_stream_may_not_carry_end_the_connection`] |
 //! | j4 | Sends CANCEL_PUSH, or a MAX_PUSH_ID that shrinks | RFC 9114 §7.2.3/§7.2.7 (`Control::accept`) | CONNECTION_CLOSE H3_ID_ERROR (0x108) | `it_critical_streams::a_cancel_push_is_an_id_error`, `it_critical_streams::a_shrinking_max_push_id_is_an_id_error` |
 //! | k | References the QPACK dynamic table in a field section | `QPACK_MAX_TABLE_CAPACITY = 0` is advertised, so there is no entry to name (`src/h3/qpack.rs`) | CONNECTION_CLOSE QPACK_DECOMPRESSION_FAILED (0x200) | `it_extended_connect::a_dynamic_table_reference_closes_the_connection` |
@@ -114,6 +116,10 @@ const FRAME_MAX_PUSH_ID: u64 = 0x0d;
 const STREAM_CONTROL: u64 = 0x00;
 /// Push stream type (RFC 9114 §6.2.2), which only a server may open.
 const STREAM_PUSH: u64 = 0x01;
+/// QPACK encoder stream type (RFC 9204 §4.2).
+const STREAM_QPACK_ENCODER: u64 = 0x02;
+/// QPACK decoder stream type (RFC 9204 §4.2).
+const STREAM_QPACK_DECODER: u64 = 0x03;
 
 /// A reserved stream or frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
 ///
@@ -460,6 +466,45 @@ async fn unidirectional_streams_that_break_a_critical_stream_rule_end_the_connec
     }
 }
 
+/// A peer gets one QPACK encoder stream and one decoder stream; a second of
+/// either kind ends the connection.
+///
+//= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+//# Each endpoint MUST initiate, at most, one encoder stream and, at most,
+//# one decoder stream.  Receipt of a second instance of either stream type
+//# MUST be treated as a connection error of type H3_STREAM_CREATION_ERROR.
+///
+/// Neither stream carries anything this server acts on -- it advertises a table
+/// capacity of zero -- which is exactly why the count needs a test: a duplicate
+/// that went unnoticed would cost nothing visible until a peer opened them by
+/// the dozen.
+#[tokio::test]
+async fn a_second_qpack_stream_of_either_kind_ends_the_connection() {
+    for (name, stream_type) in [
+        ("a second QPACK encoder stream", STREAM_QPACK_ENCODER),
+        ("a second QPACK decoder stream", STREAM_QPACK_DECODER),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        // Both held rather than dropped: dropping a `quinn::SendStream` finishes
+        // it, and the offence is a second stream existing rather than a first
+        // one ending.
+        let _first = open_uni_stream(&connection, stream_type, &[]).await;
+        let _second = open_uni_stream(&connection, stream_type, &[]).await;
+
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_STREAM_CREATION_ERROR,
+            "{name}: wrong close code; the reason was {reason:?}"
+        );
+        assert!(
+            reason.contains("a second QPACK stream"),
+            "{name}: the reason {reason:?} does not name the offence"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // j: frames that end the connection
 // ---------------------------------------------------------------------------
@@ -670,6 +715,47 @@ async fn a_field_section_on_an_established_tunnel_ends_the_connection() {
     assert_eq!(
         closed_with, H3_FRAME_UNEXPECTED,
         "a HEADERS frame once the CONNECT had completed; the reason was {reason:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// j7: a request stream's frames are judged by their order too
+// ---------------------------------------------------------------------------
+
+/// A request stream that opens with DATA ends the connection.
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
+//# Receipt of an invalid sequence of frames MUST be treated as a
+//# connection error of type H3_FRAME_UNEXPECTED. In particular, a
+//# DATA frame before any HEADERS frame, or a HEADERS or DATA frame
+//# after the trailing HEADERS frame, is considered invalid.
+///
+/// The one rule in this section that a frame *type* cannot settle: DATA is what
+/// a request body is made of, so nothing about it is out of place on a request
+/// stream except its arriving first. That makes this the only verdict here the
+/// reader of the request has to reach rather than the frame decoder, and the
+/// only one a peer can trip without sending a frame that is wrong anywhere.
+#[tokio::test]
+async fn a_data_frame_before_any_headers_ends_the_connection() {
+    let server = TestServer::start().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    // Non-empty: an empty DATA frame carries nothing to hand the reader, and
+    // this test is about what the reader does with a body that arrives before
+    // the request it belongs to.
+    let (mut send, _recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&frame(FRAME_DATA, b"a body with no request in front of it"))
+        .await
+        .expect("send a DATA frame");
+
+    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+    assert_eq!(
+        closed_with, H3_FRAME_UNEXPECTED,
+        "a request stream opening with DATA; the reason was {reason:?}"
+    );
+    assert!(
+        reason.contains("does not begin with HEADERS"),
+        "the reason {reason:?} does not name the offence"
     );
 }
 
@@ -1039,6 +1125,14 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
     control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 8));
     // Repeating it with an identifier that has not grown is legal and says the
     // peer has abandoned more, not fewer, of its own requests.
+    control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 4));
+    // And the same identifier once more, which is the boundary the rule turns
+    // on: only an identifier *larger* than one already received is refused, so
+    // a peer restating the one it just sent has taken nothing back.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
+    //# Receiving a GOAWAY containing a larger identifier than previously
+    //# received MUST be treated as a connection error of type H3_ID_ERROR.
     control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 4));
     let mut stream = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 

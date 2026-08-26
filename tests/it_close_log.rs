@@ -15,10 +15,18 @@
 mod common;
 
 use bytes::Bytes;
+use common::rawstream::open_uni_stream;
 use common::{
-    open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, SharedBuffer, TestServer,
-    ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
+    connect_quic, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, SharedBuffer,
+    TestServer, ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
 };
+
+/// Push stream type (RFC 9114 §6.2.2), which only a server may open.
+///
+/// Spelled out rather than imported: these are the bytes the server is asked to
+/// read, and a test that took them from its own constants would agree with it
+/// whatever it held.
+const STREAM_PUSH: u64 = 0x01;
 
 /// Reads a numeric field's value off a formatted log line.
 ///
@@ -38,7 +46,7 @@ fn numeric_field(line: &str, name: &str) -> u64 {
         .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
 }
 
-/// The five ways a connection ends, each with the level and reason it earns.
+/// The six ways a connection ends, each with the level and reason it earns.
 ///
 /// One test function, because the subscriber is process-wide: splitting the
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
@@ -164,7 +172,36 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
     }
 
-    // 5. The server shuts down: GOAWAY goes out, there is nothing to drain, and
+    // 5. The peer breaks a protocol rule and this server is the one that hangs
+    //    up. The level is not in doubt — a violation is a fault — but the reason
+    //    is: all the accept loop is told is that the connection was closed
+    //    locally, and the violation that caused it is kept on the connection
+    //    rather than in that error. A line that has lost it reports only that
+    //    this endpoint hung up, which is the one thing an operator reading a
+    //    warning already knows.
+    {
+        let mark = buffer.mark();
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        // Only a server may open a push stream (RFC 9114 §6.2.2), so the stream
+        // type is the whole offence and no frame need follow it.
+        let _push = open_uni_stream(&connection, STREAM_PUSH, &[]).await;
+
+        let line = buffer
+            .wait_for_line(mark, &[" WARN ", "connection closed with error"])
+            .await;
+        assert!(
+            line.contains("closed by this server"),
+            "a close this server decided on must be reported as its own, not as \
+             the transport's; line was:\n{line}"
+        );
+        assert!(
+            line.contains("H3_STREAM_CREATION_ERROR") && line.contains("push stream"),
+            "the line must carry the violation the connection was closed for; line was:\n{line}"
+        );
+    }
+
+    // 6. The server shuts down: GOAWAY goes out, there is nothing to drain, and
     //    the accept loop returns `Ok(())` on its own terms rather than through an
     //    error. Last, because it stops the server.
     {
@@ -202,7 +239,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
     assert_eq!(
         closes.len(),
         4,
-        "four of the five closes are routine; log was:\n{logged}"
+        "four of the six closes are routine; log was:\n{logged}"
     );
     for line in &closes {
         assert!(
@@ -247,20 +284,23 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         }
     }
 
-    // The whole point of the grading: exactly one of the five closes was worth a
-    // warning, and it was none of the routine ones.
+    // The whole point of the grading: exactly two of the six closes were worth a
+    // warning — the peer reporting a problem and the peer causing one — and
+    // neither of them is a routine ending.
     let warnings: Vec<&str> = logged
         .lines()
         .filter(|line| line.contains("connection closed with error"))
         .collect();
     assert_eq!(
         warnings.len(),
-        1,
-        "only the non-zero application close may warn; log was:\n{logged}"
+        2,
+        "only the non-zero application close and the protocol violation may warn; \
+         log was:\n{logged}"
     );
-    assert!(
-        !warnings[0].contains("Timeout"),
-        "an idle timeout must never reach a warning; line was:\n{}",
-        warnings[0]
-    );
+    for line in &warnings {
+        assert!(
+            !line.contains("Timeout"),
+            "an idle timeout must never reach a warning; line was:\n{line}"
+        );
+    }
 }

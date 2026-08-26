@@ -241,6 +241,13 @@ async fn encoder_instructions_beyond_a_zero_table_are_refused() {
 /// offending instruction: read correctly, the reason names the Increment; read
 /// byte by byte as instructions, the 0x81 would have been a Section
 /// Acknowledgment instead.
+///
+/// The last two cases are the two sides of the bound on how far a prefixed
+/// integer may run. Nine continuation bytes of seven bits each is what a 6-bit
+/// prefix needs to reach the 62 bits RFC 9204 §4.1.1 requires decoding, so the
+/// ninth must be read past and the tenth must not: the third case ends its
+/// integer on the ninth and is refused for the Increment that follows, and only
+/// the fourth is refused for the integer itself.
 #[tokio::test]
 async fn decoder_instructions_for_a_table_never_used_are_refused() {
     for (name, bytes, names) in [
@@ -253,6 +260,16 @@ async fn decoder_instructions_for_a_table_never_used_are_refused() {
         (
             "an Insert Count Increment after a Stream Cancellation",
             vec![0x7f, 0x81, 0x41, 0x00],
+            "Insert Count Increment",
+        ),
+        // Stream Cancellation whose stream id ends on the ninth continuation
+        // byte, then Increment 0. The reason names the Increment only if all
+        // nine were read past.
+        (
+            "an Insert Count Increment after a stream id of the full 62 bits",
+            vec![
+                0x7f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x00,
+            ],
             "Insert Count Increment",
         ),
         // Stream Cancellation whose integer never ends.
