@@ -1,0 +1,78 @@
+# cargo-mutants policy: mutants the suite deliberately does not kill, from the
+# 2026-08-25 full-tree run. Every regex is scoped to one function; delete an
+# entry rather than let it silently cover code that moves or gains meaning.
+
+# The auto timeout (5x an unloaded baseline) sat inside the noise band on a
+# loaded machine and produced spurious timeouts; a floor keeps a slow run from
+# misclassifying terminating mutants.
+minimum_test_timeout = 600
+
+exclude_globs = [
+    # Process entry: main, tracing init, and the signal watchers only run in a
+    # spawned binary, which the in-process test harness never is.
+    "src/main.rs",
+]
+
+exclude_re = [
+    # Mathematically equivalent: | folds disjoint bit ranges (varint length
+    # prefix vs value, base64 sextet packing, Huffman bit accumulation), so ^
+    # agrees with | on every input the callers can produce.
+    'replace \| with \^ in put_varint',
+    'replace \| with \^ in peek_varint',
+    'replace \| with \^ in decode_base64',
+    'replace \| with \^ in decode',
+    'replace \| with \^ in put_int',
+
+    # Operator-facing text only: these Display strings are logged, never
+    # parsed, and no test pins their wording.
+    'Display for (Denied|Error|DecodeError|ResolveFailure|RespondError)>::fmt',
+    # Debug on the message vocabulary exists so a failing assertion is
+    # readable; nothing parses it.
+    'Debug for (Status|FieldValue)>::fmt',
+    # Error::source is log-chain visibility with no behavioral edge.
+    'ConnectionError>::source',
+    'StreamError>::source',
+    'RespondError>::source',
+
+    # D56: socket buffer requests are best-effort hygiene; acceptance is the
+    # so_rcvbuf journal line on Linux, and macOS clamps silently, so no
+    # in-process assertion can observe the difference.
+    'SocketBuffer::key',
+    'SocketBuffer::ceiling_sysctl',
+    'SocketBuffers::request',
+    'in request_socket_buffer',
+    'warn_if_fd_budget_is_tight',
+    # getrlimit plumbing feeding the same WARN line.
+    'replace fd_soft_limit',
+    # Linux-only socket option behind cfg(target_os = "linux"); a no-op on the
+    # macOS dev host and kernel-visible only from outside the process.
+    'set_dont_fragment',
+
+    # Both arms of the ENABLE_CONNECT_PROTOCOL value check ignore the setting
+    # (the branch only picks a debug log line), and any grease identifier
+    # value is spec-equivalent, so the arithmetic has no behavioral edge.
+    'replace > with (<|>=|==) in parse_settings',
+    'replace match guard value > 1 with (true|false) in parse_settings',
+    'replace [*+] with [-+*/] in settings_payload',
+
+    # Reserving one read early at exactly RELAY_BUF_SIZE of remaining capacity
+    # moves an allocation, not a byte; both pinned invariants hold either way.
+    'replace < with <= in ensure_window',
+
+    # Proven equivalent during the kill pass. Widening the read guard admits
+    # only a zero-length read_exact, which quinn answers without polling; the
+    # release guard admits only a zero-byte no-op refund.
+    'replace > with >= in read_stream_type',
+    'replace > with >= in BufferBudget::release',
+    # The body already is Arc::new(Self::default()); the mutation respells it.
+    'replace BufferBudget::unshared',
+    # DATA in the tunnel branch falls through to the same None; the order of a
+    # request's frames is judged by Resolver::resolve, where it is tested.
+    'delete match arm DATA in misplaced',
+]
+
+# One known-equivalent mutant cannot be excluded by name without also hiding
+# killed siblings that share it: `keep_alive_interval > 0` -> `>= 0` in
+# Config::validate (u64, and validate has already refused a zero idle timeout,
+# so the widened case is unreachable). A run over src/config.rs reports it as
+# the one standing missed mutant.
