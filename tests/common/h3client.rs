@@ -600,6 +600,19 @@ impl ClientStream {
         Ok(())
     }
 
+    /// Resolves when the peer stops this stream, with the code it sent.
+    ///
+    /// The only reading of a `STOP_SENDING` that does not need a write to carry
+    /// it: [`Self::send_data`] reports the same code, but only once there is a
+    /// write left to meet it, and a tunnel whose client has said everything it
+    /// meant to say never issues one. The future borrows nothing, so a test may
+    /// take it before the event it is waiting for can happen.
+    pub fn stopped(
+        &self,
+    ) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> {
+        self.send.stopped()
+    }
+
     /// Abruptly resets the sending side with an error code.
     ///
     /// The receiving side is left alone, which is what

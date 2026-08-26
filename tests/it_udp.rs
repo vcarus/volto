@@ -529,6 +529,57 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
     assert_peer_reset(&error, H3_DATAGRAM_ERROR);
 }
 
+/// The boundary of the size rule the session applies to what a client sends.
+///
+/// `MAX_UDP_PAYLOAD` is the largest payload a UDP datagram can carry, so a
+/// context-0 payload of exactly that many bytes is one this proxy has to
+/// forward; a longer one could not be a UDP datagram at all, which is the
+/// malformation the session is aborted for. The two sides of that rule are one
+/// byte apart and nothing pinned which side the boundary value itself falls on.
+///
+/// The target socket refuses this payload — an IPv4 datagram has room for fewer
+/// bytes than an HTTP datagram may carry — and RFC 9298 §5 makes a payload the
+/// link cannot take a discard rather than a fault, so a session that judged the
+/// size correctly is still there afterwards. The second capsule is what shows
+/// it: the stream is ordered, so it is forwarded only after the first was
+/// judged.
+#[tokio::test]
+async fn a_payload_at_the_maximum_size_is_forwarded_and_keeps_the_session() {
+    use volto::capsule;
+
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // An order of magnitude past any QUIC datagram, so the capsule stream is the
+    // only way a payload this size can arrive at all.
+    let at_the_limit = vec![0x5c; datagram::MAX_UDP_PAYLOAD];
+    stream
+        .send_data(capsule::encode_datagram(
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            &at_the_limit,
+        ))
+        .await
+        .expect("send a payload of exactly the maximum size");
+    stream
+        .send_data(capsule::encode_datagram(
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            b"still open",
+        ))
+        .await
+        .expect("send the payload that answers whether the session survived");
+
+    let mut pending = HashMap::new();
+    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    assert_eq!(
+        &echoed[..],
+        b"still open",
+        "a payload of exactly the maximum size must be forwarded, not aborted"
+    );
+}
+
 /// A session accepted and closed on the spot asks the client to stop sending
 /// with H3_NO_ERROR, at once, on the CONNECT-UDP path as much as on the TCP one.
 ///

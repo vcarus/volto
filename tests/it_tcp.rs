@@ -558,6 +558,48 @@ async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     assert_peer_reset(&error, H3_CONNECT_ERROR);
 }
 
+/// The same target reset again, read off the *request* direction.
+///
+/// [`target_reset_becomes_h3_connect_error`] pins the response direction, where
+/// the pump that met the reset puts the code on its own writer. The other pump
+/// is somewhere else entirely — waiting for the client's next chunk — and learns
+/// of the teardown only through the reason the first one raised. What it makes
+/// of that reason is the client's STOP_SENDING, and the two directions have to
+/// carry the same verdict: a cancellation in its place tells the client the
+/// proxy gave up on the request, where what happened is that the target
+/// connection failed.
+///
+/// The client sends once and no more, which is what puts the pumps in those
+/// positions: the write to the target has completed by the time the RST lands,
+/// so the request pump is back to waiting and only the read pump can notice.
+#[tokio::test]
+async fn a_target_reset_stops_the_request_direction_with_h3_connect_error() {
+    let server = TestServer::start().await;
+    let target = spawn_reset_after_read_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    // Taken before the reset can arrive: the future borrows nothing, so waiting
+    // on it cannot miss a STOP_SENDING that overtakes this line.
+    let stopped = stream.stopped();
+
+    // Triggers the target's reset.
+    stream
+        .send_data(Bytes::from_static(b"go"))
+        .await
+        .expect("send payload");
+
+    let code = tokio::time::timeout(TIMEOUT, stopped)
+        .await
+        .expect("a failed target must stop the client's sending side")
+        .expect("the stream must still be open to be stopped");
+    assert_eq!(
+        code.map(quinn::VarInt::into_inner),
+        Some(H3_CONNECT_ERROR),
+        "the request direction must carry the target's failure, not a cancelled request"
+    );
+}
+
 /// RFC 9114 §4.4: "if the underlying TCP implementation permits it, the proxy
 /// SHOULD send a TCP segment with the RST bit set" when the client resets the
 /// tunnel. Observable at the target as `ECONNRESET` on a read that would have
@@ -1414,6 +1456,33 @@ async fn refuses_a_target_that_is_not_listening() {
         Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
         "the refusal must name the address that refused the connection"
     );
+}
+
+/// A refusal ends the request stream, so a client reading the answer to its end
+/// reaches one.
+///
+/// The response is the whole of what a refused request gets: no tunnel is opened
+/// behind it and there is nothing further to send. A stream left open after it
+/// puts a client that reads to the end of a message — the ordinary way to read
+/// an HTTP response — into a wait that only the idle timeout ends, for a message
+/// it already holds in full. Every refusal this server sends is written and
+/// closed by the one helper, so any one of them pins the shape for all.
+#[tokio::test]
+async fn a_refusal_ends_the_request_stream() {
+    let server = TestServer::start().await;
+    let target = closed_address().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (response, mut stream) =
+        send_and_respond(&mut client, connect_request(&target.to_string())).await;
+    assert_eq!(response.status, Status::BAD_GATEWAY);
+
+    match tokio::time::timeout(TIMEOUT, stream.recv_data()).await {
+        Ok(Ok(None)) => {}
+        Ok(Ok(Some(_))) => panic!("a refusal has no body to deliver"),
+        Ok(Err(error)) => panic!("a refused request stream must end cleanly, not as {error:?}"),
+        Err(_) => panic!("the refused request stream was left open with nothing left to come"),
+    }
 }
 
 /// Arms an address that black-holes SYNs, in the only portable way there is.
