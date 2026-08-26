@@ -1521,6 +1521,29 @@ mod tests {
         );
     }
 
+    /// A double-quoted segment with nothing closing it must run out *at* the end
+    /// of the message rather than one byte past it.
+    ///
+    /// The scan indexes bytes directly, so a bound that admitted the length
+    /// itself would panic on the empty slot behind the last character — inside
+    /// the error path whose whole job is to keep a password off stderr, and on
+    /// the input that reaches it, since serde renders an unterminated string in
+    /// the file as a value with no closing quote of its own.
+    #[test]
+    fn an_unclosed_double_quoted_segment_runs_out_at_the_end() {
+        assert_eq!(closing_quote("hunter2", '"'), None, "no quote at all");
+        // The other way of reaching the end: the escape skip steps over the
+        // last byte instead of landing on it.
+        assert_eq!(closing_quote("hunter2\\", '"'), None, "a lone backslash");
+        assert_eq!(closing_quote("hunter2\"", '"'), Some(7), "a closed segment");
+
+        assert_eq!(
+            redact_quoted("invalid type: string \"user1:hunter2"),
+            format!("invalid type: string {REDACTED}"),
+            "an unpaired quote redacts everything after it"
+        );
+    }
+
     /// A span the text cannot place must cost the position, not the message.
     ///
     /// `line_and_column` used to answer line 1, column 1 for an offset past the
@@ -1663,6 +1686,22 @@ mod tests {
                 .expect_err("must be rejected");
             assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
         }
+
+        // The ceiling is a sanity limit rather than a protocol one, so the value
+        // at it is still a quota the operator meant: only what is past it is
+        // read as a typo.
+        let cfg = parse(&format!(
+            "[limits]\nmax_targets_per_conn = {MAX_TARGETS_PER_CONN_CEILING}"
+        ));
+        assert_valid_apart_from_certs(&cfg, "a quota of exactly the ceiling");
+
+        let err = parse(&format!(
+            "[limits]\nmax_targets_per_conn = {}",
+            MAX_TARGETS_PER_CONN_CEILING + 1
+        ))
+        .validate()
+        .expect_err("one target past the ceiling must be rejected");
+        assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
     }
 
     /// Zero disables the connect budget rather than meaning "give up at once",
@@ -1883,6 +1922,21 @@ mod tests {
             let err = parse(body).validate().expect_err("must be rejected");
             assert!(err.to_string().contains(field), "{err}");
         }
+
+        // The ceiling is a legal idle timeout, and the default keep-alive stays
+        // well under half of it, so nothing else in the config objects to it.
+        let cfg = parse(&format!(
+            "[limits]\nmax_idle_timeout = {MAX_IDLE_TIMEOUT_CEILING}"
+        ));
+        assert_valid_apart_from_certs(&cfg, "an idle timeout of exactly the ceiling");
+
+        let err = parse(&format!(
+            "[limits]\nmax_idle_timeout = {}",
+            MAX_IDLE_TIMEOUT_CEILING + 1
+        ))
+        .validate()
+        .expect_err("one second past the ceiling must be rejected");
+        assert!(err.to_string().contains("max_idle_timeout"), "{err}");
     }
 
     #[test]
@@ -2044,6 +2098,54 @@ mod tests {
         }
     }
 
+    /// RFC 9298 §3.1 recommends two minutes, and a configuration that meets the
+    /// recommendation exactly has nothing to be told about: 120 is the first
+    /// value that draws no warning, 119 the last that does.
+    #[test]
+    fn the_udp_session_timeout_warning_stops_at_the_recommended_two_minutes() {
+        let warned = parse("[limits]\nudp_session_timeout = 119").warnings();
+        assert!(
+            warned.iter().any(|w| w.contains("udp_session_timeout")),
+            "{warned:?}"
+        );
+
+        let quiet = parse("[limits]\nudp_session_timeout = 120").warnings();
+        assert!(
+            !quiet.iter().any(|w| w.contains("udp_session_timeout")),
+            "{quiet:?}"
+        );
+    }
+
+    /// An unlimited retry budget is a warning about guessing configured
+    /// credentials, so it belongs to a configuration that has some. With no
+    /// users there is nothing to guess and no counter to exhaust, and repeating
+    /// it under the open-proxy warning would only dilute that one.
+    #[test]
+    fn an_unlimited_auth_failure_budget_warns_only_where_there_are_credentials() {
+        let with_users = parse(
+            r#"
+            [auth]
+            users = [{ username = "u", password = "p" }]
+
+            [security]
+            max_auth_failures = 0
+            "#,
+        )
+        .warnings();
+        assert!(
+            with_users.iter().any(|w| w.contains("max_auth_failures")),
+            "{with_users:?}"
+        );
+
+        let without_users = parse("[security]\nmax_auth_failures = 0").warnings();
+        assert!(
+            !without_users
+                .iter()
+                .any(|w| w.contains("max_auth_failures")),
+            "{without_users:?}"
+        );
+    }
+
     /// The shipped example configuration must stay in step with the code.
     ///
     /// `deny_unknown_fields` makes this a real test: a key renamed here without
@@ -2134,6 +2236,22 @@ mod tests {
         .expect("parses");
         let err = cfg.validate().expect_err("empty alpn must be rejected");
         assert!(err.to_string().contains("server.alpn"), "{err}");
+    }
+
+    /// An ALPN identifier is length-prefixed with a single byte, so 255 bytes is
+    /// the longest one the wire format can count -- and the longest is legal.
+    /// The first identifier that cannot be sent at all is the one after it.
+    #[test]
+    fn an_alpn_identifier_is_capped_at_what_its_length_prefix_can_count() {
+        let cfg = parse(&format!("alpn = [\"{}\"]", "h".repeat(255)));
+        assert_valid_apart_from_certs(&cfg, "an ALPN identifier of exactly 255 bytes");
+
+        let err = parse(&format!("alpn = [\"{}\"]", "h".repeat(256)))
+            .validate()
+            .expect_err("an identifier past the length prefix must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("server.alpn[0]"), "{msg}");
+        assert!(msg.contains("255"), "the limit must be named: {msg}");
     }
 
     #[test]
