@@ -606,6 +606,20 @@ mod tests {
         );
     }
 
+    /// The two alphabet characters the range arms cannot reach, pinned against
+    /// literals rather than [`encode_base64`] so a bug shared by both sides
+    /// cannot vouch for itself.
+    ///
+    /// `+` and `/` are where a table lookup and a range comparison differ, and
+    /// a password has every right to put 62 or 63 in a sextet: `u:?a` encodes
+    /// to one.
+    #[test]
+    fn base64_reads_the_last_two_alphabet_characters() {
+        assert_eq!(decode_base64(b"dTo/YQ==").as_deref(), Some(&b"u:?a"[..]));
+        assert_eq!(decode_base64(b"dTo+YQ==").as_deref(), Some(&b"u:>a"[..]));
+        assert_eq!(decode_base64(b"//8=").as_deref(), Some(&[0xff, 0xff][..]));
+    }
+
     #[test]
     fn base64_rejects_malformed_input() {
         for case in [
