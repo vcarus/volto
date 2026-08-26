@@ -69,6 +69,13 @@ exclude_re = [
     # DATA in the tunnel branch falls through to the same None; the order of a
     # request's frames is judged by Resolver::resolve, where it is tested.
     'delete match arm DATA in misplaced',
+
+    # quinn's SendStream sends the FIN from Drop as well, and every caller
+    # drops the stream on the next line, so a skipped finish() changes only
+    # which mechanism emits it; the wire contract has its own test
+    # (a_refusal_ends_the_request_stream).
+    'replace Stream::finish -> Result',
+    'replace Writer::finish -> Result',
 ]
 
 # One known-equivalent mutant cannot be excluded by name without also hiding
