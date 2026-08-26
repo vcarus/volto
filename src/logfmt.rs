@@ -178,17 +178,29 @@ mod tests {
         assert!(logged.len() < 80, "{logged}");
     }
 
-    /// Truncation must land on a character boundary, or slicing panics.
+    /// Truncation must land on a character boundary, or slicing panics — and on
+    /// the boundary *below* [`MAX_TOKEN`], since the one above it is past the
+    /// bound and so no bound at all.
     #[test]
     fn a_multibyte_token_is_cut_on_a_boundary() {
-        // Ten three-byte characters: the 32-byte cut falls inside the eleventh.
+        // Twenty three-byte characters: the 32-byte cut falls inside the
+        // eleventh, whose own boundary is at 30.
         let token = "\u{20ac}".repeat(20);
-        let logged = bounded(&token);
-        assert!(
-            logged.starts_with(&"\u{20ac}".repeat(10)),
-            "expected ten whole characters, got {logged}"
+        assert_eq!(
+            bounded(&token),
+            format!("{}... <truncated from 60 bytes>", "\u{20ac}".repeat(10)),
+            "ten whole characters, not eleven"
         );
-        assert!(logged.contains("truncated from 60 bytes"), "{logged}");
+
+        // A cut three bytes into a character rather than one: an ASCII byte
+        // followed by four-byte characters puts a boundary at 29 and the next
+        // at 33.
+        let token = format!("a{}", "\u{1f600}".repeat(10));
+        assert_eq!(
+            bounded(&token),
+            format!("a{}... <truncated from 41 bytes>", "\u{1f600}".repeat(7)),
+            "seven whole characters, not eight"
+        );
     }
 
     /// The same bound on bytes that were never promised to be text, which is

@@ -990,6 +990,143 @@ mod tests {
         }
     }
 
+    /// One QUIC connection over the loopback.
+    ///
+    /// [`Context`] holds one and there is no way to make one without a
+    /// handshake; nothing the failure counters do looks at it. The certificate
+    /// is generated here rather than taken from `tests/common`, which the lib
+    /// target cannot reach.
+    async fn loopback_connection() -> quinn::Connection {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate a self-signed certificate");
+        let certificate = issued.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .expect("certificate and key");
+        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).expect("quic tls"),
+        ));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).expect("trust the certificate");
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+        let bind = "127.0.0.1:0".parse().expect("bind address");
+        let server = quinn::Endpoint::server(server_config, bind).expect("server endpoint");
+        let addr = server.local_addr().expect("local address");
+        let mut client = quinn::Endpoint::client(bind).expect("client endpoint");
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("quic tls"),
+        )));
+
+        // Both sides have to be driven for either handshake to finish.
+        let (connection, _accepted) = tokio::join!(
+            client.connect(addr, "localhost").expect("start connecting"),
+            async {
+                server
+                    .accept()
+                    .await
+                    .expect("an incoming connection")
+                    .await
+                    .expect("the server side of the handshake")
+            }
+        );
+
+        connection.expect("the client side of the handshake")
+    }
+
+    /// A context whose authenticator knows exactly one user.
+    ///
+    /// Parsed rather than assembled so the `[auth]` section is the one the
+    /// server itself would read. The certificate paths are never opened —
+    /// nothing here binds a listener — and the cap is set well above what the
+    /// test records, so every failure below answers "not yet" and the buckets
+    /// are the only subject.
+    async fn one_user_context() -> Context {
+        let config: Config = toml::from_str(
+            r#"
+                [server]
+                listen = "127.0.0.1:0"
+                cert = "unused.pem"
+                key = "unused.pem"
+
+                [security]
+                max_auth_failures = 100
+
+                [[auth.users]]
+                username = "user1"
+                password = "s3cret"
+            "#,
+        )
+        .expect("the test configuration must parse");
+
+        Context::new(
+            &config,
+            loopback_connection().await,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// A guess at a user-id nobody has must not become a key.
+    ///
+    /// The buckets are what make clearing failures on success honest, and this
+    /// is the half of them whose input a peer chooses: a failure naming a
+    /// configured user gets that user's own counter, and every other name is
+    /// charged to the one counter no success clears. One connection therefore
+    /// holds at most `|configured users| + 2` counters however many names are
+    /// tried against it.
+    #[tokio::test]
+    async fn a_guess_at_a_name_nobody_has_never_grows_the_buckets() {
+        let context = one_user_context().await;
+
+        // Near misses included: what decides the bucket is the comparison
+        // `Authenticator` makes, not how close the name looks.
+        for guess in ["admin", "root", "user1 ", "USER1", ""] {
+            assert!(
+                !context.record_auth_failure(Some(guess)),
+                "{guess:?} must not reach the cap"
+            );
+        }
+
+        {
+            let failures = context.auth_failures();
+            assert_eq!(failures.unconfigured, 5);
+            assert!(
+                failures.configured.is_empty(),
+                "a name nobody has became a key: {:?}",
+                failures.configured.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(failures.anonymous, 0);
+        }
+
+        // The other two buckets, so the assertions above can only hold for the
+        // right reason: a configured name does get a counter of its own, and a
+        // failure that named nobody at all gets the third.
+        assert!(!context.record_auth_failure(Some("user1")));
+        assert!(!context.record_auth_failure(None));
+
+        let failures = context.auth_failures();
+        assert_eq!(failures.configured.len(), 1);
+        assert_eq!(failures.configured.get("user1").copied(), Some(1));
+        assert_eq!(failures.unconfigured, 5);
+        assert_eq!(failures.anonymous, 1);
+    }
+
     #[test]
     fn proxy_status_values_are_rfc_9209_shaped() {
         for (error, expected) in [
