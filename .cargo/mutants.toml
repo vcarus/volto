@@ -76,6 +76,12 @@ exclude_re = [
     # (a_refusal_ends_the_request_stream).
     'replace Stream::finish -> Result',
     'replace Writer::finish -> Result',
+
+    # Surfacing an empty DATA frame as Some(empty) is absorbed by both
+    # callers (a zero-byte relay write and a zero-byte decoder push), so the
+    # skip is an API nicety no black-box test can see; the true-direction
+    # mutant of the same guard swallows real data and stays covered.
+    'replace match guard data\.is_empty\(\) with false in Reader::recv_data',
 ]
 
 # One known-equivalent mutant cannot be excluded by name without also hiding
