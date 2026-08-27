@@ -169,7 +169,10 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         host,
         port,
         target = %crate::logfmt::or_dash(target),
-        datagrams = ctx.datagrams_allowed(),
+        // A snapshot, and named as one: a session raced ahead of the peer's
+        // SETTINGS reads false here, while the send path re-reads the flag on
+        // every packet and moves onto datagrams the moment they are allowed.
+        datagrams_at_setup = ctx.datagrams_allowed(),
         "udp session established"
     );
 
