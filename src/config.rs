@@ -1100,17 +1100,20 @@ fn closing_quote(rest: &str, quote: char) -> Option<usize> {
         return rest.find(quote);
     }
 
-    let bytes = rest.as_bytes();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            // Past the end when the message ends in a lone backslash, which the
-            // loop condition answers with `None`: an opening quote with no
-            // close, redacted to the end.
-            b'\\' => index += 2,
+    // An iterator rather than a hand-stepped index: every pass consumes at
+    // least one byte, so the scan cannot fail to terminate, and a defect in
+    // the skip is a wrong answer instead of a hung error path.
+    let mut bytes = rest.bytes().enumerate();
+    while let Some((index, byte)) = bytes.next() {
+        match byte {
+            // The skip lands on the escaped byte. A message that ends in a
+            // lone backslash has nothing to skip and the iterator runs out: an
+            // opening quote with no close, redacted to the end.
+            b'\\' => {
+                bytes.next();
+            }
             b'"' => return Some(index),
-            _ => index += 1,
+            _ => {}
         }
     }
 

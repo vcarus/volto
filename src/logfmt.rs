@@ -74,10 +74,14 @@ pub fn bounded(token: &str) -> Cow<'_, str> {
         return Cow::Borrowed(token);
     }
 
-    let mut end = MAX_TOKEN;
-    while !token.is_char_boundary(end) {
-        end -= 1;
-    }
+    // A search over a fixed range rather than a hand-stepped index: this runs
+    // on logging paths, where a defect must come out as a wrong cut, never as
+    // a hang. Position 0 is always a boundary, so the fallback is unreachable
+    // and total either way.
+    let end = (0..=MAX_TOKEN)
+        .rev()
+        .find(|&end| token.is_char_boundary(end))
+        .unwrap_or(0);
     Cow::Owned(truncated(&token[..end], token.len()))
 }
 

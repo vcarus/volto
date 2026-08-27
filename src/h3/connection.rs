@@ -1302,6 +1302,20 @@ mod tests {
         Item::Frame(Frame::Settings(frame::Settings { datagrams }))
     }
 
+    /// [`DatagramReceiver::recv`] with a deadline, so a router that stops
+    /// delivering is a named failure rather than a hung test binary.
+    #[track_caller]
+    fn recv_within(
+        inbound: &mut DatagramReceiver,
+    ) -> impl std::future::Future<Output = Option<Bytes>> + '_ {
+        let caller = std::panic::Location::caller();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+                .await
+                .unwrap_or_else(|_| panic!("no datagram was delivered within 5s (from {caller})"))
+        }
+    }
+
     #[test]
     fn the_first_frame_must_be_settings() {
         let shared = Shared::default();
@@ -1570,8 +1584,14 @@ mod tests {
         shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for one"));
         shared.deliver(datagram(2, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for two"));
 
-        assert_eq!(first.recv().await.as_deref(), Some(b"for one".as_slice()));
-        assert_eq!(second.recv().await.as_deref(), Some(b"for two".as_slice()));
+        assert_eq!(
+            recv_within(&mut first).await.as_deref(),
+            Some(b"for one".as_slice())
+        );
+        assert_eq!(
+            recv_within(&mut second).await.as_deref(),
+            Some(b"for two".as_slice())
+        );
         assert!(first.inbound.try_recv().is_err(), "one payload each");
         assert!(second.inbound.try_recv().is_err(), "one payload each");
     }
@@ -1624,7 +1644,7 @@ mod tests {
 
         shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"still here"));
         assert_eq!(
-            inbound.recv().await.as_deref(),
+            recv_within(&mut inbound).await.as_deref(),
             Some(b"still here".as_slice())
         );
     }
@@ -1649,8 +1669,14 @@ mod tests {
         }
 
         // The session loop starts only now.
-        assert_eq!(inbound.recv().await.as_deref(), Some(b"first".as_slice()));
-        assert_eq!(inbound.recv().await.as_deref(), Some(b"second".as_slice()));
+        assert_eq!(
+            recv_within(&mut inbound).await.as_deref(),
+            Some(b"first".as_slice())
+        );
+        assert_eq!(
+            recv_within(&mut inbound).await.as_deref(),
+            Some(b"second".as_slice())
+        );
         assert!(
             inbound.inbound.try_recv().is_err(),
             "a buffered datagram must be delivered once, not replayed"
@@ -1680,7 +1706,7 @@ mod tests {
 
         for index in 0..INBOUND_QUEUE_DEPTH {
             assert_eq!(
-                inbound.recv().await.as_deref(),
+                recv_within(&mut inbound).await.as_deref(),
                 Some([index as u8].as_slice()),
                 "everything within the depth is kept, in order"
             );
