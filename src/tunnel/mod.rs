@@ -1509,24 +1509,25 @@ mod tests {
     /// and is reported as the timeout it is rather than as an ordinary lookup
     /// failure — the two carry different statuses.
     ///
-    /// Real time rather than a paused clock, because tokio's `test-util` feature
-    /// is not enabled in this tree; the budget is therefore small and the upper
-    /// bound generous, so only a genuinely unbounded wait can fail it.
-    #[tokio::test]
+    /// On a paused clock, so the budget is the shipped default and both sides
+    /// of the deadline are pinned exactly: nothing a millisecond short of it,
+    /// the timeout on the millisecond itself.
+    #[tokio::test(start_paused = true)]
     async fn a_resolver_that_never_answers_costs_only_the_budget() {
-        let budget = Duration::from_millis(50);
-        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(crate::config::DEFAULT_CONNECT_TIMEOUT);
 
-        // The outer timeout is what turns a regression here into a failure
-        // rather than a hung test run.
-        let failure = tokio::time::timeout(
-            Duration::from_secs(5),
-            within_budget(std::future::pending(), Some(budget)),
-        )
-        .await
-        .expect("the budget must bound the wait")
-        .expect_err("a lookup that never answers must not succeed");
-        let elapsed = started.elapsed();
+        let mut waiting = Box::pin(within_budget(std::future::pending(), Some(budget)));
+
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(waiting.as_mut()).is_none(),
+            "the budget expired early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let failure = waiting
+            .await
+            .expect_err("a lookup that never answers must not succeed");
 
         assert!(matches!(failure, ResolveFailure::TimedOut(_)), "{failure}");
         assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
@@ -1534,7 +1535,44 @@ mod tests {
             failure.proxy_error().recommended_status(),
             Status::GATEWAY_TIMEOUT
         );
-        assert!(elapsed >= budget, "returned early, after {elapsed:?}");
+    }
+
+    /// A clock that jumps clean past the budget reports the timeout, not the
+    /// resolver's own failure.
+    ///
+    /// The resumed-VM shape: `Instant::now()` is hours past where the deadline
+    /// was armed and every timer in the process fires in one instant. The
+    /// budget must still resolve to `TimedOut` — the 504 with
+    /// `error=dns_timeout` — rather than wrap, panic, or leave the request
+    /// parked on a deadline the clock has already gone by. `TimedOut` carries
+    /// the *budget*, not the time actually waited, so the answer the client
+    /// gets says the same thing either way.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_jumps_hours_still_reports_the_budget() {
+        let budget = Duration::from_secs(10);
+        let mut waiting = Box::pin(within_budget(std::future::pending(), Some(budget)));
+        assert!(poll_once(waiting.as_mut()).is_none());
+
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+
+        let failure = waiting.await.expect_err("the budget is long gone");
+        assert!(
+            matches!(failure, ResolveFailure::TimedOut(reported) if reported == budget),
+            "{failure}"
+        );
+        assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
+    }
+
+    /// The value `future` has *without waiting*, or `None` if it would wait.
+    ///
+    /// The negative half of the two deadlines above: a timer that has not fired
+    /// is a future that is still pending, and one poll is the whole question.
+    fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(value) => Some(value),
+            std::task::Poll::Pending => None,
+        }
     }
 
     /// A lookup that answers is passed straight through, budget or no budget.

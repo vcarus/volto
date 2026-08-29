@@ -91,6 +91,27 @@ path = "tests/interop/difforacle/oracle.rs"
 
 [dev-dependencies]
 rcgen = "0.14"
+
+# `test-util` gives the tests a clock they drive themselves: `start_paused` plus
+# `tokio::time::advance` make "three hours pass" free and exact, which is the
+# only way to assert a *deadline* rather than assert around one. Every budget
+# test in this tree used to be a real sleep with a generous upper bound and an
+# apology in its doc comment; those are now exact, and the cases that could not
+# be written at all before -- a VM resumed after hours, where every armed timer
+# fires in the same instant -- are written.
+#
+# A dev-dependency feature, so nothing in a release build changes. Even under
+# `cargo test` the clock is the real one until a test pauses it: the feature
+# routes `tokio::time::Instant::now` through a `Clock` whose unpaused answer is
+# `std::time::Instant::now`. It pulls no new crate -- `test-util` enables only
+# `rt`, `sync` and `time`, all of which this tree already asks for.
+#
+# What it does *not* reach is quinn: a paused clock moves tokio's timers, and
+# the integration tests drive real UDP sockets whose packets no test advances
+# the clock for. So the paused-clock tests are unit tests over this crate's own
+# timers, and the on-wire deadlines stay pinned by the real-time integration
+# tests that already cover them (`it_hostile`, `it_handshake`, `it_tcp`).
+tokio = { version = "1", features = ["test-util"] }
 # Property tests over the parsers that read untrusted bytes, and the CI-side
 # half of a two-part arrangement: `cargo fuzz` needs a nightly toolchain, and
 # the dev host has stable Rust only, so coverage-guided fuzzing lives in the

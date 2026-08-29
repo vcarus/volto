@@ -934,49 +934,69 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        connect_any_with, ensure_window, split_authority, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE,
+        connect_any_with, ensure_window, split_authority, HalfClose, RELAY_BLOCK_SIZE,
+        RELAY_BUF_SIZE,
     };
     use bytes::BytesMut;
     use std::io;
     use std::net::SocketAddr;
     use std::time::Duration;
     use tokio::net::TcpStream;
+    use tokio::sync::watch;
 
     fn address(literal: &str) -> SocketAddr {
         literal.parse().expect("socket address")
+    }
+
+    /// The value `future` has *without waiting*, or `None` if it would wait.
+    ///
+    /// The negative half of every deadline below: a timer that has not fired is
+    /// a future that is still pending, and one poll is the whole question.
+    /// Polled through a bare waker rather than awaited, so a `None` is the
+    /// future's own answer and not a race with the runtime — `tokio::time`
+    /// advances only where a test says so, and nothing here wakes anything but
+    /// a timer.
+    fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(value) => Some(value),
+            std::task::Poll::Pending => None,
+        }
     }
 
     /// A target that black-holes SYNs is the case the budget exists for: the
     /// operating system would keep retrying for around two minutes, and the
     /// tunnel slot and file descriptor are held for all of it.
     ///
-    /// Real time with a small budget rather than a paused clock, because tokio's
-    /// `test-util` feature is not enabled in this tree. The upper bound is two
-    /// orders of magnitude above the budget, so only an unbounded wait fails it.
-    #[tokio::test]
+    /// On a paused clock, so the deadline is asserted rather than approximated:
+    /// the budget is the shipped default, the whole of it is spent without a
+    /// real second passing, and both sides of it are pinned — nothing one
+    /// millisecond short, the timeout on the millisecond itself.
+    #[tokio::test(start_paused = true)]
     async fn the_connect_budget_bounds_a_target_that_never_answers() {
         let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
-        let budget = Duration::from_millis(50);
-        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(10);
 
-        // The outer timeout is what turns a regression here into a failure
-        // rather than a hung test run.
-        let failure = tokio::time::timeout(
-            Duration::from_secs(5),
-            connect_any_with(&addresses, Some(budget), |_| {
-                std::future::pending::<io::Result<TcpStream>>()
-            }),
-        )
-        .await
-        .expect("the budget must bound the wait")
-        .expect_err("a connect that never answers must not succeed");
-        let elapsed = started.elapsed();
+        let mut attempt = Box::pin(connect_any_with(&addresses, Some(budget), |_| {
+            std::future::pending::<io::Result<TcpStream>>()
+        }));
+
+        // A millisecond short of the budget the target is still being waited for.
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(attempt.as_mut()).is_none(),
+            "the budget expired early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let failure = attempt
+            .await
+            .expect_err("a connect that never answers must not succeed");
 
         assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
         // The hop named is the one still in flight, which is the one the client
         // is waiting on.
         assert_eq!(failure.next_hop, Some(addresses[0]));
-        assert!(elapsed >= budget, "returned early, after {elapsed:?}");
     }
 
     /// One budget for the whole list, not one per address: several unreachable
@@ -984,33 +1004,88 @@ mod tests {
     ///
     /// The first address spends three quarters of the budget and fails, the
     /// second never answers. Shared, that ends at the budget; one budget each
-    /// would end at 1.75 times it, which the upper bound below excludes.
-    #[tokio::test]
+    /// would end at 1.75 times it. On a paused clock that is not a margin to
+    /// leave room for but an exact edge: nothing at one millisecond short, the
+    /// answer already there at the budget.
+    #[tokio::test(start_paused = true)]
     async fn every_address_draws_on_the_same_budget() {
         let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
-        let budget = Duration::from_millis(400);
-        let started = std::time::Instant::now();
+        let budget = Duration::from_secs(400);
 
-        let failure = tokio::time::timeout(
-            Duration::from_secs(5),
-            connect_any_with(&addresses, Some(budget), |address| async move {
+        let mut attempt = Box::pin(connect_any_with(
+            &addresses,
+            Some(budget),
+            |address| async move {
                 if address == addresses[0] {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    tokio::time::sleep(Duration::from_secs(300)).await;
                     return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
                 }
                 std::future::pending().await
-            }),
-        )
-        .await
-        .expect("the budget must bound the wait")
-        .expect_err("the budget must expire");
-        let elapsed = started.elapsed();
+            },
+        ));
+
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(attempt.as_mut()).is_none(),
+            "the shared budget expired early"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let failure = attempt.await.expect_err("the budget must expire");
 
         assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(failure.next_hop, Some(addresses[1]));
+        assert_eq!(
+            failure.next_hop,
+            Some(addresses[1]),
+            "the second address got a budget of its own"
+        );
+    }
+
+    /// The budget is a deadline, so a clock that jumps clean past it lands on
+    /// the same answer as a clock that walked there.
+    ///
+    /// This is the shape a paused VM resumes in, and it is the shape production
+    /// meets on a live migration: `Instant::now()` is hours ahead of where the
+    /// deadline was armed, and every timer in the process fires in the same
+    /// instant. What the connect loop must not do is read one jump as several
+    /// expiries — one per address left in the list — and either name a hop that
+    /// was never dialled or walk the rest of the list on a budget long gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_jumps_hours_expires_the_budget_exactly_once() {
+        let addresses = [
+            address("192.0.2.1:443"),
+            address("192.0.2.2:443"),
+            address("192.0.2.3:443"),
+        ];
+        let attempted = std::cell::RefCell::new(Vec::new());
+
+        let mut attempt = Box::pin(connect_any_with(
+            &addresses,
+            Some(Duration::from_secs(10)),
+            |address| {
+                attempted.borrow_mut().push(address);
+                std::future::pending::<io::Result<TcpStream>>()
+            },
+        ));
         assert!(
-            elapsed < Duration::from_millis(600),
-            "the second address got a budget of its own: {elapsed:?}"
+            poll_once(attempt.as_mut()).is_none(),
+            "the first address must be in flight before the clock moves"
+        );
+
+        // Three hours in one step, the way a resumed VM sees it.
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+        let failure = attempt.await.expect_err("the budget is long gone");
+
+        assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            failure.next_hop,
+            Some(addresses[0]),
+            "the hop named must be the one that was in flight, not one never dialled"
+        );
+        assert_eq!(
+            attempted.into_inner(),
+            vec![addresses[0]],
+            "an expired budget must not dial the rest of the list"
         );
     }
 
@@ -1048,6 +1123,185 @@ mod tests {
 
         assert_eq!(failure.error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(failure.next_hop, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The half-close bound
+    // -----------------------------------------------------------------------
+    //
+    // `HalfClose::stalled` is the only timer in this file the pumps arm
+    // themselves, and it is armed on the path where one direction has already
+    // ended cleanly and the other's write is parked -- so the pump that would
+    // have noticed is gone and this is all that is left. Its two claims are
+    // that it never fires while both directions are running, and that it fires
+    // a whole budget after the *later* of the other direction ending and this
+    // write starting. On a paused clock both are exact.
+
+    /// The two halves of a `HalfClose` pair, as the pumps hold them.
+    ///
+    /// `mine`/`other` are crossed the way [`run`] crosses them: what one pump
+    /// raises is what the other watches.
+    fn half_close_pair(budget: Duration) -> (HalfClose, HalfClose) {
+        let (client_finished, client_finished_rx) = watch::channel(false);
+        let (target_eof, target_eof_rx) = watch::channel(false);
+
+        (
+            HalfClose {
+                mine: client_finished,
+                other: target_eof_rx,
+                budget,
+            },
+            HalfClose {
+                mine: target_eof,
+                other: client_finished_rx,
+                budget,
+            },
+        )
+    }
+
+    /// A running tunnel has no bound: the other pump is the watchdog, and the
+    /// budget is only what replaces it once that pump is gone.
+    ///
+    /// Three hours of clock, which is more than the shipped budget by two
+    /// orders of magnitude, and nothing fires. A bound that armed itself before
+    /// the other direction ended would cut a live tunnel that was merely slow.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_is_not_bounded_while_both_directions_run() {
+        let budget = Duration::from_secs(180);
+        let (mut client_to_target, _target_to_client) = half_close_pair(budget);
+
+        let mut stalled = Box::pin(client_to_target.stalled());
+        assert!(poll_once(stalled.as_mut()).is_none());
+
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_none(),
+            "a running tunnel was cut by a bound that is only for a half-closed one"
+        );
+    }
+
+    /// Once the other direction has ended, the budget starts and is exact.
+    ///
+    /// The FIN lands while this write is already parked, which is the case the
+    /// `changed()` wait exists for: the arm was armed at the write's first
+    /// poll, before there was anything to wait for.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_starts_when_the_other_direction_ends() {
+        let budget = Duration::from_secs(180);
+        let (mut client_to_target, target_to_client) = half_close_pair(budget);
+
+        let mut stalled = Box::pin(client_to_target.stalled());
+        assert!(poll_once(stalled.as_mut()).is_none());
+
+        // An hour of a healthy tunnel, then the target's EOF.
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        assert!(poll_once(stalled.as_mut()).is_none());
+        target_to_client.ended();
+
+        // The flag alone cuts nothing: this poll is the wake the `watch`
+        // delivers to the `select!` in production, and all it does is start the
+        // budget.
+        assert!(
+            poll_once(stalled.as_mut()).is_none(),
+            "the other direction ending cut the write on the spot"
+        );
+
+        // The budget runs from the EOF, not from the write's first poll: an
+        // hour has already passed and the whole budget is still owed.
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_none(),
+            "the budget was counted from before the other direction ended"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_some(),
+            "the budget did not expire at the budget"
+        );
+    }
+
+    /// Every write gets its own budget, because every write builds its own
+    /// `stalled()`.
+    ///
+    /// What the pumps rely on and no test held: the future is rebuilt inside
+    /// the `select!` for each chunk, so a write that completes resets the bound
+    /// for the next one. Two writes of nine tenths of a budget apiece must cut
+    /// nothing, where a bound shared across writes would cut on the second.
+    #[tokio::test(start_paused = true)]
+    async fn each_write_gets_the_whole_budget() {
+        let budget = Duration::from_secs(180);
+        let (mut client_to_target, target_to_client) = half_close_pair(budget);
+        target_to_client.ended();
+
+        for write in 0..2 {
+            let mut stalled = Box::pin(client_to_target.stalled());
+            assert!(poll_once(stalled.as_mut()).is_none());
+            tokio::time::advance(budget * 9 / 10).await;
+            assert!(
+                poll_once(stalled.as_mut()).is_none(),
+                "write {write} was cut inside its own budget"
+            );
+            // The write completed: the `select!` drops this arm and the next
+            // iteration builds a fresh one.
+        }
+
+        let mut stalled = Box::pin(client_to_target.stalled());
+        assert!(poll_once(stalled.as_mut()).is_none());
+        tokio::time::advance(budget).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_some(),
+            "a write that really did stall a whole budget was not cut"
+        );
+    }
+
+    /// A clock that jumps past the budget cuts the write once, and says so once.
+    ///
+    /// The resumed-VM shape again: on a live migration every armed timer in the
+    /// process fires in the same instant, and this one has to resolve rather
+    /// than wrap, panic, or sit on a deadline the clock has already passed.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_jumps_hours_cuts_a_stalled_write() {
+        let budget = Duration::from_secs(180);
+        let (mut client_to_target, target_to_client) = half_close_pair(budget);
+        target_to_client.ended();
+
+        let mut stalled = Box::pin(client_to_target.stalled());
+        assert!(poll_once(stalled.as_mut()).is_none());
+
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_some(),
+            "a jump past the budget left the write parked"
+        );
+    }
+
+    /// The other pump ending *abnormally* arms nothing, however far the clock
+    /// moves.
+    ///
+    /// Its sender is dropped without the flag ever being raised, which is what
+    /// every abnormal ending does — and every one of those raises a teardown,
+    /// which is the arm that acts on it. This one must stay out of the way, or
+    /// a tunnel would be cut twice with two different verdicts on the same
+    /// event. The `pending()` branch inside `stalled` is the whole of that
+    /// promise, and a mass timer firing is exactly when it would be tested.
+    #[tokio::test(start_paused = true)]
+    async fn an_abnormally_ended_pump_arms_no_bound() {
+        let budget = Duration::from_secs(180);
+        let (mut client_to_target, target_to_client) = half_close_pair(budget);
+
+        // Dropped without `ended()`: the shape of a target error or a client
+        // abort, both of which raise a teardown instead.
+        drop(target_to_client);
+
+        let mut stalled = Box::pin(client_to_target.stalled());
+        assert!(poll_once(stalled.as_mut()).is_none());
+
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+        assert!(
+            poll_once(stalled.as_mut()).is_none(),
+            "an abnormal ending armed the half-close bound as well as a teardown"
+        );
     }
 
     #[test]
