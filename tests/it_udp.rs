@@ -9,7 +9,8 @@ use bytes::Bytes;
 use common::{
     assert_peer_reset, closed_udp_address, connect_udp_request, open_udp_session,
     open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
-    spawn_tagged_udp_target, spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
+    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -832,6 +833,233 @@ async fn an_idle_session_closes_the_request_stream() {
     assert!(
         ended.is_ok(),
         "the idle session should end cleanly, got {ended:?}"
+    );
+}
+
+/// Bytes that finish no capsule must not postpone the session timeout.
+///
+/// The idle timeout exists to reclaim a session's socket, buffers and tunnel
+/// slot, and "idle" has to mean "no packet crossed the proxy" for it to do
+/// that job: a peer dripping one byte of a never-finished capsule every few
+/// seconds moves no packet anywhere, and if arrival alone re-armed the clock,
+/// that drip would hold the session's resources for ever on an authenticated
+/// connection nothing else bounds. So the clock is re-armed by forwarded
+/// traffic — a payload that reached the target, a packet that came back — and
+/// by nothing less; a session fed only unproductive bytes closes on time, as
+/// if they had never come.
+#[tokio::test]
+async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (_qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // An unknown capsule type declaring a megabyte of value (RFC 9297 §3.2
+    // requires it to be skipped, not refused), so every byte after this header
+    // is discarded by the decoder's skip state and completes nothing.
+    stream
+        .send_data(Bytes::from_static(&[0x29, 0x80, 0x10, 0x00, 0x00]))
+        .await
+        .expect("send the capsule header");
+
+    // Drip one byte of that value at a fraction of the timeout, forever if the
+    // server lets it. The close is observed from the sending half: an idle
+    // close stops receiving, and a stopped stream refuses further writes.
+    let started = tokio::time::Instant::now();
+    let mut dripped = 0u32;
+    let closed = loop {
+        if started.elapsed() > Duration::from_secs(10) {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if stream.send_data(Bytes::from_static(&[0x00])).await.is_err() {
+            break true;
+        }
+        dripped += 1;
+    };
+    assert!(
+        closed,
+        "a drip of unproductive bytes must not hold the session open past its timeout"
+    );
+    // Several drips landed first, so the close really did cut a stream that
+    // was still speaking — and the bytes themselves were legal, since an
+    // unknown capsule refused early would have ended the stream on the spot.
+    assert!(
+        dripped >= 2,
+        "the session must have been dripped at while the deadline ran, got {dripped} sends"
+    );
+
+    // The response half ends too: socket and request stream close together
+    // (RFC 9298 §3.1), exactly as they do for a session that idled silently.
+    let ended = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .expect("the response half must end with the session");
+    assert!(
+        ended.is_ok(),
+        "the drip-fed session should end cleanly, got {ended:?}"
+    );
+}
+
+/// Payloads reaching a silent target postpone the session timeout on their
+/// own.
+///
+/// The clock has exactly two re-arm points — a payload reaching the target,
+/// the target answering — and an echo target exercises both at once, which
+/// would let either quietly stop working behind the other. This target never
+/// answers, so outbound progress is the only progress there is: eight sends
+/// spanning three timeouts must all reach it, and the session must still be
+/// open when they stop. Its mirror below pins the inbound point the same way.
+#[tokio::test]
+async fn payloads_reaching_a_silent_target_postpone_the_session_timeout() {
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let (target, received) = spawn_silent_udp_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // Well inside the default unanswered-packet budget (64), so every one of
+    // these is forwarded rather than dropped by the amplification cap.
+    for round in 0u8..8 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid, &[b'o', round]))
+            .expect("send datagram");
+    }
+
+    // All eight arrived: the session was alive to forward the last of them,
+    // 3.2 s into a 1 s timeout. Waited out rather than asserted immediately,
+    // since the sends are fire-and-forget.
+    tokio::time::timeout(TIMEOUT, async {
+        while received.load(std::sync::atomic::Ordering::Relaxed) < 8 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("all eight payloads must reach the silent target");
+
+    // And once the sends stop, the timeout still does its job.
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .expect("the server must close the session once the sends stop");
+    assert!(
+        ended.is_ok(),
+        "the quiesced session should end cleanly, got {ended:?}"
+    );
+}
+
+/// Packets from the target postpone the session timeout on their own.
+///
+/// The inbound half of the pair above: the client says one word to wake the
+/// target and then only listens, so from the second packet on, the target
+/// answering is the only progress there is. Eight pushes spanning three
+/// timeouts must all come through.
+#[tokio::test]
+async fn packets_from_the_target_postpone_the_session_timeout() {
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let target = spawn_pushing_udp_target(Duration::from_millis(400), 8).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(qsid, b"wake"))
+        .expect("send the one outbound packet");
+
+    let mut pending = HashMap::new();
+    for index in 0u8..8 {
+        assert_eq!(
+            recv_payload_for(&client.quic, qsid, &mut pending).await[..],
+            [b"push".as_slice(), &[index]].concat()[..],
+            "push {index}: a session whose target keeps talking must stay open"
+        );
+    }
+
+    // The target has said its eight; the session goes quiet and closes.
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .expect("the server must close the session once the target stops");
+    assert!(
+        ended.is_ok(),
+        "the quiesced session should end cleanly, got {ended:?}"
+    );
+}
+
+/// Forwarded packets do postpone the session timeout — the guard the drip
+/// test needs to mean anything.
+///
+/// With "idle" meaning "no packet crossed the proxy", a session whose packets
+/// are crossing must live for as long as they keep coming, however many
+/// timeouts that spans; a deadline that quietly became absolute would pass the
+/// drip test while cutting every long-lived flow at its first timeout, and
+/// this is the round-trip shape — both re-arm points at once, the way real
+/// traffic exercises them — that would catch it.
+#[tokio::test]
+async fn forwarded_packets_postpone_the_session_timeout() {
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // Eight round trips spaced well inside the timeout but spanning three of
+    // them end to end: every one must come back.
+    let mut pending = HashMap::new();
+    for round in 0u8..8 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let payload = [b"tick", &[round][..]].concat();
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid, &payload))
+            .expect("send datagram");
+        assert_eq!(
+            recv_payload_for(&client.quic, qsid, &mut pending).await[..],
+            payload[..],
+            "round {round}: a session whose packets are crossing must stay open"
+        );
+    }
+
+    // And once the traffic stops, the timeout does its job as before.
+    let ended = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .expect("the server must still close the session once traffic stops");
+    assert!(
+        ended.is_ok(),
+        "the quiesced session should end cleanly, got {ended:?}"
     );
 }
 

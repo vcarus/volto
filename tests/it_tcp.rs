@@ -419,7 +419,7 @@ async fn a_drained_stream_is_not_a_reset_to_the_watcher() {
         .expect("an incoming connection")
         .await
         .expect("the QUIC handshake");
-    let mut connection = volto::h3api::Connection::handshake(quic, TIMEOUT)
+    let mut connection = volto::h3api::Connection::handshake(quic, TIMEOUT, Default::default())
         .await
         .expect("the HTTP/3 handshake");
     let (_request, stream) = connection

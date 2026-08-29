@@ -192,6 +192,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         },
         oversize_reported: false,
         eviction_reported: false,
+        deadline: tokio::time::Instant::now() + ctx.idle_timeout,
         ctx,
     };
 
@@ -231,13 +232,24 @@ struct Session {
     /// The same shape and the same reason as `oversize_reported`: see
     /// [`send_buffer_verdict`].
     eviction_reported: bool,
+    /// When this session becomes idle enough to close.
+    ///
+    /// Pushed out by [`Self::touch`] whenever a packet crosses the proxy, and
+    /// by nothing else — see [`Self::run`] for why arrival alone must not
+    /// count.
+    deadline: tokio::time::Instant,
     ctx: Context,
 }
 
 /// What a single step of the session loop decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
-    /// Keep going, and treat this as activity for the idle timer.
+    /// Keep going.
+    ///
+    /// Deliberately not what re-arms the idle deadline: the steps that moved a
+    /// packet call [`Session::touch`] themselves, so one that merely consumed
+    /// bytes — a skipped capsule, a dropped packet — continues without buying
+    /// the session time.
     Continue,
     /// The session is over; close the request stream tidily.
     Stop,
@@ -277,11 +289,11 @@ impl Session {
         let mut packet = vec![0u8; MAX_UDP_PAYLOAD];
 
         loop {
-            // The timeout covers *waiting for* one of the three sources and
-            // nothing else, which is what makes it a measure of idleness: all
-            // three awaits below are cancel-safe (`DatagramReceiver::recv`,
-            // `UdpSocket::recv` and the stream read all resume where they left
-            // off), so an expiry here cannot lose anything half-done.
+            // The deadline covers *waiting for* one of the three sources and
+            // nothing else: all three awaits below are cancel-safe
+            // (`DatagramReceiver::recv`, `UdpSocket::recv` and the stream read
+            // all resume where they left off), so an expiry here cannot lose
+            // anything half-done.
             //
             // Handling the event is deliberately outside it. `forward_to_client`
             // writes to the request stream on the capsule path, and a write in
@@ -289,7 +301,17 @@ impl Session {
             // partial DATA frame, which the tidy `finish()` below would then FIN
             // in the middle of a capsule. That branch bounds its own write
             // instead, and ends the session by resetting rather than finishing.
-            let event = tokio::time::timeout(self.ctx.idle_timeout, async {
+            //
+            // A deadline rather than a per-wait timeout, because "idle" has to
+            // mean "no packet crossed the proxy", not "no bytes arrived":
+            // [`Self::touch`] pushes it out when a payload reaches the target
+            // or the target answers, and nothing else does. A wait re-armed by
+            // arrival alone would let a peer hold this session's socket,
+            // buffers and tunnel slot for ever by dripping bytes that complete
+            // nothing — one a second into a capsule that never finishes — and
+            // an authenticated peer is under no other bound: D76's deadline
+            // covers only connections that never authenticated.
+            let event = tokio::time::timeout_at(self.deadline, async {
                 tokio::select! {
                     payload = self.inbound.recv() => Event::Inbound(payload),
                     received = self.socket.recv(&mut packet) => Event::Socket(received),
@@ -346,6 +368,24 @@ impl Session {
         }
     }
 
+    /// Pushes the idle deadline out by one timeout from now.
+    ///
+    /// Called exactly twice: when a payload reaches the target, and when the
+    /// target answers. Bytes that produce neither — a capsule still being
+    /// assembled or skipped, a packet dropped by a budget or a full queue —
+    /// leave the deadline where it is, which is what makes the timeout a
+    /// measure of the session doing its job rather than of the peer talking.
+    ///
+    /// The two directions are deliberately not symmetric about drops: a target
+    /// packet counts on receipt, before the RFC 9298 §6.1 size check that may
+    /// yet drop it, because a target answering at all is the target consenting
+    /// to the conversation — while a client payload the unanswered budget
+    /// drops counts for nothing, because the budget exists precisely to doubt
+    /// that consent.
+    fn touch(&mut self) {
+        self.deadline = tokio::time::Instant::now() + self.ctx.idle_timeout;
+    }
+
     /// Forwards a payload received from the client to the target.
     async fn forward_to_target(&mut self, payload: Bytes) -> Step {
         // RFC 9298 §5: a context-0 payload larger than this cannot be a UDP
@@ -375,7 +415,12 @@ impl Session {
         }
 
         match self.socket.send(&payload).await {
-            Ok(_) => Step::Continue,
+            Ok(_) => {
+                // A payload crossed the proxy: the one direction of progress
+                // this side of the session can make.
+                self.touch();
+                Step::Continue
+            }
             Err(error) if is_per_packet_send_error(&error) => {
                 debug!(
                     quarter_stream_id = self.quarter_stream_id,
@@ -412,7 +457,10 @@ impl Session {
     async fn forward_to_client(&mut self, stream_id: u64, packet: &[u8]) -> Step {
         // The socket is connected, so anything arriving here really is from the
         // target: the conversation is two-way and the amplification cap is done.
+        // A target that is answering is also the other direction of progress,
+        // whatever becomes of this particular packet below.
         self.unanswered_budget = None;
+        self.touch();
 
         let encoded_len = datagram::encoded_len(
             self.quarter_stream_id,

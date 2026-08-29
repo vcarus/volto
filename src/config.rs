@@ -218,11 +218,17 @@ pub const DEFAULT_INITIAL_RTT_MS: u64 = 333;
 /// handshake recovery beyond what the default already risks.
 const INITIAL_RTT_RANGE_MS: std::ops::RangeInclusive<u64> = 10..=10_000;
 
-/// Largest accepted `max_idle_timeout`, in seconds.
+/// Largest accepted `max_idle_timeout`, `udp_session_timeout` and
+/// `connect_timeout`, in seconds.
 ///
 /// Not a protocol limit. Past an hour the value stops meaning anything: any relay's
 /// conntrack entry will have expired long before, so a larger timeout only delays
 /// noticing a peer that is already unreachable.
+///
+/// For the two application timers it is also a hard-safety line: they are added
+/// to `Instant::now()` to make deadlines, and an absurd number of seconds —
+/// they are plain `u64`s — would panic that addition rather than mean anything.
+/// The ceiling keeps every such sum far from the edge.
 const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
 
 /// Default UDP socket receive buffer to request, in bytes.
@@ -680,8 +686,21 @@ impl Config {
             }
         }
 
-        if self.limits.udp_session_timeout == 0 {
-            bail!("limits.udp_session_timeout must be greater than zero");
+        if self.limits.udp_session_timeout == 0
+            || self.limits.udp_session_timeout > MAX_IDLE_TIMEOUT_CEILING
+        {
+            bail!(
+                "limits.udp_session_timeout = {} must be between 1 and \
+                 {MAX_IDLE_TIMEOUT_CEILING} seconds",
+                self.limits.udp_session_timeout
+            );
+        }
+        if self.limits.connect_timeout > MAX_IDLE_TIMEOUT_CEILING {
+            bail!(
+                "limits.connect_timeout = {} exceeds {MAX_IDLE_TIMEOUT_CEILING} seconds; \
+                 use 0 to disable the budget instead",
+                self.limits.connect_timeout
+            );
         }
         if self.limits.max_targets_per_conn == 0 {
             bail!("limits.max_targets_per_conn must be greater than zero");
@@ -1940,6 +1959,44 @@ mod tests {
         .validate()
         .expect_err("one second past the ceiling must be rejected");
         assert!(err.to_string().contains("max_idle_timeout"), "{err}");
+    }
+
+    /// The two application timers share the transport timeout's ceiling: both
+    /// are added to `Instant::now()` to make deadlines, so an unbounded `u64`
+    /// of seconds would panic that arithmetic instead of meaning anything.
+    #[test]
+    fn the_session_and_connect_timers_share_the_ceiling() {
+        for (body, field) in [
+            (
+                format!(
+                    "[limits]\nudp_session_timeout = {}",
+                    MAX_IDLE_TIMEOUT_CEILING + 1
+                ),
+                "udp_session_timeout",
+            ),
+            (
+                format!(
+                    "[limits]\nconnect_timeout = {}",
+                    MAX_IDLE_TIMEOUT_CEILING + 1
+                ),
+                "connect_timeout",
+            ),
+            // The panic the ceiling exists to keep unreachable.
+            (
+                "[limits]\nudp_session_timeout = 9300000000000000000".to_string(),
+                "udp_session_timeout",
+            ),
+        ] {
+            let err = parse(&body).validate().expect_err("must be rejected");
+            assert!(err.to_string().contains(field), "{err}");
+        }
+
+        // The ceiling itself is legal for both.
+        let cfg = parse(&format!(
+            "[limits]\nudp_session_timeout = {MAX_IDLE_TIMEOUT_CEILING}\n\
+             connect_timeout = {MAX_IDLE_TIMEOUT_CEILING}"
+        ));
+        assert_valid_apart_from_certs(&cfg, "both timers at exactly the ceiling");
     }
 
     #[test]

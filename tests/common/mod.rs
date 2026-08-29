@@ -732,6 +732,36 @@ pub async fn spawn_silent_udp_target() -> (SocketAddr, Arc<AtomicU64>) {
     (addr, received)
 }
 
+/// A UDP target that answers the first packet with `count` replies on its own
+/// clock, one every `period`.
+///
+/// The shape of a subscription: one request, then traffic the target
+/// originates. It exists so a test can hold a session open with *inbound*
+/// progress alone — the client sends exactly once, and everything after that
+/// crosses the proxy in the other direction.
+pub async fn spawn_pushing_udp_target(period: Duration, count: usize) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp target");
+    let addr = socket.local_addr().expect("udp target address");
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        let Ok((_, from)) = socket.recv_from(&mut buf).await else {
+            return;
+        };
+        for index in 0..count {
+            tokio::time::sleep(period).await;
+            let payload = [b"push".as_slice(), &[index as u8]].concat();
+            if socket.send_to(&payload, from).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    addr
+}
+
 /// A UDP target that always answers with `size` bytes, whatever it receives.
 ///
 /// Used to produce a packet too large for a QUIC datagram.

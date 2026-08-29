@@ -51,7 +51,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -117,6 +117,32 @@ pub(crate) struct Shared {
     encoder_seen: AtomicBool,
     /// Whether a QPACK decoder stream has already been accepted.
     decoder_seen: AtomicBool,
+    /// Inbound HTTP Datagrams dropped instead of delivered, all three ways at
+    /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
+    /// a session whose inbound queue was full.
+    ///
+    /// The drops themselves are the silence RFC 9298 §5 and RFC 9297 §2.1 ask
+    /// for, so this counter is the only production-visible trace they leave —
+    /// it is read once, by the closing line in [`crate::quic`], which is
+    /// written after this struct is gone. Hence the `Arc`: injected by
+    /// [`Connection::handshake`]'s caller so the count outlives the
+    /// connection, for the same reason that line's `tunnels` counter is
+    /// created outside it.
+    dropped_datagrams: Arc<AtomicU64>,
+    /// Whether each way of dropping has been reported once already.
+    ///
+    /// Drops arrive at whatever rate the peer sends, so a line per drop would
+    /// be log amplification under a debug subscriber and a formatting cost on
+    /// the routing task either way: the first of each shape names it, and the
+    /// closing line's total carries the volume. Four flags rather than one
+    /// because the shapes have different diagnoses — an extension this server
+    /// does not speak, a session racing its own close (or a misdirected
+    /// flood), a target not draining, and a datagram cut short of its Context
+    /// ID — and the one line each gets should be the right one.
+    unknown_context_reported: AtomicBool,
+    unroutable_reported: AtomicBool,
+    queue_full_reported: AtomicBool,
+    malformed_reported: AtomicBool,
 }
 
 impl Shared {
@@ -174,30 +200,54 @@ impl Shared {
             // one to a future extension, and this proxy implements none, so
             // buffering would be holding packets for a registration that has no
             // way to arrive.
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                context_id = decoded.context_id,
-                "dropping datagram with an unknown context id"
-            );
+            self.count_drop(&self.unknown_context_reported, || {
+                debug!(
+                    quarter_stream_id = decoded.quarter_stream_id,
+                    context_id = decoded.context_id,
+                    "dropping datagrams with an unknown context id"
+                )
+            });
             return;
         }
 
-        let Some(inbound) = self.lock().get(&decoded.quarter_stream_id).cloned() else {
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                "dropping datagram for an unknown session"
-            );
-            return;
-        };
+        // One map operation under the lock, `try_send` included: it never
+        // waits, and sending inside the guard spares the routing task a sender
+        // clone -- two refcount bumps -- on every datagram it routes.
+        let delivered = self
+            .lock()
+            .get(&decoded.quarter_stream_id)
+            .map(|inbound| inbound.try_send(decoded.payload).is_ok());
 
-        // Never block the router on one slow session: dropping a UDP packet is
-        // legitimate, stalling every other session is not.
-        if inbound.try_send(decoded.payload).is_err() {
-            debug!(
-                quarter_stream_id = decoded.quarter_stream_id,
-                "inbound queue full or closed, dropping datagram"
-            );
+        match delivered {
+            Some(true) => {}
+            None => self.count_drop(&self.unroutable_reported, || {
+                debug!(
+                    quarter_stream_id = decoded.quarter_stream_id,
+                    "dropping datagrams for sessions that do not exist"
+                )
+            }),
+            // Never block the router on one slow session: dropping a UDP
+            // packet is legitimate, stalling every other session is not.
+            Some(false) => self.count_drop(&self.queue_full_reported, || {
+                debug!(
+                    quarter_stream_id = decoded.quarter_stream_id,
+                    "dropping datagrams a session's full queue cannot take"
+                )
+            }),
         }
+    }
+
+    /// Counts one dropped datagram, and lets the first of its shape say so.
+    ///
+    /// The count is for the closing line in [`crate::quic`]; the one report is
+    /// for whoever is reading a debug log while it happens. Everything is
+    /// `Relaxed` because nothing is published through either atomic: each is a
+    /// single read-modify-write ordered against nothing else.
+    fn count_drop(&self, reported: &AtomicBool, report: impl FnOnce()) {
+        if !reported.swap(true, Ordering::Relaxed) {
+            report();
+        }
+        self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The routing table, with a poisoned lock treated as an ordinary one.
@@ -478,14 +528,24 @@ impl Connection {
     /// construction: a peer that cannot complete a three-stream handshake in
     /// the time it is allowed to say nothing at all is not going to complete
     /// it.
+    ///
+    /// `dropped_datagrams` is where this connection counts every inbound HTTP
+    /// Datagram it drops rather than delivers. The caller supplies it, keeping
+    /// a clone of its own, because the count is read for the connection's
+    /// closing log line -- which is written after everything constructed here
+    /// is gone.
     pub async fn handshake(
         quic: quinn::Connection,
         within: Duration,
+        dropped_datagrams: Arc<AtomicU64>,
     ) -> Result<Self, ConnectionError> {
         let handle = Handle {
             quic,
             idle: within,
-            shared: Arc::default(),
+            shared: Arc::new(Shared {
+                dropped_datagrams,
+                ..Shared::default()
+            }),
         };
 
         let opened = tokio::time::timeout(within, handle.open_critical_streams()).await;
@@ -779,7 +839,13 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
         }
 
         Err(error) => {
-            debug!(%error, "malformed HTTP datagram");
+            // The one malformation §2.1 does not make a connection error: a
+            // datagram cut short of its Context ID. Dropped like the routing
+            // misses in [`Shared::deliver`], and counted with them.
+            handle.shared.count_drop(
+                &handle.shared.malformed_reported,
+                || debug!(%error, "dropping malformed HTTP datagrams"),
+            );
             ControlFlow::Continue(())
         }
     }
@@ -1641,11 +1707,21 @@ mod tests {
             inbound.inbound.try_recv().is_err(),
             "neither may reach a session"
         );
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            2,
+            "both drops are counted for the closing line"
+        );
 
         shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"still here"));
         assert_eq!(
             recv_within(&mut inbound).await.as_deref(),
             Some(b"still here".as_slice())
+        );
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            2,
+            "a delivery is not a drop"
         );
     }
 
@@ -1715,6 +1791,35 @@ mod tests {
             inbound.inbound.try_recv().is_err(),
             "the queue must stop accepting at its depth rather than grow"
         );
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            1,
+            "the overflow is the one drop this connection saw, and it is counted"
+        );
+    }
+
+    /// The first drop of a shape is the one that speaks; every drop counts.
+    ///
+    /// Three drops rather than two, because the mutation that inverts the
+    /// first-report test reports on every call *but* the first — across two
+    /// calls that is also exactly one report, and only a third call tells the
+    /// two apart.
+    #[test]
+    fn a_drop_shape_is_reported_once_and_counted_every_time() {
+        let shared = Shared::default();
+        let mut reports = 0;
+        for _ in 0..3 {
+            shared.count_drop(&shared.unroutable_reported, || reports += 1);
+        }
+        assert_eq!(reports, 1, "the first drop of a shape is the one reported");
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            3,
+            "every drop is counted, reported or not"
+        );
+        // A different shape gets its own first report.
+        shared.count_drop(&shared.queue_full_reported, || reports += 1);
+        assert_eq!(reports, 2, "each shape speaks for itself");
     }
 
     /// RFC 9114 §6.2.1 stands while the connection does; once it is over, the

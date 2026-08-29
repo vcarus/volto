@@ -227,7 +227,10 @@ Two ordering rules that are easy to get wrong:
 
 The target socket is connected, so packets from anywhere else are dropped by the
 kernel. Sessions have their own idle timeout (default 180 s; RFC 9298 §3.1 asks
-for at least 120), and closing the socket must also close the request stream.
+for at least 120), where idle means no packet crossed the proxy: the clock is
+re-armed by a payload reaching the target or the target answering, never by
+bytes alone, so a peer dripping fragments of a capsule that never completes is
+reclaimed on schedule. Closing the socket must also close the request stream.
 
 ## Datagram routing
 
@@ -259,6 +262,11 @@ silent:
   raw UDP payload; anything else is an extension. An unknown Context ID is
   dropped silently — never a connection error — and so is a truncated one, which
   no requirement covers.
+
+Every such drop — an unknown Context ID, a truncated one, an unclaimed Quarter
+Stream ID, or a session's inbound queue already full — is counted, and the
+total is reported as `dropped_datagrams=` on the connection's closing log line,
+since the drops themselves are required to be silent.
 
 Get either wrong and the symptom is "the handshake succeeds, the tunnel is
 established, and not one packet gets through", with no error anywhere. The

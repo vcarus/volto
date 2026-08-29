@@ -818,7 +818,19 @@ impl Server {
             //
             // `tunnels` is how many requests on this connection were granted a
             // tunnel slot — TCP CONNECT and CONNECT-UDP alike — so a connection
-            // that only ever failed authentication reports zero. `tx_bytes` and
+            // that only ever failed authentication reports zero.
+            //
+            // `dropped_datagrams` is how many inbound HTTP Datagrams the
+            // connection's router dropped instead of delivering — an unknown
+            // Context ID, a Quarter Stream ID no session claims, a session
+            // whose inbound queue was full, or a datagram cut short of its
+            // Context ID. Each drop is silent where it happens, because the
+            // RFCs ask for exactly that, so this total is the only trace a
+            // misdirected or over-fast sender leaves in production. Distinct
+            // from `lost_packets`, which is the QUIC path losing what was
+            // sent; these arrived fine and were dropped on purpose.
+            //
+            // `tx_bytes` and
             // `rx_bytes` are UDP-level byte counts: everything this endpoint put
             // on or took off the wire for this connection, QUIC and HTTP/3
             // framing, retransmissions, ACKs and padding included. They are
@@ -830,10 +842,12 @@ impl Server {
             // both: either number alone says nothing about the path (D72).
             let rtt_probe = quic.clone();
 
-            // Created here rather than inside the connection so it survives it:
-            // `conn::handle` hands it to every request, and it is read below,
+            // Created here rather than inside the connection so they survive
+            // it: `conn::handle` hands the first to every request and the
+            // second to the HTTP/3 datagram router, and both are read below,
             // once, after the connection is over.
             let tunnels = Arc::new(AtomicU64::new(0));
+            let dropped_datagrams = Arc::new(AtomicU64::new(0));
 
             // Which of the two log levels this connection deserves is decided
             // from the error value `conn::handle` returned, and never from
@@ -851,7 +865,7 @@ impl Server {
                 // connection failed.
                 () = evicted.notified() => Ok("evicted"),
 
-                handled = conn::handle(quic, config, shutdown, tunnels.clone(), authenticated) =>
+                handled = conn::handle(quic, config, shutdown, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
                     match handled {
                         // The accept loop ended on its own terms: the peer said it would
                         // send no further requests, or the GOAWAY drain completed.
@@ -874,6 +888,7 @@ impl Server {
             let stats = rtt_probe.stats();
             let path = stats.path;
             let tunnels = tunnels.load(Ordering::Relaxed);
+            let dropped_datagrams = dropped_datagrams.load(Ordering::Relaxed);
 
             match closed {
                 Ok(reason) => {
@@ -885,6 +900,7 @@ impl Server {
                         mtu = path.current_mtu,
                         mtu_black_holes = path.black_holes_detected,
                         tunnels,
+                        dropped_datagrams,
                         tx_bytes = stats.udp_tx.bytes,
                         rx_bytes = stats.udp_rx.bytes,
                         sent_packets = path.sent_packets,
@@ -901,6 +917,7 @@ impl Server {
                         mtu = path.current_mtu,
                         mtu_black_holes = path.black_holes_detected,
                         tunnels,
+                        dropped_datagrams,
                         tx_bytes = stats.udp_tx.bytes,
                         rx_bytes = stats.udp_rx.bytes,
                         sent_packets = path.sent_packets,

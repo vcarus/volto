@@ -17,9 +17,11 @@ mod common;
 use bytes::Bytes;
 use common::rawstream::open_uni_stream;
 use common::{
-    connect_quic, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, SharedBuffer,
-    TestServer, ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
+    connect_quic, open_tcp_tunnel, open_udp_session, read_at_least, recv_datagram,
+    spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    IMPATIENT, STOP_TIMEOUT, TIMEOUT,
 };
+use volto::datagram;
 
 /// Push stream type (RFC 9114 §6.2.2), which only a server may open.
 ///
@@ -46,7 +48,7 @@ fn numeric_field(line: &str, name: &str) -> u64 {
         .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
 }
 
-/// The six ways a connection ends, each with the level and reason it earns.
+/// The seven ways a connection ends, each with the level and reason it earns.
 ///
 /// One test function, because the subscriber is process-wide: splitting the
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
@@ -201,7 +203,67 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
     }
 
-    // 6. The server shuts down: GOAWAY goes out, there is nothing to drain, and
+    // 6. A connection that had inbound datagrams dropped — an unknown Context
+    //    ID, a truncated one, a Quarter Stream ID no session claims — reports
+    //    how many on its closing line. The drops themselves are silent by
+    //    design (RFC 9298 §5 says drop, RFC 9297 §2.1 permits it), so this
+    //    counter is the only production-visible trace a misdirected flood
+    //    leaves. Scenario 2's warning applies here doubled: this connection
+    //    does a session handshake and five datagrams under the same 1 s idle
+    //    timeout, so nothing below may wait.
+    {
+        let mark = buffer.mark();
+        let mut client = H3Client::connect(&server).await;
+        let target = spawn_udp_echo_target().await;
+        let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
+
+        // Two datagrams no session claims, one with a context this server
+        // never registered, one cut short of any Context ID at all. All four
+        // must be dropped, and counted.
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid + 55, b"nowhere"))
+            .expect("send an unroutable datagram");
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid + 56, b"nowhere"))
+            .expect("send an unroutable datagram");
+        client
+            .quic
+            .send_datagram(datagram::encode(qsid, 7, b"unknown context"))
+            .expect("send an unknown-context datagram");
+        let mut truncated = bytes::BytesMut::new();
+        datagram::put_varint(&mut truncated, qsid);
+        client
+            .quic
+            .send_datagram(truncated.freeze())
+            .expect("send a truncated datagram");
+
+        // A round trip on the live session, sent after the four: the router
+        // handles a connection's datagrams in arrival order, so the echo
+        // coming back proves the drops were counted before the close below.
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid, b"fence"))
+            .expect("send the fence datagram");
+        let fenced = recv_datagram(&client.quic).await;
+        assert_eq!(&fenced.payload[..], b"fence");
+
+        client.quic.close(quinn::VarInt::from_u32(0), b"");
+        let line = buffer
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
+            .await;
+        assert_eq!(
+            numeric_field(&line, "dropped_datagrams"),
+            4,
+            "four datagrams were dropped on this connection; line was:\n{line}"
+        );
+    }
+
+    // 7. The server shuts down: GOAWAY goes out, there is nothing to drain, and
     //    the accept loop returns `Ok(())` on its own terms rather than through an
     //    error. Last, because it stops the server.
     {
@@ -238,8 +300,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .collect();
     assert_eq!(
         closes.len(),
-        4,
-        "four of the six closes are routine; log was:\n{logged}"
+        5,
+        "five of the seven closes are routine; log was:\n{logged}"
     );
     for line in &closes {
         assert!(
@@ -272,6 +334,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         // checked against real traffic — but every close line owes them.
         for field in [
             "tunnels=",
+            "dropped_datagrams=",
             "tx_bytes=",
             "rx_bytes=",
             "sent_packets=",
@@ -284,7 +347,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         }
     }
 
-    // The whole point of the grading: exactly two of the six closes were worth a
+    // The whole point of the grading: exactly two of the seven closes were worth a
     // warning — the peer reporting a problem and the peer causing one — and
     // neither of them is a routine ending.
     let warnings: Vec<&str> = logged

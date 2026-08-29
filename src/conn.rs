@@ -69,12 +69,15 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 /// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
 /// reason `tunnels` does: the accept loop reads it after this has been handed
 /// the connection, to decide which connection loses its slot when the server is
-/// full.
+/// full. `dropped_datagrams` belongs there too — it is read for the closing
+/// line, at the same moment `tunnels` is — and is handed on to the HTTP/3
+/// connection, whose datagram router is the thing that drops.
 pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
     mut shutdown: Shutdown,
     tunnels: Arc<AtomicU64>,
+    dropped_datagrams: Arc<AtomicU64>,
     authenticated: Arc<AtomicBool>,
 ) -> Result<(), h3api::ConnectionError> {
     // Cloned before the handshake, which takes ownership of the connection: a
@@ -88,7 +91,8 @@ pub async fn handle(
     // `quic.rs` puts in this connection's transport parameters. Why a handshake
     // needs a deadline of its own is on `h3api::Connection::handshake`.
     let mut connection =
-        h3api::Connection::handshake(quic, config.limits.max_idle_timeout()).await?;
+        h3api::Connection::handshake(quic, config.limits.max_idle_timeout(), dropped_datagrams)
+            .await?;
 
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
