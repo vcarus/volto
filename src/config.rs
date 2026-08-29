@@ -2113,6 +2113,69 @@ pub(crate) mod tests {
         assert_valid_apart_from_certs(&cfg, "both timers at exactly the ceiling");
     }
 
+    /// The positive half of D86: the largest legal configuration is one every
+    /// deadline in this server can actually be built from.
+    ///
+    /// The tests above prove the ceiling *rejects*. That is only half a bound —
+    /// a ceiling that rejected everything would pass them all — and the half it
+    /// leaves out is the one an operator meets: a value the file accepts and
+    /// the first connection then panics on. So this does the arithmetic itself,
+    /// every sum a running server makes out of these four keys, on the largest
+    /// values the file will take.
+    ///
+    /// It has teeth because of where it runs. `Duration`'s `Mul` and `Instant`'s
+    /// `Add` panic on overflow rather than saturating, and `cargo test` is a
+    /// debug build where integer overflow panics too — so a ceiling raised past
+    /// what the arithmetic can carry fails here rather than in production, which
+    /// is the whole point of having one.
+    ///
+    /// The factor is `crate::conn`'s own rather than a copy: a copy would go on
+    /// agreeing with itself after the real one moved.
+    #[test]
+    fn every_deadline_can_be_built_from_the_largest_legal_configuration() {
+        let cfg = parse(&format!(
+            "[limits]\nmax_idle_timeout = {MAX_IDLE_TIMEOUT_CEILING}\n\
+             udp_session_timeout = {MAX_IDLE_TIMEOUT_CEILING}\n\
+             connect_timeout = {MAX_IDLE_TIMEOUT_CEILING}\n\
+             keep_alive_interval = {}",
+            MAX_IDLE_TIMEOUT_CEILING / 2 - 1
+        ));
+        assert_valid_apart_from_certs(&cfg, "every timer at exactly the ceiling");
+
+        let now = tokio::time::Instant::now();
+
+        // `crate::conn`: D76's absolute deadline, the only product of two
+        // configured numbers in the tree.
+        let silence = cfg.limits.max_idle_timeout() * crate::conn::SILENCE_FACTOR;
+        let deadline = now + silence;
+        assert!(deadline > now, "the D76 deadline did not move forward");
+
+        // `crate::tunnel::udp`: the session deadline, armed at setup and pushed
+        // out by every packet that crosses.
+        assert!(now + cfg.limits.udp_session_timeout() > now);
+
+        // `crate::tunnel::tcp`: the connect budget, and the same budget spent a
+        // second time on the address list -- one request can hold both.
+        let connect = cfg.limits.connect_timeout().expect("the ceiling is not 0");
+        assert!(now + connect + connect > now);
+
+        // `crate::quic`: the drain, and the transport parameters quinn is given.
+        assert!(now + cfg.server.shutdown_grace() >= now);
+        assert!(
+            quinn::IdleTimeout::try_from(cfg.limits.max_idle_timeout()).is_ok(),
+            "the ceiling is past what a QUIC idle timeout can carry"
+        );
+
+        // And the whole of it together, which is what a single unauthenticated
+        // connection can spend: one idle timeout for the QUIC handshake, one for
+        // the HTTP/3 handshake, then D76's two.
+        let lifetime = cfg.limits.max_idle_timeout() * 2 + silence;
+        assert!(
+            now + lifetime > now,
+            "an unauthenticated connection's whole lifetime overflows the clock"
+        );
+    }
+
     /// The drain period is a bound, so it has to stay one (D86).
     ///
     /// Unlike the timers above, an absurd grace period does not panic anything:

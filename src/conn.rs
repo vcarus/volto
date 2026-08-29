@@ -235,7 +235,12 @@ pub async fn handle(
 /// keep-alive PINGs, or one sending packets of its own. The cost of the factor
 /// is that such a peer holds its slot for two idle timeouts rather than one,
 /// which is bounded either way.
-const SILENCE_FACTOR: u32 = 2;
+///
+/// Visible to the crate because [`crate::config`] has to multiply by it: the
+/// ceiling on `max_idle_timeout` is what keeps `Instant::now() + idle * this`
+/// inside what the arithmetic can take (D86), and a ceiling checked against a
+/// copy of the factor would stop meaning anything the day the factor moved.
+pub(crate) const SILENCE_FACTOR: u32 = 2;
 
 /// What waiting for the next request stream produced.
 enum NextRequest {
