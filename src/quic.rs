@@ -1806,6 +1806,57 @@ mod tests {
             .expect("the permit `notify_one` stored must outlive the send");
     }
 
+    /// An eviction a lost `select!` race consumed is still delivered to the
+    /// next wait.
+    ///
+    /// `serve` waits on this signal *twice* — once beside the QUIC handshake,
+    /// once beside the whole connection — and the two waits are separate
+    /// futures. So there is a window nothing else in this file covers: the
+    /// eviction lands while the first wait is parked, `Notify` hands the
+    /// notification to that waiter, and then the handshake completes in the
+    /// same wake-up and wins the race. The first wait is dropped holding a
+    /// notification it never returned.
+    ///
+    /// If that were lost, the victim would keep running until its own idle
+    /// timeout rather than "as long as one poll takes", which is what the
+    /// [`Roster`] documentation promises and what an operator reading
+    /// `max_connections` is owed. `Notify` puts an unclaimed notification back
+    /// as a permit when its waiter is dropped, and this pins that: the whole
+    /// two-wait design rests on it and nothing said so.
+    ///
+    /// Polled through a bare waker rather than awaited, so the assertion is
+    /// about the permit being there and not about a runtime getting round to
+    /// it.
+    #[tokio::test]
+    async fn an_eviction_a_lost_race_consumed_is_still_delivered() {
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Poll, Waker};
+
+        let roster = Roster::new();
+        let (evict, _registration) = roster.register(peer(0), Arc::new(AtomicBool::new(false)));
+
+        let mut cx = TaskContext::from_waker(Waker::noop());
+
+        // The wait beside the handshake, parked.
+        let mut first = Box::pin(evict.notified());
+        assert_eq!(first.as_mut().poll(&mut cx), Poll::Pending);
+
+        // The eviction arrives while it is parked, and is handed to it.
+        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+
+        // The other arm of that `select!` wins the wake-up: this one is dropped
+        // without ever being polled again.
+        drop(first);
+
+        // The wait beside the connection must still find it.
+        let mut second = Box::pin(evict.notified());
+        assert_eq!(
+            second.as_mut().poll(&mut cx),
+            Poll::Ready(()),
+            "an eviction was swallowed by the wait that lost the race"
+        );
+    }
+
     /// A dropped registration gives the slot back, and takes nobody else's.
     ///
     /// The guard is what makes the cap survive the several ways a connection

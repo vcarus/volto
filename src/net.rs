@@ -621,6 +621,84 @@ mod tests {
             assert_eq!(resolved, vec!["192.0.2.1:443".parse().unwrap()]);
         }
 
+        /// A whole connection's worth of lookups giving up at once leaves the
+        /// budget exactly as it found it.
+        ///
+        /// This is the shape a resumed VM produces, and the reason it is worth
+        /// a test of its own: on a live migration every `connect_timeout` in
+        /// the process expires in the same instant, so every parked
+        /// [`ConnectionResolver::acquire`] is dropped together rather than one
+        /// at a time. A parked one is not empty-handed — it holds a burst
+        /// permit while it queues on the shared allowance, and it is
+        /// simultaneously queued on the reserved slot — so a drop that gave
+        /// back only part of that would erode the budget one mass expiry at a
+        /// time until no connection could resolve anything.
+        ///
+        /// Note what this does *not* say. A lookup that has already reached the
+        /// blocking pool keeps its slot when its caller gives up, on purpose:
+        /// the permit travels into the blocking task and is released by the
+        /// thread, because `getaddrinfo` is not cancellable and a slot freed at
+        /// `connect_timeout` would say a thread is free while it is still gone
+        /// (D90). What is proved here is the other half — a lookup that never
+        /// got a slot must not keep a claim on one.
+        #[test]
+        fn lookups_that_all_give_up_at_once_give_back_everything_they_held() {
+            let budget = ResolverBudget::new();
+
+            // The shared allowance gone, the way an attack leaves it.
+            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
+                .map(|_| budget.per_connection())
+                .collect();
+            let _held: Vec<_> = hostile
+                .iter()
+                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
+                .collect();
+            assert_eq!(budget.shared.available_permits(), 0);
+
+            let victim = budget.per_connection();
+            // The reserved slot is taken, so everything below has to queue.
+            let reserved = ready(victim.acquire()).expect("the reserved slot starts free");
+            assert_eq!(victim.slots.burst.available_permits(), BURST_LOOKUPS);
+
+            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+            let mut parked: Vec<_> = (0..BURST_LOOKUPS)
+                .map(|_| Box::pin(victim.acquire()))
+                .collect();
+            for (nth, lookup) in parked.iter_mut().enumerate() {
+                assert!(
+                    lookup.as_mut().poll(&mut cx).is_pending(),
+                    "lookup {nth} had a slot with the allowance gone and the reserved slot held"
+                );
+            }
+            assert_eq!(
+                victim.slots.burst.available_permits(),
+                0,
+                "a parked lookup is meant to be holding its burst permit while it queues"
+            );
+
+            // Every one of them gives up in the same instant.
+            drop(parked);
+
+            assert_eq!(
+                victim.slots.burst.available_permits(),
+                BURST_LOOKUPS,
+                "burst permits were left behind by lookups that gave up"
+            );
+            assert_eq!(
+                budget.shared.available_permits(),
+                0,
+                "a lookup that never reached the shared allowance disturbed it"
+            );
+
+            // And the reserved slot is still this connection's own, taken by
+            // the next lookup the moment the one holding it finishes.
+            drop(reserved);
+            assert!(
+                ready(victim.acquire()).is_some(),
+                "the reserved slot did not come back after a mass expiry"
+            );
+        }
+
         /// The pool has a thread for every slot the budget can hand out.
         #[test]
         fn the_pool_covers_every_slot_the_budget_can_hand_out() {
