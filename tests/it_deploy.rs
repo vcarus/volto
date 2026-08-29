@@ -256,6 +256,88 @@ fn an_older_installed_version_becomes_an_update() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A downgrade is the incident path, and two of its hazards are invisible from
+/// the outside until they bite.
+///
+/// The config file is never rewritten by anything here, so it may name keys the
+/// older binary refuses outright — `mtu_upper_bound` reached the shipped example
+/// in v0.4.5, and every install is derived from that example — and an older
+/// volto rejects the whole file rather than the one key, so the service simply
+/// does not start. And `--tag` pins nothing: the update timer resolves the
+/// latest release, so a rollback left alone is undone on the next tick.
+///
+/// Both belong in front of the operator running the rollback, not in a document
+/// they are not reading at the time.
+#[test]
+fn a_downgrade_says_what_bites_on_the_way_back() {
+    let root = install_root("downgrade");
+    plant_binary(&root, "0.5.1");
+    plant_config(&root);
+    plant_unit(&root);
+
+    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.4.4"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    for expected in [
+        "0.5.1 -> 0.4.4 is a downgrade",
+        // The config hazard, and the string to grep the journal for.
+        "unknown field",
+        // The timer hazard, and the command that holds the rollback.
+        "volto-deploy.timer",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "a downgrade must warn about {expected}: {stdout}"
+        );
+    }
+
+    // The advisory goes in front of the decision, which stays the last line and
+    // keeps its exact shape.
+    assert!(
+        stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
+        "the decision must still be the last thing printed: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The everyday direction must stay quiet: an upgrade has neither hazard, and a
+/// warning printed on every timer tick is a warning nobody reads.
+#[test]
+fn an_upgrade_and_a_reinstall_say_nothing_about_downgrades() {
+    for (name, installed, tag, decision) in [
+        (
+            "upgrade",
+            "0.4.4",
+            "v0.5.1",
+            "dry-run: would update 0.4.4 -> v0.5.1\n",
+        ),
+        (
+            "same-version",
+            "0.5.1",
+            "v0.5.1",
+            "dry-run: already deployed and intact (v0.5.1)\n",
+        ),
+    ] {
+        let root = install_root(name);
+        plant_binary(&root, installed);
+        plant_config(&root);
+        plant_unit(&root);
+
+        let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", tag]);
+
+        assert!(output.status.success(), "{}", stderr_of(&output));
+        assert_eq!(
+            stdout_of(&output),
+            decision,
+            "{name} must print only its decision"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 /// `refresh_self` keeps the copy the timer executes in step with the release,
 /// and must do so exactly once: a second run has nothing to copy.
 #[test]

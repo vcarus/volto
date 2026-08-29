@@ -17,6 +17,11 @@
 # Rolling back by hand is the same flow pinned to an older release:
 #   sudo volto-deploy --tag v0.1.0
 #
+# That path prints an advisory of its own, because it has two hazards the
+# everyday direction does not: the config file is never rewritten and an older
+# volto refuses the whole file over one key it does not know, and --tag is not a
+# pin -- the update timer, if enabled, converges forward again.
+#
 # --dry-run is the test seam, in the spirit of install-selfsigned.sh's
 # --print-config: it skips the preflight, prints the convergence decision it
 # would act on and stops before touching anything. Together with
@@ -93,6 +98,32 @@ note() {
     echo "  $*"
 }
 
+# True when version $1 is strictly older than version $2, comparing the dotted
+# numeric fields left to right.
+#
+# Anything that is not plain dotted digits answers false, which covers the two
+# cases that matter: no install yet, so INSTALLED is empty, and a binary whose
+# --version could not be read. An advisory drawn from a comparison that cannot
+# be trusted is worse than no advisory.
+is_older_version() {
+    case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+    case "$2" in ''|*[!0-9.]*) return 1 ;; esac
+
+    local a b i x y
+    local IFS=.
+    # shellcheck disable=SC2206  # splitting on IFS is exactly the point here
+    a=($1)
+    # shellcheck disable=SC2206
+    b=($2)
+
+    for i in 0 1 2; do
+        x="${a[$i]:-0}"
+        y="${b[$i]:-0}"
+        [ "$x" -eq "$y" ] || { [ "$x" -lt "$y" ]; return; }
+    done
+    return 1
+}
+
 # --- arguments ---------------------------------------------------------------
 
 while [ $# -gt 0 ]; do
@@ -153,6 +184,21 @@ VERSION="${TAG#v}"
 INSTALLED=""
 if [ -x "$BIN" ]; then
     INSTALLED="$("$BIN" --version 2>/dev/null | awk '{print $2}')" || INSTALLED=""
+fi
+
+# A downgrade is the incident-response path, and it is the one path nobody
+# rehearses. Two of its hazards are invisible from the outside until they bite,
+# and both are cheaper to say here than to rediscover from a service that will
+# not start at three in the morning. Printed before the decision below, and in a
+# dry run as much as in a real one, because deciding is what a dry run is for.
+if is_older_version "$VERSION" "$INSTALLED"; then
+    echo "==> $INSTALLED -> $VERSION is a downgrade"
+    note "nothing here rewrites the config, and an older volto refuses a key it does not know"
+    note "-- the whole file, not the key -- so if the service does not come up, look for"
+    note "'unknown field' in 'journalctl -u $SERVICE_NAME -e': it names the line to comment"
+    note "out in $CONF (see docs/configuration.md, version compatibility)"
+    note "and --tag pins nothing: an enabled $TIMER_NAME.timer puts this host back on the"
+    note "latest release within a day ('systemctl disable --now $TIMER_NAME.timer' holds it)"
 fi
 
 # --- download and verify -----------------------------------------------------

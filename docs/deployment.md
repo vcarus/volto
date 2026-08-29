@@ -213,12 +213,38 @@ Rolling back is the same flow pinned to an older release:
 sudo volto-deploy --tag v0.1.0
 ```
 
-Two properties worth knowing: the script never rewrites
-`/etc/volto/config.toml` or the certificate (both belong to
-`install-selfsigned.sh`'s first run and to you afterwards), and it carries no
-version pin of its own — it converges on whatever the newest *published*
-release is, in either direction. Deleting a bad release from the releases page
-therefore rolls every host back on its next timer tick.
+It is also the one flow nobody rehearses, so the script says the two things
+that bite on the way back before it does anything about them.
+
+**The config file goes back with nothing.** The script never rewrites
+`/etc/volto/config.toml` or the certificate — both belong to
+`install-selfsigned.sh`'s first run and to you afterwards — and an older volto
+refuses a key it does not know, refusing the *whole* file rather than the key,
+so the service does not start at all. `mtu_upper_bound` is the one that bites in
+practice: it reached the shipped example in v0.4.5, and every install is derived
+from that example. The startup error names the file, the line and the column;
+comment that key out and start the service, or comment out everything
+introduced after the target release beforehand. See
+[version compatibility](configuration.md#version-compatibility) for which key
+arrived when.
+
+The script's own guardrail does not help here, and reads backwards if you are
+not expecting it: when the newly installed binary is not running a few seconds
+later, the previous one is restored — which on a rollback is the release you
+were trying to leave.
+
+**`--tag` is not a pin.** The script carries no version pin of its own; it
+converges on whatever the newest *published* release is, in either direction. So
+a rollback left alone is undone by the next timer tick, within a day. Hold it
+with
+
+```sh
+sudo systemctl disable --now volto-deploy.timer
+```
+
+or, if the release itself is the problem for every host, delete it from the
+releases page — that rolls every host back on its own next tick and needs no
+per-host action at all.
 
 ## systemd
 
