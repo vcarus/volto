@@ -51,6 +51,12 @@
 //! * `[security]` defaults deny private address space but nothing else.
 //!
 //! [`Config::warnings`] reports the first of those at startup.
+//!
+//! Rejecting unknown keys also makes a configuration file forward-only: one
+//! written for this version does not load on a release that predates any key in
+//! it, so the file has to be edited before a rollback rather than after the
+//! service fails to start. `docs/configuration.md` carries the operator's half
+//! of that (which key arrived in which release, and why the policy stays).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -2481,6 +2487,171 @@ pub(crate) mod tests {
         )
         .expect_err("must reject unknown keys");
         assert!(err.to_string().contains("lisen"), "{err}");
+    }
+
+    /// The rejection is the policy of *every* table, not a property of
+    /// `[server]`.
+    ///
+    /// It is enforced by a `deny_unknown_fields` attribute repeated on each
+    /// struct, so it holds only for as long as nobody adds a table without one,
+    /// and the file that would silently change meaning is `[auth]`: with the
+    /// attribute missing there, `uesrs = [...]` deserializes to an empty user
+    /// list, and an empty user list is an open proxy. Every other table's typo
+    /// falls back to a default that is merely wrong. That asymmetry is why this
+    /// is worth a test rather than a review note, and it is also the argument
+    /// against relaxing the policy to make rollback easier — see
+    /// [`a_config_that_names_a_key_from_the_future_is_refused_whole`].
+    #[test]
+    fn every_table_rejects_unknown_keys() {
+        // Whole documents rather than fragments appended to a `[server]` table:
+        // a bare key written after one lands *inside* it, so a fragment could
+        // only ever exercise `Server`'s attribute however it was spelled.
+        const SERVER: &str = "[server]\n\
+                              listen = \"127.0.0.1:4433\"\n\
+                              cert = \"/tmp/c.pem\"\n\
+                              key = \"/tmp/k.pem\"\n";
+
+        // One unknown key per table, each spelled as a plausible typo or as
+        // something a later release might add.
+        for (table, text) in [
+            ("top level (key)", format!("stray_key = 1\n{SERVER}")),
+            ("top level (table)", format!("{SERVER}\n[metrics]\nlisten = \"\"")),
+            ("[server]", format!("{SERVER}lisen = \"typo\"")),
+            ("[auth]", format!("{SERVER}\n[auth]\nuesrs = []")),
+            (
+                "[auth.users]",
+                format!(
+                    "{SERVER}\n[auth]\nusers = [{{ username = \"u\", password = \"p\", role = \"admin\" }}]"
+                ),
+            ),
+            ("[limits]", format!("{SERVER}\n[limits]\nmax_connection = 8")),
+            (
+                "[security]",
+                format!("{SERVER}\n[security]\ndenied_port = [25]"),
+            ),
+            ("[log]", format!("{SERVER}\n[log]\nlevl = \"info\"")),
+        ] {
+            match toml::from_str::<Config>(&text) {
+                Ok(accepted) => panic!(
+                    "{table} must reject unknown keys, but the file parsed: {accepted:?}\n{text}"
+                ),
+                Err(error) => assert!(
+                    error.to_string().contains("unknown field"),
+                    "{table}: the refusal must be an unknown-field one, got: {error}"
+                ),
+            }
+        }
+    }
+
+    /// A configuration file is forward-only: one written for this version does
+    /// not load on a version that predates any key in it.
+    ///
+    /// That is the same `deny_unknown_fields` seen from the rollback side, and
+    /// the consequence is not hypothetical. `script/config.example.toml` began
+    /// setting `mtu_upper_bound` in v0.4.5, and `install-selfsigned.sh` derives
+    /// every install from that file, so a host first installed at v0.4.5 or
+    /// later carries a key v0.4.4 refuses to start on — during the one operation
+    /// that only ever runs when something is already wrong.
+    ///
+    /// The policy stands anyway, for the reason in
+    /// [`every_table_rejects_unknown_keys`]: ignoring unknown keys would let a
+    /// misspelled `users` install an open proxy. What this test pins is that
+    /// adding a key is a decision about rollback rather than a surprise during
+    /// one, and `docs/configuration.md` states the resulting rule for operators.
+    #[test]
+    fn a_config_that_names_a_key_from_the_future_is_refused_whole() {
+        // The whole file is refused, not the one key: nothing else in it takes
+        // effect, which is why this is a startup failure rather than a warning.
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+
+            [limits]
+            initial_mtu = 1242
+            a_key_a_later_release_added = 2
+            "#,
+        )
+        .expect_err("a key this version does not know must refuse the file");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "the refusal must name the shape of the problem: {err}"
+        );
+
+        // And the position is the operator's only thread back to the offending
+        // key, because `parse_error` redacts every quoted segment of the
+        // message — the key name included. Rolling back turns on that span
+        // still being there.
+        assert!(
+            err.span().is_some(),
+            "the error must carry a span: it is what names the line to comment out"
+        );
+    }
+
+    /// The other direction has no exceptions: a file written for an older
+    /// release must load on this one, with every key added since taking its
+    /// documented default.
+    ///
+    /// The body is the complete key set as of v0.4.3, every key set explicitly
+    /// so a rename cannot pass unnoticed, and it deliberately does *not*
+    /// mention `mtu_upper_bound` (v0.4.5) — the one key added inside the window
+    /// of releases that have been deployed. An upgrade never rewrites
+    /// `/etc/volto/config.toml`, so this is the file the new binary actually
+    /// gets handed.
+    #[test]
+    fn a_config_from_an_older_release_still_loads_with_defaults_for_what_it_lacks() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            alpn = ["h3"]
+            shutdown_grace = 5
+
+            [auth]
+            users = [{ username = "u", password = "p" }]
+
+            [limits]
+            udp_session_timeout = 180
+            max_targets_per_conn = 256
+            max_connections = 256
+            connect_timeout = 10
+            ip_family_preference = "ipv4"
+            max_streams_bidi = 1024
+            max_idle_timeout = 60
+            keep_alive_interval = 20
+            initial_mtu = 1200
+            mtu_discovery = true
+            congestion_control = "bbr"
+            initial_rtt_ms = 150
+            socket_recv_buffer = 2097152
+            socket_send_buffer = 2097152
+
+            [security]
+            allow_private_networks = false
+            denied_ports = [25]
+            unanswered_packet_budget = 64
+            max_auth_failures = 5
+
+            [log]
+            level = "info"
+            keylog = false
+            "#,
+        )
+        .expect("a configuration file from v0.4.3 must still parse");
+
+        // The key added since is absent, so it takes its compiled-in default
+        // rather than leaving the file half-applied.
+        assert_eq!(cfg.limits.mtu_upper_bound, DEFAULT_MTU_UPPER_BOUND);
+        assert_eq!(cfg.limits.mtu_upper_bound, 1452);
+
+        // And the default has to be consistent with what the old file *does*
+        // say, or an upgrade would fail validation on a file that was fine.
+        assert!(cfg.limits.mtu_upper_bound >= cfg.limits.initial_mtu);
+        assert_valid_apart_from_certs(&cfg, "a v0.4.3-era configuration file");
     }
 
     #[test]

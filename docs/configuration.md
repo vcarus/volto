@@ -8,8 +8,10 @@ volto --config /etc/volto/config.toml
 
 Only `[server]` is required; every other section and key has a default. Unknown
 keys are an error at startup rather than being silently ignored, so a typo fails
-loudly. A commented reference file ships as
-[`script/config.example.toml`](../script/config.example.toml).
+loudly — in every table, not only in `[server]`. That also makes a config file
+forward-only, which matters when rolling a release back; see
+[version compatibility](#version-compatibility). A commented reference file
+ships as [`script/config.example.toml`](../script/config.example.toml).
 
 `SIGHUP` re-reads the file. A file that fails to parse or validate is rejected
 whole and the running configuration keeps serving; see
@@ -290,6 +292,53 @@ blocker's decision. A target that resolves to loopback, private or mixed
 addresses is a refusal volto really did make: it stays a WARN and a 403 with
 `Proxy-Status: …; error=destination_ip_prohibited`, because that is what a probe
 for internal services looks like from here.
+
+## Version compatibility
+
+An unknown key is refused, and the file is refused *whole* rather than the one
+key: nothing else in it takes effect, so this is a startup failure and not a
+warning. Two consequences, and they are not symmetric.
+
+**Upgrading is always safe.** A key a later release adds takes its documented
+default when the file does not mention it, and nothing ever rewrites
+`/etc/volto/config.toml` — not `script/deploy.sh` on an update, not
+`install-selfsigned.sh` on a re-run. No key has ever been renamed or removed, so
+a file written for any earlier release still loads.
+
+**Rolling back is not.** A file that names a key the older binary does not know
+stops it from starting at all, which is the one moment that costs the most: a
+rollback is only ever run when something is already wrong. The failure looks
+like this in the journal, and it names the file, the line and the column but not
+the key — a parse error redacts every quoted segment of the parser's message,
+because the same message can quote a password, and a key is quoted the same way:
+
+```
+Error: failed to parse config file /etc/volto/config.toml at line 181, column 1: unknown field `<redacted>`
+```
+
+The line number is the thread to pull: comment that key out and start the
+service. To do it before the restart instead, comment out every key introduced
+after the release being rolled back to.
+
+| Key | Introduced in |
+|---|---|
+| `[limits].connect_timeout` | v0.2.6 |
+| `[limits].socket_recv_buffer`, `[limits].socket_send_buffer` | v0.2.8 |
+| `[limits].ip_family_preference` | v0.2.9 |
+| `[limits].mtu_upper_bound` | v0.4.5 |
+
+Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
+bites in practice, because the shipped example sets it and every install made by
+`install-selfsigned.sh` is derived from that example — so a host first installed
+at v0.4.5 or later carries it whether or not anyone chose it.
+
+**Why the rejection stays.** Ignoring unknown keys would make rollback a
+non-event, and it would also make one typo dangerous rather than merely wrong.
+Every misspelled key falls back to a default; for `[auth].users` that default is
+the empty list, and an empty user list is an open proxy. A configuration that
+silently drops its credentials is a worse failure than a service that refuses to
+start, so the refusal stands and the rollback cost is paid in this section
+instead.
 
 ## A minimal file
 
