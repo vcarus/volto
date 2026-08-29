@@ -4,13 +4,14 @@
   "source": {
     "files": 2,
     "lines_read": 416827,
-    "lines_kept": 313247,
+    "lines_kept": 327100,
     "lines_duplicate": 89198,
     "lines_other_unit": 0,
-    "lines_not_tracing": 14382,
-    "window_seconds": 1288993.8,
-    "window_days": 14.92,
-    "server_restarts": 20,
+    "lines_decoloured": 13853,
+    "lines_not_tracing": 529,
+    "window_seconds": 1318540.9,
+    "window_days": 15.26,
+    "server_restarts": 23,
     "server_versions": [
       "0.4.3",
       "0.4.4",
@@ -20,22 +21,22 @@
       "0.5.1",
       "unknown"
     ],
-    "distinct_targets": 2077,
+    "distinct_targets": 2111,
     "distinct_client_addresses": 2,
     "note": "aggregates only; no name, address or log line from the input survives into this file"
   },
   "connections": {
-    "count": 2977,
-    "per_hour": 8.314,
+    "count": 3028,
+    "per_hour": 8.267,
     "interarrival": {
       "unit": "ms",
-      "n": 2976,
+      "n": 3027,
       "min": 4,
       "max": 169237509,
-      "mean": 433036.373,
-      "p50": 156500,
-      "p90": 801042,
-      "p99": 1220021,
+      "mean": 435501.579,
+      "p50": 156516,
+      "p90": 814924,
+      "p99": 1283348,
       "buckets": [
         [
           2,
@@ -63,55 +64,55 @@
         ],
         [
           500,
-          68
+          70
         ],
         [
           1000,
-          65
+          66
         ],
         [
           2000,
-          122
+          126
         ],
         [
           5000,
-          154
+          157
         ],
         [
           10000,
-          165
+          171
         ],
         [
           20000,
-          221
+          223
         ],
         [
           50000,
-          251
+          256
         ],
         [
           100000,
-          358
+          359
         ],
         [
           200000,
-          749
+          754
         ],
         [
           500000,
-          523
+          540
         ],
         [
           1000000,
-          52
+          55
         ],
         [
           2000000,
-          7
+          8
         ],
         [
           5000000,
-          2
+          3
         ],
         [
           10000000,
@@ -133,13 +134,13 @@
     },
     "lifetime": {
       "unit": "ms",
-      "n": 2977,
+      "n": 3028,
       "min": 0,
       "max": 44031173,
-      "mean": 545467.075,
-      "p50": 262175,
-      "p90": 557860,
-      "p99": 7523582,
+      "mean": 545432.696,
+      "p50": 262142,
+      "p90": 556085,
+      "p99": 7563452,
       "buckets": [
         [
           0,
@@ -171,31 +172,31 @@
         ],
         [
           2000,
-          29
+          31
         ],
         [
           5000,
-          66
+          68
         ],
         [
           10000,
-          76
+          81
         ],
         [
           20000,
-          233
+          234
         ],
         [
           50000,
-          111
+          117
         ],
         [
           100000,
-          93
+          95
         ],
         [
           200000,
-          1969
+          1999
         ],
         [
           500000,
@@ -203,7 +204,7 @@
         ],
         [
           1000000,
-          74
+          75
         ],
         [
           2000000,
@@ -211,11 +212,11 @@
         ],
         [
           5000000,
-          35
+          36
         ],
         [
           10000000,
-          11
+          12
         ],
         [
           20000000,
@@ -225,29 +226,29 @@
     },
     "concurrency": {
       "unit": "connections",
-      "n": 5954,
+      "n": 6056,
       "min": 0,
       "max": 24,
-      "mean": 3.126,
+      "mean": 3.102,
       "p50": 3,
       "p90": 5,
-      "p99": 20,
+      "p99": 19,
       "buckets": [
         [
           0,
-          242
+          254
         ],
         [
           1,
-          930
+          968
         ],
         [
           2,
-          3982
+          4031
         ],
         [
           5,
-          625
+          628
         ],
         [
           10,
@@ -260,30 +261,28 @@
       ]
     },
     "outcome": {
-      "idle": 2412,
-      "peer_close": 371,
-      "protocol_violation": 158,
-      "server_shutdown": 20,
-      "drained": 12,
-      "other_error": 4
+      "idle": 2448,
+      "peer_close": 384,
+      "protocol_violation": 163,
+      "server_shutdown": 21,
+      "drained": 12
     },
     "outcome_share": {
-      "idle": 0.81021,
-      "peer_close": 0.12462,
-      "protocol_violation": 0.05307,
-      "server_shutdown": 0.00672,
-      "drained": 0.00403,
-      "other_error": 0.00134
+      "idle": 0.80845,
+      "peer_close": 0.12682,
+      "protocol_violation": 0.05383,
+      "server_shutdown": 0.00694,
+      "drained": 0.00396
     },
     "lifetime_by_outcome": {
       "idle": {
         "unit": "ms",
-        "n": 2412,
+        "n": 2448,
         "min": 30000,
         "max": 44031173,
-        "mean": 481981.021,
-        "p50": 263456,
-        "p90": 431338,
+        "mean": 480692.653,
+        "p50": 263624,
+        "p90": 426903,
         "p99": 5616814,
         "buckets": [
           [
@@ -292,15 +291,15 @@
           ],
           [
             50000,
-            71
+            75
           ],
           [
             100000,
-            60
+            61
           ],
           [
             200000,
-            1919
+            1949
           ],
           [
             500000,
@@ -316,7 +315,7 @@
           ],
           [
             5000000,
-            19
+            20
           ],
           [
             10000000,
@@ -330,11 +329,11 @@
       },
       "peer_close": {
         "unit": "ms",
-        "n": 371,
+        "n": 384,
         "min": 0,
         "max": 43573654,
-        "mean": 612763.792,
-        "p50": 20863,
+        "mean": 597857.109,
+        "p50": 20980,
         "p90": 1090373,
         "p99": 8460565,
         "buckets": [
@@ -372,23 +371,23 @@
           ],
           [
             5000,
-            45
+            46
           ],
           [
             10000,
-            51
+            56
           ],
           [
             20000,
-            50
+            52
           ],
           [
             50000,
-            21
+            23
           ],
           [
             100000,
-            20
+            21
           ],
           [
             200000,
@@ -396,11 +395,11 @@
           ],
           [
             500000,
-            26
+            27
           ],
           [
             1000000,
-            15
+            16
           ],
           [
             2000000,
@@ -418,25 +417,25 @@
       },
       "protocol_violation": {
         "unit": "ms",
-        "n": 158,
+        "n": 163,
         "min": 2060,
         "max": 8790462,
-        "mean": 656584.987,
-        "p50": 36953,
+        "mean": 637110.54,
+        "p50": 36066,
         "p90": 2247812,
         "p99": 8547824,
         "buckets": [
           [
             2000,
-            17
+            19
           ],
           [
             5000,
-            21
+            22
           ],
           [
             10000,
-            24
+            25
           ],
           [
             20000,
@@ -444,7 +443,7 @@
           ],
           [
             50000,
-            17
+            18
           ],
           [
             100000,
@@ -472,40 +471,12 @@
           ]
         ]
       },
-      "other_error": {
-        "unit": "ms",
-        "n": 4,
-        "min": 15536,
-        "max": 715850,
-        "mean": 206200.5,
-        "p50": 72436,
-        "p90": 715850,
-        "p99": 715850,
-        "buckets": [
-          [
-            10000,
-            1
-          ],
-          [
-            20000,
-            1
-          ],
-          [
-            50000,
-            1
-          ],
-          [
-            500000,
-            1
-          ]
-        ]
-      },
       "server_shutdown": {
         "unit": "ms",
-        "n": 20,
+        "n": 21,
         "min": 200049,
         "max": 17382827,
-        "mean": 5744390.8,
+        "mean": 6041885.476,
         "p50": 4242200,
         "p90": 13525653,
         "p99": 17382827,
@@ -532,7 +503,7 @@
           ],
           [
             10000000,
-            5
+            6
           ]
         ]
       },
@@ -2043,25 +2014,25 @@
         ]
       ]
     },
-    "migrated": 178,
-    "goaways_sent": 36,
+    "migrated": 179,
+    "goaways_sent": 38,
     "rtt_at_open": {
       "unit": "ms",
-      "n": 2977,
+      "n": 3028,
       "min": 50,
       "max": 6094,
-      "mean": 114.9,
+      "mean": 114.292,
       "p50": 98,
-      "p90": 143,
+      "p90": 142,
       "p99": 437,
       "buckets": [
         [
           50,
-          1561
+          1604
         ],
         [
           100,
-          1312
+          1320
         ],
         [
           200,
@@ -2087,25 +2058,25 @@
     },
     "rtt_at_close": {
       "unit": "ms",
-      "n": 2977,
+      "n": 3028,
       "min": 50,
       "max": 9648,
-      "mean": 157.58,
-      "p50": 101,
-      "p90": 250,
+      "mean": 156.327,
+      "p50": 100,
+      "p90": 247,
       "p99": 816,
       "buckets": [
         [
           50,
-          1414
+          1457
         ],
         [
           100,
-          1200
+          1207
         ],
         [
           200,
-          253
+          254
         ],
         [
           500,
@@ -2535,31 +2506,31 @@
     }
   },
   "tunnels": {
-    "attempts_logged": 307158,
-    "attempts_per_hour": 857.85,
+    "attempts_logged": 320892,
+    "attempts_per_hour": 876.13,
     "reported_by_closing_lines": 212975,
     "kind": {
-      "tcp": 284032,
+      "tcp": 295868,
       "blackhole": 20580,
-      "udp": 2542,
-      "policy_denied": 4
+      "udp": 2586,
+      "policy_denied": 1858
     },
-    "udp_share_of_established": 0.00887,
-    "blackhole_share_of_attempts": 0.067,
-    "policy_denied_share_of_attempts": 1e-05,
-    "literal_share_of_attempts": 0.4236,
+    "udp_share_of_established": 0.00866,
+    "blackhole_share_of_attempts": 0.06413,
+    "policy_denied_share_of_attempts": 0.00579,
+    "literal_share_of_attempts": 0.4226,
     "port_class": {
-      "443": 228294,
-      "80": 71703,
-      "other": 7160,
+      "443": 241394,
+      "80": 72217,
+      "other": 7280,
       "853": 1
     },
     "name_length": {
       "unit": "characters",
-      "n": 177045,
+      "n": 185282,
       "min": 4,
       "max": 70,
-      "mean": 20.525,
+      "mean": 20.603,
       "p50": 18,
       "p90": 33,
       "p99": 34,
@@ -2570,15 +2541,15 @@
         ],
         [
           5,
-          1189
+          1424
         ],
         [
           10,
-          121351
+          126283
         ],
         [
           20,
-          54309
+          57379
         ],
         [
           50,
@@ -2654,7 +2625,7 @@
         ]
       ]
     },
-    "per_connection_coverage": 0.7991,
+    "per_connection_coverage": 0.7857,
     "transport_bytes_per_tunnel": {
       "unit": "bytes",
       "n": 2371,
@@ -2733,73 +2704,73 @@
     },
     "spacing_within_connection": {
       "note": "gaps between consecutive tunnels on one connection, measured over solo epochs only",
-      "attributed": 57177,
-      "attributed_share": 0.1861,
+      "attributed": 65217,
+      "attributed_share": 0.2032,
       "gap": {
         "unit": "ms",
-        "n": 56841,
+        "n": 64867,
         "min": 0,
         "max": 6905231,
-        "mean": 5349.605,
-        "p50": 502,
-        "p90": 5495,
-        "p99": 77335,
+        "mean": 4955.95,
+        "p50": 503,
+        "p90": 5285,
+        "p99": 61277,
         "buckets": [
           [
             0,
-            7262
+            8854
           ],
           [
             1,
-            1017
+            1277
           ],
           [
             2,
-            1287
+            1382
           ],
           [
             5,
-            1181
+            1232
           ],
           [
             10,
-            1012
+            1067
           ],
           [
             20,
-            1602
+            1732
           ],
           [
             50,
-            4600
+            5424
           ],
           [
             100,
-            3136
+            3450
           ],
           [
             200,
-            6884
+            7522
           ],
           [
             500,
-            8187
+            9056
           ],
           [
             1000,
-            5964
+            7106
           ],
           [
             2000,
-            8268
+            9762
           ],
           [
             5000,
-            3945
+            4430
           ],
           [
             10000,
-            1264
+            1322
           ],
           [
             20000,
@@ -2815,11 +2786,11 @@
           ],
           [
             200000,
-            284
+            302
           ],
           [
             500000,
-            76
+            77
           ],
           [
             1000000,
@@ -2842,133 +2813,133 @@
         [
           1,
           1.0,
-          336
+          350
         ],
         [
           2,
-          1.661,
-          286
+          1.653,
+          300
         ],
         [
           3,
-          2.198,
-          268
+          2.181,
+          281
         ],
         [
           5,
-          3.175,
-          228
+          3.133,
+          241
         ],
         [
           8,
-          4.408,
-          206
+          4.381,
+          218
         ],
         [
           13,
-          5.995,
-          184
+          5.99,
+          196
         ],
         [
           21,
-          7.964,
-          166
+          7.96,
+          173
         ],
         [
           34,
-          9.9,
-          140
+          9.876,
+          145
         ],
         [
           55,
-          12.419,
-          117
+          12.322,
+          121
         ],
         [
           89,
-          15.939,
-          98
+          15.782,
+          101
         ],
         [
           144,
-          22.206,
-          63
+          21.923,
+          65
         ],
         [
           233,
-          29.976,
-          41
+          29.279,
+          43
         ],
         [
           377,
-          32.655,
-          29
+          31.742,
+          31
         ],
         [
           610,
-          44.095,
-          21
+          42.826,
+          23
         ],
         [
           987,
-          50.643,
-          14
+          49.188,
+          16
         ],
         [
           1597,
-          67.333,
-          9
+          64.091,
+          11
         ]
       ]
     },
     "popularity": {
-      "distinct": 2077,
-      "tunnels": 307158,
+      "distinct": 2111,
+      "tunnels": 320892,
       "share_of_tunnels": {
-        "top_1": 0.1471,
-        "top_5": 0.5196,
-        "top_10": 0.708,
-        "top_50": 0.8607,
-        "top_100": 0.9094,
-        "top_500": 0.9794
+        "top_1": 0.1464,
+        "top_5": 0.5254,
+        "top_10": 0.7146,
+        "top_50": 0.8628,
+        "top_100": 0.9111,
+        "top_500": 0.9795
       },
       "requests_per_target": {
         "unit": "tunnels",
-        "n": 2077,
+        "n": 2111,
         "min": 1,
-        "max": 45169,
-        "mean": 147.885,
+        "max": 46965,
+        "mean": 152.009,
         "p50": 4,
-        "p90": 68,
-        "p99": 1051,
+        "p90": 66,
+        "p99": 1135,
         "buckets": [
           [
             1,
-            541
+            547
           ],
           [
             2,
-            542
+            550
           ],
           [
             5,
-            319
+            329
           ],
           [
             10,
-            226
+            230
           ],
           [
             20,
-            192
+            194
           ],
           [
             50,
-            107
+            109
           ],
           [
             100,
-            53
+            54
           ],
           [
             200,
@@ -2976,7 +2947,7 @@
           ],
           [
             500,
-            27
+            28
           ],
           [
             1000,
@@ -3093,35 +3064,35 @@
         ]
       }
     },
-    "server_restarts": 20
+    "server_restarts": 23
   },
   "violations": {
     "note": "connections the peer closed with H3_GENERAL_PROTOCOL_ERROR; the server-visible half of a client-reported protocol violation. Rate it against tunnel attempts, which are counted from the tunnel lines themselves and are complete; the closing line's own tunnel count is a newer field and covers only part of a multi-release capture",
-    "count": 158,
-    "per_1000_connections": 53.0736,
-    "per_1000_tunnel_attempts": 0.5144,
-    "per_1000_reported_tunnels": 0.7419,
+    "count": 163,
+    "per_1000_connections": 53.8309,
+    "per_1000_tunnel_attempts": 0.508,
+    "per_1000_reported_tunnels": 0.7653,
     "offset_from_connection_start": {
       "unit": "ms",
-      "n": 158,
+      "n": 163,
       "min": 2060,
       "max": 8790462,
-      "mean": 656584.987,
-      "p50": 36953,
+      "mean": 637110.54,
+      "p50": 36066,
       "p90": 2247812,
       "p99": 8547824,
       "buckets": [
         [
           2000,
-          17
+          19
         ],
         [
           5000,
-          21
+          22
         ],
         [
           10000,
-          24
+          25
         ],
         [
           20000,
@@ -3129,7 +3100,7 @@
         ],
         [
           50000,
-          17
+          18
         ],
         [
           100000,
@@ -3334,11 +3305,11 @@
       "violations_per_1000_connections": 0.0
     },
     "unknown": {
-      "connections": 733,
-      "tunnel_attempts": 114675,
-      "violations": 47,
-      "violations_per_1000_tunnel_attempts": 0.4099,
-      "violations_per_1000_connections": 64.1201
+      "connections": 784,
+      "tunnel_attempts": 128409,
+      "violations": 52,
+      "violations_per_1000_tunnel_attempts": 0.405,
+      "violations_per_1000_connections": 66.3265
     }
   }
 }

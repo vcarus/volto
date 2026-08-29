@@ -89,6 +89,15 @@ LINE = re.compile(
 # routinely a whole sentence.
 FIELD_KEY = re.compile(r"(?:^|\s)([a-z_][a-z0-9_]*)=")
 
+# Colour. A process whose stdout is not a terminal usually turns it off, but not
+# always -- a run started by hand, or a unit whose environment says otherwise,
+# writes SGR sequences into the journal, and rsyslog escapes each ESC into the
+# four literal characters `#033` on the way to disk. Either form splits a field
+# name from its `=` and hides the whole line from the parser: in the captures
+# this was written against it was a quarter of one host's lines, silently
+# dropped, until the count of unparsed lines was looked at rather than trusted.
+COLOUR = re.compile(r"(?:\x1b|#033)\[[0-9;]*[A-Za-z]")
+
 
 def parse_timestamp(text: str) -> int:
     """`2026-08-27T07:35:54.176862Z` to microseconds since the epoch.
@@ -221,7 +230,19 @@ def close_outcome(fields: dict[str, str]) -> str:
     if "reason" in fields:
         return unquote(fields["reason"])
 
-    error = fields.get("error", "")
+    # Older still than any of the error vocabularies below: before there was a
+    # reason at all, the closing line carried one boolean saying whether the
+    # idle timer was what ended it.
+    if "idle" in fields:
+        return "idle" if fields["idle"] == "true" else "peer_close"
+
+    if "error" not in fields:
+        # Older than the boolean too: the line said a connection had closed and
+        # nothing about why. Named for what it is rather than folded in with the
+        # faults, so that `other_error` stays a row worth looking twice at.
+        return "unrecorded"
+
+    error = fields["error"]
     if "H3_GENERAL_PROTOCOL_ERROR" in error or "protocol compliance" in error:
         return "protocol_violation"
     if error.endswith("Timeout"):
@@ -336,6 +357,9 @@ def read_events(paths: list[str], unit: str | None) -> tuple[list[tuple], dict[s
         with opener(path, "rt", errors="replace") as handle:  # type: ignore[operator]
             for line in handle:
                 counts["lines_read"] += 1
+                if COLOUR.search(line):
+                    line = COLOUR.sub("", line)
+                    counts["lines_decoloured"] += 1
                 match = LINE.match(line)
                 if match is None:
                     counts["lines_unparsed"] += 1
@@ -896,6 +920,7 @@ def build_profile(name: str, world: dict, counts: dict, sources: list[str]) -> d
             "lines_kept": counts.get("lines_kept", 0),
             "lines_duplicate": counts.get("lines_duplicate", 0),
             "lines_other_unit": counts.get("lines_other_unit", 0),
+            "lines_decoloured": counts.get("lines_decoloured", 0),
             "lines_not_tracing": counts.get("lines_unparsed", 0),
             "window_seconds": round(span_s, 1),
             "window_days": round(span_s / 86400, 2),
