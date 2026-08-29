@@ -365,6 +365,44 @@ async fn the_grace_period_bounds_the_wait() {
         .expect("the client learns the connection is closed");
 }
 
+/// `shutdown_grace = 0` is the documented "close everything at once".
+///
+/// The other side of [`the_grace_period_bounds_the_wait`]: that one proves the
+/// grace period is an upper bound on the wait, this one that it is the whole of
+/// it. The tunnel below is held open and in use, so a drain that waited for
+/// anything at all would still be waiting -- the endpoint's own close flush is
+/// then all that stands between the signal and the process ending, and it is
+/// bounded at one second.
+#[tokio::test]
+async fn a_zero_grace_period_closes_everything_at_once() {
+    let mut server = TestServer::start_with(&format!("shutdown_grace = 0\n{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    stream
+        .send_data(Bytes::from_static(b"unfinished"))
+        .await
+        .expect("send");
+    assert_eq!(&read_at_least(&mut stream, 10).await, b"unfinished");
+
+    let started = std::time::Instant::now();
+    server.shutdown();
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "a zero grace period must not wait for a live tunnel, and the default of \
+         five seconds must not creep back in; stopping took {elapsed:?}"
+    );
+
+    // And the client is told rather than left to time out.
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("the client learns the connection is closed");
+}
+
 /// With nothing to drain, shutdown does not wait out the grace period.
 #[tokio::test]
 async fn an_idle_server_stops_promptly() {
