@@ -1070,4 +1070,57 @@ mod tests {
             assert_eq!(first.next_u64(), second.next_u64());
         }
     }
+
+    /// A joint row is drawn whole, and every value comes out of that row.
+    ///
+    /// The point of the table is that the three quantities belong together, so
+    /// the test that matters is not the marginal frequency of any one of them
+    /// but that a lifetime is never paired with a tunnel count from a different
+    /// row -- which is exactly the pairing three independent samplers would
+    /// produce.
+    #[test]
+    fn a_joint_draw_keeps_its_row_together() {
+        let profile = Json::parse(
+            r#"{"connections": {"joint": {"rows": [
+                 ["idle", 100000, 200000, 1, 2, 7],
+                 ["peer_close", 1000, 2000, 500, 1000, 3]]}}}"#,
+        )
+        .expect("json");
+        let table = JointTable::read(&profile);
+        let mut rng = Rng::new(11);
+
+        let mut idle = 0;
+        for _ in 0..1000 {
+            let (outcome, lifetime, tunnels) = table.draw(&mut rng).expect("a row");
+            match outcome {
+                "idle" => {
+                    idle += 1;
+                    assert!((100_000.0..200_000.0).contains(&lifetime), "{lifetime}");
+                    assert!((1.0..2.0).contains(&tunnels), "{tunnels}");
+                }
+                "peer_close" => {
+                    assert!((1_000.0..2_000.0).contains(&lifetime), "{lifetime}");
+                    assert!((500.0..1000.0).contains(&tunnels), "{tunnels}");
+                }
+                other => panic!("`{other}` is in no row"),
+            }
+        }
+        // Seven of the ten connections in the table are idle ones.
+        assert!(
+            (650..750).contains(&idle),
+            "{idle} of 1000 drew the idle row"
+        );
+    }
+
+    /// A profile with no joint table at all falls back on the marginals.
+    ///
+    /// The path a capture takes when its releases predate the tunnel count on
+    /// the closing line: there is nothing to build a contingency from, and the
+    /// planner has to go back to sampling the three quantities separately. Worth
+    /// pinning because it is the branch a modern capture never reaches.
+    #[test]
+    fn an_absent_joint_table_is_not_an_error() {
+        let table = JointTable::read(&Json::parse(r#"{"connections": {}}"#).expect("json"));
+        assert!(table.draw(&mut Rng::new(3)).is_none());
+    }
 }
