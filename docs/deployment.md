@@ -292,8 +292,14 @@ number needed is 512 × 256 + 64 = 131136, past what the unit grants, and client
 at their quotas can then consume every descriptor the process has, leaving none
 for the listening socket, for the certificate a `SIGHUP` re-reads, or for
 anything else. Fd exhaustion is not a crash here — a tunnel whose `socket()`
-fails is refused with a 503 and `error=destination_unavailable` — but it is a
-degradation that hits every connection at once.
+fails is refused with a 500 and `Proxy-Status: volto; error=proxy_internal_error`,
+one request at a time, and the tunnels already running are untouched — but it is
+a degradation that hits every connection at once. That error type is what
+distinguishes it from an unreachable destination: it is RFC 9209's "internal
+error unrelated to the origin", so a burst of them in a client's logs points at
+this host's descriptor budget rather than at the targets, and it carries no
+`next-hop` because nothing was contacted. The same answer covers the other ways
+a host can run out — no kernel buffer, no ephemeral port left to bind.
 
 volto compares that number against `RLIMIT_NOFILE` at startup and warns when it
 does not fit, which is worth heeding rather than silencing. Take the headroom in

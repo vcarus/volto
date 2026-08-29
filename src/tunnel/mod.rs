@@ -471,6 +471,13 @@ pub enum ProxyError {
     ConnectionRefused,
     /// The connection attempt timed out.
     ConnectionTimeout,
+    /// This host could not spare the resources to reach the target at all.
+    ///
+    /// RFC 9209 §2.3.30 describes the type as "the intermediary encountered an
+    /// internal error unrelated to the origin", which is exactly the case: the
+    /// descriptor, the buffer or the source port ran out here, and nothing at
+    /// all was learned about the destination. See `is_local_exhaustion`.
+    ProxyInternalError,
     /// This connection already holds as many tunnels as it may.
     ConnectionLimitReached,
     /// The request is refused by policy.
@@ -697,6 +704,7 @@ impl ProxyError {
             Self::DestinationUnavailable => "volto; error=destination_unavailable",
             Self::ConnectionRefused => "volto; error=connection_refused",
             Self::ConnectionTimeout => "volto; error=connection_timeout",
+            Self::ProxyInternalError => "volto; error=proxy_internal_error",
             Self::ConnectionLimitReached => "volto; error=connection_limit_reached",
             Self::HttpRequestDenied => "volto; error=http_request_denied",
         }
@@ -725,6 +733,10 @@ impl ProxyError {
     ///   from-here information in, so the refusal must not carry it out.
     /// * `connection_limit_reached`, and the 407 path, say nothing about a
     ///   target: they are verdicts on the client.
+    /// * `proxy_internal_error` — nothing was contacted. The allocation this
+    ///   host could not make failed before the first packet, so naming the
+    ///   address would be reporting a hop that was never tried, and would hand
+    ///   a client this server's resolution of a name it never reached (D89).
     fn discloses_next_hop(self) -> bool {
         matches!(
             self,
@@ -764,7 +776,15 @@ impl ProxyError {
     }
 
     /// The error type that best describes a failure to reach a target.
+    ///
+    /// The local failures are separated out first, because everything below
+    /// them is a statement *about the target* and they are not one: see
+    /// `is_local_exhaustion`.
     pub fn from_connect_error(error: &std::io::Error) -> Self {
+        if is_local_exhaustion(error) {
+            return Self::ProxyInternalError;
+        }
+
         match error.kind() {
             std::io::ErrorKind::ConnectionRefused => Self::ConnectionRefused,
             std::io::ErrorKind::TimedOut => Self::ConnectionTimeout,
@@ -800,8 +820,49 @@ impl ProxyError {
                 Status::SERVICE_UNAVAILABLE
             }
             Self::DestinationIpProhibited | Self::HttpRequestDenied => Status::FORBIDDEN,
+            Self::ProxyInternalError => Status::INTERNAL_SERVER_ERROR,
         }
     }
+}
+
+/// Whether a socket could not be opened because *this host* had nothing left.
+///
+/// The distinction the RFC 9209 registry draws, and the one D89 is about.
+/// `destination_unavailable` is defined as "the intermediary considers the next
+/// hop to be unavailable; e.g., recent attempts to communicate with it may have
+/// failed, or a health check may indicate that it is down" (§2.3.4) — a
+/// statement about the target. None of the errors below is one. They are raised
+/// by the allocation itself, before a single packet is addressed anywhere, so
+/// what they report is that this process ran out of something:
+///
+/// * `EMFILE` / `ENFILE` — no descriptor, per process or system-wide. This is
+///   the one an operator meets: `max_connections` x `max_targets_per_conn`
+///   sockets is what `crate::quic`'s startup check sizes `RLIMIT_NOFILE`
+///   against, and a host that is over it fails every `socket()` at once.
+/// * `ENOBUFS` / `ENOMEM` — no kernel buffer or memory for another socket.
+/// * `EADDRNOTAVAIL` — no source address left to bind, which on a connect to a
+///   remote address is the ephemeral port range exhausted. A target address
+///   that is itself unassignable cannot reach here: the unspecified address is
+///   answered by decision D49 before any dial, and every other refusal by the
+///   destination policy.
+///
+/// Reported as `proxy_internal_error` — "the intermediary encountered an
+/// internal error unrelated to the origin" (§2.3.30) — which is the registry's
+/// own name for this, rather than as a healthy destination being down.
+///
+/// Deliberately *not* here: `EACCES` and `EPERM`. A local firewall refusing the
+/// route to one target is a fact about reaching that target, so it keeps
+/// `destination_unavailable`; running out of descriptors is not.
+///
+/// A plain function over the OS error number, for the reason
+/// `udp::is_per_packet_send_error` gives for the same shape: `std` maps none of
+/// these onto an `ErrorKind` that is stable to match on, and both hosts this
+/// server builds for define every constant.
+fn is_local_exhaustion(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EADDRNOTAVAIL)
+    )
 }
 
 /// The field an RFC 9209 refusal explains itself in.
@@ -1185,6 +1246,7 @@ mod tests {
                 "connection_limit_reached",
             ),
             (ProxyError::HttpRequestDenied, "http_request_denied"),
+            (ProxyError::ProxyInternalError, "proxy_internal_error"),
         ] {
             let value = error.field_value();
             // `<identifier>; error=<type>`: the identifier names this proxy, the
@@ -1219,11 +1281,69 @@ mod tests {
             ),
             (ProxyError::HttpRequestDenied, Status::FORBIDDEN),
             (ProxyError::DestinationIpProhibited, Status::FORBIDDEN),
+            (
+                ProxyError::ProxyInternalError,
+                Status::INTERNAL_SERVER_ERROR,
+            ),
         ] {
             assert_eq!(
                 error.recommended_status(),
                 expected,
                 "{error:?} must answer {expected}"
+            );
+        }
+    }
+
+    /// A failure of *this host* is not a report about the target (D89).
+    ///
+    /// Every errno here is raised by the allocation itself, before anything is
+    /// addressed anywhere, so none of them can be evidence that "the next hop
+    /// [is] unavailable" — RFC 9209 §2.3.4's definition of the type they used
+    /// to be reported as. `proxy_internal_error` is §2.3.30's "internal error
+    /// unrelated to the origin", which is what happened.
+    #[test]
+    fn a_local_resource_failure_does_not_blame_the_target() {
+        for code in [
+            libc::EMFILE,
+            libc::ENFILE,
+            libc::ENOBUFS,
+            libc::ENOMEM,
+            libc::EADDRNOTAVAIL,
+        ] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(
+                ProxyError::from_connect_error(&error),
+                ProxyError::ProxyInternalError,
+                "errno {code} ({error}) is this host's failure, not the target's"
+            );
+            assert_eq!(
+                ProxyError::from_connect_error(&error).recommended_status(),
+                Status::INTERNAL_SERVER_ERROR
+            );
+        }
+    }
+
+    /// The other side of that line: a failure that really is about reaching
+    /// this target keeps saying so.
+    ///
+    /// `EACCES` and `EPERM` are the pair worth naming — a local firewall
+    /// refusing the route to one destination is a fact about that destination,
+    /// however local the component enforcing it is.
+    #[test]
+    fn a_failure_to_reach_the_target_still_blames_the_target() {
+        for code in [
+            libc::ECONNREFUSED,
+            libc::ETIMEDOUT,
+            libc::EHOSTUNREACH,
+            libc::ENETUNREACH,
+            libc::EACCES,
+            libc::EPERM,
+        ] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_ne!(
+                ProxyError::from_connect_error(&error),
+                ProxyError::ProxyInternalError,
+                "errno {code} ({error}) is about the target"
             );
         }
     }
@@ -1313,6 +1433,9 @@ mod tests {
             ProxyError::DestinationIpProhibited,
             ProxyError::HttpRequestDenied,
             ProxyError::ConnectionLimitReached,
+            // Nothing was contacted, so there is no hop this one could name
+            // even though it is produced by the connect step (D89).
+            ProxyError::ProxyInternalError,
         ] {
             let value = proxy_status(&error.fields_with_next_hop(Some(hop)));
             assert_eq!(
