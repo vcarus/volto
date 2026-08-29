@@ -286,6 +286,79 @@ async fn opening_request_streams_does_not_extend_the_bound() {
     );
 }
 
+/// Nor does opening them without pause, which is a different way round the same
+/// deadline.
+///
+/// `opening_request_streams_does_not_extend_the_bound` above spaces its streams
+/// out, so between two of them the accept loop has nothing to do, parks, and the
+/// deadline is looked at. This one never lets it park, and that used to be
+/// enough on its own: `tokio::time::timeout_at` polls the future it wraps
+/// **first** and returns its value without consulting the clock, so a lapsed
+/// deadline is only ever noticed on a poll where nothing was ready. A peer with
+/// another stream always queued was therefore never measured against it at all —
+/// not by rearming it, which is what D76 made it absolute to prevent, but by
+/// stepping over the branch that reads it. With `max_streams_bidi` raised, the
+/// connection below stayed open for as long as the churn lasted; two minutes was
+/// as far as it was worth measuring (adversarial pass 2026-08-29).
+///
+/// The streams are opened and finished *empty*, which is what makes the supply
+/// unbounded: an empty request stream is a stream error apiece (RFC 9114 §4.1's
+/// H3_REQUEST_INCOMPLETE, quoted in `h3::stream::read_request`), so the
+/// connection survives every one of them and the allowance comes straight back.
+/// It is the only shape of stream that is both free to make and not in itself a
+/// reason to hang up.
+/// Threads enough for the churn, the client's endpoint driver and the server's
+/// accept loop to run at once, since all three have to make progress for the
+/// close to be seen at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unbroken_churn_of_request_streams_does_not_extend_the_bound() {
+    // The allowance raised to the ceiling, so the peer never waits a round trip
+    // for credit: at the 1024 default the churn stalls often enough that the
+    // accept loop parks now and then and the bound held anyway on two runs out
+    // of three, which is a flaky test rather than a passing server.
+    let server =
+        TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}max_streams_bidi = 65536\n")).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    let churning = tokio::spawn({
+        let connection = connection.clone();
+        async move {
+            while let Ok((mut send, _recv)) = connection.open_bi().await {
+                if send.finish().is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Four times the two-second bound: room for a loaded machine, and still
+    // nowhere near the defect this pins, which did not overshoot the bound by a
+    // margin -- it never reached it.
+    let ended = tokio::time::timeout(Duration::from_secs(8), connection.closed())
+        .await
+        .expect("the bound must close a connection that never authenticates");
+    churning.abort();
+
+    match ended {
+        quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+            close.error_code.into_inner(),
+            H3_NO_ERROR,
+            "the bound closes with nothing to report"
+        ),
+        // Also the server having ended it, and the one ending this test cannot
+        // rule out: the churn fills both sockets' buffers, so the loopback
+        // kernel can drop the CONNECTION_CLOSE itself, after which the client
+        // learns only from the stateless reset the endpoint sends for a
+        // connection it no longer has. Which code the bound closes with is
+        // pinned by `a_peer_that_never_sends_a_request_gives_its_slot_back`,
+        // where nothing is flooding; what this test is about is *when*.
+        quinn::ConnectionError::Reset => {}
+        // An idle timeout would mean the keep-alive stopped working and this
+        // test stopped testing what it says it does.
+        other => panic!("expected the server to end the connection, got {other}"),
+    }
+}
+
 /// A request stream that stalls before its HEADERS costs one stream, not the
 /// connection.
 ///

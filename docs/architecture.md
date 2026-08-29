@@ -89,7 +89,12 @@ credentials check: twice `limits.max_idle_timeout` for one request to
 authenticate. It is armed once at the handshake and never re-armed by a new
 stream, so what it bounds is the connection rather than a pause in it; twice, so
 that the transport's own idle timeout stays the first thing to fire on a peer
-that has simply gone away. Without it a peer that finishes the QUIC handshake
+that has simply gone away. The clock is read on each pass as well as awaited,
+because awaiting it alone is not enough: a timeout only reports a lapsed
+deadline on a poll where the work underneath it was not already finished, so a
+peer with another request stream always queued — one opened and finished empty
+costs it nothing and the server nothing but a stream error — was never measured
+against the deadline at all. Without it a peer that finishes the QUIC handshake
 and then says nothing holds a `max_connections` slot for as long as it keeps its
 socket open. It is lifted for the life of the connection the moment one request
 authenticates, so a client reusing an idle connection between requests is

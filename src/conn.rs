@@ -270,7 +270,24 @@ impl From<Result<Option<h3api::Resolver>, h3api::ConnectionError>> for NextReque
 /// The flag is read on every pass rather than once, because it is written by the
 /// request tasks: a request accepted a moment ago may be authenticating right
 /// now, and a deadline that has just expired must not close the connection out
-/// from under it.
+/// from under it. That re-read is the *only* place the verdict is reached, which
+/// is why a lapsed wait goes back round the loop instead of deciding for itself.
+///
+/// # Why the clock is read as well as awaited
+///
+/// `tokio::time::timeout_at` polls the future it wraps **first** and returns its
+/// value without ever consulting the clock, so a lapsed deadline is only noticed
+/// on a poll where nothing was ready. [`h3api::Connection::accept`] is ready the
+/// moment the peer has opened a stream, and a peer may always have another one
+/// queued: with `max_streams_bidi` raised, one that opens a request stream and
+/// finishes it empty -- a stream error apiece, so the connection survives every
+/// one and the allowance comes straight back -- kept the loop supplied
+/// indefinitely and was never measured against the deadline at all. D76 made the
+/// deadline absolute so that it could not be *rearmed*; this is what stops it
+/// being stepped over (adversarial pass 2026-08-29).
+///
+/// So the clock is read before each wait. The cost is one `Instant::now()` per
+/// accepted stream, and only while the connection has yet to authenticate.
 async fn next_request(
     connection: &mut h3api::Connection,
     context: &Context,
@@ -281,10 +298,21 @@ async fn next_request(
             return connection.accept().await.into();
         }
 
+        // The verdict, and the only place it is reached. The authentication
+        // flag has just been read above, so this races a request that is
+        // authenticating exactly as the wait below used to.
+        if tokio::time::Instant::now() >= deadline {
+            return NextRequest::Silent;
+        }
+
         match tokio::time::timeout_at(deadline, connection.accept()).await {
             Ok(accepted) => return accepted.into(),
-            Err(_elapsed) if context.is_authenticated() => continue,
-            Err(_elapsed) => return NextRequest::Silent,
+            // Back round the loop rather than deciding here: the next pass
+            // re-reads the authentication flag -- a request may have
+            // authenticated while this waited -- and then the clock, which has
+            // just reached the deadline. Deciding in this arm as well would be
+            // a second copy of that judgement to keep in step.
+            Err(_elapsed) => continue,
         }
     }
 }
