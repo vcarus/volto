@@ -43,6 +43,12 @@ pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreferenc
 
 /// Resolves `host`/`port` to a non-empty list of socket addresses.
 ///
+/// **Unbudgeted** — this takes no slot from the D90 lookup budget, so nothing a
+/// client controls may reach it: a tunnel target resolves through
+/// [`ConnectionResolver::lookup`] or not at all. What keeps this `pub` is the
+/// tests (`it_resolver_pool` proves its injected resolver took hold by watching
+/// this very function hang).
+///
 /// An IP literal resolves to itself without consulting the resolver, and an IPv6
 /// one is written bare: the brackets belong to the syntax a target arrived in,
 /// and each of the two places a target arrives has already taken them off --
@@ -262,38 +268,55 @@ impl ConnectionResolver {
         on_the_blocking_pool(host, port, Some(slot)).await
     }
 
-    /// Takes this connection's reserved slot if it is free, and queues for the
-    /// shared allowance if it is not.
+    /// Takes this connection's reserved slot or a share of the allowance,
+    /// whichever is free first.
     ///
-    /// The order of the two waits below is not interchangeable: the per-
+    /// A race rather than a check-then-queue, because the reserved slot can
+    /// free *while* a lookup waits: the shared allowance may not come back for
+    /// tens of seconds under attack, while the reserved slot turns over as
+    /// fast as this connection's own lookups finish. A lookup parked on the
+    /// shared queue therefore keeps a claim on the reserved slot too — that is
+    /// what makes "serial at worst" literally true instead of "one lookup per
+    /// burst of arrivals". `biased` puts the reserved slot first so a free one
+    /// is taken before the shared allowance is touched.
+    ///
+    /// Within the shared branch the order is not interchangeable: the per-
     /// connection permit is taken *first*, so a connection already at
     /// [`BURST_LOOKUPS`] queues on its own limit rather than on the server's,
     /// and never sits in the shared queue holding a permit it is not using.
+    /// Losing the race drops that branch and gives back whatever it held.
+    ///
+    /// Neither semaphore is ever closed, and a closed one is the only error
+    /// `acquire_owned` has.
     async fn acquire(&self) -> LookupSlot {
-        if let Ok(reserved) = self.slots.reserved.clone().try_acquire_owned() {
-            return LookupSlot::Reserved { _slot: reserved };
-        }
+        let from_shared = async {
+            let burst = self
+                .slots
+                .burst
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the budget is never closed");
+            let shared = self
+                .slots
+                .shared
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the budget is never closed");
 
-        // Neither semaphore is ever closed, and a closed one is the only error
-        // `acquire` has.
-        let burst = self
-            .slots
-            .burst
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the budget is never closed");
-        let shared = self
-            .slots
-            .shared
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("the budget is never closed");
+            LookupSlot::Shared {
+                _burst: burst,
+                _shared: shared,
+            }
+        };
 
-        LookupSlot::Shared {
-            _burst: burst,
-            _shared: shared,
+        tokio::select! {
+            biased;
+            reserved = self.slots.reserved.clone().acquire_owned() => LookupSlot::Reserved {
+                _slot: reserved.expect("the budget is never closed"),
+            },
+            slot = from_shared => slot,
         }
     }
 }
@@ -514,6 +537,48 @@ mod tests {
             assert!(
                 ready(victim.acquire()).is_none(),
                 "the reserved slot was not the only thing left"
+            );
+        }
+
+        /// A lookup parked on the shared queue takes the reserved slot when it
+        /// frees.
+        ///
+        /// The case an entry-time check alone cannot cover: during an attack
+        /// the shared allowance never comes back, and a connection's second
+        /// concurrent lookup parks while its first — on the reserved slot —
+        /// finishes in milliseconds. "Serial at worst" means the parked lookup
+        /// runs then, on the slot its own connection just freed, not that it
+        /// waits out `connect_timeout` beside an idle slot.
+        #[test]
+        fn a_parked_lookup_takes_the_reserved_slot_when_it_frees() {
+            let budget = ResolverBudget::new();
+            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
+                .map(|_| budget.per_connection())
+                .collect();
+            let _held: Vec<_> = hostile
+                .iter()
+                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
+                .collect();
+            assert_eq!(
+                budget.shared.available_permits(),
+                0,
+                "the shared allowance was not actually exhausted"
+            );
+
+            let victim = budget.per_connection();
+            let first = ready(victim.acquire()).expect("the reserved slot starts free");
+
+            let mut second = Box::pin(victim.acquire());
+            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+            assert!(
+                second.as_mut().poll(&mut cx).is_pending(),
+                "a second lookup had a slot with the allowance gone and the reserved slot held"
+            );
+
+            drop(first);
+            assert!(
+                second.as_mut().poll(&mut cx).is_ready(),
+                "a parked lookup did not take the reserved slot its own connection freed"
             );
         }
 

@@ -29,6 +29,11 @@
 //!   permit the shared allowance has ([`SHARED_LOOKUPS`] of them, each connection
 //!   taking its reserved one plus [`BURST_LOOKUPS`]), and a connection that
 //!   arrives after that still opens a tunnel — and carries bytes through it.
+//! * **Serial at worst means all of them, not the first of them.** The same
+//!   victim's [`CONCURRENT_VICTIM_LOOKUPS`] simultaneous lookups all resolve,
+//!   chaining through the one reserved slot as each frees it. A budget that
+//!   only checked the slot on arrival would answer the first and leave the
+//!   rest to their `connect_timeout` beside an idle slot.
 //! * **The name it opens needs no resolver.** The victim's target resolves from
 //!   `/etc/hosts`, so a refusal could only ever be about the *thread*, never
 //!   about DNS. That is what makes this a test of the budget rather than of the
@@ -99,6 +104,13 @@ const MAX_CONNECTIONS: u32 = 8;
 /// pool inside its own arithmetic, so borrowing a different number here would
 /// be testing a server nobody runs.
 const POOL: usize = blocking_pool_size(MAX_CONNECTIONS);
+
+/// Lookups the victim sends at once, all of which must resolve.
+///
+/// More than its reserved slot admits at a time, which is the point: with the
+/// shared allowance parked they can only get through by taking that one slot
+/// in turn.
+const CONCURRENT_VICTIM_LOOKUPS: usize = 8;
 
 /// How long the victim's tunnel may take to open while the fault lasts.
 ///
@@ -270,6 +282,40 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
             .expect("write into the tunnel");
         let echoed = read_at_least(&mut stream, b"still working".len()).await;
         assert_eq!(echoed, b"still working");
+
+        // Serial at worst, from the same victim: every one of these parks
+        // behind the exhausted shared allowance, and every one of them must
+        // still open by chaining through the reserved slot.
+        let mut concurrent = Vec::new();
+        for _ in 0..CONCURRENT_VICTIM_LOOKUPS {
+            concurrent.push(
+                victim
+                    .send
+                    .send_request(connect_request(&target))
+                    .await
+                    .expect("the request stream opens"),
+            );
+        }
+        for (nth, stream) in concurrent.iter_mut().enumerate() {
+            let response = tokio::time::timeout(VICTIM_BOUND, stream.recv_response())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "concurrent victim lookup {nth} was not answered within {VICTIM_BOUND:?}"
+                    )
+                })
+                .expect("a response");
+
+            assert_eq!(
+                response.status,
+                Status::OK,
+                "concurrent victim lookup {nth} was refused while the pool was parked: {:?}",
+                response
+                    .fields
+                    .get("proxy-status")
+                    .and_then(|value| value.to_str())
+            );
+        }
 
         // The refusals are unchanged: what the budget bounds is the thread, not
         // the answer the client gets.
