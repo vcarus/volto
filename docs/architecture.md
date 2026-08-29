@@ -526,3 +526,10 @@ Context ID, which RFC 9298 requires to be dropped silently and which only a
 client that writes its own Context ID prefix can send. The clients live in
 `tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python script),
 so `cargo test` neither sees nor needs them.
+
+The decoders that read untrusted bytes — the frame state machine, QPACK,
+Huffman, the capsule parser and the datagram codec — also have coverage-guided
+fuzz targets under `fuzz/`, run on demand on a nightly toolchain in a Linux
+container rather than in CI; `fuzz/README.md` has the invocation. The property
+tests in `tests/it_props.rs` and `tests/it_fuzz.rs` state the same kinds of
+invariants on stable Rust, so they are what CI runs on every push.

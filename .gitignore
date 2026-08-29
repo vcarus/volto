@@ -1,6 +1,13 @@
 # Rust
 /target
 
+# cargo-fuzz build tree and run outputs (fuzz/ is its own workspace, so the
+# /target entry above does not cover it; the corpus is machine-local on purpose)
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/coverage/
+
 # macOS
 .DS_Store
 

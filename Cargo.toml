@@ -81,13 +81,15 @@ socket2 = "0.6"
 
 [dev-dependencies]
 rcgen = "0.14"
-# Property tests over the parsers that read untrusted bytes, as a stand-in for
-# coverage-guided fuzzing: `cargo fuzz` needs a nightly toolchain, and the dev
-# host has stable Rust only. `tests/it_props.rs` covers the datagram and capsule
-# decoders and the CONNECT-UDP path template; the rest are unit tests next to the
-# code, in `src/h3/frame.rs` (the frame decoder, the SETTINGS parser) and
-# `src/h3/qpack.rs` (the field-section decoder, which is also what reaches the
-# Huffman decoder).
+# Property tests over the parsers that read untrusted bytes, and the CI-side
+# half of a two-part arrangement: `cargo fuzz` needs a nightly toolchain, and
+# the dev host has stable Rust only, so coverage-guided fuzzing lives in the
+# `fuzz/` crate and runs on demand in a Linux container (see fuzz/README.md)
+# while these run everywhere on stable. `tests/it_props.rs` covers the datagram
+# and capsule decoders and the CONNECT-UDP path template; the rest are unit
+# tests next to the code, in `src/h3/frame.rs` (the frame decoder, the SETTINGS
+# parser) and `src/h3/qpack.rs` (the field-section decoder, which is also what
+# reaches the Huffman decoder).
 proptest = "1"
 
 # TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion

@@ -1,0 +1,60 @@
+[package]
+name = "volto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+
+[dependencies.volto]
+path = ".."
+
+# Same pin as the root manifest. This crate is its own workspace (cargo-fuzz
+# convention), so the root's `[patch.crates-io]` does not reach it and the
+# stanza has to be repeated; keep the rev in lockstep with `../Cargo.toml`,
+# where the reasoning and the exit condition live.
+[patch.crates-io]
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "dcb9eabee2284141d24fc1632903d7a5269be404" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack"
+path = "fuzz_targets/qpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "huffman"
+path = "fuzz_targets/huffman.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capsule"
+path = "fuzz_targets/capsule.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "datagram"
+path = "fuzz_targets/datagram.rs"
+test = false
+doc = false
+bench = false
