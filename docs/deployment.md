@@ -376,6 +376,17 @@ a few seconds of failed requests at each restart. Keep systemd's
 be configured: the grace period is the bound the drain is built around, and a
 value past that would only hand the ending back to `SIGKILL`.
 
+The GOAWAY carries an identifier, and it is a promise in both directions.
+Requests below it were already accepted and are still served during the drain,
+tunnel and all, even if the client only finishes sending them after the signal.
+Requests at or past it are rejected with `H3_REQUEST_REJECTED`, which tells the
+client they were not processed and may be retried on another connection.
+
+A SIGHUP that arrives once the drain has begun is refused and logged: the
+listener has been closed by then, and reopening it to accept handshakes that are
+seconds from being closed again would be worse than doing nothing. Reload before
+you stop, not during.
+
 ## Running behind a UDP relay
 
 volto needs no special configuration to sit behind a plain layer-4 UDP

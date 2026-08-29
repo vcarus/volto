@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::auth::Authenticator;
@@ -360,12 +360,25 @@ impl Context {
 /// is the bound that keeps one client from exhausting the process fd limit, so
 /// both tunnel types draw on the *same* budget rather than one each.
 ///
-/// A semaphore rather than a counter, because it gives the M5 shutdown path the
-/// other half for free: acquiring every permit at once is exactly "wait until all
-/// tunnels have finished".
+/// A semaphore for the admission decision, plus a signal for the drain: the
+/// shutdown path needs to *observe* the count reaching zero without competing
+/// for it.
+///
+/// The two used to be one thing — `wait_until_idle` was `acquire_many(limit)`,
+/// on the reading that taking every permit at once is the same as waiting for
+/// every tunnel to end. It is not. `tokio`'s semaphore is fair, so a waiter that
+/// cannot be satisfied yet *takes the permits that are free* and queues for the
+/// rest; while the drain waited, `available_permits()` was zero, so `live()`
+/// reported the full limit and `acquire()` refused every caller. The connection
+/// then answered `503 connection_limit_reached` to requests the GOAWAY had
+/// promised to serve — those below its identifier, RFC 9114 §5.2 — with one
+/// tunnel open out of a hundred (adversarial pass 2026-08-29).
 pub struct Quota {
     permits: Arc<Semaphore>,
     limit: u32,
+    /// Signalled by every [`Slot`] as it goes, so the drain can watch the count
+    /// instead of taking part in it.
+    idle: Arc<Notify>,
 }
 
 /// One occupied tunnel slot, released when dropped.
@@ -374,7 +387,26 @@ pub struct Quota {
 /// path — response failure, idle timeout, reset, panic — leak-free by
 /// construction, in the same spirit as the [`h3api::DatagramReceiver`] a UDP
 /// session holds for as long as its Quarter Stream ID routes.
-pub type Slot = OwnedSemaphorePermit;
+pub struct Slot {
+    /// `None` only inside [`Drop::drop`], which is how the permit is given back
+    /// before the announcement that it was; see there.
+    permit: Option<OwnedSemaphorePermit>,
+    idle: Arc<Notify>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        // Order matters, and is the reason the permit is an `Option` at all:
+        // fields are dropped *after* this body runs. On the multi-threaded
+        // runtime the server actually uses, waking the drain first lets it
+        // re-read a count that has not moved yet on another core and park again
+        // with nothing left to wake it. A current-thread runtime -- what the
+        // tests below run on -- cannot show the difference, so this ordering is
+        // stated rather than asserted.
+        drop(self.permit.take());
+        self.idle.notify_one();
+    }
+}
 
 impl Quota {
     /// Creates a quota allowing `limit` concurrent tunnels.
@@ -382,12 +414,17 @@ impl Quota {
         Self {
             permits: Arc::new(Semaphore::new(limit as usize)),
             limit,
+            idle: Arc::new(Notify::new()),
         }
     }
 
     /// Takes a slot, or `None` when the connection is at its limit.
     pub fn acquire(&self) -> Option<Slot> {
-        Arc::clone(&self.permits).try_acquire_owned().ok()
+        let permit = Arc::clone(&self.permits).try_acquire_owned().ok()?;
+        Some(Slot {
+            permit: Some(permit),
+            idle: self.idle.clone(),
+        })
     }
 
     /// How many tunnels are open right now.
@@ -397,12 +434,19 @@ impl Quota {
 
     /// Resolves once every tunnel on this connection has finished.
     ///
-    /// Used by the graceful shutdown path: all permits back means all slots
-    /// dropped. The caller is responsible for bounding the wait — a tunnel that
-    /// never ends would otherwise hold shutdown open forever.
+    /// Used by the graceful shutdown path. The caller is responsible for
+    /// bounding the wait — a tunnel that never ends would otherwise hold
+    /// shutdown open forever.
+    ///
+    /// Cancel-safe, which it has to be: `crate::conn::handle` polls this as one
+    /// arm of a `select!` and drops it again on every pass. `notify_one` leaves
+    /// a permit behind when nobody is waiting and hands an unclaimed
+    /// notification on when a waiter is dropped, so neither a slot released
+    /// between the check and the park nor a lost race can wedge the drain.
     pub async fn wait_until_idle(&self) {
-        // The semaphore is never closed, so this cannot fail.
-        let _all = self.permits.acquire_many(self.limit).await;
+        while self.live() > 0 {
+            self.idle.notified().await;
+        }
     }
 }
 
@@ -1435,5 +1479,66 @@ mod tests {
             .await
             .expect("idle within the timeout")
             .expect("waiter task");
+    }
+
+    /// Watching for idle must not *take* the budget it is watching.
+    ///
+    /// `crate::conn::handle` polls `wait_until_idle` for the whole of a GOAWAY
+    /// drain, while requests below the GOAWAY identifier are still being
+    /// dispatched. When the wait was `acquire_many(limit)` the fair semaphore
+    /// handed it every free permit up front, so `live()` reported the limit and
+    /// `acquire()` refused everyone until the drain ended -- and the connection
+    /// answered `503 connection_limit_reached` to requests RFC 9114 §5.2 had
+    /// promised to serve.
+    #[tokio::test]
+    async fn waiting_for_idle_neither_spends_the_budget_nor_miscounts_it() {
+        let quota = Quota::new(4);
+        let held = quota.acquire().expect("first slot");
+
+        // Parked, exactly as the drain parks it: polled inside a `select!` that
+        // it loses.
+        let mut waiting = std::pin::pin!(quota.wait_until_idle());
+        tokio::select! {
+            () = &mut waiting => panic!("one tunnel is still live"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        assert_eq!(quota.live(), 1, "the wait must not count as a tunnel");
+        let during = quota
+            .acquire()
+            .expect("a slot must still be available while the drain waits");
+        assert_eq!(quota.live(), 2);
+
+        drop(during);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait resolves once the last slot goes");
+    }
+
+    /// The drain's own shape: the wait is rebuilt and dropped on every pass of
+    /// a `select!`, and a slot released while it is not parked must still be
+    /// noticed.
+    #[tokio::test]
+    async fn the_idle_wait_survives_being_cancelled_repeatedly() {
+        let quota = Arc::new(Quota::new(4));
+        let slots: Vec<_> = (0..3).map(|_| quota.acquire().expect("slot")).collect();
+
+        let mut slots = slots.into_iter();
+        for _ in 0..3 {
+            // One pass of the loop: build the wait, lose the race, drop it --
+            // and release a slot in between, which is the notification most
+            // easily lost.
+            tokio::select! {
+                () = quota.wait_until_idle() => panic!("tunnels are still live"),
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            drop(slots.next().expect("a slot to release"));
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), quota.wait_until_idle())
+            .await
+            .expect("every slot is back, so the wait must resolve");
+        assert_eq!(quota.live(), 0);
     }
 }

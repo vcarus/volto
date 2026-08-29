@@ -233,6 +233,109 @@ async fn new_requests_are_refused_after_goaway() {
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
+/// A request the GOAWAY promised to serve is still served once its headers
+/// arrive.
+///
+/// RFC 9114 §5.2 makes the identifier the *first* request that will not be
+/// served, so everything below it was accepted and must be carried out. The
+/// interesting one is a request accepted before the signal whose HEADERS frame
+/// only completes after it: it reaches the dispatch path while the connection is
+/// already draining, which is the one moment the tunnel quota is asked for a
+/// slot mid-drain.
+///
+/// No sleeps anywhere: quinn hands remote streams to the application in
+/// ascending id order, and receiving a frame for one stream implicitly opens
+/// every lower-numbered one (RFC 9000 §3.2), so the server answering the *later*
+/// stream is proof it accepted the earlier, half-written one first.
+#[tokio::test]
+async fn a_request_below_the_goaway_identifier_is_served_during_the_drain() {
+    use common::rawstream::{read_frame, status_of};
+
+    let mut server = TestServer::start().await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // Something to drain: without a live tunnel the connection finishes the
+    // moment the GOAWAY is out.
+    let held = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    // The request under test, opened now and completed later: the HEADERS frame
+    // type byte alone, which is enough for the server to accept the stream and
+    // not enough for it to read a request off it.
+    let request = common::rawstream::connect_headers_frame(&target.to_string());
+    let (mut late_send, mut late_recv) = client
+        .quic
+        .open_bi()
+        .await
+        .expect("open the half-written request stream");
+    let late_id = u64::from(late_send.id());
+    late_send
+        .write_all(&request[..1])
+        .await
+        .expect("send the HEADERS frame type");
+
+    // A later stream, written whole: the server's answer to it is what proves
+    // the half-written stream above was accepted first.
+    let (mut probe_send, mut probe_recv) = client
+        .quic
+        .open_bi()
+        .await
+        .expect("open the ordering probe");
+    let probe_id = u64::from(probe_send.id());
+    probe_send
+        .write_all(&request)
+        .await
+        .expect("send the probe request");
+    let (_, block) = read_frame(&mut probe_recv).await;
+    assert_eq!(status_of(&block), "200", "the probe tunnel must open");
+
+    server.shutdown();
+
+    let identifier = client.await_goaway().await;
+    assert_eq!(
+        identifier,
+        probe_id + REQUEST_STREAM_STEP,
+        "the GOAWAY must name the first request the server will not serve"
+    );
+    assert!(
+        late_id < identifier,
+        "stream {late_id} is at or past the GOAWAY identifier {identifier}, \
+         so this test is no longer about a promised request"
+    );
+
+    // The rest of the request the server has already committed to serving.
+    late_send
+        .write_all(&request[1..])
+        .await
+        .expect("finish the HEADERS frame");
+
+    let (_, block) = read_frame(&mut late_recv).await;
+    assert_eq!(
+        status_of(&block),
+        "200",
+        "a request below the GOAWAY identifier must still get its tunnel"
+    );
+
+    // And it is a working tunnel, not just a 200: the drain must not have left
+    // it half-built.
+    late_send
+        .write_all(&frame_data(b"late"))
+        .await
+        .expect("send through the late tunnel");
+    let (_, echoed) = read_frame(&mut late_recv).await;
+    assert_eq!(&echoed, b"late", "the late tunnel must carry data");
+
+    drop(held);
+    drop(probe_send);
+    drop(late_send);
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+}
+
+/// A DATA frame (RFC 9114 §7.2.1) carrying `payload`.
+fn frame_data(payload: &[u8]) -> Vec<u8> {
+    common::rawstream::frame(0x00, payload)
+}
+
 /// A client that never closes its tunnel must not be able to hold the process
 /// open: the grace period expires and the endpoint closes anyway.
 #[tokio::test]
