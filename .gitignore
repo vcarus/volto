@@ -30,5 +30,8 @@ proptest-regressions/
 # config, server log), in case the same steps are run by hand.
 /interop-*
 
+# Python bytecode from the interop and diff-oracle helpers
+__pycache__/
+
 # Claude Code local settings and subagent worktrees
 /.claude/

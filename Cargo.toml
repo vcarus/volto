@@ -79,6 +79,16 @@ libc = "0.2"
 # one-line `socket2::SockRef` wrapper quinn repeats when it wraps the socket.
 socket2 = "0.6"
 
+# The volto half of the QPACK/Huffman differential oracle: a filter that turns
+# bytes into this server's verdict about them, so that `tests/interop/difforacle`
+# can put the same bytes through an independent decoder and compare. An example
+# rather than a test binary because it is driven from outside `cargo test`, and
+# it lives beside its driver rather than in an `examples/` directory because it
+# is not an example of anything -- see that directory's README.
+[[example]]
+name = "diff_oracle"
+path = "tests/interop/difforacle/oracle.rs"
+
 [dev-dependencies]
 rcgen = "0.14"
 # Property tests over the parsers that read untrusted bytes, and the CI-side
