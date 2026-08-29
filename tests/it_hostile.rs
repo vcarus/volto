@@ -54,6 +54,10 @@
 //! | q3 | Points a CONNECT-UDP session at a target that never answers, and floods it | `[security] unanswered_packet_budget` (`src/tunnel/udp.rs`) | Packets past the budget are dropped; the budget is lifted once the target answers | `it_policy::packets_to_a_silent_target_are_capped`, `it_policy::the_cap_is_lifted_once_the_target_answers` |
 //! | q4 | Guesses with a user-id carrying a newline, a terminal escape, or 48 KB of text | `logfmt::bounded` cuts the peer's bytes to 32 and tracing escapes them, in a line that puts `remote=` first (`src/conn.rs`, `src/logfmt.rs`, review H3/M5) | A quoted, escaped, truncated `username=` field: no forged journal line, and no log amplification -- and never the attempted password | `it_log_fields::operator_facing_fields_print_values_not_options`, `it_auth_log::a_rejected_password_is_never_logged` |
 //! | r | Sends GOAWAY | RFC 9114 §5.2: a client's GOAWAY does not end the connection here; only an identifier that grows is an error | Nothing, and requests are still served; a growing identifier is CONNECTION_CLOSE H3_ID_ERROR | [`a_goaway_from_the_peer_does_not_end_the_connection`] |
+//! | r3 | Sends GOAWAY while one of its own tunnels is carrying traffic | The same: `h3api::Connection::accept` never reports `Ok(None)`, so a GOAWAY can never be read as permission to drop the connection and the tunnels on it | Nothing; the tunnel that was already open keeps carrying bytes both ways | [`a_goaway_from_the_peer_leaves_a_live_tunnel_running`] |
+//! | s | Delivers two requests a byte at a time, interleaved, so each stream's frame header straddles the other's bytes | `FrameDecoder`'s per-stream header carry-over and buffering charge (`src/h3/frame.rs`) | Both are answered 200 and both tunnels carry traffic: a request is a request however it was cut up | [`interleaved_requests_delivered_a_byte_at_a_time_are_both_served`] |
+//! | s2 | Puts a trailer section on the wire *behind* its CONNECT, before the CONNECT has been answered | RFC 9114 §4.4 is judged when the frame is **read**, which is after `Stream::split` narrows the decoder to a tunnel's rules | CONNECTION_CLOSE H3_FRAME_UNEXPECTED, and the target socket is closed with it; nothing promises the 200 arrives first | `it_tcp::a_trailer_section_sent_before_the_connect_is_answered_ends_the_connection` |
+//! | s3 | Half-closes a tunnel and then abandons it -- FIN plus STOP_SENDING -- against a target that never speaks | `Writer::stopped` watched beside the target read in `target_to_client` (`src/tunnel/tcp.rs`, D87) | The target socket, its fd and the tunnel slot are released at once rather than at the end of the QUIC connection | `it_tcp::a_tunnel_abandoned_after_its_own_fin_frees_its_slot` |
 //! | r2 | Completes the QUIC handshake and closes at once, never a stream and never a byte of HTTP/3 | Nothing to bound: the connection task ends with the connection, and the `Registration` guard gives the slot back with it (`src/quic.rs`) | Nothing; the slot returns, so the next arrival finds room instead of evicting the oldest unauthenticated peer to make some | [`a_peer_that_closes_before_it_says_anything_frees_its_slot`] |
 //!
 //! # Reading the tests
@@ -81,7 +85,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
     application_close, assert_closed_with, authenticated_connect_headers_frame,
-    connect_headers_frame, frame, open_uni_stream, read_frame, status_of,
+    connect_headers_frame, frame, headers_frame, open_uni_stream, read_frame, status_of,
 };
 use common::{
     auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport, connect_quic,
@@ -1250,6 +1254,130 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
         closed_with, H3_ID_ERROR,
         "a GOAWAY identifier that grows is an ID error; the reason was {reason:?}"
     );
+}
+
+/// The same GOAWAY, arriving in the middle of a tunnel that is already carrying
+/// traffic.
+///
+/// The test above proves the *connection* is still serving afterwards, by opening
+/// a fresh request. What it cannot prove is the request that was already in
+/// flight, which is what a client actually loses if this is got wrong:
+/// `h3api::Connection::accept` never reports `Ok(None)` precisely so that a
+/// client's GOAWAY cannot be read as permission to drop the connection -- and
+/// dropping it would cut every tunnel on it mid-sentence.
+///
+/// Identifier 0 is the strongest thing a client can say here, and in this
+/// direction it is a push ID rather than a stream ID (RFC 9114 §5.2), so it names
+/// nothing on the request side at all.
+#[tokio::test]
+async fn a_goaway_from_the_peer_leaves_a_live_tunnel_running() {
+    let server = TestServer::start().await;
+    let echo = spawn_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+    let mut control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&echo.to_string()))
+        .await
+        .expect("send a CONNECT request");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(status_of(&payload), "200", "the tunnel must open");
+
+    send.write_all(&frame(FRAME_DATA, b"before"))
+        .await
+        .expect("send payload before the GOAWAY");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_DATA);
+    assert_eq!(payload, b"before");
+
+    control
+        .write_all(&varint_frame(FRAME_GOAWAY, 0))
+        .await
+        .expect("send a GOAWAY mid-tunnel");
+
+    // A whole request served in between, which is the nearest thing to a fence
+    // there is: nothing orders a control-stream frame against a request-stream
+    // one, so the tunnel below is exercised after the server has been given work
+    // to do rather than in the same breath as the GOAWAY.
+    still_serving(&connection).await;
+
+    // The tunnel is untouched: the same stream still carries bytes both ways.
+    send.write_all(&frame(FRAME_DATA, b"after"))
+        .await
+        .expect("send payload after the GOAWAY");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_DATA);
+    assert_eq!(
+        payload, b"after",
+        "a client's GOAWAY must not disturb a tunnel that was already open"
+    );
+}
+
+/// Two requests arriving a byte at a time, interleaved, must both be served.
+///
+/// The frame decoder is fed a byte at a time by its own unit tests and by
+/// `it_fuzz`, but both drive the decoder (or a QUIC pair of their own) rather
+/// than this server, so nothing until now put a *fragmented* request in front of
+/// the real accept path. Two of them alternating is what makes it an ordering
+/// test rather than a slow one: each stream's decoder holds a half-assembled
+/// frame header and a half-charged budget while the other stream's bytes go past
+/// it, so any state that leaked between streams -- a shared header buffer, a
+/// charge released against the wrong decoder -- turns one of these into a
+/// malformed request or a connection error.
+///
+/// The padding field is there to make the *frame header itself* straddle: it
+/// pushes the field section past 63 bytes, so the length is a two-byte varint and
+/// the type, the first length byte and the second arrive in three separate reads.
+#[tokio::test]
+async fn interleaved_requests_delivered_a_byte_at_a_time_are_both_served() {
+    let server = TestServer::start().await;
+    let echo = spawn_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+
+    let authority = echo.to_string();
+    let padding = "x".repeat(64);
+    let request = headers_frame([
+        (b":method".as_slice(), b"CONNECT".as_slice()),
+        (b":authority", authority.as_bytes()),
+        (b"x-volto-probe", padding.as_bytes()),
+    ]);
+    assert!(
+        request.len() > 0x40,
+        "the field section must be long enough to need a two-byte length varint"
+    );
+
+    let mut streams = Vec::new();
+    for _ in 0..2 {
+        streams.push(connection.open_bi().await.expect("open a request stream"));
+    }
+
+    // One byte to each stream in turn, so neither request is ever whole while
+    // the other is being written.
+    for byte in &request {
+        for (send, _) in &mut streams {
+            send.write_all(&[*byte]).await.expect("send one byte");
+        }
+    }
+
+    for (index, (send, recv)) in streams.iter_mut().enumerate() {
+        let (frame_type, payload) = read_frame(recv).await;
+        assert_eq!(frame_type, FRAME_HEADERS, "stream {index}");
+        assert_eq!(
+            status_of(&payload),
+            "200",
+            "stream {index}: a request is a request however it was cut up"
+        );
+
+        // And the tunnel behind it really is a tunnel.
+        send.write_all(&frame(FRAME_DATA, b"payload"))
+            .await
+            .expect("send payload");
+        let (frame_type, payload) = read_frame(recv).await;
+        assert_eq!(frame_type, FRAME_DATA, "stream {index}");
+        assert_eq!(payload, b"payload", "stream {index}");
+    }
 }
 
 /// A peer that closes the moment its QUIC handshake is done -- never a stream,

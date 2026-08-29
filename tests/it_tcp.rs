@@ -8,7 +8,9 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::{assert_closed_with, connect_headers_frame, frame, read_frame, status_of};
+use common::rawstream::{
+    assert_closed_with, connect_headers_frame, frame, headers_frame, read_frame, status_of,
+};
 use common::{
     assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
     finish_connect, open_tcp_tunnel, read_at_least, read_to_end, respond_to, send_and_respond,
@@ -1918,4 +1920,65 @@ async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
     // A trailer section must end the connection, with the code that tells the
     // peer which rule it broke.
     assert_closed_with(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
+}
+
+/// The same trailer section, put on the wire *before* the CONNECT is answered.
+///
+/// §4.4's rule is about the state of the CONNECT, not about the order the bytes
+/// reached the socket, and here the two disagree: both frames leave in one write,
+/// so the second is already sitting in the request stream's decoder while that
+/// decoder is still reading a *request*, where a HEADERS frame is ordinary. What
+/// decides the verdict is when the frame is **read**, and nothing reads again
+/// until `Stream::split` has narrowed the decoder to a tunnel's rules — so a
+/// frame that arrived before the CONNECT completed is judged as one that arrived
+/// after it, and the answer is the one above.
+///
+/// Nothing is asserted about the 200. It is written before the offending frame is
+/// reached, but a CONNECT that has been answered is also a tunnel that has been
+/// *built*, and the connection error that follows discards whatever quinn had
+/// queued: whether the response overtakes the CONNECTION_CLOSE is a race, and
+/// the client learns the connection failed either way.
+///
+/// What is asserted besides the code is that the target connection built in that
+/// moment does not survive it — RFC 9114 §4.4's "if a proxy detects an error with
+/// the stream or the QUIC connection, it MUST close the TCP connection", on the
+/// one path where the tunnel is torn down before it ever carried a byte.
+///
+/// Two guards can answer this and the test holds both, which a mutation check
+/// (2026-08-29) is what established: with `frame::misplaced` made to allow
+/// HEADERS on a tunnel, the frame is buffered and handed on, and the arm in
+/// `Reader::recv_data` its own comment calls unreachable repeats the verdict.
+/// That arm is load-bearing after all, so nothing here should be narrowed to the
+/// first guard alone.
+///
+/// Driven on a raw stream because the shared client cannot write a second HEADERS
+/// frame before it has read the response.
+#[tokio::test]
+async fn a_trailer_section_sent_before_the_connect_is_answered_ends_the_connection() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let (mut send, _recv) = client.quic.open_bi().await.expect("open a request stream");
+
+    let mut request = connect_headers_frame(&target.to_string());
+    request.extend_from_slice(&headers_frame([(
+        b"x-volto-trailer".as_slice(),
+        b"1".as_slice(),
+    )]));
+    send.write_all(&request)
+        .await
+        .expect("send a CONNECT with a trailer section behind it");
+
+    assert_closed_with(&client.quic, H3_FRAME_UNEXPECTED, TIMEOUT).await;
+
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target connection must not outlive the connection error")
+        .expect("close notification");
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "a tunnel cut before it carried anything is still cut abortively"
+    );
 }

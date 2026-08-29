@@ -454,6 +454,76 @@ async fn closing_the_request_stream_ends_the_session() {
     );
 }
 
+/// The other way a session ends: the client resets the request stream instead of
+/// finishing it.
+///
+/// The same requirement as the test above — RFC 9298 §3.1 ties a session's life
+/// to its request stream — reached by the client's other gesture. Worth pinning
+/// separately because a reset arrives at the session loop as something else
+/// entirely: the read fails once with `RemoteTerminate`, and *then* the stream
+/// reports its end, so the session is carried out through the same clean arm a
+/// FIN uses and the error arm is only a transient on the way (verified by
+/// mutation, 2026-08-29 — making the error arm continue does not keep the
+/// session alive). Either way the `DatagramReceiver` has to go with it (D79).
+///
+/// The second session is the other half of the assertion, and the half nothing
+/// else covers: a reset in the middle of one session must cost nothing outside
+/// it, and the new session's answers must come back under the new session's id.
+/// The tagged targets are what would catch an answer routed under the old one.
+#[tokio::test]
+async fn a_reset_request_stream_gives_up_its_quarter_stream_id() {
+    let server = TestServer::start().await;
+    let abandoned_target = spawn_tagged_udp_target(1).await;
+    let live_target = spawn_tagged_udp_target(2).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (abandoned, mut stream) = open_udp_session(&mut client, &server, abandoned_target).await;
+
+    // Confirm it works before abandoning it, or the silence below would prove
+    // nothing at all.
+    let mut pending = HashMap::new();
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(abandoned, b"live"))
+        .expect("send datagram");
+    assert_eq!(
+        &recv_payload_for(&client.quic, abandoned, &mut pending).await[..],
+        b"\x01live"
+    );
+
+    // A RESET_STREAM and nothing else. The stream is deliberately kept rather
+    // than dropped: dropping it would add a `STOP_SENDING`, and — more to the
+    // point — the reset would then be followed by the end of the stream, which
+    // the session's *clean* arm answers. Keeping it means the read error is the
+    // only thing the session is ever told, which is what this test is for.
+    stream.stop_stream(volto::h3api::Code::H3_REQUEST_CANCELLED);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Nothing outside the abandoned session was disturbed: a new one opens and
+    // answers under its own id.
+    let (live, _live_stream) = open_udp_session(&mut client, &server, live_target).await;
+    assert_ne!(live, abandoned, "quinn does not reuse a stream id");
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(live, b"still here"))
+        .expect("send datagram");
+    assert_eq!(
+        &recv_payload_for(&client.quic, live, &mut pending).await[..],
+        b"\x02still here"
+    );
+
+    // And the abandoned id routes nowhere.
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(abandoned, b"after"))
+        .expect("send datagram");
+    let stray = tokio::time::timeout(Duration::from_millis(500), client.quic.read_datagram()).await;
+    assert!(
+        stray.is_err(),
+        "a session its client reset must not forward datagrams any more"
+    );
+}
+
 /// A zero-length UDP payload is legitimate and must survive the round trip.
 #[tokio::test]
 async fn empty_payloads_are_forwarded() {
