@@ -783,13 +783,17 @@ fn send_buffer_verdict(len: usize, space: usize, reported: &mut bool) -> SendBuf
 ///   UDP packet, and tearing its tunnel down for it would be a bug the dev host
 ///   cannot reproduce, since macOS has no equivalent socket option.
 /// * `EPERM` / `EACCES` — a local firewall rejecting individual packets.
+/// * `ENOBUFS` — the kernel's send buffer momentarily full. The socket is
+///   still usable, the shortage is local and transient, and dropping the
+///   packet is exactly what the network would have done with it (D89's rule
+///   in miniature: a local shortage is not a verdict on the peer).
 ///
 /// Kept as a plain function over the OS error number because `std` maps none of
 /// these onto a stable `ErrorKind`.
 fn is_per_packet_send_error(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
-        Some(libc::EMSGSIZE | libc::EPERM | libc::EACCES)
+        Some(libc::EMSGSIZE | libc::EPERM | libc::EACCES | libc::ENOBUFS)
     )
 }
 
@@ -1153,7 +1157,7 @@ mod tests {
     /// three codes below are POSIX and present in `libc` on both hosts.
     #[test]
     fn per_packet_send_errors_do_not_end_the_session() {
-        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES] {
+        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES, libc::ENOBUFS] {
             let error = std::io::Error::from_raw_os_error(code);
             assert!(
                 is_per_packet_send_error(&error),
