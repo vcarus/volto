@@ -21,6 +21,11 @@ CLAUDE.md
 *.qlog
 *.sslkeylog
 
+# proptest failure-seed files; a persisted seed is for the debugging session
+# that produced it, and a regression worth keeping becomes a named test case
+proptest-regressions/
+*.proptest-regressions
+
 # Scratch files the interop job writes into the workspace (certificate, key,
 # config, server log), in case the same steps are run by hand.
 /interop-*
