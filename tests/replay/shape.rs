@@ -685,6 +685,22 @@ pub struct Scaling {
     pub max_transfer: u32,
     /// Most tunnels one connection is asked for.
     pub max_tunnels: u64,
+    /// Longest silence a replayed connection may be planned to have, in wall
+    /// milliseconds.
+    ///
+    /// Production keeps a connection alive through a long gap between tunnels
+    /// with the server's keep-alive PINGs -- its measured gaps reach a minute
+    /// and a half at the 99th percentile, well past its idle timeout, which
+    /// only the keep-alive explains. The replay cannot use that mechanism: a
+    /// keep-alive has to be under half the idle timeout, the idle timeout is
+    /// already at its one-second floor, and with the PINGs on, a client that is
+    /// merely holding its connection open would answer them and never time out
+    /// -- which is precisely the ending four in five production connections
+    /// have.
+    ///
+    /// So the gap is shortened instead of the connection being allowed to die
+    /// in a way production's would not. Below the idle timeout, and counted.
+    pub max_gap_ms: u64,
 }
 
 /// What the planner had to bend to fit the run, reported alongside the results.
@@ -697,6 +713,10 @@ pub struct Compromises {
     /// Tunnels whose compressed spacing rounded down to nothing, so they go out
     /// together instead of at their own moment.
     pub spacings_collapsed: u64,
+    /// Gaps shortened to keep the connection under the lab's idle timeout.
+    pub gaps_shortened: u64,
+    /// Connections whose quiet tail was cut for the same reason.
+    pub active_windows_shortened: u64,
     /// Tunnels dropped because the connection ran out of its active window.
     pub tunnels_past_window: u64,
     /// Connections planned from the joint table rather than from the marginals.
@@ -797,6 +817,24 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
     let spacing = Histogram::read(profile.at("tunnels/spacing_within_connection/gap"), 1_000.0);
     let transfer = Histogram::read(profile.at("tunnels/transport_bytes_per_tunnel"), 4_096.0);
 
+    // The spacing distribution is pooled over every connection in the capture,
+    // so its mean is the mean over all of them and not the rate of any one. A
+    // connection carrying a thousand tunnels in two hundred seconds is spacing
+    // them a fifth of a second apart, and drawing its gaps from a pool whose
+    // mean is five seconds would need it to run for fifteen hours: the tunnels
+    // fall off the end of its window and the replay ends up with a fraction of
+    // the volume it planned.
+    //
+    // So each connection's gaps are the pooled *shape* rescaled to its own
+    // rate: burstiness -- the spread between a gap and the next -- is the
+    // capture's, and the mean is this connection's working time divided by its
+    // tunnel count, which the joint table gives together and correctly.
+    let pooled_gap_mean = profile
+        .maybe("tunnels/spacing_within_connection/gap/mean")
+        .and_then(Json::as_f64)
+        .filter(|mean| *mean > 0.0)
+        .unwrap_or(1.0);
+
     // The preferred source for a connection's ending, lifetime and tunnel
     // count. The three marginals above stay as the fallback for a capture whose
     // releases were too old to log a tunnel count, where the table is empty.
@@ -872,6 +910,10 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
             wanted
         };
 
+        // This connection's own mean gap, in production milliseconds, and the
+        // factor that rescales a pooled sample onto it.
+        let gap_scale = (working / tunnel_count as f64) / pooled_gap_mean;
+
         let mut tunnels = Vec::new();
         let mut targets = 0usize;
         // Kept as a float and only rounded at the end, so that a run of gaps
@@ -881,7 +923,13 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
         let mut previous_at = 0u64;
         for index in 0..tunnel_count {
             if index > 0 {
-                offset_ms += spacing.sample(&mut rng) / scaling.compression;
+                let gap = spacing.sample(&mut rng) * gap_scale / scaling.compression;
+                if gap > scaling.max_gap_ms as f64 {
+                    compromises.gaps_shortened += 1;
+                    offset_ms += scaling.max_gap_ms as f64;
+                } else {
+                    offset_ms += gap;
+                }
             }
             let at_ms = offset_ms.round() as u64;
             if index > 0 && at_ms == previous_at {
@@ -926,6 +974,23 @@ pub fn plan(profile: &Json, scaling: Scaling, seed: u64) -> Plan {
                 bytes,
             });
         }
+
+        // The same bound as a gap, applied to the silence after the last
+        // tunnel. A production connection often has a long quiet tail before
+        // whatever ends it -- the keep-alive carries it through, and the
+        // closing line's lifetime includes all of it. The replay has no
+        // keep-alive to carry it, so planning that tail plans something the lab
+        // cannot execute: the connection would be reclaimed in the middle of it
+        // and the run would report a lifetime shorter than it planned without
+        // saying why. Planned to what the lab can actually hold instead, and
+        // counted, so a lab lifetime is always "the working part, plus one idle
+        // timeout" rather than something in between.
+        let last_at = tunnels.last().map_or(0, |tunnel| tunnel.at_ms);
+        let holdable = last_at.saturating_add(scaling.max_gap_ms);
+        if active_ms > holdable {
+            compromises.active_windows_shortened += 1;
+        }
+        let active_ms = active_ms.min(holdable);
 
         connections.push(ConnectionPlan {
             start_ms: now_ms as u64,

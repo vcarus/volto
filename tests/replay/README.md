@@ -125,6 +125,60 @@ Everything else per connection — lifetime, tunnel count, bytes, packets, loss,
 dropped datagrams, close reason — is read off the closing line, exactly, for
 every connection that has one.
 
+## Measured fidelity
+
+One baseline, seed `24061`, against `profiles/host-b.json`. Two runs, because
+no single compression serves both purposes: a strong one buys sample size, a
+weak one buys timing.
+
+```sh
+# A. volume: 150 s at 1400x = 58 production-hours, 657 connections, 44 393 tunnels
+VOLTO_REPLAY_SECONDS=150 VOLTO_REPLAY_COMPRESSION=1400 \
+VOLTO_REPLAY_TARGETS=256 VOLTO_REPLAY_MAX_TUNNELS=4096 \
+    cargo test --release --test it_replay -- --ignored --nocapture
+
+# B. timing: 200 s at 120x with a 1 s idle timeout, 67 connections
+VOLTO_REPLAY_SECONDS=200 VOLTO_REPLAY_COMPRESSION=120 VOLTO_REPLAY_IDLE_SECS=1 \
+VOLTO_REPLAY_TARGETS=256 VOLTO_REPLAY_MAX_TUNNELS=4096 \
+    cargo test --release --test it_replay -- --ignored --nocapture
+```
+
+Run A against the production profile, the rows that matter:
+
+| metric | production | replay | ratio |
+|---|---|---|---|
+| violations per 1000 connections | 53.83 | 53.27 | 0.99x |
+| violations per 1000 tunnel attempts | 0.508 | 0.791 | 1.56x |
+| close: idle | 0.8085 | 0.8189 | 1.01x |
+| close: peer_close | 0.1268 | 0.1263 | 1.00x |
+| close: protocol_violation | 0.0538 | 0.0533 | 0.99x |
+| blackhole share of attempts | 0.0641 | 0.0657 | 1.02x |
+| address-literal share of attempts | 0.4226 | 0.4586 | 1.09x |
+| UDP share of established tunnels | 0.00866 | 0.00808 | 0.93x |
+| most popular target's share | 0.1464 | 0.1465 | 1.00x |
+| tunnels per connection, mean | 89.5 | 67.6 | 0.75x |
+| dropped datagrams per connection | 0.038 | 0 | — |
+| concurrency, mean | 3.10 | 10.98 | 3.54x |
+
+Reading it:
+
+* The **close-reason mix** and the **violation rate per connection** land within
+  a percent. That is the headline: the thing an operator watches is reproducible
+  in the lab now, and a rate that moved would be visible against it.
+* **Per tunnel** the violation rate reads 1.56x high, and the row below says
+  why: the replay delivers three quarters of production's tunnels per
+  connection. Violations are planned per connection, so the shortfall lands
+  entirely in the denominator. Prefer the per-connection rate; use the per-tunnel
+  one only against another replay at the same settings.
+* The tunnel shortfall itself is the long tail being cut in three places, all
+  printed by the run: `tunnels past window`, `capped tunnel counts`, and the
+  tunnels a restart burst takes with the connection it aborts.
+* **Concurrency** and **lifetime** are the rows to disbelieve, for the reason in
+  the section below.
+* **Dropped datagrams** are zero in the lab against 0.038 per connection in
+  production. Not a fidelity gap: those are drops on a lossy 80-95 ms path, and
+  the replay has no such path. Zero is what an assertion holds it to.
+
 ## What the replay cannot do
 
 Stated here as well as in `it_replay.rs` because it is the first thing to read
@@ -138,10 +192,25 @@ before believing a number out of a run:
   an over-count, and flat across a connection's tunnels.
 * **Tunnel lifetime is not in the data at all.** Nothing at INFO level says when
   a tunnel ends, so a replayed one lives as long as its transfer takes.
-* **Time compression has a floor.** The lab idle timeout cannot go below a
-  second, and four in five production connections end on that timer, so at high
-  compression measured lifetime and concurrency read high. The run prints the
-  factor.
+* **A connection's quiet time cannot be replayed.** Production carries a
+  connection through a long silence on the server's keep-alive PINGs — its
+  measured gaps between tunnels reach a minute and a half at the 99th
+  percentile, well past its 30-second idle timeout. The lab cannot: a keep-alive
+  must be under half the idle timeout, the idle timeout is already at its
+  one-second floor, and PINGs would stop an idle-ended connection ever timing
+  out, which is the ending four in five production connections have. The planner
+  therefore shortens gaps and quiet tails it cannot hold, and prints how many.
+  A replayed connection lives for its working time plus one idle timeout, so
+  **lifetime and concurrency read high at strong compression and low at weak
+  compression** and neither figure should be compared. Nothing else is affected.
 * **The target pool is small.** Distinct authorities in the lab are bounded by
   the pool size, well below production's distinct-target count, so the fan-out
-  curve is followed only up to that bound.
+  curve is followed only up to that bound. The most popular target's share comes
+  out right; the next nine are spread thinner than production's.
+* **Host limits are the lab's, not production's.** A hard run on macOS reaches
+  ephemeral-port and descriptor limits that a server does not, and the run
+  reports them as refusals with their `Proxy-Status` reason — `503
+  connection_limit_reached` when a connection's compressed tunnels overlap past
+  `max_targets_per_conn`, `500 proxy_internal_error` when the host runs out of
+  something to `connect()` with. Both are the server naming a local failure
+  correctly. Read them as a note on the settings, not on the server.

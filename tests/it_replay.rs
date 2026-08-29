@@ -52,22 +52,32 @@
 //!   flattens the variation between tunnels on one connection.
 //! * **Tunnel lifetime.** Nothing at INFO level records when a tunnel *ends*,
 //!   so a replayed tunnel lives exactly as long as its transfer takes.
-//! * **Time.** Wall-clock hours are compressed by a configurable factor. What
-//!   compression preserves is every *ratio* -- concurrency, tunnels per
-//!   connection, the arrival-to-lifetime relationship -- because arrivals,
-//!   lifetimes and spacings are all divided by the same number. What it
-//!   distorts is anything with an absolute floor, and there is one that
-//!   matters: the server's idle timeout, which the configuration will not take
-//!   below one second however far time is compressed. Four in five production
-//!   connections end on that timer, so at a compression of 1000 an
-//!   idle-ended connection holds its slot for the equivalent of 2000
-//!   production-seconds instead of 30 -- and **measured lifetime and
-//!   concurrency read high by roughly that factor**. The *working* part of a
-//!   connection's life is right, because the production idle wait is subtracted
-//!   before compression; it is only the tail that is long. A run whose subject
-//!   is lifetime or concurrency should use a compression near 30 and accept the
-//!   smaller sample; a run whose subject is volume, fan-out or the violation
-//!   rate should compress hard and read those two rows as inflated.
+//! * **Time, and with it connection lifetime.** Wall-clock hours are compressed
+//!   by a configurable factor. What compression preserves is every *ratio* --
+//!   tunnels per connection, the close-reason mix, the arrival-to-lifetime
+//!   relationship -- because arrivals, lifetimes and spacings are all divided
+//!   by the same number.
+//!
+//!   What it cannot preserve is a connection's quiet time, and the reason is
+//!   worth stating exactly because it puts a floor under the whole exercise.
+//!   Production carries a connection through a long silence on the server's
+//!   keep-alive PINGs: its measured gaps between tunnels reach a minute and a
+//!   half at the 99th percentile, well past its 30-second idle timeout, which
+//!   nothing but the keep-alive explains. The replay cannot use that mechanism.
+//!   A keep-alive must be under half the idle timeout; the idle timeout is
+//!   already at its one-second floor; and with PINGs on, a client that is
+//!   merely holding a connection open would answer them and never time out --
+//!   which is the ending four in five production connections have.
+//!
+//!   So the planner shortens what it cannot hold: a gap longer than the lab's
+//!   idle timeout, and the quiet tail after a connection's last tunnel. Both
+//!   are counted and printed. The consequence is that a replayed connection
+//!   lives for its working time plus one idle timeout and no more, and
+//!   **lifetime and concurrency are the two rows a comparison should not
+//!   believe**. They read high at strong compression, where the one-second
+//!   floor dwarfs a working phase compressed to milliseconds, and low at weak
+//!   compression, where the clamped tail is shorter than production's. Every
+//!   other row is unaffected.
 //!
 //! # Running it
 //!
@@ -101,20 +111,30 @@
 //! three assertions that are here are the ones a replay is uniquely able to
 //! make, and none of them is about a rate:
 //!
-//! * **No protocol violation the run did not inject.** The plan closes some
-//!   connections with H3_GENERAL_PROTOCOL_ERROR on purpose, because production
-//!   does; any *other* error close is the server having produced one under
-//!   load, which is exactly the signal this harness exists to catch.
+//! * **No close this server decided on.** The plan closes some connections with
+//!   H3_GENERAL_PROTOCOL_ERROR on purpose, because production does. A close the
+//!   *server* decided on is different in kind: it means it found fault with a
+//!   client that commits no offence, and that is exactly the signal this
+//!   harness exists to catch. A close the peer decided on with a code the plan
+//!   never sends fails too, as the harness misreporting what it drove.
 //! * **No dropped datagrams.** Every UDP session's datagrams must reach it. A
 //!   Quarter-Stream-ID mix-up under this much concurrency shows up here.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
+//!
+//! What is deliberately *not* asserted is the transport ending a client's own
+//! churn produces: this replay opens an endpoint per connection and lets it go,
+//! so an ephemeral port comes back round to a fresh endpoint that answers a
+//! straggling packet with a stateless reset, and the server logs the connection
+//! as reset by its peer. One shows up every few hundred connections. It is
+//! counted and printed, because a rise in it would be worth knowing about, and
+//! it is not a failure because nothing in the server produced it.
 
 mod common;
 
 #[path = "replay/shape.rs"]
 mod shape;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -242,6 +262,7 @@ struct Tally {
     aborted_by_burst: AtomicU64,
 
     tunnels_requested: AtomicU64,
+    tunnels_skipped: AtomicU64,
     tunnels_opened: AtomicU64,
     tunnels_refused: AtomicU64,
     tunnels_failed: AtomicU64,
@@ -254,11 +275,36 @@ struct Tally {
     udp_lost: AtomicU64,
     crosstalk: AtomicU64,
     bytes_echoed: AtomicU64,
+
+    /// How the refusals were spelled, and how many of each.
+    ///
+    /// Status plus the RFC 9209 `Proxy-Status` reason, because a bare count of
+    /// refusals is not usable: production refuses tunnels too -- a name its
+    /// resolver will not answer, a port its policy denies -- and a refusal is
+    /// only news once it is clear which refusal it is and whether the lab
+    /// produced a kind production does not.
+    refusals: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Tally {
     fn bump(&self, counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn refused(&self, response: &common::Response) {
+        let reason = response
+            .fields
+            .get("proxy-status")
+            .and_then(volto::h3api::FieldValue::to_str)
+            .unwrap_or("no Proxy-Status")
+            .to_owned();
+
+        *self
+            .refusals
+            .lock()
+            .expect("refusal lock")
+            .entry(format!("{} {reason}", response.status))
+            .or_default() += 1;
     }
 }
 
@@ -508,6 +554,7 @@ async fn run_tunnel(
 
     if response.status != Status::OK {
         tally.bump(&tally.tunnels_refused);
+        tally.refused(&response);
         return;
     }
     tally.bump(&tally.tunnels_opened);
@@ -656,8 +703,16 @@ async fn run_connection(
         let stream = match client.send.send_request(request).await {
             Ok(stream) => stream,
             // The connection is gone -- aborted by a burst, or closed under us.
+            // Everything this connection had left to do goes with it, which is
+            // counted rather than left as a gap between what was planned and
+            // what the server saw: a burst that lands on a connection carrying
+            // hundreds of tunnels takes all of them, and that is a real effect
+            // worth being able to see in the numbers.
             Err(_) => {
                 tally.bump(&tally.tunnels_failed);
+                tally
+                    .tunnels_skipped
+                    .fetch_add((plan.tunnels.len() - index - 1) as u64, Ordering::Relaxed);
                 break;
             }
         };
@@ -734,6 +789,25 @@ async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
     }
 }
 
+/// [`futures_join`] for the connection drivers, where a panic must not be lost.
+///
+/// A panic inside a spawned task is caught by tokio and left in the
+/// `JoinHandle`; awaiting it with `let _ =` swallows it, and the only trace is a
+/// message on stderr and a run that quietly did less than it planned. That is
+/// exactly the failure this harness must not have, because "did less than it
+/// planned" is indistinguishable from a finding. The tunnel bodies stay silent
+/// -- they are supposed to be torn down mid-flight -- but a driver that panicked
+/// takes the run down with it.
+async fn join_drivers(handles: Vec<tokio::task::JoinHandle<()>>) {
+    for handle in handles {
+        if let Err(error) = handle.await {
+            if let Ok(panic) = error.try_into_panic() {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------------------
 // Reading the lab's own log
 // --------------------------------------------------------------------------
@@ -749,8 +823,22 @@ struct LabLog {
     established: u64,
     closed: u64,
     by_reason: HashMap<String, u64>,
-    error_closes: Vec<String>,
+    /// Closes carrying H3_GENERAL_PROTOCOL_ERROR: the ones the plan injects.
     violations: u64,
+    /// Closes this server decided on: a protocol violation it detected, or the
+    /// authentication budget. The only kind that would be news.
+    server_decided: Vec<String>,
+    /// Closes the peer decided on with some code the plan never sends.
+    unexpected_peer_codes: Vec<String>,
+    /// Everything else the transport reported, counted by text.
+    ///
+    /// A stateless reset lands here, and one shows up every few hundred
+    /// connections: the replay opens a client endpoint per connection and lets
+    /// it go when the connection ends, so an ephemeral port comes back round to
+    /// a fresh endpoint that answers a straggling packet the way RFC 9000 §10.3
+    /// says an endpoint with no matching connection should. It is the harness's
+    /// churn, not the server's doing, so it is reported rather than asserted on.
+    transport_endings: BTreeMap<String, u64>,
     tunnels: u64,
     dropped_datagrams: u64,
     lost_packets: u64,
@@ -788,11 +876,16 @@ fn read_log(text: &str) -> LabLog {
                 .nth(1)
                 .map(|rest| rest.split(" rtt_ms=").next().unwrap_or(rest).to_owned())
                 .unwrap_or_default();
-            if error.contains("H3_GENERAL_PROTOCOL_ERROR") || error.contains("protocol compliance")
-            {
+            // Which end decided this, and on what. The three cases are kept
+            // apart because only the first is ever the server's fault.
+            if error.contains("H3_GENERAL_PROTOCOL_ERROR") {
                 log.violations += 1;
+            } else if error.starts_with("closed by this server:") {
+                log.server_decided.push(error);
+            } else if error.starts_with("ApplicationClose:") {
+                log.unexpected_peer_codes.push(error);
             } else {
-                log.error_closes.push(error);
+                *log.transport_endings.entry(error).or_default() += 1;
             }
         } else if line.contains("connection closed") {
             log.closed += 1;
@@ -841,6 +934,9 @@ async fn production_shapes_are_replayed() {
         production_idle_seconds: 30,
         max_transfer: settings.max_transfer,
         max_tunnels: settings.max_tunnels,
+        // Three quarters of the idle timeout: far enough under it that a gap
+        // planned to the millisecond cannot become a timeout in practice.
+        max_gap_ms: (settings.idle_seconds * 1000) * 3 / 4,
     };
     let plan = shape::plan(&profile, scaling, settings.seed);
 
@@ -867,6 +963,8 @@ async fn production_shapes_are_replayed() {
          capped tunnel counts  {}\n\
          capped transfers      {}\n\
          collapsed spacings    {}\n\
+         shortened gaps        {}  (a silence the lab idle timer would have ended)\n\
+         shortened tails       {}  (the same, after a connection's last tunnel)\n\
          tunnels past window   {}\n",
         settings.profile,
         settings.seed,
@@ -888,6 +986,8 @@ async fn production_shapes_are_replayed() {
         plan.compromises.tunnel_counts_capped,
         plan.compromises.transfers_capped,
         plan.compromises.spacings_collapsed,
+        plan.compromises.gaps_shortened,
+        plan.compromises.active_windows_shortened,
         plan.compromises.tunnels_past_window,
     );
 
@@ -913,7 +1013,7 @@ async fn production_shapes_are_replayed() {
 
     // Every driver returns once its connection has ended the way its plan said,
     // which for an idle ending is after the server's timer has had time to fire.
-    futures_join(drivers).await;
+    join_drivers(drivers).await;
 
     // Nothing is left driving; give the last closing lines time to be written,
     // then take the server down so anything still open is logged as drained.
@@ -934,9 +1034,9 @@ async fn production_shapes_are_replayed() {
          connections started   {} ({} handshakes failed)\n\
          endings driven        idle {}, peer_close {}, protocol_violation {}, outlive {}\n\
          burst aborts          {}\n\
-         tunnels requested     {}\n\
+         tunnels requested     {} ({} never asked for: the connection went first)\n\
          tunnels opened (200)  {}\n\
-         tunnels refused       {}\n\
+         tunnels refused       {} {:?}\n\
          tunnels failed        {}\n\
          transfers aborted     {}  (a restart burst tearing one down mid-flight)\n\
          transfers completed   {} ({} bytes echoed)\n\
@@ -952,8 +1052,10 @@ async fn production_shapes_are_replayed() {
         tally.ended_outlive.load(Ordering::Relaxed),
         tally.aborted_by_burst.load(Ordering::Relaxed),
         tally.tunnels_requested.load(Ordering::Relaxed),
+        tally.tunnels_skipped.load(Ordering::Relaxed),
         tally.tunnels_opened.load(Ordering::Relaxed),
         tally.tunnels_refused.load(Ordering::Relaxed),
+        tally.refusals.lock().expect("refusal lock"),
         tally.tunnels_failed.load(Ordering::Relaxed),
         tally.tunnels_aborted.load(Ordering::Relaxed),
         tally.tunnels_transferred.load(Ordering::Relaxed),
@@ -974,7 +1076,9 @@ async fn production_shapes_are_replayed() {
          closed                {}\n\
          close reasons         {:?}\n\
          protocol violations   {}  ({:.4} per 1000 connections, {:.4} per 1000 tunnels)\n\
-         other error closes    {} {:?}\n\
+         decided by the server {} {:?}\n\
+         unexpected peer codes {} {:?}\n\
+         transport endings     {:?}\n\
          tunnels reported      {}\n\
          dropped datagrams     {}\n\
          packets               {} sent, {} lost\n\
@@ -985,8 +1089,11 @@ async fn production_shapes_are_replayed() {
         summary.violations,
         1000.0 * summary.violations as f64 / summary.established.max(1) as f64,
         1000.0 * summary.violations as f64 / summary.tunnels.max(1) as f64,
-        summary.error_closes.len(),
-        summary.error_closes,
+        summary.server_decided.len(),
+        summary.server_decided,
+        summary.unexpected_peer_codes.len(),
+        summary.unexpected_peer_codes,
+        summary.transport_endings,
         summary.tunnels,
         summary.dropped_datagrams,
         summary.sent_packets,
@@ -994,13 +1101,26 @@ async fn production_shapes_are_replayed() {
         settings.log_path.display(),
     );
 
-    // The three assertions a replay is uniquely able to make. Everything above
-    // is a measurement and is printed rather than asserted; these are about the
+    // The assertions a replay is uniquely able to make. Everything above is a
+    // measurement and is printed rather than asserted; these are about the
     // server having done something wrong under a load nothing else produces.
+    //
+    // Which end decided a close is the whole distinction here. A close this
+    // server decided on -- a protocol violation it detected in the client, or
+    // the authentication budget -- is news, because this client commits neither
+    // offence. A close the *peer* decided on with a code the plan never sends
+    // would be the harness lying about what it drove. A transport ending is
+    // neither: see `LabLog::transport_endings`.
     assert_eq!(
-        summary.error_closes,
+        summary.server_decided,
         Vec::<String>::new(),
-        "the server ended connections with errors this run did not inject"
+        "the server decided to close connections, having found fault with a \
+         client that committed none"
+    );
+    assert_eq!(
+        summary.unexpected_peer_codes,
+        Vec::<String>::new(),
+        "a connection was closed with an application code this run never sends"
     );
     assert_eq!(
         summary.dropped_datagrams, 0,
