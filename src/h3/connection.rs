@@ -1690,6 +1690,45 @@ mod tests {
         );
     }
 
+    /// The same claim over a churn of sessions: the table returns to its
+    /// baseline every time, rather than to its baseline plus one.
+    ///
+    /// The single-session test above proves the entry goes; this proves the
+    /// table is *flat*, which is the property a server that runs for weeks
+    /// depends on and the one a single cycle cannot tell apart from a leak. A
+    /// live session is held throughout so the baseline is non-empty: a table
+    /// that grew by an entry per session would still be "back to one" after the
+    /// first cycle and only diverge after many, which is exactly the shape that
+    /// hides at N = 1.
+    #[tokio::test]
+    async fn the_routing_table_is_flat_across_a_churn_of_sessions() {
+        const CHURN: u64 = 512;
+
+        let shared = Arc::new(Shared::default());
+        let held = shared.register_datagrams(0).expect("a free id");
+
+        for id in 1..=CHURN {
+            let inbound = shared.register_datagrams(id).expect("a free id");
+            assert_eq!(
+                shared.lock().len(),
+                2,
+                "one held session and one live one, whatever id {id} we are on"
+            );
+            drop(inbound);
+            assert_eq!(
+                shared.lock().len(),
+                1,
+                "session {id} took its entry with it"
+            );
+        }
+
+        drop(held);
+        assert!(
+            shared.lock().is_empty(),
+            "nothing is left once the last session has gone"
+        );
+    }
+
     /// Both of the drops RFC 9297 §2.1 and RFC 9298 §5 call for, and the
     /// session surviving each of them.
     #[tokio::test]
