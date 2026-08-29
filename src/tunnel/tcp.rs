@@ -869,7 +869,13 @@ async fn torn_down(teardown_rx: &mut watch::Receiver<Teardown>) -> Teardown {
 ///
 /// RFC 9114 §4.4 requires authority-form (`host:port`), with IPv6 literals in
 /// brackets as per RFC 3986.
-fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
+///
+/// Public for the reason [`super::udp::parse_target`] is: the two are the same
+/// decision reached along the two routes a client can name a target by, what
+/// comes out of either is what gets dialled, and reaching one through a live
+/// tunnel costs a QUIC connection per input. `fuzz/fuzz_targets/authority.rs`
+/// holds both to the same invariants.
+pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
     if authority.contains('@') {
         return Err("userinfo is not allowed in a CONNECT authority");
     }

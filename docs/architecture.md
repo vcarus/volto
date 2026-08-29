@@ -583,9 +583,14 @@ client that writes its own Context ID prefix can send. The clients live in
 `tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python script),
 so `cargo test` neither sees nor needs them.
 
-The decoders that read untrusted bytes — the frame state machine, QPACK,
-Huffman, the capsule parser and the datagram codec — also have coverage-guided
-fuzz targets under `fuzz/`, run on demand on a nightly toolchain in a Linux
-container rather than in CI; `fuzz/README.md` has the invocation. The property
-tests in `tests/it_props.rs` and `tests/it_fuzz.rs` state the same kinds of
-invariants on stable Rust, so they are what CI runs on every push.
+Every hand-written parser that reads bytes a peer chose also has a
+coverage-guided fuzz target under `fuzz/`, run on demand on a nightly toolchain
+in a Linux container rather than in CI; `fuzz/README.md` maps each target to the
+parser it covers and has the invocation. Beside the five codecs — the frame
+state machine, QPACK, Huffman, the capsule parser and the datagram codec — that
+means the request validator that reaches RFC 9114 §4.1.2's malformed verdict,
+the two parsers that turn a client-named target into a host and a port, and the
+credentials field, which is the one attacker-shaped byte string read before
+anything has authenticated. The property tests in `tests/it_props.rs` and
+`tests/it_fuzz.rs` state the same kinds of invariants on stable Rust, so they
+are what CI runs on every push.

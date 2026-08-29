@@ -58,3 +58,24 @@ path = "fuzz_targets/datagram.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "request"
+path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authority"
+path = "fuzz_targets/authority.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth"
+path = "fuzz_targets/auth.rs"
+test = false
+doc = false
+bench = false
