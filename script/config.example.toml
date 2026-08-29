@@ -29,6 +29,7 @@ key = "/etc/volto/privkey.pem"
 # does) has its new requests fail for the whole drain, so this is also how long
 # each restart looks broken from the client. Raise it if in-flight transfers
 # matter more. Keep systemd's TimeoutStopSec above this value.
+# Range: 0..3600, where 0 closes every tunnel at once.
 # Default: 5
 #shutdown_grace = 5
 
@@ -122,6 +123,10 @@ users = [
 # Concurrent bidirectional streams one QUIC connection may open — one per tunnel.
 # quinn's own default of 100 runs out during ordinary browsing, since Surge
 # multiplexes every proxied TCP connection onto a single QUIC connection.
+# Raise it with care: a stream slot is reserved for every unit of the credit when
+# a connection is created, not when a stream is opened, so this is work every
+# handshake pays for — about 11 ms at 1024 and 7 seconds at a million.
+# Range: 1..65536
 # Default: 1024
 #max_streams_bidi = 1024
 

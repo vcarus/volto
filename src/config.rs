@@ -9,7 +9,7 @@
 //! cert   = "/etc/volto/fullchain.pem"
 //! key    = "/etc/volto/privkey.pem"
 //! alpn   = ["h3"]      # optional, this is the default
-//! shutdown_grace = 5   # seconds to let tunnels finish after SIGTERM
+//! shutdown_grace = 5   # seconds to let tunnels finish after SIGTERM, 0..3600
 //!
 //! [auth]
 //! users = [{ username = "user1", password = "..." }]
@@ -20,7 +20,7 @@
 //! max_connections      = 256
 //! connect_timeout      = 10    # seconds, 0 disables the budget
 //! ip_family_preference = "ipv4" # ipv4 | ipv6 | system
-//! max_streams_bidi     = 1024
+//! max_streams_bidi     = 1024  # 1..65536
 //! max_idle_timeout     = 60    # seconds
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
 //! initial_mtu          = 1200  # bytes, 1200..1452
@@ -231,6 +231,23 @@ const INITIAL_RTT_RANGE_MS: std::ops::RangeInclusive<u64> = 10..=10_000;
 /// The ceiling keeps every such sum far from the edge.
 const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
 
+/// Largest accepted `shutdown_grace`, in seconds.
+///
+/// The same number as [`MAX_IDLE_TIMEOUT_CEILING`] and half of the same
+/// reasoning — past an hour a wait stops describing anything anybody observes,
+/// and a drain that long has outlived any service manager's own patience
+/// (systemd's default `TimeoutStopSec` is 90 seconds).
+///
+/// The other half is this key's own, and it is the opposite of the timers'.
+/// A grace period that cannot be added to `Instant::now()` does not panic:
+/// `tokio::time::timeout` folds a duration it cannot add into a deadline in the
+/// far future instead, so an absurd `u64` of seconds fails quietly rather than
+/// loudly — it removes the bound `crate::quic`'s drain is built around, leaving
+/// the process waiting on connections that may never end until a `SIGKILL`
+/// arrives, which is precisely the ungraceful ending the grace period exists to
+/// avoid. Bounding the key is what keeps that state unreachable.
+const MAX_SHUTDOWN_GRACE: u64 = MAX_IDLE_TIMEOUT_CEILING;
+
 /// Default UDP socket receive buffer to request, in bytes.
 ///
 /// Not a size that arrives on its own. quinn never calls
@@ -422,6 +439,10 @@ pub struct Limits {
     /// [`IpFamilyPreference`] for why the default departs from the resolver's.
     pub ip_family_preference: IpFamilyPreference,
     /// Concurrent client-initiated bidirectional streams per QUIC connection.
+    ///
+    /// Between 1 and 65536. The ceiling is not a formality: the credit is
+    /// reserved slot by slot when a connection is created rather than when a
+    /// stream is opened, so it is work every handshake pays for.
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
     ///
@@ -529,10 +550,11 @@ pub struct Server {
     /// ALPN identifiers to advertise, in preference order.
     #[serde(default = "default_alpn")]
     pub alpn: Vec<String>,
-    /// Seconds to let existing tunnels finish after SIGTERM.
+    /// Seconds to let existing tunnels finish after SIGTERM, at most an hour.
     ///
     /// Zero closes everything at once. The wait ends early if all tunnels finish
-    /// sooner, so a generous value costs nothing in the common case.
+    /// sooner, so a generous value costs nothing in the common case — but it is
+    /// a bound rather than a wish, which is why it has a ceiling of its own.
     #[serde(default = "default_shutdown_grace")]
     pub shutdown_grace: u64,
 }
@@ -686,6 +708,15 @@ impl Config {
             }
         }
 
+        if self.server.shutdown_grace > MAX_SHUTDOWN_GRACE {
+            bail!(
+                "server.shutdown_grace = {} exceeds {MAX_SHUTDOWN_GRACE} seconds; \
+                 a drain that long outlives the service manager's own kill timeout, \
+                 and use 0 to close every tunnel at once instead",
+                self.server.shutdown_grace
+            );
+        }
+
         if self.limits.udp_session_timeout == 0
             || self.limits.udp_session_timeout > MAX_IDLE_TIMEOUT_CEILING
         {
@@ -719,6 +750,15 @@ impl Config {
                  ever be opened"
             );
         }
+        if self.limits.max_streams_bidi > MAX_STREAMS_BIDI_CEILING {
+            bail!(
+                "limits.max_streams_bidi = {} exceeds the {MAX_STREAMS_BIDI_CEILING} this \
+                 server allows; a stream slot is reserved for every unit of the credit when \
+                 a connection is created, so the value is paid at every handshake rather \
+                 than when a stream is opened",
+                self.limits.max_streams_bidi
+            );
+        }
 
         if self.limits.max_idle_timeout == 0
             || self.limits.max_idle_timeout > MAX_IDLE_TIMEOUT_CEILING
@@ -736,8 +776,19 @@ impl Config {
         // conntrack entry expires on its own schedule (30s by default), and only a
         // keep-alive that comfortably beats both timeouts keeps the NAT mapping
         // alive.
+        //
+        // Written as `interval >= ceil(idle / 2)` rather than the more obvious
+        // `interval * 2 >= idle`: the two reject exactly the same pairs of
+        // integers, and this one cannot overflow. The doubling could, and a
+        // `u64` large enough to make it — anything above `u64::MAX / 2` — is
+        // reachable straight from the file, since TOML integers deserialize
+        // across the whole target type's range. A debug build panicked inside
+        // this function; a release build wrapped the product to something small,
+        // accepted the interval, and handed it to quinn, where it becomes
+        // `Instant::now() + interval` the moment a connection is established and
+        // panics the connection driver instead (D86).
         if self.limits.keep_alive_interval > 0
-            && self.limits.keep_alive_interval * 2 >= self.limits.max_idle_timeout
+            && self.limits.keep_alive_interval >= self.limits.max_idle_timeout.div_ceil(2)
         {
             bail!(
                 "limits.keep_alive_interval = {} must be less than half of \
@@ -1003,6 +1054,23 @@ impl Config {
 /// Not a protocol limit — a sanity limit. A value beyond this cannot be backed by
 /// file descriptors on any realistic host, so it is more likely a typo.
 const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
+
+/// Upper bound on `limits.max_streams_bidi`.
+///
+/// The same number as [`MAX_TARGETS_PER_CONN_CEILING`], because one tunnel is
+/// one stream: credit past the ceiling on tunnels could not carry one anyway.
+///
+/// What makes it worth rejecting rather than tolerating is where the cost is
+/// paid. quinn does not allocate a stream when one is opened — `StreamsState`
+/// reserves a slot for every unit of the credit when the *connection* is
+/// created, so this value is spent at every handshake, by any peer, before a
+/// request has been seen. Measured on the dev host: a handshake takes about
+/// 11 ms at the default of 1024, 135 ms at this ceiling, 7.3 s at a million,
+/// and does not finish inside ten seconds at four million — where `u32::MAX`,
+/// which a config file can hold, is a further thousandfold. A typo here leaves
+/// a server that still answers `systemctl status` and no client at all, which
+/// is the same failure `MAX_INITIAL_MTU` is written against.
+const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 
 /// Renders a TOML parse failure without the source line it points at.
 ///
@@ -1790,6 +1858,27 @@ mod tests {
         }
     }
 
+    /// The ratio check must survive the interval it is checking (D86).
+    ///
+    /// TOML integers deserialize across the whole of the target type, so every
+    /// `u64` here is something an operator can write in the file, `u64::MAX`
+    /// included. The check used to double the interval before comparing it,
+    /// which above `u64::MAX / 2` has no answer to give: a debug build panicked
+    /// inside `validate` — a validator that aborts the process instead of
+    /// returning `Err` — and a release build wrapped the product to a small
+    /// number, accepted the interval and passed it to quinn, where the first
+    /// established connection turns it into `Instant::now() + interval` and
+    /// panics the connection driver instead.
+    #[test]
+    fn an_overflowing_keep_alive_interval_is_rejected_rather_than_panicking() {
+        for keepalive in [u64::MAX, u64::MAX - 1, u64::MAX / 2 + 1, 1u64 << 63] {
+            let err = parse(&format!("[limits]\nkeep_alive_interval = {keepalive}"))
+                .validate()
+                .expect_err("an interval past half the idle timeout must be rejected");
+            assert!(err.to_string().contains("keep_alive_interval"), "{err}");
+        }
+    }
+
     /// Zero disables keep-alives rather than failing the ratio check — but it is
     /// warned about, because behind a relay it is how idle connections die.
     #[test]
@@ -1961,6 +2050,29 @@ mod tests {
         assert!(err.to_string().contains("max_idle_timeout"), "{err}");
     }
 
+    /// The stream credit is work per handshake, so it has a ceiling (D86).
+    ///
+    /// quinn reserves a slot for every unit of it when a connection is created,
+    /// not when a stream is opened, so an operator writing a large number here
+    /// is not raising a limit but adding work to every handshake: measured on
+    /// the dev host, about 11 ms at the default 1024, 135 ms at the ceiling,
+    /// 7.3 s at a million, and no completed handshake within ten seconds at
+    /// four million. `u32::MAX` is a config file away from any of those.
+    #[test]
+    fn a_stream_limit_past_the_ceiling_is_rejected() {
+        for streams in [u32::MAX, MAX_STREAMS_BIDI_CEILING + 1] {
+            let err = parse(&format!("[limits]\nmax_streams_bidi = {streams}"))
+                .validate()
+                .expect_err("a stream limit past the ceiling must be rejected");
+            assert!(err.to_string().contains("max_streams_bidi"), "{err}");
+        }
+
+        let cfg = parse(&format!(
+            "[limits]\nmax_streams_bidi = {MAX_STREAMS_BIDI_CEILING}"
+        ));
+        assert_valid_apart_from_certs(&cfg, "a stream limit of exactly the ceiling");
+    }
+
     /// The two application timers share the transport timeout's ceiling: both
     /// are added to `Instant::now()` to make deadlines, so an unbounded `u64`
     /// of seconds would panic that arithmetic instead of meaning anything.
@@ -1997,6 +2109,44 @@ mod tests {
              connect_timeout = {MAX_IDLE_TIMEOUT_CEILING}"
         ));
         assert_valid_apart_from_certs(&cfg, "both timers at exactly the ceiling");
+    }
+
+    /// The drain period is a bound, so it has to stay one (D86).
+    ///
+    /// Unlike the timers above, an absurd grace period does not panic anything:
+    /// `tokio::time::timeout` folds a duration it cannot add to `Instant::now()`
+    /// into a deadline in the far future, so `u64::MAX` seconds was accepted and
+    /// silently removed the bound `crate::quic`'s drain is built around — a
+    /// `SIGTERM` would then wait on connections that may never end until the
+    /// service manager's `SIGKILL` arrived, which is the ungraceful ending the
+    /// grace period exists to avoid.
+    #[test]
+    fn an_unbounded_shutdown_grace_is_rejected() {
+        for grace in [u64::MAX, MAX_SHUTDOWN_GRACE + 1] {
+            let err = toml::from_str::<Config>(&format!(
+                "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"/tmp/c.pem\"\n\
+                 key = \"/tmp/k.pem\"\nshutdown_grace = {grace}\n"
+            ))
+            .expect("parses")
+            .validate()
+            .expect_err("a grace period past the ceiling must be rejected");
+            assert!(err.to_string().contains("shutdown_grace"), "{err}");
+        }
+
+        // Both ends of the accepted range stay accepted: zero closes everything
+        // at once, and the ceiling itself is a legal drain.
+        for grace in [0, MAX_SHUTDOWN_GRACE] {
+            let cfg: Config = toml::from_str(&format!(
+                "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"/tmp/c.pem\"\n\
+                 key = \"/tmp/k.pem\"\nshutdown_grace = {grace}\n"
+            ))
+            .expect("parses");
+            assert_valid_apart_from_certs(&cfg, &format!("shutdown_grace = {grace}"));
+            assert_eq!(
+                cfg.server.shutdown_grace(),
+                std::time::Duration::from_secs(grace)
+            );
+        }
     }
 
     #[test]

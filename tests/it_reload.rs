@@ -250,6 +250,30 @@ async fn a_broken_configuration_changes_nothing() {
                 server.dir().join("key.pem").display()
             ),
         ),
+        // Valid TOML whose integers are out of range. TOML deserializes across
+        // the whole of the target type, so `u64::MAX` is something a typo can
+        // put in the file, and validation used to have no answer for either of
+        // these: the keep-alive check panicked on the arithmetic it did (which
+        // on this path is a panic *while a server is running*), and the grace
+        // period was accepted and quietly stopped bounding the drain (D86).
+        (
+            "keep-alive past what its own check could double",
+            format!(
+                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
+                 [limits]\nkeep_alive_interval = 18446744073709551615\n",
+                server.dir().join("cert.pem").display(),
+                server.dir().join("key.pem").display()
+            ),
+        ),
+        (
+            "unbounded shutdown grace",
+            format!(
+                "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n\
+                 shutdown_grace = 18446744073709551615\n",
+                server.dir().join("cert.pem").display(),
+                server.dir().join("key.pem").display()
+            ),
+        ),
         // Valid and internally consistent, but the certificate is missing.
         (
             "missing certificate",

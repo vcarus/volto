@@ -372,7 +372,9 @@ grace period trades a longer outage for every new request against finishing the
 transfers already in flight. Raise it if long transfers matter more to you than
 a few seconds of failed requests at each restart. Keep systemd's
 `TimeoutStopSec` comfortably above whatever you choose — the shipped unit uses
-45 — so systemd does not send SIGKILL mid-drain.
+45 — so systemd does not send SIGKILL mid-drain. An hour is the most that can
+be configured: the grace period is the bound the drain is built around, and a
+value past that would only hand the ending back to `SIGKILL`.
 
 ## Running behind a UDP relay
 
