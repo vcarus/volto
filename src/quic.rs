@@ -372,6 +372,14 @@ pub struct Server {
     /// The connections being served, in accept order, and what the accept loop
     /// decides `max_connections` against; see [`Roster`].
     roster: Roster,
+    /// The blocking-pool allowance every connection's name lookups draw on.
+    ///
+    /// Server-wide because the pool is: what one connection may hold at once is
+    /// bounded here so that a client whose targets never resolve cannot park
+    /// every thread the process has and starve the rest (D90). Built at bind
+    /// time and never reloaded -- it is sized against the runtime the process
+    /// was started with, which a `SIGHUP` cannot resize.
+    resolver: crate::net::ResolverBudget,
     /// Fires the graceful shutdown. Handed to whoever watches for signals.
     trigger: Trigger,
     /// The other end of the same latch, cloned into every connection.
@@ -416,6 +424,7 @@ impl Server {
             socket_buffers,
             config: Arc::new(RwLock::new(config)),
             roster: Roster::new(),
+            resolver: crate::net::ResolverBudget::new(),
             trigger,
             shutdown,
         })
@@ -723,6 +732,7 @@ impl Server {
         // would mean a tunnel's rules changing under it mid-transfer.
         let config = self.config();
         let shutdown = self.shutdown.clone();
+        let resolver = self.resolver.clone();
         let remote = incoming.remote_address();
 
         let handshake_deadline = config.limits.max_idle_timeout();
@@ -865,7 +875,7 @@ impl Server {
                 // connection failed.
                 () = evicted.notified() => Ok("evicted"),
 
-                handled = conn::handle(quic, config, shutdown, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
+                handled = conn::handle(quic, config, shutdown, &resolver, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
                     match handled {
                         // The accept loop ended on its own terms: the peer said it would
                         // send no further requests, or the GOAWAY drain completed.

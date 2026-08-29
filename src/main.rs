@@ -24,13 +24,31 @@ struct Cli {
     config: PathBuf,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Loaded and validated before logging exists, so configuration errors are
-    // reported by returning them from main.
+    // reported by returning them from main -- and before the runtime exists,
+    // which is what the hand-built runtime below needs: the blocking pool is
+    // sized from `max_connections` rather than left at tokio's 512, so that
+    // every connection's reserved name-lookup slot has a thread to run on
+    // (D90). `#[tokio::main]` cannot express that, which is the only reason it
+    // is gone.
     let config = Config::load(&cli.config)?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(volto::net::blocking_pool_size(
+            config.limits.max_connections,
+        ))
+        .build()
+        .context("failed to build the async runtime")?;
+
+    runtime.block_on(run(cli, config))
+}
+
+/// Everything that needs a runtime, which is everything after the configuration.
+async fn run(cli: Cli, config: Config) -> Result<()> {
     init_tracing(&config.log.level)?;
 
     // Only now that a subscriber exists: settings that are legal but risky —

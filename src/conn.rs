@@ -66,6 +66,10 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 /// (review C1'). Nothing legitimate is near it: a client that has just
 /// completed two handshakes sends its first request within a round trip.
 ///
+/// `resolver` is the server's blocking-pool allowance; the connection takes its
+/// own view of it here, which is what bounds the threads its name lookups can
+/// hold (D90).
+///
 /// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
 /// reason `tunnels` does: the accept loop reads it after this has been handed
 /// the connection, to decide which connection loses its slot when the server is
@@ -76,6 +80,7 @@ pub async fn handle(
     quic: quinn::Connection,
     config: Arc<Config>,
     mut shutdown: Shutdown,
+    resolver: &crate::net::ResolverBudget,
     tunnels: Arc<AtomicU64>,
     dropped_datagrams: Arc<AtomicU64>,
     authenticated: Arc<AtomicBool>,
@@ -101,6 +106,7 @@ pub async fn handle(
         &config,
         datagrams,
         connection.peer_datagrams(),
+        resolver,
         tunnels,
         authenticated,
     );

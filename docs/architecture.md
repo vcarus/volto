@@ -144,6 +144,39 @@ all — connecting a UDP socket only asks the kernel for a route, so the first
 address with one wins outright. The reorder is a stable partition, leaving
 RFC 6724's ordering within each family intact; `system` opts out of it entirely.
 
+### The name lookup budget
+
+Name resolution is the one place in this server where a request reaches a
+resource it cannot give back on demand. `tokio::net::lookup_host` runs
+`getaddrinfo` on the runtime's blocking thread pool, and that call cannot be
+cancelled: when `limits.connect_timeout` expires the client is answered, but the
+thread stays in the resolver until the stub gives up on its own — five seconds
+per attempt on a stock `resolv.conf`, tens of seconds when the nameserver
+answers nothing at all. The pool is process-wide, so without a bound one
+client's black-holed names park threads that every other connection's lookups
+need, including names that would have resolved from `/etc/hosts` without a query.
+
+So the pool is rationed in two tiers, in `net.rs`:
+
+- **One reserved lookup slot per connection**, which nothing else can take. No
+  number of hostile connections can starve a connection outright; at worst its
+  lookups run one at a time.
+- **A server-wide allowance on top of that**, capped per connection, so ordinary
+  use resolves a page's worth of tunnels in parallel while no single connection
+  can hold more than its share.
+
+The permit is dropped by the blocking task rather than by the request that asked
+for it — a permit released when the client is answered would say a thread is
+free while it is still inside the resolver, which is exactly how a client could
+park the pool one `connect_timeout` at a time. An IP literal never reaches the
+resolver and never takes a permit.
+
+The blocking pool is sized from `limits.max_connections` at startup for the same
+reason: it has a thread for every slot the budget can hand out, plus headroom.
+Threads are created on demand and reaped when idle, so this is a ceiling rather
+than an allocation. Because it is fixed when the process starts, a `SIGHUP` that
+raises `max_connections` does not resize it.
+
 ### TCP tunnels
 
 `tunnel/tcp.rs` resolves `:authority` explicitly — not implicitly through

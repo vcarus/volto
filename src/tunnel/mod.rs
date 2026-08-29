@@ -229,6 +229,14 @@ pub struct Context {
     /// the whole list of addresses it resolved to — so the worst case a tunnel
     /// slot is held before any byte flows is twice this.
     pub connect_timeout: Option<Duration>,
+    /// This connection's share of the blocking pool, spent on name resolution.
+    ///
+    /// Per connection rather than per request, because what it bounds is a
+    /// connection: one reserved lookup slot nobody can take away plus a capped
+    /// draw on the server-wide allowance, so a client whose targets never
+    /// resolve can neither park the whole pool nor stop anyone else's names
+    /// from resolving (D90).
+    pub resolver: crate::net::ConnectionResolver,
     /// Which address family a resolved target is tried on first.
     ///
     /// Snapshotted with the rest of the connection's `[limits]`, so a reload
@@ -251,6 +259,7 @@ impl Context {
         config: &Config,
         datagrams: quinn::Connection,
         peer_datagrams: Arc<AtomicBool>,
+        resolver: &crate::net::ResolverBudget,
         tunnels: Arc<AtomicU64>,
         authenticated: Arc<AtomicBool>,
     ) -> Self {
@@ -267,6 +276,7 @@ impl Context {
             tunnels,
             idle_timeout: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
+            resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
         }
@@ -562,10 +572,11 @@ impl std::fmt::Display for ResolveFailure {
 pub(crate) async fn resolve_within(
     host: &str,
     port: u16,
+    resolver: &crate::net::ConnectionResolver,
     budget: Option<Duration>,
     family: IpFamilyPreference,
 ) -> Result<Vec<std::net::SocketAddr>, ResolveFailure> {
-    let mut addresses = within_budget(crate::net::resolve(host, port), budget).await?;
+    let mut addresses = within_budget(resolver.lookup(host, port), budget).await?;
     crate::net::prefer_family(&mut addresses, family);
     Ok(addresses)
 }
@@ -652,7 +663,14 @@ pub(crate) async fn admit_target(
         return None;
     }
 
-    let resolved = resolve_within(host, port, ctx.connect_timeout, ctx.ip_family_preference).await;
+    let resolved = resolve_within(
+        host,
+        port,
+        &ctx.resolver,
+        ctx.connect_timeout,
+        ctx.ip_family_preference,
+    )
+    .await;
     let addresses = match resolved {
         Ok(addresses) => addresses,
         Err(failure) => {
@@ -1182,6 +1200,7 @@ mod tests {
             &config,
             loopback_connection().await,
             Arc::new(AtomicBool::new(false)),
+            &crate::net::ResolverBudget::new(),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
         )

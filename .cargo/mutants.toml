@@ -77,6 +77,11 @@ exclude_re = [
     'replace Stream::finish -> Result',
     'replace Writer::finish -> Result',
 
+    # D90: `max_connections as usize > RESERVED_LOOKUP_CEILING` -> `>=`. The two
+    # branches agree at the boundary -- at exactly the ceiling both give the
+    # ceiling -- so the mutant is equivalent, not uncovered.
+    'replace > with >= in blocking_pool_size',
+
     # Surfacing an empty DATA frame as Some(empty) is absorbed by both
     # callers (a zero-byte relay write and a zero-byte decoder push), so the
     # skip is an API nicety no black-box test can see; the true-direction

@@ -106,6 +106,21 @@ request stream while its target is still being dialled does not cancel the dial,
 so with the budget off the slot stays spent until the kernel gives up. volto
 warns at startup when the budget is off.
 
+**`connect_timeout` bounds the answer, not the resolver.** A lookup that runs
+out of budget is answered 504 immediately, but the `getaddrinfo` call behind it
+cannot be cancelled and keeps its thread until the system resolver gives up. The
+server bounds that separately: every connection has a name-lookup slot reserved
+for it that nothing else can take, plus a capped share of a server-wide
+allowance, so a client aiming at names that never resolve cannot stop anyone
+else's names from resolving. Nothing is configurable there, and nothing changes
+on the wire — the refusals are the same 504 `dns_timeout` they always were.
+
+**`max_connections` also sizes the blocking thread pool, at startup only.** The
+pool is given a thread for every reserved lookup slot the budget can hand out,
+plus the shared allowance and headroom; threads are created on demand and reaped
+when idle. A reload that raises `max_connections` takes effect for new
+connections but does not resize the pool, which needs a restart.
+
 **`max_streams_bidi`, `max_idle_timeout`, `keep_alive_interval`, `initial_mtu`,
 `mtu_discovery`, `congestion_control` and `initial_rtt_ms` are QUIC transport
 settings and apply to new connections only.** A reload carries them to

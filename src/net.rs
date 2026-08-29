@@ -10,8 +10,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::IpFamilyPreference;
 
@@ -49,10 +51,52 @@ pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreferenc
 /// as well would mean accepting a host neither of those produced, and answering
 /// `example.com]:443` by dialling `example.com`.
 pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
-    let addresses: Vec<SocketAddr> = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
-    } else {
-        tokio::net::lookup_host((host, port)).await?.collect()
+    match literal(host, port) {
+        Some(address) => Ok(vec![address]),
+        None => on_the_blocking_pool(host, port, None).await,
+    }
+}
+
+/// `host` read as an IP address, which resolves to itself.
+fn literal(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, port))
+}
+
+/// Asks the system resolver about `host`, holding `slot` until it answers.
+///
+/// The blocking task is spawned here rather than left to
+/// `tokio::net::lookup_host`, which spawns exactly this, for one reason: the
+/// permit has to be dropped by the *thread*, not by the future. A
+/// `connect_timeout` that expires drops the caller, and `getaddrinfo` is not
+/// cancellable -- the thread stays in the resolver until the stub gives up. A
+/// permit released at that moment would say a slot is free while the thread it
+/// stands for is still gone, which is the accounting that lets a client park
+/// the pool one `connect_timeout` at a time (D90).
+///
+/// `None` is the unbudgeted path: [`resolve`] itself, and the tests.
+async fn on_the_blocking_pool(
+    host: &str,
+    port: u16,
+    slot: Option<LookupSlot>,
+) -> io::Result<Vec<SocketAddr>> {
+    let owned = host.to_owned();
+    let resolved = tokio::task::spawn_blocking(move || {
+        let addresses = std::net::ToSocketAddrs::to_socket_addrs(&(owned.as_str(), port));
+        // Explicit, and last: the slot is what the thread is holding, so it is
+        // given back where the thread finishes rather than where the caller
+        // does.
+        drop(slot);
+        addresses
+    })
+    .await;
+
+    let addresses: Vec<SocketAddr> = match resolved {
+        Ok(addresses) => addresses?.collect(),
+        // The runtime is shutting down, or the resolver call panicked. Neither
+        // is an answer about the name.
+        Err(error) => return Err(io::Error::other(error)),
     };
 
     if addresses.is_empty() {
@@ -63,6 +107,214 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     }
 
     Ok(addresses)
+}
+
+/// Name lookups the whole process may have in flight beyond the one every
+/// connection keeps in reserve.
+///
+/// The number this bounds is threads, not queries: `tokio::net::lookup_host`
+/// hands a name to `getaddrinfo` on the runtime's *blocking* pool, and that call
+/// is not cancellable. A `connect_timeout` that expires drops the future and
+/// answers the client, but the thread stays in the resolver until the stub gives
+/// up on its own — five seconds per attempt on a stock `resolv.conf`, tens of
+/// seconds where the nameserver answers nothing at all. So an unbounded proxy
+/// converts one client's black-holed names directly into parked threads, and the
+/// pool is process-wide: with the default `max_connections` x
+/// `max_targets_per_conn` at 65 536 in-flight requests against tokio's 512
+/// threads, two connections' worth of hung lookups leave every *other*
+/// connection's resolution waiting for a thread, including names that never
+/// needed the resolver at all (D90).
+pub const SHARED_LOOKUPS: usize = 128;
+
+/// Lookups one connection may take from [`SHARED_LOOKUPS`] at once.
+///
+/// The reserved slot below is what guarantees progress; this is what keeps the
+/// guarantee worth having. A connection opening a page's worth of tunnels wants
+/// its lookups to run at once, so the figure is well clear of a browser's
+/// per-page domain count, and four connections at it exhaust the shared
+/// allowance -- which is the point at which everyone else falls back on their
+/// reserved slot rather than on nothing.
+pub const BURST_LOOKUPS: usize = 32;
+
+/// Blocking threads the pool keeps clear of name resolution.
+///
+/// Nothing else in this process uses the blocking pool today. The headroom is
+/// for the day something does -- and so that the arithmetic below never has to
+/// be exact.
+pub const LOOKUP_FREE_THREADS: usize = 64;
+
+/// Connections the blocking pool is sized to reserve a lookup slot for.
+///
+/// `max_connections` is an operator's number and may be raised without limit (or
+/// switched off entirely, which is what `0` means), while a thread is a real
+/// resource. Past this ceiling the reservation is best-effort: connections still
+/// get their slot, the pool just no longer has a thread standing by for every
+/// one of them at the same instant.
+pub const RESERVED_LOOKUP_CEILING: usize = 1024;
+
+/// The blocking pool the runtime is built with, in threads.
+///
+/// Sized from the configuration rather than left at tokio's 512 so that the two
+/// numbers that matter are related on purpose: every connection's reserved
+/// lookup slot has a thread to run on, the shared allowance has its own, and
+/// [`LOOKUP_FREE_THREADS`] are left over. Threads are created on demand and
+/// reaped when idle, so this is a ceiling and not an allocation -- a server with
+/// three clients holds three of them.
+///
+/// Startup-only: a `SIGHUP` that raises `max_connections` does not resize the
+/// pool, so the reservation for the connections it adds is best-effort in the
+/// same way [`RESERVED_LOOKUP_CEILING`] describes.
+pub const fn blocking_pool_size(max_connections: u32) -> usize {
+    // `0` is "uncapped", so there is nothing to size against and the ceiling is
+    // the answer. Written out rather than as `min` because a `const fn` may not
+    // call `Ord::min`, and this is a constant in the tests that check it.
+    let reserved = if max_connections == 0 || max_connections as usize > RESERVED_LOOKUP_CEILING {
+        RESERVED_LOOKUP_CEILING
+    } else {
+        max_connections as usize
+    };
+
+    reserved + SHARED_LOOKUPS + LOOKUP_FREE_THREADS
+}
+
+/// The server's share of the blocking pool, handed out one connection at a time.
+///
+/// Cloned into every connection, which is the whole design: what one connection
+/// can take away from the others is bounded, and what it keeps for itself is
+/// not takeable at all. See [`ConnectionResolver`].
+#[derive(Clone, Debug)]
+pub struct ResolverBudget {
+    shared: Arc<Semaphore>,
+}
+
+impl ResolverBudget {
+    /// The budget for one server.
+    pub fn new() -> Self {
+        Self {
+            shared: Arc::new(Semaphore::new(SHARED_LOOKUPS)),
+        }
+    }
+
+    /// One connection's view of it.
+    pub fn per_connection(&self) -> ConnectionResolver {
+        ConnectionResolver {
+            slots: Arc::new(ConnectionSlots {
+                reserved: Arc::new(Semaphore::new(1)),
+                burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
+                shared: self.shared.clone(),
+            }),
+        }
+    }
+}
+
+impl Default for ResolverBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What one connection may ask the resolver to do at once.
+///
+/// Two tiers, because a single shared pool answers only one of the two questions
+/// worth asking:
+///
+/// * **One reserved slot**, held by this connection alone and by nothing else.
+///   No number of hostile connections can take it away, so a connection is never
+///   starved outright -- at worst its lookups run one at a time. This is the
+///   guarantee; the shared allowance is only ever an optimisation on top of it.
+/// * **[`BURST_LOOKUPS`] from the shared allowance**, so ordinary use --
+///   a client opening thirty tunnels at once -- still resolves them in parallel,
+///   while one connection can never hold more than its share of the pool.
+///
+/// The waiting itself is inside the caller's `connect_timeout`, so a lookup that
+/// cannot get a slot in time is refused exactly as a resolver that did not
+/// answer in time is, with the same 504 and the same `Proxy-Status` (D90).
+/// Cloned with [`crate::tunnel::Context`], and every clone counts against the
+/// same slots: a clone that started its own count would be no bound at all.
+#[derive(Clone, Debug)]
+pub struct ConnectionResolver {
+    slots: Arc<ConnectionSlots>,
+}
+
+/// What one connection's clones share.
+#[derive(Debug)]
+struct ConnectionSlots {
+    /// This connection's own slot. One permit, never shared.
+    reserved: Arc<Semaphore>,
+    /// How much of the shared allowance this connection may hold at once.
+    burst: Arc<Semaphore>,
+    /// The server-wide allowance, from [`ResolverBudget`].
+    shared: Arc<Semaphore>,
+}
+
+impl ConnectionResolver {
+    /// [`resolve`], with a slot in the blocking pool taken for the length of it.
+    ///
+    /// An IP literal never reaches the resolver and so never occupies a thread:
+    /// it is answered without taking a slot at all, which keeps the budget
+    /// spent on the only thing that can block.
+    pub async fn lookup(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        if let Some(address) = literal(host, port) {
+            return Ok(vec![address]);
+        }
+
+        let slot = self.acquire().await;
+        on_the_blocking_pool(host, port, Some(slot)).await
+    }
+
+    /// Takes this connection's reserved slot if it is free, and queues for the
+    /// shared allowance if it is not.
+    ///
+    /// The order of the two waits below is not interchangeable: the per-
+    /// connection permit is taken *first*, so a connection already at
+    /// [`BURST_LOOKUPS`] queues on its own limit rather than on the server's,
+    /// and never sits in the shared queue holding a permit it is not using.
+    async fn acquire(&self) -> LookupSlot {
+        if let Ok(reserved) = self.slots.reserved.clone().try_acquire_owned() {
+            return LookupSlot::Reserved { _slot: reserved };
+        }
+
+        // Neither semaphore is ever closed, and a closed one is the only error
+        // `acquire` has.
+        let burst = self
+            .slots
+            .burst
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the budget is never closed");
+        let shared = self
+            .slots
+            .shared
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the budget is never closed");
+
+        LookupSlot::Shared {
+            _burst: burst,
+            _shared: shared,
+        }
+    }
+}
+
+/// A lookup's claim on the blocking pool, released when it is dropped.
+///
+/// Owned rather than borrowed because of where it is dropped: it travels into
+/// the blocking task and is released there, outliving the future that asked for
+/// it whenever a `connect_timeout` expires first. See [`on_the_blocking_pool`].
+#[derive(Debug)]
+enum LookupSlot {
+    /// The connection's own slot.
+    ///
+    /// Named with a leading underscore because it is never read: a permit is
+    /// held, not consulted, and releasing it is what dropping this does.
+    Reserved { _slot: OwnedSemaphorePermit },
+    /// One of the connection's burst permits, and the shared one it stands for.
+    Shared {
+        _burst: OwnedSemaphorePermit,
+        _shared: OwnedSemaphorePermit,
+    },
 }
 
 /// The process's soft limit on open file descriptors.
@@ -171,6 +423,165 @@ fn set_dont_fragment(_socket: &UdpSocket) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The resolver budget, tested as the thing it is: an accounting rule.
+    ///
+    /// Nothing here resolves a name. What the rule has to survive is a
+    /// connection that never gives its slots back, and that is a resolver no
+    /// test can conjure on demand — a real one always answers eventually. So
+    /// the permits are held directly and the questions asked of them are the
+    /// two the design makes: can one connection take everything, and is a
+    /// connection that arrives after it has tried still able to resolve
+    /// anything at all. The end-to-end version, with an injected resolver that
+    /// really does hang, is `tests/it_resolver_pool.rs` (D90).
+    mod resolver_budget {
+        use super::*;
+
+        use std::future::Future;
+        use std::task::{Context as TaskContext, Poll};
+
+        /// The value `future` has *without waiting*, or `None` if it would wait.
+        ///
+        /// One poll is the whole question here: an acquire is either satisfied
+        /// from a permit that is free right now or it parks itself in the
+        /// semaphore's queue, and those are exactly the two answers the
+        /// assertions below are about. Dropping the future on `None` releases
+        /// whatever it took on the way, which is what makes a would-wait probe
+        /// safe to repeat.
+        fn ready<F: Future>(future: F) -> Option<F::Output> {
+            let mut future = Box::pin(future);
+            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(value) => Some(value),
+                Poll::Pending => None,
+            }
+        }
+
+        /// Holds `count` lookup slots on `resolver`, asserting it could.
+        fn hold(resolver: &ConnectionResolver, count: usize) -> Vec<LookupSlot> {
+            (0..count)
+                .map(|held| {
+                    ready(resolver.acquire())
+                        .unwrap_or_else(|| panic!("slot {held} of {count} was refused"))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_connection_may_hold_its_reserved_slot_plus_a_burst() {
+            let budget = ResolverBudget::new();
+            let resolver = budget.per_connection();
+
+            let held = hold(&resolver, BURST_LOOKUPS + 1);
+
+            assert!(
+                ready(resolver.acquire()).is_none(),
+                "a connection took more than its reserved slot and {BURST_LOOKUPS} burst"
+            );
+            drop(held);
+        }
+
+        /// The guarantee: no number of hostile connections can starve a new one.
+        ///
+        /// The shared allowance is drained by connections that never let go,
+        /// which is what a client aiming at black-holed names does to the
+        /// blocking pool. A connection arriving after that still resolves —
+        /// serially, on the slot that was never theirs to take.
+        #[test]
+        fn a_new_connection_still_has_a_slot_when_the_shared_allowance_is_gone() {
+            let budget = ResolverBudget::new();
+
+            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
+                .map(|_| budget.per_connection())
+                .collect();
+            let _held: Vec<_> = hostile
+                .iter()
+                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
+                .collect();
+
+            assert_eq!(
+                budget.shared.available_permits(),
+                0,
+                "the shared allowance was not actually exhausted"
+            );
+
+            let victim = budget.per_connection();
+            let slot = ready(victim.acquire());
+            assert!(slot.is_some(), "a fresh connection was left with no slot");
+
+            // And exactly one: the guarantee is progress, not parallelism.
+            assert!(
+                ready(victim.acquire()).is_none(),
+                "the reserved slot was not the only thing left"
+            );
+        }
+
+        #[test]
+        fn a_finished_lookup_gives_its_slot_back() {
+            let budget = ResolverBudget::new();
+            let resolver = budget.per_connection();
+
+            let held = hold(&resolver, BURST_LOOKUPS + 1);
+            let shared_before = budget.shared.available_permits();
+            drop(held);
+
+            assert_eq!(
+                budget.shared.available_permits(),
+                shared_before + BURST_LOOKUPS,
+                "the shared allowance did not come back"
+            );
+            assert!(
+                ready(resolver.acquire()).is_some(),
+                "the connection could not resolve again after its lookups finished"
+            );
+        }
+
+        /// An IP literal costs nothing, because it blocks nothing.
+        ///
+        /// Asserted without a runtime at all: `lookup_host` would reach the
+        /// blocking pool, and reaching it from here panics. So a literal
+        /// answered by a single poll is a literal that never went near a
+        /// thread — with every slot this connection has already held.
+        #[test]
+        fn an_ip_literal_needs_no_slot() {
+            let budget = ResolverBudget::new();
+            let resolver = budget.per_connection();
+            let _held = hold(&resolver, BURST_LOOKUPS + 1);
+
+            let resolved = ready(resolver.lookup("192.0.2.1", 443))
+                .expect("a literal must not wait for a slot")
+                .expect("a literal resolves");
+
+            assert_eq!(resolved, vec!["192.0.2.1:443".parse().unwrap()]);
+        }
+
+        /// The pool has a thread for every slot the budget can hand out.
+        #[test]
+        fn the_pool_covers_every_slot_the_budget_can_hand_out() {
+            for max_connections in [1, 16, crate::config::DEFAULT_MAX_CONNECTIONS, 4096] {
+                let reserved = (max_connections as usize).min(RESERVED_LOOKUP_CEILING);
+
+                assert!(
+                    blocking_pool_size(max_connections) >= reserved + SHARED_LOOKUPS,
+                    "max_connections = {max_connections}"
+                );
+                assert_eq!(
+                    blocking_pool_size(max_connections) - reserved - SHARED_LOOKUPS,
+                    LOOKUP_FREE_THREADS,
+                    "max_connections = {max_connections}"
+                );
+            }
+
+            // `max_connections = 0` is "no cap", so there is nothing to size
+            // against and the ceiling is the answer.
+            assert_eq!(
+                blocking_pool_size(0),
+                blocking_pool_size(u32::MAX),
+                "an uncapped server is sized like one at the ceiling"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn resolves_ipv4_literals_without_a_resolver() {
