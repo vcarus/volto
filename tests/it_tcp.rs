@@ -710,10 +710,15 @@ async fn a_client_stop_sending_cancels_the_request_direction_too() {
         .expect("stop reading the response direction");
 
     // The echo comes back on a direction nobody is reading, which is where the
-    // server meets the STOP_SENDING.
-    send.write_all(&frame(FRAME_DATA, b"echo me"))
-        .await
-        .expect("send payload");
+    // server meets the STOP_SENDING. The write itself may lose a race it cannot
+    // win: the server's cancellation of the request direction — the behavior
+    // under test — can arrive before the payload leaves, and quinn then refuses
+    // the write with the very stop code asserted below.
+    match send.write_all(&frame(FRAME_DATA, b"echo me")).await {
+        Ok(()) => {}
+        Err(quinn::WriteError::Stopped(code)) if code.into_inner() == H3_REQUEST_CANCELLED => {}
+        Err(error) => panic!("send payload: {error}"),
+    }
 
     let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
         .await
