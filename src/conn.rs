@@ -43,9 +43,17 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 ///   about the requests already in flight, so [`crate::h3api::Connection::accept`]
 ///   never reports one. The tunnel quota going idle is the signal instead.
 ///
-/// The wait is deliberately unbounded here: the grace period belongs to the
-/// endpoint ([`crate::quic`]), which closes everything when it expires. Bounding
-/// it in both places would mean two timeouts to keep consistent.
+/// The wait for the tunnels is deliberately unbounded here: the grace period
+/// belongs to the endpoint ([`crate::quic`]), which closes everything when it
+/// expires. Bounding it in both places would mean two timeouts to keep
+/// consistent.
+///
+/// Sending the GOAWAY is a different matter and is bounded, because it is a
+/// write and the peer decides when a write completes: the control stream
+/// carries the peer's flow control, and this one sits in the same `select!` as
+/// the drain, so a peer granting no window used to park the drain behind it for
+/// the whole grace period. A frame that cannot be sent within one idle timeout
+/// is given up on and the connection drains without it.
 ///
 /// # The unauthenticated bound
 ///
@@ -112,6 +120,9 @@ pub async fn handle(
     );
 
     let mut going_away = false;
+    // The one idle timeout every peer-dependent write in this server gets; see
+    // the GOAWAY arm below.
+    let goaway_within = config.limits.max_idle_timeout();
     let silence = config.limits.max_idle_timeout() * SILENCE_FACTOR;
     // Armed here and never again: the clock the peer is racing runs from the
     // moment it could first have sent a request.
@@ -126,15 +137,45 @@ pub async fn handle(
             () = shutdown.fired(), if !going_away => {
                 going_away = true;
 
-                if let Err(error) = connection.shutdown().await {
-                    // The connection is unusable, so there is nothing left to
-                    // drain politely.
-                    debug!(%error, "failed to send GOAWAY");
-                    break Ok(());
-                }
+                // Bounded like every other write that depends on the peer
+                // taking it ([`h3api::Stream::respond_within`]): the control
+                // stream applies the peer's flow control, and this write is a
+                // `select!` arm of the loop that drains the connection, so a
+                // peer granting no window parks the drain with it -- the arm
+                // below never polled again, the connection never reported
+                // finished, and the whole process waiting out
+                // `server.shutdown_grace` for one peer that is under no
+                // obligation to read anything (adversarial pass 2026-08-29).
+                let sent = match tokio::time::timeout(
+                    goaway_within,
+                    connection.shutdown(),
+                ).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(error)) => {
+                        // The connection is unusable, so there is nothing left
+                        // to drain politely.
+                        debug!(%error, "failed to send GOAWAY");
+                        break Ok(());
+                    }
+                    // Not a break: the GOAWAY is a courtesy, and this
+                    // connection's tunnels are somebody's live traffic. Giving
+                    // up on the frame and draining anyway is what keeps the
+                    // promise the grace period makes to them; returning here
+                    // would drop the HTTP/3 connection and cut every one.
+                    Err(_elapsed) => false,
+                };
 
                 let live = context.quota.live();
-                info!(live_tunnels = live, "sent GOAWAY, draining tunnels");
+                if sent {
+                    info!(live_tunnels = live, "sent GOAWAY, draining tunnels");
+                } else {
+                    debug!(
+                        remote = %context.remote,
+                        live_tunnels = live,
+                        timeout_secs = goaway_within.as_secs(),
+                        "the peer would not take a GOAWAY; draining without one"
+                    );
+                }
                 if live == 0 {
                     break Ok(());
                 }

@@ -388,6 +388,13 @@ tunnel and all, even if the client only finishes sending them after the signal.
 Requests at or past it are rejected with `H3_REQUEST_REJECTED`, which tells the
 client they were not processed and may be retried on another connection.
 
+Sending the GOAWAY is itself bounded by `limits.max_idle_timeout`, because a
+peer decides when a write to it completes: one that grants no flow-control
+window on the control stream would otherwise hold that connection's drain open
+for the whole grace period, and with it the process. A connection whose peer will
+not take the frame within that bound drains without one and is closed when its
+tunnels end, exactly as it would have been otherwise.
+
 A SIGHUP that arrives once the drain has begun is refused and logged: the
 listener has been closed by then, and reopening it to accept handshakes that are
 seconds from being closed again would be worse than doing nothing. Reload before

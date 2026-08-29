@@ -426,3 +426,73 @@ async fn a_server_with_no_connections_stops() {
     server.shutdown();
     server.wait_until_stopped(Duration::from_secs(15)).await;
 }
+
+/// The bytes of an HTTP/3 control stream: its type, then an empty SETTINGS
+/// frame.
+///
+/// Written by hand rather than through [`H3Client`], because the peer below has
+/// to be one that never *reads* the server's control stream — and that client
+/// reads it for the life of the connection, as RFC 9114 §6.2.1 requires of a
+/// well-behaved one.
+fn client_control_preface() -> Vec<u8> {
+    let mut preface = vec![0x00];
+    preface.extend_from_slice(&common::rawstream::frame(0x04, &[]));
+    preface
+}
+
+/// A peer that will not take the GOAWAY must not cost the whole grace period.
+///
+/// The exact twin of [`an_idle_server_stops_promptly`] above: one connection,
+/// no tunnels, nothing to drain, a grace period nobody should ever reach. The
+/// only difference is the client's flow-control window, which is set to exactly
+/// the 19 bytes of the server's own control preface — so the HTTP/3 handshake
+/// fits and the GOAWAY behind it does not — and the fact that this client never
+/// reads that stream, so the window never reopens.
+///
+/// The GOAWAY write is a `select!` arm of the connection's accept loop, so a
+/// write parked on the peer's flow control parks the loop with it: the drain
+/// that would have noticed "no tunnels left, this connection is finished" is
+/// never polled again, and the whole process waits out `shutdown_grace` for one
+/// peer that is under no obligation to read anything. Every other write in this
+/// server that depends on the peer taking it is bounded by one idle timeout
+/// (`h3api::Stream::respond_within`); this one is too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
+    let mut server = TestServer::start_with(&format!(
+        "shutdown_grace = 300\n[limits]\nmax_idle_timeout = 1\nkeep_alive_interval = 0\n\
+         {ALLOW_PRIVATE}"
+    ))
+    .await;
+
+    // 19 bytes is the server's control preface exactly. The keep-alive is what
+    // makes this a test of the application's own deadline: with it, the QUIC
+    // idle timeout can never be the thing that ends the connection.
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(19u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+
+    let endpoint = common::client_endpoint_with_transport(&server.ca, &["h3"], transport);
+    let quic = common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    // A control stream of our own, so the server sees an ordinary HTTP/3 peer
+    // rather than one it could refuse for something else.
+    let mut control = quic
+        .open_uni()
+        .await
+        .expect("open the client control stream");
+    control
+        .write_all(&client_control_preface())
+        .await
+        .expect("write the client control preface");
+
+    // Long enough for the server's own preface to have been written and to sit
+    // unread, which is what leaves its control stream with no window at all.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    server.shutdown();
+    // Far below the 300 s grace period, and far above the one idle timeout the
+    // GOAWAY is allowed.
+    server.wait_until_stopped(Duration::from_secs(15)).await;
+}
