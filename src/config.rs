@@ -1272,8 +1272,10 @@ impl Server {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    use proptest::prelude::*;
 
     #[test]
     fn defaults_are_applied() {
@@ -2506,5 +2508,239 @@ mod tests {
     fn a_malformed_filter_directive_is_rejected() {
         let err = validate_log_level("volto=notalevel").expect_err("must be rejected");
         assert!(err.to_string().contains("log.level"), "{err}");
+    }
+
+    /// `u64`s worth generating for a key whose accepted range ends at `edge`.
+    ///
+    /// A uniform `u64` would spend essentially every case in the astronomically
+    /// invalid region, where each key's first range check answers and nothing
+    /// downstream is ever reached; a uniform value inside the range would never
+    /// reach the arithmetic that only the far end can break. So the mix is
+    /// deliberate: values around the range, the exact boundaries, the halves of
+    /// `u64` that a doubling straddles, and the whole domain.
+    fn around(edge: u64) -> BoxedStrategy<u64> {
+        prop_oneof![
+            4 => 0..=edge.saturating_mul(2).max(4),
+            3 => prop::sample::select(vec![
+                0,
+                1,
+                edge.saturating_sub(1),
+                edge,
+                edge.saturating_add(1),
+            ]),
+            2 => prop::sample::select(vec![
+                u64::MAX,
+                u64::MAX - 1,
+                u64::MAX / 2,
+                u64::MAX / 2 + 1,
+                1 << 62,
+                1 << 63,
+            ]),
+            1 => any::<u64>(),
+        ]
+        .boxed()
+    }
+
+    /// [`Limits`] over the whole of every field's integer domain.
+    ///
+    /// Shared with the transport-config property in [`crate::quic`], which is
+    /// the other half of the same invariant: this module decides what is
+    /// accepted, that one has to build a `quinn::TransportConfig` out of
+    /// everything that was.
+    pub(crate) fn any_limits() -> impl Strategy<Value = Limits> {
+        // Saturating rather than truncating, so that "absurdly large" stays
+        // absurdly large in the narrower types instead of wrapping to something
+        // ordinary.
+        fn narrow_u32(value: u64) -> u32 {
+            u32::try_from(value).unwrap_or(u32::MAX)
+        }
+        fn narrow_u16(value: u64) -> u16 {
+            u16::try_from(value).unwrap_or(u16::MAX)
+        }
+
+        (
+            (
+                around(MAX_IDLE_TIMEOUT_CEILING),
+                around(u64::from(MAX_TARGETS_PER_CONN_CEILING)),
+                around(u64::from(DEFAULT_MAX_CONNECTIONS)),
+                around(MAX_IDLE_TIMEOUT_CEILING),
+                around(u64::from(MAX_STREAMS_BIDI_CEILING)),
+                around(MAX_IDLE_TIMEOUT_CEILING),
+                around(MAX_IDLE_TIMEOUT_CEILING / 2),
+            ),
+            (
+                around(u64::from(MAX_INITIAL_MTU)),
+                around(u64::from(MAX_MTU_UPPER_BOUND)),
+                around(*INITIAL_RTT_RANGE_MS.end()),
+                around(DEFAULT_SOCKET_RECV_BUFFER as u64),
+                around(DEFAULT_SOCKET_SEND_BUFFER as u64),
+                any::<bool>(),
+                prop::sample::select(vec![
+                    CongestionControl::Bbr,
+                    CongestionControl::Cubic,
+                    CongestionControl::NewReno,
+                ]),
+                prop::sample::select(vec![
+                    IpFamilyPreference::Ipv4,
+                    IpFamilyPreference::Ipv6,
+                    IpFamilyPreference::System,
+                ]),
+            ),
+        )
+            .prop_map(
+                |(
+                    (
+                        udp_session_timeout,
+                        max_targets_per_conn,
+                        max_connections,
+                        connect_timeout,
+                        max_streams_bidi,
+                        max_idle_timeout,
+                        keep_alive_interval,
+                    ),
+                    (
+                        initial_mtu,
+                        mtu_upper_bound,
+                        initial_rtt_ms,
+                        socket_recv_buffer,
+                        socket_send_buffer,
+                        mtu_discovery,
+                        congestion_control,
+                        ip_family_preference,
+                    ),
+                )| Limits {
+                    udp_session_timeout,
+                    max_targets_per_conn: narrow_u32(max_targets_per_conn),
+                    max_connections: narrow_u32(max_connections),
+                    connect_timeout,
+                    ip_family_preference,
+                    max_streams_bidi: narrow_u32(max_streams_bidi),
+                    max_idle_timeout,
+                    keep_alive_interval,
+                    initial_mtu: narrow_u16(initial_mtu),
+                    mtu_discovery,
+                    mtu_upper_bound: narrow_u16(mtu_upper_bound),
+                    congestion_control,
+                    initial_rtt_ms,
+                    socket_recv_buffer: usize::try_from(socket_recv_buffer).unwrap_or(usize::MAX),
+                    socket_send_buffer: usize::try_from(socket_send_buffer).unwrap_or(usize::MAX),
+                },
+            )
+    }
+
+    /// [`Limits`] that [`Config::validate`] accepts.
+    ///
+    /// [`any_limits`] folded into the accepted space rather than filtered down
+    /// to it: a filter would reject essentially every case, since a value is
+    /// only legal when all ten of its independently generated fields are, while
+    /// clamping maps the whole invalid region onto the boundaries — which is
+    /// where a transport parameter is most likely to be the one that cannot be
+    /// built. The folding is a second statement of the ranges `validate`
+    /// enforces, so the property that uses it checks that claim rather than
+    /// trusting it.
+    pub(crate) fn valid_limits() -> impl Strategy<Value = Limits> {
+        any_limits().prop_map(|limits| {
+            let max_idle_timeout = limits.max_idle_timeout.clamp(1, MAX_IDLE_TIMEOUT_CEILING);
+            // Strictly below half, and 0 is always legal: an idle timeout of 1
+            // or 2 seconds leaves no interval that is.
+            let half = max_idle_timeout.div_ceil(2);
+            let keep_alive_interval = match (limits.keep_alive_interval, half) {
+                (0, _) | (_, 0..=1) => 0,
+                (interval, half) => 1 + interval % (half - 1),
+            };
+            let initial_mtu = limits.initial_mtu.clamp(MIN_INITIAL_MTU, MAX_INITIAL_MTU);
+
+            Limits {
+                udp_session_timeout: limits
+                    .udp_session_timeout
+                    .clamp(1, MAX_IDLE_TIMEOUT_CEILING),
+                max_targets_per_conn: limits
+                    .max_targets_per_conn
+                    .clamp(1, MAX_TARGETS_PER_CONN_CEILING),
+                connect_timeout: limits.connect_timeout.min(MAX_IDLE_TIMEOUT_CEILING),
+                max_streams_bidi: limits.max_streams_bidi.clamp(1, MAX_STREAMS_BIDI_CEILING),
+                max_idle_timeout,
+                keep_alive_interval,
+                initial_mtu,
+                mtu_upper_bound: limits
+                    .mtu_upper_bound
+                    .clamp(initial_mtu, MAX_MTU_UPPER_BOUND),
+                initial_rtt_ms: limits
+                    .initial_rtt_ms
+                    .clamp(*INITIAL_RTT_RANGE_MS.start(), *INITIAL_RTT_RANGE_MS.end()),
+                // Unbounded by `validate` and left that way here: the socket
+                // buffers are a request the kernel answers, and `max_connections`
+                // = 0 means no cap at all.
+                ..limits
+            }
+        })
+    }
+
+    /// A config carrying `limits`, with everything else at its default.
+    ///
+    /// Its certificate paths do not exist, so a config whose limits are all
+    /// legal still fails validation on the certificate check — the last thing
+    /// `validate` does, and hence the marker that everything before it passed.
+    pub(crate) fn config_with(limits: Limits) -> Config {
+        let mut config = parse("");
+        config.limits = limits;
+        config
+    }
+
+    /// Whether `validate` found nothing wrong except the missing certificates.
+    pub(crate) fn valid_apart_from_certs(config: &Config) -> bool {
+        match config.validate() {
+            Ok(()) => true,
+            Err(error) => {
+                let message = error.to_string();
+                message.contains("server.cert") || message.contains("server.key")
+            }
+        }
+    }
+
+    proptest! {
+        /// Property 1: validation answers. It never panics (D86).
+        ///
+        /// Every integer here is reachable from the file — TOML deserializes
+        /// across the whole of each target type — so a `u64` that breaks the
+        /// arithmetic *inside* `validate` is an operator's typo turning startup
+        /// into an abort, and a `SIGHUP` into one on a running server. The
+        /// property is deliberately weak on purpose: `Ok` or `Err`, but a third
+        /// outcome is not allowed to exist.
+        #[test]
+        fn validation_of_any_limits_answers_rather_than_panicking(limits in any_limits()) {
+            let config = config_with(limits);
+            let _ = config.validate();
+            // The warnings run over the same values, and are rendered on the
+            // startup path right after validation.
+            let _ = config.warnings();
+        }
+
+        /// The rewritten keep-alive comparison is the doubling it replaced.
+        ///
+        /// Same accept/reject boundary for every pair of integers, computed in
+        /// arithmetic wide enough to hold the product the check no longer takes
+        /// (D86). The idle timeout is generated inside its own range so that
+        /// this is the only check that can object.
+        #[test]
+        fn the_keep_alive_ratio_keeps_the_boundary_its_doubling_had(
+            max_idle_timeout in 1..=MAX_IDLE_TIMEOUT_CEILING,
+            keep_alive_interval in around(MAX_IDLE_TIMEOUT_CEILING / 2),
+        ) {
+            let limits = Limits {
+                max_idle_timeout,
+                keep_alive_interval,
+                ..Limits::default()
+            };
+
+            let rejected = config_with(limits)
+                .validate()
+                .is_err_and(|error| error.to_string().contains("keep_alive_interval"));
+
+            let doubling = keep_alive_interval > 0
+                && u128::from(keep_alive_interval) * 2 >= u128::from(max_idle_timeout);
+
+            prop_assert_eq!(rejected, doubling);
+        }
     }
 }

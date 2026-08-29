@@ -1348,6 +1348,8 @@ const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 mod tests {
     use super::*;
 
+    use proptest::prelude::*;
+
     /// Renders the built transport parameters for inspection.
     ///
     /// `TransportConfig` has no getters, but its `Debug` prints every field, and
@@ -1463,6 +1465,33 @@ mod tests {
             rendered.contains("initial_rtt: 150ms"),
             "the initial RTT must apply: {rendered}"
         );
+    }
+
+    proptest::proptest! {
+        /// Property 2: whatever validation accepts, this can be built from (D86).
+        ///
+        /// The other half of the invariant `crate::config`'s properties state:
+        /// a value that passes validation must not be able to fail — or panic —
+        /// on its way into a `quinn::TransportConfig`, which is where every
+        /// `[limits]` key that reaches the transport ends up. The generator
+        /// clamps into the accepted space rather than filtering, so it stacks
+        /// cases on the boundaries; that its output really is accepted is
+        /// asserted here rather than assumed, so the two statements of the
+        /// ranges cannot drift apart silently. Run in a debug build, where
+        /// arithmetic overflow is a panic rather than a wrap.
+        #[test]
+        fn every_accepted_limits_builds_a_transport_config(
+            limits in crate::config::tests::valid_limits()
+        ) {
+            let config = crate::config::tests::config_with(limits.clone());
+            prop_assert!(
+                crate::config::tests::valid_apart_from_certs(&config),
+                "the generator produced limits validation rejects: {:?}",
+                config.validate().err()
+            );
+
+            prop_assert!(transport_config(&limits).is_ok());
+        }
     }
 
     /// The check has to fire on the configuration that actually bites: a macOS
