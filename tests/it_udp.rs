@@ -979,6 +979,97 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
     );
 }
 
+/// Nor does a flood of them, which is a different way round the same deadline.
+///
+/// The drip above spaces its bytes out, so between two of them the session loop
+/// has nothing to do, parks on its three sources, and the deadline is looked at.
+/// This one never lets it park, because `tokio::time::timeout_at` polls the
+/// future it wraps **first** and returns its value without consulting the clock:
+/// a lapsed deadline is only ever noticed on a poll where none of the three
+/// sources was already ready. A peer that keeps one of them ready is therefore
+/// the shape that steps over the branch reading the deadline rather than
+/// re-arming it — and that same poll order really did defeat the connection's
+/// silence deadline, which `it_handshake`'s churn test now pins (adversarial
+/// pass 2026-08-29).
+///
+/// It does not defeat this one. The bytes are the fastest unproductive supply a
+/// peer has: an unknown capsule type declaring a gigabyte of value, which
+/// RFC 9297 §3.2 requires to be skipped, written as fast as the stream will take
+/// it — around 18 MB before the cut. The session still closes on its deadline to
+/// the millisecond, so the window below is tight; a regression here is a session
+/// that outlives its timeout by the length of the flood.
+///
+/// The datagram half of the same idea is deliberately not a test: keeping a
+/// session's 64-deep inbound queue non-empty means outrunning the server, which
+/// means outrunning the client's own transmit path, and a client's outgoing
+/// datagram queue that deep trips an accounting bug in quinn-proto's
+/// drop-oldest branch (`Datagrams::send` subtracts `payload_bytes` twice) long
+/// before it proves anything about this server. Measured by hand instead: a 1 s
+/// timeout ended at 1.1 s to 1.4 s idle, 3.9 s on a loaded machine.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_flood_of_skipped_capsule_bytes_does_not_postpone_the_timeout() {
+    let server = TestServer::start_with_udp_timeout(1).await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (_qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+
+    // Type 0x29, length 2^30: every byte after this header is discarded by the
+    // decoder's skip state and completes nothing, so none of it re-arms the
+    // deadline.
+    stream
+        .send_data(Bytes::from_static(&[
+            0x29, 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        ]))
+        .await
+        .expect("send the capsule header");
+
+    // The close is observed from the sending half: an idle close stops
+    // receiving, and a stopped stream refuses further writes.
+    let started = tokio::time::Instant::now();
+    let chunk = Bytes::from(vec![0u8; 16 * 1024]);
+    let mut written = 0usize;
+    let closed = loop {
+        if started.elapsed() > Duration::from_secs(6) {
+            break false;
+        }
+        if stream.send_data(chunk.clone()).await.is_err() {
+            break true;
+        }
+        written += chunk.len();
+    };
+
+    assert!(
+        closed,
+        "a flood of unproductive bytes must not hold the session open past its \
+         timeout; wrote {written} bytes"
+    );
+    // Several megabytes landed first, so the close really did cut a stream that
+    // was still speaking rather than one the server had refused outright.
+    assert!(
+        written > 1024 * 1024,
+        "the session must have been flooded while the deadline ran, got {written} bytes"
+    );
+
+    // The response half ends too: socket and request stream close together
+    // (RFC 9298 §3.1).
+    let ended = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match stream.recv_data().await {
+                Ok(Some(_)) => continue,
+                Ok(None) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .expect("the response half must end with the session");
+    assert!(
+        ended.is_ok(),
+        "the flooded session should end cleanly, got {ended:?}"
+    );
+}
+
 /// Payloads reaching a silent target postpone the session timeout on their
 /// own.
 ///
