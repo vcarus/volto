@@ -20,8 +20,8 @@
 //! | b | Completes both handshakes and then says nothing, answering keep-alives | `SILENCE_FACTOR * max_idle_timeout` from the handshake, never re-armed (`src/conn.rs`, D76) | CONNECTION_CLOSE H3_NO_ERROR (0x100); the `max_connections` slot comes back | `it_handshake::a_peer_that_never_sends_a_request_gives_its_slot_back`; shipped numbers in [`the_shipped_bound_closes_a_silent_peer`] |
 //! | c | Opens one request stream per idle period, a byte on each, never a whole request (review C1') | The same deadline: it is absolute, so opening streams buys no time (`src/conn.rs`) | CONNECTION_CLOSE H3_NO_ERROR two idle timeouts after the *handshake* | `it_handshake::opening_request_streams_does_not_extend_the_bound`; shipped numbers in [`the_shipped_bound_is_not_extended_by_new_streams`] |
 //! | c2 | Authenticates once and then idles for ever | None -- the bound is lifted for the life of the connection (`Context.authenticated`) | Nothing; the connection stays usable | `it_handshake::an_authenticated_connection_is_not_bounded` |
-//! | d | Opens a request stream and stalls before its HEADERS arrive | One `max_idle_timeout` per stream, in `Resolver::resolve` (`src/h3/stream.rs`, D76 M2) | RESET_STREAM + STOP_SENDING H3_REQUEST_INCOMPLETE (0x10d); the connection carries on | `it_handshake::a_request_that_stalls_before_its_headers_is_reset` |
-//! | d2 | Opens a unidirectional stream and never completes its type varint | One `max_idle_timeout` on `read_stream_type` (`src/h3/connection.rs`, review L3) | STOP_SENDING H3_STREAM_CREATION_ERROR; the connection carries on | `it_hardening::a_unidirectional_stream_that_never_names_its_type_is_abandoned` |
+//! | d | Opens a request stream and stalls before its HEADERS arrive -- or a batch of them at once, past authentication where no connection bound is left | One `max_idle_timeout` per stream, in `Resolver::resolve` (`src/h3/stream.rs`, D76 M2) | RESET_STREAM + STOP_SENDING H3_REQUEST_INCOMPLETE (0x10d) on every one of them; the connection carries on | `it_handshake::a_request_that_stalls_before_its_headers_is_reset`, `it_handshake::a_batch_of_stalled_requests_is_reset_stream_by_stream` |
+//! | d2 | Opens a unidirectional stream and never completes its type varint -- or all sixteen of its allowance at once | One `max_idle_timeout` on `read_stream_type` (`src/h3/connection.rs`, review L3), concurrently per stream | STOP_SENDING H3_STREAM_CREATION_ERROR on each; the credit comes back; the connection carries on | `it_hardening::a_unidirectional_stream_that_never_names_its_type_is_abandoned`, [`a_stalled_uni_stream_allowance_is_reclaimed`] |
 //! | e | Announces a HEADERS frame larger than one frame may be | `MAX_BUFFERED_FRAME` = `MAX_FIELD_SECTION_SIZE` = 64 KiB (`src/h3/frame.rs`) | 431 then STOP_SENDING H3_EXCESSIVE_LOAD (0x107); the connection carries on | `it_settings::an_oversized_header_section_is_refused` |
 //! | e2 | Announces full-sized HEADERS on stream after stream and finishes none | `HEADERS_BUFFER_BUDGET` = 1 MiB per connection (`src/h3/mod.rs`, D77) | 431 + H3_EXCESSIVE_LOAD on the request past the budget only; sixteen at once are all served | `it_hardening::headers_buffered_across_a_connection_are_bounded`, `it_hardening::a_request_past_the_buffering_budget_costs_only_that_request` |
 //! | e3 | Fills that budget with request streams, then sends its own well-formed control frames | The control stream has an unshared budget (`BufferBudget::unshared`), so its frames cannot be the ones refused -- a refusal there could only be a connection error | Nothing: the control frames are accepted and the connection lives | [`the_control_stream_does_not_share_the_request_buffering_budget`] |
@@ -43,6 +43,7 @@
 //! | l | Sends a datagram whose Quarter Stream ID is unparseable or above 2^60-1 | RFC 9297 §2.1's two MUST-close cases (`src/datagram.rs`, `route_datagram`) | CONNECTION_CLOSE H3_DATAGRAM_ERROR (0x33) | `it_udp::an_out_of_range_quarter_stream_id_closes_the_connection`, `it_udp::a_datagram_without_a_quarter_stream_id_closes_the_connection` |
 //! | l2 | Sends a datagram for a session that does not exist, or with an unknown or truncated context ID | Dropped, never a connection error (`route_datagram`, `Shared::deliver`) | Nothing at all; the connection and every session on it carry on | `it_udp::datagrams_for_unknown_sessions_are_dropped`, `it_udp::unknown_context_ids_are_dropped_without_ending_the_session`, `it_udp::a_truncated_context_id_is_dropped_without_closing_the_connection` |
 //! | l3 | Sends a datagram before it has sent SETTINGS, or one addressed to a live *TCP* tunnel | The same drop: the routing table is claimed by CONNECT-UDP sessions only, and receipt is not gated on the peer's SETTINGS | Nothing; the tunnel is unaffected | [`datagrams_no_session_can_own_are_dropped`] |
+//! | l4 | Floods a live CONNECT-UDP session with datagrams faster than its target drains | `INBOUND_QUEUE_DEPTH` = 64 per session (`src/h3/connection.rs`); overflow is dropped, never buffered or blocked on | Packets lost, as UDP loses them; the session answers again once the flood stops | `it_udp::a_datagram_flood_at_a_live_session_is_survived` |
 //! | m | Sends a truncated, oversized or unknown capsule on a session's request stream | RFC 9297 §3 incremental decoder, `MAX_DATAGRAM_CAPSULE_VALUE` per capsule (`src/capsule.rs`) | RESET_STREAM H3_MESSAGE_ERROR (0x10e) for a capsule that merely stopped early, H3_DATAGRAM_ERROR (0x33) for one that could never parse, nothing at all for an unknown type; the connection carries on | `it_udp::a_truncated_capsule_is_rejected`, `it_udp::an_oversized_datagram_capsule_is_reset_as_a_parse_error`, `it_udp::unknown_capsule_types_are_skipped` |
 //! | n | Opens more request streams than it is allowed at once | `[limits] max_streams_bidi` (`src/quic.rs`) | The next one is never granted; the streams already open are untouched | [`the_bidirectional_stream_limit_caps_what_one_peer_can_open`] |
 //! | n2 | Opens more tunnels than one connection may hold | `[limits] max_targets_per_conn`, taken before any socket is (`src/conn.rs`) | 503 with `Proxy-Status: connection_limit_reached`; other connections have their own budget | `it_policy::the_tunnel_quota_is_enforced_per_connection`, `it_policy::tcp_and_udp_tunnels_share_the_quota` |
@@ -372,6 +373,107 @@ async fn sixteen_is_all_the_unidirectional_streams_a_peer_gets() {
         .expect("the allowance must come back once the streams end")
         .expect("open a unidirectional stream");
     drop(granted);
+}
+
+/// The whole allowance stalled at once: sixteen streams, half a type varint
+/// apiece, cost the peer those sixteen streams for one idle timeout and
+/// nothing after it.
+///
+/// Row d2's bound at row h's cap. The single-stream test
+/// (`it_hardening::a_unidirectional_stream_that_never_names_its_type_is_abandoned`)
+/// pins the deadline and this one pins its arithmetic: the deadlines have to
+/// run concurrently -- a server that read for one type at a time would abandon
+/// the sixteenth of these sixteen idle timeouts late, not one -- and once the
+/// peer answers the STOP_SENDING with the reset RFC 9000 §3.5 requires of it,
+/// every abandoned stream hands its credit back. A peer that withholds that
+/// reset parks its own allowance and nothing else: the server's task ended
+/// with the `stop`, so what stays behind is quinn's per-stream state, bounded
+/// at sixteen. Authenticated first, so what is measured is this bound and not
+/// D76's absolute deadline, which would close an unproven connection at about
+/// the same moment and swallow the case.
+///
+/// The bidirectional mirror of this batch is
+/// `it_handshake::a_batch_of_stalled_requests_is_reset_stream_by_stream`:
+/// request streams stalled the same way draw per-stream resets under their own
+/// deadline in `Resolver::resolve`, so each direction has its own pin.
+#[tokio::test]
+async fn a_stalled_uni_stream_allowance_is_reclaimed() {
+    /// Two seconds of idle timeout, keep-alives off: long enough that parking
+    /// all sixteen streams and asking for a seventeenth fits comfortably
+    /// before the first deadline fires, short enough to wait out sixteen of
+    /// them concurrently inside [`TIMEOUT`].
+    const UNHURRIED: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+
+    let server = TestServer::start_with(UNHURRIED).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    // No `[auth]` section, so this answered request authenticates the
+    // connection and lifts the D76 bound before anything is parked.
+    still_serving(&connection).await;
+
+    let mut parked = Vec::new();
+    for index in 0..PEER_UNI_STREAMS {
+        let mut stream = tokio::time::timeout(TIMEOUT, connection.open_uni())
+            .await
+            .unwrap_or_else(|_| panic!("stream {index} of {PEER_UNI_STREAMS} was not granted"))
+            .expect("open a unidirectional stream");
+        // 0x40 opens a two-byte varint (RFC 9000 §16), so the type is one
+        // byte short of complete on every one of them.
+        stream
+            .write_all(&[0x40])
+            .await
+            .expect("send half a stream type");
+        parked.push(stream);
+    }
+
+    // With the whole allowance parked there is no credit for another stream:
+    // the seventeenth is not refused, it is never granted (row h).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), connection.open_uni())
+            .await
+            .is_err(),
+        "while sixteen streams are parked there is no credit for a seventeenth"
+    );
+
+    // Every stream is abandoned with the code a single one draws. Sixteen
+    // waits bounded by TIMEOUT apiece only fit because the deadlines run
+    // concurrently: the first `stopped` pays the idle timeout and the rest
+    // have already fired.
+    for (index, stream) in parked.iter_mut().enumerate() {
+        let stopped = tokio::time::timeout(TIMEOUT, stream.stopped())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "stream {index} of {PEER_UNI_STREAMS}: the server must not read for a \
+                     stream type indefinitely"
+                )
+            })
+            .expect("the stalled stream must be stopped, not broken");
+        assert_eq!(
+            stopped.map(quinn::VarInt::into_inner),
+            Some(H3_STREAM_CREATION_ERROR),
+            "stream {index} of {PEER_UNI_STREAMS} is abandoned the way a single one is"
+        );
+    }
+
+    // The peer answers each STOP_SENDING with the RESET_STREAM RFC 9000 §3.5
+    // requires of it -- by hand, because a held `quinn::SendStream` is not
+    // reset for its holder -- and the abandoned streams hand their credit
+    // back: the allowance is usable again, not merely intact.
+    for stream in &mut parked {
+        let _ = stream.reset(quinn::VarInt::from_u32(0));
+    }
+    let granted = tokio::time::timeout(TIMEOUT, connection.open_uni())
+        .await
+        .expect("the allowance must come back once the stalled streams are abandoned")
+        .expect("open a unidirectional stream");
+    drop(granted);
+
+    assert!(
+        connection.close_reason().is_none(),
+        "sixteen abandoned streams must not add up to a connection error"
+    );
+    still_serving(&connection).await;
 }
 
 // ---------------------------------------------------------------------------

@@ -181,6 +181,82 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
     assert_eq!(&echoed[..], b"somewhere");
 }
 
+/// A flood of datagrams at one live session costs datagrams, not the session.
+///
+/// The session's inbound queue is bounded (`INBOUND_QUEUE_DEPTH` in
+/// `src/h3/connection.rs`) and overflow is dropped rather than buffered or
+/// blocked on, so a peer sending faster than the target drains can lose
+/// packets -- UDP's own promise -- but must not be able to grow the server's
+/// memory, stall the routing task, or take the session down. Which packets
+/// drop is scheduling, so nothing here counts them: what is pinned is that
+/// the session answers again once the flood stops, on the same connection,
+/// with no close of any kind. The unclaimed-id mirror of this flood (a peer
+/// filling its allowance with misses) has no queue to overflow -- those
+/// datagrams are dropped at the routing table -- which is why this test aims
+/// at a live session and the drop tests above aim past one.
+#[tokio::test]
+async fn a_datagram_flood_at_a_live_session_is_survived() {
+    /// Well past `INBOUND_QUEUE_DEPTH` (64), so the overflow path is really
+    /// entered rather than the queue merely filling.
+    const FLOOD: usize = 1024;
+
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
+
+    // Nothing is read while the flood is queued: reading would drain the
+    // client's half and pace the server's, and the case is the unpaced one.
+    for _ in 0..FLOOD {
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid, b"flood"))
+            .expect("queue a flood datagram");
+    }
+
+    // The probe is retried rather than trusted: a probe that lands while the
+    // queue is still full is dropped exactly as the flood's own overflow was,
+    // and that drop is correct behaviour, not a failure. What would fail this
+    // test is the session never answering again -- a routing task that
+    // deadlocked, a queue that jammed shut -- which no number of retries
+    // inside the deadline would paper over.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    'probing: loop {
+        client
+            .quic
+            .send_datagram(datagram::encode_udp_payload(qsid, b"probe"))
+            .expect("queue a probe datagram");
+
+        let window = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let Ok(read) = tokio::time::timeout_at(window, client.quic.read_datagram()).await
+            else {
+                break;
+            };
+            let raw = read.expect("the connection must survive the flood");
+            let decoded = datagram::decode(raw).expect("server datagrams must be well formed");
+            assert_eq!(
+                decoded.quarter_stream_id, qsid,
+                "every answer belongs to the flooded session; there is no other"
+            );
+            if &decoded.payload[..] == b"probe" {
+                break 'probing;
+            }
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session never answered once the flood stopped"
+        );
+    }
+
+    assert!(
+        client.quic.close_reason().is_none(),
+        "a flood is met with drops, never with a close"
+    );
+}
+
 /// RFC 9297 §2.1: "The largest legal QUIC stream ID value is 2^62-1, so the
 /// largest legal value of the Quarter Stream ID field is 2^60-1. Receipt of an
 /// HTTP/3 Datagram that includes a larger value MUST be treated as an HTTP/3

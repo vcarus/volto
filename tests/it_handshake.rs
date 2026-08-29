@@ -336,6 +336,98 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
     assert_eq!(status_of(&payload), "403");
 }
 
+/// A batch of stalled requests is reset stream by stream, on a connection
+/// nothing else bounds.
+///
+/// The single-stream test above runs unauthenticated, where D76's absolute
+/// deadline would have answered the peer anyway. This one authenticates first,
+/// so that deadline is lifted for good and the per-stream bound in
+/// `Resolver::resolve` is the only thing standing between an authenticated
+/// peer and `max_streams_bidi` parked decoder tasks. Per stream is the design
+/// (D76 M2), so the batch is the shape that would catch it quietly becoming
+/// per connection: one deadline tearing the connection down, or one reset
+/// standing in for the lot. Every stream must draw its own
+/// H3_REQUEST_INCOMPLETE, and the connection must come out serving.
+#[tokio::test]
+async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
+    /// Enough streams to be a batch rather than a coincidence, well under the
+    /// 1024 the transport would grant: what is measured is one reset apiece,
+    /// not the allowance.
+    const STALLED: usize = 32;
+
+    let server = TestServer::start_with(IMPATIENT).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    // Authenticate first -- no `[auth]` section, so any completed request does
+    // it. Port 25 is on the default deny list, so the 403 arrives without
+    // touching the network, and it is the acceptance of the request rather
+    // than its outcome that lifts the connection bound.
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame("192.0.2.1:25"))
+        .await
+        .expect("send a CONNECT request");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(
+        status_of(&payload),
+        "403",
+        "the request must be answered, which is what lifts the D76 bound"
+    );
+
+    // Every stream gets its byte before any deadline is waited out, so the
+    // batch really is concurrent: all of them are mid-request at once, and
+    // their deadlines run together rather than one at a time.
+    let mut stalled = Vec::new();
+    for index in 0..STALLED {
+        let (mut send, recv) = connection
+            .open_bi()
+            .await
+            .unwrap_or_else(|error| panic!("stream {index} of {STALLED} was not granted: {error}"));
+        // One byte: enough to open the stream at the server, not enough to be
+        // a frame header, let alone a request.
+        send.write_all(&[0x01])
+            .await
+            .expect("send one byte of a request");
+        // The sending half is held: dropping it would finish the stream and
+        // turn a request that stalled into one that ended, which has a
+        // verdict of its own.
+        stalled.push((send, recv));
+    }
+
+    for (index, (_send, mut recv)) in stalled.into_iter().enumerate() {
+        let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(64))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("stream {index} of {STALLED}: the server must not wait for a request that is not coming")
+            })
+            .expect_err("the stalled stream must be reset");
+        match error {
+            quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
+                code.into_inner(),
+                H3_REQUEST_INCOMPLETE,
+                "stream {index} of {STALLED} must draw its own reset"
+            ),
+            other => panic!("stream {index} of {STALLED}: expected a reset, got {other}"),
+        }
+    }
+
+    assert!(
+        connection.close_reason().is_none(),
+        "the bound is per stream: a batch of stalled requests must not cost the connection"
+    );
+    // And it is a working connection, not merely an unclosed one.
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .expect("the connection must still be usable");
+    send.write_all(&connect_headers_frame("192.0.2.1:25"))
+        .await
+        .expect("send a CONNECT request");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(status_of(&payload), "403");
+}
+
 /// A QUIC handshake that never finishes must not sit on a connection slot.
 ///
 /// One layer below everything else in this file. The slot is taken when the
@@ -498,6 +590,74 @@ async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
             .await
             .is_err(),
         "only one slot was needed, so the younger parked connection must keep its own"
+    );
+}
+
+/// Lowering `max_connections` under a running roster evicts down to the new
+/// cap in one arrival, oldest first.
+///
+/// The eviction in the accept loop is a `while len >= max` rather than a
+/// single step, because the cap it is measured against can move underneath the
+/// roster: the cap is read per accepted connection so that a SIGHUP lowering
+/// it during an incident takes effect at once (`docs/deployment.md`), and the
+/// reload itself touches nobody -- it is applied where arrivals are, so the
+/// roster stays over the new cap until somebody arrives. Four parked peers
+/// over a cap of two mean the newcomer's arrival must take three victims at
+/// once; a single-eviction reading of that loop would admit the newcomer with
+/// the roster still over its cap, which is exactly what the one-at-a-time
+/// tests above cannot notice (D80).
+#[tokio::test]
+async fn lowering_the_connection_cap_evicts_down_to_it() {
+    let server =
+        TestServer::start_with(&format!("[limits]\nmax_connections = 5\n{ALLOW_PRIVATE}")).await;
+    let echo = spawn_echo_target().await;
+
+    // Four connections that never authenticate, registered in this order --
+    // which is the order eviction owes them nothing in.
+    let parked = [
+        H3Client::connect(&server).await,
+        H3Client::connect(&server).await,
+        H3Client::connect(&server).await,
+        H3Client::connect(&server).await,
+    ];
+
+    server.rewrite_config(&format!("[limits]\nmax_connections = 2\n{ALLOW_PRIVATE}"));
+    server.reload().expect("the lowered cap must load");
+
+    // The reload alone evicts nobody: connections already accepted are
+    // promised their configuration, and the squaring below happens at the
+    // next arrival.
+    for (index, client) in parked.iter().enumerate() {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.quic.closed())
+                .await
+                .is_err(),
+            "connection {index}: a reload is applied at arrivals, not to the connections \
+             already accepted"
+        );
+    }
+
+    // The arrival. It is over the cap the moment it knocks, so it pays the
+    // validation round trip (quinn answers the Retry without telling anybody)
+    // and then takes its slot from the oldest unauthenticated peers -- three
+    // of them, because that is how far over the new cap the roster is.
+    let mut newcomer = H3Client::connect(&server).await;
+    let mut tunnel = open_tcp_tunnel(&mut newcomer, &echo.to_string()).await;
+    tunnel
+        .send_data(Bytes::from_static(b"payload"))
+        .await
+        .expect("send payload");
+    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+
+    for victim in &parked[..3] {
+        assert_closed_with(&victim.quic, H3_NO_ERROR, TIMEOUT).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), parked[3].quic.closed())
+            .await
+            .is_err(),
+        "the newcomer and the youngest parked connection fit the new cap of two, \
+         so the fourth eviction must not happen"
     );
 }
 
