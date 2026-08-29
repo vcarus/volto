@@ -31,6 +31,10 @@
 //!   different `Proxy-Status` on the wire, which is what the assertion reads.
 //!   Driven sequentially and then as a concurrent burst, because the two take
 //!   different paths through the quota.
+//! * **And its Quarter Stream ID.** A CONNECT-UDP session claims one before the
+//!   resolver is asked anything, so a refusal has to give the routing entry
+//!   back; a datagram named for a refused session is counted as dropped on the
+//!   closing line rather than delivered into a queue nobody reads.
 //! * **Exhaustion is quiet.** Nothing spins: with no client traffic at all the
 //!   server writes essentially nothing to its log, which a `socket()` retry loop
 //!   could not manage, and every refusal arrives inside [`REFUSAL_BOUND`].
@@ -52,9 +56,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::{
     connect_request, connect_udp_request, open_tcp_tunnel, open_udp_session, read_at_least,
-    respond_to, spawn_echo_target, spawn_udp_echo_target, udp_round_trip, ClientStream, H3Client,
-    Response, SharedBuffer, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    respond_to, send_and_respond, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
+    ClientStream, H3Client, Response, SharedBuffer, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
+use volto::datagram;
 use volto::h3api::{FieldValue, Status};
 
 /// Tunnel slots the connection under test is given.
@@ -325,13 +330,20 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     // And a CONNECT-UDP one, which RFC 9298 §3.1 makes the sharper case: the
     // socket is opened before the 2xx precisely so that a session that cannot
     // carry anything is refused instead of accepted and black-holed.
+    //
+    // The stream is kept rather than dropped, because its Quarter Stream ID is
+    // the third thing a refused session has to give back: the claim on the
+    // connection's datagram routing table, taken before the resolver is asked
+    // anything so that optimistically sent packets are not lost. What happens
+    // to a datagram named for it afterwards is asserted at the end of the run.
     let started = Instant::now();
-    let udp_refusal = respond_to(
+    let (udp_refusal, refused_udp) = send_and_respond(
         &mut client,
         connect_udp_request(server.addr, &udp_echo.ip().to_string(), udp_echo.port()),
     )
     .await;
     let elapsed = started.elapsed();
+    let refused_qsid = datagram::quarter_stream_id(refused_udp.id());
     assert_local_failure(&udp_refusal, "CONNECT-UDP under EMFILE");
     assert!(elapsed < REFUSAL_BOUND, "the refusal took {elapsed:?}");
 
@@ -466,4 +478,57 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         b"after!"
     );
     assert_eq!(client.goaway(), None, "the connection outlived every fault");
+
+    // --- The third thing a refused session held: its Quarter Stream ID. ---
+    //
+    // A session claims one before the resolver is asked anything, so a refusal
+    // has to give it back, and the only production-visible trace of that is the
+    // drop counter on the closing line (RFC 9298 §5 and RFC 9297 §2.1 both ask
+    // the router to drop such a datagram silently). A routing entry that
+    // outlived its refused session would deliver this into a queue nobody reads
+    // and count nothing.
+    //
+    // One datagram, and the run sends no other droppable one, so the closing
+    // line has to say exactly one.
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(refused_qsid, b"orphan"))
+        .expect("a datagram for a session that was refused");
+    // A fence: the round trip crosses the router after the datagram above, so
+    // the drop has been counted by the time the connection closes.
+    assert_eq!(
+        udp_round_trip(&client, live_qsid, b"fence").await.as_ref(),
+        b"fence"
+    );
+
+    let mark = log.mark();
+    client.quic.close(quinn::VarInt::from_u32(0), b"");
+
+    let line = log
+        .wait_for_line(
+            mark,
+            &[" INFO ", "connection closed", "reason=\"peer_close\""],
+        )
+        .await;
+    assert_eq!(
+        numeric_field(&line, "dropped_datagrams"),
+        1,
+        "the Quarter Stream ID of a refused session must route nowhere; line was:\n{line}"
+    );
+}
+
+/// Reads a numeric field's value off a formatted log line.
+///
+/// The reader `it_close_log` and `it_soak` use, and here for the same reason: a
+/// counter wired to the wrong source is present and wrong rather than absent.
+#[track_caller]
+fn numeric_field(line: &str, name: &str) -> u64 {
+    let rest = line
+        .split_once(&format!("{name}="))
+        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
+        .1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
 }
