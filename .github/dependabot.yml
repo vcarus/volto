@@ -1,10 +1,11 @@
 # Dependabot only touches registry dependencies and action versions.
 #
-# Three ecosystems are watched below: the crates in `Cargo.toml`, the pinned
-# GitHub Actions, and the Go module the `interop` job drives the server with.
-# The last one matters as much as the first: masque-go is the only independent
-# implementation this project is checked against, so an unwatched copy of it
-# would quietly age into agreeing with us by being too old to disagree.
+# Four ecosystems are watched below: the crates in `Cargo.toml`, the pinned
+# GitHub Actions, and the Go and Python modules the `interop` job drives the
+# server with. The last two matter as much as the first: masque-go and aioquic
+# are the independent implementations this project is checked against, so an
+# unwatched copy of either would quietly age into agreeing with us by being too
+# old to disagree.
 #
 # The `[patch.crates-io]` entry redirecting `quinn-proto` at a git commit is
 # outside its reach: Dependabot ignores git dependencies. It is meant to be
@@ -37,5 +38,12 @@ updates:
   # up by the runner too, not just the module requirements.
   - package-ecosystem: gomod
     directory: "/tests/interop"
+    schedule:
+      interval: weekly
+
+  # The aioquic client behind the same job's Python half, pinned in full in
+  # requirements.txt for the same reason.
+  - package-ecosystem: pip
+    directory: "/tests/interop/aioquic"
     schedule:
       interval: weekly

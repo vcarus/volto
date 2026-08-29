@@ -121,10 +121,12 @@ Integration tests assert on-wire behaviour — status codes, response headers, t
 actual bytes on the control stream — rather than internal state.
 
 Because that suite has volto on both ends, CI also runs a cross-implementation
-job that drives a real server with Go's
-[masque-go](https://github.com/quic-go/masque-go) client. The client lives in
-[tests/interop](tests/interop) and needs a Go toolchain plus a running server;
-see [docs/architecture.md](docs/architecture.md#testing).
+job that drives a real server with two independent clients: Go's
+[masque-go](https://github.com/quic-go/masque-go) for CONNECT-UDP and Python's
+[aioquic](https://github.com/aiortc/aioquic) for the plain CONNECT (TCP)
+tunnel. They live in [tests/interop](tests/interop) and need a Go toolchain and
+a Python interpreter plus a running server; see
+[docs/architecture.md](docs/architecture.md#testing).
 
 ## License
 

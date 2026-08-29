@@ -163,17 +163,18 @@ jobs:
           VOLTO_SCRUB_PATTERNS: ${{ secrets.VOLTO_SCRUB_PATTERNS }}
 
   interop:
-    # Cross-implementation check, and the only one there is. `cargo test` has
-    # volto on both ends: since HTTP/3 moved into `src/h3`, its client
-    # (`tests/common/h3client.rs`) is built on the server's own codec, so the two
-    # agree by construction even where both are wrong. Here a real volto process
-    # is driven by Go's quic-go/masque-go instead, which shares no code and no
-    # reading of the RFCs with it -- which makes this job more load-bearing than
-    # it was, not less.
+    # Cross-implementation checks. `cargo test` has volto on both ends: since
+    # HTTP/3 moved into `src/h3`, its client (`tests/common/h3client.rs`) is
+    # built on the server's own codec, so the two agree by construction even
+    # where both are wrong. Here a real volto process is driven by two clients
+    # that share no code, no QUIC stack and no reading of the RFCs with it or
+    # with each other: Go's quic-go/masque-go for CONNECT-UDP, and Python's
+    # aioquic -- the only one of the two that can speak plain CONNECT, so the
+    # TCP tunnel's independent coverage lives entirely in its half.
     #
     # Linux only: this is about the protocol on the wire, not about the host, and
     # the platform matrix is already covered by the `test` job above.
-    name: interop (masque-go)
+    name: interop (masque-go + aioquic)
     runs-on: ubuntu-latest
     env:
       # Loopback, so nothing outside the runner can reach this server for the
@@ -267,6 +268,22 @@ jobs:
         # being sent. The timeout is the backstop for a tunnel that hangs instead
         # of failing: `go test` then panics and the job fails.
         run: go test -v -count=1 -timeout 120s ./...
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/interop/aioquic/requirements.txt
+
+      - name: Drive it with aioquic
+        env:
+          VOLTO_CERT: ${{ github.workspace }}/interop-cert.pem
+        # The same server instance: every test opens its own QUIC connection, so
+        # nothing carries over from the Go half. The suite is its own runner and
+        # exits non-zero on the first assertion it cannot make.
+        run: |
+          pip install -r tests/interop/aioquic/requirements.txt
+          python tests/interop/aioquic/interop_test.py
 
       # Runs even when an earlier step failed, including before the server was
       # started, so neither file is assumed to exist. The log is the half of a

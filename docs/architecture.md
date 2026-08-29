@@ -511,12 +511,18 @@ the HTTP/3 client in `tests/common/h3client.rs` that drives it.
 
 One thing that suite cannot do is disagree with itself: that client is built on
 the same codec as the server, so a misreading of the framing or of QPACK is one
-both ends share. The `interop` CI job closes that gap by
-starting a real `volto` process and driving it with Go's
-[masque-go](https://github.com/quic-go/masque-go) on quic-go — an independent
-implementation — over the RFC 9298 default URI template, with authentication on
-and the server's certificate trusted rather than skipped. It asserts multi-round
-CONNECT-UDP echo on one session, three concurrent sessions on a single QUIC
-connection receiving only their own traffic, `Proxy-Status` on a refusal, and a
-407 when credentials are omitted. The client lives in `tests/interop/`, which is
-a Go module rather than a Rust test, so `cargo test` neither sees nor needs it.
+both ends share. The `interop` CI job closes that gap by starting a real
+`volto` process and driving it with two clients that share no code, no QUIC
+stack and no reading of the RFCs with it or with each other. Go's
+[masque-go](https://github.com/quic-go/masque-go) on quic-go speaks CONNECT-UDP
+over the RFC 9298 default URI template, with authentication on and the server's
+certificate trusted rather than skipped; it asserts multi-round echo on one
+session, three concurrent sessions on a single QUIC connection receiving only
+their own traffic, `Proxy-Status` on a refusal, and a 407 when credentials are
+omitted. Python's [aioquic](https://github.com/aiortc/aioquic) covers what
+masque-go cannot: the plain CONNECT (TCP) tunnel — round trips, two concurrent
+tunnels, and the RFC 9114 §4.4 half-close — plus a datagram carrying an unknown
+Context ID, which RFC 9298 requires to be dropped silently and which only a
+client that writes its own Context ID prefix can send. The clients live in
+`tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python script),
+so `cargo test` neither sees nor needs them.
