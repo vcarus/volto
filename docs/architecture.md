@@ -185,13 +185,22 @@ open is never on a timer at all, however long a write parks.
 
 The bound covers the parked *write* half of the problem and only that. A
 half-closed tunnel whose surviving direction is parked in a **read** — no bytes
-in either direction — is deliberately left alone, because a target that has taken
-the client's FIN may legitimately take minutes to answer and cutting it would
-break the half-closes this proxy exists to carry; what limits those is capacity
-rather than time, `max_connections` × `max_targets_per_conn` sockets. Without the
-write bound, a half-closed tunnel whose surviving peer stopped taking bytes held
-the target socket, its file descriptor and the tunnel slot until the QUIC
-connection ended — which this server's own keep-alives can postpone indefinitely.
+in either direction — is deliberately not put on a timer, because a target that
+has taken the client's FIN may legitimately take minutes to answer and cutting it
+would break the half-closes this proxy exists to carry; what limits those is
+capacity rather than time, `max_connections` × `max_targets_per_conn` sockets.
+Without the write bound, a half-closed tunnel whose surviving peer stopped taking
+bytes held the target socket, its file descriptor and the tunnel slot until the
+QUIC connection ended — which this server's own keep-alives can postpone
+indefinitely.
+
+Not on a timer is not unwatched. Such a tunnel still ends the moment the client
+says it wants no more of it: the response direction watches for the client's
+`STOP_SENDING` — the other half of what dropping a request stream sends — even
+while there is nothing to write, so a client that half-closed and then walked
+away releases the target socket and its tunnel slot at once rather than at the
+end of the QUIC connection. Only a client that is still waiting for an answer
+keeps a quiet half-closed tunnel alive.
 
 The last row cancels both directions because RFC 9114 §4.4 asks for it: "If the
 stream is reset or reading is aborted by the client, a proxy SHOULD perform the

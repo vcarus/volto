@@ -871,6 +871,71 @@ impl Writer {
         Ok(())
     }
 
+    /// Resolves when the peer stops this stream, or the connection under it
+    /// ends.
+    ///
+    /// The mirror of [`Reader::reset_by_peer`] on the sending half, and it
+    /// exists for the mirror of that reason. [`Self::send_data`] already reports
+    /// a `STOP_SENDING` -- it is the error a write fails with -- but only to a
+    /// caller that is writing, and a CONNECT tunnel spends much of its life not
+    /// writing: with the client's half of the tunnel finished and a target that
+    /// has yet to say anything, the pump is parked in a read of the *target*,
+    /// and nothing there watches the request stream. This is what such a read
+    /// can select on.
+    ///
+    /// # Why this one may be held across writes
+    ///
+    /// The future borrows nothing -- [`quinn::SendStream::stopped`] clones the
+    /// connection handle and the stream id into an owned future -- so a caller
+    /// builds it once, before its loop, and keeps polling the same one while
+    /// writing to the same stream through `&mut self`. That is the point: a
+    /// fresh future per iteration would take the connection lock on every pass,
+    /// where one that is kept registers once and is a bare `Notified` poll
+    /// afterwards.
+    ///
+    /// It is also why this is safe where `quinn::RecvStream::received_reset` is
+    /// not (that comparison, and the panic it caused, is on
+    /// [`Reader::reset_by_peer`]): quinn keeps no single-slot waker for it, but
+    /// a `Notify` per stream that the connection wakes and removes when the
+    /// stream is stopped or finished.
+    ///
+    /// Cancel-safe, so a `select!` may poll it and set it aside repeatedly.
+    ///
+    /// # What it resolves to
+    ///
+    /// Only endings. `Ok(Some(code))` is the peer's `STOP_SENDING` and is the
+    /// case this exists for; a lost connection is reported as such; and quinn's
+    /// `Ok(None)` -- the stream gone from the transport, which on a live tunnel
+    /// means this endpoint finished it and the peer acknowledged every byte --
+    /// is reported as this endpoint's own clean ending, since no peer said
+    /// anything. All three mean the same thing to a caller: nothing more will be
+    /// sent on this stream.
+    pub fn stopped(&self) -> impl std::future::Future<Output = StreamError> + Send + 'static {
+        let stopped = self.send.stopped();
+
+        async move {
+            match stopped.await {
+                Ok(Some(code)) => StreamError::RemoteTerminate {
+                    code: Code::new(code.into_inner()),
+                },
+                Ok(None) => StreamError::Local(Violation::stream(
+                    Code::H3_NO_ERROR,
+                    "the response stream is over",
+                )),
+                Err(quinn::StoppedError::ConnectionLost(error)) => {
+                    StreamError::Connection(error.into())
+                }
+                // 0-RTT, which this server never accepts (`quic::Server`
+                // answers every `Incoming` with `accept`, never `retry` into a
+                // 0-RTT acceptance), so there is no rejection to report.
+                Err(other) => StreamError::Local(Violation::stream(
+                    Code::H3_INTERNAL_ERROR,
+                    other.to_string(),
+                )),
+            }
+        }
+    }
+
     /// Abruptly resets the sending side with an error code.
     pub fn reset(&mut self, code: Code) {
         // Fails only if the stream is already finished or reset, which needs no

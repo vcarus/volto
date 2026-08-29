@@ -32,6 +32,15 @@
 //! whichever pump touches the socket next. Every one of those raises a teardown,
 //! and a teardown is what ends the other pump's wait.
 //!
+//! Those two arms cover a client that **resets** its request stream. A client
+//! that merely **stops reading** the response -- `STOP_SENDING`, which is half
+//! of what dropping a request stream sends -- is a signal on the other half of
+//! the stream, and `Writer::stopped` in `target_to_client` is what watches for
+//! it. It has to be watched rather than met by a write, because the two things
+//! that would otherwise notice can both be absent at once: the client's own FIN
+//! ends the opposite pump without raising a teardown, and a target that has yet
+//! to say anything leaves this pump nothing to write (D87).
+//!
 //! The first two rows of the table above take that watchdog away, because they
 //! are the two endings that end a direction *without* a teardown: the pump
 //! returns, and the surviving direction is left with nobody watching it. A
@@ -55,12 +64,18 @@
 //! are both still open is untouched however long a write parks, because there
 //! the other pump is still the watchdog.
 //!
-//! What nothing bounds is the surviving direction parked in a *read*. A target
-//! that has taken the client's FIN may legitimately take minutes to answer, and
-//! a bound there would cut the very half-closes this proxy exists to carry, so a
-//! half-closed tunnel with no traffic at all on it is deliberately left to run.
-//! What limits that is capacity rather than time: `max_connections` x
-//! `max_targets_per_conn` sockets, the product the fd budget is sized from.
+//! What nothing bounds *by time* is the surviving direction parked in a read. A
+//! target that has taken the client's FIN may legitimately take minutes to
+//! answer, and a bound there would cut the very half-closes this proxy exists to
+//! carry, so a half-closed tunnel with no traffic at all on it is deliberately
+//! left to run. What limits that is capacity rather than time:
+//! `max_connections` x `max_targets_per_conn` sockets, the product the fd budget
+//! is sized from.
+//!
+//! Left to run is not left unwatched, though, and the distinction is the whole
+//! of D87: such a tunnel ends the moment the client says it wants no more of it,
+//! however quiet the target stays. Only a client that is still waiting for an
+//! answer keeps one alive.
 
 use std::io;
 use std::net::SocketAddr;
@@ -598,6 +613,13 @@ async fn target_to_client(
     let budget = half.budget;
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
+    // Built once and kept, which is what makes it affordable: it borrows
+    // nothing, registers on its first poll and is a bare wake-up check
+    // afterwards, where one per iteration would take the connection's lock on
+    // every read. [`Writer::stopped`] says why keeping it is sound.
+    let stopped = writer.stopped();
+    tokio::pin!(stopped);
+
     // Both places that can notice a teardown -- the wait for the target's next
     // read and the write of the bytes already in hand -- end this direction
     // identically, so the reason is carried out of the loop and acted on once
@@ -609,6 +631,37 @@ async fn target_to_client(
             biased;
             reason = torn_down(&mut teardown_rx) => break reason,
             read = tcp_read.read_buf(&mut buf) => read,
+            // The third place a client abort can arrive, and the one the write
+            // arm below cannot cover: this read. RFC 9114 §4.4 -- "If the proxy
+            // detects that the client has reset the stream or aborted reading
+            // from the stream, it MUST close the TCP connection" -- is met by
+            // the *other* pump for as long as that pump exists, and by
+            // `send_data` failing for as long as there is something to send.
+            // Neither holds here: the client's own FIN ends the other pump
+            // without raising a teardown, and a target that has yet to say
+            // anything gives this one nothing to write. So a client that
+            // half-closed and then abandoned the tunnel -- which is what
+            // dropping a request stream is, a FIN and a STOP_SENDING -- left
+            // the target socket, its file descriptor and the tunnel slot held
+            // for the life of the QUIC connection (D87).
+            //
+            // Last in the order for the reason the watchers in
+            // `client_to_target` are: a read that is ready on its first poll
+            // never reaches this arm, so a busy tunnel never pays for it.
+            error = &mut stopped => {
+                match h3api::peer_reset_code(&error) {
+                    Some(code) => debug!(code, "client stopped reading the tunnel"),
+                    None => debug!(%error, "the response direction ended under the tunnel"),
+                }
+                // The same close the other client-abort paths arm, and for the
+                // same sentence of §4.4: the tunnel is being cut rather than
+                // seen through, so the target must not read a polite FIN off
+                // it. `abort_target` records what the two stacks make of that
+                // on a socket already in FIN_WAIT_2.
+                abort_target(tcp_read.as_ref());
+                let _ = teardown.send(Teardown::ClientAbort);
+                return;
+            }
         };
 
         match read {

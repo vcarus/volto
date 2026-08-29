@@ -912,6 +912,82 @@ async fn a_client_reset_closes_a_target_that_stopped_reading() {
     );
 }
 
+/// A TCP target that accepts a connection and then says nothing at all: it never
+/// reads, never writes, and never closes.
+///
+/// The one shape that leaves the proxy's target → client pump parked in its
+/// *read*, which is the third place a client abort can arrive and the one the two
+/// tests above cannot reach: [`park_both_pumps`] needs a target that floods, and
+/// a target that answers or closes ends the tunnel on its own. Nothing here is
+/// ever read from the socket, so the client's FIN reaches it and stops there.
+async fn spawn_mute_target() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        // Held rather than dropped: a closed socket would reach the proxy as the
+        // target's own EOF and end the tunnel for it.
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+
+    addr
+}
+
+/// The third pump position: a client that abandons a tunnel it has already
+/// half-closed.
+///
+/// Dropping a request stream is a FIN plus a `STOP_SENDING`, which is every
+/// signal a client has for "I am done with this request". The FIN ends the
+/// client → target pump — by design, it raises no teardown — so the only pump
+/// left is target → client, parked in a read of a target that will never speak.
+/// Nothing in that `select!` watched the request stream, so the `STOP_SENDING`
+/// was never seen:
+///
+/// RFC 9114 §4.4: "If the proxy detects that the client has reset the stream or
+/// aborted reading from the stream, it MUST close the TCP connection." The
+/// target socket, its file descriptor and the tunnel slot were held for the life
+/// of the QUIC connection instead.
+///
+/// The slot is what the leak is measured by, because it is what a leak costs a
+/// real client: with room for one tunnel, the next CONNECT is refused until the
+/// abandoned one is closed. The RST the same paragraph asks for is deliberately
+/// *not* asserted — the socket is in FIN_WAIT_2 by then, where Linux sends none;
+/// `tcp::abort_target` has the platform note.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_abandoned_after_its_own_fin_frees_its_slot() {
+    let server = TestServer::start_with(&format!(
+        "[limits]\nmax_targets_per_conn = 1\n{ALLOW_PRIVATE}"
+    ))
+    .await;
+    let target = spawn_mute_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // Opened and then abandoned whole: the drop finishes the sending side and
+    // stops the response direction, in that order or the other.
+    drop(open_tcp_tunnel(&mut client, &target.to_string()).await);
+
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut refusals = 0u32;
+    loop {
+        let response = respond_to(&mut client, connect_request(&target.to_string())).await;
+        if response.status == Status::OK {
+            return;
+        }
+        refusals += 1;
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the abandoned tunnel never gave up its slot: {refusals} CONNECTs refused with \
+             {:?} in {TIMEOUT:?}",
+            response.status
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The counterpart, and the regression that stops the reset above from leaking
 /// into the normal path: a client that finishes its sending side cleanly must
 /// still reach the target as a FIN, i.e. as a clean EOF.
