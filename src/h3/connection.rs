@@ -1729,6 +1729,100 @@ mod tests {
         );
     }
 
+    /// The same table with the router and the sessions running at once.
+    ///
+    /// Every test above drives it one step at a time, which is the one ordering
+    /// the server never produces: [`serve_peer`] routes datagrams on a task of
+    /// its own while the sessions on the connection claim and give up their
+    /// Quarter Stream IDs on theirs, so a delivery and a claim ending race by
+    /// construction. Three failures could hide in that race and all three are
+    /// silent -- a payload handed to the session next door, an entry left behind
+    /// by a receiver that was being delivered to as it dropped, and an id a
+    /// session cannot re-claim because its own entry outlived it -- so all three
+    /// are asserted rather than inferred from the table being the right size.
+    ///
+    /// Bounded on both sides: the sessions do a fixed number of rounds, and the
+    /// router stops on their last one or on its own deadline, whichever comes
+    /// first, so nothing here can spin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delivery_racing_registration_neither_misroutes_nor_leaks() {
+        const SESSIONS: u64 = 24;
+        const ROUNDS: usize = 128;
+
+        let shared = Arc::new(Shared::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicU64::new(0));
+
+        // The router: every id, over and over, whether or not anyone is there.
+        let router = tokio::spawn({
+            let shared = shared.clone();
+            let stop = stop.clone();
+            let sent = sent.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+                while !stop.load(Ordering::Relaxed) && tokio::time::Instant::now() < deadline {
+                    for id in 0..SESSIONS {
+                        // The payload names the session it is for, which is how
+                        // a misroute is told from an ordinary drop.
+                        shared.deliver(datagram(
+                            id,
+                            datagram::CONTEXT_ID_UDP_PAYLOAD,
+                            &id.to_be_bytes(),
+                        ));
+                        sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        // The sessions: each one opens, drains what it was given, and closes.
+        let sessions: Vec<_> = (0..SESSIONS)
+            .map(|id| {
+                let shared = shared.clone();
+                tokio::spawn(async move {
+                    let mut received = 0u64;
+                    for round in 0..ROUNDS {
+                        let mut inbound = shared.register_datagrams(id).unwrap_or_else(|| {
+                            panic!("session {id} could not re-claim its own id on round {round}")
+                        });
+                        while let Ok(payload) = inbound.inbound.try_recv() {
+                            assert_eq!(
+                                payload.as_ref(),
+                                id.to_be_bytes().as_slice(),
+                                "session {id} was handed another session's payload"
+                            );
+                            received += 1;
+                        }
+                        drop(inbound);
+                        tokio::task::yield_now().await;
+                    }
+                    received
+                })
+            })
+            .collect();
+
+        let mut received = 0u64;
+        for session in sessions {
+            received += session.await.expect("session task");
+        }
+        stop.store(true, Ordering::Relaxed);
+        router.await.expect("router task");
+
+        assert!(
+            shared.lock().is_empty(),
+            "an entry outlived the receiver that owned it"
+        );
+        assert!(
+            received > 0,
+            "nothing was ever routed, so the race was never run"
+        );
+        assert!(
+            received <= sent.load(Ordering::Relaxed),
+            "more payloads arrived than were ever sent"
+        );
+    }
+
     /// Both of the drops RFC 9297 §2.1 and RFC 9298 §5 call for, and the
     /// session surviving each of them.
     #[tokio::test]

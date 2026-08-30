@@ -1729,6 +1729,164 @@ mod tests {
         assert_eq!(budget.held(), 0);
     }
 
+    /// The same bound when every stream announces at the same instant.
+    ///
+    /// The test above walks the streams one at a time, which is the one order
+    /// that cannot show what [`BufferBudget::charge`] is written for: a peer
+    /// opens as many request streams as it likes and their HEADERS frames arrive
+    /// together, so the charges really do contend. `fetch_update` is what makes a
+    /// refused charge leave the counter alone -- an add-then-check would let two
+    /// streams failing at once each subtract the other's rolled-back bytes, and
+    /// the bound would then hold on average rather than at every instant.
+    ///
+    /// Four times as many streams as there is room for, all released from a
+    /// barrier, so the answer has to be exactly the number that fits however the
+    /// threads interleave. Bounded by construction: every thread does one charge
+    /// and stops.
+    #[test]
+    fn concurrent_charges_hold_the_budget_exactly() {
+        let budget = Arc::new(BufferBudget::default());
+        let fits = HEADERS_BUFFER_BUDGET / MAX_BUFFERED_FRAME as usize;
+        let streams = 4 * fits;
+
+        let start = std::sync::Barrier::new(streams);
+        let charged = std::sync::Mutex::new(Vec::new());
+        let refused = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            for _ in 0..streams {
+                scope.spawn(|| {
+                    // Everything but the charge itself happens before the
+                    // barrier, so what the threads contend on is the counter.
+                    let mut decoder = FrameDecoder::new(StreamKind::Request, budget.clone());
+                    let mut wire = BytesMut::new();
+                    put_header(&mut wire, HEADERS, MAX_BUFFERED_FRAME);
+                    decoder.push(wire.freeze());
+
+                    start.wait();
+                    match decoder.next_item() {
+                        // Charged, and the frame is still being held: the
+                        // decoder goes in the pile rather than being dropped,
+                        // which would give the share straight back.
+                        Ok(None) => charged.lock().expect("collector").push(decoder),
+                        Err(Error::Protocol(violation)) => {
+                            assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+                            assert!(!violation.is_connection_error());
+                            refused.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => {
+                            panic!("a frame that has not arrived cannot be complete: {other:?}")
+                        }
+                    }
+                });
+            }
+        });
+
+        let held = charged.into_inner().expect("collector");
+        assert_eq!(
+            held.len(),
+            fits,
+            "{} streams were charged where {fits} fit",
+            held.len()
+        );
+        assert_eq!(refused.load(Ordering::Relaxed), streams - fits);
+        assert_eq!(
+            budget.held(),
+            fits * MAX_BUFFERED_FRAME as usize,
+            "the refused charges left bytes behind"
+        );
+
+        drop(held);
+        assert_eq!(budget.held(), 0, "a share was not given back");
+    }
+
+    /// The counter the bound is read off is never seen above the bound.
+    ///
+    /// The other half of the same claim, and the half a barrier cannot show. A
+    /// charge and its refusal are three instructions apart, so streams released
+    /// together mostly still take the counter in turn; what really contends is a
+    /// connection whose streams are announcing and ending continuously, which is
+    /// what a peer opening request streams in a loop produces.
+    ///
+    /// An add-then-check charge is wrong there in a way that is invisible to the
+    /// arithmetic afterwards: the counter goes over the bound for as long as it
+    /// takes to roll the refused bytes back, and any stream that reads it in that
+    /// window is refused a frame the connection had room for -- a 431 to a client
+    /// that broke no rule. `fetch_update` never publishes the rejected value at
+    /// all, so a reader cannot see one.
+    ///
+    /// Bounded by construction twice over: every worker does a fixed number of
+    /// rounds, and the sampler stops on their last one or on its own deadline,
+    /// whichever comes first.
+    #[test]
+    fn a_refused_charge_is_never_visible_to_another_stream() {
+        /// Announces a full-sized frame, then lets the decoder go.
+        fn churn(budget: &Arc<BufferBudget>) {
+            let mut decoder = FrameDecoder::new(StreamKind::Request, budget.clone());
+            let mut wire = BytesMut::new();
+            put_header(&mut wire, HEADERS, MAX_BUFFERED_FRAME);
+            decoder.push(wire.freeze());
+            let _ = decoder.next_item();
+        }
+
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 4096;
+
+        let budget = Arc::new(BufferBudget::default());
+        let fits = HEADERS_BUFFER_BUDGET / MAX_BUFFERED_FRAME as usize;
+
+        // Most of the budget pinned, so the churn below sits on the boundary
+        // rather than well inside it and every round is a real decision.
+        let mut pinned = Vec::new();
+        for _ in 0..fits - 1 {
+            let mut decoder = FrameDecoder::new(StreamKind::Request, budget.clone());
+            let mut wire = BytesMut::new();
+            put_header(&mut wire, HEADERS, MAX_BUFFERED_FRAME);
+            decoder.push(wire.freeze());
+            assert!(matches!(decoder.next_item(), Ok(None)));
+            pinned.push(decoder);
+        }
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let seen = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                let mut worst = 0;
+                while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                    worst = worst.max(budget.held());
+                }
+                seen.store(worst, Ordering::Relaxed);
+            });
+
+            let workers: Vec<_> = (0..WORKERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        for _ in 0..ROUNDS {
+                            churn(&budget);
+                        }
+                    })
+                })
+                .collect();
+
+            for worker in workers {
+                worker.join().expect("worker");
+            }
+            stop.store(true, Ordering::Relaxed);
+            sampler.join().expect("sampler");
+        });
+
+        assert!(
+            seen.load(Ordering::Relaxed) <= HEADERS_BUFFER_BUDGET,
+            "the budget was seen holding {} bytes, past the {HEADERS_BUFFER_BUDGET} it may",
+            seen.load(Ordering::Relaxed)
+        );
+
+        drop(pinned);
+        assert_eq!(budget.held(), 0, "the churn left bytes behind");
+    }
+
     /// RFC 9114 §7.1: a stream that ends inside a frame is an error, and one
     /// that ends between them is the ordinary end of a request body.
     #[test]
