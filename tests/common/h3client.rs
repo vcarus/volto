@@ -332,34 +332,103 @@ impl H3Client {
         }
     }
 
+    /// Connects, tolerating a server that will not have this connection.
+    ///
+    /// [`H3Client::connect`] is the right call for a test whose subject is
+    /// something else: a handshake that does not happen is then a failure of the
+    /// test and says so, with the caller's location on it. This is for the one
+    /// caller whose subject *is* the handshake population --
+    /// `tests/it_replay.rs` on a lossy path, where the server refusing, evicting
+    /// or simply not completing a handshake is a result to be counted and
+    /// reported rather than a fault to abort on.
+    ///
+    /// `within` bounds the transport handshake, which is the half that waits on
+    /// the peer. Datagram support is advertised, as [`H3Client::connect`] does.
+    /// Nothing here is retried: one attempt, one outcome.
+    pub async fn try_connect_within(
+        server: &TestServer,
+        within: Duration,
+    ) -> Result<Self, NoClient> {
+        let endpoint = super::client_endpoint(&server.ca, &["h3"]);
+        let connecting = endpoint
+            .connect(server.addr, "localhost")
+            .expect("start connecting");
+
+        // Bounded, and safe to bound: giving up here drops a `Connecting`, which
+        // closes a connection that has no streams on it yet.
+        let connection = match tokio::time::timeout(within, connecting).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(error)) => return Err(NoClient::Lost(error)),
+            Err(_elapsed) => return Err(NoClient::TooSlow(within)),
+        };
+
+        // Deliberately *not* bounded. What is left is three `open_uni` calls and
+        // three short writes, none of which waits on the peer: the server's
+        // transport parameters grant sixteen unidirectional streams and a
+        // flow-control window vastly larger than the sixty-odd bytes written
+        // here, and both arrived with the handshake that has just completed. So
+        // this either finishes without a round trip or fails at once because the
+        // connection has gone. A bound would have to enforce itself by dropping
+        // the half-built client, and a dropped control stream *finishes* --
+        // handing the server the H3_CLOSED_CRITICAL_STREAM that
+        // [`H3Client::try_from_quic`] exists to keep off the wire.
+        Self::try_from_quic(endpoint, connection, true)
+            .await
+            .map_err(NoClient::Lost)
+    }
+
     /// Performs the client half of the HTTP/3 handshake on a live connection.
     async fn from_quic(
         endpoint: quinn::Endpoint,
         connection: quinn::Connection,
         datagrams: bool,
     ) -> Self {
+        Self::try_from_quic(endpoint, connection, datagrams)
+            .await
+            .expect("the client half of the HTTP/3 handshake")
+    }
+
+    /// [`H3Client::from_quic`] for a connection that may not survive it.
+    ///
+    /// The connection is closed rather than dropped on the way out of a failure,
+    /// and the reason is a rule the replay's central assertion depends on: a
+    /// dropped [`quinn::SendStream`] *finishes*, so letting a half-built client
+    /// fall out of scope would put a FIN on the control stream, which RFC 9114
+    /// §6.2.1 makes a connection error of type H3_CLOSED_CRITICAL_STREAM. The
+    /// server would be right to report it, and a run that manufactured it would
+    /// be accusing the server of a fault of the harness's own making.
+    async fn try_from_quic(
+        endpoint: quinn::Endpoint,
+        connection: quinn::Connection,
+        datagrams: bool,
+    ) -> Result<Self, quinn::ConnectionError> {
         // The control stream first, so a server reading streams in the order
         // they arrive sees SETTINGS before anything else.
-        let mut control = connection
-            .open_uni()
-            .await
-            .expect("open the client control stream");
-        control
-            .write_all(&control_preface(datagrams))
-            .await
-            .expect("send the client SETTINGS");
+        let mut control = match connection.open_uni().await {
+            Ok(control) => control,
+            Err(error) => return Err(abandon(&connection, error)),
+        };
+        if let Err(error) = control.write_all(&control_preface(datagrams)).await {
+            return Err(abandon(&connection, write_error_cause(&connection)(error)));
+        }
 
         // Nothing is ever written to these beyond their type: with a zero table
         // capacity there are no QPACK instructions to send. They exist because
         // every deployed client opens them, so the server is driven the way a
         // real one drives it.
-        let encoder = open_typed(&connection, STREAM_QPACK_ENCODER).await;
-        let decoder = open_typed(&connection, STREAM_QPACK_DECODER).await;
+        let encoder = match try_open_typed(&connection, STREAM_QPACK_ENCODER).await {
+            Ok(stream) => stream,
+            Err(error) => return Err(abandon(&connection, error)),
+        };
+        let decoder = match try_open_typed(&connection, STREAM_QPACK_DECODER).await {
+            Ok(stream) => stream,
+            Err(error) => return Err(abandon(&connection, error)),
+        };
 
         let peer = Arc::new(Peer::default());
         let driver = tokio::spawn(drive(connection.clone(), peer.clone()));
 
-        Self {
+        Ok(Self {
             send: SendRequest {
                 quic: connection.clone(),
                 peer,
@@ -370,8 +439,45 @@ impl H3Client {
             endpoint,
             _streams: [control, encoder, decoder],
             driver,
+        })
+    }
+}
+
+/// Why [`H3Client::try_connect_within`] produced no client.
+///
+/// The two are kept apart because they are different findings. `Lost` is the
+/// server having decided something -- a refusal at the connection limit, an
+/// eviction, a handshake it gave up on -- and carries which. `TooSlow` is the
+/// path: nothing was decided, the bytes simply did not get there in time.
+#[derive(Debug)]
+pub enum NoClient {
+    /// The connection ended before there was an HTTP/3 client on it.
+    Lost(quinn::ConnectionError),
+    /// Neither handshake finished within the bound.
+    TooSlow(Duration),
+}
+
+impl std::fmt::Display for NoClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Lost(error) => write!(f, "{error}"),
+            Self::TooSlow(within) => write!(f, "no handshake within {within:?}"),
         }
     }
+}
+
+/// Closes a connection whose HTTP/3 handshake will not be finished, and reports
+/// why. See [`H3Client::try_from_quic`].
+fn abandon(
+    connection: &quinn::Connection,
+    error: quinn::ConnectionError,
+) -> quinn::ConnectionError {
+    // Code 0 is what this client's plain endings use, so an abandoned
+    // half-handshake is indistinguishable on the wire from a peer that changed
+    // its mind -- which is exactly what it is. A connection already closed
+    // ignores this.
+    connection.close(quinn::VarInt::from_u32(0), b"");
+    error
 }
 
 impl Drop for H3Client {
@@ -823,18 +929,48 @@ fn control_preface(datagrams: bool) -> BytesMut {
 
 /// Opens a unidirectional stream and writes its type (RFC 9114 §6.2).
 async fn open_typed(connection: &quinn::Connection, stream_type: u64) -> quinn::SendStream {
-    let mut send = connection
-        .open_uni()
+    try_open_typed(connection, stream_type)
         .await
-        .expect("open a unidirectional stream");
+        .expect("open a unidirectional stream")
+}
+
+/// [`open_typed`] for a connection that may go away underneath it.
+///
+/// A connection evicted between its QUIC handshake and its HTTP/3 one takes
+/// these streams with it, which is a result on a path that stretches the gap
+/// between the two and not a fault of the client. See
+/// [`H3Client::try_connect_within`].
+async fn try_open_typed(
+    connection: &quinn::Connection,
+    stream_type: u64,
+) -> Result<quinn::SendStream, quinn::ConnectionError> {
+    let mut send = connection.open_uni().await?;
 
     let mut header = BytesMut::new();
     put_varint(&mut header, stream_type);
     send.write_all(&header)
         .await
-        .expect("write the stream type");
+        .map_err(write_error_cause(connection))?;
 
-    send
+    Ok(send)
+}
+
+/// The connection error behind a failed write, or the connection's own.
+///
+/// `quinn::WriteError` carries `ConnectionLost(ConnectionError)` for the case
+/// that matters here -- the peer went away mid-handshake -- and several
+/// stream-local ones that cannot arise on a stream nothing else has touched.
+/// Those fall back to whatever the connection itself reports, and to a
+/// locally-closed report if it reports nothing.
+fn write_error_cause(
+    connection: &quinn::Connection,
+) -> impl FnOnce(quinn::WriteError) -> quinn::ConnectionError + '_ {
+    move |error| match error {
+        quinn::WriteError::ConnectionLost(error) => error,
+        _ => connection
+            .close_reason()
+            .unwrap_or(quinn::ConnectionError::LocallyClosed),
+    }
 }
 
 /// Accepts the server's unidirectional streams for the life of the connection.
