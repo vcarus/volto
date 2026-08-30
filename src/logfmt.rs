@@ -27,6 +27,16 @@
 //! them can write into the journal. Length and provenance are separate
 //! concerns, and both apply to the same fields -- `bounded` does not escape
 //! anything, and recording its result with `%` would undo the third rule.
+//!
+//! Some peer bytes have no field of their own to be recorded in: they arrive
+//! already inside somebody else's `Display`, and the log sees only the sentence
+//! they ended up in -- a QUIC close reason phrase inside the error the closing
+//! line reports, say. The sigil cannot save those, because by the time the sigil
+//! is chosen the peer's bytes are already part of a value that formats itself.
+//! [`escaped_bytes`] is the answer for them: applied where the peer's bytes
+//! enter the value rather than where the value is logged, it applies both rules
+//! at once and hands back something the rest of the program may print with
+//! `Display` from then on.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -100,6 +110,32 @@ pub fn bounded_bytes(token: &[u8]) -> Cow<'_, str> {
     Cow::Owned(truncated(&head, token.len()))
 }
 
+/// [`bounded_bytes`] with the escaping applied too, for peer bytes that will be
+/// printed with `Display`.
+///
+/// The rest of this module divides the work: `bounded` cuts, and the recording
+/// sigil escapes. That division needs a *field* to record, and some peer bytes
+/// never get one -- a QUIC close reason phrase is inside `quinn`'s error by the
+/// time this server sees it, and the closing line in [`crate::quic`] records the
+/// whole error with `%`. Escaping at the call site is not available there, and
+/// choosing `?` instead would change how every other error on that line reads.
+///
+/// So both rules are applied here instead, once, where the peer's bytes enter
+/// the value: the result is quoted and `Debug`-escaped, so a newline in it stays
+/// on the one line and cannot forge a journal entry, and it carries the same
+/// length bound as everything else a peer writes into a log.
+///
+/// ```
+/// # use volto::logfmt::escaped_bytes;
+/// assert_eq!(escaped_bytes(b"unexpected frame"), "\"unexpected frame\"");
+/// assert!(!escaped_bytes(b"a\nb").contains('\n'));
+/// ```
+pub fn escaped_bytes(token: &[u8]) -> String {
+    // `Debug` for `Cow<str>` forwards to the `str`'s, which is the quoted,
+    // control-character-escaping spelling tracing gives a `str` field.
+    format!("{:?}", bounded_bytes(token))
+}
+
 /// How a token that had to be cut is spelled: its head, and its real length.
 fn truncated(head: &str, whole: usize) -> String {
     format!("{head}... <truncated from {whole} bytes>")
@@ -131,7 +167,7 @@ pub fn or_dash<T: fmt::Display>(value: Option<T>) -> impl fmt::Display {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded, bounded_bytes, or_dash, ABSENT};
+    use super::{bounded, bounded_bytes, escaped_bytes, or_dash, ABSENT};
     use std::net::SocketAddr;
 
     /// A value present prints as itself, with no wrapper and no quotes.
@@ -224,5 +260,30 @@ mod tests {
             "a huge user-id costs a bounded log line, and says how huge it was"
         );
         assert!(logged.len() < 80, "{logged}");
+    }
+
+    /// Both rules at once, for the bytes that reach a line inside somebody
+    /// else's `Display` and so have no sigil of their own.
+    #[test]
+    fn escaped_bytes_bounds_and_escapes() {
+        assert_eq!(escaped_bytes(b"unexpected frame"), "\"unexpected frame\"");
+
+        // The attack the escaping is for: systemd splits on `\n`, so a raw one
+        // would end the line and start a forged entry.
+        let forged = escaped_bytes(b"bye\nINFO volto: all is well");
+        assert!(!forged.contains('\n'), "{forged}");
+        assert!(forged.contains("bye"), "{forged}");
+
+        // A carriage return and an escape are the other two a terminal or a log
+        // reader acts on; neither survives as itself.
+        let control = escaped_bytes(b"a\r\x1b[2Jb");
+        assert!(
+            !control.contains('\r') && !control.contains('\x1b'),
+            "{control}"
+        );
+
+        let long = escaped_bytes(&vec![b'r'; 4096]);
+        assert!(long.len() < 80, "{long}");
+        assert!(long.contains("4096"), "{long}");
     }
 }

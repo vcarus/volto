@@ -230,18 +230,46 @@ pub enum ConnectionError {
 }
 
 impl From<quinn::ConnectionError> for ConnectionError {
-    /// Keeps exactly the two cases [`crate::h3api::benign_close`] grades on.
+    /// Keeps exactly the two cases [`crate::h3api::benign_close`] grades on, and
+    /// takes the peer's prose apart from its verdict on the way.
     ///
     /// `LocallyClosed` deliberately stays in `Transport`: this server closes a
     /// connection only for a reason worth reporting (a protocol violation, or
     /// the authentication-failure budget), so it must not be filed alongside a
     /// peer's clean goodbye.
+    ///
+    /// # The reason phrase
+    ///
+    /// Both kinds of QUIC close carry a reason phrase (RFC 9000 §19.19), and it
+    /// is whatever bytes the peer felt like sending -- bounded only by the
+    /// packet that carried it, and reaching this endpoint from anybody who can
+    /// complete a handshake, authenticated or not. It ends up in a production
+    /// log line: [`crate::quic`] records the whole error with `%` on the `WARN`
+    /// that closes a connection that ended badly, and `Display` escapes nothing.
+    /// A newline in there is a journal entry of the peer's own composition,
+    /// attributed to this server, and a kilobyte of prose is a kilobyte of
+    /// journal per handshake.
+    ///
+    /// The application half never had the problem: only the code survives the
+    /// conversion, because [`crate::h3api::benign_close`] grades on the code and
+    /// nothing downstream wanted the text. The transport half keeps quinn's
+    /// error whole, which is worth keeping -- a peer's QUIC stack says useful
+    /// things there -- so the phrase is bounded and escaped in place instead,
+    /// where the peer's bytes enter this type rather than where they are logged
+    /// (the same point [`crate::auth`] cuts a claimed user-id at, and for the
+    /// same reason).
     fn from(error: quinn::ConnectionError) -> Self {
         match error {
             quinn::ConnectionError::ApplicationClosed(close) => Self::ApplicationClose {
                 code: Code::new(close.error_code.into_inner()),
             },
             quinn::ConnectionError::TimedOut => Self::Timeout,
+            quinn::ConnectionError::ConnectionClosed(close) => Self::Transport(
+                quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                    reason: crate::logfmt::escaped_bytes(&close.reason).into(),
+                    ..close
+                }),
+            ),
             other => Self::Transport(other),
         }
     }
@@ -402,6 +430,68 @@ mod tests {
         let text = error.to_string();
         assert!(text.contains("ApplicationClose"), "{text}");
         assert!(!text.contains("Timeout"), "{text}");
+    }
+
+    /// A peer's *transport* close carries prose the peer wrote, and this type's
+    /// `Display` is what `quic.rs` records with `%error` on the `WARN` that ends
+    /// a connection. `Display` escapes nothing, and systemd splits a service's
+    /// stdout on `\n`, so a reason phrase reaching that line whole hands any peer
+    /// that can complete a handshake a journal entry of its own -- forged,
+    /// attributed to this server, and free.
+    ///
+    /// The peer's own words are still worth having, so they are kept: bounded and
+    /// `Debug`-escaped where they enter this type, which is the same division of
+    /// labour `logfmt` states and `auth` already applies to a claimed user-id.
+    #[test]
+    fn a_peer_transport_close_cannot_forge_a_log_line() {
+        let forged = "bye\nINFO volto: authentication succeeded for admin";
+        let error = ConnectionError::from(quinn::ConnectionError::ConnectionClosed(
+            quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::PROTOCOL_VIOLATION,
+                frame_type: None,
+                reason: bytes::Bytes::from(forged),
+            },
+        ));
+
+        let text = error.to_string();
+        assert!(
+            !text.contains('\n') && !text.contains('\r'),
+            "a peer's reason phrase must not be able to start a journal line: {text:?}"
+        );
+        // The head survives, so the phrase is still a diagnostic.
+        assert!(text.contains("bye"), "{text:?}");
+    }
+
+    /// The same phrase, at the length a peer may actually send: the reason is
+    /// bounded only by the QUIC packet that carries it, so an unbounded copy is
+    /// a kilobyte of journal per handshake as well as an injection.
+    #[test]
+    fn a_peer_transport_close_reason_is_bounded() {
+        let error = ConnectionError::from(quinn::ConnectionError::ConnectionClosed(
+            quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::PROTOCOL_VIOLATION,
+                frame_type: None,
+                reason: bytes::Bytes::from(vec![b'r'; 4096]),
+            },
+        ));
+
+        let text = error.to_string();
+        // The bulk of what is left is quinn's own prose for the error code,
+        // which is a constant; what the peer chose is the part that has to stop
+        // growing.
+        assert!(
+            !text.contains(&"r".repeat(33)),
+            "the peer's phrase is unbounded: {text:?}"
+        );
+        assert!(
+            text.len() < 256,
+            "one close must not buy {} bytes of journal: {text:?}",
+            text.len()
+        );
+        assert!(
+            text.contains("4096"),
+            "the real length is the fact: {text:?}"
+        );
     }
 
     #[test]
