@@ -165,6 +165,11 @@ pub struct Context {
     /// Only the sending half: an inbound datagram is routed to the request
     /// stream it names by the HTTP/3 connection, and reaches a session through
     /// the [`h3api::DatagramReceiver`] that stream handed it (D79).
+    ///
+    /// Named for what nearly every use of it is. The two that are not are the
+    /// connection-wide decisions a request can reach: closing after repeated
+    /// authentication failures, and raising the stream allowance once one
+    /// succeeds (`Context::mark_authenticated`).
     pub datagrams: quinn::Connection,
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
@@ -196,6 +201,10 @@ pub struct Context {
     /// request sets this too -- the flag means "this peer got past the door",
     /// not "credentials were seen".
     ///
+    /// Its transition is load-bearing as well as its value: the false-to-true
+    /// edge is what raises this connection's bidirectional stream allowance to
+    /// the configured one, exactly once. See `Context::mark_authenticated`.
+    ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
     /// from outside the connection as well: the accept loop needs to know which
     /// of the connections it is holding has never got past the door, so that a
@@ -208,6 +217,16 @@ pub struct Context {
     pub policy: Arc<Policy>,
     /// How many tunnels this connection may hold open at once.
     pub quota: Arc<Quota>,
+    /// The bidirectional stream allowance this connection is granted once it
+    /// has authenticated: `[limits] max_streams_bidi`, in full.
+    ///
+    /// It is not what the handshake advertised. A connection is accepted on the
+    /// small allowance `quic::INITIAL_BIDI_STREAMS` describes and raised to this
+    /// by `Context::mark_authenticated`, so the number is carried here for the
+    /// one moment it is needed — snapshotted with the rest of this connection's
+    /// `[limits]`, so a reload changes what connections accepted from then on
+    /// are worth and leaves a running one alone.
+    pub max_streams_bidi: u32,
     /// How many tunnels this connection has been granted a slot for so far.
     ///
     /// Counted once per request that gets past [`Quota::acquire`], TCP and
@@ -292,6 +311,7 @@ impl Context {
             auth: Arc::new(Authenticator::new(&config.auth)),
             policy: Arc::new(Policy::new(&config.security)),
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
+            max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
             idle_timeout: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
@@ -364,8 +384,25 @@ impl Context {
     /// [`AuthFailures`]. `None` means there was nothing to check — no users are
     /// configured — so there is no user's bucket to clear, and no failure can
     /// have been recorded either.
+    ///
+    /// # The stream allowance
+    ///
+    /// This is also where a connection stops being worth
+    /// `quic::INITIAL_BIDI_STREAMS` request streams and becomes worth
+    /// `[limits] max_streams_bidi` of them. A `swap` rather than a `store`
+    /// because that raise must happen exactly once: every CONNECT on this
+    /// connection carries credentials and so arrives here, and the request
+    /// tasks run concurrently, so the flag going from false to true is the only
+    /// thing that names one of them the first. Every later success takes the
+    /// same path and grants nothing, which is what it means for the allowance
+    /// to be a property of the connection rather than of the request.
+    ///
+    /// Done before the failure counters below rather than after, so this holds
+    /// no lock of ours while it takes quinn's.
     pub(crate) fn mark_authenticated(&self, username: Option<&str>) {
-        self.authenticated.store(true, Ordering::Relaxed);
+        if !self.authenticated.swap(true, Ordering::Relaxed) {
+            crate::quic::admit_configured_streams(&self.datagrams, self.max_streams_bidi);
+        }
 
         let mut failures = self.auth_failures();
 

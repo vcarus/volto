@@ -10,7 +10,7 @@ mod common;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use common::rawstream::{assert_closed_with, read_frame, status_of, stopped_code};
+use common::rawstream::{assert_closed_with, authenticate, read_frame, status_of, stopped_code};
 use common::{
     auth_section, authorized_connect, connect_quic, connect_request, open_tcp_tunnel,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
@@ -838,10 +838,24 @@ async fn announce_oversized_headers(
 /// stream breaks a rule of its own — so the bound that has to catch this is the
 /// one on their sum, and what it catches is the request rather than the
 /// connection carrying it (D77).
+///
+/// Authenticated first, because the budget is now only *reachable* there. An
+/// unauthenticated connection is held to `quic::INITIAL_BIDI_STREAMS` request
+/// streams at once, and sixteen full-sized field sections are exactly the
+/// budget — so a peer that has proved nothing can meet it and never overshoot
+/// it, and this test's twenty streams cannot all be open. That is the clamp
+/// doing D77's job before D77 is asked, not D77 becoming untestable: what still
+/// has to hold is the budget on a connection with the configured 1024 streams
+/// to spend, which is what this now measures.
 #[tokio::test(flavor = "multi_thread")]
 async fn headers_buffered_across_a_connection_are_bounded() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
+
+    // No `[auth]` users on this server, so any completed request opens the
+    // door. It costs the budget nothing: the frame it charges is complete
+    // before the announcements below start.
+    authenticate(&connection, None).await;
 
     assert_eq!(
         volto::h3::HEADERS_BUFFER_BUDGET / volto::h3::MAX_FIELD_SECTION_SIZE as usize,

@@ -23,7 +23,9 @@ them — only RFC 9114 itself.
 `quic.rs` owns the quinn endpoint. Transport parameters come from `[limits]`, so
 the stream cap, idle timeout, keep-alive, MTU settings, congestion controller and
 initial RTT are configuration rather than constants; they apply to connections
-accepted from then on, including across a SIGHUP reload.
+accepted from then on, including across a SIGHUP reload. The stream cap is the
+one of them that does not reach the handshake as itself; what an unauthenticated
+connection is worth is further down this section.
 
 The UDP socket underneath is bound here rather than by `quinn::Endpoint::server`,
 which is a bare `std::net::UdpSocket::bind` and never sets `SO_RCVBUF`/`SO_SNDBUF`
@@ -103,6 +105,23 @@ which is not an error and is logged as the idle ending it is; a lapsed HEADERS
 bound resets that one stream with `H3_REQUEST_INCOMPLETE` and a lapsed response
 write resets it with `H3_REQUEST_CANCELLED`, leaving everything else on the
 connection running.
+
+That bound is on time. The second one on an unauthenticated connection is on
+size, and it is a transport parameter: the handshake advertises 16 concurrent
+bidirectional streams (`INITIAL_BIDI_STREAMS`) rather than the configured
+`limits.max_streams_bidi`, and the first request to pass the credentials check
+raises the connection to the configured value in one step. Before it, a peer that
+has proved nothing holds at most 16 request streams — 16 parked request tasks and
+16 refusals to write, where 1024 of each were free — and its whole HEADERS
+buffering is bounded twice over by the same number, since 16 field sections at the
+64 KiB per-frame cap are exactly the 1 MiB budget below. Running into the
+allowance is backpressure rather than an error: the peer's own stack holds the
+stream, and closing streams returns credit before authentication as after it. A
+client that fires more than 16 CONNECTs at once therefore waits for the raise,
+which happens before its first request has resolved a name or opened a socket, so
+what it waits is the round trip it was already waiting for that first answer. An
+operator who configures fewer than 16 gets what they configured throughout: the
+clamp only ever lowers.
 
 That bound holds one connection; it does not bound how many of the
 `limits.max_connections` slots unauthenticated peers hold between them, and a
@@ -450,7 +469,10 @@ are untouched. A CONNECT request with credentials is a few hundred bytes, so
 every request stream the transport allows could be mid-HEADERS at once and still
 be using a tenth of the budget — what reaches it is sixteen field sections of the
 largest advertised size in flight together, and the seventeenth of those is what
-is refused. Only frames that are legal where they arrived are counted, since the
+is refused. Sixteen streams at once is also the whole of what an unauthenticated
+connection may hold, so a peer that has proved nothing can meet this budget and
+never overshoot it: the 431 belongs to a connection past the credentials check,
+and against such a connection's 1024 streams it is the only thing standing. Only frames that are legal where they arrived are counted, since the
 type verdict comes first: a peer cannot hold the budget with PUSH_PROMISE frames
 on request streams, nor with field sections announced on tunnels that may carry
 none. The peer's control stream is not counted in it either: there is one of it

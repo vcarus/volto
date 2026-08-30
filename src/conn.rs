@@ -84,6 +84,11 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 /// (review C1'). Nothing legitimate is near it: a client that has just
 /// completed two handshakes sends its first request within a round trip.
 ///
+/// The deadline bounds how long such a connection may last; what bounds how
+/// much of this server it may occupy while it does is a second, transport-level
+/// clamp on its request streams (`quic::INITIAL_BIDI_STREAMS`), lifted by the
+/// same request that lifts this one.
+///
 /// `resolver` is the server's blocking-pool allowance; the connection takes its
 /// own view of it here, which is what bounds the threads its name lookups can
 /// hold (D90).
@@ -323,6 +328,14 @@ impl From<Result<Option<h3api::Resolver>, h3api::ConnectionError>> for NextReque
 /// deadline absolute so that it could not be *rearmed*; this is what stops it
 /// being stepped over (adversarial pass 2026-08-29).
 ///
+/// A peer under the pre-authentication clamp (`quic::INITIAL_BIDI_STREAMS`) can
+/// no longer keep a supply of that depth: the configured allowance does not
+/// reach it at all, and sixteen streams' worth of credit comes back three at a
+/// time. That makes this the second line rather than the first, and it stays,
+/// because hard to reach is not the same as unreachable -- the clamp is lifted
+/// by authentication and the deadline exists only until authentication, so
+/// neither can be the other's proof.
+///
 /// So the clock is read before each wait. The cost is one `Instant::now()` per
 /// accepted stream, and only while the connection has yet to authenticate.
 async fn next_request(
@@ -397,7 +410,10 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
         Ok(Some(username)) => {
             // Lifts D76's bound for the rest of this connection's life: the peer
             // has proved who it is, and may now hold the connection idle for as
-            // long as the transport allows.
+            // long as the transport allows -- and, on the first request to get
+            // here, raises the connection's request-stream allowance from the
+            // handshake's clamp to the configured one. Both are the same door,
+            // so both are opened in one place.
             context.mark_authenticated(Some(username));
             debug!(stream_id, username, "request authenticated");
         }

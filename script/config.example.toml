@@ -120,12 +120,18 @@ users = [
 # them to new connections; connections already open keep what they negotiated at
 # handshake time, because QUIC cannot renegotiate transport parameters.
 
-# Concurrent bidirectional streams one QUIC connection may open — one per tunnel.
+# Concurrent bidirectional streams one QUIC connection may open — one per tunnel
+# — once a request on it has passed the credentials check.
 # quinn's own default of 100 runs out during ordinary browsing, since Surge
 # multiplexes every proxied TCP connection onto a single QUIC connection.
+# This is not what the handshake advertises. A connection is accepted on a fixed
+# allowance of 16 and granted this one in a single step by its first
+# authenticated request, so a peer that has proved nothing cannot open a thousand
+# request streams and draw a refusal on each.
 # Raise it with care: a stream slot is reserved for every unit of the credit when
-# a connection is created, not when a stream is opened, so this is work every
-# handshake pays for — about 11 ms at 1024 and 7 seconds at a million.
+# the allowance is granted, not when a stream is opened, so this is work paid in
+# one go — about 11 ms at 1024 and 7 seconds at a million — by the connection's
+# first authenticated request rather than by every handshake.
 # Range: 1..65536
 # Default: 1024
 #max_streams_bidi = 1024

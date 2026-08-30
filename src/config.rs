@@ -444,11 +444,18 @@ pub struct Limits {
     /// addresses, so both tunnel kinds see the same order; see
     /// [`IpFamilyPreference`] for why the default departs from the resolver's.
     pub ip_family_preference: IpFamilyPreference,
-    /// Concurrent client-initiated bidirectional streams per QUIC connection.
+    /// Concurrent client-initiated bidirectional streams per QUIC connection,
+    /// once a request on it has passed the credentials check.
+    ///
+    /// Not what the handshake advertises: a connection is accepted on the
+    /// smaller `quic::INITIAL_BIDI_STREAMS` and raised to this by its first
+    /// authenticated request, so an unauthenticated peer is never worth the
+    /// configured value.
     ///
     /// Between 1 and 65536. The ceiling is not a formality: the credit is
-    /// reserved slot by slot when a connection is created rather than when a
-    /// stream is opened, so it is work every handshake pays for.
+    /// reserved slot by slot when the allowance is granted rather than when a
+    /// stream is opened, so it is work paid in one go — at the first
+    /// authentication now, and at every handshake before the clamp.
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
     ///

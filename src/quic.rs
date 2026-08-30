@@ -82,7 +82,14 @@ fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
 /// gets and what an attacker can make this process hold.
 fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportConfig> {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_concurrent_bidi_streams(VarInt::from_u32(limits.max_streams_bidi));
+
+    // Deliberately *not* `limits.max_streams_bidi`: that is what an
+    // authenticated connection gets, and it is granted in one step by
+    // [`admit_configured_streams`] the first time a request on the connection
+    // passes the credentials check. What goes into the transport parameters is
+    // the small allowance a peer that has proved nothing starts on; see
+    // [`INITIAL_BIDI_STREAMS`].
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(initial_bidi_streams(limits)));
 
     // Stated rather than inherited: HTTP/3 needs three of these and quinn's
     // default allows a hundred; see [`MAX_PEER_UNI_STREAMS`].
@@ -147,6 +154,34 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     transport.congestion_controller_factory(congestion_factory(limits.congestion_control));
 
     Ok(transport)
+}
+
+/// The bidirectional stream allowance a connection is accepted with.
+///
+/// A `min` rather than a flat constant, so that an operator who configures fewer
+/// than [`INITIAL_BIDI_STREAMS`] gets what they configured and not more —
+/// before authentication as well as after it. Nothing here can raise the
+/// configured value; the clamp only ever lowers it.
+fn initial_bidi_streams(limits: &crate::config::Limits) -> u32 {
+    limits.max_streams_bidi.min(INITIAL_BIDI_STREAMS)
+}
+
+/// Grants a connection the configured bidirectional stream allowance.
+///
+/// The other half of [`INITIAL_BIDI_STREAMS`], called once per connection by
+/// [`crate::tunnel::Context::mark_authenticated`] — the one place both ways of
+/// getting past the door meet. It lives here rather than there so that the two
+/// values a connection's stream allowance can take are stated in the same file
+/// as each other, next to the reasoning that pairs them.
+///
+/// quinn spells the two directions differently — `max_concurrent_bidi_streams`
+/// on `TransportConfig`, `set_max_concurrent_bi_streams` on `Connection` — and
+/// they are the same parameter. Raising it allocates the new stream slots and
+/// queues a MAX_STREAMS frame, which reaches the peer on the next packet this
+/// connection sends: in practice the one carrying the response to the request
+/// that just authenticated.
+pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bidi: u32) {
+    quic.set_max_concurrent_bi_streams(VarInt::from_u32(max_streams_bidi));
 }
 
 /// The quinn congestion controller factory named by `[limits] congestion_control`.
@@ -1351,6 +1386,63 @@ const FD_HEADROOM: u64 = 64;
 /// limit beside it has been a configuration key all along (review L3).
 const MAX_PEER_UNI_STREAMS: u32 = 16;
 
+/// Bidirectional streams a peer may have open before it has authenticated.
+///
+/// `[limits] max_streams_bidi` is what an authenticated connection is worth —
+/// one stream per tunnel, 1024 of them by default — and it used to be what the
+/// transport parameters advertised at the handshake, which handed it to every
+/// peer that could complete one. So a client that had proved nothing could open
+/// 1024 request streams at once and draw a 407 on each: 1024 parked request
+/// tasks and 1024 refusals written for a peer with no credentials. Neither
+/// bound that already applied there is a bound on *concurrency* — D77's 1 MiB
+/// HEADERS budget bounds bytes buffered, D76's absolute deadline bounds time —
+/// so nothing measured the one quantity that was free.
+///
+/// It is also work this process pays for at the wrong moment. quinn reserves a
+/// stream slot for every unit of the allowance when the connection is
+/// *created*, not when a stream is opened (see `docs/configuration.md`), so the
+/// configured value was a per-handshake cost that a peer never had to
+/// authenticate to impose. Clamping moves it to the first request that gets
+/// past the door.
+///
+/// Sixteen, the same number as [`MAX_PEER_UNI_STREAMS`] and for the same kind
+/// of reason: margin over what the protocol needs rather than the minimum,
+/// because running into a transport parameter is a QUIC-level stall with no
+/// application-level explanation attached. It happens to be exactly D77's
+/// budget as well — sixteen field sections at the 64 KiB per-frame cap is the
+/// 1 MiB a connection may buffer — so what an unauthenticated peer can hold in
+/// HEADERS is now bounded twice over by the same number.
+///
+/// # Why it cannot stall a client that bursts
+///
+/// A client may fire several CONNECTs the moment the handshake completes,
+/// before the first 200 comes back, and more than sixteen of them would find
+/// the seventeenth blocked rather than refused — STREAMS_BLOCKED, which is
+/// backpressure and not an error. What unblocks it is the first of the sixteen
+/// to authenticate, and that is decided before any name is resolved and any
+/// socket is opened (`conn::handle_request`), so the raise happens in the same
+/// task that read the first HEADERS and its MAX_STREAMS rides the packet
+/// carrying that request's response. The seventeenth tunnel therefore waits the
+/// round trip the client was already waiting for its first answer, once per
+/// connection, and only on a connection that opens more than sixteen tunnels
+/// before any of them is answered. Below that this is never reached at all.
+///
+/// Closing streams returns credit before authentication too, which is what
+/// keeps a well-behaved unauthenticated peer moving at all — RFC 9000 §4.6
+/// leaves that to the receiver ("this document leaves implementations to decide
+/// when and how many streams should be advertised to a peer via MAX_STREAMS.
+/// Implementations might choose to increase limits as streams are closed"), and
+/// quinn announces one only once an eighth of the window has come back, so three
+/// closes rather than one. That is why the raise is what a burst waits on and
+/// not the churn.
+///
+/// Which is also why the raise is not conditioned on hearing from the peer. The
+/// same section: "An endpoint MUST NOT wait to receive this signal before
+/// advertising additional credit, since doing so will mean that the peer will be
+/// blocked for at least an entire round trip, and potentially indefinitely if
+/// the peer chooses not to send STREAMS_BLOCKED frames."
+const INITIAL_BIDI_STREAMS: u32 = 16;
+
 /// How long to wait for `CONNECTION_CLOSE` frames to be flushed on shutdown.
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -1440,7 +1532,65 @@ mod tests {
         );
     }
 
+    /// What the handshake advertises is the clamp, not `max_streams_bidi`.
+    ///
+    /// The shipped default is 1024, and finding it here would mean every peer
+    /// that can complete a handshake is handed a thousand request streams
+    /// before it has proved anything; see [`INITIAL_BIDI_STREAMS`]. Asserted on
+    /// the default limits rather than on a contrived pair, because the default
+    /// is the configuration that ships.
+    #[test]
+    fn the_handshake_advertises_the_initial_stream_allowance() {
+        let limits = crate::config::Limits::default();
+        assert!(
+            limits.max_streams_bidi > INITIAL_BIDI_STREAMS,
+            "the default must be above the clamp for this to be measuring anything: {}",
+            limits.max_streams_bidi
+        );
+
+        let rendered = transport_debug(&limits);
+        assert!(
+            rendered.contains(&format!(
+                "max_concurrent_bidi_streams: {INITIAL_BIDI_STREAMS}"
+            )),
+            "an unauthenticated peer must be advertised the clamp: {rendered}"
+        );
+    }
+
+    /// The clamp only ever lowers: an operator who wants fewer gets fewer.
+    ///
+    /// `min` rather than a flat constant, so a configuration below the clamp is
+    /// honoured from the handshake onwards rather than being quietly raised to
+    /// sixteen for as long as the connection went unauthenticated.
+    #[test]
+    fn a_configured_allowance_below_the_clamp_is_not_raised_to_it() {
+        for configured in [1, 7, INITIAL_BIDI_STREAMS] {
+            let limits = crate::config::Limits {
+                max_streams_bidi: configured,
+                ..Default::default()
+            };
+            assert_eq!(
+                initial_bidi_streams(&limits),
+                configured,
+                "a configured allowance of {configured} must reach the wire as itself"
+            );
+        }
+
+        assert_eq!(
+            initial_bidi_streams(&crate::config::Limits {
+                max_streams_bidi: INITIAL_BIDI_STREAMS + 1,
+                ..Default::default()
+            }),
+            INITIAL_BIDI_STREAMS,
+            "and one above it must not"
+        );
+    }
+
     /// The configured limits really reach the transport parameters.
+    ///
+    /// `max_streams_bidi` is the one that does not reach them as itself: 7 is
+    /// below [`INITIAL_BIDI_STREAMS`], so it is what an unauthenticated peer is
+    /// advertised, and the clamp's own two tests are above.
     #[test]
     fn configured_limits_reach_the_transport_config() {
         let limits = crate::config::Limits {

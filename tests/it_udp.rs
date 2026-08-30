@@ -87,13 +87,25 @@ async fn forwards_udp_payloads_to_a_target_and_back() {
 ///
 /// Every target tags its reply, so a misrouted datagram shows up as the wrong
 /// tag rather than as a silent pass.
+///
+/// Twenty rather than a handful, for two reasons. A routing mistake that is off
+/// by a small amount, or that folds several sessions onto one bucket, has more
+/// room to show itself across twenty adjacent Quarter Stream IDs than across
+/// four. And twenty request streams is past what an unauthenticated connection
+/// may hold at once (`quic::INITIAL_BIDI_STREAMS`), so this now also carries
+/// the routing half of the stream allowance being raised on authentication:
+/// were it not, the sessions past the sixteenth would never open at all.
 #[tokio::test]
 async fn concurrent_sessions_do_not_cross_talk() {
+    /// Enough sessions to be past the pre-authentication allowance, and a
+    /// distinct byte for each of them.
+    const SESSIONS: u8 = 20;
+
     let server = TestServer::start().await;
     let mut client = H3Client::connect(&server).await;
 
     let mut sessions = Vec::new();
-    for tag in 1..=4u8 {
+    for tag in 1..=SESSIONS {
         let target = spawn_tagged_udp_target(tag).await;
         let (qsid, stream) = open_udp_session(&mut client, &server, target).await;
         sessions.push((tag, qsid, stream));

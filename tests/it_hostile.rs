@@ -46,6 +46,7 @@
 //! | l4 | Floods a live CONNECT-UDP session with datagrams faster than its target drains | `INBOUND_QUEUE_DEPTH` = 64 per session (`src/h3/connection.rs`); overflow is dropped, never buffered or blocked on | Packets lost, as UDP loses them; the session answers again once the flood stops | `it_udp::a_datagram_flood_at_a_live_session_is_survived` |
 //! | m | Sends a truncated, oversized or unknown capsule on a session's request stream | RFC 9297 §3 incremental decoder, `MAX_DATAGRAM_CAPSULE_VALUE` per capsule (`src/capsule.rs`) | RESET_STREAM H3_MESSAGE_ERROR (0x10e) for a capsule that merely stopped early, H3_DATAGRAM_ERROR (0x33) for one that could never parse, nothing at all for an unknown type; the connection carries on | `it_udp::a_truncated_capsule_is_rejected`, `it_udp::an_oversized_datagram_capsule_is_reset_as_a_parse_error`, `it_udp::unknown_capsule_types_are_skipped` |
 //! | n | Opens more request streams than it is allowed at once | `[limits] max_streams_bidi` (`src/quic.rs`) | The next one is never granted; the streams already open are untouched | [`the_bidirectional_stream_limit_caps_what_one_peer_can_open`] |
+//! | n1 | Opens request streams before it has authenticated | `INITIAL_BIDI_STREAMS` = 16, a transport parameter, raised to `[limits] max_streams_bidi` by the first request that authenticates (`src/quic.rs`, `Context::mark_authenticated`) | The seventeenth is never granted: no credit, so no stream, no request task and no 407 to write. A peer that authenticates gets the configured allowance in one step | `it_transport::an_unauthenticated_connection_is_held_to_the_initial_stream_allowance`, `it_transport::authenticating_raises_the_stream_allowance_to_the_configured_one` |
 //! | n2 | Opens more tunnels than one connection may hold | `[limits] max_targets_per_conn`, taken before any socket is (`src/conn.rs`) | 503 with `Proxy-Status: connection_limit_reached`; other connections have their own budget | `it_policy::the_tunnel_quota_is_enforced_per_connection`, `it_policy::tcp_and_udp_tunnels_share_the_quota` |
 //! | o | Opens its control stream with an unknown frame whose declared length never ends, then authenticates | **None.** The MISSING_SETTINGS verdict is suspended for as long as the frame runs, and an authenticated connection is not bounded | Nothing: the connection serves requests for ever. **Recorded residual** (review L1, "recorded, not fixed"): the cost to this server is zero -- the payload is discarded as it arrives, never buffered -- and it needs credentials, so it buys an authenticated peer nothing it does not already have | [`an_unfinished_unknown_frame_suspends_the_settings_verdict`] pins today's behaviour so a change is noticed |
 //! | p | Opens and resets request streams in a storm, each announcing a full-sized field section | No rate limit; what has to hold is that every charge is released when the frame dies with its stream (`FrameDecoder`'s guard, D77) | Nothing; the budget is exactly where it was afterwards | [`a_storm_of_reset_requests_leaves_the_budget_where_it_was`] |
@@ -85,7 +86,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
-    application_close, assert_closed_with, authenticated_connect_headers_frame,
+    application_close, assert_closed_with, authenticate, authenticated_connect_headers_frame,
     connect_headers_frame, frame, headers_frame, open_uni_stream, read_frame, status_of,
 };
 use common::{
@@ -745,10 +746,18 @@ async fn control_stream_frames_on_a_request_stream_end_the_connection() {
 /// HEADERS would answer the last of them with a 431 and carry on. None of them
 /// is charged: the first is a connection error the moment its header lands, and
 /// no answer of any kind reaches the peer.
+///
+/// Seventeen streams is also one past what an unauthenticated connection may
+/// have open at once (`quic::INITIAL_BIDI_STREAMS`), so the door is walked
+/// through first. It changes nothing about the subject: what is on trial is the
+/// decoder's judgement of a frame type, which is the same judgement either side
+/// of the credentials check.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_refused_for_its_type_is_never_charged_for() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
+
+    authenticate(&connection, None).await;
 
     // Every stream is opened before any of them says anything: the first
     // announcement ends the connection, and `open_bi` with it.
@@ -893,10 +902,18 @@ async fn a_data_frame_before_any_headers_ends_the_connection() {
 /// control frames arrive; which stream is refused is up to the order the
 /// server's tasks reach them in, so it is looked for rather than expected on a
 /// particular one.
+///
+/// Filling the budget takes seventeen streams at once, which is one past what
+/// an unauthenticated connection may hold (`quic::INITIAL_BIDI_STREAMS`), so
+/// the door is walked through first. The control stream's own budget is not a
+/// property of who is on the connection, and the state this puts the connection
+/// in — request budget full, control frames arriving — is unchanged.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_control_stream_does_not_share_the_request_buffering_budget() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
+
+    authenticate(&connection, None).await;
 
     let mut held = Vec::new();
     let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
@@ -1083,6 +1100,12 @@ async fn the_bidirectional_stream_limit_caps_what_one_peer_can_open() {
 /// the race every time -- a `RESET_STREAM` that overtakes three bytes of
 /// announcement is read by nobody -- and the storm would pass through the
 /// charge path not once (mutation check, 2026-08-23).
+///
+/// The storm runs on an authenticated connection, because seventeen streams at
+/// once is one past what an unauthenticated one may hold
+/// (`quic::INITIAL_BIDI_STREAMS`) — and because that is where the property
+/// matters: a leaked charge is a leak against the 1024 streams a connection
+/// past the door has to spend, not against sixteen.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
     /// One leaked charge in any of these is enough to be caught below; the
@@ -1092,6 +1115,8 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
 
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
+
+    authenticate(&connection, None).await;
 
     for _ in 0..ROUNDS {
         let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);

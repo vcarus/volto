@@ -8,11 +8,13 @@
 //! stream and naming its type, building a frame, reading one back, waiting for
 //! the connection to end.
 //!
-//! What is *not* here is any assertion about what the server chose. The three
+//! What is *not* here is any assertion about what the server chose. The four
 //! this module does make are the ones that were written identically at every
 //! call site: a response carries `:status` ([`status_of`]), a stream the server
-//! refuses to read is stopped ([`stopped_code`]), and a connection the server
-//! ends is ended with a code the caller names ([`assert_closed_with`]).
+//! refuses to read is stopped ([`stopped_code`]), a connection the server ends
+//! is ended with a code the caller names ([`assert_closed_with`]), and a
+//! connection that needs more than the pre-authentication stream allowance gets
+//! itself through the door first ([`authenticate`]).
 //!
 //! D66 shape: helpers that assert are synchronous functions returning a future,
 //! so `#[track_caller]` survives to the poll that panics.
@@ -90,6 +92,61 @@ pub fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<
         (b":authority", authority.as_bytes()),
         (b":path", path.as_bytes()),
     ])
+}
+
+/// A target the default destination policy refuses before the resolver is
+/// asked.
+///
+/// Port 25 is on the deny list and the port rule is checked before the resolver
+/// runs, so a request for it is answered without a packet leaving this host.
+const DENIED_TARGET: &str = "192.0.2.1:25";
+
+/// Walks a raw-stream connection through the credentials check, and no further.
+///
+/// A connection is accepted on a small request-stream allowance and granted the
+/// configured `[limits] max_streams_bidi` only once a request on it has
+/// authenticated (`quic::INITIAL_BIDI_STREAMS`), so a test that needs more
+/// streams open at once than that allowance has to walk through the door before
+/// it opens them. Nothing else about it changes: the allowance is the only
+/// thing this hands the connection.
+///
+/// The cheapest request that does it. What opens the door is the request being
+/// *accepted*, not its outcome, so this asks for a target the policy refuses on
+/// its port alone — answered without a packet leaving the host, without a name
+/// to resolve, and without a tunnel slot that would have to be given back.
+///
+/// `credentials` is `None` for a server with no `[auth]` users, where any
+/// completed request authenticates. A server that configures them is passed
+/// them, because a 407 would leave the connection exactly where it was.
+#[track_caller]
+pub fn authenticate<'a>(
+    connection: &'a quinn::Connection,
+    credentials: Option<&'a str>,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .unwrap_or_else(|error| panic!("at {caller}: open a request stream: {error}"));
+
+        let request = match credentials {
+            Some(credentials) => authenticated_connect_headers_frame(DENIED_TARGET, credentials),
+            None => connect_headers_frame(DENIED_TARGET),
+        };
+        send.write_all(&request)
+            .await
+            .unwrap_or_else(|error| panic!("at {caller}: send a CONNECT request: {error}"));
+
+        let (kind, payload) = read_frame(&mut recv).await;
+        assert_eq!(kind, HEADERS, "at {caller}: the answer must be a response");
+        assert_eq!(
+            status_of(&payload),
+            "403",
+            "at {caller}: the request must be refused for its destination, which is \
+             the proof that it got past the credentials check"
+        );
+    }
 }
 
 /// Opens a unidirectional stream, names its type, and writes `bytes` after it.
