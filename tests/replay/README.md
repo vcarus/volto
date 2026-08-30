@@ -28,6 +28,8 @@ replay it, and compare the two profiles field by field.
 | `profiles/*.json` | committed profiles, one per captured host |
 | `../it_replay.rs` | the replayer: consumes a profile, drives a lab server |
 | `shape.rs` | the profile reader, the seeded sampler and the planner behind it |
+| `netem.rs` | the lossy path: a qdisc on the QUIC four-tuple |
+| `lossy-lab.sh` | the container that can run one, a tier at a time |
 
 Python is the host's `python3` and nothing else; the Rust side adds no
 dependency, which is why `shape.rs` carries its own small JSON reader.
@@ -179,14 +181,68 @@ Reading it:
   production. Not a fidelity gap: those are drops on a lossy 80-95 ms path, and
   the replay has no such path. Zero is what an assertion holds it to.
 
+## The lossy path
+
+Loopback was the replay's largest single limitation, and it is the one that
+mattered most: the production symptom this harness was built to chase is
+erasure-loss spikes, and a path that cannot lose a packet cannot produce one.
+
+`netem.rs` injects a real one. It is a `tc` qdisc, so the loss and the delay are
+applied by the same kernel code that would apply them on a wire, and it is aimed
+at the QUIC four-tuple alone — two `u32` filters on the lab server's UDP port,
+one netem per direction — so the server-to-target hop stays on unshaped
+loopback, as it broadly is in production. Segmentation offload is turned off so
+a loss draw deletes one datagram rather than a whole GSO batch, and `lo` is
+given a 1500-byte MTU so DPLPMTUD has something real to discover. The reasoning
+for each of those is in the module's own documentation.
+
+It needs Linux, `iproute2` and `CAP_NET_ADMIN`, none of which the macOS dev host
+has, so `lossy-lab.sh` runs it in a container:
+
+```sh
+tests/replay/lossy-lab.sh                              # off, steady, spike
+TIERS="off severe" SECONDS_PER_TIER=600 tests/replay/lossy-lab.sh
+```
+
+Three presets, all at a 90 ms round trip with 6 ms of jitter, differing only in
+the per-packet loss:
+
+| preset | loss | where the number comes from |
+|---|---|---|
+| `steady` | 0.2% | the standing measured rate for this link (D33) |
+| `spike` | 13% | the p90 connection in `profiles/host-b.json` |
+| `severe` | 42% | the other intensity point D71 recorded |
+
+Two things about how it is used are load-bearing.
+
+**Run the `off` tier.** Every tier executes the identical plan and differs only
+in the path, so a metric that moves between tiers moved because of the path.
+Comparing a shaped run against the loopback numbers published in this file
+instead would compare two different plans at two different compressions and
+prove nothing.
+
+**Compression has a ceiling here that it does not have on loopback.** At
+compression *C* a production connection's 262-second median lifetime becomes
+262/*C* seconds, and 90 ms of round trip only stays in proportion while that
+stays well above it. `lossy-lab.sh` defaults to 100x for that reason where the
+loopback baseline below uses 1400x, and buys its sample size with wall time.
+
+A shaped run checks its own premise before reporting anything: it asserts that
+the server independently measured a round trip near the one the qdisc was given,
+and that the qdisc carried packets at all. A replay that believed it was lossy
+and was not would file a loopback result under a lossy heading, which is the one
+outcome worse than not running.
+
 ## What the replay cannot do
 
 Stated here as well as in `it_replay.rs` because it is the first thing to read
 before believing a number out of a run:
 
-* **The path is loopback.** Sub-millisecond RTT against 80–95 ms, and no loss at
-  all against a link whose p90 connection loses 13% of its packets. Congestion
-  control, MTU discovery and everything loss-driven are not under test.
+* **The path is loopback unless it is shaped.** Sub-millisecond RTT against
+  80–95 ms, and no loss at all against a link whose p90 connection loses 13% of
+  its packets. Congestion control, MTU discovery and everything loss-driven are
+  not under test in an unshaped run — see *The lossy path* above for the one
+  that puts them there.
 * **Payload sizes are inferred.** The log records transport bytes per
   *connection*, so a tunnel's transfer size is that divided by the tunnel count:
   an over-count, and flat across a connection's tunnels.

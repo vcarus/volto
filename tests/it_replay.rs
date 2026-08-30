@@ -39,12 +39,22 @@
 //!
 //! What it cannot reproduce, and no amount of tuning here will:
 //!
-//! * **The path.** Everything is loopback: sub-millisecond RTT against
-//!   production's 80-95 ms, and no loss at all against a link whose p90
-//!   connection loses 13% of its packets. Congestion control, MTU discovery and
-//!   the loss-driven half of the server's behaviour are therefore *not* under
-//!   test here. `initial_rtt_ms` is set to the production value so the server's
-//!   own timers start where production's do, which is as close as loopback gets.
+//! * **The path -- unless one is injected.** By default everything is loopback:
+//!   sub-millisecond RTT against production's 80-95 ms, and no loss at all
+//!   against a link whose p90 connection loses 13% of its packets. Congestion
+//!   control, MTU discovery and the loss-driven half of the server's behaviour
+//!   are then not under test at all. `initial_rtt_ms` is set to the production
+//!   value so the server's own timers start where production's do, which is as
+//!   close as loopback gets.
+//!
+//!   `VOLTO_REPLAY_NETEM` removes that limit where the host allows it: on Linux
+//!   with `CAP_NET_ADMIN` it puts a real qdisc on the QUIC four-tuple -- 90 ms
+//!   round trip, per-packet loss, a rate and a 1500-byte device MTU -- and
+//!   leaves the server-to-target hop alone. See `replay/netem.rs` for what it
+//!   shapes and why, and `replay/lossy-lab.sh` for the container that can run
+//!   it. A shaped run checks itself: it asserts that the server independently
+//!   measured the round trip it was given, because a replay that believes it is
+//!   lossy and is not would file a loopback result under a lossy heading.
 //! * **Payload sizes.** The log records transport bytes per connection, not
 //!   payload per tunnel, so a tunnel's transfer size is derived from
 //!   `tx_bytes + rx_bytes` divided by the connection's tunnel count. That
@@ -98,6 +108,7 @@
 //! | `VOLTO_REPLAY_MAX_TUNNELS` | `512` | ceiling on one connection's tunnels |
 //! | `VOLTO_REPLAY_TARGETS` | `64` | distinct lab targets to spread over |
 //! | `VOLTO_REPLAY_LOG` | a temp file | where the server's own log is written |
+//! | `VOLTO_REPLAY_NETEM` | `off` | the path to put the connection on: `off`, a preset (`clean`, `steady`, `spike`, `severe`) or a spec such as `spike,rtt=80,downloss=20` |
 //!
 //! The run prints the log's path. Feeding that file back through
 //! `shape_extract.py` produces a lab profile in the same schema as the
@@ -130,6 +141,9 @@
 //! it is not a failure because nothing in the server produced it.
 
 mod common;
+
+#[path = "replay/netem.rs"]
+mod netem;
 
 #[path = "replay/shape.rs"]
 mod shape;
@@ -184,6 +198,8 @@ struct Settings {
     max_tunnels: u64,
     targets: usize,
     log_path: std::path::PathBuf,
+    /// The path to put the QUIC connection on, or `None` for loopback.
+    netem: Option<netem::Spec>,
 }
 
 fn env_or<T: std::str::FromStr>(name: &str, fallback: T) -> T {
@@ -217,6 +233,8 @@ impl Settings {
             log_path: std::env::var("VOLTO_REPLAY_LOG")
                 .map(std::path::PathBuf::from)
                 .unwrap_or(default_log),
+            netem: netem::Spec::parse(&std::env::var("VOLTO_REPLAY_NETEM").unwrap_or_default())
+                .unwrap_or_else(|error| panic!("{error}")),
         }
     }
 
@@ -843,6 +861,55 @@ struct LabLog {
     dropped_datagrams: u64,
     lost_packets: u64,
     sent_packets: u64,
+
+    /// The round trip the server itself measured, one sample per closing line.
+    ///
+    /// This is the check on the injection, and the reason it is collected at
+    /// all: the shaping is done by the kernel, outside this process, on a device
+    /// the harness cannot see the state of once the run is under way. What it
+    /// *can* see is that the server's own smoothed round trip came out where the
+    /// qdisc was told to put it. On loopback these are zero; if they are still
+    /// zero with netem installed, the run measured nothing and says so.
+    rtt_ms: Vec<u64>,
+    /// The path MTU each connection settled on.
+    mtu: Vec<u64>,
+    /// How often quinn's black-hole detector fired, summed over connections.
+    ///
+    /// The path this harness builds has no black hole -- `lo` carries 1500 and
+    /// the server probes to 1464 -- so on a lossy run this is the D81 question
+    /// asked directly: does loss alone make the detector give up an MTU that was
+    /// never actually unreachable?
+    mtu_black_holes: u64,
+    /// Connections that saw at least one, so the sum is readable.
+    connections_with_black_holes: u64,
+}
+
+impl LabLog {
+    /// Takes the per-connection totals off a closing line of either kind.
+    fn absorb(&mut self, line: &str) {
+        self.closed += 1;
+        self.tunnels += number(line, "tunnels");
+        self.dropped_datagrams += number(line, "dropped_datagrams");
+        self.lost_packets += number(line, "lost_packets");
+        self.sent_packets += number(line, "sent_packets");
+        self.rtt_ms.push(number(line, "rtt_ms"));
+        self.mtu.push(number(line, "mtu"));
+        let black_holes = number(line, "mtu_black_holes");
+        self.mtu_black_holes += black_holes;
+        if black_holes > 0 {
+            self.connections_with_black_holes += 1;
+        }
+    }
+
+    /// The middle of a set of samples, or zero if there are none.
+    fn median(samples: &[u64]) -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2]
+    }
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -865,11 +932,7 @@ fn read_log(text: &str) -> LabLog {
         if line.contains("connection established") {
             log.established += 1;
         } else if line.contains("connection closed with error") {
-            log.closed += 1;
-            log.tunnels += number(line, "tunnels");
-            log.dropped_datagrams += number(line, "dropped_datagrams");
-            log.lost_packets += number(line, "lost_packets");
-            log.sent_packets += number(line, "sent_packets");
+            log.absorb(line);
 
             let error = line
                 .split(" error=")
@@ -888,11 +951,7 @@ fn read_log(text: &str) -> LabLog {
                 *log.transport_endings.entry(error).or_default() += 1;
             }
         } else if line.contains("connection closed") {
-            log.closed += 1;
-            log.tunnels += number(line, "tunnels");
-            log.dropped_datagrams += number(line, "dropped_datagrams");
-            log.lost_packets += number(line, "lost_packets");
-            log.sent_packets += number(line, "sent_packets");
+            log.absorb(line);
             let reason = field(line, "reason")
                 .unwrap_or("?")
                 .trim_matches('"')
@@ -942,6 +1001,15 @@ async fn production_shapes_are_replayed() {
 
     let buffer = SharedBuffer::install("info");
     let server = Arc::new(TestServer::start_with(&settings.config()).await);
+
+    // After the server has a port and before any client has used it. The guard
+    // is held for the whole run and takes the qdisc tree down with it, including
+    // on the way out of a panic.
+    let shaper = settings
+        .netem
+        .clone()
+        .map(|spec| netem::Shaper::install(spec, server.addr.port()));
+
     let targets = Arc::new(Targets::spawn(settings.targets).await);
     let tally = Arc::new(Tally::default());
     let live: Live = Arc::new(Mutex::new(Vec::new()));
@@ -990,6 +1058,37 @@ async fn production_shapes_are_replayed() {
         plan.compromises.active_windows_shortened,
         plan.compromises.tunnels_past_window,
     );
+
+    match &shaper {
+        None => println!(
+            "--- path ---\n\
+             loopback, unshaped. Sub-millisecond round trip, no loss: the\n\
+             loss-driven half of the server is not under test in this run.\n"
+        ),
+        Some(shaper) => {
+            let spec = shaper.spec();
+            println!(
+                "--- path ---\n\
+                 spec                  {}\n\
+                 round trip            {:.0} ms  ({:.0} up + {:.0} down, jitter {:.0} ms each)\n\
+                 loss                  {}% up, {}% down  (independent per packet)\n\
+                 rate                  {} up, {} down\n\
+                 device MTU            {}   (the server probes up to mtu_upper_bound)\n\
+                 netem backlog         {} packets each way\n",
+                spec.name,
+                spec.round_trip_ms(),
+                spec.up.delay_ms,
+                spec.down.delay_ms,
+                spec.up.jitter_ms,
+                spec.up.loss_percent,
+                spec.down.loss_percent,
+                spec.up.rate,
+                spec.down.rate,
+                spec.mtu,
+                spec.limit,
+            );
+        }
+    }
 
     let start = Instant::now();
     let run_end = start + Duration::from_secs(settings.wall_seconds);
@@ -1100,6 +1199,86 @@ async fn production_shapes_are_replayed() {
         summary.lost_packets,
         settings.log_path.display(),
     );
+
+    // What the path actually did, from both ends of it: the qdisc's own
+    // counters, and the numbers the server independently arrived at. They are
+    // printed together because either alone is easy to misread -- the qdisc
+    // counts what it was handed, the server counts what it concluded, and the
+    // two agreeing is the evidence that the run was shaped at all.
+    let median_rtt = LabLog::median(&summary.rtt_ms);
+    let median_mtu = LabLog::median(&summary.mtu);
+    let loss_permille = 1000.0 * summary.lost_packets as f64 / summary.sent_packets.max(1) as f64;
+    println!(
+        "--- path, as measured ---\n\
+         server's own rtt      {} ms median over {} closes\n\
+         server's own loss     {:.3} per 1000 packets sent  ({} of {})\n\
+         path mtu settled at   {} median\n\
+         mtu black holes       {} over {} connections\n",
+        median_rtt,
+        summary.rtt_ms.len(),
+        loss_permille,
+        summary.lost_packets,
+        summary.sent_packets,
+        median_mtu,
+        summary.mtu_black_holes,
+        summary.connections_with_black_holes,
+    );
+
+    if let Some(shaper) = &shaper {
+        let (up, down) = shaper.counters();
+
+        // The independent measurement of the downlink, and the one to quote: the
+        // server counted what it sent and the kernel counted what came out the
+        // far side, with nothing in common between the two counters. The qdisc's
+        // own two numbers are in different units and cannot be divided -- see
+        // `netem::Counters` -- so they are printed as what they are.
+        let downlink_lost = summary.sent_packets.saturating_sub(down.delivered);
+        let downlink_loss = 100.0 * downlink_lost as f64 / summary.sent_packets.max(1) as f64;
+        let batch = if down.loss_draws == 0 {
+            0.0
+        } else {
+            downlink_lost as f64 / down.loss_draws as f64
+        };
+
+        println!(
+            "--- path, as the qdisc saw it ---\n\
+             client to server      {} datagrams delivered, {} loss draws\n\
+             server to client      {} datagrams delivered, {} loss draws\n\
+             downlink loss         {:.2}% against {}% asked\n\
+             \x20                     ({} sent by the server, {} never delivered;\n\
+             \x20                      a draw took {:.2} datagrams, which is the GSO batch)\n",
+            up.delivered,
+            up.loss_draws,
+            down.delivered,
+            down.loss_draws,
+            downlink_loss,
+            shaper.spec().down.loss_percent,
+            summary.sent_packets,
+            downlink_lost,
+            batch,
+        );
+
+        // The whole run is worthless if the shaping was not live, and a qdisc
+        // that failed to attach fails silently as far as the sockets on it are
+        // concerned. So the run refuses to report a finding it cannot stand
+        // behind: the server must independently have measured a round trip in
+        // the neighbourhood of the one that was asked for, and the qdisc must
+        // have carried the traffic. Half the configured round trip is the
+        // threshold, which no loopback run has ever come near.
+        let floor = (shaper.spec().round_trip_ms() / 2.0) as u64;
+        assert!(
+            median_rtt >= floor,
+            "netem was installed but the server measured a {median_rtt} ms median \
+             round trip, under the {floor} ms this run needs to be believable. \
+             The shaping did not reach the connection: nothing in this run is \
+             evidence about a lossy path."
+        );
+        assert!(
+            up.delivered > 0 && down.delivered > 0,
+            "netem was installed but carried no packets ({up:?} up, {down:?} down): \
+             the filters did not match the connection's four-tuple."
+        );
+    }
 
     // The assertions a replay is uniquely able to make. Everything above is a
     // measurement and is printed rather than asserted; these are about the
