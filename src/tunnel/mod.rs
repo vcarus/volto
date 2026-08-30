@@ -3,7 +3,7 @@
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -380,14 +380,28 @@ impl Context {
 /// cannot be satisfied yet *takes the permits that are free* and queues for the
 /// rest; while the drain waited, `available_permits()` was zero, so `live()`
 /// reported the full limit and `acquire()` refused every caller. The connection
-/// then answered `503 connection_limit_reached` to requests the GOAWAY had
-/// promised to serve — those below its identifier, RFC 9114 §5.2 — with one
-/// tunnel open out of a hundred (adversarial pass 2026-08-29).
+/// then answered `503 connection_limit_reached` to requests below the GOAWAY
+/// identifier — ones the peer had been told "might have been processed",
+/// RFC 9114 §5.2, and this server means to serve — with one tunnel open out of
+/// a hundred (adversarial pass 2026-08-29).
 pub struct Quota {
     permits: Arc<Semaphore>,
     limit: u32,
-    /// Signalled by every [`Slot`] as it goes, so the drain can watch the count
-    /// instead of taking part in it.
+    /// Accepted requests that have not finished, whether or not they ever take
+    /// a slot.
+    ///
+    /// The slot is taken late on purpose -- after the credentials check, so an
+    /// unauthenticated peer cannot spend one, and after the 400 an RFC 9114 §4.2
+    /// violation gets -- which leaves a stretch of every request's life during
+    /// which it is being served and holds nothing. The semaphore cannot see that
+    /// stretch, and the drain must: a request below the GOAWAY identifier is
+    /// one the peer was told "might have been processed" (RFC 9114 §5.2), and
+    /// this server serves those rather than rejecting them individually -- so a
+    /// request whose HEADERS frame is still arriving is squarely its business
+    /// (adversarial pass 2026-08-30).
+    pending: Arc<AtomicU32>,
+    /// Signalled by every [`Slot`] and every [`Pending`] as it goes, so the
+    /// drain can watch the count instead of taking part in it.
     idle: Arc<Notify>,
 }
 
@@ -418,12 +432,45 @@ impl Drop for Slot {
     }
 }
 
+/// One accepted request that has not finished, released when dropped.
+///
+/// The companion to [`Slot`], and deliberately not the same thing: a slot is
+/// rationed and is taken only once a request has proved it deserves one, while
+/// this is taken the moment the request stream is accepted and rations nothing.
+/// What it buys is the drain being able to see a request that is *between* those
+/// two points — headers still arriving, credentials being checked — which is
+/// exactly the request a tunnel-count drain used to close the connection on,
+/// against the "might have been processed" its own GOAWAY identifier had just
+/// signalled (RFC 9114 §5.2).
+///
+/// Dropping is the only way it is given back, for the reason [`Slot`] gives.
+pub struct Pending {
+    pending: Arc<AtomicU32>,
+    idle: Arc<Notify>,
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        // Decrement first, announce second, for the reason `Slot` does it in
+        // that order: a drain woken by the announcement must not re-read a
+        // count that has yet to move.
+        //
+        // `Relaxed` is enough on the counter itself. Nothing is published
+        // through it, and the only reader is the drain -- which either reaches
+        // it through `Notify`, whose own synchronisation orders this write
+        // before that wake-up, or is about to look again anyway.
+        self.pending.fetch_sub(1, Ordering::Relaxed);
+        self.idle.notify_one();
+    }
+}
+
 impl Quota {
     /// Creates a quota allowing `limit` concurrent tunnels.
     pub fn new(limit: u32) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(limit as usize)),
             limit,
+            pending: Arc::new(AtomicU32::new(0)),
             idle: Arc::new(Notify::new()),
         }
     }
@@ -437,12 +484,40 @@ impl Quota {
         })
     }
 
+    /// Records that a request has been accepted and is being served.
+    ///
+    /// Held by the task from the moment the request stream is accepted until
+    /// that task ends, which is the span [`Self::acquire`] cannot cover: a
+    /// request only reaches the semaphore once its headers have arrived and its
+    /// credentials have been checked, and the ones that never get that far --
+    /// the 400s, the 407s -- never reach it at all. Nothing is rationed here;
+    /// the count exists so the drain can tell "no work left" from "no work that
+    /// has a slot yet".
+    pub fn enter(&self) -> Pending {
+        self.pending.fetch_add(1, Ordering::Relaxed);
+        Pending {
+            pending: self.pending.clone(),
+            idle: self.idle.clone(),
+        }
+    }
+
     /// How many tunnels are open right now.
     pub fn live(&self) -> u32 {
         self.limit - self.permits.available_permits() as u32
     }
 
-    /// Resolves once every tunnel on this connection has finished.
+    /// Whether anything on this connection is still being served.
+    ///
+    /// Both halves count, and the second is the one a tunnel count alone
+    /// misses: a request accepted before the GOAWAY whose headers are still
+    /// arriving holds no slot, and closing the connection on it contradicts the
+    /// "might have been processed" its GOAWAY identifier signalled (RFC 9114
+    /// §5.2) without the REQUEST_REJECTED that would let the client retry.
+    pub fn is_busy(&self) -> bool {
+        self.live() > 0 || self.pending.load(Ordering::Relaxed) > 0
+    }
+
+    /// Resolves once every request on this connection has finished.
     ///
     /// Used by the graceful shutdown path. The caller is responsible for
     /// bounding the wait — a tunnel that never ends would otherwise hold
@@ -454,7 +529,7 @@ impl Quota {
     /// notification on when a waiter is dropped, so neither a slot released
     /// between the check and the park nor a lost race can wedge the drain.
     pub async fn wait_until_idle(&self) {
-        while self.live() > 0 {
+        while self.is_busy() {
             self.idle.notified().await;
         }
     }
@@ -1668,8 +1743,8 @@ mod tests {
     /// dispatched. When the wait was `acquire_many(limit)` the fair semaphore
     /// handed it every free permit up front, so `live()` reported the limit and
     /// `acquire()` refused everyone until the drain ended -- and the connection
-    /// answered `503 connection_limit_reached` to requests RFC 9114 §5.2 had
-    /// promised to serve.
+    /// answered `503 connection_limit_reached` to requests below the GOAWAY
+    /// identifier (RFC 9114 §5.2).
     #[tokio::test]
     async fn waiting_for_idle_neither_spends_the_budget_nor_miscounts_it() {
         let quota = Quota::new(4);
@@ -1720,5 +1795,66 @@ mod tests {
             .await
             .expect("every slot is back, so the wait must resolve");
         assert_eq!(quota.live(), 0);
+    }
+
+    /// A request that has been accepted and holds no slot yet is still work.
+    ///
+    /// The whole of the gap `Pending` closes: a request stream is accepted the
+    /// moment the peer opens it, and does not reach [`Quota::acquire`] until its
+    /// headers have arrived and its credentials have been checked. Between those
+    /// two points `live()` is zero while the connection has committed to serving
+    /// something -- and after a GOAWAY that something is a request the peer was
+    /// told "might have been processed" (RFC 9114 §5.2). A drain reading
+    /// `live()` alone closed the connection on it.
+    #[tokio::test]
+    async fn a_request_that_has_not_taken_a_slot_still_holds_the_drain() {
+        let quota = Quota::new(4);
+        let pending = quota.enter();
+
+        assert_eq!(quota.live(), 0, "an accepted request is not yet a tunnel");
+        assert!(quota.is_busy(), "but the connection is not idle either");
+
+        let mut waiting = std::pin::pin!(quota.wait_until_idle());
+        tokio::select! {
+            () = &mut waiting => panic!("a request is still being served"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        // The request reaches the quota, runs, and gives its slot back: still
+        // not idle, because the task itself has not finished.
+        let slot = quota.acquire().expect("a slot for the accepted request");
+        assert_eq!(quota.live(), 1);
+        drop(slot);
+        tokio::select! {
+            () = &mut waiting => panic!("the request's task has not ended"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        drop(pending);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the wait resolves once the request's task ends");
+        assert!(!quota.is_busy());
+    }
+
+    /// Entering costs no slot, so the tunnel budget is unchanged by it.
+    ///
+    /// `Pending` rations nothing -- it only records that a request exists -- and
+    /// a version of it that spent a permit would refuse tunnels a connection is
+    /// entitled to, which is the shape of the bug `wait_until_idle` used to have.
+    #[test]
+    fn an_accepted_request_does_not_spend_the_tunnel_budget() {
+        let quota = Quota::new(2);
+        let _entered: Vec<_> = (0..8).map(|_| quota.enter()).collect();
+
+        assert_eq!(quota.live(), 0);
+        let first = quota.acquire().expect("the budget is untouched");
+        let second = quota.acquire().expect("the budget is untouched");
+        assert!(quota.acquire().is_none(), "the limit is still the limit");
+        assert_eq!(quota.live(), 2);
+
+        drop((first, second));
+        assert_eq!(quota.live(), 0);
+        assert!(quota.is_busy(), "the requests themselves are still running");
     }
 }

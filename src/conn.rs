@@ -41,7 +41,17 @@ use crate::tunnel::{self, udp, Context, ProxyError, Route};
 ///   early would kill the very tunnels being drained — the loop has to stay;
 /// * `accept()` cannot report the end of the drain: a client GOAWAY says nothing
 ///   about the requests already in flight, so [`crate::h3api::Connection::accept`]
-///   never reports one. The tunnel quota going idle is the signal instead.
+///   never reports one. The connection going idle is the signal instead —
+///   [`crate::tunnel::Quota::is_busy`], which counts accepted requests as well as
+///   open tunnels. Both halves are needed: a request stream is accepted the
+///   moment the peer opens it and does not take a tunnel slot until its headers
+///   have arrived and its credentials have been checked, so a drain that watched
+///   only the tunnel count reported "nothing left to do" while a request below
+///   the GOAWAY identifier was still being read. RFC 9114 §5.2 tells the peer
+///   such requests "might have been processed" and leaves a server the choice
+///   of rejecting them individually (REQUEST_REJECTED, §4.1.1, so the client
+///   knows to retry); this server's choice is to serve them, and closing the
+///   connection mid-request is neither.
 ///
 /// The wait for the tunnels is deliberately unbounded here: the grace period
 /// belongs to the endpoint ([`crate::quic`]), which closes everything when it
@@ -176,7 +186,15 @@ pub async fn handle(
                         "the peer would not take a GOAWAY; draining without one"
                     );
                 }
-                if live == 0 {
+                // Not `live == 0`: a request accepted before the signal whose
+                // headers are still arriving holds no tunnel slot yet, and it
+                // is below the identifier this GOAWAY just published -- one the
+                // peer was told "might have been processed" (RFC 9114 §5.2).
+                // This server serves those rather than rejecting them
+                // individually, and reading only the tunnel count closed the
+                // connection out from under it instead (adversarial pass
+                // 2026-08-30).
+                if !context.quota.is_busy() {
                     break Ok(());
                 }
             }
@@ -190,7 +208,21 @@ pub async fn handle(
 
             accepted = next_request(&mut connection, &context, deadline) => match accepted {
                 NextRequest::Stream(resolver) => {
-                    tokio::spawn(handle_request(resolver, context.clone()));
+                    // Taken here rather than inside the task, and before the
+                    // spawn: what it records is that this connection has
+                    // accepted a request, which is true from this line on
+                    // whether or not the task has been polled yet. Held for the
+                    // task's whole life, so the drain below cannot mistake a
+                    // request whose headers are still arriving -- one this
+                    // server means to serve, per the GOAWAY identifier above it
+                    // (RFC 9114 §5.2) -- for a connection with nothing left to
+                    // do.
+                    let pending = context.quota.enter();
+                    let context = context.clone();
+                    tokio::spawn(async move {
+                        let _pending = pending;
+                        handle_request(resolver, context).await;
+                    });
                 }
                 // The peer will send no further requests.
                 NextRequest::Finished => break Ok(()),

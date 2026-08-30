@@ -255,8 +255,11 @@ async fn a_request_below_the_goaway_identifier_is_served_during_the_drain() {
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
-    // Something to drain: without a live tunnel the connection finishes the
-    // moment the GOAWAY is out.
+    // Something to drain, so the GOAWAY finds a connection mid-work. The drain
+    // no longer needs a tunnel to stay open -- an accepted request holds it by
+    // itself, and `a_promised_request_outlives_the_last_tunnel_on_the_connection`
+    // is that shape without this safety net -- but a live tunnel is still the
+    // ordinary traffic this test drains around.
     let held = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // The request under test, opened now and completed later: the HEADERS frame
@@ -328,6 +331,136 @@ async fn a_request_below_the_goaway_identifier_is_served_during_the_drain() {
     drop(held);
     drop(probe_send);
     drop(late_send);
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+}
+
+/// The same promise, with no tunnel open to keep the connection alive for it.
+///
+/// [`a_request_below_the_goaway_identifier_is_served_during_the_drain`] holds a
+/// tunnel open throughout, because without one the connection used to finish the
+/// moment the GOAWAY was out. That is the interleaving this test is about: a
+/// request stream is accepted the instant the peer opens it, and does not take a
+/// tunnel slot until its headers have arrived and its credentials have been
+/// checked, so between those two points it is a request the server has committed
+/// to and the tunnel count cannot see. A drain that watches only the tunnel count
+/// reads "nothing left to do" and closes the connection out from under it.
+///
+/// The order that breaks it is the last tunnel ending while such a request is
+/// still being read — which is not exotic at all, since a client that has been
+/// told to take its new work elsewhere is closing its tunnels precisely then.
+///
+/// The ordering is established without sleeps, exactly as in the test above, and
+/// the request that establishes it is one the server answers *without* taking a
+/// tunnel slot: a connection-specific field is refused with 400 before the quota
+/// is asked for anything (RFC 9110 §7.6.1, judged by `tunnel::route`'s caller).
+/// So when the GOAWAY goes out this connection has accepted three requests and
+/// holds exactly one tunnel — the one the test then closes.
+#[tokio::test]
+async fn a_promised_request_outlives_the_last_tunnel_on_the_connection() {
+    use common::rawstream::{headers_frame, read_frame, status_of};
+
+    // Long enough that what this test measures is the drain rather than the
+    // grace period, and short enough to stay inside `STOP_TIMEOUT`.
+    let mut server = TestServer::start_with(&format!("shutdown_grace = 15\n{ALLOW_PRIVATE}")).await;
+    let target = spawn_echo_target().await;
+    let authority = target.to_string();
+    let mut client = H3Client::connect(&server).await;
+
+    // The only tunnel on the connection, and so the whole of what a
+    // tunnel-counting drain can see.
+    let mut held = open_tcp_tunnel(&mut client, &authority).await;
+
+    // The request under test, opened now and completed later: the HEADERS frame
+    // type byte alone, which is enough for the server to accept the stream and
+    // not enough for it to read a request off it.
+    let request = connect_headers_frame(&authority);
+    let (mut late_send, mut late_recv) = client
+        .quic
+        .open_bi()
+        .await
+        .expect("open the half-written request stream");
+    let late_id = u64::from(late_send.id());
+    late_send
+        .write_all(&request[..1])
+        .await
+        .expect("send the HEADERS frame type");
+
+    // The ordering probe: a request the server answers in full and for which it
+    // never takes a tunnel slot, so the tunnel count is still one afterwards.
+    let refused = headers_frame([
+        (b":method".as_slice(), b"CONNECT".as_slice()),
+        (b":authority", authority.as_bytes()),
+        (b"proxy-connection", b"keep-alive"),
+    ]);
+    let (mut probe_send, mut probe_recv) = client
+        .quic
+        .open_bi()
+        .await
+        .expect("open the ordering probe");
+    let probe_id = u64::from(probe_send.id());
+    probe_send
+        .write_all(&refused)
+        .await
+        .expect("send the probe request");
+    let (_, block) = read_frame(&mut probe_recv).await;
+    assert_eq!(
+        status_of(&block),
+        "400",
+        "the probe must be refused before the quota is asked for a slot"
+    );
+
+    server.shutdown();
+
+    let identifier = client.await_goaway().await;
+    assert_eq!(
+        identifier,
+        probe_id + REQUEST_STREAM_STEP,
+        "the GOAWAY must name the first request the server will not serve"
+    );
+    assert!(
+        late_id < identifier,
+        "stream {late_id} is at or past the GOAWAY identifier {identifier}, \
+         so this test is no longer about a promised request"
+    );
+
+    // The last tunnel goes. What is left on the connection is one request the
+    // GOAWAY promised to serve and no tunnel slot anywhere.
+    held.finish().expect("finish the held tunnel");
+    common::read_to_end(&mut held).await;
+
+    // The drain must still be waiting. Two seconds is three orders of magnitude
+    // over the microseconds a connection with nothing left to do takes to close
+    // itself on loopback, so a failure here is the drain having decided it was
+    // finished rather than a slow machine.
+    let closed = tokio::time::timeout(Duration::from_secs(2), client.quic.closed()).await;
+    assert!(
+        closed.is_err(),
+        "the connection was closed while a request below the GOAWAY identifier \
+         was still being read: {closed:?}"
+    );
+
+    // And the promise is kept: the request completes and gets its tunnel.
+    late_send
+        .write_all(&request[1..])
+        .await
+        .expect("finish the HEADERS frame");
+    let (_, block) = read_frame(&mut late_recv).await;
+    assert_eq!(
+        status_of(&block),
+        "200",
+        "a request below the GOAWAY identifier must still get its tunnel"
+    );
+
+    late_send
+        .write_all(&frame_data(b"late"))
+        .await
+        .expect("send through the late tunnel");
+    let (_, echoed) = read_frame(&mut late_recv).await;
+    assert_eq!(&echoed, b"late", "the late tunnel must carry data");
+
+    drop(probe_send);
+    drop(late_send);
+    drop(late_recv);
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
