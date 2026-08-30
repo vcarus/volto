@@ -47,6 +47,24 @@ fn run_deploy_under(root: Option<&Path>, args: &[&str]) -> Output {
         .expect("the deploy script must be runnable")
 }
 
+/// Runs the script with a binary standing in for the one a release would carry.
+///
+/// `VOLTO_DEPLOY_CANDIDATE` is the second test seam, alongside
+/// `VOLTO_DEPLOY_ROOT`: in a real run the candidate is the binary just unpacked
+/// from the verified tarball, which a dry run never downloads, so a dry run
+/// takes it from here instead. Everything after that — the capability probe and
+/// the check itself — is the same code path either way.
+fn run_deploy_with_candidate(root: &Path, candidate: &Path, args: &[&str]) -> Output {
+    Command::new("bash")
+        .arg(deploy_script())
+        .args(args)
+        .current_dir(repo_root())
+        .env("VOLTO_DEPLOY_ROOT", root)
+        .env("VOLTO_DEPLOY_CANDIDATE", candidate)
+        .output()
+        .expect("the deploy script must be runnable")
+}
+
 /// Runs the script the way the documented one-liner does: `curl … | bash -s --`,
 /// which leaves `$0` as `bash` instead of a path.
 fn run_deploy_piped(root: &Path, args: &[&str]) -> Output {
@@ -103,6 +121,64 @@ fn plant_config(root: &Path) {
 fn plant_unit(root: &Path) {
     fs::write(root.join("etc/systemd/system/volto.service"), "# planted\n")
         .expect("the unit must be writable");
+}
+
+/// Plants a configuration the real binary can be asked a real question about,
+/// with `body` appended verbatim so a test can add a key from the future.
+///
+/// The certificate pair is planted with it because `Config::validate` insists
+/// both paths are files; nothing reads them.
+fn plant_loadable_config(root: &Path, body: &str) {
+    let dir = root.join("etc/volto");
+    fs::write(dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
+    fs::write(dir.join("key.pem"), "not a key\n").expect("key must be writable");
+    fs::write(
+        dir.join("config.toml"),
+        format!(
+            "[server]\n\
+             listen = \"127.0.0.1:4433\"\n\
+             cert = \"{}\"\n\
+             key = \"{}\"\n\
+             \n\
+             [auth]\n\
+             users = [{{ username = \"user1\", password = \"planted\" }}]\n\
+             {body}",
+            dir.join("cert.pem").display(),
+            dir.join("key.pem").display(),
+        ),
+    )
+    .expect("config must be writable");
+}
+
+/// The binary a release would install, for the tests that need a real verdict.
+fn real_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_volto"))
+}
+
+/// A stand-in for a volto from before `--check-config` existed.
+///
+/// It answers `--help` the way clap does, without the flag, and treats anything
+/// it does not know the way clap does too: a usage error on stderr and a
+/// non-zero status. That second half is the trap — a script that tried the flag
+/// and read the failure as a verdict on the configuration would abandon the
+/// rollback here, so the stand-in fails loudly rather than quietly.
+fn plant_binary_without_the_flag(root: &Path) -> PathBuf {
+    let path = root.join("candidate-old");
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --help ]; then\n\
+         \x20 echo 'Usage: volto [OPTIONS] --config <FILE>'\n\
+         \x20 echo '  -c, --config <FILE>  Path to the TOML configuration file'\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo \"error: unexpected argument '$1' found\" >&2\n\
+         exit 2\n",
+    )
+    .expect("the stand-in binary must be writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("the stand-in binary must be executable");
+    path
 }
 
 /// `-h` must work and describe the flags the documentation relies on.
@@ -336,6 +412,141 @@ fn an_upgrade_and_a_reinstall_say_nothing_about_downgrades() {
 
         let _ = fs::remove_dir_all(&root);
     }
+}
+
+/// The advisory's successor: a downgrade the candidate binary cannot survive is
+/// refused at the door rather than announced and then attempted.
+///
+/// This is the D93 shape end to end, with the real binary as the judge: the
+/// config carries a key it does not know, every table is `deny_unknown_fields`,
+/// so it refuses the whole file and would not start. Saying so is only useful
+/// before the swap — afterwards the service is already down and the automatic
+/// rollback restores the release the operator was trying to leave.
+#[test]
+fn a_candidate_that_cannot_load_this_hosts_config_is_refused_before_anything_moves() {
+    let root = install_root("candidate-refuses");
+    plant_binary(&root, "0.5.1");
+    plant_loadable_config(&root, "\n[limits]\na_key_a_later_release_added = 2\n");
+    plant_unit(&root);
+
+    let output =
+        run_deploy_with_candidate(&root, &real_binary(), &["--dry-run", "--tag", "v0.4.4"]);
+
+    assert!(
+        !output.status.success(),
+        "an install that cannot come up must not be attempted: {}",
+        stdout_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("unknown field"),
+        "the candidate's own account of the refusal must reach the operator: {stderr}"
+    );
+    assert!(
+        stderr.contains("at line "),
+        "including the position, which is the only thread back to the key: {stderr}"
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(
+        !stdout.contains("would update"),
+        "the run must stop before the decision it would have acted on: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The other verdict: a configuration the candidate loads is not in the way, and
+/// the run carries on to the decision it was going to make anyway.
+#[test]
+fn a_candidate_that_loads_the_config_lets_the_run_continue() {
+    let root = install_root("candidate-accepts");
+    plant_binary(&root, "0.5.1");
+    plant_loadable_config(&root, "");
+    plant_unit(&root);
+
+    let output =
+        run_deploy_with_candidate(&root, &real_binary(), &["--dry-run", "--tag", "v0.4.4"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("loads on volto 0.4.4"),
+        "the run must say the config was checked and by which version: {stdout}"
+    );
+    assert!(
+        stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
+        "the decision must still be the last thing printed: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The branch that decides whether any of this can be trusted: a candidate from
+/// before the flag existed.
+///
+/// Such a binary answers `--check-config` with clap's usage error, and reading
+/// that as "your configuration is broken" would refuse every rollback to a
+/// release older than this one — the exact opposite of what the check is for.
+/// So the flag is detected by name in the candidate's own `--help` before it is
+/// used at all, and a candidate without it falls back to the advisory the script
+/// printed before any of this existed. The stand-in fails loudly on an unknown
+/// argument, so an implementation that tried the flag first would be caught
+/// here rather than on a host.
+#[test]
+fn a_candidate_that_predates_the_flag_falls_back_to_the_advisory() {
+    let root = install_root("candidate-too-old");
+    plant_binary(&root, "0.5.1");
+    plant_loadable_config(&root, "\n[limits]\na_key_a_later_release_added = 2\n");
+    plant_unit(&root);
+    let candidate = plant_binary_without_the_flag(&root);
+
+    let output = run_deploy_with_candidate(&root, &candidate, &["--dry-run", "--tag", "v0.4.4"]);
+
+    assert!(
+        output.status.success(),
+        "a candidate that cannot be asked must not be treated as a refusal: {}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "the flag must never be tried on a binary whose help does not name it: {stderr}"
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("cannot be asked"),
+        "the run must say why the config went unchecked: {stdout}"
+    );
+    assert!(
+        stdout.contains("unknown field"),
+        "and fall back to the advisory, which is all it has left: {stdout}"
+    );
+    assert!(
+        stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
+        "the decision must still be the last thing printed: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// There is nothing to check before a first install: the file the check would
+/// read is the one the installer is about to create.
+#[test]
+fn there_is_nothing_to_check_before_a_first_install() {
+    let root = install_root("candidate-first-install");
+    let output =
+        run_deploy_with_candidate(&root, &real_binary(), &["--dry-run", "--tag", "v0.4.4"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        stdout_of(&output),
+        "dry-run: would install v0.4.4 (missing: config unit)\n",
+        "a first install has no configuration to check"
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 /// `refresh_self` keeps the copy the timer executes in step with the release,

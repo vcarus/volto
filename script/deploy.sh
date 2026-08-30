@@ -17,18 +17,27 @@
 # Rolling back by hand is the same flow pinned to an older release:
 #   sudo volto-deploy --tag v0.1.0
 #
-# That path prints an advisory of its own, because it has two hazards the
-# everyday direction does not: the config file is never rewritten and an older
-# volto refuses the whole file over one key it does not know, and --tag is not a
-# pin -- the update timer, if enabled, converges forward again.
+# Before the binary is swapped, the one that is about to replace it is asked
+# whether it can even read this host's /etc/volto/config.toml -- `volto
+# --check-config`. A "no" refuses the install outright and leaves the running
+# service alone, which is the only useful moment to say it: afterwards the
+# service is already down and the rollback guard below has restored the release
+# the operator was trying to leave. That path still prints an advisory too,
+# because it has two hazards the everyday direction does not: the config file is
+# never rewritten and an older volto refuses the whole file over one key it does
+# not know, and --tag is not a pin -- the update timer, if enabled, converges
+# forward again. On a candidate too old to know the flag, the advisory is all
+# there is, and the run continues.
 #
 # --dry-run is the test seam, in the spirit of install-selfsigned.sh's
 # --print-config: it skips the preflight, prints the convergence decision it
 # would act on and stops before touching anything. Together with
-# VOLTO_DEPLOY_ROOT, which prefixes every install path, that puts the two
-# branches which have broken in production -- the convergence check and
-# refresh_self under a piped bootstrap -- inside reach of tests/it_deploy.rs,
-# with no root, no systemd and no network.
+# VOLTO_DEPLOY_ROOT, which prefixes every install path, and
+# VOLTO_DEPLOY_CANDIDATE, which names a binary to check the config against
+# instead of downloading one, that puts the three branches which have broken (or
+# would break silently) in production -- the convergence check, refresh_self
+# under a piped bootstrap, and the config check above -- inside reach of
+# tests/it_deploy.rs, with no root, no systemd and no network.
 
 set -euo pipefail
 
@@ -40,6 +49,12 @@ TAG="${TAG:-}" # empty means: resolve the latest release
 # Empty in every real run, so the paths below are the absolute ones; a test sets
 # it to a temporary directory to relocate the whole install.
 ROOT="${VOLTO_DEPLOY_ROOT:-}"
+
+# The binary whose verdict on the config decides whether the install proceeds.
+# Empty in every real run until the release has been unpacked, when it becomes
+# the binary out of the verified tarball; a --dry-run test names one here
+# instead, since a dry run downloads nothing.
+CANDIDATE="${VOLTO_DEPLOY_CANDIDATE:-}"
 
 BIN="$ROOT/usr/local/bin/volto"
 SELF_INSTALLED="$ROOT/usr/local/sbin/volto-deploy"
@@ -65,6 +80,11 @@ is restarted, keeping the previous binary for automatic rollback. When the
 installed version already matches the release and the config and unit are in
 place, nothing is touched.
 
+Before the binary is swapped the new one is asked whether it can load
+/etc/volto/config.toml (volto --check-config); if it cannot, nothing is
+installed and the running service is left alone. A release too old to know
+that flag is not checked, only warned about.
+
 Options:
   -t, --tag vX.Y.Z     deploy this release instead of the latest one (this is
                        also how you roll back)
@@ -81,7 +101,8 @@ Options:
 REPO and TAG can also be given as environment variables, as can the
 install-selfsigned.sh variables (SNI, PORT, USERNAME, PASSWORD) on a first
 install. VOLTO_DEPLOY_ROOT prefixes every install path (/usr/local/bin,
-/etc/volto, /etc/systemd/system); it exists for --dry-run tests.
+/etc/volto, /etc/systemd/system) and VOLTO_DEPLOY_CANDIDATE names the binary
+the config check runs; both exist for --dry-run tests.
 
 Re-running is safe: the version check turns a run with nothing new into a
 no-op, and the first-install path inherits install-selfsigned.sh's guarantees
@@ -122,6 +143,64 @@ is_older_version() {
         [ "$x" -eq "$y" ] || { [ "$x" -lt "$y" ]; return; }
     done
     return 1
+}
+
+# Refuses the install when the binary in $1 cannot load this host's config.
+#
+# The hazard this closes is the rollback one: every table in the config file is
+# `deny_unknown_fields`, so a binary older than a key in the file refuses the
+# whole file and does not start. Nothing rewrites the config on the way back
+# either, so the answer is already fixed by the time the tarball is unpacked --
+# and the only moment it is worth anything is before the swap, since afterwards
+# the service is down and the guard below has restored the very release the
+# operator was trying to leave.
+#
+# The candidate is run rather than inspected, which costs no trust that was not
+# already spent: its checksum has been verified against the release's
+# SHA256SUMS by the time we get here, and the next thing that happens to it
+# either way is being installed and started as root.
+#
+# Whether the candidate can be asked at all is settled by looking for the flag
+# in its own --help, not by running it and reading the failure. A volto from
+# before the flag existed answers an unknown argument with clap's usage error,
+# and taking that for "your configuration is broken" would refuse every rollback
+# to a release older than this one -- the exact opposite of the point. The help
+# text goes into a variable rather than through a pipe to grep, because `grep -q`
+# closes the pipe on its first match and `set -o pipefail` would then report the
+# producer's SIGPIPE as a failure.
+#
+# A candidate that cannot be asked leaves the run exactly as it was before any
+# of this existed: the downgrade advisory above is what the operator gets.
+check_config_with() {
+    local binary="$1" help output
+
+    help="$("$binary" --help 2>&1)" || help=""
+    case "$help" in
+        *--check-config*) ;;
+        *)
+            note "volto $VERSION predates --check-config, so it cannot be asked whether it"
+            note "can load $CONF; the advisory above is all there is"
+            return 0
+            ;;
+    esac
+
+    if output="$("$binary" --check-config --config "$CONF" 2>&1)"; then
+        note "$CONF loads on volto $VERSION"
+        return 0
+    fi
+
+    # Everything about the refusal, on stderr, where a failing run's output is
+    # read from -- including the candidate's own message, which names the file,
+    # the line and the column but not the key (a parse error redacts every
+    # quoted segment, because the same message can quote a password).
+    {
+        echo "==> volto $VERSION cannot load $CONF"
+        echo "$output"
+        note "nothing was installed; the $SERVICE_NAME service still runs ${INSTALLED:-what it had}"
+        note "the position above names the line to comment out in $CONF"
+        note "(docs/configuration.md, version compatibility, says which key arrived when)"
+    } >&2
+    die "refusing to install volto $VERSION over a config it cannot load"
 }
 
 # --- arguments ---------------------------------------------------------------
@@ -217,6 +296,13 @@ if [ "$INSTALLED" = "$VERSION" ] && [ -f "$CONF" ] && [ -f "$UNIT" ]; then
         note "volto $INSTALLED is already deployed and intact ($TAG), nothing to do"
     fi
 elif [ "$DRY_RUN" -eq 1 ]; then
+    # The check the real path makes before it swaps the binary, made here in the
+    # same place in the order: after the advisory, before the decision. A dry run
+    # has no downloaded binary to ask, so it asks the one a test named.
+    if [ -f "$CONF" ] && [ -n "$CANDIDATE" ]; then
+        check_config_with "$CANDIDATE"
+    fi
+
     # Same two questions the real branches below ask, in the same order: a
     # missing config means the first-install path, anything else an update.
     MISSING=""
@@ -260,6 +346,12 @@ else
         bash "$SRC/script/install-selfsigned.sh" --binary "$SRC/volto" \
             ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}
     else
+        # Before anything on this host moves: the binary about to be installed
+        # is asked whether it can read the config that is already here. It
+        # either says yes, says nothing useful because it predates the flag, or
+        # ends the run with the service still up.
+        check_config_with "$SRC/volto"
+
         echo "==> updating volto ${INSTALLED:-(unknown)} -> $VERSION"
 
         if [ -x "$BIN" ]; then

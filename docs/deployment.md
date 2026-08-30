@@ -161,10 +161,13 @@ host needs:
 - **No install yet** (`/etc/volto/config.toml` absent): it runs the bundled
   `install-selfsigned.sh` for the full first-time setup, so the same flags and
   environment variables apply (`--sni`, `--port`, `--username`, `--password`).
-- **Older version installed**: it keeps the current binary at
-  `/usr/local/bin/volto.prev`, swaps in the new one, refreshes the systemd
-  unit and restarts. If the service is not running a few seconds later, the
-  previous binary is restored and restarted, and the script fails loudly.
+- **Older version installed**: it asks the release it is about to install
+  whether it can load this host's `/etc/volto/config.toml` and stops if it
+  cannot (see [before the swap](#before-the-swap)); otherwise it keeps the
+  current binary at `/usr/local/bin/volto.prev`, swaps in the new one, refreshes
+  the systemd unit and restarts. If the service is not running a few seconds
+  later, the previous binary is restored and restarted, and the script fails
+  loudly.
 - **Already on that version**, with the config and the unit in place: it exits
   without touching anything. The presence checks are part of the deal —
   deleting `/etc/volto/config.toml` and re-running is the supported way to
@@ -207,6 +210,30 @@ with the repository. `journalctl -u volto-deploy.service` shows what each run
 did; a failed update leaves the timer unit in a failed state, which is the
 signal to go look.
 
+### Before the swap
+
+On every update, and on a rollback above all, the script asks the binary it is
+about to install whether it can load the configuration this host already has:
+
+```sh
+volto --check-config --config /etc/volto/config.toml
+```
+
+If the answer is no, nothing is installed, the running service is not touched,
+and the run fails with the candidate's own message — file, line and column —
+on stderr. Asking before the swap is the only time the answer is worth having:
+afterwards the service is already down, and the guard below has restored the
+release you were trying to leave.
+
+Whether the candidate can be asked at all is decided by looking for the flag in
+its own `--help`, not by running it and reading how it fails, so a release from
+before the flag existed is never mistaken for a bad configuration. Such a
+release simply goes unchecked — which means a rollback *past* the release that
+introduced `--check-config` is exactly as unguarded as it always was, and gets
+the advisory below instead.
+
+### Rolling back
+
 Rolling back is the same flow pinned to an older release:
 
 ```sh
@@ -226,7 +253,8 @@ from that example. The startup error names the file, the line and the column;
 comment that key out and start the service, or comment out everything
 introduced after the target release beforehand. See
 [version compatibility](configuration.md#version-compatibility) for which key
-arrived when.
+arrived when. On a rollback the check above catches this first, when the target
+release is new enough to be asked.
 
 The script's own guardrail does not help here, and reads backwards if you are
 not expecting it: when the newly installed binary is not running a few seconds
