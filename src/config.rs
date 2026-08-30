@@ -1075,14 +1075,16 @@ const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 ///
 /// What makes it worth rejecting rather than tolerating is where the cost is
 /// paid. quinn does not allocate a stream when one is opened — `StreamsState`
-/// reserves a slot for every unit of the credit when the *connection* is
-/// created, so this value is spent at every handshake, by any peer, before a
-/// request has been seen. Measured on the dev host: a handshake takes about
+/// reserves a slot for every unit of the credit when the allowance is granted,
+/// which since the pre-authentication clamp is once per connection, at its
+/// first authenticated request (before the clamp, at every handshake, by any
+/// peer). Measured on the dev host when it was paid per handshake (D86): about
 /// 11 ms at the default of 1024, 135 ms at this ceiling, 7.3 s at a million,
-/// and does not finish inside ten seconds at four million — where `u32::MAX`,
-/// which a config file can hold, is a further thousandfold. A typo here leaves
-/// a server that still answers `systemctl status` and no client at all, which
-/// is the same failure `MAX_INITIAL_MTU` is written against.
+/// and no completed handshake inside ten seconds at four million — where
+/// `u32::MAX`, which a config file can hold, is a further thousandfold. The
+/// raise measures cheaper than the handshake did, but the shape is the same:
+/// a typo here buys every connection's first request a stall, which is the
+/// same class of self-inflicted outage `MAX_INITIAL_MTU` is written against.
 const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 
 /// Renders a TOML parse failure without the source line it points at.
@@ -2067,12 +2069,13 @@ pub(crate) mod tests {
 
     /// The stream credit is work per handshake, so it has a ceiling (D86).
     ///
-    /// quinn reserves a slot for every unit of it when a connection is created,
-    /// not when a stream is opened, so an operator writing a large number here
-    /// is not raising a limit but adding work to every handshake: measured on
-    /// the dev host, about 11 ms at the default 1024, 135 ms at the ceiling,
-    /// 7.3 s at a million, and no completed handshake within ten seconds at
-    /// four million. `u32::MAX` is a config file away from any of those.
+    /// quinn reserves a slot for every unit of it when the allowance is
+    /// granted — once per connection since the pre-authentication clamp, at
+    /// its first authenticated request — so an operator writing a large number
+    /// here is not raising a limit but adding work to every connection. D86's
+    /// per-handshake measurements ran 11 ms at the default 1024 to 7.3 s at a
+    /// million, with no completed handshake within ten seconds at four
+    /// million; `u32::MAX` is a config file away from any of those.
     #[test]
     fn a_stream_limit_past_the_ceiling_is_rejected() {
         for streams in [u32::MAX, MAX_STREAMS_BIDI_CEILING + 1] {
