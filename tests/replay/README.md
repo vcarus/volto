@@ -233,6 +233,39 @@ and that the qdisc carried packets at all. A replay that believed it was lossy
 and was not would file a loopback result under a lossy heading, which is the one
 outcome worse than not running.
 
+### At the severe tier, connections stop being free
+
+The first three tiers are paths a connection survives. The fourth is not: at 42%
+per-packet loss a QUIC handshake needs several flights and most of them do not
+arrive, so a sizeable share of connections never establish at all. The run
+reports them by what ended each one — the path running out the ten-second bound,
+the server refusing at `max_connections`, or the server evicting a connection
+that had not yet authenticated (D76) — and carries on. None of the three is a
+fault, and until the tier was first run the harness treated all of them as one,
+by panicking.
+
+The two that name the server are also the two the harness must not provoke. A
+run that drove the server into its own admission control would be measuring its
+own scheduling: the connections it failed to open would read as a shortfall of
+the tier, and the closes it caused would sit in the log beside the ones a real
+fault writes. So the replay holds itself to three quarters of the server's
+`max_connections`, an arrival waits for a slot rather than stacking on top of the
+connections already open, and the run prints `arrivals that waited` and
+`never started`. Both are zero on any path that can execute the plan — the
+plan's own peak concurrency is in the low tens against a ceiling of 192 — so the
+first three tiers run exactly the plan they always did.
+
+Two further lines are worth reading together on a shaped run:
+
+* `peak connections` — the most connections open at once, counted over the same
+  span the server holds a slot for. It is the number that says whether a run came
+  anywhere near the ceiling.
+* `overran their window` — connections still working when their planned active
+  window closed. The plan gives each connection a working phase; on loopback the
+  tunnels are long finished by the end of it, and under loss they are not. They
+  are counted rather than cut short, because cutting them would change what a
+  tier executes and the tiers must differ only in the path.
+
 ## What the replay cannot do
 
 Stated here as well as in `it_replay.rs` because it is the first thing to read

@@ -147,6 +147,35 @@
 //! as reset by its peer. One shows up every few hundred connections. It is
 //! counted and printed, because a rise in it would be worth knowing about, and
 //! it is not a failure because nothing in the server produced it.
+//!
+//! # Connections that do not happen
+//!
+//! Nor is a handshake that produces no client. On loopback every one of them
+//! succeeds, so for a long time the harness simply assumed it: the connect
+//! helper panicked on anything else, and at the severe tier's 42% loss that
+//! panic was the whole result of the run. Three things can end a handshake
+//! there, and none of them is a fault:
+//!
+//! * **The path.** Several flights, most of which do not arrive, against a
+//!   ten-second bound. Reported as `no handshake within 10s`.
+//! * **A refusal.** At `max_connections` the server refuses what it has no slot
+//!   for, after asking an unvalidated address to prove itself first (RFC 9000
+//!   §8.1). Reported as a transport close carrying CONNECTION_REFUSED.
+//! * **An eviction.** At the same cap, a connection that has never
+//!   authenticated may have its slot taken by a newcomer (D76) -- and a
+//!   connection between its QUIC handshake and its first CONNECT is exactly
+//!   that. Reported as the application close the eviction sends.
+//!
+//! All three are counted by kind and printed. The last two are also the ones
+//! this harness must not *cause*, because a run that drove the server into its
+//! own admission control would be measuring its own scheduling: the connections
+//! it failed to open would look like a shortfall of the tier, and the closes it
+//! provoked would sit in the log beside the ones a real fault would write. So
+//! the harness holds itself to a ceiling below the server's cap, waits for a
+//! slot rather than stacking arrivals on top of one another, and prints how
+//! often it had to -- see `CONNECTION_CEILING_SHARE`. The ceiling is far above
+//! the concurrency the plan asks for, so on any path that can execute the plan
+//! it never binds and every tier runs the plan it was given.
 
 mod common;
 
@@ -163,11 +192,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::h3client::NoClient;
 use common::{
     basic_credentials, spawn_echo_target, spawn_udp_echo_target, ClientStream, H3Client,
     SharedBuffer, TestServer, CONNECT_UDP,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 use volto::datagram;
 use volto::h3api::{Method, Request, Status};
@@ -185,6 +215,37 @@ const PASSWORD: &str = "replay-password";
 /// off. Generous: this is loopback, and the interesting case is a request that
 /// is never answered at all.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a connection may take to be established before it is written off.
+///
+/// The same bound the rest of the harness uses, and on a shaped path it is
+/// reached: at the severe tier's 42% per-packet loss a QUIC handshake needs
+/// several flights that mostly do not arrive, and the server has meanwhile given
+/// up on it at its own `max_idle_timeout`. What matters is that reaching it is a
+/// *result* -- one counted handshake that did not happen -- rather than the end
+/// of the run.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The lab server's `max_connections`, written into its config rather than
+/// left to the default so that [`CONNECTION_CEILING_SHARE`] has something to be
+/// a share *of*. The value is the program default, which is what the captured
+/// hosts run.
+const LAB_MAX_CONNECTIONS: usize = 256;
+
+/// How much of the server's own connection limit this harness will occupy.
+///
+/// A guard rail, not a shaper. At the cap the server does two correct things --
+/// it evicts the oldest connection that has never authenticated (D76) and
+/// refuses what it cannot make room for -- and a run that reached them would be
+/// measuring its own scheduling rather than the path: the numbers would carry a
+/// population of connections that never ran, and the log would carry closes that
+/// look like the server finding fault. So the harness stops short of the cap by
+/// a quarter, which is far above anything the plan asks for (its own peak
+/// concurrency is in the low tens) and so never binds on a path that can execute
+/// the plan. When it does bind the run says so, in `arrivals that waited` and
+/// `never started`, and those two numbers are the signal that a tier's shortfall
+/// is the harness's and not the server's.
+const CONNECTION_CEILING_SHARE: (usize, usize) = (3, 4);
 
 /// How long a transfer may take.
 const TRANSFER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -251,12 +312,16 @@ impl Settings {
     /// The MTU and initial-RTT keys are the values the shipped
     /// `script/config.example.toml` recommends and the captured hosts run with,
     /// so the server's own timers and packet sizes start where production's do.
-    /// Everything else is the program default, which is what those hosts use.
+    /// Everything else is the program default, which is what those hosts use --
+    /// including `max_connections`, spelled out here rather than left implicit
+    /// only because [`CONNECTION_CEILING_SHARE`] is a share of it and a default
+    /// that moved would silently move the harness's own ceiling with it.
     fn config(&self) -> String {
         format!(
             "[auth]\n\
              users = [{{ username = \"{USER}\", password = \"{PASSWORD}\" }}]\n\
              [limits]\n\
+             max_connections = {max_connections}\n\
              max_idle_timeout = {idle}\n\
              keep_alive_interval = 0\n\
              udp_session_timeout = {udp}\n\
@@ -265,6 +330,7 @@ impl Settings {
              initial_rtt_ms = 150\n\
              [security]\n\
              allow_private_networks = true\n",
+            max_connections = LAB_MAX_CONNECTIONS,
             idle = self.idle_seconds,
             // The production 180s scaled the same way everything else is, with
             // the config's own floor of one second under it.
@@ -281,6 +347,39 @@ impl Settings {
 struct Tally {
     connections_started: AtomicU64,
     handshakes_failed: AtomicU64,
+
+    /// Connections that never got a slot under the harness's own ceiling.
+    ///
+    /// Zero on any path that can execute the plan. Non-zero means the run
+    /// stopped short of [`CONNECTION_CEILING_SHARE`] of the server's cap, and
+    /// so that this tier's connection count is short by the harness's doing and
+    /// not the server's. See [`Slots`].
+    connections_never_started: AtomicU64,
+    /// Arrivals that had to wait for one, and how long they waited in total.
+    arrivals_delayed: AtomicU64,
+    arrival_delay_ms: AtomicU64,
+
+    /// Connections holding a slot right now, and the most there have ever been.
+    ///
+    /// The peak is the number that says whether a run came anywhere near the
+    /// server's admission control, and it is the honest measure of the
+    /// concurrency a path produced: it counts a connection from the moment its
+    /// handshake starts to the moment the transport is genuinely over, which is
+    /// exactly the span the server holds a roster slot for.
+    live_now: AtomicU64,
+    live_peak: AtomicU64,
+
+    /// Connections still working when their planned active window closed.
+    ///
+    /// The plan gives every connection a working phase and the driver waits out
+    /// exactly that; on loopback the tunnels are long finished by the end of it.
+    /// Under loss they are not, and the connection goes on holding its slot
+    /// while its transfers run down their own timeouts. Counted rather than cut
+    /// short: cutting would change what every tier executes, and the point of
+    /// the number is to say how far a path pushed a connection past the
+    /// lifetime it was planned for.
+    connections_overrunning: AtomicU64,
+
     ended_idle: AtomicU64,
     ended_peer_close: AtomicU64,
     ended_violation: AtomicU64,
@@ -319,11 +418,57 @@ struct Tally {
     /// only news once it is clear which refusal it is and whether the lab
     /// produced a kind production does not.
     refusals: Mutex<BTreeMap<String, u64>>,
+
+    /// How the handshakes that produced no client ended, and how many of each.
+    ///
+    /// The same reasoning as `refusals`, one layer down. A bare count would say
+    /// nothing: a handshake the *server* refused because it was full, one it
+    /// evicted to make room, and one whose packets simply never arrived are
+    /// three different findings, and only the last is the path. So each is named
+    /// by what ended it.
+    handshake_endings: Mutex<BTreeMap<String, u64>>,
 }
 
 impl Tally {
     fn bump(&self, counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records a handshake that produced no client, by what ended it.
+    ///
+    /// The peer's own reason phrase is deliberately left out of the key: a
+    /// refusal carries none, and a key that carried arbitrary text would give
+    /// the table a row per connection instead of a row per kind. The transport
+    /// code is spelled with `Debug`, which quinn defines as the RFC 9000 §20.1
+    /// name (`CONNECTION_REFUSED`) where `Display` gives it a sentence.
+    fn no_client(&self, error: &NoClient) {
+        let kind = match error {
+            NoClient::TooSlow(within) => format!("no handshake within {}s", within.as_secs()),
+            NoClient::Lost(quinn::ConnectionError::ConnectionClosed(close)) => {
+                format!("transport close: {:?}", close.error_code)
+            }
+            NoClient::Lost(quinn::ConnectionError::ApplicationClosed(close)) => {
+                format!("application close: {:#x}", close.error_code.into_inner())
+            }
+            NoClient::Lost(other) => other.to_string(),
+        };
+
+        *self
+            .handshake_endings
+            .lock()
+            .expect("handshake lock")
+            .entry(kind)
+            .or_default() += 1;
+    }
+
+    /// Notes that a connection has taken a slot, keeping the high-water mark.
+    fn slot_taken(&self) {
+        let live = self.live_now.fetch_add(1, Ordering::Relaxed) + 1;
+        self.live_peak.fetch_max(live, Ordering::Relaxed);
+    }
+
+    fn slot_given_back(&self) {
+        self.live_now.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn refused(&self, response: &common::Response) {
@@ -677,6 +822,68 @@ async fn run_tunnel(
 /// Connections still open, so a restart burst has something to abort.
 type Live = Arc<Mutex<Vec<quinn::Connection>>>;
 
+/// The harness's own ceiling on how many connections it holds open at once.
+///
+/// One permit is a connection's right to exist, taken before its handshake
+/// starts and given back the moment its transport is genuinely over -- the same
+/// span the server holds a roster slot for, so what this counts is what the
+/// server's `max_connections` counts. See [`CONNECTION_CEILING_SHARE`] for why
+/// there is a ceiling at all.
+#[derive(Clone)]
+struct Slots {
+    permits: Arc<Semaphore>,
+    ceiling: usize,
+}
+
+impl Slots {
+    fn new(ceiling: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(ceiling)),
+            ceiling,
+        }
+    }
+
+    /// Takes a slot, waiting no later than `until` for one.
+    ///
+    /// `None` means the harness was at its ceiling for the whole of what was
+    /// left of the run window, so this connection is not opened at all. Waiting
+    /// happens inside the spawned driver rather than in the arrival loop on
+    /// purpose: a blocked arrival must not push every later arrival back with it
+    /// and turn one congested moment into a shifted schedule.
+    async fn take(
+        &self,
+        until: Instant,
+        tally: &Tally,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if let Ok(permit) = self.permits.clone().try_acquire_owned() {
+            tally.slot_taken();
+            return Some(permit);
+        }
+
+        tally.bump(&tally.arrivals_delayed);
+        let waited_from = Instant::now();
+        let permit = timeout(
+            until.saturating_duration_since(waited_from),
+            self.permits.clone().acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        tally
+            .arrival_delay_ms
+            .fetch_add(waited_from.elapsed().as_millis() as u64, Ordering::Relaxed);
+        tally.slot_taken();
+        Some(permit)
+    }
+}
+
+/// Adds every tunnel a connection will now never ask for to the skipped count.
+fn skip_remaining(tally: &Tally, plan: &shape::ConnectionPlan, done: usize) {
+    tally
+        .tunnels_skipped
+        .fetch_add((plan.tunnels.len() - done) as u64, Ordering::Relaxed);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     server: Arc<TestServer>,
@@ -684,13 +891,16 @@ async fn run_connection(
     plan: shape::ConnectionPlan,
     tally: Arc<Tally>,
     live: Live,
+    slots: Slots,
+    run_end: Instant,
     idle_release: Instant,
     outlive_release: Instant,
     connection_tag: u64,
 ) {
     // A restart burst is a client that came back: whatever it was holding is
     // gone. Aborting a predecessor here rather than at plan time is what puts a
-    // transfer genuinely in flight when the abort lands.
+    // transfer genuinely in flight when the abort lands. Before the slot is
+    // taken, so the burst's own victim is what makes room for it.
     if plan.in_burst {
         let victim = live.lock().expect("live lock").pop();
         if let Some(victim) = victim {
@@ -699,19 +909,47 @@ async fn run_connection(
         }
     }
 
-    let client = match timeout(RESPONSE_TIMEOUT, H3Client::connect(&server)).await {
+    let Some(permit) = slots.take(run_end, &tally).await else {
+        tally.bump(&tally.connections_never_started);
+        skip_remaining(&tally, &plan, 0);
+        return;
+    };
+
+    // Not a panic, on any path. A handshake the server refused because it was
+    // full, one it evicted to make room (D76), and one whose packets never got
+    // there are all outcomes a lossy run is entitled to produce, and all three
+    // used to end the run instead of appearing in it. Which one it was is kept,
+    // because only the last of the three is the path.
+    let mut client = match H3Client::try_connect_within(&server, HANDSHAKE_TIMEOUT).await {
         Ok(client) => client,
-        Err(_) => {
+        Err(error) => {
             tally.bump(&tally.handshakes_failed);
+            tally.no_client(&error);
+            skip_remaining(&tally, &plan, 0);
+            tally.slot_given_back();
             return;
         }
     };
-    let mut client = client;
     tally.bump(&tally.connections_started);
 
     let quic = client.quic.clone();
     live.lock().expect("live lock").push(quic.clone());
     let router = Router::spawn(quic.clone(), tally.clone());
+
+    // The slot goes back when the transport is over, which is not when the
+    // driver below stops using it: a connection whose plan ends in silence is
+    // reclaimed by the server's idle timer long before the run's release
+    // instants come round, and holding its slot until then would have the
+    // harness counting connections the server has already let go of.
+    tokio::spawn({
+        let quic = quic.clone();
+        let tally = tally.clone();
+        async move {
+            quic.closed().await;
+            tally.slot_given_back();
+            drop(permit);
+        }
+    });
 
     let mut bodies = Vec::new();
     let started = Instant::now();
@@ -745,9 +983,7 @@ async fn run_connection(
             // worth being able to see in the numbers.
             Err(_) => {
                 tally.bump(&tally.tunnels_failed);
-                tally
-                    .tunnels_skipped
-                    .fetch_add((plan.tunnels.len() - index - 1) as u64, Ordering::Relaxed);
+                skip_remaining(&tally, &plan, index + 1);
                 break;
             }
         };
@@ -767,12 +1003,23 @@ async fn run_connection(
     // Let the transfers finish, but no longer than the connection was planned
     // to be active: a connection that ends mid-transfer is exactly what a
     // restart looks like from the server's side.
+    //
+    // The transfers are not cut short when the window closes, and that is a
+    // decision rather than an oversight: cutting them would change what every
+    // tier executes, and this run's whole premise is that the tiers differ only
+    // in the path. So a connection that is still working is counted instead --
+    // it goes on holding its slot while its tunnels run down their own timeouts,
+    // and `overran their window` is what says how far a path pushed one past the
+    // lifetime it was planned for.
     let deadline = started + Duration::from_millis(plan.active_ms);
-    let _ = timeout(
+    let finished = timeout(
         deadline.saturating_duration_since(Instant::now()),
         futures_join(bodies),
     )
     .await;
+    if finished.is_err() {
+        tally.bump(&tally.connections_overrunning);
+    }
 
     // The connection is no longer a candidate for a burst to abort.
     {
@@ -1058,6 +1305,8 @@ async fn production_shapes_are_replayed() {
     let targets = Arc::new(Targets::spawn(settings.targets).await);
     let tally = Arc::new(Tally::default());
     let live: Live = Arc::new(Mutex::new(Vec::new()));
+    let slots =
+        Slots::new(LAB_MAX_CONNECTIONS * CONNECTION_CEILING_SHARE.0 / CONNECTION_CEILING_SHARE.1);
 
     let planned_tunnels: usize = plan.connections.iter().map(|c| c.tunnels.len()).sum();
     println!(
@@ -1072,6 +1321,7 @@ async fn production_shapes_are_replayed() {
          connections planned   {}\n\
          tunnels planned       {}\n\
          lab targets           {} TCP, {} UDP\n\
+         harness ceiling       {} connections at once, against the server's own {}\n\
          from joint table      {} of {} connections\n\
          capped tunnel counts  {}\n\
          capped transfers      {}\n\
@@ -1094,6 +1344,8 @@ async fn production_shapes_are_replayed() {
         planned_tunnels,
         targets.echo.len(),
         targets.udp.len(),
+        slots.ceiling,
+        LAB_MAX_CONNECTIONS,
         plan.compromises.from_joint_table,
         plan.connections.len(),
         plan.compromises.tunnel_counts_capped,
@@ -1149,6 +1401,8 @@ async fn production_shapes_are_replayed() {
             connection,
             tally.clone(),
             live.clone(),
+            slots.clone(),
+            run_end,
             idle_release,
             outlive_release,
             index as u64,
@@ -1175,7 +1429,13 @@ async fn production_shapes_are_replayed() {
     println!(
         "--- client side ---\n\
          wall clock            {:.1}s\n\
-         connections started   {} ({} handshakes failed)\n\
+         connections started   {} ({} handshakes produced no client)\n\
+         no client, by ending  {:?}\n\
+         peak connections      {} at once, against a ceiling of {} and the server's {}\n\
+         arrivals that waited  {} for a slot ({} ms in total)\n\
+         never started         {}  (at the ceiling for the rest of the window)\n\
+         overran their window  {}  (still working when their planned active window\n\
+         \x20                     closed, so they held their slot past it)\n\
          endings driven        idle {}, peer_close {}, protocol_violation {}, outlive {}\n\
          burst aborts          {}\n\
          still live at hand-off {}  (kept until the connection ended, never dropped live)\n\
@@ -1191,6 +1451,14 @@ async fn production_shapes_are_replayed() {
         elapsed.as_secs_f64(),
         tally.connections_started.load(Ordering::Relaxed),
         tally.handshakes_failed.load(Ordering::Relaxed),
+        tally.handshake_endings.lock().expect("handshake lock"),
+        tally.live_peak.load(Ordering::Relaxed),
+        slots.ceiling,
+        LAB_MAX_CONNECTIONS,
+        tally.arrivals_delayed.load(Ordering::Relaxed),
+        tally.arrival_delay_ms.load(Ordering::Relaxed),
+        tally.connections_never_started.load(Ordering::Relaxed),
+        tally.connections_overrunning.load(Ordering::Relaxed),
         tally.ended_idle.load(Ordering::Relaxed),
         tally.ended_peer_close.load(Ordering::Relaxed),
         tally.ended_violation.load(Ordering::Relaxed),
