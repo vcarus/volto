@@ -138,6 +138,17 @@
 //!   its connection is over; `still live at hand-off` counts how many needed it.
 //! * **No dropped datagrams.** Every UDP session's datagrams must reach it. A
 //!   Quarter-Stream-ID mix-up under this much concurrency shows up here.
+//!
+//!   This is the one assertion the path relaxes, and it is relaxed to the shape
+//!   the path can cause and no further. A session sends its next packet only
+//!   once the last was answered and gives up on the first answer that does not
+//!   come back, so a lossy path can cost each session exactly one drop -- the
+//!   packet it gets away after the server's `udp_session_timeout` has reclaimed
+//!   the session. A shaped run is therefore held to one drop per session where
+//!   an unshaped one is still held to zero, and a mix-up, which misroutes in
+//!   proportion to the datagrams sent rather than to the sessions opened, is
+//!   caught either way. Production's own 0.038 drops per connection are this
+//!   phenomenon; the replay could not reproduce them until it had a path.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
 //!
 //! What is deliberately *not* asserted is the transport ending a client's own
@@ -1616,10 +1627,40 @@ async fn production_shapes_are_replayed() {
         Vec::<String>::new(),
         "a connection was closed with an application code this run never sends"
     );
-    assert_eq!(
-        summary.dropped_datagrams, 0,
-        "the server dropped inbound datagrams instead of delivering them"
-    );
+    // Inbound datagram drops. Zero was assertable for as long as the lab had no
+    // path, and this file said so at the time: production drops 0.038 of them
+    // per connection and the profile attributes those to its 80-95 ms lossy
+    // link, which loopback has no way to reproduce.
+    //
+    // A shaped lab does reproduce it, and the shape is precise enough to bound.
+    // A CONNECT-UDP session here sends its next packet only once the last one
+    // has been answered, and gives up on the first answer that does not come
+    // back -- so a session gets at most one packet away after the server's own
+    // `udp_session_timeout` has reclaimed it, and at most one of its datagrams
+    // can arrive at a Quarter Stream ID nothing claims any more. One drop per
+    // session is therefore the whole of what a path can cause, and a
+    // Quarter-Stream-ID mix-up -- which is what this assertion exists for --
+    // would misroute in proportion to the datagrams sent rather than to the
+    // sessions opened, so it stays comfortably caught.
+    //
+    // The relaxation is the shaping and nothing else: an unshaped run is still
+    // held to zero.
+    let udp_sessions = tally.udp_sessions.load(Ordering::Relaxed);
+    match &shaper {
+        None => assert_eq!(
+            summary.dropped_datagrams, 0,
+            "the server dropped inbound datagrams instead of delivering them, \
+             on a path that cannot lose one"
+        ),
+        Some(_) => assert!(
+            summary.dropped_datagrams <= udp_sessions,
+            "the server dropped {} inbound datagrams over {udp_sessions} \
+             CONNECT-UDP sessions. A lossy path can cost each session one -- the \
+             packet it sends after its answer was lost and the session timed out \
+             -- and no more, so this is a routing fault rather than the path.",
+            summary.dropped_datagrams,
+        ),
+    }
     assert_eq!(
         tally.crosstalk.load(Ordering::Relaxed),
         0,

@@ -177,9 +177,11 @@ Reading it:
   tunnels a restart burst takes with the connection it aborts.
 * **Concurrency** and **lifetime** are the rows to disbelieve, for the reason in
   the section below.
-* **Dropped datagrams** are zero in the lab against 0.038 per connection in
-  production. Not a fidelity gap: those are drops on a lossy 80-95 ms path, and
-  the replay has no such path. Zero is what an assertion holds it to.
+* **Dropped datagrams** are zero in this run against 0.038 per connection in
+  production. Not a fidelity gap: those are drops on a lossy 80–95 ms path, and
+  an unshaped replay has no such path. Zero is what an assertion holds an
+  unshaped run to — see *The lossy path* below for what a shaped one produces
+  instead, which is the same phenomenon production records.
 
 ## The lossy path
 
@@ -265,6 +267,59 @@ Two further lines are worth reading together on a shaped run:
   tunnels are long finished by the end of it, and under loss they are not. They
   are counted rather than cut short, because cutting them would change what a
   tier executes and the tiers must differ only in the path.
+
+### The one assertion the path relaxes
+
+A shaped run is allowed one dropped inbound datagram per CONNECT-UDP session,
+where an unshaped one is still held to zero. That is the shape a path can cause
+and no more: a session sends its next packet only once the last was answered and
+gives up on the first answer that does not come back, so exactly one packet can
+get away after the server's `udp_session_timeout` has reclaimed the session and
+arrive at a Quarter Stream ID nothing claims any more. A Quarter-Stream-ID
+mix-up, which is what the assertion is for, misroutes in proportion to the
+datagrams sent rather than to the sessions opened, and is caught either way.
+
+Production's own 0.038 dropped datagrams per connection are this phenomenon. The
+replay reproduced none of them until it had a path.
+
+### What the four tiers produced
+
+One run each: 300 s at 100x, seed `24061`, `IDLE_SECS=3`, 256 targets. Every tier
+ran the same 81-connection, 5335-tunnel plan.
+
+| | off | steady | spike | severe |
+|---|---|---|---|---|
+| server's own rtt, median | 0 ms | 97 ms | 97 ms | 103 ms |
+| server's own loss, per 1000 packets | 0 | 2.8 | 124 | 312 |
+| connections established | 81 | 81 | 78 | 71 |
+| handshakes that produced no client | 0 | 0 | 0 | 6 |
+| peak connections at once | 5 | 5 | 5 | 9 |
+| connections that overran their window | 7 | 20 | 30 | 63 |
+| tunnels opened | 5331 | 5283 | 3048 | 401 |
+| transfers completed | 4944 | 4782 | 774 | 54 |
+| arrivals that waited for a slot | 0 | 0 | 0 | 0 |
+| closes the server decided on | 0 | 0 | 0 | 0 |
+| dropped datagrams | 0 | 0 | 0 | 0 |
+| cross-talk | 0 | 0 | 0 | 0 |
+
+Only the `off` column reproduces exactly between runs — two runs of it agreed
+down to the byte count echoed. The lossy columns do not: two spike runs at the
+same settings differed by a third in `transfers completed`, because which
+connection happens to die takes hundreds of its tunnels with it. Read the
+structural rows.
+
+The severe column's six lost handshakes split evenly between the ten-second
+client bound and the server dropping a half-built connection at its own
+`max_idle_timeout` — which the lab compresses to three seconds and production
+runs at sixty. That is the tier's own compression showing, not a production
+risk, and `IDLE_SECS` is the knob if a severe run wants more connections at the
+cost of lifetime fidelity.
+
+The ceiling did not bind in any of these, nor in a heavier probe at 1000x where
+the peak rose from 17 connections on `off` to just over 40 on `severe`. It is a
+guard with measured headroom rather than something a normal run notices — and
+that probe is where the datagram drop above showed up, one over eighteen
+sessions, twice running.
 
 ## What the replay cannot do
 
