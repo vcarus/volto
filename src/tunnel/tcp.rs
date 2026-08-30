@@ -255,7 +255,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
             debug!(
                 stream_id,
                 authority,
-                ?allowed,
+                allowed = %crate::logfmt::addresses(&allowed),
                 error = %failure.error,
                 "failed to connect to target"
             );

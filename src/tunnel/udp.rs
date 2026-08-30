@@ -131,7 +131,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
             // names the address that failed.
             debug!(
                 stream_id,
-                ?allowed,
+                allowed = %crate::logfmt::addresses(&allowed),
                 error = %failure.error,
                 "failed to open target UDP socket"
             );

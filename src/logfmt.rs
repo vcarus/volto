@@ -216,9 +216,65 @@ pub fn or_dash<T: fmt::Display>(value: Option<T>) -> impl fmt::Display {
     OrDash(value)
 }
 
+/// How many addresses of a resolved list a log line prints.
+///
+/// A dual-stack name has two, a load balancer a handful; past that the list has
+/// stopped being something an operator reads and become something the log has to
+/// carry.
+const MAX_ADDRESSES: usize = 8;
+
+/// Renders a resolved address list at a length a log line can afford.
+///
+/// The list on the two refusal lines in [`crate::tunnel`] is what the *resolver*
+/// answered, before the policy filter, and nothing between `getaddrinfo` and the
+/// line bounds it: a name whose owner returns four thousand records — which a
+/// DNS answer over TCP has room for — puts every one of them on the line. The
+/// client picks the name, and on the blackhole line, which is deliberately not
+/// sampled because it fires on ordinary ad-blocked traffic, that is tens of
+/// kilobytes of INFO per request. The two `debug` lines naming the addresses a
+/// tunnel failed to reach come through here as well, so that a list this server
+/// prints has one length rule rather than one per call site.
+///
+/// So the head is printed and the rest is counted. The count is the part worth
+/// keeping: "and 3992 more" is itself the diagnosis, where a line that simply
+/// stopped would look like a short list.
+///
+/// The addresses go in with `Display` rather than a `str` field, and may: they
+/// are `SocketAddr`s this server parsed, not bytes a peer chose, which is the
+/// third rule above. Written as a lazy adapter so a filtered-out line pays for
+/// none of it.
+///
+/// ```
+/// # use volto::logfmt::addresses;
+/// # use std::net::SocketAddr;
+/// let one: Vec<SocketAddr> = vec!["127.0.0.1:443".parse().unwrap()];
+/// assert_eq!(addresses(&one).to_string(), "[127.0.0.1:443]");
+/// ```
+pub fn addresses(list: &[std::net::SocketAddr]) -> impl fmt::Display + '_ {
+    struct Addresses<'a>(&'a [std::net::SocketAddr]);
+
+    impl fmt::Display for Addresses<'_> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("[")?;
+            for (index, address) in self.0.iter().take(MAX_ADDRESSES).enumerate() {
+                if index > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{address}")?;
+            }
+            if let Some(rest) = self.0.len().checked_sub(MAX_ADDRESSES).filter(|n| *n > 0) {
+                write!(f, ", and {rest} more")?;
+            }
+            f.write_str("]")
+        }
+    }
+
+    Addresses(list)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{bounded, bounded_bytes, escaped_bytes, or_dash, Sampler, ABSENT};
+    use super::{addresses, bounded, bounded_bytes, escaped_bytes, or_dash, Sampler, ABSENT};
     use std::net::SocketAddr;
 
     /// A value present prints as itself, with no wrapper and no quotes.
@@ -347,6 +403,43 @@ mod tests {
 
         let reported: Vec<u64> = (0..64).filter_map(|_| sampler.record()).collect();
         assert_eq!(reported, vec![1, 2, 4, 8, 16, 32, 64]);
+    }
+
+    /// The list a name resolves to is the name owner's choice, and a DNS answer
+    /// has room for thousands: a log line may not carry all of them, and may not
+    /// hide that there were thousands either.
+    #[test]
+    fn an_address_list_is_printed_at_a_length_a_line_can_afford() {
+        let none: Vec<SocketAddr> = Vec::new();
+        assert_eq!(addresses(&none).to_string(), "[]");
+
+        let two: Vec<SocketAddr> = vec![
+            "127.0.0.1:443".parse().expect("address"),
+            "[::1]:443".parse().expect("address"),
+        ];
+        assert_eq!(addresses(&two).to_string(), "[127.0.0.1:443, [::1]:443]");
+
+        // Exactly at the bound is still printed whole, with nothing appended.
+        let eight: Vec<SocketAddr> = (0..8)
+            .map(|n| SocketAddr::from(([10, 0, 0, n], 443)))
+            .collect();
+        let printed = addresses(&eight).to_string();
+        assert!(printed.ends_with("10.0.0.7:443]"), "{printed}");
+        assert!(!printed.contains("more"), "{printed}");
+
+        let flood: Vec<SocketAddr> = (0..4000)
+            .map(|n| SocketAddr::from(([0, 0, 0, 0], n)))
+            .collect();
+        let printed = addresses(&flood).to_string();
+        assert!(
+            printed.ends_with(", and 3992 more]"),
+            "the count is the diagnosis, not the list: {printed}"
+        );
+        assert!(
+            printed.len() < 200,
+            "one line must not carry {} bytes of resolver answer",
+            printed.len()
+        );
     }
 
     /// The property that makes it a bound rather than a slower flood: the line

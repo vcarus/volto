@@ -784,7 +784,7 @@ pub(crate) async fn admit_target(
                 stream_id,
                 host,
                 port,
-                ?addresses,
+                addresses = %crate::logfmt::addresses(&addresses),
                 "every address of the target is a DNS blackhole"
             );
             accept_then_close(stream, accepted_fields(), stream_id).await;
@@ -802,7 +802,7 @@ pub(crate) async fn admit_target(
                 stream_id,
                 host,
                 port,
-                ?addresses,
+                addresses = %crate::logfmt::addresses(&addresses),
                 refusals,
                 "every address of the target is prohibited by policy; further refusals on \
                  this connection are logged at debug level until the count doubles"
@@ -811,7 +811,7 @@ pub(crate) async fn admit_target(
                 stream_id,
                 host,
                 port,
-                ?addresses,
+                addresses = %crate::logfmt::addresses(&addresses),
                 "every address of the target is prohibited by policy"
             ),
         }
