@@ -83,6 +83,29 @@ const MAX_VARINT: usize = 8;
 ///
 /// The unit is the size formula of RFC 9114 §4.2.2: name plus value plus 32
 /// bytes for each field.
+///
+/// # What a section costs once it is decoded, and for how long
+///
+/// This bounds what is *decoded*; [`HEADERS_BUFFER_BUDGET`] bounds what is being
+/// decoded at one moment, in encoded bytes. Neither bounds what the decoded
+/// product costs after that, so the arithmetic is worth stating here, since this
+/// constant is the only knob in it.
+///
+/// A decoded section is a `message::Fields`: a vector of 32-byte entries with an
+/// allocation per name. §4.2.2's 32 bytes a field exist to model exactly that
+/// per-field cost, so a section at this limit costs about this much again once
+/// decoded — measured at ~77 KiB for the widest conformant one, from a request
+/// under 6 KiB on the wire
+/// (`tests/it_bounds.rs::a_tunnel_holds_its_requests_field_section_for_its_whole_life`).
+///
+/// It is held for as long as the request is: `crate::conn::handle_request` keeps
+/// the decoded [`message::Request`] for the whole life of the tunnel it opened,
+/// not merely until the target has been named. So the multiplier is
+/// `max_targets_per_conn` times `max_connections` — ~19 MiB per connection and
+/// ~4.8 GiB across a server at the shipped defaults — with a further transient
+/// while requests are being refused rather than served, where the multiplier is
+/// `max_streams_bidi` instead and each refusal write is bounded by one
+/// `max_idle_timeout`.
 pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 
 /// Most encoded frame payload one connection may hold buffered at once, in

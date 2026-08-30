@@ -270,7 +270,8 @@ impl Shared {
 ///
 /// # What this costs at the configured limits
 ///
-/// A session holds two buffers, and this constant sizes only the first of them.
+/// A session holds three buffers, and this constant sizes only the first of
+/// them.
 ///
 /// The queue is `depth x payload`. Only the payload needs care: a QUIC DATAGRAM
 /// frame cannot be fragmented, so a datagram never exceeds the
@@ -285,11 +286,24 @@ impl Shared {
 /// exists only once the session loop is running, so a session refused before its
 /// socket is bound never allocates one.
 ///
-/// A session therefore costs ~156 KiB, and the worst case is that times
+/// The third is the [`crate::capsule::CapsuleDecoder`] on the request stream,
+/// which buffers a DATAGRAM capsule's value until all of it has arrived —
+/// [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`] bounds it, and a peer that
+/// declares that much and stops one byte short holds it for the session's idle
+/// timeout. Measured at ~78 KiB, since the `BytesMut` behind it doubles its way
+/// to 64 KiB rather than landing on it
+/// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`).
+///
+/// A session therefore costs ~236 KiB, and the worst case is that times
 /// `max_targets_per_conn` times `max_connections`. With the shipped defaults
-/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~39 MiB per
-/// connection and ~9.8 GiB across a server saturated at both limits — an operator
-/// lowering either limit lowers it proportionally.
+/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~59 MiB per
+/// connection and ~14.7 GiB across a server saturated at both limits — an
+/// operator lowering either limit lowers it proportionally.
+///
+/// All three are released by dropping what owns them rather than by any explicit
+/// call, on whichever of the half-dozen paths a session ends by;
+/// `tests/it_bounds.rs::a_connection_keeps_nothing_for_the_sessions_it_has_closed`
+/// is where that composition is weighed rather than reasoned about.
 ///
 /// Registering a session before its target socket exists does **not** raise that
 /// ceiling: the queue is the same size in both phases, sessions are still capped

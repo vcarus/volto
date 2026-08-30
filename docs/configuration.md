@@ -77,16 +77,18 @@ Raise either limit past that point and `LimitNOFILE` has to go up with it, or
 the startup warning fires.
 
 **A CONNECT-UDP session costs memory as well as a descriptor**, and only the
-descriptors are checked at startup. Each session holds two buffers for its whole
-life: a 64 KiB receive buffer for the packets it reads off its target socket —
-it cannot be smaller, because a `recv` into a short buffer truncates the packet
-silently — and an inbound datagram queue of 64 entries, each at most the
-1472-byte `max_udp_payload_size` this server advertises, so about 92 KiB. That
-is roughly 156 KiB per session, 39 MiB per connection at
-`max_targets_per_conn = 256`, and about 9.8 GiB across a server saturated at
-both defaults. Lowering either limit lowers it proportionally. It is a ceiling
-rather than a resting size because the queue is only full while a client sends
-faster than the proxy forwards.
+descriptors are checked at startup. Each session holds three buffers for its
+whole life: a 64 KiB receive buffer for the packets it reads off its target
+socket — it cannot be smaller, because a `recv` into a short buffer truncates the
+packet silently — an inbound datagram queue of 64 entries, each at most the
+1472-byte `max_udp_payload_size` this server advertises, so about 92 KiB, and the
+capsule decoder on the request stream, which buffers one DATAGRAM capsule's value
+until all of it has arrived and so tops out around 78 KiB. That is roughly
+236 KiB per session, 59 MiB per connection at `max_targets_per_conn = 256`, and
+about 14.7 GiB across a server saturated at both defaults. Lowering either limit
+lowers it proportionally. It is a ceiling rather than a resting size: the queue
+is only full while a client sends faster than the proxy forwards, and the capsule
+buffer only fills for a client that leaves a capsule unfinished.
 
 **A TCP tunnel costs less, not nothing.** Its relay buffer starts at 16 KiB, and
 settles on a single 64 KiB block once the tunnel has relayed anything: reads are
@@ -97,6 +99,16 @@ saturation product for TCP is `max_connections` × `max_targets_per_conn` ×
 holds beyond that one block is bounded by quinn's per-connection send window:
 the pieces cut from a block share it, and each is held until the segment
 carrying it has been acknowledged, so the block outlives them all.
+
+**Every tunnel also holds its request's header fields.** volto advertises
+`SETTINGS_MAX_FIELD_SECTION_SIZE = 65536`, and a client is entitled to send a
+request that large; decoded, it costs roughly that much again — about 77 KiB
+measured — and it is kept for the whole life of the tunnel the request opened,
+not just until the target has been named. At the defaults that is another
+19 MiB per connection and about 4.8 GiB across the server, on top of the tunnel
+figures above. Real clients send a few hundred bytes of headers, so this is a
+ceiling reached only by a client that chooses to fill the advertised limit; it is
+listed because nothing else in this section accounts for it.
 
 **`connect_timeout` is spent per request, not per connection.** Without it a
 target that silently drops SYNs holds a tunnel slot and its file descriptor for

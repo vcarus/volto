@@ -35,6 +35,17 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// A DATAGRAM capsule value is a Context ID varint followed by the payload
 /// (RFC 9297 §3.5). Beyond this the payload could not be a UDP datagram, so
 /// RFC 9298 §5 requires the stream to be aborted rather than the value buffered.
+///
+/// It is also this decoder's memory bound, and therefore one of the three
+/// buffers a CONNECT-UDP session holds
+/// ([`crate::h3::connection::INBOUND_QUEUE_DEPTH`] accounts for all three). A
+/// value has to be buffered whole because a UDP payload cannot be forwarded
+/// piecewise, and a peer that declares the largest one allowed and then stops
+/// one byte short is doing nothing RFC 9297 §3.2 forbids — so what is held is
+/// held until the session's idle timeout. One capsule's worth is all of it:
+/// bytes past a declared value belong to the next capsule and are cut out of the
+/// buffer as they are decoded, and an unknown type is discarded as it arrives
+/// without being buffered at all.
 pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + MAX_UDP_PAYLOAD as u64;
 
 /// Why a capsule sequence could not be decoded.
