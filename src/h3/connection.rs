@@ -1032,6 +1032,22 @@ struct Control {
     /// Kept only to enforce that it never shrinks: this server never pushes,
     /// so the value itself is never consulted.
     max_push_id: Option<u64>,
+    /// Frames of an unknown type this stream has skipped, and when the next one
+    /// is worth a line.
+    ///
+    /// An unknown frame with a zero length is two bytes on the wire, and RFC
+    /// 9114 §9 says to ignore it — so a peer may send them back to back for as
+    /// long as the connection lives, and a line apiece was the highest ratio of
+    /// journal to peer bytes anywhere in this server. It is a `debug!`, so it
+    /// does not reach a default production log at all; what it does reach is the
+    /// operator who turned `debug` on to read what a client is actually sending,
+    /// which is the one moment the flood costs the most.
+    ///
+    /// Ignoring them silently is not the answer: greasing is exactly how a peer
+    /// checks that this server skips what it does not know, so an unexplained
+    /// gap in a debug trace would be the wrong reading. The doubling schedule
+    /// keeps the first one and the size of the flood, and drops the repetition.
+    skipped: crate::logfmt::Sampler,
 }
 
 impl Control {
@@ -1061,10 +1077,14 @@ impl Control {
                 if !self.settings {
                     return Err(missing_settings());
                 }
-                debug!(
-                    frame_type = kind,
-                    "ignoring a frame of an unknown type on the control stream"
-                );
+                if let Some(skipped) = self.skipped.record() {
+                    debug!(
+                        frame_type = kind,
+                        skipped,
+                        "ignoring a frame of an unknown type on the control stream; \
+                         further ones are logged as the count doubles"
+                    );
+                }
                 return Ok(());
             }
         };
@@ -1428,6 +1448,43 @@ mod tests {
         control
             .accept(Item::Frame(Frame::Goaway(4)), &shared)
             .expect("accepted");
+    }
+
+    /// A grease frame is two bytes on the wire and a peer may send them for as
+    /// long as the connection lives, so the line they used to buy apiece was the
+    /// highest ratio of journal to peer bytes in this server.
+    ///
+    /// What is asserted here is that every one of them reaches the sampler,
+    /// which is the half the log cannot show: the schedule's whole point is that
+    /// most occurrences produce no line, so a test reading lines could not tell
+    /// "sampled" from "stopped counting". The schedule itself — 1, 2, 4, 8, and
+    /// seventeen lines for sixty-five thousand — is
+    /// `logfmt::tests::a_sampler_turns_a_flood_into_a_handful_of_lines`.
+    #[test]
+    fn every_skipped_frame_is_counted_and_only_a_few_are_said_out_loud() {
+        const FLOOD: u64 = 1000;
+
+        let shared = Shared::default();
+        let mut control = Control::default();
+        control.accept(settings(true), &shared).expect("accepted");
+
+        for kind in 0..FLOOD {
+            control
+                .accept(
+                    Item::Skipped {
+                        kind: 0x1f * kind + 0x21,
+                    },
+                    &shared,
+                )
+                .expect("ignored");
+        }
+
+        assert_eq!(
+            control.skipped.seen(),
+            FLOOD,
+            "the sampler has to see every skipped frame, or the count it reports \
+             is not the size of the flood"
+        );
     }
 
     /// An empty DATA frame after SETTINGS is a DATA frame like any other, and

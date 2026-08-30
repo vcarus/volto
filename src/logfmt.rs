@@ -190,6 +190,16 @@ impl Sampler {
         let total = self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         total.is_power_of_two().then_some(total)
     }
+
+    /// How many occurrences have been recorded, reported or not.
+    ///
+    /// Only a test asks: it is how a caller's wiring is shown to reach the
+    /// sampler at all, which the log lines cannot show for a schedule whose
+    /// whole point is that most occurrences produce none.
+    #[cfg(test)]
+    pub fn seen(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 /// Formats an optional log field: the value itself, or [`ABSENT`].
