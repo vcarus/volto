@@ -8,6 +8,11 @@
 /fuzz/corpus/
 /fuzz/coverage/
 
+# cargo-mutants run tree, left behind by a mutation run (src/main.rs stopped
+# being excluded when it_cli.rs began running the binary, so a run touches it now)
+/mutants.out/
+/mutants.out.old/
+
 # macOS
 .DS_Store
 
