@@ -128,6 +128,14 @@
 //!   client that commits no offence, and that is exactly the signal this
 //!   harness exists to catch. A close the peer decided on with a code the plan
 //!   never sends fails too, as the harness misreporting what it drove.
+//!
+//!   For that assertion to mean anything, the client must commit no offence,
+//!   and one of them is easy to commit by accident: dropping an `H3Client` on a
+//!   live connection finishes its control stream, which RFC 9114 §6.2.1 makes a
+//!   connection error. The lossy path found that -- on loopback a connection had
+//!   always ended before the drop, so the fault never fired and the assertion
+//!   was passing for the wrong reason. A client is therefore never let go until
+//!   its connection is over; `still live at hand-off` counts how many needed it.
 //! * **No dropped datagrams.** Every UDP session's datagrams must reach it. A
 //!   Quarter-Stream-ID mix-up under this much concurrency shows up here.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
@@ -278,6 +286,15 @@ struct Tally {
     ended_violation: AtomicU64,
     ended_outlive: AtomicU64,
     aborted_by_burst: AtomicU64,
+
+    /// Connections whose transport was still live when their plan ran out.
+    ///
+    /// Zero on loopback, where a connection has always finished and idled out
+    /// before the run's release instants come round. Non-zero once the path has
+    /// a round trip in it, which is what makes it worth counting: it is the
+    /// population that must not be dropped outright, and the size of the
+    /// difference between the two kinds of path.
+    handed_over_live: AtomicU64,
 
     tunnels_requested: AtomicU64,
     tunnels_skipped: AtomicU64,
@@ -793,7 +810,35 @@ async fn run_connection(
         }
     }
 
-    drop(client);
+    // Letting go of the client is not a neutral act. `H3Client` holds its
+    // control stream as a `quinn::SendStream`, and a dropped `SendStream`
+    // *finishes*: the peer gets a FIN on the one stream RFC 9114 §6.2.1 says
+    // must never close, and the server answers it -- correctly -- with
+    // H3_CLOSED_CRITICAL_STREAM. A client that has merely gone quiet sends no
+    // such thing; it stops sending, and nothing else.
+    //
+    // Whether the drop lands on a live connection is a question of timing, and
+    // that is why this was invisible until the path had a round trip in it. The
+    // releases above are absolute instants in the run, not offsets into this
+    // connection's life, so a connection that arrives near the end of the window
+    // reaches them with work still in flight. On loopback it had always
+    // finished and idled out first, so the drop fell on an already-dead
+    // connection and said nothing. At 90 ms with loss it has not, and the run
+    // accused the server of a fault it was right to report.
+    //
+    // So the client is handed to a task that lets go of it only once the
+    // connection is genuinely over, however it ends -- the close above, the
+    // server's idle timer, or the server's shutdown at the end of the run. For
+    // the two endings that close explicitly this resolves at once and nothing
+    // changes. The endpoint goes with it, which is also why a quiet client keeps
+    // its socket for as long as production's would.
+    if quic.close_reason().is_none() {
+        tally.bump(&tally.handed_over_live);
+    }
+    tokio::spawn(async move {
+        quic.closed().await;
+        drop(client);
+    });
 }
 
 /// Awaits every handle, ignoring what they returned.
@@ -1133,6 +1178,7 @@ async fn production_shapes_are_replayed() {
          connections started   {} ({} handshakes failed)\n\
          endings driven        idle {}, peer_close {}, protocol_violation {}, outlive {}\n\
          burst aborts          {}\n\
+         still live at hand-off {}  (kept until the connection ended, never dropped live)\n\
          tunnels requested     {} ({} never asked for: the connection went first)\n\
          tunnels opened (200)  {}\n\
          tunnels refused       {} {:?}\n\
@@ -1150,6 +1196,7 @@ async fn production_shapes_are_replayed() {
         tally.ended_violation.load(Ordering::Relaxed),
         tally.ended_outlive.load(Ordering::Relaxed),
         tally.aborted_by_burst.load(Ordering::Relaxed),
+        tally.handed_over_live.load(Ordering::Relaxed),
         tally.tunnels_requested.load(Ordering::Relaxed),
         tally.tunnels_skipped.load(Ordering::Relaxed),
         tally.tunnels_opened.load(Ordering::Relaxed),
