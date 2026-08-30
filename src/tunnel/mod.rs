@@ -245,6 +245,25 @@ pub struct Context {
     pub ip_family_preference: IpFamilyPreference,
     /// Packets a UDP session may send before its target has answered.
     pub unanswered_packet_budget: u32,
+    /// How many destinations this connection's policy has refused, and when
+    /// that is worth saying out loud again.
+    ///
+    /// The warning is deliberately loud (D44 left it at WARN while demoting the
+    /// blackhole line beside it, because a client probing loopback through the
+    /// proxy is what SSRF looks like from here) and deliberately cheap for a
+    /// peer to provoke: an IP literal takes no resolver slot, opens no socket,
+    /// and holds its tunnel slot only for as long as the refusal takes. One
+    /// warning per request would let a peer decide how much of this host's
+    /// journal is left for anybody else. See [`crate::logfmt::Sampler`] for the
+    /// schedule and for why silencing the repeats was not the answer.
+    pub policy_refusals: Arc<crate::logfmt::Sampler>,
+    /// The same, for requests refused because this connection is already
+    /// holding every tunnel it may.
+    ///
+    /// Reaching the limit costs a peer `max_targets_per_conn` live tunnels,
+    /// which is real; staying there costs it nothing at all, and every further
+    /// request was a warning for as long as it cared to keep asking.
+    pub limit_refusals: Arc<crate::logfmt::Sampler>,
 }
 
 impl Context {
@@ -279,6 +298,8 @@ impl Context {
             resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
+            policy_refusals: Arc::new(crate::logfmt::Sampler::new()),
+            limit_refusals: Arc::new(crate::logfmt::Sampler::new()),
         }
     }
 
@@ -770,13 +791,30 @@ pub(crate) async fn admit_target(
             return None;
         }
 
-        warn!(
-            stream_id,
-            host,
-            port,
-            ?addresses,
-            "every address of the target is prohibited by policy"
-        );
+        // Loud on a doubling schedule rather than every time: this is the
+        // evidence an operator has that somebody is probing the private side of
+        // the host, and one line per request would let the peer decide how much
+        // of the journal is left to record it in. The first refusal warns as
+        // immediately as it ever did, and `refusals` is what a scan announces
+        // itself by. See [`Context::policy_refusals`].
+        match ctx.policy_refusals.record() {
+            Some(refusals) => warn!(
+                stream_id,
+                host,
+                port,
+                ?addresses,
+                refusals,
+                "every address of the target is prohibited by policy; further refusals on \
+                 this connection are logged at debug level until the count doubles"
+            ),
+            None => debug!(
+                stream_id,
+                host,
+                port,
+                ?addresses,
+                "every address of the target is prohibited by policy"
+            ),
+        }
         refuse_because(stream, ProxyError::DestinationIpProhibited, stream_id).await;
         return None;
     }

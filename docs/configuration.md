@@ -297,6 +297,16 @@ addresses is a refusal volto really did make: it stays a WARN and a 403 with
 `Proxy-Status: …; error=destination_ip_prohibited`, because that is what a probe
 for internal services looks like from here.
 
+That warning, and the one a request refused for reaching `max_targets_per_conn`
+writes, are reported on a doubling schedule per connection: the 1st, 2nd, 4th,
+8th and so on, each carrying `refusals=` with the running total, and the ones in
+between at DEBUG. Both are refusals a client can repeat as fast as it can open
+request streams, and journald's rate limiting counts lines, so one line per
+request would let a peer decide how much of the journal is left to record
+anything else in — including the lines about it. A scan of every port on a host
+is 17 warnings rather than 65535, the first arrives as promptly as it ever did,
+and the last one says how large the scan was.
+
 ## Checking a file without starting the server
 
 ```sh

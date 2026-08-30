@@ -40,6 +40,7 @@
 
 use std::borrow::Cow;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// What an absent value prints as.
 pub const ABSENT: &str = "-";
@@ -141,6 +142,56 @@ fn truncated(head: &str, whole: usize) -> String {
     format!("{head}... <truncated from {whole} bytes>")
 }
 
+/// How often a warning a peer can repeat at will is allowed to be loud.
+///
+/// The rules above bound what one line may carry. This bounds how many lines
+/// there are, which is the other half of the same problem and the one an
+/// operator feels first: `journald` rate limiting counts *lines*, per unit, so a
+/// peer that can buy one warning per request does not merely fill a disk — it
+/// spends this service's whole allowance and the genuine lines that follow are
+/// dropped. Suppressing the real signal is the more expensive half of the
+/// attack, and a peer needs no privilege to run it: a refusal is a request that
+/// went nowhere, so the refusals are the cheapest lines there are.
+///
+/// Silencing the repeats is not the answer either. The two warnings this guards
+/// are read as evidence — a client probing the private side of the host, a
+/// client sitting on its tunnel limit — and evidence that reports "it happened"
+/// while hiding "it happened sixty thousand times" is worse than useless.
+///
+/// So the schedule doubles: occurrence 1 is reported, then 2, 4, 8, and so on,
+/// each carrying the running total. A scan of every port on a host is 17 lines
+/// instead of 65535, the first of them lands as immediately as it does today,
+/// and the last one *says* it was 65536 — which is more than the unsampled
+/// version ever told anybody, since counting identical lines was left to whoever
+/// read the journal. The cost is that the count between reports is only known to
+/// within a factor of two until the next one arrives.
+///
+/// One of these per connection, so a peer cannot use a quiet neighbour's
+/// allowance, and nothing here is ever reset: the schedule is about a
+/// connection's whole life.
+#[derive(Debug, Default)]
+pub struct Sampler(AtomicU64);
+
+impl Sampler {
+    /// A sampler that has seen nothing yet.
+    pub const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Records an occurrence: `Some(total)` when this one is to be reported.
+    ///
+    /// `Relaxed` because the only thing ordered against is the counter itself —
+    /// two threads racing here get two distinct totals and at most one of them
+    /// is a power of two, which is all the schedule asks. Wrapping is
+    /// unreachable (a `u64` of refusals is longer than the hardware lasts) and
+    /// harmless if it happened: zero is not a power of two, so the pass is
+    /// quiet rather than wrong.
+    pub fn record(&self) -> Option<u64> {
+        let total = self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        total.is_power_of_two().then_some(total)
+    }
+}
+
 /// Formats an optional log field: the value itself, or [`ABSENT`].
 ///
 /// ```
@@ -167,7 +218,7 @@ pub fn or_dash<T: fmt::Display>(value: Option<T>) -> impl fmt::Display {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded, bounded_bytes, escaped_bytes, or_dash, ABSENT};
+    use super::{bounded, bounded_bytes, escaped_bytes, or_dash, Sampler, ABSENT};
     use std::net::SocketAddr;
 
     /// A value present prints as itself, with no wrapper and no quotes.
@@ -285,5 +336,26 @@ mod tests {
         let long = escaped_bytes(&vec![b'r'; 4096]);
         assert!(long.len() < 80, "{long}");
         assert!(long.contains("4096"), "{long}");
+    }
+
+    /// The first occurrence is never held back — a bound that made an operator
+    /// wait for the second probe before saying anything would have traded the
+    /// flood for a blind spot — and the reports carry the running total.
+    #[test]
+    fn a_sampler_reports_on_a_doubling_schedule() {
+        let sampler = Sampler::new();
+
+        let reported: Vec<u64> = (0..64).filter_map(|_| sampler.record()).collect();
+        assert_eq!(reported, vec![1, 2, 4, 8, 16, 32, 64]);
+    }
+
+    /// The property that makes it a bound rather than a slower flood: the line
+    /// count grows with the *logarithm* of the occurrences.
+    #[test]
+    fn a_sampler_turns_a_flood_into_a_handful_of_lines() {
+        let sampler = Sampler::new();
+        let reported = (0..65_536).filter(|_| sampler.record().is_some()).count();
+
+        assert_eq!(reported, 17, "every port on a host, in seventeen lines");
     }
 }

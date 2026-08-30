@@ -463,11 +463,23 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     // before any socket is opened, so the limit bounds file descriptors rather
     // than trailing them.
     let Some(_slot) = context.quota.acquire() else {
-        warn!(
-            stream_id,
-            live = context.quota.live(),
-            "connection is at its tunnel limit"
-        );
+        // Sampled for the reason `tunnel::admit_target`'s refusal is: a
+        // connection that has reached its limit answers every further request
+        // this way, at one HEADERS frame apiece, for as long as the peer keeps
+        // asking. The first refusal is as loud as it ever was and the reports
+        // carry the running total, so an operator still sees both that the
+        // limit was hit and how hard (`crate::logfmt::Sampler`).
+        let live = context.quota.live();
+        match context.limit_refusals.record() {
+            Some(refusals) => warn!(
+                stream_id,
+                live,
+                refusals,
+                "connection is at its tunnel limit; further refusals on this connection are \
+                 logged at debug level until the count doubles"
+            ),
+            None => debug!(stream_id, live, "connection is at its tunnel limit"),
+        }
         tunnel::refuse_because(&mut stream, ProxyError::ConnectionLimitReached, stream_id).await;
         return;
     };
