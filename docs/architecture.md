@@ -369,7 +369,12 @@ is what a CONNECT proxy needs, and it is stated in full:
   length: the decoder knows which of the three kinds of stream it is reading —
   the peer's control stream, a request stream, or a request stream whose CONNECT
   has been answered — and a frame type that may not appear there is a connection
-  error at any size.
+  error at any size. The *number* of reserved or unknown frames a request stream
+  may make the decoder skip before its request arrives is bounded too (RFC 9114
+  §10.5): grease and padding are legitimate (§7.2.8), but a flood of them — zero-
+  length frames included, which no size bound would catch — is refused for
+  `H3_EXCESSIVE_LOAD`. The limit is generous, per stream, and answered with a bare
+  reset rather than a 431, since no field section was ever too large.
 - **QPACK** (RFC 9204) against the static table, including Huffman decoding
   (RFC 7541 Appendix B).
 - **The control stream** — SETTINGS, GOAWAY, and the rules about what may appear

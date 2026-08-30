@@ -111,6 +111,40 @@ const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 /// Longest frame header there can be: a type and a length, both varints.
 const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
 
+/// How many reserved or unknown frames one request stream may make this server
+/// skip before it is a stream error of type H3_EXCESSIVE_LOAD.
+///
+/// RFC 9114 §9 has this server ignore a frame type it does not know, and §7.2.8
+/// makes the reserved "grease" types (0x1f * N + 0x21) padding a peer MAY send
+/// "on any stream where frames are allowed to be sent". Both are legitimate --
+/// §10.5 names "padding to increase resistance to traffic analysis" among the
+/// uses that are "entirely legitimate" -- and both are free of any per-frame
+/// cost here, because the payload is discarded as it arrives and never buffered.
+/// What is not free is the count: each skipped frame is a frame header to parse
+/// and an `Item::Skipped` to hand back, so a peer that sends nothing but grease
+/// keeps a request stream's reader busy without ever completing a request.
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
+//# Implementations SHOULD track the use of these features and set limits
+//# on their use.  An endpoint MAY treat activity that is suspicious as a
+//# connection error of type H3_EXCESSIVE_LOAD, but false positives will
+//# result in disrupting valid connections and requests.
+///
+/// This is that limit for the frame skip. The count is of *frames*, not the
+/// bytes they carry: a grease frame declaring a zero-length payload is two
+/// bytes on the wire and would be charged nothing by any byte-counting bound,
+/// so counting bytes could never stop a flood of them -- and a flood of them is
+/// the cheapest shape this attack takes. It is per stream and unshared, since
+/// §7.2.8 padding is a legitimate thing to send on one stream and counting it
+/// against a connection-wide total would let one stream's padding refuse
+/// another stream's request. The value is generous on purpose: a real client
+/// greases with a handful of small frames, so several thousand leaves orders of
+/// magnitude of headroom while still bounding the count. The refusal is a
+/// *stream* error (`Violation::excessive_load_reset`), so only the one request
+/// is lost -- §10.5's "false positives" caution is why this is not a connection
+/// error and why the limit is nowhere near what a client could reach.
+const MAX_SKIPPED_FRAMES: u32 = 4096;
+
 /// What one connection may hold in `FrameDecoder` payload buffers, as a
 /// counter every request stream on it shares (D77).
 ///
@@ -439,6 +473,15 @@ pub struct FrameDecoder {
     /// the moment its CONNECT is answered, and RFC 9114 §4.4 narrows what may
     /// follow to DATA alone.
     stream: StreamKind,
+    /// Reserved or unknown frames skipped so far while this was a request
+    /// stream (RFC 9114 §10.5).
+    ///
+    /// Counted only in [`StreamKind::Request`]: a tunnel's skips are DATA's
+    /// equals under §4.4 and have their own reader, the control stream's are
+    /// [`super::connection`]'s to bound, and [`MAX_SKIPPED_FRAMES`] says why the
+    /// unit is frames rather than bytes. It only grows -- a request stream that
+    /// becomes a tunnel stops adding to it, and there is nothing to reset.
+    skipped: u32,
     state: State,
 }
 
@@ -454,6 +497,7 @@ impl FrameDecoder {
             budget,
             charged: 0,
             stream,
+            skipped: 0,
             state: State::Header,
         }
     }
@@ -565,6 +609,7 @@ impl FrameDecoder {
                     match remaining - take as u64 {
                         0 => {
                             self.state = State::Header;
+                            self.count_skip()?;
                             return Ok(Some(Item::Skipped { kind }));
                         }
                         left => {
@@ -600,6 +645,34 @@ impl FrameDecoder {
             self.header[self.header_len] = byte;
             self.header_len += 1;
         }
+    }
+
+    /// Counts one skipped frame against [`MAX_SKIPPED_FRAMES`], reporting a
+    /// stream error once a request stream is past it (RFC 9114 §10.5).
+    ///
+    /// Only a request stream is counted, so a tunnel's grease -- DATA's equal
+    /// under §4.4 -- and the control stream's cost nothing here. Called as each
+    /// skip *completes*, which is where a zero-length grease frame is counted
+    /// too: `count_skip` is reached whatever the payload length, so a frame that
+    /// declares no payload still advances the count, which is the whole point of
+    /// counting frames rather than their bytes.
+    ///
+    /// The verdict is `excessive_load_reset`, not the plain
+    /// `Violation::stream(H3_EXCESSIVE_LOAD, ..)` the field-section bounds use:
+    /// this is not a field section that was too large, so the 431 that answers
+    /// those would be the wrong thing to tell the peer. It is answered with a
+    /// bare reset and STOP_SENDING instead ([`super::stream::Resolver::resolve`]).
+    fn count_skip(&mut self) -> Result<(), Violation> {
+        if self.stream == StreamKind::Request {
+            self.skipped = self.skipped.saturating_add(1);
+            if self.skipped > MAX_SKIPPED_FRAMES {
+                return Err(Violation::excessive_load_reset(format!(
+                    "more than {MAX_SKIPPED_FRAMES} reserved or unknown frames were skipped on \
+                     this request stream before a request arrived"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Gives back whatever this decoder had charged to the connection's budget.
@@ -1302,6 +1375,103 @@ mod tests {
                 })
                 .collect();
             assert_eq!(payload, b"body", "grease type {kind:#x}");
+        }
+    }
+
+    /// RFC 9114 §10.5: a request stream may make this server skip only so many
+    /// reserved or unknown frames before it is a stream error.
+    ///
+    /// The flood is zero-length grease frames -- the input a byte-counting bound
+    /// could never stop, since two wire bytes declaring no payload are charged
+    /// nothing -- so this proves the count is of frames. The first
+    /// `MAX_SKIPPED_FRAMES` are skipped and announced; the one past the limit is
+    /// the refusal.
+    #[test]
+    fn a_request_stream_flood_of_skipped_frames_is_refused() {
+        let mut wire = BytesMut::new();
+        for _ in 0..=MAX_SKIPPED_FRAMES {
+            // 0x21 = 0x1f * 0 + 0x21, a reserved grease type, declaring no
+            // payload: two bytes, and worth nothing to any byte budget.
+            put_header(&mut wire, 0x21, 0);
+        }
+
+        let mut decoder = fresh_decoder();
+        decoder.push(wire.freeze());
+
+        let mut skipped = 0u32;
+        let error = loop {
+            match decoder.next_item() {
+                Ok(Some(Item::Skipped { kind: 0x21 })) => skipped += 1,
+                Ok(Some(other)) => panic!("expected only skips, got {other:?}"),
+                Ok(None) => panic!("the flood was exhausted without a refusal"),
+                Err(Error::Protocol(violation)) => break violation,
+                Err(other) => panic!("expected a protocol violation, got {other:?}"),
+            }
+        };
+
+        assert_eq!(
+            skipped, MAX_SKIPPED_FRAMES,
+            "every frame up to the limit is skipped and announced"
+        );
+        assert_eq!(error.code(), Code::H3_EXCESSIVE_LOAD);
+        assert!(
+            !error.is_connection_error(),
+            "a grease flood costs one request, not the connection"
+        );
+        assert!(
+            error.is_reset_only(),
+            "a grease flood is answered by a bare reset, not the 431 a field \
+             section too large gets"
+        );
+    }
+
+    /// The generous limit does not touch a real client: a handful of grease
+    /// frames before the HEADERS is exactly what a greasing client sends, and
+    /// the request still arrives.
+    #[test]
+    fn a_few_skipped_frames_before_headers_are_harmless() {
+        let mut wire = BytesMut::new();
+        for _ in 0..8 {
+            wire.extend_from_slice(&frame(0x1f * 3 + 0x21, b"pad"));
+        }
+        wire.extend_from_slice(&frame(HEADERS, b"the request"));
+
+        let items = decode_bytewise(&wire).expect("a few greases then a request decodes");
+        let headers = items
+            .iter()
+            .filter(|item| matches!(item, Item::Frame(Frame::Headers(_))))
+            .count();
+        assert_eq!(headers, 1, "the HEADERS frame still arrives, got {items:?}");
+    }
+
+    /// The count is a request stream's alone: a tunnel's grease is DATA's equal
+    /// under RFC 9114 §4.4, and the control stream's is bounded elsewhere, so
+    /// neither is counted here however much of it there is.
+    #[test]
+    fn skipped_frames_are_only_counted_on_a_request_stream() {
+        for stream in [StreamKind::Tunnel, StreamKind::Control] {
+            let mut wire = BytesMut::new();
+            for _ in 0..=MAX_SKIPPED_FRAMES {
+                put_header(&mut wire, 0x21, 0);
+            }
+
+            let mut decoder = FrameDecoder::new(stream, Arc::new(BufferBudget::default()));
+            decoder.push(wire.freeze());
+
+            let mut skipped = 0u32;
+            loop {
+                match decoder.next_item() {
+                    Ok(Some(Item::Skipped { .. })) => skipped += 1,
+                    Ok(Some(other)) => panic!("{stream:?}: unexpected {other:?}"),
+                    Ok(None) => break,
+                    Err(error) => panic!("{stream:?}: grease is not counted here, got {error:?}"),
+                }
+            }
+            assert_eq!(
+                skipped,
+                MAX_SKIPPED_FRAMES + 1,
+                "{stream:?}: every grease frame is skipped, none refused"
+            );
         }
     }
 

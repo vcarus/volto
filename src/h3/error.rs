@@ -116,6 +116,9 @@ impl fmt::Debug for Code {
 pub struct Violation {
     code: Code,
     fatal: bool,
+    /// Whether a stream-class refusal is signaled by a bare reset alone, with no
+    /// HTTP status line -- see [`Self::excessive_load_reset`].
+    reset_only: bool,
     detail: Cow<'static, str>,
 }
 
@@ -125,6 +128,7 @@ impl Violation {
         Self {
             code,
             fatal: false,
+            reset_only: false,
             detail: detail.into(),
         }
     }
@@ -134,6 +138,27 @@ impl Violation {
         Self {
             code,
             fatal: true,
+            reset_only: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// An H3_EXCESSIVE_LOAD stream error answered by a bare reset, not a 431.
+    ///
+    /// `H3_EXCESSIVE_LOAD` on a request stream otherwise draws the 431 (Request
+    /// Header Fields Too Large) that [`crate::h3::stream::Resolver::resolve`]
+    /// sends for a field section past the advertised limit (RFC 9114 §10.5.1).
+    /// That status is the right thing to tell a peer to shrink its header
+    /// fields, and the wrong thing to tell one whose fault is not field-section
+    /// size at all -- the reserved/grease frame flood of RFC 9114 §10.5, where
+    /// no header field was ever sent. A violation built this way keeps the same
+    /// code, so the machine-readable signal is identical, but is answered with
+    /// RESET_STREAM and STOP_SENDING alone.
+    pub fn excessive_load_reset(detail: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            code: Code::H3_EXCESSIVE_LOAD,
+            fatal: false,
+            reset_only: true,
             detail: detail.into(),
         }
     }
@@ -146,6 +171,16 @@ impl Violation {
     /// Whether the whole connection has to be closed.
     pub fn is_connection_error(&self) -> bool {
         self.fatal
+    }
+
+    /// Whether a stream-class refusal is answered by a bare reset, never a 431.
+    ///
+    /// True only for [`Self::excessive_load_reset`], which says why. The one
+    /// reader is [`crate::h3::stream::Resolver::resolve`], where it keeps a
+    /// reserved-frame flood out of the arm that answers an oversized field
+    /// section with a 431.
+    pub fn is_reset_only(&self) -> bool {
+        self.reset_only
     }
 
     /// The same violation, escalated to end the connection.

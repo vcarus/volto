@@ -127,22 +127,32 @@ impl Resolver {
             // then stopped with the code, because the rest of the section is
             // precisely what this server has declined to read.
             //
-            // All three of this server's H3_EXCESSIVE_LOAD sources on a request
-            // stream are stream-class and all three land here: the per-frame
-            // buffering limit, a field section that decoded past what
-            // `SETTINGS_MAX_FIELD_SECTION_SIZE` told the peer to send -- the
-            // same 64 KiB either way -- and the connection-wide buffering budget
-            // of D77, which refuses the request that would overrun it rather
-            // than the connection holding it. The guard stays because
-            // `is_connection_error` is what decides between answering and
-            // closing everywhere else in this file, and a code is not a class.
+            // Three of this server's H3_EXCESSIVE_LOAD sources on a request
+            // stream are stream-class and about a field section too large to
+            // hold, and all three land here: the per-frame buffering limit, a
+            // field section that decoded past what `SETTINGS_MAX_FIELD_SECTION_SIZE`
+            // told the peer to send -- the same 64 KiB either way -- and the
+            // connection-wide buffering budget of D77, which refuses the request
+            // that would overrun it rather than the connection holding it. The
+            // guard stays because `is_connection_error` is what decides between
+            // answering and closing everywhere else in this file, and a code is
+            // not a class.
+            //
+            // The fourth H3_EXCESSIVE_LOAD source -- a request stream flooded
+            // with reserved or unknown frames (RFC 9114 §10.5,
+            // `frame::MAX_SKIPPED_FRAMES`) -- is stream-class too, but is not a
+            // field section that was too large: `is_reset_only` keeps it out of
+            // this arm, so it falls through to the bare reset `answer` gives it
+            // rather than a 431 that would tell the peer to shrink header fields
+            // it never sent.
             //
             // The write is bounded and, when the bound lapses, abandoned with
             // a reset: [`Stream::respond_within`] says why, and a peer that
             // grants no flow-control window never takes these fifty-odd bytes.
             Err(frame::Error::Protocol(violation))
                 if violation.code() == Code::H3_EXCESSIVE_LOAD
-                    && !violation.is_connection_error() =>
+                    && !violation.is_connection_error()
+                    && !violation.is_reset_only() =>
             {
                 if stream
                     .respond_within(Status::REQUEST_HEADER_FIELDS_TOO_LARGE, Fields::new())

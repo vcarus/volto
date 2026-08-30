@@ -49,6 +49,7 @@
 //! | n2 | Opens more tunnels than one connection may hold | `[limits] max_targets_per_conn`, taken before any socket is (`src/conn.rs`) | 503 with `Proxy-Status: connection_limit_reached`; other connections have their own budget | `it_policy::the_tunnel_quota_is_enforced_per_connection`, `it_policy::tcp_and_udp_tunnels_share_the_quota` |
 //! | o | Opens its control stream with an unknown frame whose declared length never ends, then authenticates | **None.** The MISSING_SETTINGS verdict is suspended for as long as the frame runs, and an authenticated connection is not bounded | Nothing: the connection serves requests for ever. **Recorded residual** (review L1, "recorded, not fixed"): the cost to this server is zero -- the payload is discarded as it arrives, never buffered -- and it needs credentials, so it buys an authenticated peer nothing it does not already have | [`an_unfinished_unknown_frame_suspends_the_settings_verdict`] pins today's behaviour so a change is noticed |
 //! | p | Opens and resets request streams in a storm, each announcing a full-sized field section | No rate limit; what has to hold is that every charge is released when the frame dies with its stream (`FrameDecoder`'s guard, D77) | Nothing; the budget is exactly where it was afterwards | [`a_storm_of_reset_requests_leaves_the_budget_where_it_was`] |
+//! | p2 | Floods a request stream with reserved or unknown (grease) frames before its HEADERS, each declaring no payload, so the reader skips without end | `frame::MAX_SKIPPED_FRAMES` per stream (RFC 9114 §10.5, `src/h3/frame.rs`) | RESET_STREAM + STOP_SENDING H3_EXCESSIVE_LOAD (0x107) -- a bare reset and never a 431, since no field section was ever too large; the connection carries on | [`a_request_stream_flooded_with_grease_is_reset`] |
 //! | q | Asks for a target in private address space, or on a denied port | `[security] allow_private_networks`, `denied_ports` (`src/policy.rs`) | 403 with `Proxy-Status: destination_ip_prohibited` / `http_request_denied` | `it_policy::loopback_is_prohibited_by_default`, `it_policy::special_purpose_and_transition_addresses_are_prohibited_by_default`, `it_policy::a_denied_port_is_refused_on_both_paths` |
 //! | q2 | Asks for a name the exit resolver blackholed | D49: not this proxy's refusal to make | 200, then the stream is closed at once -- indistinguishable from a target that hung up | `it_policy::a_blackholed_tcp_target_is_accepted_then_closed`, `it_policy::a_blackholed_udp_target_is_accepted_then_closed` |
 //! | q3 | Points a CONNECT-UDP session at a target that never answers, and floods it | `[security] unanswered_packet_budget` (`src/tunnel/udp.rs`) | Packets past the budget are dropped; the budget is lifted once the target answers | `it_policy::packets_to_a_silent_target_are_capped`, `it_policy::the_cap_is_lifted_once_the_target_answers` |
@@ -140,6 +141,8 @@ const H3_STREAM_CREATION_ERROR: u64 = 0x103;
 const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
 /// H3_FRAME_UNEXPECTED (RFC 9114 §8.1).
 const H3_FRAME_UNEXPECTED: u64 = 0x105;
+/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
+const H3_EXCESSIVE_LOAD: u64 = 0x107;
 /// H3_ID_ERROR (RFC 9114 §8.1).
 const H3_ID_ERROR: u64 = 0x108;
 /// H3_REQUEST_CANCELLED (RFC 9114 §8.1).
@@ -158,6 +161,14 @@ const PEER_UNI_STREAMS: usize = 16;
 /// Field sections of the largest advertised size one connection may hold
 /// half-received at once: `HEADERS_BUFFER_BUDGET / MAX_FIELD_SECTION_SIZE`.
 const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
+
+/// The most reserved or unknown frames one request stream may make the server
+/// skip before its HEADERS (`frame::MAX_SKIPPED_FRAMES` in `src/h3/frame.rs`).
+///
+/// Spelled out here rather than imported, like the other bounds in this file:
+/// what it means is the count of grease frames the server will skip, and that is
+/// what the test drives one past.
+const SKIPPED_FRAME_LIMIT: u32 = 4096;
 
 /// A target the destination policy refuses before the resolver is asked.
 ///
@@ -1139,6 +1150,114 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
         );
     }
     stays_open(&connection, Duration::from_millis(200)).await;
+}
+
+// ---------------------------------------------------------------------------
+// p2: a flood of reserved or unknown frames
+// ---------------------------------------------------------------------------
+
+/// A request stream flooded with grease frames before its HEADERS is refused
+/// for excessive load -- with a bare reset, not the 431 an oversized field
+/// section draws.
+///
+/// RFC 9114 §9 has this server skip a frame type it does not know, and §7.2.8
+/// makes the reserved grease types padding a peer MAY send; §10.5 then asks an
+/// implementation to track and limit that use. `frame::MAX_SKIPPED_FRAMES` is
+/// that limit. The flood here is zero-length grease frames -- two wire bytes
+/// apiece, declaring no payload -- so it is also the on-wire proof that the
+/// bound counts frames rather than the bytes they carry: a byte budget would
+/// charge these nothing and never fire.
+///
+/// The refusal is a bare RESET_STREAM and STOP_SENDING carrying H3_EXCESSIVE_LOAD,
+/// with no 431: the peer sent no field section, so telling it to shrink its
+/// header fields would be nonsense. The connection carries on -- §10.5's caution
+/// about false positives is why this costs one request and not the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_stream_flooded_with_grease_is_reset() {
+    let server = TestServer::start().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+
+    // One frame past the limit, every one declaring no payload.
+    let mut flood = BytesMut::new();
+    for _ in 0..=SKIPPED_FRAME_LIMIT {
+        flood.extend_from_slice(&frame(GREASE, b""));
+    }
+    // A write that fails is the stream already reset, which is the outcome
+    // under test rather than a failure of it.
+    let _ = send.write_all(&flood).await;
+
+    // STOP_SENDING on the sending half, carrying the code.
+    let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+        .await
+        .expect("the server must refuse the flood, not skip frames for ever")
+        .expect("the stream is stopped, not broken");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(H3_EXCESSIVE_LOAD),
+        "a grease flood is excessive load"
+    );
+
+    // RESET_STREAM on the receiving half, and never a 431 body: a clean finish
+    // -- which is what the 431 path ends with -- would come back as `Ok(bytes)`
+    // and fail here instead.
+    match recv.read_to_end(4096).await {
+        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => assert_eq!(
+            code.into_inner(),
+            H3_EXCESSIVE_LOAD,
+            "the response side is reset with the same code, not answered with a 431"
+        ),
+        other => panic!("expected a bare reset with no 431 body, got {other:?}"),
+    }
+
+    assert!(
+        connection.close_reason().is_none(),
+        "a grease flood costs one request, not the connection"
+    );
+    still_serving(&connection).await;
+}
+
+/// A handful of grease frames before a real CONNECT is exactly what a greasing
+/// client sends, and the generous limit leaves it untouched: the tunnel opens.
+///
+/// The green half of the row above -- the bound must not be reachable by a
+/// well-behaved client.
+#[tokio::test]
+async fn a_few_grease_frames_before_a_connect_still_open_a_tunnel() {
+    let server = TestServer::start().await;
+    let echo = spawn_echo_target().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+
+    // A few small greases, then the CONNECT they were padding.
+    let mut opening = BytesMut::new();
+    for _ in 0..8 {
+        opening.extend_from_slice(&frame(GREASE, b"pad"));
+    }
+    opening.extend_from_slice(&connect_headers_frame(&echo.to_string()));
+    send.write_all(&opening)
+        .await
+        .expect("send grease then a CONNECT");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS);
+    assert_eq!(
+        status_of(&payload),
+        "200",
+        "a handful of grease frames must not stop the request behind them"
+    );
+
+    // And the tunnel really carries traffic.
+    send.write_all(&frame(FRAME_DATA, b"payload"))
+        .await
+        .expect("send payload through the tunnel");
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_DATA);
+    assert_eq!(payload, b"payload");
 }
 
 // ---------------------------------------------------------------------------
