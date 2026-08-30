@@ -278,7 +278,11 @@ kernel. Sessions have their own idle timeout (default 180 s; RFC 9298 §3.1 asks
 for at least 120), where idle means no packet crossed the proxy: the clock is
 re-armed by a payload reaching the target or the target answering, never by
 bytes alone, so a peer dripping fragments of a capsule that never completes is
-reclaimed on schedule. Closing the socket must also close the request stream.
+reclaimed on schedule. As on the connection bound above, that clock is read on
+each pass and not only awaited: a peer with another payload always queued — the
+ones the amplification cap drops re-arm nothing, and cost it only bandwidth —
+kept the session's wait finishing on its own and the deadline was never measured
+against it. Closing the socket must also close the request stream.
 
 ## Datagram routing
 

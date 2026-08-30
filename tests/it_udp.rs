@@ -993,19 +993,22 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
 /// pass 2026-08-29).
 ///
 /// It does not defeat this one. The bytes are the fastest unproductive supply a
-/// peer has: an unknown capsule type declaring a gigabyte of value, which
-/// RFC 9297 §3.2 requires to be skipped, written as fast as the stream will take
-/// it — around 18 MB before the cut. The session still closes on its deadline to
-/// the millisecond, so the window below is tight; a regression here is a session
-/// that outlives its timeout by the length of the flood.
+/// peer has on the stream: an unknown capsule type declaring a gigabyte of
+/// value, which RFC 9297 §3.2 requires to be skipped, written as fast as the
+/// stream will take it — around 18 MB before the cut. The session still closes
+/// on its deadline to the millisecond, so the window below is tight; a
+/// regression here is a session that outlives its timeout by the length of the
+/// flood.
 ///
-/// The datagram half of the same idea is deliberately not a test: keeping a
-/// session's 64-deep inbound queue non-empty means outrunning the server, which
-/// means outrunning the client's own transmit path, and a client's outgoing
-/// datagram queue that deep trips an accounting bug in quinn-proto's
-/// drop-oldest branch (`Datagrams::send` subtracts `payload_bytes` twice) long
-/// before it proves anything about this server. Measured by hand instead: a 1 s
-/// timeout ended at 1.1 s to 1.4 s idle, 3.9 s on a loaded machine.
+/// The stream is only half of it, though, and the quieter half: a chunk of
+/// skipped bytes is one pass of the session loop however many bytes it carries,
+/// so this flood asks the deadline one question per chunk. The datagram half
+/// asks it one per *payload*, and that is where the poll order really did win —
+/// see `it_udp_idle`, which pins it with the RFC 9298 §7 budget dropping every
+/// payload after the first. It could not be written until now: the client end of
+/// it used to trip an accounting bug in quinn-proto's drop-oldest branch
+/// (`Datagrams::send` subtracting `payload_bytes` twice), fixed upstream and in
+/// our pin since v0.5.2.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_of_skipped_capsule_bytes_does_not_postpone_the_timeout() {
     let server = TestServer::start_with_udp_timeout(1).await;

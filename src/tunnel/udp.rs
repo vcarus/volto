@@ -275,6 +275,50 @@ enum Event {
     Stream(Result<Option<Bytes>, h3api::StreamError>),
 }
 
+/// Waits for `work`, unless the idle deadline has been reached already.
+///
+/// `None` is "this session is idle": the deadline is behind us, and whatever the
+/// peer still has queued does not change that.
+///
+/// # Why the clock is read as well as awaited
+///
+/// `tokio::time::timeout_at` polls the future it wraps **first** and returns its
+/// value without consulting the clock, so a lapsed deadline is only noticed on a
+/// poll where the inner future was not already ready. Two of a session's three
+/// sources are things a peer can keep ready for as long as it likes without a
+/// single packet crossing the proxy — bytes that finish no capsule, and payloads
+/// the unanswered-packet budget drops — and the second of those, sent fast
+/// enough, kept the loop supplied so that the deadline was never measured at
+/// all. Measured on a dev host: a 1 s timeout closed anywhere between on time
+/// and 2.4 s late under one flooding sender, ran 9.3 s past its deadline under
+/// four, and in one run of four had not closed at all when the test gave up at
+/// 30 s. How far it ran was a matter of how long the queue stayed non-empty, so
+/// a busy host was the worst case — and this is the only bound an authenticated
+/// peer's session is under, since D76's covers connections that never
+/// authenticated.
+///
+/// So the clock is read before each wait, which is D92's rule for the
+/// connection's own silence deadline applied to the other absolute deadline in
+/// this tree: a deadline paired with an inner future the peer can keep ready has
+/// to be *read*, not only awaited. The cost is one `Instant::now()` per packet,
+/// the same price D92 accepted there.
+///
+/// The timer arm decides as well, and may: `timeout_at` expires only once the
+/// clock has passed `deadline`, so it is the same verdict as the read above
+/// reached by the other road, with nothing else to weigh. That is where this
+/// differs from D92's loop, which had to go back round because a second input —
+/// the authentication flag — could have changed while it waited.
+async fn before_deadline<T>(
+    deadline: tokio::time::Instant,
+    work: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+
+    tokio::time::timeout_at(deadline, work).await.ok()
+}
+
 impl Session {
     /// Pumps the session until it closes, one direction at a time.
     async fn run(&mut self, stream_id: u64) {
@@ -311,25 +355,26 @@ impl Session {
             // nothing — one a second into a capsule that never finishes — and
             // an authenticated peer is under no other bound: D76's deadline
             // covers only connections that never authenticated.
-            let event = tokio::time::timeout_at(self.deadline, async {
+            //
+            // Waited on through [`before_deadline`] rather than `timeout_at`
+            // alone, because two of the three sources are ones a peer can keep
+            // ready for ever without moving a packet: see that function for why
+            // the clock has to be read as well as awaited (D92).
+            let sources = async {
                 tokio::select! {
                     payload = self.inbound.recv() => Event::Inbound(payload),
                     received = self.socket.recv(&mut packet) => Event::Socket(received),
                     chunk = self.reader.recv_data() => Event::Stream(chunk),
                 }
-            })
-            .await;
+            };
 
-            let event = match event {
-                Ok(event) => event,
-                Err(_elapsed) => {
-                    debug!(
-                        stream_id,
-                        timeout_secs = self.ctx.idle_timeout.as_secs(),
-                        "udp session idle timeout"
-                    );
-                    break;
-                }
+            let Some(event) = before_deadline(self.deadline, sources).await else {
+                debug!(
+                    stream_id,
+                    timeout_secs = self.ctx.idle_timeout.as_secs(),
+                    "udp session idle timeout"
+                );
+                break;
             };
 
             let step = match event {
@@ -965,10 +1010,113 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     fn parse(path: &str) -> Result<(String, u16), &'static str> {
         parse_target(path, None)
+    }
+
+    // -----------------------------------------------------------------------
+    // The idle deadline
+    // -----------------------------------------------------------------------
+    //
+    // [`before_deadline`] is the whole of the session's idle bound: the loop
+    // rebuilds its three sources on every pass and hands them here, so what this
+    // decides is when a session ends. On a paused clock the answers are exact
+    // rather than approximate, and the flood the deadline has to survive is a
+    // future that is ready on every poll -- which is what a peer with another
+    // packet always queued amounts to.
+
+    /// A source the peer keeps ready must not carry a session past its deadline.
+    ///
+    /// The regression this exists for: `timeout_at` polls the future it wraps
+    /// first and returns its value without consulting the clock, so a peer that
+    /// always had another payload queued was never measured against the deadline
+    /// at all. A thousand ready polls is a flood in miniature, and not one of
+    /// them may buy the session a step.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_is_always_ready_does_not_step_over_the_deadline() {
+        let budget = Duration::from_secs(180);
+        let deadline = tokio::time::Instant::now() + budget;
+
+        // The deadline itself is already late enough -- the comparison is `>=`,
+        // so a session does not get one more pass for landing exactly on it.
+        tokio::time::advance(budget).await;
+
+        for step in 0..1000 {
+            assert_eq!(
+                before_deadline(deadline, std::future::ready(())).await,
+                None,
+                "a peer with another packet always ready stepped over the deadline at {step}"
+            );
+        }
+    }
+
+    /// And a clock that jumps clean past the deadline lands on the same answer.
+    ///
+    /// The shape a paused VM resumes in, as on the TCP path: `Instant::now()` is
+    /// hours beyond where the deadline was armed and every timer in the process
+    /// fires at once. A session being flooded at that moment must still read the
+    /// clock and stop, rather than keep serving what is queued.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_that_jumps_hours_ends_a_flooded_session() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+
+        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+
+        assert_eq!(
+            before_deadline(deadline, std::future::ready(())).await,
+            None
+        );
+    }
+
+    /// Work that arrives before the deadline is still served.
+    ///
+    /// The other half of the clock read, and the one that would turn a bound
+    /// into a bug: a session with a millisecond left is a working session, and
+    /// the packet in its queue belongs to the target, not to the floor.
+    #[tokio::test(start_paused = true)]
+    async fn work_that_beats_the_deadline_is_served() {
+        let budget = Duration::from_secs(180);
+        let deadline = tokio::time::Instant::now() + budget;
+
+        tokio::time::advance(budget - Duration::from_millis(1)).await;
+
+        assert_eq!(
+            before_deadline(deadline, std::future::ready(7)).await,
+            Some(7),
+            "a session was cut a millisecond early"
+        );
+    }
+
+    /// A silent session ends at its deadline, and not a millisecond before.
+    ///
+    /// Nothing is ready here, which is the ordinary case the timer serves: the
+    /// wait is still unresolved a millisecond short of the budget, and over at
+    /// the budget. Auto-advance carries the paused clock through both without a
+    /// real millisecond passing.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_session_ends_at_its_deadline_and_not_before() {
+        let budget = Duration::from_secs(180);
+        let deadline = tokio::time::Instant::now() + budget;
+
+        assert!(
+            tokio::time::timeout(
+                budget - Duration::from_millis(1),
+                before_deadline(deadline, std::future::pending::<()>()),
+            )
+            .await
+            .is_err(),
+            "the idle bound expired early"
+        );
+
+        assert_eq!(
+            before_deadline(deadline, std::future::pending::<()>()).await,
+            None,
+            "the idle bound did not expire at the deadline"
+        );
     }
 
     #[test]
