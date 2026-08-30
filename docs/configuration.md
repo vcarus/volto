@@ -13,6 +13,10 @@ forward-only, which matters when rolling a release back; see
 [version compatibility](#version-compatibility). A commented reference file
 ships as [`script/config.example.toml`](../script/config.example.toml).
 
+`--check-config` answers whether a given binary can read a given file without
+starting anything; see
+[checking a file](#checking-a-file-without-starting-the-server).
+
 `SIGHUP` re-reads the file. A file that fails to parse or validate is rejected
 whole and the running configuration keeps serving; see
 [deployment.md](deployment.md#reloading).
@@ -293,6 +297,42 @@ addresses is a refusal volto really did make: it stays a WARN and a 403 with
 `Proxy-Status: …; error=destination_ip_prohibited`, because that is what a probe
 for internal services looks like from here.
 
+## Checking a file without starting the server
+
+```sh
+volto --check-config --config /etc/volto/config.toml
+```
+
+reads the file, validates it and exits. A file that is good exits 0 with one
+line on stdout; a file that is not exits non-zero with the reason on stderr —
+the same error, word for word, that the service would print at startup, because
+it is the same code path. Settings that are legal but worth a word (`[auth].users`
+empty, `log.keylog` on) are printed to stderr as warnings and do not change the
+exit status: they describe a server that runs, not one that refuses to.
+
+Nothing is bound, started or written, so this needs no privilege beyond reading
+the file it is given — which on a host set up by `install-selfsigned.sh` still
+means root or `sudo -u volto`, since `/etc/volto` is `0750 volto:volto`.
+
+**What it covers** is what startup does with the file before it becomes a
+server: TOML syntax, every table's refusal of a key it does not know, and every
+range and cross-field rule (`keep_alive_interval` against `max_idle_timeout`,
+`mtu_upper_bound` against `initial_mtu`, and the rest) — including that
+`server.cert` and `server.key` exist and are files.
+
+**What it does not cover** is what only the running service can answer: whether
+the listen address is free, whether the certificate and key parse and form a
+usable pair, and whether `RLIMIT_NOFILE` leaves room for `max_connections` ×
+`max_targets_per_conn`. That last one is a property of the systemd unit rather
+than of the file, so answering it from a shell would answer a different
+question than the one that matters. A file that passes can still fail to serve
+for one of those reasons; a file that fails will not start at all.
+
+The reason the flag exists is the section below: it is how
+[`script/deploy.sh`](deployment.md#deploying-from-releases) asks a release it is
+about to install whether it can read the file this host already has, before it
+swaps the binary.
+
 ## Version compatibility
 
 An unknown key is refused, and the file is refused *whole* rather than the one
@@ -317,8 +357,16 @@ Error: failed to parse config file /etc/volto/config.toml at line 181, column 1:
 ```
 
 The line number is the thread to pull: comment that key out and start the
-service. To do it before the restart instead, comment out every key introduced
-after the release being rolled back to.
+service. To find out before the restart instead of after it, ask the binary you
+are about to install:
+
+```sh
+/path/to/old/volto --check-config --config /etc/volto/config.toml
+```
+
+which is what `script/deploy.sh` does on your behalf — but only for a release
+that knows the flag. Rolling back past the release that introduced it leaves you
+with the table below and the line number in the journal.
 
 | Key | Introduced in |
 |---|---|

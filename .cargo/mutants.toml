@@ -7,13 +7,19 @@
 # misclassifying terminating mutants.
 minimum_test_timeout = 600
 
-exclude_globs = [
-    # Process entry: main, tracing init, and the signal watchers only run in a
-    # spawned binary, which the in-process test harness never is.
-    "src/main.rs",
-]
-
 exclude_re = [
+    # Process entry. `src/main.rs` used to be excluded whole, on the grounds
+    # that it only runs in a spawned binary and the harness never is one. Half
+    # of that stopped being true with `--check-config` (D94): `tests/it_cli.rs`
+    # spawns the real binary and judges it by its exit status and its output
+    # streams, so `main` and `report_config_check` are now covered and the file
+    # exclusion was hiding them. What still only runs inside a served process is
+    # named here instead.
+    'replace run -> Result',
+    'replace init_tracing -> Result',
+    'replace watch_for_reload',
+    'replace watch_for_signals',
+
     # Mathematically equivalent: | folds disjoint bit ranges (varint length
     # prefix vs value, base64 sextet packing, Huffman bit accumulation), so ^
     # agrees with | on every input the callers can produce.

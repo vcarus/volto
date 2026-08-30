@@ -2,7 +2,7 @@
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -22,6 +22,13 @@ struct Cli {
     /// Path to the TOML configuration file.
     #[arg(short, long, value_name = "FILE")]
     config: PathBuf,
+
+    /// Load and validate the configuration, then exit without serving.
+    ///
+    /// Answers whether this binary can read that file, which is the question a
+    /// rollback turns on: nothing is bound, started or written.
+    #[arg(long)]
+    check_config: bool,
 }
 
 fn main() -> Result<()> {
@@ -36,6 +43,13 @@ fn main() -> Result<()> {
     // is gone.
     let config = Config::load(&cli.config)?;
 
+    // Deliberately the very next thing, and before the runtime is built: what
+    // the flag promises is that nothing happens except reading the file.
+    if cli.check_config {
+        report_config_check(&cli.config, &config);
+        return Ok(());
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(volto::net::blocking_pool_size(
@@ -45,6 +59,41 @@ fn main() -> Result<()> {
         .context("failed to build the async runtime")?;
 
     runtime.block_on(run(cli, config))
+}
+
+/// Says that the file loaded, and repeats what starting on it would warn about.
+///
+/// Reached only when [`Config::load`] has already succeeded, so the failure
+/// direction is not here: it is the `?` in `main`, which prints the same error
+/// the service would print at startup and exits non-zero. That symmetry is the
+/// whole value of the flag — `script/deploy.sh` asks the binary it is about to
+/// install whether it can read the configuration this host already has, and an
+/// answer that did not match what the service does on the same file would be
+/// worse than no answer (D93, D94).
+///
+/// What it therefore covers is exactly what `Config::load` covers: the TOML
+/// itself, every table's refusal of a key it does not know, and every range and
+/// cross-field rule in `Config::validate` — the certificate and key existing as
+/// files included. What it cannot cover is everything that is only decidable
+/// once the process is the service: whether the port is free, whether the
+/// certificate and key parse and match, whether `RLIMIT_NOFILE` (a property of
+/// the unit, not of the file) leaves room for the configured quotas. Those stay
+/// startup's business, and `docs/configuration.md` says so to the operator.
+///
+/// The warnings go to stderr and leave the status alone. They are the ones the
+/// service logs at startup on the same file, and none of them describes a
+/// configuration that fails to start, so making them fatal here would refuse to
+/// deploy a host that runs perfectly well.
+fn report_config_check(path: &Path, config: &Config) {
+    for warning in config.warnings() {
+        eprintln!("warning: {warning}");
+    }
+
+    println!(
+        "{}: loads and validates on volto {}",
+        path.display(),
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Everything that needs a runtime, which is everything after the configuration.
