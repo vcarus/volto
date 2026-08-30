@@ -129,20 +129,25 @@ proptest = "1"
 # 0.11.x branch every further loss burst at the floor re-triggers the detector
 # and pushes the re-probe out again, so the MTU stays there for the whole
 # download. That branch is also missing two comparison fixes that upstream
-# landed on `main` only. Until a quinn-proto 0.11.x release carries all three,
-# we pin the `0.11.x` branch commit that carries them: `dcb9eabe` is the squash
-# merge of quinn-rs/quinn#2799, which is the `quinn-proto-0.11.17` tag plus the
-# three fixes, every one of them in `quinn-proto/src/connection/mtud.rs`:
+# landed on `main` only. Until a quinn-proto 0.11.x release carries all of
+# these, we pin the `0.11.x` branch commit that carries them: `f650e0f` is the
+# `quinn-proto-0.11.17` tag plus four fixes. Three are in
+# `quinn-proto/src/connection/mtud.rs` (brought over by quinn-rs/quinn#2799):
 #
 #   Fix some comparisons in the black hole detector               (upstream #2400)
 #   Relax MTU discovery state assertion                           (upstream #2400)
 #   proto: treat an equal-size delivery as evidence against a
 #          preceding loss burst                                   (#2792, ours)
 #
-# Upstream refs: the bug is quinn-rs/quinn#2791, the fix quinn-rs/quinn#2792
-# (merged to `main`), and #2799 brought all three to `0.11.x` on 2026-08-20.
-# Until 2026-08-20 the same three commits were served from a personal fork;
-# the `quinn-proto` crate at this commit is tree-identical to that fork's rev.
+# and the fourth is in `quinn-proto/src/connection/datagrams.rs` (#2806, ours):
+# the outgoing-datagram eviction loop double-subtracted an evicted datagram's
+# size from `payload_bytes`, so sustained eviction underflows the counter and
+# panics inside `send_datagram` while the connection lock is held (#2805).
+#
+# Upstream refs: the MTU bug is quinn-rs/quinn#2791, the fix quinn-rs/quinn#2792
+# (merged to `main`), and #2799 brought all three to `0.11.x` on 2026-08-20;
+# the datagram bug is #2805, fixed on `0.11.x` by #2806 on 2026-08-29.
+# Until 2026-08-20 the three MTU commits were served from a personal fork.
 #
 # EXIT CONDITION: delete this stanza as soon as a quinn-proto 0.11.x release
 # includes the fix, then `cargo update -p quinn-proto` and drop the CI audit
@@ -154,4 +159,4 @@ proptest = "1"
 # pinned commit's version *is* the upstream tag, so advisories filed against
 # quinn-proto 0.11.17 apply to us unchanged.
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "dcb9eabee2284141d24fc1632903d7a5269be404" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }

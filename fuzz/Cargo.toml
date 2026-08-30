@@ -19,7 +19,7 @@ path = ".."
 # stanza has to be repeated; keep the rev in lockstep with `../Cargo.toml`,
 # where the reasoning and the exit condition live.
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "dcb9eabee2284141d24fc1632903d7a5269be404" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }
 
 [workspace]
 members = ["."]

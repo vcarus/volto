@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "git+https://github.com/quinn-rs/quinn?rev=dcb9eabee2284141d24fc1632903d7a5269be404#dcb9eabee2284141d24fc1632903d7a5269be404"
+source = "git+https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f213b01ea7bebd60023e5df7df65e5c2bd"
 dependencies = [
  "bytes",
  "fastbloom",

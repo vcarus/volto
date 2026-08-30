@@ -486,10 +486,9 @@ at the floor re-triggers the detector and pushes the next probe out again, so th
 MTU stays there for as long as the transfer lasts. That branch was also missing
 two comparison fixes that upstream had landed on `main` only.
 
-The pinned commit, `dcb9eabe`, is the squash merge of
-[quinn-rs/quinn#2799](https://github.com/quinn-rs/quinn/pull/2799): the
-`quinn-proto-0.11.17` tag plus three fixes, all of them in
-`quinn-proto/src/connection/mtud.rs`:
+The pinned commit, `f650e0f`, is the `quinn-proto-0.11.17` tag plus four fixes.
+Three are in `quinn-proto/src/connection/mtud.rs`, brought to `0.11.x` by
+[quinn-rs/quinn#2799](https://github.com/quinn-rs/quinn/pull/2799):
 
 - "Fix some comparisons in the black hole detector" and "Relax MTU discovery
   state assertion", backported from
@@ -499,9 +498,16 @@ The pinned commit, `dcb9eabe`, is the squash merge of
   [#2791](https://github.com/quinn-rs/quinn/issues/2791) and the fix
   [#2792](https://github.com/quinn-rs/quinn/pull/2792), merged to `main`.
 
+The fourth is in `quinn-proto/src/connection/datagrams.rs`: the
+outgoing-datagram eviction loop subtracted an evicted datagram's size from the
+buffered-bytes counter twice, so sustained eviction underflows the counter and
+ends in a panic inside `send_datagram` while the connection lock is held. The
+bug is [#2805](https://github.com/quinn-rs/quinn/issues/2805) and the fix
+[#2806](https://github.com/quinn-rs/quinn/pull/2806), landed on `0.11.x`.
+
 No 0.11.x *release* carries these yet, which is why the stanza pins a commit
 rather than a version. Because that commit's version *is* the upstream tag,
-anything true of quinn-proto 0.11.17 is true here except those three fixes.
+anything true of quinn-proto 0.11.17 is true here except those four fixes.
 
 **Exit condition:** drop the stanza as soon as a quinn-proto 0.11.x release
 includes the fix, then `cargo update -p quinn-proto` and remove the CI audit
