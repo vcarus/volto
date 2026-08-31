@@ -129,20 +129,27 @@ pub(crate) struct Shared {
     /// connection, for the same reason that line's `tunnels` counter is
     /// created outside it.
     dropped_datagrams: Arc<AtomicU64>,
-    /// Whether each way of dropping has been reported once already.
+    /// How often each way of dropping has been reported, on a doubling
+    /// schedule.
     ///
     /// Drops arrive at whatever rate the peer sends, so a line per drop would
     /// be log amplification under a debug subscriber and a formatting cost on
-    /// the routing task either way: the first of each shape names it, and the
-    /// closing line's total carries the volume. Four flags rather than one
-    /// because the shapes have different diagnoses — an extension this server
-    /// does not speak, a session racing its own close (or a misdirected
-    /// flood), a target not draining, and a datagram cut short of its Context
-    /// ID — and the one line each gets should be the right one.
-    unknown_context_reported: AtomicBool,
-    unroutable_reported: AtomicBool,
-    queue_full_reported: AtomicBool,
-    malformed_reported: AtomicBool,
+    /// the routing task either way. [`crate::logfmt::Sampler`] is the whole of
+    /// this crate's answer to that question, so these use it rather than a
+    /// flag of their own: the first drop of each shape names it as immediately
+    /// as it ever did, and the reports that follow say how far the count has
+    /// got without one line per packet. Four samplers rather than one because
+    /// the shapes have different diagnoses — an extension this server does not
+    /// speak, a session racing its own close (or a misdirected flood), a
+    /// target not draining, and a datagram cut short of its Context ID — and
+    /// each should be able to double at its own rate.
+    ///
+    /// The closing line's `dropped_datagrams` is still the total across all
+    /// four; these bound the running commentary, not the count.
+    unknown_context_drops: crate::logfmt::Sampler,
+    unroutable_drops: crate::logfmt::Sampler,
+    queue_full_drops: crate::logfmt::Sampler,
+    malformed_drops: crate::logfmt::Sampler,
 }
 
 impl Shared {
@@ -200,11 +207,13 @@ impl Shared {
             // one to a future extension, and this proxy implements none, so
             // buffering would be holding packets for a registration that has no
             // way to arrive.
-            self.count_drop(&self.unknown_context_reported, || {
+            self.count_drop(&self.unknown_context_drops, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
                     context_id = decoded.context_id,
-                    "dropping datagrams with an unknown context id"
+                    drops,
+                    "dropping datagrams with an unknown context id; further ones are \
+                     logged as the count doubles"
                 )
             });
             return;
@@ -220,32 +229,39 @@ impl Shared {
 
         match delivered {
             Some(true) => {}
-            None => self.count_drop(&self.unroutable_reported, || {
+            None => self.count_drop(&self.unroutable_drops, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
-                    "dropping datagrams for sessions that do not exist"
+                    drops,
+                    "dropping datagrams for sessions that do not exist; further ones are \
+                     logged as the count doubles"
                 )
             }),
             // Never block the router on one slow session: dropping a UDP
             // packet is legitimate, stalling every other session is not.
-            Some(false) => self.count_drop(&self.queue_full_reported, || {
+            Some(false) => self.count_drop(&self.queue_full_drops, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
-                    "dropping datagrams a session's full queue cannot take"
+                    drops,
+                    "dropping datagrams a session's full queue cannot take; further ones \
+                     are logged as the count doubles"
                 )
             }),
         }
     }
 
-    /// Counts one dropped datagram, and lets the first of its shape say so.
+    /// Counts one dropped datagram, and lets its shape say so on the doubling
+    /// schedule.
     ///
-    /// The count is for the closing line in [`crate::quic`]; the one report is
-    /// for whoever is reading a debug log while it happens. Everything is
-    /// `Relaxed` because nothing is published through either atomic: each is a
-    /// single read-modify-write ordered against nothing else.
-    fn count_drop(&self, reported: &AtomicBool, report: impl FnOnce()) {
-        if !reported.swap(true, Ordering::Relaxed) {
-            report();
+    /// The count is for the closing line in [`crate::quic`]; the reports are
+    /// for whoever is reading a debug log while it happens, and each carries
+    /// the running total of its own shape so a report says how far this has
+    /// got rather than only that it started. Everything is `Relaxed` because
+    /// nothing is published through either atomic: each is a single
+    /// read-modify-write ordered against nothing else.
+    fn count_drop(&self, sampler: &crate::logfmt::Sampler, report: impl FnOnce(u64)) {
+        if let Some(drops) = sampler.record() {
+            report(drops);
         }
         self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
     }
@@ -856,10 +872,16 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
             // The one malformation §2.1 does not make a connection error: a
             // datagram cut short of its Context ID. Dropped like the routing
             // misses in [`Shared::deliver`], and counted with them.
-            handle.shared.count_drop(
-                &handle.shared.malformed_reported,
-                || debug!(%error, "dropping malformed HTTP datagrams"),
-            );
+            handle
+                .shared
+                .count_drop(&handle.shared.malformed_drops, |drops| {
+                    debug!(
+                        %error,
+                        drops,
+                        "dropping malformed HTTP datagrams; further ones are logged as the \
+                         count doubles"
+                    )
+                });
             ControlFlow::Continue(())
         }
     }
@@ -2051,28 +2073,35 @@ mod tests {
         );
     }
 
-    /// The first drop of a shape is the one that speaks; every drop counts.
+    /// A drop shape speaks on the doubling schedule; every drop counts.
     ///
-    /// Three drops rather than two, because the mutation that inverts the
-    /// first-report test reports on every call *but* the first — across two
-    /// calls that is also exactly one report, and only a third call tells the
-    /// two apart.
+    /// Eight drops rather than three, because the schedule itself is the
+    /// assertion now: a report has to land on the 1st, 2nd, 4th and 8th drop
+    /// and on none of the others, and each has to carry the running total. The
+    /// two mutations a weaker test would let through -- reporting always, and
+    /// reporting on every call but the first -- both produce a sequence this
+    /// one names as wrong.
     #[test]
-    fn a_drop_shape_is_reported_once_and_counted_every_time() {
+    fn a_drop_shape_is_reported_on_a_doubling_schedule_and_counted_every_time() {
         let shared = Shared::default();
-        let mut reports = 0;
-        for _ in 0..3 {
-            shared.count_drop(&shared.unroutable_reported, || reports += 1);
+        let mut reports: Vec<u64> = Vec::new();
+        for _ in 0..8 {
+            shared.count_drop(&shared.unroutable_drops, |drops| reports.push(drops));
         }
-        assert_eq!(reports, 1, "the first drop of a shape is the one reported");
+        assert_eq!(
+            reports,
+            vec![1, 2, 4, 8],
+            "the first drop is as loud as it ever was, and the reports that follow \
+             say how far the count has got"
+        );
         assert_eq!(
             shared.dropped_datagrams.load(Ordering::Relaxed),
-            3,
+            8,
             "every drop is counted, reported or not"
         );
-        // A different shape gets its own first report.
-        shared.count_drop(&shared.queue_full_reported, || reports += 1);
-        assert_eq!(reports, 2, "each shape speaks for itself");
+        // A different shape keeps its own schedule, from its own first drop.
+        shared.count_drop(&shared.queue_full_drops, |drops| reports.push(drops));
+        assert_eq!(reports, vec![1, 2, 4, 8, 1], "each shape speaks for itself");
     }
 
     /// RFC 9114 §6.2.1 stands while the connection does; once it is over, the

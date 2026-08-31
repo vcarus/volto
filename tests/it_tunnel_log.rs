@@ -41,7 +41,7 @@ async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {
 
     blackhole_is_information(&buffer).await;
     policy_refusal_is_still_a_warning(&buffer).await;
-    the_oversize_sentinel_fires_once_per_session(&buffer).await;
+    the_oversize_sentinel_reports_on_a_doubling_schedule(&buffer).await;
 }
 
 /// D44/D49: a name the resolver blackholed is not this proxy's verdict, so its
@@ -113,14 +113,21 @@ async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
     );
 }
 
-/// D48 §2: the first oversized drop of a session is INFO, with the two numbers
-/// that make it actionable, and every later one is quiet.
+/// D48 §2 as D97 leaves it: an oversized drop is INFO on the doubling schedule,
+/// with the two numbers that make it actionable and the running total, and every
+/// drop between reports is quiet.
 ///
 /// This is the only reading we have on whether the peer still accepts datagrams
 /// of the size we assumed. Its failure mode is why it needs a test: if the line
 /// is demoted or the call site bypassed, the journal shows zero occurrences —
 /// byte for byte what "no drops are happening" looks like.
-async fn the_oversize_sentinel_fires_once_per_session(buffer: &SharedBuffer) {
+///
+/// The schedule replaced a plain "first only" flag (`logfmt::Sampler`, D97): the
+/// first drop is as immediate as it ever was, and what follows now says how far
+/// the count has got instead of nothing at all. Driven one packet at a time and
+/// asserted after each, so the test names the exact drop a report was owed for
+/// rather than counting lines at the end and hoping.
+async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuffer) {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     // Comfortably above any QUIC datagram limit on a 1200-1500 byte path.
     let target = spawn_large_reply_udp_target(8000).await;
@@ -139,39 +146,53 @@ async fn the_oversize_sentinel_fires_once_per_session(buffer: &SharedBuffer) {
         send_udp_payload(&client.quic, qsid, &[nth]);
     };
 
-    send_one(1);
+    // Eight drops on the one session, one packet at a time. `owed` is what the
+    // schedule has promised so far: a report on the 1st, 2nd, 4th and 8th drop,
+    // and nothing for the drops between them.
+    let mut owed = 0usize;
+    for nth in 1..=8u8 {
+        send_one(nth);
 
-    let line = buffer
-        .wait_for_line(
+        if nth.is_power_of_two() {
+            owed += 1;
+            let line = buffer
+                .wait_for_line(
+                    mark,
+                    &[
+                        " INFO ",
+                        "target packet too large for a QUIC datagram",
+                        &format!("drops={nth}"),
+                    ],
+                )
+                .await;
+            // The numbers are the reading. A line saying only "too large" would
+            // tell an operator nothing about how much too large, which is what
+            // decides whether `max_datagram_frame_size` moved or the targets
+            // simply got chattier — and `drops` is what says how long it has
+            // been happening, which is the half the unsampled version never
+            // told anybody.
+            assert!(
+                line.contains("encoded_len=") && line.contains("limit="),
+                "the sentinel must carry the encoded length and the datagram limit: {line}"
+            );
+        } else {
+            // A drop between reports goes to DEBUG, which a `volto=info`
+            // subscriber does not carry, so there is no line to wait for: what
+            // is observable is that no new one appears.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        let sentinels = buffer.lines_since(
             mark,
             &[" INFO ", "target packet too large for a QUIC datagram"],
-        )
-        .await;
-    // The numbers are the reading. A line saying only "too large" would tell an
-    // operator nothing about how much too large, which is what decides whether
-    // `max_datagram_frame_size` moved or the targets simply got chattier.
-    assert!(
-        line.contains("encoded_len=") && line.contains("limit="),
-        "the sentinel must carry the encoded length and the datagram limit: {line}"
-    );
-
-    // Two more drops on the same session. Waiting for the *second* of them to be
-    // logged at DEBUG is not possible under a `volto=info` subscriber, so the
-    // bound is a plain one: nothing more may appear within it.
-    send_one(2);
-    send_one(3);
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    let sentinels = buffer.lines_since(
-        mark,
-        &[" INFO ", "target packet too large for a QUIC datagram"],
-    );
-    assert_eq!(
-        sentinels.len(),
-        1,
-        "one INFO per session, then silence; got:\n{}",
-        sentinels.join("\n")
-    );
+        );
+        assert_eq!(
+            sentinels.len(),
+            owed,
+            "after {nth} drop(s) the schedule owes {owed} line(s); got:\n{}",
+            sentinels.join("\n")
+        );
+    }
 
     // A dropped packet is not a fault: the session survived it, and nothing here
     // is an operator's problem.
