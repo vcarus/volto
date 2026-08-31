@@ -43,9 +43,9 @@
 mod scripts;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use scripts::repo_root;
+use scripts::{code_only, repo_root, rust_files};
 
 /// The identifiers that would put a wall-clock reading into this crate.
 ///
@@ -56,49 +56,6 @@ const WALL_CLOCK: [&str; 4] = ["SystemTime", "UNIX_EPOCH", "chrono", "OffsetDate
 
 fn source_root() -> PathBuf {
     repo_root().join("src")
-}
-
-/// Every `.rs` file under `root`, in a stable order so a failure names the same
-/// file twice running.
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![root.to_path_buf()];
-
-    while let Some(directory) = pending.pop() {
-        let entries = fs::read_dir(&directory)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", directory.display()));
-
-        for entry in entries {
-            let path = entry.expect("directory entry").path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.extension().is_some_and(|kind| kind == "rs") {
-                found.push(path);
-            }
-        }
-    }
-
-    found.sort();
-    found
-}
-
-/// `line` with a trailing `//` comment removed, and `None` for a line that is
-/// nothing but a comment.
-///
-/// Deliberately crude: this crate has no `/* */` comments and no string literal
-/// carrying a `//`, so the only thing a cleverer parser would buy is the chance
-/// of a subtler bug in the gate itself. What it must get right is the doc
-/// comments — the module above names every banned identifier, and so does the
-/// prose beside the `bloom` feature in `Cargo.toml`.
-fn code_only(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//") {
-        return None;
-    }
-    match line.split_once("//") {
-        Some((code, _)) => Some(code),
-        None => Some(line),
-    }
 }
 
 #[test]
