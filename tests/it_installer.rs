@@ -10,15 +10,134 @@
 //! generation path, touches nothing, and needs no root. The rest of the script
 //! (users, certificates, systemd) cannot be exercised on the dev host and is
 //! covered by shellcheck plus review.
+//!
+//! `--check-config` is the second seam, and it closes the other half of the same
+//! hazard: parsing the generated text here proves this crate can read it, which
+//! is not the same question as whether the binary about to be installed can.
+//! That one is only answerable by running it, so the script runs it — `volto
+//! --check-config`, the same flag `script/deploy.sh` puts to a release before it
+//! swaps a binary (D93, D94). `VOLTO_INSTALL_ROOT` relocates the installer's
+//! paths the way `VOLTO_DEPLOY_ROOT` does for `deploy.sh`, so a temporary
+//! directory can hold the certificate and key the generated config names.
 
 #[path = "common/scripts.rs"]
 mod scripts;
 
-use std::path::PathBuf;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scripts::repo_root;
 use volto::config::Config;
+
+/// The binary a first install would put on the host, and the only thing that can
+/// answer whether it accepts the config the script generates.
+fn real_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_volto"))
+}
+
+/// A stand-in for the host filesystem the installer writes into, carrying the
+/// certificate and key the generated config names.
+///
+/// Nothing reads them: `Config::validate` insists both paths are files, which is
+/// exactly the rule that makes `--check-config` unusable from a bare checkout and
+/// the reason this seam exists at all.
+fn install_root(name: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("volto-install-{}-{name}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let conf_dir = root.join("etc/volto");
+    fs::create_dir_all(&conf_dir).expect("the temporary install root must be creatable");
+    fs::write(conf_dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
+    fs::write(conf_dir.join("key.pem"), "not a key\n").expect("key must be writable");
+    root
+}
+
+/// Copies the four sibling deployment assets into `root/script` and appends
+/// `example_suffix` to the example config, returning the installer's new path.
+///
+/// They travel together because the installer resolves the unit and the example
+/// through `SCRIPT_DIR`, which is wherever the copy of the script being run sits.
+/// Copying all four rather than the two this reads is the point: a test that
+/// silently worked with a broken sibling set would stop noticing when that
+/// contract is what breaks.
+fn plant_script_dir(root: &Path, example_suffix: &str) -> PathBuf {
+    let dir = root.join("script");
+    fs::create_dir_all(&dir).expect("the script directory must be creatable");
+
+    for asset in [
+        "install-selfsigned.sh",
+        "deploy.sh",
+        "config.example.toml",
+        "masque.service",
+    ] {
+        fs::copy(repo_root().join("script").join(asset), dir.join(asset))
+            .unwrap_or_else(|error| panic!("{asset} must be a sibling to copy: {error}"));
+    }
+
+    let example = dir.join("config.example.toml");
+    let mut text = fs::read_to_string(&example).expect("the example must be readable");
+    text.push_str(example_suffix);
+    fs::write(&example, text).expect("the example copy must be writable");
+
+    dir.join("install-selfsigned.sh")
+}
+
+/// A stand-in for a volto from before `--check-config` existed.
+///
+/// It answers `--help` the way clap does, without the flag, and anything it does
+/// not know the way clap does too: a usage error and a non-zero status. That
+/// second half is the trap — a script that tried the flag and read the failure as
+/// a verdict on the configuration would fail every install with an older binary,
+/// so the stand-in fails loudly rather than quietly.
+fn plant_binary_without_the_flag(root: &Path) -> PathBuf {
+    let path = root.join("volto-old");
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --help ]; then\n\
+         \x20 echo 'Usage: volto [OPTIONS] --config <FILE>'\n\
+         \x20 echo '  -c, --config <FILE>  Path to the TOML configuration file'\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo \"error: unexpected argument '$1' found\" >&2\n\
+         exit 2\n",
+    )
+    .expect("the stand-in binary must be writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("the stand-in binary must be executable");
+    path
+}
+
+/// Runs `--check-config` on the installer at `script`, with its install paths
+/// relocated under `root` and `binary` as the volto being asked.
+///
+/// The credentials are fixed on purpose: what varies between the tests below is
+/// the config the generator produces and the binary asked about it, and a value
+/// that changes with neither would only be noise in the failure message.
+fn run_check_config(root: &Path, script: &Path, binary: &Path) -> (bool, String, String) {
+    let output = Command::new("bash")
+        .arg(script)
+        .args([
+            "--check-config",
+            "--binary",
+            binary.to_str().expect("a UTF-8 path to the binary"),
+            "-u",
+            "alice",
+            "-w",
+            "correct-horse-battery",
+        ])
+        .current_dir(repo_root())
+        .env("VOLTO_INSTALL_ROOT", root)
+        .output()
+        .expect("the installer script must be runnable");
+
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
 
 /// Runs `--print-config` with the given arguments, returning its exit status,
 /// standard output and standard error.
@@ -191,6 +310,169 @@ fn credentials_with_a_pipe_or_an_ampersand_are_refused() {
     }
 }
 
+/// The question this crate cannot answer for itself: parsing the generated text
+/// here proves *this* build reads it, and the host runs the binary the installer
+/// was handed. So the script asks that binary, and this is the end-to-end shape
+/// of the answer — the generator, the shipped example and a real volto agreeing
+/// that what a first install writes is a file the service can start on.
+#[test]
+fn the_generated_configuration_is_one_the_binary_can_load() {
+    let root = install_root("accepts");
+    let script = repo_root().join("script/install-selfsigned.sh");
+
+    let (ok, stdout, stderr) = run_check_config(&root, &script, &real_binary());
+
+    assert!(ok, "the generated config must load: {stderr}");
+    assert!(
+        stdout.contains("loads on this volto"),
+        "the run must say the config was checked: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The drift this closes: the generated config is the shipped example with four
+/// values substituted, every table in it is `deny_unknown_fields`, and one key
+/// the binary does not know refuses the whole file rather than the key. Before
+/// the check, that reached the host as a service looping under
+/// `Restart=on-failure` with the answer only in the journal.
+///
+/// The example is corrupted in a copy of the whole `script/` directory, not in
+/// the checkout: the installer resolves its siblings through `SCRIPT_DIR`, so
+/// they have to move together.
+#[test]
+fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
+    let root = install_root("refuses");
+    let script = plant_script_dir(&root, "\na_key_a_later_release_added = 2\n");
+
+    let (ok, stdout, stderr) = run_check_config(&root, &script, &real_binary());
+
+    assert!(
+        !ok,
+        "a config volto refuses must not be installed: {stdout}"
+    );
+    assert!(
+        stderr.contains("unknown field"),
+        "the binary's own account of the refusal must reach the operator: {stderr}"
+    );
+    assert!(
+        stderr.contains("at line "),
+        "including the position, which is the only thread back to the key: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to install a config volto cannot load"),
+        "and the script must say what it did about it: {stderr}"
+    );
+
+    // The check happens before anything is written, so a refusal leaves nothing
+    // for the "already exists, keeping it" branch to preserve on a later run.
+    assert!(
+        !root.join("etc/volto/config.toml").exists(),
+        "a refused run must not leave a config behind"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// The branch that decides whether the check may exist at all: a binary from
+/// before the flag.
+///
+/// Such a volto answers `--check-config` with clap's usage error, and reading
+/// that as "your configuration is broken" would turn every install with an older
+/// binary into a failure — a new failure mode where there was none. So the flag
+/// is looked for by name in the binary's own `--help` before it is used, and a
+/// binary without it leaves the run exactly as it was before any of this existed.
+///
+/// The example carries the same unknown key as the test above, so a probe that
+/// silently stopped working would show up here as a refusal rather than as a
+/// quietly weaker check.
+#[test]
+fn a_binary_that_predates_the_flag_leaves_the_config_unchecked() {
+    let root = install_root("too-old");
+    let script = plant_script_dir(&root, "\na_key_a_later_release_added = 2\n");
+    let binary = plant_binary_without_the_flag(&root);
+
+    let (ok, stdout, stderr) = run_check_config(&root, &script, &binary);
+
+    assert!(
+        ok,
+        "a binary that cannot be asked must not be treated as a refusal: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unexpected argument"),
+        "the flag must never be tried on a binary whose help does not name it: {stderr}"
+    );
+    assert!(
+        stdout.contains("predates --check-config"),
+        "the run must say why the config went unchecked: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// Whether a user-id is short enough is volto's rule, not the installer's, and
+/// the installer spells the number out anyway so the refusal arrives before a
+/// certificate is generated. This is the only thing tying the two together.
+///
+/// `logfmt::MAX_TOKEN` is private to the crate, so the limit is asked of the
+/// server through `Config::validate` rather than repeated a fourth time. If it
+/// ever moves, the script keeps refusing at the old number and this fails,
+/// naming the literal to change.
+#[test]
+fn the_username_limit_is_the_one_the_server_enforces() {
+    let limit = longest_username_the_server_accepts();
+    assert!(
+        (1..256).contains(&limit),
+        "the probe must have found a real limit, got {limit}"
+    );
+
+    // Exactly at the limit the installer must let the name through.
+    let at_limit = "u".repeat(limit);
+    let text = generated_config(&["-u", at_limit.as_str(), "-w", "hunter2"]);
+    let config: Config = toml::from_str(&text).expect("parses");
+    assert_eq!(config.auth.users[0].username.len(), limit);
+
+    // One byte over, and it must refuse in the server's own number.
+    let over_limit = "u".repeat(limit + 1);
+    let (ok, stdout, stderr) = print_config(&["-u", over_limit.as_str(), "-w", "hunter2"]);
+    assert!(!ok, "a user-id over the limit must be refused: {stdout}");
+    assert!(
+        stderr.contains(&format!("at most {limit} bytes")),
+        "the refusal must carry the limit the server enforces: {stderr}"
+    );
+}
+
+/// The longest user-id `Config::validate` accepts, asked of the server rather
+/// than repeated from `logfmt::MAX_TOKEN`, which the test crate cannot see.
+fn longest_username_the_server_accepts() -> usize {
+    (1..256)
+        .take_while(|length| server_accepts_username(&"u".repeat(*length)))
+        .count()
+}
+
+/// Whether the server's user-id length rule lets `name` through.
+///
+/// The certificate paths deliberately do not exist, and that complaint comes
+/// after the `[auth]` rules, so any error but the length one means the name got
+/// past the rule being probed.
+fn server_accepts_username(name: &str) -> bool {
+    let text = format!(
+        "[server]\n\
+         listen = \"0.0.0.0:443\"\n\
+         cert = \"/nonexistent/cert.pem\"\n\
+         key = \"/nonexistent/key.pem\"\n\
+         \n\
+         [auth]\n\
+         users = [{{ username = \"{name}\", password = \"placeholder\" }}]\n"
+    );
+    let config: Config = toml::from_str(&text).expect("the probe config must parse");
+
+    match config.validate() {
+        Ok(()) => true,
+        Err(error) => !error.to_string().contains("byte limit"),
+    }
+}
+
 /// `-h` must work and describe the safety-relevant flags.
 #[test]
 fn the_script_documents_itself() {
@@ -203,7 +485,14 @@ fn the_script_documents_itself() {
 
     assert!(output.status.success());
     let usage = String::from_utf8_lossy(&output.stdout);
-    for expected in ["--force", "--sni", "--username", "Re-running is safe"] {
+    for expected in [
+        "--force",
+        "--sni",
+        "--username",
+        "--print-config",
+        "--check-config",
+        "Re-running is safe",
+    ] {
         assert!(
             usage.contains(expected),
             "usage must mention {expected}: {usage}"

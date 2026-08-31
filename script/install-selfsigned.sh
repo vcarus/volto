@@ -12,6 +12,22 @@
 # client through a channel you trust, and there is no revocation if it leaks.
 #
 # Safe to re-run: anything that already exists is left alone.
+#
+# The config this generates is not installed until the volto binary has been
+# asked whether it can load it -- `volto --check-config`, the same question
+# deploy.sh puts to a release before it swaps the binary on an existing host.
+# This is the other half of that: on a first install the file is brand new, and
+# the only thing that decides whether the service comes up is whether the
+# generator and the shipped example still agree with the binary. A volto too old
+# to know the flag is not asked, and the install proceeds as it always did.
+#
+# --print-config and --check-config are the test seams: both stop after
+# generating the config, neither needs root, and between them they put
+# generate_config, verify_config and check_generated_config -- everything the
+# install path decides the config on -- within reach of tests/it_installer.rs.
+# VOLTO_INSTALL_ROOT prefixes every path this script installs into, so a
+# temporary directory can stand in for /etc and /usr/local, the same way
+# VOLTO_DEPLOY_ROOT works for deploy.sh.
 
 set -euo pipefail
 
@@ -28,13 +44,28 @@ USERNAME="${USERNAME:-surge}"
 PASSWORD="${PASSWORD:-}"
 FORCE=0
 PRINT_CONFIG=0
+CHECK_CONFIG=0
 
-CONF_DIR=/etc/volto
+# volto's own bound on a user-id, repeated here only so the refusal arrives
+# before anything is installed rather than out of the service's first log line.
+# The binary is the authority: it is `logfmt::MAX_TOKEN`, and since the generated
+# config now goes past `volto --check-config` before it is installed, a copy that
+# has drifted from it can no longer let a config through that the service would
+# refuse -- it only makes the message worse. `it_installer.rs` pins the two
+# together by asking the server for its limit and this script for its verdict.
+MAX_USERNAME_BYTES=32
+
+# Empty in every real run, so the paths below are the absolute ones; a test sets
+# it to a temporary directory to relocate the whole install.
+ROOT="${VOLTO_INSTALL_ROOT:-}"
+
+CONF_DIR="$ROOT/etc/volto"
 CONF="$CONF_DIR/config.toml"
 CERT="$CONF_DIR/cert.pem"
 KEY="$CONF_DIR/key.pem"
 SERVICE_NAME=volto
-UNIT="/etc/systemd/system/$SERVICE_NAME.service"
+BIN="$ROOT/usr/local/bin/volto"
+UNIT="$ROOT/etc/systemd/system/$SERVICE_NAME.service"
 CERT_DAYS=3650
 
 usage() {
@@ -54,17 +85,28 @@ Options:
   -f, --force          regenerate the certificate even if one exists
       --print-config   print the config that would be generated, then exit
                        (changes nothing, needs no root; used by the test suite)
+      --check-config   generate the config this run would install and ask the
+                       volto binary whether it can load it, then exit (changes
+                       nothing, needs no root, needs the certificate and key to
+                       be in place already; used by the test suite)
   -h, --help           show this help
 
 Every option can also be given as an environment variable: BINARY, SNI, PORT,
-USERNAME, PASSWORD.
+USERNAME, PASSWORD. VOLTO_INSTALL_ROOT prefixes every path this script installs
+into (/etc/volto, /etc/systemd/system, /usr/local/bin); it exists for the tests.
 
-The username must not contain a colon (RFC 7617) and must be at most 32 bytes
-(volto refuses a longer one at startup). Neither the username nor the
-password may contain " \ | or &: the first two cannot be written into the
-generated TOML, and the other two are metacharacters of the substitution that
-writes it. Every other printable character is fine, and a generated password is
-never affected.
+The username must not contain a colon (RFC 7617) and must be at most 32 bytes.
+That bound is volto's, not this script's -- the binary refuses a longer user-id
+at startup, and repeating it here only moves the complaint earlier. Neither the
+username nor the password may contain " \ | or &: the first two cannot be
+written into the generated TOML, and the other two are metacharacters of the
+substitution that writes it. Every other printable character is fine, and a
+generated password is never affected.
+
+Before the generated config is installed, the volto binary is asked whether it
+can load it (volto --check-config); if it cannot, nothing is written and the
+binary's own complaint is printed. A volto too old to know that flag is not
+asked, and the install goes ahead unchecked.
 
 Re-running is safe: an existing config file, certificate or user is kept as it
 is. --force regenerates the certificate only; it never rewrites config.toml, so
@@ -85,8 +127,9 @@ note() {
 # Rejects credentials the generated config could not express, or that the
 # substitution writing it would rewrite into something else.
 #
-# Called from the --print-config path as well as from the preflight, because
-# that flag runs the same generator and used to reach it with no check at all.
+# Called from the two flags that stop after generating a config as well as from
+# the preflight, because they run the same generator and --print-config used to
+# reach it with no check at all.
 check_credentials() {
     # A username with a colon cannot be expressed in HTTP Basic (RFC 7617), and
     # volto rejects one at startup. Catch it here, where the message can be
@@ -95,14 +138,16 @@ check_credentials() {
         *:*) die "username must not contain a colon (RFC 7617)" ;;
         '')  die "username must not be empty" ;;
     esac
-    # volto refuses a username longer than 32 bytes at startup (the length a
-    # user-id is carried at in the logs and the authentication failure
-    # counters). Catch it here so the service does not install and then loop
-    # under Restart=on-failure.
+    # volto refuses a longer username at startup (that is the length a user-id
+    # is carried at in the logs and the authentication failure counters). The
+    # generated config is now put to the binary before it is installed, so this
+    # is no longer the only thing between a too-long name and a service that
+    # loops under Restart=on-failure -- it is the copy that can say so in one
+    # line, and say it before the certificate is generated.
     # Bytes, not characters: ${#var} counts characters in some shells, and the
     # limit volto enforces is a byte length.
-    if [ "$(printf %s "$USERNAME" | wc -c)" -gt 32 ]; then
-        die "username must be at most 32 bytes"
+    if [ "$(printf %s "$USERNAME" | wc -c)" -gt "$MAX_USERNAME_BYTES" ]; then
+        die "username must be at most $MAX_USERNAME_BYTES bytes"
     fi
     case "$USERNAME$PASSWORD" in
         # Neither survives being written into a double-quoted TOML string.
@@ -126,6 +171,7 @@ while [ $# -gt 0 ]; do
         -w|--password) [ $# -ge 2 ] || die "$1 needs a value"; PASSWORD="$2"; shift 2 ;;
         -f|--force)    FORCE=1; shift ;;
         --print-config) PRINT_CONFIG=1; shift ;;
+        --check-config) CHECK_CONFIG=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             usage >&2; die "unknown option: $1" ;;
     esac
@@ -166,19 +212,92 @@ verify_config() {
     fi
 }
 
-if [ "$PRINT_CONFIG" -eq 1 ]; then
+# Asks the volto binary whether it can load the config generated in $1, and ends
+# the run when it cannot.
+#
+# verify_config above only checks that the four substitutions landed. Everything
+# else in the file comes from the shipped example, where every table is
+# `deny_unknown_fields` -- so one key the binary being installed does not know
+# refuses the whole file, and the service never starts. On a first install there
+# is no running service to fall back to and no previous config to compare
+# against, which makes this the one moment the question can still be answered
+# cheaply. deploy.sh asks the same question on the update path
+# (`check_config_with`); this is the first-install half of it.
+#
+# The temporary file is asked about rather than the installed one, so a refusal
+# leaves no configuration behind and the service is never started on it.
+# Installing first and checking after would write a config that the "already
+# exists, keeping it" branch then preserves on every later run -- the failure
+# would outlive the run that caused it. It cannot move any earlier than this:
+# one of the rules being checked is that the certificate and key the file names
+# are readable files, and the certificate is generated a few lines above.
+#
+# Whether the binary can be asked at all is settled by looking for the flag in
+# its own --help, not by running it and reading the failure. A volto from before
+# the flag existed answers an unknown argument with clap's usage error, and
+# taking that for "your configuration is broken" would turn every older binary
+# into a failed install -- the opposite of the point. The help text goes into a
+# variable rather than through a pipe to grep, because `grep -q` closes the pipe
+# on its first match and `set -o pipefail` would then report the producer's
+# SIGPIPE as a failure. A binary that cannot be asked leaves the run exactly as
+# it was before any of this existed.
+check_generated_config() {
+    local help output
+
+    help="$("$BINARY" --help 2>&1)" || help=""
+    case "$help" in
+        *--check-config*) ;;
+        *)
+            note "this volto predates --check-config, so the generated config goes in unchecked"
+            return 0
+            ;;
+    esac
+
+    if output="$("$BINARY" --check-config --config "$1" 2>&1)"; then
+        note "the generated config loads on this volto"
+        return 0
+    fi
+
+    # Everything about the refusal, on stderr, where a failing run's output is
+    # read from -- including the binary's own message, which names the line and
+    # the column but not the key (a parse error redacts every quoted segment,
+    # because the same message can quote a password).
+    {
+        echo "==> volto cannot load the config this install would write"
+        echo "$output"
+        note "no configuration was written and the service was not started"
+        note "the position above is a line of $EXAMPLE_SRC, which is this"
+        note "config with four values substituted into it"
+        note "(docs/configuration.md, version compatibility, says which key arrived when)"
+    } >&2
+    die "refusing to install a config volto cannot load"
+}
+
+# Both flags below stop after the config has been generated, and both reach it
+# through the same temporary file the install path writes. That is what puts
+# generate_config, verify_config and check_generated_config within reach of the
+# test suite, which cannot run the rest of the script.
+if [ "$PRINT_CONFIG" -eq 1 ] || [ "$CHECK_CONFIG" -eq 1 ]; then
     [ -f "$EXAMPLE_SRC" ] || die "missing $EXAMPLE_SRC"
     check_credentials
     [ -n "$PASSWORD" ] || PASSWORD="$(openssl rand -base64 18)"
-    # Through a file rather than straight to stdout, so this path runs the same
-    # verification the install path does. That is what puts the verification
-    # within reach of the test suite, which cannot run the rest of the script.
+
     tmp="$(mktemp)"
     # shellcheck disable=SC2064  # $tmp must expand now, not at trap time.
     trap "rm -f '$tmp'" EXIT
     generate_config >"$tmp"
     verify_config "$tmp"
-    cat "$tmp"
+
+    [ "$PRINT_CONFIG" -eq 0 ] || cat "$tmp"
+
+    if [ "$CHECK_CONFIG" -eq 1 ]; then
+        # The binary is needed here and only here: --print-config never runs it,
+        # which is why it works in a checkout with nothing built.
+        [ -f "$BINARY" ] || die "no volto binary at $BINARY — build it first: cargo build --release"
+        [ -x "$BINARY" ] || die "$BINARY is not executable"
+        check_generated_config "$tmp"
+    fi
+
     exit 0
 fi
 
@@ -227,8 +346,8 @@ else
     note "created system user 'volto'"
 fi
 
-install -m 0755 "$BINARY" /usr/local/bin/volto
-note "installed $(/usr/local/bin/volto --version 2>/dev/null || echo volto) to /usr/local/bin/volto"
+install -m 0755 "$BINARY" "$BIN"
+note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
 
 install -d -o volto -g volto -m 0750 "$CONF_DIR"
 
@@ -283,6 +402,10 @@ else
 
     generate_config >"$tmp"
     verify_config "$tmp"
+    # Last thing before the file becomes this host's configuration, and after
+    # the certificate exists -- one of the rules the binary checks is that the
+    # paths in the file are readable files.
+    check_generated_config "$tmp"
 
     install -o volto -g volto -m 0640 "$tmp" "$CONF"
     rm -f "$tmp"

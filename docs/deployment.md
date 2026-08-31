@@ -105,6 +105,13 @@ the substitution that writes it. The installer refuses them up front rather than
 installing something other than what was asked for. Everything else printable is
 accepted, `*` and `.` included, and a generated password never runs into this.
 
+Before the generated `config.toml` is installed, the binary being installed is
+asked whether it can load it — the same `volto --check-config` question
+`deploy.sh` puts to a release on the update path. A no ends the run with the
+binary's own message and nothing written, so the cause can be fixed and the
+installer re-run on a host it left untouched. A binary too old to know the flag
+is not asked, and the install goes ahead as it always did.
+
 Re-running is safe: an existing config file, certificate or user is kept.
 `--force` regenerates the certificate only — it never rewrites `config.toml`, so
 hand edits survive. Regenerating changes the fingerprint, and every client then
