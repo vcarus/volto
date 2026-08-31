@@ -58,10 +58,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use common::{
-    connect_request, echoes, read_at_least, respond_to, spawn_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE,
+    connect_request, echoes, respond_to, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
 };
 use volto::h3api::Status;
 use volto::net::{blocking_pool_size, BURST_LOOKUPS, SHARED_LOOKUPS};
