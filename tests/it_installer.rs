@@ -11,14 +11,14 @@
 //! (users, certificates, systemd) cannot be exercised on the dev host and is
 //! covered by shellcheck plus review.
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::path::PathBuf;
 use std::process::Command;
 
+use scripts::repo_root;
 use volto::config::Config;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// Runs `--print-config` with the given arguments, returning its exit status,
 /// standard output and standard error.

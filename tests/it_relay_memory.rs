@@ -14,7 +14,9 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+#[path = "common/alloc.rs"]
+mod alloc;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -52,29 +54,18 @@ fn record(size: usize) {
     }
 }
 
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        System.alloc(layout)
+impl alloc::Record for Counting {
+    fn allocated(size: usize) {
+        record(size);
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        record(layout.size());
-        System.alloc_zeroed(layout)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        record(new_size);
-        System.realloc(ptr, layout, new_size)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+    fn reallocated(_old: usize, new: usize) {
+        record(new);
     }
 }
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: alloc::PassThrough<Counting> = alloc::PassThrough::new();
 
 /// Runs `body` with the tally armed, and returns what it counted.
 async fn while_counting<F: std::future::Future>(body: F) -> (F::Output, u64) {

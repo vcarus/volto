@@ -14,18 +14,12 @@ mod common;
 use bytes::BytesMut;
 use common::rawstream::{
     application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
-    status_of, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
+    status_of, DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
     H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR, H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR,
     QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use common::{connect_quic, TestServer, TIMEOUT};
 use volto::datagram;
-
-/// A target the destination policy refuses before the resolver is asked.
-///
-/// Port 25 is on the default deny list and the port rule is checked first, so a
-/// request for it is answered without touching the network.
-const DENIED_TARGET: &str = "192.0.2.1:25";
 
 /// A frame whose whole payload is one varint: CANCEL_PUSH or MAX_PUSH_ID.
 fn push_id_frame(kind: u64, push_id: u64) -> Vec<u8> {

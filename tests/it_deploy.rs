@@ -15,14 +15,18 @@
 //! (download, checksum, rollback, systemd) is still covered by shellcheck plus
 //! first-run review, the same deal as install-selfsigned.sh.
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+use scripts::{
+    loadable_config_text, plant_placeholder_certificates, repo_root, scratch_dir, stderr_of,
+    stdout_of,
+};
 
 fn deploy_script() -> PathBuf {
     repo_root().join("script/deploy.sh")
@@ -81,19 +85,10 @@ fn run_deploy_piped(root: &Path, args: &[&str]) -> Output {
         .expect("the deploy script must be runnable from stdin")
 }
 
-fn stdout_of(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr_of(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
 /// A stand-in for a host's filesystem: the directories a Linux host already has,
 /// under a directory of this test's own.
 fn install_root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("volto-deploy-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch_dir("deploy", name);
     for dir in [
         "usr/local/bin",
         "usr/local/sbin",
@@ -130,22 +125,10 @@ fn plant_unit(root: &Path) {
 /// both paths are files; nothing reads them.
 fn plant_loadable_config(root: &Path, body: &str) {
     let dir = root.join("etc/volto");
-    fs::write(dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
-    fs::write(dir.join("key.pem"), "not a key\n").expect("key must be writable");
+    let (cert, key) = plant_placeholder_certificates(&dir);
     fs::write(
         dir.join("config.toml"),
-        format!(
-            "[server]\n\
-             listen = \"127.0.0.1:4433\"\n\
-             cert = \"{}\"\n\
-             key = \"{}\"\n\
-             \n\
-             [auth]\n\
-             users = [{{ username = \"user1\", password = \"planted\" }}]\n\
-             {body}",
-            dir.join("cert.pem").display(),
-            dir.join("key.pem").display(),
-        ),
+        loadable_config_text(&cert, &key, "127.0.0.1:4433", "planted", body),
     )
     .expect("config must be writable");
 }

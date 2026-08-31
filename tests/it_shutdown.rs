@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::rawstream::{connect_headers_frame, H3_REQUEST_REJECTED};
 use common::{
-    connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
+    close_and_drain, connect_request, echoes, open_tcp_tunnel, open_udp_session, spawn_echo_target,
     spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT,
     TIMEOUT,
 };
@@ -30,26 +30,17 @@ async fn an_established_tunnel_survives_goaway_and_finishes() {
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    stream
-        .send_data(Bytes::from_static(b"before"))
-        .await
-        .expect("send before shutdown");
-    assert_eq!(&read_at_least(&mut stream, 6).await, b"before");
+    echoes(&mut stream, b"before").await;
 
     server.shutdown();
 
     // The GOAWAY does not touch this tunnel: it must still carry data in both
     // directions afterwards.
-    stream
-        .send_data(Bytes::from_static(b"after!"))
-        .await
-        .expect("send after shutdown");
-    assert_eq!(&read_at_least(&mut stream, 6).await, b"after!");
+    echoes(&mut stream, b"after!").await;
 
     // Once the client is done, the server should finish its side and stop —
     // well inside the default grace period.
-    stream.finish().expect("finish the request stream");
-    common::read_to_end(&mut stream).await;
+    close_and_drain(&mut stream).await;
 
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
@@ -158,13 +149,9 @@ async fn a_request_stream_past_the_goaway_identifier_is_rejected() {
 
     // Rejecting a late request does not disturb the tunnel that was already
     // open, which is the whole reason a GOAWAY has an identifier at all.
-    held.send_data(Bytes::from_static(b"alive"))
-        .await
-        .expect("the held tunnel still works");
-    assert_eq!(&read_at_least(&mut held, 5).await, b"alive");
+    echoes(&mut held, b"alive").await;
 
-    held.finish().expect("finish");
-    common::read_to_end(&mut held).await;
+    close_and_drain(&mut held).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
@@ -214,13 +201,9 @@ async fn new_requests_are_refused_after_goaway() {
     }
 
     // Meanwhile the tunnel opened before the signal is untouched.
-    held.send_data(Bytes::from_static(b"alive"))
-        .await
-        .expect("the held tunnel still works");
-    assert_eq!(&read_at_least(&mut held, 5).await, b"alive");
+    echoes(&mut held, b"alive").await;
 
-    held.finish().expect("finish");
-    common::read_to_end(&mut held).await;
+    close_and_drain(&mut held).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 
@@ -416,8 +399,7 @@ async fn a_promised_request_outlives_the_last_tunnel_on_the_connection() {
 
     // The last tunnel goes. What is left on the connection is one request the
     // GOAWAY promised to serve and no tunnel slot anywhere.
-    held.finish().expect("finish the held tunnel");
-    common::read_to_end(&mut held).await;
+    close_and_drain(&mut held).await;
 
     // The drain must still be waiting. Two seconds is three orders of magnitude
     // over the microseconds a connection with nothing left to do takes to close
@@ -504,11 +486,7 @@ async fn a_zero_grace_period_closes_everything_at_once() {
     let mut client = H3Client::connect(&server).await;
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
-    stream
-        .send_data(Bytes::from_static(b"unfinished"))
-        .await
-        .expect("send");
-    assert_eq!(&read_at_least(&mut stream, 10).await, b"unfinished");
+    echoes(&mut stream, b"unfinished").await;
 
     let started = std::time::Instant::now();
     server.shutdown();

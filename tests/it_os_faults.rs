@@ -53,14 +53,14 @@ mod common;
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use common::{
-    connect_request, connect_udp_request, open_tcp_tunnel, open_udp_session, read_at_least,
-    respond_to, send_and_respond, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
-    ClientStream, H3Client, Response, SharedBuffer, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    connect_request, connect_udp_request, echoes, numeric_field, open_tcp_tunnel, open_udp_session,
+    proxy_status, respond_to, send_and_respond, send_udp_payload, spawn_echo_target,
+    spawn_udp_echo_target, udp_round_trip, ClientStream, H3Client, Response, SharedBuffer,
+    TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
-use volto::h3api::{FieldValue, Status};
+use volto::h3api::Status;
 
 /// Tunnel slots the connection under test is given.
 ///
@@ -210,13 +210,11 @@ async fn settled_fds() -> Option<usize> {
 }
 
 /// The `Proxy-Status` field of a response, or `"<none>"`.
-fn proxy_status(response: &Response) -> String {
-    response
-        .fields
-        .get("proxy-status")
-        .and_then(FieldValue::to_str)
-        .unwrap_or("<none>")
-        .to_owned()
+///
+/// The `String` form the assertions here interpolate, over
+/// [`common::proxy_status`].
+fn reported_status(response: &Response) -> String {
+    proxy_status(response).unwrap_or("<none>").to_owned()
 }
 
 /// Asserts that a response is the answer a local resource exhaustion gets.
@@ -227,7 +225,7 @@ fn proxy_status(response: &Response) -> String {
 /// one, so there is none to name (D89).
 #[track_caller]
 fn assert_local_failure(response: &Response, what: &str) {
-    let status = proxy_status(response);
+    let status = reported_status(response);
     assert_eq!(
         response.status,
         Status::INTERNAL_SERVER_ERROR,
@@ -303,11 +301,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     let mut live_tcp = open_tcp_tunnel(&mut client, &echo_authority).await;
     let (live_qsid, _live_udp) = open_udp_session(&mut client, &server, udp_echo).await;
 
-    live_tcp
-        .send_data(Bytes::from_static(b"before"))
-        .await
-        .expect("write into the live tunnel");
-    assert_eq!(read_at_least(&mut live_tcp, 6).await, b"before");
+    echoes(&mut live_tcp, b"before").await;
     assert_eq!(
         udp_round_trip(&client, live_qsid, b"before").await.as_ref(),
         b"before"
@@ -348,11 +342,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     assert!(elapsed < REFUSAL_BOUND, "the refusal took {elapsed:?}");
 
     // --- The tunnels already running are untouched, in both directions. ---
-    live_tcp
-        .send_data(Bytes::from_static(b"during"))
-        .await
-        .expect("the live tunnel still takes bytes");
-    assert_eq!(read_at_least(&mut live_tcp, 6).await, b"during");
+    echoes(&mut live_tcp, b"during").await;
     assert_eq!(
         udp_round_trip(&client, live_qsid, b"during").await.as_ref(),
         b"during"
@@ -407,21 +397,13 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         !failed.to_string().is_empty(),
         "a failed reload must say why"
     );
-    live_tcp
-        .send_data(Bytes::from_static(b"reload"))
-        .await
-        .expect("a failed reload leaves the live tunnel alone");
-    assert_eq!(read_at_least(&mut live_tcp, 6).await, b"reload");
+    echoes(&mut live_tcp, b"reload").await;
 
     // --- Recovery. ---
     drop(clamp);
 
     let mut recovered = open_tcp_tunnel(&mut client, &echo_authority).await;
-    recovered
-        .send_data(Bytes::from_static(b"healed"))
-        .await
-        .expect("the recovered tunnel takes bytes");
-    assert_eq!(read_at_least(&mut recovered, 6).await, b"healed");
+    echoes(&mut recovered, b"healed").await;
 
     // The datagram router is the part of the recovery a status code cannot
     // show: a session opened after the fault has to claim its Quarter Stream ID
@@ -459,20 +441,16 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
             response.status,
             Status::BAD_GATEWAY,
             "storm request {attempt}: proxy-status={}",
-            proxy_status(&response)
+            reported_status(&response)
         );
         assert_eq!(
             proxy_status(&response),
-            "volto; error=dns_error",
+            Some("volto; error=dns_error"),
             "storm request {attempt}"
         );
     }
 
-    live_tcp
-        .send_data(Bytes::from_static(b"after!"))
-        .await
-        .expect("the live tunnel survives the storm");
-    assert_eq!(read_at_least(&mut live_tcp, 6).await, b"after!");
+    echoes(&mut live_tcp, b"after!").await;
     assert_eq!(
         udp_round_trip(&client, live_qsid, b"after!").await.as_ref(),
         b"after!"
@@ -490,10 +468,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     //
     // One datagram, and the run sends no other droppable one, so the closing
     // line has to say exactly one.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(refused_qsid, b"orphan"))
-        .expect("a datagram for a session that was refused");
+    send_udp_payload(&client.quic, refused_qsid, b"orphan");
     // A fence: the round trip crosses the router after the datagram above, so
     // the drop has been counted by the time the connection closes.
     assert_eq!(
@@ -515,20 +490,4 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         1,
         "the Quarter Stream ID of a refused session must route nowhere; line was:\n{line}"
     );
-}
-
-/// Reads a numeric field's value off a formatted log line.
-///
-/// The reader `it_close_log` and `it_soak` use, and here for the same reason: a
-/// counter wired to the wrong source is present and wrong rather than absent.
-#[track_caller]
-fn numeric_field(line: &str, name: &str) -> u64 {
-    let rest = line
-        .split_once(&format!("{name}="))
-        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
-        .1;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
 }

@@ -30,11 +30,10 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use common::{
-    open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_flooding_udp_target,
-    spawn_udp_echo_target, ClientStream, H3Client, TestServer, TIMEOUT,
+    echoes, open_tcp_tunnel, open_udp_session, send_udp_payload, spawn_echo_target,
+    spawn_flooding_udp_target, spawn_udp_echo_target, ClientStream, H3Client, TestServer, TIMEOUT,
 };
 use volto::capsule::{self, Capsule, CapsuleDecoder};
-use volto::datagram;
 
 /// A per-stream receive window too small for a flooding target's replies, so
 /// the server is parked in its write to the client rather than racing it.
@@ -134,10 +133,7 @@ async fn a_session_that_never_drains_its_queue_does_not_stall_the_router() {
 
     // The whole test: a neighbour's round trip, through the router that is now
     // holding a full queue it cannot deliver to.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(live_qsid, b"neighbour"))
-        .expect("queue a datagram for the live session");
+    send_udp_payload(&client.quic, live_qsid, b"neighbour");
     capsule_reply_is(&mut live, b"neighbour").await;
 
     assert!(
@@ -164,10 +160,7 @@ async fn a_session_that_never_drains_its_queue_does_not_stall_the_accept_loop() 
     // Opened *after* the flood, and it has to work end to end rather than
     // merely be answered.
     let (fresh_qsid, mut fresh) = open_udp_session(&mut client, &server, echo).await;
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(fresh_qsid, b"fresh"))
-        .expect("queue a datagram for the fresh session");
+    send_udp_payload(&client.quic, fresh_qsid, b"fresh");
     capsule_reply_is(&mut fresh, b"fresh").await;
 }
 
@@ -199,10 +192,7 @@ async fn a_session_with_a_full_queue(server: &TestServer) -> (H3Client, u64, Cli
 /// is full and staying full rather than merely reaching its last slot.
 fn fill_inbound_queue(client: &H3Client, quarter_stream_id: u64) {
     for _ in 0..4 * volto::h3::connection::INBOUND_QUEUE_DEPTH {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(quarter_stream_id, b"queued"))
-            .expect("queue a datagram for the stalled session");
+        send_udp_payload(&client.quic, quarter_stream_id, b"queued");
     }
 }
 
@@ -263,12 +253,7 @@ async fn a_request_whose_headers_never_arrive_does_not_delay_other_requests() {
     });
 
     // Established, not merely answered.
-    tunnel
-        .send_data(Bytes::from_static(b"behind the stall"))
-        .await
-        .expect("write to the tunnel");
-    let echoed = common::read_at_least(&mut tunnel, b"behind the stall".len()).await;
-    assert_eq!(&echoed, b"behind the stall");
+    echoes(&mut tunnel, b"behind the stall").await;
 }
 
 /// A HEADERS frame declaring 4096 bytes of field section, with three of them.
@@ -377,10 +362,7 @@ async fn a_connection_out_of_stream_credit_keeps_its_datagrams_and_downloads() {
     );
 
     // And the session, whose payloads never touch a stream at all.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"dns"))
-        .expect("queue a datagram");
+    send_udp_payload(&client.quic, qsid, b"dns");
     let answered = tokio::time::timeout(TIMEOUT, async {
         loop {
             let reply = common::recv_datagram(&client.quic).await;

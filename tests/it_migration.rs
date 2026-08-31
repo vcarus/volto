@@ -6,8 +6,7 @@
 
 mod common;
 
-use bytes::Bytes;
-use common::{open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, TestServer};
+use common::{echoes, open_tcp_tunnel, spawn_echo_target, H3Client, TestServer};
 
 #[tokio::test]
 async fn a_tcp_tunnel_survives_the_client_changing_address() {
@@ -17,23 +16,13 @@ async fn a_tcp_tunnel_survives_the_client_changing_address() {
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    stream
-        .send_data(Bytes::from_static(b"before the move"))
-        .await
-        .expect("send before rebinding");
-    let echoed = read_at_least(&mut stream, b"before the move".len()).await;
-    assert_eq!(&echoed, b"before the move");
+    echoes(&mut stream, b"before the move").await;
 
     client.rebind();
 
     // The same stream keeps carrying bytes across the address change; a server
     // that resets or drops the connection on migration fails here.
-    stream
-        .send_data(Bytes::from_static(b"after the move"))
-        .await
-        .expect("send after rebinding");
-    let echoed = read_at_least(&mut stream, b"after the move".len()).await;
-    assert_eq!(&echoed, b"after the move");
+    echoes(&mut stream, b"after the move").await;
 }
 
 #[tokio::test]
@@ -46,10 +35,5 @@ async fn new_tunnels_open_after_the_client_changed_address() {
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    stream
-        .send_data(Bytes::from_static(b"fresh tunnel"))
-        .await
-        .expect("send on the fresh tunnel");
-    let echoed = read_at_least(&mut stream, b"fresh tunnel".len()).await;
-    assert_eq!(&echoed, b"fresh tunnel");
+    echoes(&mut stream, b"fresh tunnel").await;
 }

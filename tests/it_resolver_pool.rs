@@ -60,7 +60,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::{
-    connect_request, read_at_least, respond_to, spawn_echo_target, H3Client, TestServer,
+    connect_request, echoes, read_at_least, respond_to, spawn_echo_target, H3Client, TestServer,
     ALLOW_PRIVATE,
 };
 use volto::h3api::Status;
@@ -276,12 +276,7 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
 
         // And it is a tunnel, not just a 200.
         let (_, mut stream) = common::send_and_respond(&mut victim, connect_request(&target)).await;
-        stream
-            .send_data(Bytes::from_static(b"still working"))
-            .await
-            .expect("write into the tunnel");
-        let echoed = read_at_least(&mut stream, b"still working".len()).await;
-        assert_eq!(echoed, b"still working");
+        echoes(&mut stream, b"still working").await;
 
         // Serial at worst, from the same victim: every one of these parks
         // behind the exhausted shared allowance, and every one of them must

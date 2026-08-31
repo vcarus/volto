@@ -84,19 +84,20 @@ use std::future::Future;
 use std::panic::Location;
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use common::rawstream::{
     application_close, assert_closed_with, authenticate, authenticated_connect_headers_frame,
-    connect_headers_frame, frame, headers_frame, open_uni_stream, read_frame, status_of,
-    FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
-    FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
-    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
-    STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    connect_headers_frame, frame, grease_type, headers_frame, open_uni_stream, read_frame,
+    status_of, still_serving, DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY,
+    FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_PUSH_PROMISE, FRAME_SETTINGS,
+    H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD, H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR,
+    H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR, STREAM_CONTROL, STREAM_PUSH,
+    STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use common::{
     auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport, connect_quic,
-    finish_connect, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client, TestServer,
-    ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    echoes, finish_connect, open_tcp_tunnel, send_udp_payload, spawn_echo_target,
+    windowless_transport, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
 use volto::datagram;
 
@@ -112,8 +113,9 @@ use volto::datagram;
 /// A reserved stream or frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
 ///
 /// N is arbitrary: every value of it names something an endpoint must ignore or
-/// abort rather than fault on.
-const GREASE: u64 = 0x1f * 7 + 0x21;
+/// abort rather than fault on. This file's N differs from the server's and the
+/// test client's only so the greases can be told apart in a packet capture.
+const GREASE: u64 = grease_type(7);
 
 /// The most unidirectional streams this server lets a peer have at once.
 ///
@@ -133,12 +135,6 @@ const FULL_SIZED_FRAMES_THAT_FIT: usize = 16;
 /// what it means is the count of grease frames the server will skip, and that is
 /// what the test drives one past.
 const SKIPPED_FRAME_LIMIT: u32 = 4096;
-
-/// A target the destination policy refuses before the resolver is asked.
-///
-/// Port 25 is on the default deny list and the port rule is checked first, so a
-/// request for it is answered without touching the network.
-const DENIED_TARGET: &str = "192.0.2.1:25";
 
 /// The credentials the tests that configure authentication use.
 const USER: (&str, &str) = ("user1", "s3cret");
@@ -212,42 +208,6 @@ async fn announce_frame(
     (send, recv)
 }
 
-/// Opens a request stream and asserts the server answers it.
-///
-/// The answer is a 403 rather than a 200 because the target is [`DENIED_TARGET`]:
-/// nothing has to be listening, and the answer still proves the connection is
-/// serving rather than merely unclosed -- which is the difference most cases here
-/// turn on.
-///
-/// Written as a synchronous function returning a future so `#[track_caller]`
-/// survives to the poll that panics (D66).
-#[track_caller]
-fn still_serving(connection: &quinn::Connection) -> impl Future<Output = ()> + '_ {
-    let caller = Location::caller();
-    async move {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .unwrap_or_else(|error| panic!("the connection at {caller} is gone: {error}"));
-        send.write_all(&connect_headers_frame(DENIED_TARGET))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("the request sent at {caller} could not be written: {error}")
-            });
-
-        let (frame_type, payload) = read_frame(&mut recv).await;
-        assert_eq!(
-            frame_type, FRAME_HEADERS,
-            "at {caller}: a response begins with HEADERS"
-        );
-        assert_eq!(
-            status_of(&payload),
-            "403",
-            "at {caller}: the connection must still be serving requests"
-        );
-    }
-}
-
 /// Asserts that `connection` is still open after `within`.
 ///
 /// The negative half of most of these cases: what the peer observes is that
@@ -260,22 +220,6 @@ fn stays_open(connection: &quinn::Connection, within: Duration) -> impl Future<O
             panic!("the connection at {caller} was closed within {within:?}: {error}");
         }
     }
-}
-
-/// Transport parameters for a peer with no room for an answer at all.
-///
-/// A short response fits in any per-stream window big enough for the server's
-/// own 19-byte SETTINGS frame, so what has to be exhausted is the *connection*
-/// window: nothing here reads the server's control stream, so those 19 bytes
-/// stay charged to that window and leave less than a response behind them. The
-/// keep-alive is what makes a test about the application's deadlines -- with it,
-/// the transport's own idle timeout can never be the thing that ends anything.
-fn windowless_transport() -> quinn::TransportConfig {
-    let mut transport = quinn::TransportConfig::default();
-    transport.receive_window(24u32.into());
-    transport.stream_receive_window(24u32.into());
-    transport.keep_alive_interval(Some(Duration::from_millis(100)));
-    transport
 }
 
 /// A QUIC connection that keeps itself alive and has said nothing.
@@ -952,9 +896,7 @@ async fn datagrams_no_session_can_own_are_dropped() {
 
     // Before SETTINGS: a raw QUIC connection with no control stream on it yet.
     let (_endpoint, connection) = connect_quic(&server).await;
-    connection
-        .send_datagram(datagram::encode_udp_payload(4321, b"for nobody"))
-        .expect("the server advertises max_datagram_frame_size");
+    send_udp_payload(&connection, 4321, b"for nobody");
     still_serving(&connection).await;
     assert!(
         connection.close_reason().is_none(),
@@ -967,13 +909,7 @@ async fn datagrams_no_session_can_own_are_dropped() {
     let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
 
     let quarter_stream_id = datagram::quarter_stream_id(tunnel.id());
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(
-            quarter_stream_id,
-            b"not a UDP session",
-        ))
-        .expect("send a datagram for a TCP tunnel");
+    send_udp_payload(&client.quic, quarter_stream_id, b"not a UDP session");
 
     assert!(
         tokio::time::timeout(Duration::from_millis(300), client.quic.read_datagram())
@@ -983,11 +919,7 @@ async fn datagrams_no_session_can_own_are_dropped() {
     );
 
     // And the tunnel itself never noticed.
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 }
 
 // ---------------------------------------------------------------------------

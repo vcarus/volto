@@ -717,6 +717,50 @@ impl ClientStream {
     }
 }
 
+/// Drains `stream` until the server ends it, asserting it ended cleanly.
+///
+/// The judgement a test makes when the *server* is supposed to be the one that
+/// closes: whatever is still in flight is read past, and what matters is that
+/// the stream ends with an end of stream rather than a reset, within a bound.
+/// `what` names the session or tunnel being waited on, so the failure says
+/// which one did not end.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66) — the `.expect()` form each call site
+/// used to carry reported this line instead.
+#[track_caller]
+pub fn ends_cleanly<'a>(
+    stream: &'a mut ClientStream,
+    what: &'static str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let drained = async {
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
+        };
+
+        let ended = tokio::time::timeout(super::TIMEOUT, drained)
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}, awaited at {caller}, was still open after {:?}",
+                    super::TIMEOUT
+                )
+            });
+
+        assert!(
+            ended.is_ok(),
+            "{what}, awaited at {caller}, should end cleanly, got {ended:?}"
+        );
+    }
+}
+
 /// Turns a request into the field lines that carry it (RFC 9114 §4.3).
 ///
 /// Pseudo-headers first and in the order RFC 9114 §4.3.1 lists them, then the
@@ -888,7 +932,7 @@ fn control_preface(datagrams: bool) -> BytesMut {
     ///
     /// N is arbitrary; this one differs from the server's only so that the two
     /// greases can be told apart in a packet capture.
-    const GREASE: u64 = 0x1f * 5 + 0x21;
+    const GREASE: u64 = super::rawstream::grease_type(5);
 
     let mut settings = BytesMut::new();
     for (identifier, value) in [

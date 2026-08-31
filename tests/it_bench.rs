@@ -42,14 +42,19 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+#[path = "common/alloc.rs"]
+mod alloc;
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
-use common::{open_tcp_tunnel, open_udp_session, read_to_end, H3Client, TestServer, ALLOW_PRIVATE};
+use common::{
+    close_and_drain, open_tcp_tunnel, open_udp_session, read_to_end, H3Client, TestServer,
+    ALLOW_PRIVATE,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
@@ -73,35 +78,20 @@ struct Counting;
 static ALLOC_COUNT: AtomicU64 = AtomicU64::new(0);
 static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+impl alloc::Record for Counting {
+    fn allocated(size: usize) {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.alloc(layout)
+        ALLOC_BYTES.fetch_add(size as u64, Ordering::Relaxed);
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+    fn reallocated(old: usize, new: usize) {
         ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        System.alloc_zeroed(layout)
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_COUNT.fetch_add(1, Ordering::Relaxed);
-        ALLOC_BYTES.fetch_add(
-            new_size.saturating_sub(layout.size()) as u64,
-            Ordering::Relaxed,
-        );
-        System.realloc(ptr, layout, new_size)
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
+        ALLOC_BYTES.fetch_add(new.saturating_sub(old) as u64, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static GLOBAL: Counting = Counting;
+static GLOBAL: alloc::PassThrough<Counting> = alloc::PassThrough::new();
 
 // ---------------------------------------------------------------------------
 // Measurement
@@ -808,8 +798,7 @@ async fn tcp_churn(count: u64) -> Rep {
         // Closing without a round trip would measure a tunnel that may never
         // have reached its target; a FIN answered by the target's EOF proves the
         // whole path was built and torn down.
-        stream.finish().expect("finish the request stream");
-        read_to_end(&mut stream).await;
+        close_and_drain(&mut stream).await;
     }
     let totals = window.close();
 
@@ -827,8 +816,7 @@ async fn udp_churn(count: u64) -> Rep {
     let window = Window::open();
     for _ in 0..count {
         let (_qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
-        stream.finish().expect("finish the request stream");
-        read_to_end(&mut stream).await;
+        close_and_drain(&mut stream).await;
     }
     let totals = window.close();
 

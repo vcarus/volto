@@ -9,10 +9,10 @@
 
 mod common;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use common::rawstream::{close_reason, QPACK_DECOMPRESSION_FAILED};
 use common::{
-    auth_section, authorize, basic_credentials, connect_request, read_at_least, respond_to,
+    auth_section, authorize, basic_credentials, connect_request, echoes, respond_to,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::h3::frame;
@@ -49,11 +49,7 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
     // One request this server will not serve is not a reason to drop the rest:
     // the same connection must still open an ordinary tunnel.
     let mut tunnel = open_tcp_tunnel_as_user(&mut client, &target.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"after 501"))
-        .await
-        .expect("send through the tunnel");
-    assert_eq!(&read_at_least(&mut tunnel, 9).await, b"after 501");
+    echoes(&mut tunnel, b"after 501").await;
 }
 
 /// The whole connection ends when a field section references the dynamic table.

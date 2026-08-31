@@ -202,66 +202,30 @@ jobs:
           cache-dependency-path: tests/interop/go.sum
       - run: cargo build --locked
 
-      # A helper binary would be one more thing to keep compiling; openssl is
-      # already on the runner and is what `script/install-selfsigned.sh` uses.
-      - name: Generate a self-signed certificate
-        run: |
-          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-            -keyout interop-key.pem -out interop-cert.pem \
-            -days 1 -nodes -subj "/CN=$VOLTO_SNI" \
-            -addext "subjectAltName=DNS:$VOLTO_SNI"
+      # The certificate and the configuration come from tests/interop/serve.sh,
+      # which ./run-local.sh calls too: that script claims to mirror this job,
+      # and sharing the fixture is what makes the claim enforced rather than
+      # asserted. A helper binary would be one more thing to keep compiling;
+      # openssl is already on the runner and is what
+      # `script/install-selfsigned.sh` uses.
+      - name: Prepare the certificate and configuration
+        run: tests/interop/serve.sh prepare "$PWD/interop"
 
-      - name: Write the server configuration
-        run: |
-          cat > interop-config.toml <<EOF
-          [server]
-          listen = "$VOLTO_ADDR"
-          cert = "$PWD/interop-cert.pem"
-          key = "$PWD/interop-key.pem"
-
-          [auth]
-          users = [{ username = "$VOLTO_USER", password = "$VOLTO_PASSWORD" }]
-
-          [security]
-          # The interop targets are UDP echo servers on loopback, which the
-          # default policy refuses — as it must in production. Port 25 stays
-          # denied by default, which is what the refusal test drives.
-          allow_private_networks = true
-
-          [log]
-          # Every inbound request is logged with its headers, so a failure in the
-          # Go client can be read off the server side too.
-          level = "debug"
-          EOF
-
+      # Started here rather than in the fixture: a step is its own process, so
+      # the server has to outlive the one that starts it and is reaped by the
+      # `if: always()` step at the end through this pid file. run-local.sh is
+      # one shell throughout and uses an EXIT trap instead.
       - name: Start the server
         run: |
-          nohup ./target/debug/volto --config interop-config.toml \
-            > interop-server.log 2>&1 &
-          echo $! > interop-server.pid
-
-          # Poll for the line the accept loop logs once it is bound, rather than
-          # sleeping: a fixed sleep is either flaky or slow, and QUIC listens on
-          # UDP so there is no TCP connect to probe with.
-          for _ in $(seq 1 60); do
-            if grep -q "accepting QUIC connections" interop-server.log; then
-              exit 0
-            fi
-            if ! kill -0 "$(cat interop-server.pid)" 2>/dev/null; then
-              echo "the server exited during startup"
-              cat interop-server.log
-              exit 1
-            fi
-            sleep 0.5
-          done
-          echo "the server did not become ready within 30s"
-          cat interop-server.log
-          exit 1
+          nohup ./target/debug/volto --config interop/config.toml \
+            > interop/server.log 2>&1 &
+          echo $! > interop/server.pid
+          tests/interop/serve.sh wait interop/server.log "$(cat interop/server.pid)"
 
       - name: Drive it with masque-go
         working-directory: tests/interop
         env:
-          VOLTO_CERT: ${{ github.workspace }}/interop-cert.pem
+          VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
         # `-count=1` defeats Go's test result cache, which keys on the binary and
         # the environment and knows nothing about the server on the other end —
         # a restored cache entry would let this job pass without a single packet
@@ -277,7 +241,7 @@ jobs:
 
       - name: Drive it with aioquic
         env:
-          VOLTO_CERT: ${{ github.workspace }}/interop-cert.pem
+          VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
         # The same server instance: every test opens its own QUIC connection, so
         # nothing carries over from the Go half. The suite is its own runner and
         # exits non-zero on the first assertion it cannot make.
@@ -292,9 +256,9 @@ jobs:
       - name: Stop the server and show its log
         if: always()
         run: |
-          if [ -f interop-server.pid ]; then
-            kill "$(cat interop-server.pid)" 2>/dev/null || true
+          if [ -f interop/server.pid ]; then
+            kill "$(cat interop/server.pid)" 2>/dev/null || true
           fi
-          if [ -f interop-server.log ]; then
-            cat interop-server.log
+          if [ -f interop/server.log ]; then
+            cat interop/server.log
           fi

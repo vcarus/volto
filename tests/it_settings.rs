@@ -13,14 +13,14 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
-    self, connect_headers_frame, connect_udp_headers_frame, open_uni_stream, read_frame, status_of,
+    self, connect_udp_headers_frame, open_uni_stream, read_frame, status_of, still_serving,
     stopped_code, FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, H3_EXCESSIVE_LOAD,
     H3_MISSING_SETTINGS, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM,
     SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL,
 };
 use common::{
-    client_endpoint_with_transport, connect_quic, finish_connect, spawn_udp_echo_target,
-    TestServer, TIMEOUT,
+    client_endpoint_with_transport, connect_quic, finish_connect, send_udp_payload,
+    spawn_udp_echo_target, TestServer, TIMEOUT,
 };
 use volto::capsule::{Capsule, CapsuleDecoder};
 use volto::datagram;
@@ -135,20 +135,8 @@ async fn an_oversized_header_section_is_refused() {
     );
 
     // The connection survives it: one oversized request is a stream-level
-    // problem, not a reason to drop everything else on the connection. Port 25
-    // is on the default deny list, and the port rule is checked before the
-    // resolver runs, so the 403 arrives without touching the network.
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .expect("the connection must still be usable");
-    send.write_all(&connect_headers_frame("192.0.2.1:25"))
-        .await
-        .expect("send a CONNECT request");
-
-    let (frame_type, payload) = read_frame(&mut recv).await;
-    assert_eq!(frame_type, FRAME_HEADERS);
-    assert_eq!(status_of(&payload), "403");
+    // problem, not a reason to drop everything else on the connection.
+    still_serving(&connection).await;
 }
 
 #[tokio::test]
@@ -195,7 +183,7 @@ async fn a_frame_before_settings_ends_the_connection() {
     ///
     /// N is arbitrary; this one differs from the server's and the test client's
     /// only so that the three greases can be told apart in a packet capture.
-    const GREASE: u64 = 0x1f * 4 + 0x21;
+    const GREASE: u64 = rawstream::grease_type(4);
 
     for (name, first) in [
         ("a grease frame", rawstream::frame(GREASE, b"skip me")),
@@ -366,12 +354,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 
     // And with datagrams not known to be allowed, the reply travels as a capsule
     // on the request stream — the fallback this test is about escaping.
-    connection
-        .send_datagram(datagram::encode_udp_payload(
-            quarter_stream_id,
-            b"before settings",
-        ))
-        .expect("send a UDP payload as a QUIC datagram");
+    send_udp_payload(&connection, quarter_stream_id, b"before settings");
 
     let (frame_type, payload) = read_frame(&mut recv).await;
     assert_eq!(
@@ -407,12 +390,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
              enabled them"
         );
 
-        connection
-            .send_datagram(datagram::encode_udp_payload(
-                quarter_stream_id,
-                b"after settings",
-            ))
-            .expect("send a UDP payload as a QUIC datagram");
+        send_udp_payload(&connection, quarter_stream_id, b"after settings");
 
         match tokio::time::timeout(Duration::from_millis(200), connection.read_datagram()).await {
             Ok(raw) => {

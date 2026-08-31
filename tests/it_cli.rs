@@ -21,9 +21,16 @@
 //! misreading that would turn "your volto is too old to check" into "your config
 //! is broken".
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+use scripts::{
+    loadable_config_text, plant_placeholder_certificates, scratch_dir, stderr_of, stdout_of,
+};
 
 /// The binary under test, built by cargo for this integration test.
 fn volto() -> &'static str {
@@ -32,13 +39,9 @@ fn volto() -> &'static str {
 
 /// A directory of this test's own, standing in for `/etc/volto`.
 fn config_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("volto-cli-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    let dir = scratch_dir("cli", name);
     fs::create_dir_all(&dir).expect("the temporary config directory must be creatable");
-    // `Config::validate` insists both exist and are files; nothing here parses
-    // them, because the certificate is not what any of this is about.
-    fs::write(dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
-    fs::write(dir.join("key.pem"), "not a key\n").expect("key must be writable");
+    plant_placeholder_certificates(&dir);
     dir
 }
 
@@ -48,17 +51,12 @@ fn config_dir(name: &str) -> PathBuf {
 /// for itself; `body` is appended verbatim, tables and all.
 fn write_config(dir: &Path, listen: &str, body: &str) -> PathBuf {
     let path = dir.join("config.toml");
-    let text = format!(
-        "[server]\n\
-         listen = \"{listen}\"\n\
-         cert = \"{}\"\n\
-         key = \"{}\"\n\
-         \n\
-         [auth]\n\
-         users = [{{ username = \"user1\", password = \"{SECRET}\" }}]\n\
-         {body}",
-        dir.join("cert.pem").display(),
-        dir.join("key.pem").display(),
+    let text = loadable_config_text(
+        &dir.join("cert.pem"),
+        &dir.join("key.pem"),
+        listen,
+        SECRET,
+        body,
     );
     fs::write(&path, text).expect("the config must be writable");
     path
@@ -72,14 +70,6 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("the volto binary must be runnable")
-}
-
-fn stdout_of(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr_of(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
 /// The capability probe `script/deploy.sh` uses to tell a binary that can check

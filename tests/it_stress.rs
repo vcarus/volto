@@ -17,7 +17,7 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    open_tcp_tunnel, open_udp_session, read_at_least, read_to_end, spawn_echo_target,
+    close_and_drain, echoes, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
     spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE,
 };
 
@@ -81,17 +81,11 @@ async fn tcp_churn(cycles: usize) {
         let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
         let payload = format!("cycle-{i}");
-        stream
-            .send_data(Bytes::from(payload.clone()))
-            .await
-            .expect("send payload");
-        let echoed = read_at_least(&mut stream, payload.len()).await;
-        assert_eq!(String::from_utf8_lossy(&echoed), payload);
+        echoes(&mut stream, payload.as_bytes()).await;
 
         // Half-close, then wait for the server's own FIN: the tunnel is fully
         // over, and its slot must come back.
-        stream.finish().expect("finish the request stream");
-        read_to_end(&mut stream).await;
+        close_and_drain(&mut stream).await;
     }
 }
 
@@ -117,8 +111,7 @@ async fn udp_churn(cycles: usize) {
         assert_eq!(String::from_utf8_lossy(&echoed), payload);
 
         // Closing the stream ends the session, deregisters it, and frees its slot.
-        stream.finish().expect("finish the request stream");
-        read_to_end(&mut stream).await;
+        close_and_drain(&mut stream).await;
     }
 }
 

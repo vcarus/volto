@@ -55,6 +55,14 @@ pub const ALLOW_PRIVATE: &str = "[security]\nallow_private_networks = true\n";
 /// server after about a second.
 pub const IMPATIENT: &str = "[limits]\nmax_idle_timeout = 1\nkeep_alive_interval = 0\n";
 
+/// A 2s idle timeout, which is also how long any one response may take.
+///
+/// Long enough that a deadline lapsing is a deliberate act rather than a slow
+/// machine, and short enough for a test to wait out — twice, where it has to
+/// be: the connection-level bound of D76 is two of these, so a test can tell
+/// one deadline from the other.
+pub const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
+
 /// Generous upper bound for a shutdown that should take about as long as its
 /// grace period. Failing this means the grace period is not being enforced.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -312,6 +320,27 @@ pub fn client_endpoint_with_transport(
     client_endpoint_with(ca, alpn, Some(transport))
 }
 
+/// Transport parameters for a peer that leaves no room for an answer.
+///
+/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
+/// the handshake needs and under what the handshake plus any response costs. A
+/// short response would fit in any per-stream window big enough for that
+/// SETTINGS frame, so what has to be exhausted is the *connection* window:
+/// nothing in a test reaching for this reads the server's control stream, so
+/// those 19 bytes stay charged to that window and leave less than a response
+/// behind them.
+///
+/// The keep-alive is what makes such a test about the application's deadline:
+/// with it, the transport's own idle timeout can never be the thing that ends
+/// anything.
+pub fn windowless_transport() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.receive_window(24u32.into());
+    transport.stream_receive_window(24u32.into());
+    transport.keep_alive_interval(Some(Duration::from_millis(100)));
+    transport
+}
+
 fn client_endpoint_with(
     ca: &CertificateDer<'static>,
     alpn: &[&str],
@@ -485,6 +514,21 @@ pub async fn send_and_respond(client: &mut H3Client, request: Request) -> (Respo
     (response, stream)
 }
 
+/// The `Proxy-Status` (RFC 9209) a response carries, if it carries one.
+///
+/// The one spelling of the field name, and of the "a header value is text"
+/// step every reader of it repeats. A value that is not ASCII text panics
+/// rather than reading as absent: this server writes the field itself, so a
+/// value that cannot be read is a bug in it and not a refusal without a
+/// reason.
+#[track_caller]
+pub fn proxy_status(response: &Response) -> Option<&str> {
+    response
+        .fields
+        .get("proxy-status")
+        .map(|value| value.to_str().expect("Proxy-Status is ASCII"))
+}
+
 /// Opens a CONNECT tunnel to `authority` and asserts it was accepted.
 ///
 /// Written as a synchronous function returning a future rather than as an `async
@@ -505,7 +549,7 @@ pub fn open_tcp_tunnel<'a>(
             response.status,
             Status::OK,
             "the tunnel to {authority} opened at {caller} was refused: proxy-status={:?}",
-            response.fields.get("proxy-status")
+            proxy_status(&response)
         );
         stream
     }
@@ -561,7 +605,7 @@ async fn udp_session(
         response.status,
         Status::OK,
         "the session to {host}:{port} opened at {caller} was refused: proxy-status={:?}",
-        response.fields.get("proxy-status")
+        proxy_status(&response)
     );
     // RFC 9297 §3.4: the response should announce the capsule protocol, and §3.2
     // forbids it from describing a body. Protocol requirements rather than
@@ -585,6 +629,23 @@ async fn udp_session(
 
     let quarter_stream_id = datagram::quarter_stream_id(stream.id());
     (quarter_stream_id, stream)
+}
+
+/// Queues one UDP payload for `quarter_stream_id` as an HTTP/3 datagram.
+///
+/// The outbound half of every CONNECT-UDP exchange, written out at ~40 sites
+/// before it was gathered here. Queuing is asserted rather than the round trip:
+/// what comes back — a reply, nothing, a drop counted somewhere — is what each
+/// caller is about, and only failing to hand the datagram to quinn at all is a
+/// failure of the test rather than a result.
+///
+/// Takes the connection rather than an [`H3Client`] because the raw-stream
+/// tests have no client to take it from.
+#[track_caller]
+pub fn send_udp_payload(quic: &quinn::Connection, quarter_stream_id: u64, payload: &[u8]) {
+    let caller = Location::caller();
+    quic.send_datagram(datagram::encode_udp_payload(quarter_stream_id, payload))
+        .unwrap_or_else(|error| panic!("the datagram sent at {caller} was not queued: {error}"));
 }
 
 /// Sends one datagram into a CONNECT-UDP session and returns what comes back.
@@ -836,6 +897,60 @@ pub async fn read_at_least(stream: &mut ClientStream, n: usize) -> Vec<u8> {
 /// Reads from a client stream until the server finishes its sending side.
 pub async fn read_to_end(stream: &mut ClientStream) -> Vec<u8> {
     read_while(stream, |_| false).await.0
+}
+
+/// Sends `payload` through an open tunnel and asserts the target echoes it.
+///
+/// The exchange that proves a tunnel is *established* rather than merely
+/// answered, written out at some forty sites before it was gathered here.
+/// Every one of them sent a short payload to a target spawned by
+/// [`spawn_echo_target`] and compared what came back with what went out; that
+/// pair of steps is all this is.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66) — which is what replaces the
+/// bespoke `expect` text each call site used to carry.
+#[track_caller]
+pub fn echoes<'a>(
+    stream: &'a mut ClientStream,
+    payload: &'a [u8],
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        stream
+            .send_data(Bytes::copy_from_slice(payload))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("the payload sent at {caller} did not reach the tunnel: {error}")
+            });
+
+        let echoed = read_at_least(stream, payload.len()).await;
+        assert_eq!(
+            echoed, payload,
+            "the tunnel used at {caller} echoed the wrong bytes"
+        );
+    }
+}
+
+/// Half-closes `stream` and reads until the server finishes its own side.
+///
+/// The tail of a tunnel's life, and the shape of RFC 9114 §4.4's half-close as
+/// a client sees it: the FIN reaches the target as a write shutdown, the target
+/// answers its own EOF, and the server finishes the response stream. Returning
+/// only once that has happened is what makes a caller's next assertion — a slot
+/// given back, a file descriptor closed — about a tunnel that is really over.
+///
+/// Whatever arrived after the FIN is handed back, for the callers that assert
+/// nothing did.
+#[track_caller]
+pub fn close_and_drain(stream: &mut ClientStream) -> impl Future<Output = Vec<u8>> + '_ {
+    let caller = Location::caller();
+    async move {
+        stream
+            .finish()
+            .unwrap_or_else(|error| panic!("the stream finished at {caller} was gone: {error}"));
+        read_to_end(stream).await
+    }
 }
 
 /// A TCP target that echoes every chunk straight back.
@@ -1110,6 +1225,28 @@ impl SharedBuffer {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+}
+
+/// Reads a numeric field's value off a formatted log line.
+///
+/// Most assertions on a log line pin a field's presence, which is enough for a
+/// counter whose value the test cannot arrange. The ones a test *can* arrange —
+/// this connection did send packets — are read instead, because a field wired
+/// to the wrong source is present and zero rather than absent, and presence
+/// alone would pass.
+///
+/// Beside [`SharedBuffer::lines_since`] and [`SharedBuffer::wait_for_line`],
+/// which produce the lines this parses.
+#[track_caller]
+pub fn numeric_field(line: &str, name: &str) -> u64 {
+    let rest = line
+        .split_once(&format!("{name}="))
+        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
+        .1;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
 }
 
 impl std::io::Write for SharedBuffer {

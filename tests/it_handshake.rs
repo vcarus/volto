@@ -27,15 +27,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use common::rawstream::{
-    assert_closed_with, authenticated_connect_headers_frame, connect_headers_frame, read_frame,
-    status_of, FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
+    assert_closed_with, authenticate, authenticated_connect_headers_frame, read_frame, status_of,
+    still_serving, FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
 };
 use common::{
     auth_section, authorized_connect, basic_credentials, client_endpoint,
-    client_endpoint_with_transport, finish_connect, open_tcp_tunnel, read_at_least,
-    send_and_respond, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    client_endpoint_with_transport, echoes, finish_connect, open_tcp_tunnel, send_and_respond,
+    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::{
@@ -116,11 +115,7 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
     let mut client = H3Client::connect(&server).await;
     let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
 
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 }
 
 // ---------------------------------------------------------------------------
@@ -212,11 +207,7 @@ async fn an_authenticated_connection_is_not_bounded() {
 
     let mut client = H3Client::connect(&server).await;
     let mut tunnel = authenticated_tunnel(&mut client, &echo.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 
     // Longer than the bound (two 3s idle timeouts), with not a byte of HTTP/3
     // traffic in it.
@@ -224,11 +215,7 @@ async fn an_authenticated_connection_is_not_bounded() {
 
     // Still usable, which it would not be if the bound had applied.
     let mut second = authenticated_tunnel(&mut client, &echo.to_string()).await;
-    second
-        .send_data(Bytes::from_static(b"still here"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut second, 10).await, b"still here");
+    echoes(&mut second, b"still here").await;
 }
 
 /// Opening request streams must not buy a peer more time to authenticate in.
@@ -386,19 +373,7 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
     }
 
     // The connection is untouched: another request on it is served normally.
-    // Port 25 is on the default deny list and the port rule is checked before
-    // the resolver runs, so the 403 arrives without touching the network.
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .expect("the connection must still be usable");
-    send.write_all(&connect_headers_frame("192.0.2.1:25"))
-        .await
-        .expect("send a CONNECT request");
-
-    let (frame_type, payload) = read_frame(&mut recv).await;
-    assert_eq!(frame_type, FRAME_HEADERS);
-    assert_eq!(status_of(&payload), "403");
+    still_serving(&connection).await;
 }
 
 /// A batch of stalled requests is reset stream by stream, on a connection
@@ -424,20 +399,9 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
     let (_endpoint, connection) = silent_peer(&server).await;
 
     // Authenticate first -- no `[auth]` section, so any completed request does
-    // it. Port 25 is on the default deny list, so the 403 arrives without
-    // touching the network, and it is the acceptance of the request rather
-    // than its outcome that lifts the connection bound.
-    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
-    send.write_all(&connect_headers_frame("192.0.2.1:25"))
-        .await
-        .expect("send a CONNECT request");
-    let (frame_type, payload) = read_frame(&mut recv).await;
-    assert_eq!(frame_type, FRAME_HEADERS);
-    assert_eq!(
-        status_of(&payload),
-        "403",
-        "the request must be answered, which is what lifts the D76 bound"
-    );
+    // it, and it is the acceptance of the request rather than its outcome that
+    // lifts the connection bound.
+    authenticate(&connection, None).await;
 
     // Every stream gets its byte before any deadline is waited out, so the
     // batch really is concurrent: all of them are mid-request at once, and
@@ -481,16 +445,7 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
         "the bound is per stream: a batch of stalled requests must not cost the connection"
     );
     // And it is a working connection, not merely an unclosed one.
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .expect("the connection must still be usable");
-    send.write_all(&connect_headers_frame("192.0.2.1:25"))
-        .await
-        .expect("send a CONNECT request");
-    let (frame_type, payload) = read_frame(&mut recv).await;
-    assert_eq!(frame_type, FRAME_HEADERS);
-    assert_eq!(status_of(&payload), "403");
+    still_serving(&connection).await;
 }
 
 /// A QUIC handshake that never finishes must not sit on a connection slot.
@@ -573,11 +528,7 @@ async fn a_full_server_evicts_the_connection_that_never_authenticated() {
     // completed handshake.
     let mut client = H3Client::connect(&server).await;
     let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 
     // And the peer whose slot it took was told, with nothing to report: it broke
     // no rule, it simply had never asked this server for anything.
@@ -613,18 +564,10 @@ async fn an_authenticated_connection_is_never_the_one_evicted() {
 
     // The connection that kept its slot is untouched: the tunnel it already had
     // still carries bytes, and it can still open another.
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 
     let mut second = open_tcp_tunnel(&mut holder, &echo.to_string()).await;
-    second
-        .send_data(Bytes::from_static(b"still here"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut second, 10).await, b"still here");
+    echoes(&mut second, b"still here").await;
 }
 
 /// Of two connections that have never authenticated, the older one goes.
@@ -643,11 +586,7 @@ async fn the_oldest_unauthenticated_connection_is_the_one_evicted() {
 
     let mut client = H3Client::connect(&server).await;
     let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 
     assert_closed_with(&older.quic, H3_NO_ERROR, TIMEOUT).await;
     assert!(
@@ -708,11 +647,7 @@ async fn lowering_the_connection_cap_evicts_down_to_it() {
     // of them, because that is how far over the new cap the roster is.
     let mut newcomer = H3Client::connect(&server).await;
     let mut tunnel = open_tcp_tunnel(&mut newcomer, &echo.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"payload"))
-        .await
-        .expect("send payload");
-    assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+    echoes(&mut tunnel, b"payload").await;
 
     for victim in &parked[..3] {
         assert_closed_with(&victim.quic, H3_NO_ERROR, TIMEOUT).await;

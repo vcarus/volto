@@ -16,17 +16,11 @@ use common::rawstream::{
 };
 use common::{
     auth_section, authorized_connect, connect_quic, connect_request, open_tcp_tunnel,
-    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    spawn_echo_target, windowless_transport, H3Client, TestServer, ALLOW_PRIVATE, DELIBERATE,
+    TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{Request, Status};
-
-/// A 2s idle timeout, which is also how long an answer to a request may take.
-///
-/// Long enough that a deadline lapsing is a deliberate act rather than a slow
-/// machine, and short enough to wait out twice: the connection-level bound of
-/// D76 is two of these, so a test can tell one deadline from the other.
-const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
 
 /// A CONNECT attempt as `user1` with the given password, returning the status.
 async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
@@ -374,21 +368,6 @@ async fn a_431_the_peer_will_not_take_is_reset() {
         connection.close_reason().is_none(),
         "the connection must survive a stream it could not answer"
     );
-}
-
-/// Transport parameters for a peer with no room for an answer at all.
-///
-/// A ten-byte 431 fits in any per-stream window big enough for the server's own
-/// 19-byte SETTINGS frame, so what has to be exhausted here is the *connection*
-/// window. Nothing in this test reads the server's control stream, so those 19
-/// bytes stay charged to that window for the whole of it and leave less than a
-/// response behind them.
-fn windowless_transport() -> quinn::TransportConfig {
-    let mut transport = quinn::TransportConfig::default();
-    transport.receive_window(24u32.into());
-    transport.stream_receive_window(24u32.into());
-    transport.keep_alive_interval(Some(Duration::from_millis(100)));
-    transport
 }
 
 /// Transport parameters for a peer that takes an answer and then stops reading.

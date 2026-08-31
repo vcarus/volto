@@ -20,8 +20,8 @@ use bytes::Bytes;
 use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::Response;
 use common::{
-    auth_section, authorized_connect, connect_request, open_tcp_tunnel, open_udp_session,
-    read_at_least, read_to_end, respond_to, send_and_respond, spawn_echo_target,
+    auth_section, authorized_connect, close_and_drain, connect_request, echoes, open_tcp_tunnel,
+    open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
     spawn_end_reporting_target, spawn_udp_echo_target, udp_round_trip, H3Client, TestServer,
     ALLOW_PRIVATE, STOP_TIMEOUT, TIMEOUT,
 };
@@ -111,10 +111,7 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
     server.reload().expect("reload");
 
     // The tunnel opened before the reload is untouched.
-    held.send_data(Bytes::from_static(b"still mine"))
-        .await
-        .expect("the established tunnel still works");
-    assert_eq!(&read_at_least(&mut held, 10).await, b"still mine");
+    echoes(&mut held, b"still mine").await;
 
     // And so is the credential this connection was accepted with.
     assert_eq!(
@@ -686,14 +683,9 @@ async fn a_reload_during_the_shutdown_drain_is_refused() {
 
     // The tunnel being drained is untouched by the refusal, and the drain still
     // ends on its own terms.
-    tunnel
-        .send_data(Bytes::from_static(b"draining"))
-        .await
-        .expect("the drained tunnel still works");
-    assert_eq!(&read_at_least(&mut tunnel, 8).await, b"draining");
+    echoes(&mut tunnel, b"draining").await;
 
-    tunnel.finish().expect("finish the request stream");
-    read_to_end(&mut tunnel).await;
+    close_and_drain(&mut tunnel).await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 }
 

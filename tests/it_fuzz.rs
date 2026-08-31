@@ -45,6 +45,9 @@
 
 mod common;
 
+#[path = "common/proptest_support.rs"]
+mod props;
+
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
@@ -54,6 +57,8 @@ use proptest::prelude::*;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+use props::{config, pattern, payload, put_varint_in};
+
 use volto::capsule::{self, CapsuleDecoder};
 use volto::datagram::{self, DecodeError, VARINT_MAX};
 use volto::h3::error::Code;
@@ -62,21 +67,6 @@ use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
 use volto::h3::stream::build_request;
 use volto::h3::{huffman, MAX_FIELD_SECTION_SIZE};
-
-/// A configuration with `cases` defaulted per property but still overridable.
-///
-/// `ProptestConfig::default()` already reads `PROPTEST_CASES`; setting the field
-/// unconditionally would override the environment, so the default is applied
-/// only when the variable is absent. Written the same way as `it_props`, and
-/// deliberately not shared with it: `tests/common` is compiled into every
-/// integration binary, and six lines are not worth putting there.
-fn config(default_cases: u32) -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    if std::env::var_os("PROPTEST_CASES").is_none() {
-        config.cases = default_cases;
-    }
-    config
-}
 
 /// The per-field overhead in RFC 9114 §4.2.2's field-section size formula.
 ///
@@ -101,21 +91,6 @@ fn any_varint() -> impl Strategy<Value = u64> {
             0, 1, 0x3f, 0x40, 0x3fff, 0x4000, 0x3fff_ffff, 0x4000_0000, VARINT_MAX,
         ]),
     ]
-}
-
-/// A byte string described by its length and a fill pattern.
-///
-/// Generating N individual `u8` strategies costs more to shrink than it buys: a
-/// length plus a seed still catches a misaligned copy, and shrinks in one
-/// dimension instead of N.
-fn pattern(length: usize, seed: u8) -> Vec<u8> {
-    (0..length)
-        .map(|index| seed ^ (index as u8).wrapping_mul(31))
-        .collect()
-}
-
-fn payload(max: usize) -> impl Strategy<Value = Vec<u8>> {
-    (0usize..=max, any::<u8>()).prop_map(|(length, seed)| pattern(length, seed))
 }
 
 /// Splits `bytes` at the offsets in `cuts`, clamped into range and deduplicated.
@@ -153,17 +128,6 @@ fn split_at(bytes: &[u8], cuts: &[u16]) -> Vec<Vec<u8>> {
 // `peek_varint` does with bytes that were never an encoding, and the fact that
 // an encoding *longer than necessary* -- which RFC 9000 §16 permits and no
 // encoder in this tree emits -- decodes to the value it spells.
-
-/// Writes `value` in `length` bytes, which RFC 9000 §16 allows for any length
-/// that can hold it.
-fn put_varint_in(buf: &mut BytesMut, value: u64, length: usize) {
-    match length {
-        1 => buf.put_u8(value as u8),
-        2 => buf.put_u16(0x4000 | value as u16),
-        4 => buf.put_u32(0x8000_0000 | value as u32),
-        _ => buf.put_u64(0xc000_0000_0000_0000 | value),
-    }
-}
 
 proptest! {
     #![proptest_config(config(2048))]

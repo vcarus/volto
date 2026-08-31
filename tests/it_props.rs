@@ -19,10 +19,15 @@
 //! `PROPTEST_CASES` is honoured by every property here: the per-property case
 //! counts below are defaults for CI, applied only when the variable is unset.
 
+#[path = "common/proptest_support.rs"]
+mod props;
+
 use std::collections::BTreeSet;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use proptest::prelude::*;
+
+use props::{config, pattern, payload, put_varint_in};
 
 use volto::capsule::{
     self, Capsule, CapsuleDecoder, CAPSULE_TYPE_DATAGRAM, MAX_DATAGRAM_CAPSULE_VALUE,
@@ -34,20 +39,6 @@ use volto::tunnel::udp::parse_target;
 
 /// The RFC 9298 §2 default template prefix.
 const PREFIX: &str = "/.well-known/masque/udp/";
-
-/// A configuration with `cases` defaulted per property but still overridable.
-///
-/// `ProptestConfig::default()` already reads `PROPTEST_CASES`; setting the field
-/// unconditionally would override the environment, so the default is applied
-/// only when the variable is absent. That keeps the committed suite cheap and
-/// the 100k "fuzz" run one variable away.
-fn config(default_cases: u32) -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    if std::env::var_os("PROPTEST_CASES").is_none() {
-        config.cases = default_cases;
-    }
-    config
-}
 
 /// Varints across all four length classes, with the boundaries oversampled.
 ///
@@ -83,21 +74,6 @@ fn any_quarter_stream_id() -> impl Strategy<Value = u64> {
     ]
 }
 
-/// A payload described by its length and a seed, rather than byte by byte.
-///
-/// Generating 65527 individual `u8` strategies per case would dominate the run
-/// time and shrink for hours; a length plus a fill pattern still detects a
-/// misaligned copy and costs one allocation.
-fn payload(max: usize) -> impl Strategy<Value = Vec<u8>> {
-    (0usize..=max, any::<u8>()).prop_map(|(length, seed)| pattern(length, seed))
-}
-
-fn pattern(length: usize, seed: u8) -> Vec<u8> {
-    (0..length)
-        .map(|index| seed ^ (index as u8).wrapping_mul(31))
-        .collect()
-}
-
 /// Writes `value` as a varint of any length that can hold it, not necessarily
 /// the shortest -- which RFC 9000 §16 explicitly permits and `put_varint`, which
 /// only ever emits the shortest, cannot produce.
@@ -107,12 +83,7 @@ fn put_padded_varint(buf: &mut BytesMut, value: u64, length: prop::sample::Index
         .filter(|candidate| *candidate >= datagram::varint_len(value))
         .collect();
 
-    match length.get(&lengths) {
-        1 => buf.put_u8(value as u8),
-        2 => buf.put_u16(0x4000 | value as u16),
-        4 => buf.put_u32(0x8000_0000 | value as u32),
-        _ => buf.put_u64(0xc000_0000_0000_0000 | value),
-    }
+    put_varint_in(buf, value, *length.get(&lengths));
 }
 
 /// Bytes aimed at every branch of `datagram::decode`: long noise, short noise

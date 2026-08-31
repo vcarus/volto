@@ -6,12 +6,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::h3client::ends_cleanly;
 use common::rawstream::{H3_DATAGRAM_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     assert_peer_reset, closed_udp_address, connect_udp_request, open_udp_session,
-    open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
-    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    open_udp_session_to, respond_to, send_udp_payload, spawn_flooding_udp_target,
+    spawn_large_reply_udp_target, spawn_pushing_udp_target, spawn_silent_udp_target,
+    spawn_tagged_udp_target, spawn_udp_echo_target, windowless_transport, H3Client, TestServer,
+    ALLOW_PRIVATE, DELIBERATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -62,10 +64,7 @@ async fn forwards_udp_payloads_to_a_target_and_back() {
 
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"hello udp"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"hello udp");
 
     let mut pending = HashMap::new();
     let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
@@ -113,10 +112,7 @@ async fn concurrent_sessions_do_not_cross_talk() {
     // Send on every session before reading anything, so replies are in flight
     // together and a routing mistake cannot be masked by serialisation.
     for (tag, qsid, _) in &sessions {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(*qsid, &[*tag, 0xaa]))
-            .expect("send datagram");
+        send_udp_payload(&client.quic, *qsid, &[*tag, 0xaa]);
     }
 
     let mut pending = HashMap::new();
@@ -149,10 +145,7 @@ async fn unknown_context_ids_are_dropped_without_ending_the_session() {
         .expect("send datagram");
 
     // The session still works.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"still here"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"still here");
 
     let mut pending = HashMap::new();
     let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
@@ -169,15 +162,9 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
 
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid + 4242, b"nowhere"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid + 4242, b"nowhere");
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"somewhere"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"somewhere");
 
     let mut pending = HashMap::new();
     let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
@@ -212,10 +199,7 @@ async fn a_datagram_flood_at_a_live_session_is_survived() {
     // Nothing is read while the flood is queued: reading would drain the
     // client's half and pace the server's, and the case is the unpaced one.
     for _ in 0..FLOOD {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, b"flood"))
-            .expect("queue a flood datagram");
+        send_udp_payload(&client.quic, qsid, b"flood");
     }
 
     // The probe is retried rather than trusted: a probe that lands while the
@@ -226,10 +210,7 @@ async fn a_datagram_flood_at_a_live_session_is_survived() {
     // inside the deadline would paper over.
     let deadline = tokio::time::Instant::now() + TIMEOUT;
     'probing: loop {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, b"probe"))
-            .expect("queue a probe datagram");
+        send_udp_payload(&client.quic, qsid, b"probe");
 
         let window = tokio::time::Instant::now() + Duration::from_secs(1);
         loop {
@@ -348,10 +329,7 @@ async fn a_truncated_context_id_is_dropped_without_closing_the_connection() {
         .expect("send datagram");
 
     // The connection is still usable and so is the session.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"still routed"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"still routed");
 
     let mut pending = HashMap::new();
     let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
@@ -429,10 +407,7 @@ async fn closing_the_request_stream_ends_the_session() {
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Confirm it works before closing it.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"before"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"before");
     let mut pending = HashMap::new();
     assert_eq!(
         &recv_payload_for(&client.quic, qsid, &mut pending).await[..],
@@ -444,10 +419,7 @@ async fn closing_the_request_stream_ends_the_session() {
     // Give the server a moment to tear the session down, then confirm nothing
     // is routed any more.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"after"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"after");
 
     let stray = tokio::time::timeout(Duration::from_millis(500), client.quic.read_datagram()).await;
     assert!(
@@ -484,10 +456,7 @@ async fn a_reset_request_stream_gives_up_its_quarter_stream_id() {
     // Confirm it works before abandoning it, or the silence below would prove
     // nothing at all.
     let mut pending = HashMap::new();
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(abandoned, b"live"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, abandoned, b"live");
     assert_eq!(
         &recv_payload_for(&client.quic, abandoned, &mut pending).await[..],
         b"\x01live"
@@ -505,20 +474,14 @@ async fn a_reset_request_stream_gives_up_its_quarter_stream_id() {
     // answers under its own id.
     let (live, _live_stream) = open_udp_session(&mut client, &server, live_target).await;
     assert_ne!(live, abandoned, "quinn does not reuse a stream id");
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(live, b"still here"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, live, b"still here");
     assert_eq!(
         &recv_payload_for(&client.quic, live, &mut pending).await[..],
         b"\x02still here"
     );
 
     // And the abandoned id routes nowhere.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(abandoned, b"after"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, abandoned, b"after");
     let stray = tokio::time::timeout(Duration::from_millis(500), client.quic.read_datagram()).await;
     assert!(
         stray.is_err(),
@@ -535,10 +498,7 @@ async fn empty_payloads_are_forwarded() {
 
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b""))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"");
 
     let mut pending = HashMap::new();
     let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
@@ -834,10 +794,7 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
         .expect("the server must accept datagrams");
     assert!(limit < 8000, "the reply must not fit in a datagram");
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"give me a big one"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"give me a big one");
 
     // Nothing must arrive: neither a datagram...
     let stray = tokio::time::timeout(Duration::from_millis(500), client.quic.read_datagram()).await;
@@ -853,10 +810,7 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
     // The session is still alive: a small reply still gets through.
     let small_target = spawn_udp_echo_target().await;
     let (small_qsid, _small_stream) = open_udp_session(&mut client, &server, small_target).await;
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(small_qsid, b"small"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, small_qsid, b"small");
 
     let mut pending = HashMap::new();
     assert_eq!(
@@ -879,10 +833,7 @@ async fn an_idle_session_closes_the_request_stream() {
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // The session works to begin with.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"alive"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"alive");
     let mut pending = HashMap::new();
     assert_eq!(
         &recv_payload_for(&client.quic, qsid, &mut pending).await[..],
@@ -890,22 +841,7 @@ async fn an_idle_session_closes_the_request_stream() {
     );
 
     // Now go idle. The server must end the request stream on its own.
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the server must close an idle session");
-
-    assert!(
-        ended.is_ok(),
-        "the idle session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the idle session").await;
 }
 
 /// Bytes that finish no capsule must not postpone the session timeout.
@@ -964,21 +900,7 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
 
     // The response half ends too: socket and request stream close together
     // (RFC 9298 §3.1), exactly as they do for a session that idled silently.
-    let ended = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the response half must end with the session");
-    assert!(
-        ended.is_ok(),
-        "the drip-fed session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the drip-fed session").await;
 }
 
 /// Nor does a flood of them, which is a different way round the same deadline.
@@ -1058,21 +980,7 @@ async fn a_flood_of_skipped_capsule_bytes_does_not_postpone_the_timeout() {
 
     // The response half ends too: socket and request stream close together
     // (RFC 9298 §3.1).
-    let ended = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the response half must end with the session");
-    assert!(
-        ended.is_ok(),
-        "the flooded session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the flooded session").await;
 }
 
 /// Payloads reaching a silent target postpone the session timeout on their
@@ -1096,10 +1004,7 @@ async fn payloads_reaching_a_silent_target_postpone_the_session_timeout() {
     // these is forwarded rather than dropped by the amplification cap.
     for round in 0u8..8 {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, &[b'o', round]))
-            .expect("send datagram");
+        send_udp_payload(&client.quic, qsid, &[b'o', round]);
     }
 
     // All eight arrived: the session was alive to forward the last of them,
@@ -1114,21 +1019,7 @@ async fn payloads_reaching_a_silent_target_postpone_the_session_timeout() {
     .expect("all eight payloads must reach the silent target");
 
     // And once the sends stop, the timeout still does its job.
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the server must close the session once the sends stop");
-    assert!(
-        ended.is_ok(),
-        "the quiesced session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the quiesced session").await;
 }
 
 /// Packets from the target postpone the session timeout on their own.
@@ -1145,10 +1036,7 @@ async fn packets_from_the_target_postpone_the_session_timeout() {
 
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"wake"))
-        .expect("send the one outbound packet");
+    send_udp_payload(&client.quic, qsid, b"wake");
 
     let mut pending = HashMap::new();
     for index in 0u8..8 {
@@ -1160,21 +1048,7 @@ async fn packets_from_the_target_postpone_the_session_timeout() {
     }
 
     // The target has said its eight; the session goes quiet and closes.
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the server must close the session once the target stops");
-    assert!(
-        ended.is_ok(),
-        "the quiesced session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the quiesced session").await;
 }
 
 /// Forwarded packets do postpone the session timeout — the guard the drip
@@ -1200,10 +1074,7 @@ async fn forwarded_packets_postpone_the_session_timeout() {
     for round in 0u8..8 {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let payload = [b"tick", &[round][..]].concat();
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, &payload))
-            .expect("send datagram");
+        send_udp_payload(&client.quic, qsid, &payload);
         assert_eq!(
             recv_payload_for(&client.quic, qsid, &mut pending).await[..],
             payload[..],
@@ -1212,21 +1083,7 @@ async fn forwarded_packets_postpone_the_session_timeout() {
     }
 
     // And once the traffic stops, the timeout does its job as before.
-    let ended = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match stream.recv_data().await {
-                Ok(Some(_)) => continue,
-                Ok(None) => return Ok(()),
-                Err(error) => return Err(error),
-            }
-        }
-    })
-    .await
-    .expect("the server must still close the session once traffic stops");
-    assert!(
-        ended.is_ok(),
-        "the quiesced session should end cleanly, got {ended:?}"
-    );
+    ends_cleanly(&mut stream, "the quiesced session").await;
 }
 
 /// A client that stops reading the capsule stream gets that stream reset, and
@@ -1287,28 +1144,6 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     // error, never a connection error.
     let echo = spawn_udp_echo_target().await;
     let (_, _second) = open_udp_session(&mut client, &server, echo).await;
-}
-
-/// A 2s idle timeout, which is also how long any one response may take.
-///
-/// Long enough that a deadline lapsing is a deliberate act rather than a slow
-/// machine, and short enough for a test to wait out.
-const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
-
-/// Transport parameters for a peer that leaves no room for an answer.
-///
-/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
-/// the handshake needs and under what the handshake plus any response costs;
-/// nothing reads the server's control stream here, so the allowance is spent by
-/// the handshake and never returned. The keep-alive is what makes the test
-/// about the application's deadline: with it, the transport's own idle timeout
-/// can never be the thing that ends anything.
-fn windowless_transport() -> quinn::TransportConfig {
-    let mut transport = quinn::TransportConfig::default();
-    transport.receive_window(24u32.into());
-    transport.stream_receive_window(24u32.into());
-    transport.keep_alive_interval(Some(Duration::from_millis(100)));
-    transport
 }
 
 /// The 200 that opens a session is bounded like every refusal.
@@ -1380,10 +1215,7 @@ async fn an_unreachable_target_closes_the_session() {
 
     let (qsid, mut stream) = open_udp_session(&mut client, &server, closed).await;
 
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"knock knock"))
-        .expect("send datagram");
+    send_udp_payload(&client.quic, qsid, b"knock knock");
 
     // The server finishes its side of the request stream, which the client sees
     // as end-of-stream. Anything else — including nothing at all until the test

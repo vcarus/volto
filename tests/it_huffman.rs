@@ -14,10 +14,10 @@
 
 mod common;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use common::rawstream::QPACK_DECOMPRESSION_FAILED;
 use common::{
-    auth_section, authorized_connect, huffman, open_tcp_tunnel, open_udp_session, read_at_least,
+    auth_section, authorized_connect, echoes, huffman, open_tcp_tunnel, open_udp_session,
     respond_to, spawn_echo_target, spawn_udp_echo_target, udp_round_trip, H3Client, TestServer,
     ALLOW_PRIVATE, TIMEOUT,
 };
@@ -103,11 +103,7 @@ async fn a_huffman_coded_connect_opens_a_tunnel() {
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    stream
-        .send_data(Bytes::from_static(b"huffman"))
-        .await
-        .expect("send through the tunnel");
-    assert_eq!(&read_at_least(&mut stream, 7).await, b"huffman");
+    echoes(&mut stream, b"huffman").await;
 }
 
 /// The same for CONNECT-UDP, whose request carries the two pseudo-headers a
@@ -239,11 +235,7 @@ async fn assert_reset_and_survives(literal: &[u8]) {
     // The connection is untouched: a literal one request could not read says
     // nothing about the next one.
     let mut tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"still here"))
-        .await
-        .expect("send through a tunnel opened afterwards");
-    assert_eq!(&read_at_least(&mut tunnel, 10).await, b"still here");
+    echoes(&mut tunnel, b"still here").await;
 }
 
 /// A field section whose single field line carries `literal` as a Huffman-coded

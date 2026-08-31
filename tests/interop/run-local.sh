@@ -2,6 +2,8 @@
 # Runs both cross-implementation interop suites (masque-go, then aioquic)
 # against a locally built volto, mirroring the `interop` job in
 # .github/workflows/ci.yml step for step so a local pass predicts a CI pass.
+# The certificate, the configuration and the readiness wait are not mirrored
+# but shared: both this script and that job call ./serve.sh for them.
 #
 # Everything it creates lives under target/interop-local/ -- covered by the
 # existing /target ignore rule and removed by `cargo clean` -- and the two
@@ -25,37 +27,8 @@ export VOLTO_USER="interop"
 export VOLTO_PASSWORD="interop-password-not-a-secret"
 export VOLTO_CERT="$WORK/cert.pem"
 
-# The certificate: regenerate only when absent or about to expire, so repeated
-# runs skip openssl. One day of validity, exactly as in CI.
-if ! openssl x509 -checkend 3600 -noout -in "$VOLTO_CERT" 2>/dev/null; then
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$WORK/key.pem" -out "$VOLTO_CERT" \
-        -days 1 -nodes -subj "/CN=$VOLTO_SNI" \
-        -addext "subjectAltName=DNS:$VOLTO_SNI"
-fi
-
-# The configuration is cheap enough to write every run, and writing it keeps
-# it honest against this script's environment rather than a previous run's.
-cat > "$WORK/config.toml" <<EOF
-[server]
-listen = "$VOLTO_ADDR"
-cert = "$VOLTO_CERT"
-key = "$WORK/key.pem"
-
-[auth]
-users = [{ username = "$VOLTO_USER", password = "$VOLTO_PASSWORD" }]
-
-[security]
-# The interop targets are echo servers on loopback, which the default policy
-# refuses -- as it must in production. Port 25 stays denied by default, which
-# is what the refusal test drives.
-allow_private_networks = true
-
-[log]
-# Every inbound request is logged with its headers, so a client-side failure
-# can be read off the server side too.
-level = "debug"
-EOF
+# The certificate and the configuration, from the fixture CI uses.
+"$ROOT/tests/interop/serve.sh" prepare "$WORK"
 
 cargo build --locked --manifest-path "$ROOT/Cargo.toml"
 
@@ -64,21 +37,7 @@ cargo build --locked --manifest-path "$ROOT/Cargo.toml"
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
 
-# Poll for the line the accept loop logs once it is bound, rather than
-# sleeping: QUIC listens on UDP, so there is no TCP connect to probe with.
-for _ in $(seq 1 60); do
-    grep -q "accepting QUIC connections" "$WORK/server.log" && break
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "the server exited during startup:" >&2
-        cat "$WORK/server.log" >&2
-        exit 1
-    fi
-    sleep 0.5
-done
-grep -q "accepting QUIC connections" "$WORK/server.log" || {
-    echo "the server did not become ready within 30s" >&2
-    exit 1
-}
+"$ROOT/tests/interop/serve.sh" wait "$WORK/server.log" "$SERVER_PID"
 
 # masque-go. `-count=1` defeats Go's test result cache, which knows nothing
 # about the server on the other end -- a restored entry would pass this suite

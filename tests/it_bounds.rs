@@ -22,7 +22,9 @@
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+#[path = "common/alloc.rs"]
+mod alloc;
+
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -59,39 +61,22 @@ fn record(delta: i64) {
     }
 }
 
-unsafe impl GlobalAlloc for Tallying {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            record(layout.size() as i64);
-        }
-        ptr
+impl alloc::Record for Tallying {
+    fn allocated(size: usize) {
+        record(size as i64);
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc_zeroed(layout);
-        if !ptr.is_null() {
-            record(layout.size() as i64);
-        }
-        ptr
+    fn reallocated(old: usize, new: usize) {
+        record(new as i64 - old as i64);
     }
 
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let moved = System.realloc(ptr, layout, new_size);
-        if !moved.is_null() {
-            record(new_size as i64 - layout.size() as i64);
-        }
-        moved
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        record(-(layout.size() as i64));
+    fn freed(size: usize) {
+        record(-(size as i64));
     }
 }
 
 #[global_allocator]
-static GLOBAL: Tallying = Tallying;
+static GLOBAL: alloc::PassThrough<Tallying> = alloc::PassThrough::new();
 
 /// Serialises the measured windows.
 ///

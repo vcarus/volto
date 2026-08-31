@@ -66,11 +66,10 @@ mod common;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use common::{
-    open_tcp_tunnel, open_udp_session, read_at_least, read_to_end, recv_datagram,
-    spawn_echo_target, spawn_udp_echo_target, udp_round_trip, ClientStream, H3Client, SharedBuffer,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    close_and_drain, echoes, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end,
+    recv_datagram, send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
+    ClientStream, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 
@@ -215,23 +214,6 @@ async fn settled_fds() -> Option<usize> {
     Some(lowest)
 }
 
-/// Reads a numeric field's value off a formatted log line.
-///
-/// The same reader `it_close_log` uses, and here for the same reason: a counter
-/// wired to the wrong source is present and wrong rather than absent, so the
-/// value has to be read and compared rather than matched for presence.
-#[track_caller]
-fn numeric_field(line: &str, name: &str) -> u64 {
-    let rest = line
-        .split_once(&format!("{name}="))
-        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
-        .1;
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
-}
-
 /// Sends the three drop-worthy datagram shapes at `live`'s session.
 ///
 /// Two of them name that session and one names an id nothing owns, which is the
@@ -248,13 +230,7 @@ fn send_the_three_drop_shapes(client: &H3Client, live: u64) {
 
     // RFC 9297 §2.1: a Quarter Stream ID with no session behind it, which is
     // what every datagram in flight past a session's close looks like.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(
-            live + UNCLAIMED_OFFSET,
-            b"nowhere",
-        ))
-        .expect("send an unroutable datagram");
+    send_udp_payload(&client.quic, live + UNCLAIMED_OFFSET, b"nowhere");
 
     // The one malformation RFC 9297 §2.1 does not make a connection error: the
     // Quarter Stream ID parses and the Context ID is simply not there.
@@ -296,20 +272,11 @@ async fn opened<T>(what: &str, open: impl std::future::Future<Output = T>) -> T 
 /// returns only once the tunnel is over at both ends and its slot, socket and
 /// pump tasks are owed back.
 async fn use_and_close_tcp(tunnel: &mut ClientStream, payload: &str) {
-    tunnel
-        .send_data(Bytes::from(payload.to_owned()))
-        .await
-        .expect("send payload");
+    // The payload names the tunnel it belongs to, so a mismatch here is a
+    // tunnel that received another tunnel's data.
+    echoes(tunnel, payload.as_bytes()).await;
 
-    let echoed = read_at_least(tunnel, payload.len()).await;
-    assert_eq!(
-        String::from_utf8_lossy(&echoed),
-        payload,
-        "a tunnel received another tunnel's data"
-    );
-
-    tunnel.finish().expect("finish the request stream");
-    let trailing = read_to_end(tunnel).await;
+    let trailing = close_and_drain(tunnel).await;
     assert!(
         trailing.is_empty(),
         "an echo tunnel owes nothing past its echo, got {trailing:?}"
@@ -379,8 +346,7 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
         // into a FIN plus STOP_SENDING and the server has to treat as the same
         // ending. Both must return the slot, the socket and the routing entry.
         if cycle % 2 == 0 {
-            udp.finish().expect("finish the request stream");
-            read_to_end(&mut udp).await;
+            close_and_drain(&mut udp).await;
         } else {
             drop(udp);
         }
@@ -420,10 +386,7 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
         let mut awaited: HashMap<u64, String> = HashMap::new();
         for (index, (qsid, _)) in sessions.iter().enumerate() {
             let payload = format!("batch-{batch}-session-{index}");
-            client
-                .quic
-                .send_datagram(datagram::encode_udp_payload(*qsid, payload.as_bytes()))
-                .expect("send a batch datagram");
+            send_udp_payload(&client.quic, *qsid, payload.as_bytes());
             awaited.insert(*qsid, payload);
         }
         while !awaited.is_empty() {
@@ -444,8 +407,7 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
             use_and_close_tcp(tunnel, &format!("batch-{batch}-tunnel-{index}")).await;
         }
         for (_, mut stream) in sessions {
-            stream.finish().expect("finish the request stream");
-            read_to_end(&mut stream).await;
+            close_and_drain(&mut stream).await;
         }
     }
 
@@ -529,8 +491,7 @@ async fn connections_release_everything_they_held() {
         let echoed = udp_round_trip(&client, qsid, payload.as_bytes()).await;
         assert_eq!(String::from_utf8_lossy(&echoed), payload);
         use_and_close_tcp(&mut tcp, &payload).await;
-        udp.finish().expect("finish the request stream");
-        read_to_end(&mut udp).await;
+        close_and_drain(&mut udp).await;
 
         // Closed the way Surge closes, rather than left to the endpoint's own
         // teardown: the server sees a CONNECTION_CLOSE and its task returns,

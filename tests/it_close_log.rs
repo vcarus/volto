@@ -14,32 +14,13 @@
 
 mod common;
 
-use bytes::Bytes;
 use common::rawstream::{open_uni_stream, STREAM_PUSH};
 use common::{
-    connect_quic, open_tcp_tunnel, open_udp_session, read_at_least, recv_datagram,
-    spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
-    IMPATIENT, STOP_TIMEOUT, TIMEOUT,
+    connect_quic, echoes, numeric_field, open_tcp_tunnel, open_udp_session, recv_datagram,
+    send_udp_payload, spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer,
+    ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
 };
 use volto::datagram;
-
-/// Reads a numeric field's value off a formatted log line.
-///
-/// Most assertions here pin a field's presence, which is enough for a counter
-/// whose value the test cannot arrange. The traffic counters can be arranged —
-/// this connection did send packets — and a field wired to the wrong source is
-/// present and zero rather than absent, so those are read rather than matched.
-#[track_caller]
-fn numeric_field(line: &str, name: &str) -> u64 {
-    let rest = line
-        .split_once(&format!("{name}="))
-        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
-        .1;
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
-}
 
 /// The seven ways a connection ends, each with the level and reason it earns.
 ///
@@ -91,11 +72,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         let mark = buffer.mark();
         let mut client = H3Client::connect(&server).await;
         let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
-        tunnel
-            .send_data(Bytes::from_static(b"payload"))
-            .await
-            .expect("send payload");
-        assert_eq!(read_at_least(&mut tunnel, 7).await, b"payload");
+        echoes(&mut tunnel, b"payload").await;
         client.quic.close(quinn::VarInt::from_u32(0), b"");
 
         let line = buffer
@@ -213,14 +190,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         // Two datagrams no session claims, one with a context this server
         // never registered, one cut short of any Context ID at all. All four
         // must be dropped, and counted.
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid + 55, b"nowhere"))
-            .expect("send an unroutable datagram");
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid + 56, b"nowhere"))
-            .expect("send an unroutable datagram");
+        send_udp_payload(&client.quic, qsid + 55, b"nowhere");
+        send_udp_payload(&client.quic, qsid + 56, b"nowhere");
         client
             .quic
             .send_datagram(datagram::encode(qsid, 7, b"unknown context"))
@@ -235,10 +206,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         // A round trip on the live session, sent after the four: the router
         // handles a connection's datagrams in arrival order, so the echo
         // coming back proves the drops were counted before the close below.
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, b"fence"))
-            .expect("send the fence datagram");
+        send_udp_payload(&client.quic, qsid, b"fence");
         let fenced = recv_datagram(&client.quic).await;
         assert_eq!(&fenced.payload[..], b"fence");
 

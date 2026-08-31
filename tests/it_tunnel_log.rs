@@ -22,10 +22,9 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    connect_request, open_udp_session, respond_to, spawn_large_reply_udp_target, H3Client,
-    SharedBuffer, TestServer, ALLOW_PRIVATE,
+    connect_request, open_udp_session, respond_to, send_udp_payload, spawn_large_reply_udp_target,
+    H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
 };
-use volto::datagram;
 use volto::h3api::Status;
 
 /// A name whose every address is the unspecified one: the shape a filtering
@@ -137,10 +136,7 @@ async fn the_oversize_sentinel_fires_once_per_session(buffer: &SharedBuffer) {
     assert!(limit < 8000, "the reply must not fit in a datagram");
 
     let send_one = |nth: u8| {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(qsid, &[nth]))
-            .expect("send datagram");
+        send_udp_payload(&client.quic, qsid, &[nth]);
     };
 
     send_one(1);

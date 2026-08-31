@@ -15,37 +15,15 @@ use common::rawstream::{
 };
 use common::{
     assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
-    finish_connect, open_tcp_tunnel, read_at_least, read_to_end, respond_to, send_and_respond,
-    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_flood_then_reset_target, spawn_reset_after_read_target, ConnectionEnd, H3Client,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    finish_connect, open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to,
+    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_transport,
+    ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, DELIBERATE, TIMEOUT,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
-
-/// A 2s idle timeout, which is also how long any one response may take.
-///
-/// Long enough that a deadline lapsing is a deliberate act rather than a slow
-/// machine, and short enough for a test to wait out.
-const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interval = 0\n";
-
-/// Transport parameters for a peer that leaves no room for an answer.
-///
-/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
-/// the handshake needs and under what the handshake plus any response costs;
-/// nothing reads the server's control stream here, so the allowance is spent by
-/// the handshake and never returned. The keep-alive is what makes the test
-/// about the application's deadline: with it, the transport's own idle timeout
-/// can never be the thing that ends anything.
-fn windowless_transport() -> quinn::TransportConfig {
-    let mut transport = quinn::TransportConfig::default();
-    transport.receive_window(24u32.into());
-    transport.stream_receive_window(24u32.into());
-    transport.keep_alive_interval(Some(Duration::from_millis(100)));
-    transport
-}
 
 #[tokio::test]
 async fn tunnels_bytes_to_an_echo_target() {
@@ -1509,10 +1487,7 @@ async fn refuses_a_target_that_is_not_listening() {
     // RFC 9209 §2.1.2: the refusal names the hop that refused it, as a
     // structured field String. Only failures to reach a target carry it.
     assert_eq!(
-        response
-            .fields
-            .get("proxy-status")
-            .map(|value| value.to_str().expect("proxy-status is ASCII")),
+        proxy_status(&response),
         Some(format!("volto; error=connection_refused; next-hop=\"{target}\"").as_str()),
         "the refusal must name the address that refused the connection"
     );
@@ -1605,20 +1580,10 @@ async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
     // RFC 9209: a target that never answered is a timeout, not an unreachable
     // one, and the status follows the registered type.
     assert_eq!(response.status, Status::GATEWAY_TIMEOUT);
-    let proxy_status = response
-        .fields
-        .get("proxy-status")
-        .map(|value| value.to_str().expect("proxy-status is ASCII"))
-        .expect("a refusal must say why");
-    assert!(
-        proxy_status.contains("error=connection_timeout"),
-        "{proxy_status}"
-    );
+    let reason = proxy_status(&response).expect("a refusal must say why");
+    assert!(reason.contains("error=connection_timeout"), "{reason}");
     // And it names the hop it gave up on.
-    assert!(
-        proxy_status.contains(&blackhole.to_string()),
-        "{proxy_status}"
-    );
+    assert!(reason.contains(&blackhole.to_string()), "{reason}");
 
     // The budget, not the kernel, decided when to give up.
     assert!(

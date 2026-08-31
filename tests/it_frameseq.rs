@@ -52,31 +52,28 @@
 
 mod common;
 
+#[path = "common/proptest_support.rs"]
+mod props;
+
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use proptest::prelude::*;
 
+use props::config;
+
 use common::rawstream::{
-    application_close, connect_headers_frame, frame, read_frame, status_of, FRAME_CANCEL_PUSH,
-    FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_PUSH_PROMISE, FRAME_SETTINGS,
-    H3_CLOSED_CRITICAL_STREAM, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED, H3_ID_ERROR,
-    H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR,
-    RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL,
-    STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    application_close, connect_headers_frame, frame, grease_type, read_frame, status_of,
+    DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
+    FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_FRAME_ERROR,
+    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE,
+    H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM,
+    SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
+    STREAM_QPACK_ENCODER,
 };
 use common::{connect_quic, spawn_echo_target, TestServer, TIMEOUT};
 use volto::datagram;
-
-/// A reserved "grease" type of the form `0x1f * N + 0x21` (RFC 9114 §7.2.8).
-fn grease_type(n: u64) -> u64 {
-    0x1f * n + 0x21
-}
-
-/// A target the destination policy refuses before the resolver is asked:
-/// port 25 is on the default deny list and the port rule is checked first.
-const DENIED_TARGET: &str = "192.0.2.1:25";
 
 /// Upper bound on one generated case, so a hang fails instead of orphaning
 /// the run.
@@ -526,16 +523,6 @@ fn any_control_script() -> impl Strategy<Value = (Vec<ControlEvent>, ControlEnd)
             }
             (events, end)
         })
-}
-
-/// A configuration with `cases` defaulted per property but still overridable,
-/// written the way `it_props` and `it_fuzz` write it.
-fn config(default_cases: u32) -> ProptestConfig {
-    let mut config = ProptestConfig::default();
-    if std::env::var_os("PROPTEST_CASES").is_none() {
-        config.cases = default_cases;
-    }
-    config
 }
 
 proptest! {

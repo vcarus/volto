@@ -39,8 +39,13 @@
 //! ever becomes one, and it is bounded — which is exactly why it is worth
 //! knowing that nothing on *this* side of the boundary adds to it.
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use scripts::repo_root;
 
 /// The identifiers that would put a wall-clock reading into this crate.
 ///
@@ -50,7 +55,7 @@ use std::path::{Path, PathBuf};
 const WALL_CLOCK: [&str; 4] = ["SystemTime", "UNIX_EPOCH", "chrono", "OffsetDateTime"];
 
 fn source_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")
+    repo_root().join("src")
 }
 
 /// Every `.rs` file under `root`, in a stable order so a failure names the same

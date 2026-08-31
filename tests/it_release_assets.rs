@@ -10,13 +10,13 @@
 //! in one line of `journalctl -u volto-deploy`. This turns it into a test
 //! failure instead.
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+use scripts::repo_root;
 
 /// Every `script/…` path the release workflow copies into the tarball.
 fn packaged_paths() -> BTreeSet<String> {

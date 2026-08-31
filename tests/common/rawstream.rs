@@ -8,13 +8,14 @@
 //! stream and naming its type, building a frame, reading one back, waiting for
 //! the connection to end.
 //!
-//! What is *not* here is any assertion about what the server chose. The four
+//! What is *not* here is any assertion about what the server chose. The five
 //! this module does make are the ones that were written identically at every
 //! call site: a response carries `:status` ([`status_of`]), a stream the server
 //! refuses to read is stopped ([`stopped_code`]), a connection the server ends
-//! is ended with a code the caller names ([`assert_closed_with`]), and a
-//! connection that needs more than the pre-authentication stream allowance gets
-//! itself through the door first ([`authenticate`]).
+//! is ended with a code the caller names ([`assert_closed_with`]), a connection
+//! that needs more than the pre-authentication stream allowance gets itself
+//! through the door first ([`authenticate`]), and a connection that survived
+//! whatever was done to it is still answering ([`still_serving`]).
 //!
 //! D66 shape: helpers that assert are synchronous functions returning a future,
 //! so `#[track_caller]` survives to the poll that panics.
@@ -81,6 +82,20 @@ pub const FRAME_MAX_PUSH_ID: u64 = 0x0d;
 /// forgotten fails the test instead of quietly agreeing with it. Same reasoning
 /// as [`super::huffman`].
 pub const RESERVED_HTTP2_TYPES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
+
+/// A reserved "grease" frame or stream type of the form `0x1f * N + 0x21`.
+///
+/// RFC 9114 §7.2.8: "Frame types of the format `0x1f * N + 0x21` for
+/// non-negative integer values of N are reserved to exercise the requirement
+/// that unknown types be ignored (Section 9)."
+///
+/// `n` is the caller's, and deliberately so: the server, the shared HTTP/3
+/// client and each raw-stream test pick different ones only so that the
+/// greases can be told apart in a packet capture. What is shared here is the
+/// formula, which is the part transcribed from the RFC.
+pub const fn grease_type(n: u64) -> u64 {
+    0x1f * n + 0x21
+}
 
 /// Control stream type (RFC 9114 §6.2.1).
 pub const STREAM_CONTROL: u64 = 0x00;
@@ -222,7 +237,30 @@ pub fn connect_udp_headers_frame(authority: &str, host: &str, port: u16) -> Vec<
 ///
 /// Port 25 is on the deny list and the port rule is checked before the resolver
 /// runs, so a request for it is answered without a packet leaving this host.
-const DENIED_TARGET: &str = "192.0.2.1:25";
+/// That is what makes it the cheapest request a test can make when what it
+/// wants is an *answer* rather than a tunnel — and the choice depends on two
+/// facts about the server (the port is denied, and the port rule runs before
+/// the resolver), so it is stated here once rather than at every call site.
+pub const DENIED_TARGET: &str = "192.0.2.1:25";
+
+/// Opens a request stream and asserts the server answers it.
+///
+/// The answer is a 403 rather than a 200 because the target is
+/// [`DENIED_TARGET`]: nothing has to be listening, and the answer still proves
+/// the connection is serving rather than merely unclosed -- which is the
+/// difference most hostile cases turn on.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66).
+#[track_caller]
+pub fn still_serving(connection: &quinn::Connection) -> impl Future<Output = ()> + '_ {
+    expect_denied(
+        connection,
+        None,
+        "the connection must still be serving requests",
+        Location::caller(),
+    )
+}
 
 /// Walks a raw-stream connection through the credentials check, and no further.
 ///
@@ -233,10 +271,9 @@ const DENIED_TARGET: &str = "192.0.2.1:25";
 /// it opens them. Nothing else about it changes: the allowance is the only
 /// thing this hands the connection.
 ///
-/// The cheapest request that does it. What opens the door is the request being
-/// *accepted*, not its outcome, so this asks for a target the policy refuses on
-/// its port alone — answered without a packet leaving the host, without a name
-/// to resolve, and without a tunnel slot that would have to be given back.
+/// The cheapest request that does it, which is why it is the same exchange
+/// [`still_serving`] makes: what opens the door is the request being
+/// *accepted*, not its outcome.
 ///
 /// `credentials` is `None` for a server with no `[auth]` users, where any
 /// completed request authenticates. A server that configures them is passed
@@ -246,33 +283,44 @@ pub fn authenticate<'a>(
     connection: &'a quinn::Connection,
     credentials: Option<&'a str>,
 ) -> impl Future<Output = ()> + 'a {
-    let caller = Location::caller();
-    async move {
-        let (mut send, mut recv) = connection
-            .open_bi()
-            .await
-            .unwrap_or_else(|error| panic!("at {caller}: open a request stream: {error}"));
+    expect_denied(
+        connection,
+        credentials,
+        "the request must be refused for its destination, which is the proof that \
+         it got past the credentials check",
+        Location::caller(),
+    )
+}
 
-        let request = match credentials {
-            Some(credentials) => authenticated_connect_headers_frame(DENIED_TARGET, credentials),
-            None => connect_headers_frame(DENIED_TARGET),
-        };
-        send.write_all(&request)
-            .await
-            .unwrap_or_else(|error| panic!("at {caller}: send a CONNECT request: {error}"));
+/// The exchange behind both, with `caller` already captured.
+///
+/// `what` says what the 403 proves for the caller that asked for it; the two
+/// assertions themselves are the same either way.
+async fn expect_denied(
+    connection: &quinn::Connection,
+    credentials: Option<&str>,
+    what: &'static str,
+    caller: &'static Location<'static>,
+) {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .unwrap_or_else(|error| panic!("at {caller}: open a request stream: {error}"));
 
-        let (kind, payload) = read_frame(&mut recv).await;
-        assert_eq!(
-            kind, FRAME_HEADERS,
-            "at {caller}: the answer must be a response"
-        );
-        assert_eq!(
-            status_of(&payload),
-            "403",
-            "at {caller}: the request must be refused for its destination, which is \
-             the proof that it got past the credentials check"
-        );
-    }
+    let request = match credentials {
+        Some(credentials) => authenticated_connect_headers_frame(DENIED_TARGET, credentials),
+        None => connect_headers_frame(DENIED_TARGET),
+    };
+    send.write_all(&request)
+        .await
+        .unwrap_or_else(|error| panic!("at {caller}: send a CONNECT request: {error}"));
+
+    let (kind, payload) = read_frame(&mut recv).await;
+    assert_eq!(
+        kind, FRAME_HEADERS,
+        "at {caller}: the answer must be a response"
+    );
+    assert_eq!(status_of(&payload), "403", "at {caller}: {what}");
 }
 
 /// Opens a unidirectional stream, names its type, and writes `bytes` after it.

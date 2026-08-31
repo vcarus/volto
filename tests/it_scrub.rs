@@ -26,13 +26,14 @@
 //! with the gate half open: a renamed or expired secret would otherwise turn the
 //! whole check into a no-op without anyone noticing.
 
+#[path = "common/scripts.rs"]
+mod scripts;
+
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
+use scripts::repo_root;
 
 /// Ranges that no tracked file may contain.
 ///

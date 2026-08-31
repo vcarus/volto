@@ -35,7 +35,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    open_udp_session, spawn_silent_udp_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    open_udp_session, send_udp_payload, spawn_silent_udp_target, H3Client, SharedBuffer,
+    TestServer, ALLOW_PRIVATE,
 };
 use tokio::time::Instant;
 use volto::datagram;
@@ -90,10 +91,7 @@ async fn a_datagram_flood_does_not_hold_a_session_past_its_idle_timeout() {
     // The one payload the budget allows. Waited for at the target, so the
     // deadline is known to be armed — and armed by this packet — before the
     // flood starts.
-    client
-        .quic
-        .send_datagram(datagram::encode_udp_payload(qsid, b"one"))
-        .expect("send the one payload the budget allows");
+    send_udp_payload(&client.quic, qsid, b"one");
     while received.load(Ordering::Relaxed) == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }

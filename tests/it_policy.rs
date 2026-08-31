@@ -13,23 +13,15 @@ use common::rawstream::H3_NO_ERROR;
 use common::Response;
 use common::{
     assert_peer_reset, auth_section, authorize, authorized_connect, basic_credentials,
-    connect_request, connect_udp_request, open_tcp_tunnel, open_udp_session, read_at_least,
-    respond_to, send_and_respond, spawn_echo_target, spawn_silent_udp_target,
-    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    close_and_drain, connect_request, connect_udp_request, echoes, open_tcp_tunnel,
+    open_udp_session, proxy_status, respond_to, send_and_respond, send_udp_payload,
+    spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, udp_round_trip, H3Client,
+    TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
-use volto::datagram;
 use volto::h3api::{FieldValue, Request, Status};
 
 /// The credentials the test servers below are configured with.
 const USER: (&str, &str) = ("user1", "s3cret");
-
-/// The `Proxy-Status` field of a response, if it has one.
-fn proxy_status(response: &Response) -> Option<&str> {
-    response
-        .fields
-        .get("proxy-status")
-        .map(|value| value.to_str().expect("proxy-status is ASCII"))
-}
 
 /// Asserts a refusal carries the RFC 9209 reason it should.
 fn assert_refused(response: &Response, status: Status, error: &str) {
@@ -418,12 +410,7 @@ async fn private_addresses_are_reachable_when_allowed() {
     assert!(proxy_status(&response).is_none(), "a 200 needs no reason");
 
     // And the tunnel really works, rather than merely being answered.
-    stream
-        .send_data(Bytes::from_static(b"through the acl"))
-        .await
-        .expect("send payload");
-    let echoed = read_at_least(&mut stream, b"through the acl".len()).await;
-    assert_eq!(&echoed, b"through the acl");
+    echoes(&mut stream, b"through the acl").await;
 }
 
 /// Port 25 is closed by default; the refusal is about the port, not the address,
@@ -559,8 +546,7 @@ async fn a_finished_tunnel_returns_its_slot() {
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // Close the tunnel from the client side and let it drain.
-    stream.finish().expect("finish the request stream");
-    common::read_to_end(&mut stream).await;
+    close_and_drain(&mut stream).await;
 
     // The slot is released when the server-side task ends, a moment after the
     // stream closes, so allow it to catch up rather than racing it.
@@ -598,13 +584,7 @@ async fn packets_to_a_silent_target_are_capped() {
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
     for i in 0..SENT {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(
-                qsid,
-                format!("packet {i}").as_bytes(),
-            ))
-            .expect("send datagram");
+        send_udp_payload(&client.quic, qsid, format!("packet {i}").as_bytes());
     }
 
     // Wait for the budget to be spent, then keep waiting to catch any leak past
