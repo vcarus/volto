@@ -494,7 +494,7 @@ impl Session {
     fn datagram_limit(&self) -> Option<usize> {
         self.ctx
             .datagrams_allowed()
-            .then(|| self.ctx.datagrams.max_datagram_size())
+            .then(|| self.ctx.quic.max_datagram_size())
             .flatten()
     }
 
@@ -568,7 +568,7 @@ impl Session {
             // Steady-state cost is one extra connection-lock acquisition per
             // outbound UDP packet, the same order as the one `send_datagram`
             // itself takes.
-            let space = self.ctx.datagrams.datagram_send_buffer_space();
+            let space = self.ctx.quic.datagram_send_buffer_space();
             let len = encoded.len();
             match send_buffer_verdict(len, space, &mut self.eviction_reported) {
                 SendBuffer::Room => {}
@@ -589,7 +589,7 @@ impl Session {
                 ),
             }
 
-            if let Err(error) = self.ctx.datagrams.send_datagram(encoded) {
+            if let Err(error) = self.ctx.quic.send_datagram(encoded) {
                 debug!(%error, "failed to send a QUIC datagram");
             }
             return Step::Continue;

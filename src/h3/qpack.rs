@@ -251,10 +251,9 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
             // RFC 9114 §8.1 defines H3_EXCESSIVE_LOAD for a peer "exhibiting a
             // behavior that might be generating excessive load", which is what
             // ignoring an advertised bound is.
-            return Err(Violation::stream(
-                Code::H3_EXCESSIVE_LOAD,
-                format!("field section exceeds the advertised {max_section_size} bytes"),
-            ));
+            return Err(Violation::field_section_too_large(format!(
+                "field section exceeds the advertised {max_section_size} bytes"
+            )));
         }
         fields.push(field);
     }

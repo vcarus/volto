@@ -30,16 +30,21 @@ fuzz_target!(|data: &[u8]| {
     let budget = Arc::new(BufferBudget::default());
     let mut decoder = FrameDecoder::new(kind, budget);
 
+    // One copy of the input, sliced per chunk. The decoder may retain what it is
+    // handed, so each chunk has to be a `Bytes` of its own -- but a `slice` of
+    // one buffer is a refcount bump, where a `copy_from_slice` per chunk is an
+    // allocate-and-copy per 1..16 bytes of every input the fuzzer produces.
+    let all = Bytes::copy_from_slice(rest);
     let mut chunk_len = 1 + (control as usize) % 16;
-    let mut input = rest;
-    'stream: while !input.is_empty() {
-        let take = chunk_len.min(input.len());
-        let (chunk, tail) = input.split_at(take);
-        input = tail;
+    let mut offset = 0;
+    'stream: while offset < all.len() {
+        let take = chunk_len.min(all.len() - offset);
+        let chunk = all.slice(offset..offset + take);
+        offset += take;
         // Vary the split points so frame headers and payloads straddle chunks.
         chunk_len = (chunk_len % 16) + 1;
 
-        decoder.push(Bytes::copy_from_slice(chunk));
+        decoder.push(chunk);
         loop {
             match decoder.next_item() {
                 Ok(Some(item)) => {

@@ -1585,10 +1585,15 @@ async fn a_peer_that_closes_before_it_says_anything_frees_its_slot() {
 /// that is a green run: every round evicts, and one round whose close is slow
 /// ends the retry loop with a pass.
 ///
-/// So the window is generous rather than tight. It costs an unloaded host
-/// nothing (the first round wins and never waits it out) and it is two orders
-/// of magnitude over a loopback CONNECTION_CLOSE, so a peer still open at the
-/// end of it was not evicted at all.
+/// So the window is generous rather than tight: it is two orders of magnitude
+/// over a loopback CONNECTION_CLOSE, so a peer still open at the end of it was
+/// not evicted at all.
+///
+/// It is not free, and the cost falls on the passing run rather than the failing
+/// one: a round the newcomer *survives* is a round that waits this out in full,
+/// because expiry is what "no close arrived" is spelled as. A round that loses
+/// returns as soon as the close lands. So the whole of this is on the wall clock
+/// of the first round of a green run, once.
 const EVICTION_VISIBLE: Duration = Duration::from_secs(2);
 
 /// One round of it: with a peer parked in front of a connection that closed at

@@ -116,9 +116,10 @@ impl fmt::Debug for Code {
 pub struct Violation {
     code: Code,
     fatal: bool,
-    /// Whether a stream-class refusal is signaled by a bare reset alone, with no
-    /// HTTP status line -- see [`Self::excessive_load_reset`].
-    reset_only: bool,
+    /// Whether the peer's fault is a field section this server would not hold,
+    /// which is the one thing a 431 answers -- see
+    /// [`Self::field_section_too_large`].
+    field_section: bool,
     detail: Cow<'static, str>,
 }
 
@@ -128,7 +129,7 @@ impl Violation {
         Self {
             code,
             fatal: false,
-            reset_only: false,
+            field_section: false,
             detail: detail.into(),
         }
     }
@@ -138,27 +139,32 @@ impl Violation {
         Self {
             code,
             fatal: true,
-            reset_only: false,
+            field_section: false,
             detail: detail.into(),
         }
     }
 
-    /// An H3_EXCESSIVE_LOAD stream error answered by a bare reset, not a 431.
+    /// An H3_EXCESSIVE_LOAD stream error a 431 is the right answer to.
     ///
-    /// `H3_EXCESSIVE_LOAD` on a request stream otherwise draws the 431 (Request
-    /// Header Fields Too Large) that [`crate::h3::stream::Resolver::resolve`]
-    /// sends for a field section past the advertised limit (RFC 9114 §10.5.1).
-    /// That status is the right thing to tell a peer to shrink its header
-    /// fields, and the wrong thing to tell one whose fault is not field-section
-    /// size at all -- the reserved/grease frame flood of RFC 9114 §10.5, where
-    /// no header field was ever sent. A violation built this way keeps the same
-    /// code, so the machine-readable signal is identical, but is answered with
-    /// RESET_STREAM and STOP_SENDING alone.
-    pub fn excessive_load_reset(detail: impl Into<Cow<'static, str>>) -> Self {
+    /// The 431 (Request Header Fields Too Large) that
+    /// [`crate::h3::stream::Resolver::resolve`] sends is a *diagnosis*, not a
+    /// consequence of the code: it tells a peer which part of its request to
+    /// shrink (RFC 9114 §10.5.1). That is worth saying only when the fault
+    /// really is a field section too large to hold -- the three sources being
+    /// the per-frame buffering limit, the advertised
+    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`, and D77's connection-wide budget.
+    ///
+    /// It is stated here rather than inferred at the answering site because
+    /// `H3_EXCESSIVE_LOAD` is a code, not a class: RFC 9114 §10.5's
+    /// reserved-frame flood carries the same code and no header field was ever
+    /// sent, so a peer told to shrink its field sections would be told to fix
+    /// something it never did. Marking the three that mean it keeps a fourth
+    /// source, added later, on the bare reset that is safe for anything.
+    pub fn field_section_too_large(detail: impl Into<Cow<'static, str>>) -> Self {
         Self {
             code: Code::H3_EXCESSIVE_LOAD,
             fatal: false,
-            reset_only: true,
+            field_section: true,
             detail: detail.into(),
         }
     }
@@ -173,14 +179,14 @@ impl Violation {
         self.fatal
     }
 
-    /// Whether a stream-class refusal is answered by a bare reset, never a 431.
+    /// Whether a 431 is the right thing to tell the peer about this.
     ///
-    /// True only for [`Self::excessive_load_reset`], which says why. The one
-    /// reader is [`crate::h3::stream::Resolver::resolve`], where it keeps a
-    /// reserved-frame flood out of the arm that answers an oversized field
-    /// section with a 431.
-    pub fn is_reset_only(&self) -> bool {
-        self.reset_only
+    /// True only for [`Self::field_section_too_large`], which says why. The one
+    /// reader is [`crate::h3::stream::Resolver::resolve`]; every other
+    /// stream-class violation, this code included, is answered by the bare reset
+    /// that says nothing a peer could act on wrongly.
+    pub fn is_field_section_too_large(&self) -> bool {
+        self.field_section
     }
 
     /// The same violation, escalated to end the connection.
@@ -257,20 +263,16 @@ impl From<quinn::ConnectionError> for ConnectionError {
     /// things there -- so the phrase is bounded and escaped in place instead,
     /// where the peer's bytes enter this type rather than where they are logged
     /// (the same point [`crate::auth`] cuts a claimed user-id at, and for the
-    /// same reason).
+    /// same reason). [`crate::logfmt::peer_error`] is that cut, and it is the
+    /// same call [`crate::quic`] makes on the handshake that never got far
+    /// enough to reach this conversion at all.
     fn from(error: quinn::ConnectionError) -> Self {
         match error {
             quinn::ConnectionError::ApplicationClosed(close) => Self::ApplicationClose {
                 code: Code::new(close.error_code.into_inner()),
             },
             quinn::ConnectionError::TimedOut => Self::Timeout,
-            quinn::ConnectionError::ConnectionClosed(close) => Self::Transport(
-                quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
-                    reason: crate::logfmt::escaped_bytes(&close.reason).into(),
-                    ..close
-                }),
-            ),
-            other => Self::Transport(other),
+            other => Self::Transport(crate::logfmt::peer_error(other)),
         }
     }
 }

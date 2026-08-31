@@ -365,23 +365,18 @@ async fn a_431_the_peer_will_not_take_is_reset() {
         .await
         .expect("announce an oversized field section");
 
-    // Past the server's idle timeout without reading a byte: reading is what
-    // would grow the window and let the answer through.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
-
-    let error = tokio::time::timeout(TIMEOUT, recv.read_to_end(4096))
+    // Waited for rather than slept past: `received_reset` observes the reset
+    // without granting the flow-control credit an ordinary read would, which is
+    // the whole reason a window this small is the setup.
+    let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
         .await
         .expect("the server must not wait for a window that is not coming")
-        .expect_err("an answer the peer would not take must end in a reset");
-
-    match error {
-        quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)) => assert_eq!(
-            code.into_inner(),
-            H3_REQUEST_CANCELLED,
-            "an abandoned answer is a cancelled request"
-        ),
-        other => panic!("expected the response side to be reset, got {other}"),
-    }
+        .expect("an answer the peer would not take must end in a reset");
+    assert_eq!(
+        reset.map(quinn::VarInt::into_inner),
+        Some(H3_REQUEST_CANCELLED),
+        "an abandoned answer is a cancelled request"
+    );
 
     // One abandoned answer is not a reason to drop everything else.
     assert!(

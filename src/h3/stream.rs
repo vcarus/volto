@@ -127,32 +127,30 @@ impl Resolver {
             // then stopped with the code, because the rest of the section is
             // precisely what this server has declined to read.
             //
-            // Three of this server's H3_EXCESSIVE_LOAD sources on a request
-            // stream are stream-class and about a field section too large to
-            // hold, and all three land here: the per-frame buffering limit, a
-            // field section that decoded past what `SETTINGS_MAX_FIELD_SECTION_SIZE`
-            // told the peer to send -- the same 64 KiB either way -- and the
+            // Which refusals those are is the verdict's own to say, and
+            // `Violation::field_section_too_large` is how it says it. Three
+            // sources build one: the per-frame buffering limit, a field section
+            // that decoded past what `SETTINGS_MAX_FIELD_SECTION_SIZE` told the
+            // peer to send -- the same 64 KiB either way -- and the
             // connection-wide buffering budget of D77, which refuses the request
-            // that would overrun it rather than the connection holding it. The
-            // guard stays because `is_connection_error` is what decides between
-            // answering and closing everywhere else in this file, and a code is
-            // not a class.
+            // that would overrun it rather than the connection holding it.
             //
-            // The fourth H3_EXCESSIVE_LOAD source -- a request stream flooded
-            // with reserved or unknown frames (RFC 9114 §10.5,
-            // `frame::MAX_SKIPPED_FRAMES`) -- is stream-class too, but is not a
-            // field section that was too large: `is_reset_only` keeps it out of
-            // this arm, so it falls through to the bare reset `answer` gives it
-            // rather than a 431 that would tell the peer to shrink header fields
-            // it never sent.
+            // Everything else falls through to the bare reset `answer` gives it,
+            // H3_EXCESSIVE_LOAD included: a request stream flooded with reserved
+            // or unknown frames (RFC 9114 §10.5, `frame::MAX_SKIPPED_FRAMES`)
+            // carries the same code and sent no header field at all, so a 431
+            // would tell that peer to shrink something it never sent.
+            //
+            // The `is_connection_error` guard stays because that is what decides
+            // between answering and closing everywhere else in this file, and a
+            // critical stream's reader is entitled to escalate a verdict after
+            // it was made.
             //
             // The write is bounded and, when the bound lapses, abandoned with
             // a reset: [`Stream::respond_within`] says why, and a peer that
             // grants no flow-control window never takes these fifty-odd bytes.
             Err(frame::Error::Protocol(violation))
-                if violation.code() == Code::H3_EXCESSIVE_LOAD
-                    && !violation.is_connection_error()
-                    && !violation.is_reset_only() =>
+                if violation.is_field_section_too_large() && !violation.is_connection_error() =>
             {
                 if stream
                     .respond_within(Status::REQUEST_HEADER_FIELDS_TOO_LARGE, Fields::new())
@@ -618,20 +616,19 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
 ///
 /// A value that is nothing but whitespace becomes the empty string, which is a
 /// field value like any other.
-fn trim_optional_whitespace(value: &[u8]) -> &[u8] {
-    let whitespace = |byte: &u8| matches!(byte, b' ' | b'\t');
+fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
+    // Slice patterns rather than a pair of index searches: SP and HTAB are the
+    // only two octets `[u8]::trim_ascii` would go beyond, and peeling them off
+    // each end leaves the all-whitespace case as the empty slice with no arm of
+    // its own.
+    while let [b' ' | b'\t', rest @ ..] = value {
+        value = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = value {
+        value = rest;
+    }
 
-    let start = value.iter().position(|byte| !whitespace(byte));
-    let Some(start) = start else {
-        return &[];
-    };
-    // There is a non-whitespace octet at `start`, so there is a last one too.
-    let end = value
-        .iter()
-        .rposition(|byte| !whitespace(byte))
-        .unwrap_or(start);
-
-    &value[start..=end]
+    value
 }
 
 /// A message this server will not process (RFC 9114 §4.1.2).

@@ -164,6 +164,29 @@ enum Teardown {
     TargetError,
 }
 
+impl Teardown {
+    /// The HTTP/3 error code this ending puts on the direction that did not see
+    /// it (RFC 9114 §4.4).
+    ///
+    /// One table rather than one per pump: §4.4 gives both directions the same
+    /// answer, so the two pumps differing about it could only ever be a defect.
+    /// `Running` is not a teardown and never reaches a reset; it takes the
+    /// cancellation code because there is no ending it could describe that is
+    /// the target's fault.
+    fn code(self) -> h3api::Code {
+        match self {
+            // A target error is what the pump that saw it already put on the
+            // response direction.
+            Self::TargetError => h3api::CONNECT_ERROR,
+            // §4.4 asks a proxy to "perform the same operation on the other
+            // direction in order to ensure that both directions of the stream
+            // are cancelled", and §8.1 gives this code for "the request or its
+            // response (including pushed response) is cancelled".
+            Self::ClientAbort | Self::Running => h3api::REQUEST_CANCELLED,
+        }
+    }
+}
+
 /// One direction's clean ending, and the bound it puts on the other's writes.
 ///
 /// Deliberately *not* a [`Teardown`] variant. A clean FIN is not an abnormal
@@ -555,22 +578,15 @@ async fn client_to_target(
     // stop the client with code 0 — which would leave the two halves carrying
     // different verdicts on the same event.
     //
-    // A target error is `H3_CONNECT_ERROR`, the code the other pump put on the
-    // response direction (RFC 9114 §4.4). A client abort is
-    // `H3_REQUEST_CANCELLED`: §4.4 asks a proxy to "perform the same operation
-    // on the other direction in order to ensure that both directions of the
-    // stream are cancelled", and §8.1 gives that code for "the request or its
-    // response (including pushed response) is cancelled".
+    // Which code says which (RFC 9114 §4.4) is [`Teardown::code`]'s, so that
+    // the two pumps cannot answer the same event differently.
     //
     // The ask reaches the wire here and not later: `stop_receiving` is
     // `quinn::RecvStream::stop`, which queues STOP_SENDING at the point of call.
     // On the half a client has already closed it is a no-op — quinn answers
     // `ClosedStream`, which `FrameReader::stop` discards, because a stream that
     // is already over has nothing left to stop.
-    reader.stop_receiving(match reason {
-        Teardown::TargetError => h3api::CONNECT_ERROR,
-        _ => h3api::REQUEST_CANCELLED,
-    });
+    reader.stop_receiving(reason.code());
 
     // Forgotten rather than dropped: shutting the write side down on the way out
     // would put a FIN on the wire, which is the wrong signal for every path that
@@ -767,19 +783,13 @@ async fn target_to_client(
     // response. Both reasons are therefore spelled out here; only the code
     // differs.
     //
-    // The write pump finding the target broken is a stream error of type
-    // H3_CONNECT_ERROR (RFC 9114 §4.4). A client abort is H3_REQUEST_CANCELLED,
-    // because §4.4 asks that "if the stream is reset or reading is aborted by
-    // the client, a proxy SHOULD perform the same operation on the other
-    // direction in order to ensure that both directions of the stream are
-    // cancelled" — and §8.1 defines that code as "the request or its response
-    // (including pushed response) is cancelled". A client that reset only its
-    // sending side is exactly the case that used to be told its truncated
-    // response was complete.
-    writer.reset(match reason {
-        Teardown::TargetError => h3api::CONNECT_ERROR,
-        _ => h3api::REQUEST_CANCELLED,
-    });
+    // Which code says which is [`Teardown::code`]'s, the same table the read
+    // pump uses: RFC 9114 §4.4 asks that "if the stream is reset or reading is
+    // aborted by the client, a proxy SHOULD perform the same operation on the
+    // other direction in order to ensure that both directions of the stream are
+    // cancelled", and a client that reset only its sending side is exactly the
+    // case that used to be told its truncated response was complete.
+    writer.reset(reason.code());
 }
 
 /// Offers `buf` a full-sized window to read into, allocating a block at a time.
@@ -937,6 +947,9 @@ mod tests {
         connect_any_with, ensure_window, split_authority, HalfClose, RELAY_BLOCK_SIZE,
         RELAY_BUF_SIZE,
     };
+    // The deadlines here and the resolver's are asserted the same way; the
+    // helper lives beside the first of them rather than in both files.
+    use crate::tunnel::tests::poll_once;
     use bytes::BytesMut;
     use std::io;
     use std::net::SocketAddr;
@@ -946,22 +959,6 @@ mod tests {
 
     fn address(literal: &str) -> SocketAddr {
         literal.parse().expect("socket address")
-    }
-
-    /// The value `future` has *without waiting*, or `None` if it would wait.
-    ///
-    /// The negative half of every deadline below: a timer that has not fired is
-    /// a future that is still pending, and one poll is the whole question.
-    /// Polled through a bare waker rather than awaited, so a `None` is the
-    /// future's own answer and not a race with the runtime — `tokio::time`
-    /// advances only where a test says so, and nothing here wakes anything but
-    /// a timer.
-    fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
-        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-        match future.as_mut().poll(&mut cx) {
-            std::task::Poll::Ready(value) => Some(value),
-            std::task::Poll::Pending => None,
-        }
     }
 
     /// A target that black-holes SYNs is the case the budget exists for: the

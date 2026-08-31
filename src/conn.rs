@@ -11,7 +11,7 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -20,6 +20,7 @@ use crate::auth;
 use crate::config::Config;
 use crate::h3api::{self, FieldValue, Request, Status};
 use crate::logfmt::bounded;
+use crate::quic::AuthGate;
 use crate::shutdown::Shutdown;
 use crate::tunnel::{self, udp, Context, ProxyError, Route};
 
@@ -106,7 +107,7 @@ pub async fn handle(
     resolver: &crate::net::ResolverBudget,
     tunnels: Arc<AtomicU64>,
     dropped_datagrams: Arc<AtomicU64>,
-    authenticated: Arc<AtomicBool>,
+    authenticated: AuthGate,
 ) -> Result<(), h3api::ConnectionError> {
     // Cloned before the handshake, which takes ownership of the connection: a
     // UDP session sends its datagrams on the QUIC connection itself, and asks it
@@ -273,10 +274,12 @@ pub async fn handle(
 /// is that such a peer holds its slot for two idle timeouts rather than one,
 /// which is bounded either way.
 ///
-/// Visible to the crate because [`crate::config`] has to multiply by it: the
-/// ceiling on `max_idle_timeout` is what keeps `Instant::now() + idle * this`
-/// inside what the arithmetic can take (D86), and a ceiling checked against a
+/// Visible to the crate because [`crate::config`]'s test for D86 multiplies by
+/// it: the ceiling on `max_idle_timeout` is what keeps `Instant::now() + idle *
+/// this` inside what the arithmetic can take, and a ceiling pinned against a
 /// copy of the factor would stop meaning anything the day the factor moved.
+/// `validate` itself never multiplies -- it compares against the ceiling
+/// constant, and this is the number that ceiling was chosen for.
 pub(crate) const SILENCE_FACTOR: u32 = 2;
 
 /// What waiting for the next request stream produced.
@@ -457,7 +460,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                     failures = context.max_auth_failures,
                     "closing the connection after repeated authentication failures"
                 );
-                context.datagrams.close(
+                context.quic.close(
                     h3api::AUTH_FAILURE_LIMIT_CODE,
                     b"too many authentication failures",
                 );

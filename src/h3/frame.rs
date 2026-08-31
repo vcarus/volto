@@ -65,6 +65,26 @@ pub const GOAWAY: u64 = 0x07;
 /// MAX_PUSH_ID (RFC 9114 §7.2.7).
 pub const MAX_PUSH_ID: u64 = 0x0d;
 
+/// The frame types this server parses, and so has to buffer whole.
+///
+/// The one list the two decisions that turn on it read: what `begin` puts in
+/// [`State::Buffering`], and which types `misplaced` refuses once a stream has
+/// become a tunnel (RFC 9114 §4.4's "any other known frame type"). DATA is not
+/// here because it is never buffered, and a type absent from this list is one
+/// §9 has this server skip rather than judge.
+///
+/// Written once because `parse`'s `unreachable!` is only sound while the two
+/// agree: a seventh type added to one list and not the other compiles, and the
+/// first frame of it reaches an arm that says it cannot happen.
+const BUFFERED_TYPES: [u64; 6] = [
+    HEADERS,
+    SETTINGS,
+    GOAWAY,
+    CANCEL_PUSH,
+    MAX_PUSH_ID,
+    PUSH_PROMISE,
+];
+
 /// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
 ///
 /// §7.2.8 makes their receipt a connection error rather than something to skip:
@@ -140,7 +160,7 @@ const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
 /// another stream's request. The value is generous on purpose: a real client
 /// greases with a handful of small frames, so several thousand leaves orders of
 /// magnitude of headroom while still bounding the count. The refusal is a
-/// *stream* error (`Violation::excessive_load_reset`), so only the one request
+/// *stream* error, so only the one request
 /// is lost -- §10.5's "false positives" caution is why this is not a connection
 /// error and why the limit is nowhere near what a client could reach.
 const MAX_SKIPPED_FRAMES: u32 = 4096;
@@ -219,14 +239,11 @@ impl BufferBudget {
                 (wanted <= HEADERS_BUFFER_BUDGET).then_some(wanted)
             })
             .map_err(|held| {
-                Violation::stream(
-                    Code::H3_EXCESSIVE_LOAD,
-                    format!(
-                        "buffering another {bytes} bytes would put this connection past the \
-                         {HEADERS_BUFFER_BUDGET} it may hold in unfinished frames, of which \
-                         {held} are already held"
-                    ),
-                )
+                Violation::field_section_too_large(format!(
+                    "buffering another {bytes} bytes would put this connection past the \
+                     {HEADERS_BUFFER_BUDGET} it may hold in unfinished frames, of which \
+                     {held} are already held"
+                ))
             })?;
         Ok(())
     }
@@ -476,11 +493,16 @@ pub struct FrameDecoder {
     /// Reserved or unknown frames skipped so far while this was a request
     /// stream (RFC 9114 §10.5).
     ///
-    /// Counted only in [`StreamKind::Request`]: a tunnel's skips are DATA's
-    /// equals under §4.4 and have their own reader, the control stream's are
-    /// [`super::connection`]'s to bound, and [`MAX_SKIPPED_FRAMES`] says why the
-    /// unit is frames rather than bytes. It only grows -- a request stream that
-    /// becomes a tunnel stops adding to it, and there is nothing to reset.
+    /// Counted only in [`StreamKind::Request`], and [`MAX_SKIPPED_FRAMES`] says
+    /// why the unit is frames rather than bytes. A tunnel's skips are DATA's
+    /// equals under §4.4 and have their own reader. The control stream's are
+    /// deliberately not counted at all: greasing it is what §7.2.8 invites, and
+    /// what bounds the cost there is the [`logfmt::Sampler`] in
+    /// [`super::connection`] on the *log line* each one produces, not any limit
+    /// on the frames. It only grows -- a request stream that becomes a tunnel
+    /// stops adding to it, and there is nothing to reset.
+    ///
+    /// [`logfmt::Sampler`]: crate::logfmt::Sampler
     skipped: u32,
     state: State,
 }
@@ -657,8 +679,8 @@ impl FrameDecoder {
     /// declares no payload still advances the count, which is the whole point of
     /// counting frames rather than their bytes.
     ///
-    /// The verdict is `excessive_load_reset`, not the plain
-    /// `Violation::stream(H3_EXCESSIVE_LOAD, ..)` the field-section bounds use:
+    /// The verdict is the plain `Violation::stream(H3_EXCESSIVE_LOAD, ..)`, not
+    /// the `Violation::field_section_too_large` the field-section bounds use:
     /// this is not a field section that was too large, so the 431 that answers
     /// those would be the wrong thing to tell the peer. It is answered with a
     /// bare reset and STOP_SENDING instead ([`super::stream::Resolver::resolve`]).
@@ -666,10 +688,13 @@ impl FrameDecoder {
         if self.stream == StreamKind::Request {
             self.skipped = self.skipped.saturating_add(1);
             if self.skipped > MAX_SKIPPED_FRAMES {
-                return Err(Violation::excessive_load_reset(format!(
-                    "more than {MAX_SKIPPED_FRAMES} reserved or unknown frames were skipped on \
-                     this request stream before a request arrived"
-                )));
+                return Err(Violation::stream(
+                    Code::H3_EXCESSIVE_LOAD,
+                    format!(
+                        "more than {MAX_SKIPPED_FRAMES} reserved or unknown frames were skipped \
+                         on this request stream before a request arrived"
+                    ),
+                ));
             }
         }
         Ok(())
@@ -832,12 +857,11 @@ fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
     Ok(match kind {
         DATA => State::Data { remaining: length },
 
-        HEADERS | SETTINGS | GOAWAY | CANCEL_PUSH | MAX_PUSH_ID | PUSH_PROMISE => {
+        kind if BUFFERED_TYPES.contains(&kind) => {
             if length > MAX_BUFFERED_FRAME {
-                return Err(Violation::stream(
-                    Code::H3_EXCESSIVE_LOAD,
-                    format!("a {length}-byte frame is past what this server buffers"),
-                )
+                return Err(Violation::field_section_too_large(format!(
+                    "a {length}-byte frame is past what this server buffers"
+                ))
                 .into());
             }
             State::Buffering {
@@ -940,7 +964,7 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
         // same section rather than by reopening it.
         StreamKind::Tunnel => match kind {
             DATA => None,
-            HEADERS | SETTINGS | GOAWAY | CANCEL_PUSH | MAX_PUSH_ID | PUSH_PROMISE => {
+            kind if BUFFERED_TYPES.contains(&kind) => {
                 Some("a frame other than DATA once the CONNECT method had completed")
             }
             _ => None,
@@ -957,7 +981,8 @@ fn parse(kind: u64, payload: Bytes) -> Result<Frame, Violation> {
         CANCEL_PUSH => single_varint(CANCEL_PUSH, &payload).map(Frame::CancelPush),
         MAX_PUSH_ID => single_varint(MAX_PUSH_ID, &payload).map(Frame::MaxPushId),
         PUSH_PROMISE => Ok(Frame::PushPromise),
-        // `begin` only buffers the types above.
+        // `begin` buffers exactly `BUFFERED_TYPES`, which is exactly the six
+        // arms above.
         other => unreachable!("frame type {other:#x} is not buffered"),
     }
 }
@@ -1419,7 +1444,7 @@ mod tests {
             "a grease flood costs one request, not the connection"
         );
         assert!(
-            error.is_reset_only(),
+            !error.is_field_section_too_large(),
             "a grease flood is answered by a bare reset, not the 431 a field \
              section too large gets"
         );

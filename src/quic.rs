@@ -184,6 +184,43 @@ pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bid
     quic.set_max_concurrent_bi_streams(VarInt::from_u32(max_streams_bidi));
 }
 
+/// Whether a connection has got past the door, shared by everything that asks.
+///
+/// One flag with three readers in three modules — the accept loop's eviction
+/// candidacy (D80), the bound on how long a connection may say nothing (D76),
+/// and the stream allowance above (D98) — and one of those is not a read at all
+/// but a transition: the raise happens on the false-to-true edge and must
+/// happen exactly once, however many requests authenticate at the same moment.
+///
+/// A newtype rather than the `Arc<AtomicBool>` it wraps, because that invariant
+/// cannot survive as a convention across three modules: a plain `store(true)`
+/// written anywhere in them compiles and silently skips the raise. There is no
+/// way to open this gate without being told whether you were the one who opened
+/// it.
+#[derive(Clone, Debug, Default)]
+pub struct AuthGate(Arc<AtomicBool>);
+
+impl AuthGate {
+    /// A gate nothing has passed yet.
+    pub fn closed() -> Self {
+        Self::default()
+    }
+
+    /// Records that a request got past the door; `true` if it was the first.
+    ///
+    /// `Relaxed` for the same reason the reads are: what is ordered against is
+    /// the flag itself, and a `swap` names exactly one caller the first however
+    /// many race.
+    pub fn mark(&self) -> bool {
+        !self.0.swap(true, Ordering::Relaxed)
+    }
+
+    /// Whether anything has.
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// The quinn congestion controller factory named by `[limits] congestion_control`.
 ///
 /// Split out from [`transport_config`] purely so it can be tested: `TransportConfig`
@@ -224,10 +261,10 @@ struct Slot {
     remote: SocketAddr,
     /// Whether a request on this connection has passed the credentials check.
     ///
-    /// The very flag [`crate::tunnel::Context`] sets (D76), created here and
+    /// The very gate [`crate::tunnel::Context`] opens (D76), created here and
     /// handed down, so that the accept loop can read it without reaching into
     /// a connection it does not own.
-    authenticated: Arc<AtomicBool>,
+    authenticated: AuthGate,
     /// Ends this connection. `notify_one` leaves a permit behind, so a slot
     /// evicted before its task has run is still ended by it rather than
     /// missing the signal.
@@ -295,11 +332,7 @@ impl Roster {
 
     /// Enters a connection about to be served, returning its eviction signal
     /// and the guard that takes it off the roster again.
-    fn register(
-        &self,
-        remote: SocketAddr,
-        authenticated: Arc<AtomicBool>,
-    ) -> (Arc<Notify>, Registration) {
+    fn register(&self, remote: SocketAddr, authenticated: AuthGate) -> (Arc<Notify>, Registration) {
         let evict = Arc::new(Notify::new());
         let sequence = self.next.fetch_add(1, Ordering::Relaxed);
 
@@ -333,7 +366,7 @@ impl Roster {
 
         let sequence = *slots
             .iter()
-            .find(|(_, slot)| !slot.authenticated.load(Ordering::Relaxed))
+            .find(|(_, slot)| !slot.authenticated.is_open())
             .map(|(sequence, _)| sequence)?;
 
         let slot = slots.remove(&sequence)?;
@@ -776,7 +809,7 @@ impl Server {
         // on the roster's length, and a slot that only appeared when the task
         // was first polled would let a burst of accepts all pass the same
         // check and overshoot the cap.
-        let authenticated = Arc::new(AtomicBool::new(false));
+        let authenticated = AuthGate::closed();
         let (evicted, registration) = self.roster.register(remote, authenticated.clone());
 
         async move {
@@ -806,7 +839,17 @@ impl Server {
                     Ok(Err(error)) => {
                         // A failed handshake is routine on a public port: scanners,
                         // version negotiation, stale retries.
-                        debug!(%remote, %error, "QUIC handshake failed");
+                        //
+                        // Through `peer_error` because a peer that closes during
+                        // the handshake writes the reason phrase inside this
+                        // error, and `Display` escapes nothing: the connection
+                        // that completed has the same door, and both call the
+                        // one name.
+                        debug!(
+                            %remote,
+                            error = %crate::logfmt::peer_error(error),
+                            "QUIC handshake failed"
+                        );
                         return;
                     }
                     // Equally routine, and logged at the same level for the same
@@ -1855,13 +1898,20 @@ mod tests {
         SocketAddr::from(([192, 0, 2, n], 443))
     }
 
+    /// A gate a request has already passed, for the rosters that are about what
+    /// an authenticated connection is owed.
+    fn authenticated_gate() -> AuthGate {
+        let gate = AuthGate::closed();
+        assert!(gate.mark(), "the first pass through a gate is the first");
+        gate
+    }
+
     /// Registers `count` connections that have never authenticated, keeping the
     /// registrations alive: dropping one gives its slot straight back.
     fn park(roster: &Roster, count: u8) -> Vec<Registration> {
         (0..count)
             .map(|n| {
-                let (_evict, registration) =
-                    roster.register(peer(n), Arc::new(AtomicBool::new(false)));
+                let (_evict, registration) = roster.register(peer(n), AuthGate::closed());
                 registration
             })
             .collect()
@@ -1903,7 +1953,7 @@ mod tests {
 
         let mut held = Vec::new();
         for n in 0..3 {
-            let (_evict, registration) = roster.register(peer(n), Arc::new(AtomicBool::new(true)));
+            let (_evict, registration) = roster.register(peer(n), authenticated_gate());
             held.push(registration);
         }
 
@@ -1945,7 +1995,7 @@ mod tests {
     #[tokio::test]
     async fn an_eviction_that_arrives_first_is_still_delivered() {
         let roster = Roster::new();
-        let (evict, _registration) = roster.register(peer(0), Arc::new(AtomicBool::new(false)));
+        let (evict, _registration) = roster.register(peer(0), AuthGate::closed());
 
         assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
 
@@ -1983,7 +2033,7 @@ mod tests {
         use std::task::{Context as TaskContext, Poll, Waker};
 
         let roster = Roster::new();
-        let (evict, _registration) = roster.register(peer(0), Arc::new(AtomicBool::new(false)));
+        let (evict, _registration) = roster.register(peer(0), AuthGate::closed());
 
         let mut cx = TaskContext::from_waker(Waker::noop());
 

@@ -13,6 +13,13 @@
 //! (`script/config.example.toml`, `docs/configuration.md`): DEBUG is invisible in
 //! production, so a line only counts if it reaches this filter.
 //!
+//! One target is raised past it. Volume is a level question and escaping is not:
+//! the rule that peer bytes are bounded and escaped where they enter a value
+//! holds at every level, and the operator who turned DEBUG on is the one moment
+//! a flood of forged entries costs the most. The only such line a peer can reach
+//! before it has done anything at all is `volto::quic`'s handshake failure, so
+//! that module alone is watched at DEBUG here.
+//!
 //! Its own binary because a capturing subscriber is process-wide and
 //! `tracing_subscriber::fmt().init()` may run once, which is why every scenario
 //! lives inside the one `#[tokio::test]` and takes a mark into the shared buffer
@@ -20,6 +27,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
@@ -27,6 +35,9 @@ use common::{
     connect_request, connect_udp_request, open_tcp_tunnel, respond_to, spawn_echo_target, H3Client,
     SharedBuffer, TestServer, ALLOW_PRIVATE,
 };
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use volto::h3api::Status;
 
 /// Loopback, which the default policy refuses: what an SSRF probe looks like
@@ -48,12 +59,13 @@ const PASSWORD: &str = "s3cret-pa55word";
 
 #[tokio::test]
 async fn one_peer_cannot_buy_an_unbounded_number_of_production_log_lines() {
-    let buffer = SharedBuffer::install("volto=info");
+    let buffer = SharedBuffer::install("volto=info,volto::quic=debug");
 
     a_policy_refusal_storm_is_sampled(&buffer).await;
     a_tunnel_limit_storm_is_sampled(&buffer).await;
     an_authentication_storm_is_bounded_by_the_failure_budget(&buffer).await;
     a_peer_close_reason_never_reaches_the_journal(&buffer).await;
+    a_handshake_close_reason_never_forges_a_line(&buffer).await;
     a_udp_session_costs_exactly_one_line(&buffer).await;
 }
 
@@ -251,6 +263,139 @@ async fn a_peer_close_reason_never_reaches_the_journal(buffer: &SharedBuffer) {
         !contents.contains("authentication succeeded"),
         "a peer forged a log line through a close reason:\n{contents}"
     );
+}
+
+/// The same rule at the other door: a close that lands *during* the handshake.
+///
+/// The conversion the scenario above pins is reached only by a connection this
+/// server already has. A peer that closes before the handshake completes never
+/// gets there: `quinn`'s error goes straight onto `volto::quic`'s failure line,
+/// and its `Display` prints the reason phrase the peer wrote, unbounded and
+/// unescaped.
+///
+/// A TLS alert is how a test reaches that door without a hostile QUIC stack: the
+/// client below refuses the server's certificate with an error of its own
+/// choosing, `rustls` sends the alert while the server is still handshaking, and
+/// the alert's description travels in the CONNECTION_CLOSE reason phrase. So the
+/// bytes asserted on here are the client's, sent before it has proved anything
+/// at all -- which is exactly the peer this bound exists for.
+///
+/// Unlike the application close above, the phrase is *kept* rather than dropped:
+/// what a peer's QUIC stack says about a failed handshake is worth reading. What
+/// it may not do is arrive whole, or with a newline still in it.
+async fn a_handshake_close_reason_never_forges_a_line(buffer: &SharedBuffer) {
+    /// The bytes a peer would like the journal to carry. The newline is the
+    /// attack; `for admin` is the tail that a bounded field can never reach.
+    const FORGED: &str = "goodbye\nINFO volto: authentication succeeded for admin";
+
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let mark = buffer.mark();
+
+    let endpoint = endpoint_refusing_the_certificate(FORGED);
+    common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect_err("a client that refuses the certificate cannot complete the handshake");
+
+    let line = buffer
+        .wait_for_line(mark, &[" DEBUG ", "QUIC handshake failed"])
+        .await;
+    assert!(
+        line.contains("goodbye"),
+        "the phrase a peer's stack sent is what makes a failed handshake \
+         diagnosable, so it must survive: {line}"
+    );
+
+    let contents = buffer.since(mark);
+    assert!(
+        buffer
+            .lines_since(mark, &["authentication succeeded"])
+            .is_empty(),
+        "a peer forged a journal entry through a handshake close reason:\n{contents}"
+    );
+    assert!(
+        !contents.contains("for admin"),
+        "the whole of the peer's prose reached the journal; only a bounded head \
+         of it may:\n{contents}"
+    );
+}
+
+/// A client endpoint that refuses every certificate, with `detail` as its reason.
+///
+/// The reason is what makes this a probe rather than a connectivity test:
+/// `rustls` puts its error text into the alert it sends, `quinn` puts the alert
+/// description into the CONNECTION_CLOSE reason phrase, and the server reads
+/// `detail` off the wire without having accepted anything.
+fn endpoint_refusing_the_certificate(detail: &'static str) -> quinn::Endpoint {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = RefuseWith {
+        detail,
+        schemes: provider
+            .signature_verification_algorithms
+            .supported_schemes(),
+    };
+
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic tls"),
+    )));
+    endpoint
+}
+
+/// The verifier behind [`endpoint_refusing_the_certificate`].
+///
+/// The signature schemes are the provider's own: an empty list would be refused
+/// by the *server* while choosing one, which is a different failure than the one
+/// under test.
+#[derive(Debug)]
+struct RefuseWith {
+    detail: &'static str,
+    schemes: Vec<SignatureScheme>,
+}
+
+impl ServerCertVerifier for RefuseWith {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Err(rustls::Error::General(self.detail.to_owned()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        // TLS 1.3 only, and the certificate is refused before any signature is
+        // reached either way.
+        Err(rustls::Error::General(self.detail.to_owned()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::General(self.detail.to_owned()))
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.schemes.clone()
+    }
 }
 
 /// The baseline every bound above is measured against: a tunnel is worth one

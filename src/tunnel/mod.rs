@@ -14,6 +14,7 @@ use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
 use crate::h3api::{self, FieldValue, Fields, Method, Request, RespondError, Status, Stream};
 use crate::policy::{self, Policy};
+use crate::quic::AuthGate;
 
 /// How a request should be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,17 +161,17 @@ impl AuthFailures {
 /// handshake, before the first request arrives.
 #[derive(Clone)]
 pub struct Context {
-    /// The QUIC connection, used directly for sending datagrams.
+    /// The QUIC connection this request arrived on.
     ///
-    /// Only the sending half: an inbound datagram is routed to the request
-    /// stream it names by the HTTP/3 connection, and reaches a session through
-    /// the [`h3api::DatagramReceiver`] that stream handed it (D79).
-    ///
-    /// Named for what nearly every use of it is. The two that are not are the
-    /// connection-wide decisions a request can reach: closing after repeated
+    /// Most uses are a datagram being sent, and only the sending half: an
+    /// inbound datagram is routed to the request stream it names by the HTTP/3
+    /// connection, and reaches a session through the
+    /// [`h3api::DatagramReceiver`] that stream handed it (D79). The rest are
+    /// connection-wide decisions a request can reach — closing after repeated
     /// authentication failures, and raising the stream allowance once one
-    /// succeeds (`Context::mark_authenticated`).
-    pub datagrams: quinn::Connection,
+    /// succeeds (`Context::mark_authenticated`) — which is why the handle is
+    /// named for what it is rather than for what it mostly does.
+    pub quic: quinn::Connection,
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
     /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
@@ -203,14 +204,15 @@ pub struct Context {
     ///
     /// Its transition is load-bearing as well as its value: the false-to-true
     /// edge is what raises this connection's bidirectional stream allowance to
-    /// the configured one, exactly once. See `Context::mark_authenticated`.
+    /// the configured one, exactly once — which is why it is an [`AuthGate`]
+    /// and not the bare atomic it wraps. See `Context::mark_authenticated`.
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
     /// from outside the connection as well: the accept loop needs to know which
     /// of the connections it is holding has never got past the door, so that a
     /// full server can take that slot back rather than refuse a client that has
     /// credentials.
-    pub authenticated: Arc<AtomicBool>,
+    pub authenticated: AuthGate,
     /// The peer's address, for logs that a fail2ban rule can act on.
     pub remote: std::net::SocketAddr,
     /// Which destinations this proxy may reach.
@@ -295,18 +297,18 @@ impl Context {
     /// while it runs.
     pub fn new(
         config: &Config,
-        datagrams: quinn::Connection,
+        quic: quinn::Connection,
         peer_datagrams: Arc<AtomicBool>,
         resolver: &crate::net::ResolverBudget,
         tunnels: Arc<AtomicU64>,
-        authenticated: Arc<AtomicBool>,
+        authenticated: AuthGate,
     ) -> Self {
         Self {
-            remote: datagrams.remote_address(),
+            remote: quic.remote_address(),
             auth_failures: Arc::new(Mutex::new(AuthFailures::default())),
             max_auth_failures: config.security.max_auth_failures,
             authenticated,
-            datagrams,
+            quic,
             peer_datagrams,
             auth: Arc::new(Authenticator::new(&config.auth)),
             policy: Arc::new(Policy::new(&config.security)),
@@ -400,8 +402,8 @@ impl Context {
     /// Done before the failure counters below rather than after, so this holds
     /// no lock of ours while it takes quinn's.
     pub(crate) fn mark_authenticated(&self, username: Option<&str>) {
-        if !self.authenticated.swap(true, Ordering::Relaxed) {
-            crate::quic::admit_configured_streams(&self.datagrams, self.max_streams_bidi);
+        if self.authenticated.mark() {
+            crate::quic::admit_configured_streams(&self.quic, self.max_streams_bidi);
         }
 
         let mut failures = self.auth_failures();
@@ -417,7 +419,7 @@ impl Context {
 
     /// Whether any request on this connection has (D76).
     pub(crate) fn is_authenticated(&self) -> bool {
-        self.authenticated.load(Ordering::Relaxed)
+        self.authenticated.is_open()
     }
 }
 
@@ -1352,7 +1354,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             &crate::net::ResolverBudget::new(),
             Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicBool::new(false)),
+            AuthGate::closed(),
         )
     }
 
@@ -1715,9 +1717,15 @@ mod tests {
 
     /// The value `future` has *without waiting*, or `None` if it would wait.
     ///
-    /// The negative half of the two deadlines above: a timer that has not fired
-    /// is a future that is still pending, and one poll is the whole question.
-    fn poll_once<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+    /// The negative half of every deadline in this module and in
+    /// [`super::tcp`]: a timer that has not fired is a future that is still
+    /// pending, and one poll is the whole question. Polled through a bare waker
+    /// rather than awaited, so a `None` is the future's own answer and not a
+    /// race with the runtime -- `tokio::time` advances only where a test says
+    /// so, and nothing in either module wakes anything but a timer.
+    pub(crate) fn poll_once<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> Option<F::Output> {
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
         match future.as_mut().poll(&mut cx) {
             std::task::Poll::Ready(value) => Some(value),

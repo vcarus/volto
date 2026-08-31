@@ -36,7 +36,9 @@
 //! [`escaped_bytes`] is the answer for them: applied where the peer's bytes
 //! enter the value rather than where the value is logged, it applies both rules
 //! at once and hands back something the rest of the program may print with
-//! `Display` from then on.
+//! `Display` from then on. [`peer_error`] is that answer applied to the value
+//! this server meets it in -- a QUIC connection error -- so that the two places
+//! one of those reaches a log line apply the rule by calling the same name.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -135,6 +137,37 @@ pub fn escaped_bytes(token: &[u8]) -> String {
     // `Debug` for `Cow<str>` forwards to the `str`'s, which is the quoted,
     // control-character-escaping spelling tracing gives a `str` field.
     format!("{:?}", bounded_bytes(token))
+}
+
+/// The same error, with any reason phrase the peer wrote passed through
+/// [`escaped_bytes`].
+///
+/// Both kinds of QUIC close carry a reason phrase of the peer's own composition
+/// (RFC 9000 §19.19), and `quinn`'s `Display` prints it as it arrived. Every
+/// door a `quinn::ConnectionError` reaches a log line through goes through here
+/// first, so that "a connection error a peer may have authored is escaped where
+/// it enters this program" is one name rather than a rule to remember: the
+/// handshake that never completed ([`crate::quic`]) and the connection that did
+/// ([`crate::h3api::ConnectionError`]) are the two of them.
+///
+/// Every other variant is this server's own account of what went wrong -- a
+/// timeout, a transport error it raised itself -- and is left alone.
+pub fn peer_error(error: quinn::ConnectionError) -> quinn::ConnectionError {
+    match error {
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            quinn::ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+                reason: escaped_bytes(&close.reason).into(),
+                ..close
+            })
+        }
+        quinn::ConnectionError::ApplicationClosed(close) => {
+            quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+                reason: escaped_bytes(&close.reason).into(),
+                ..close
+            })
+        }
+        other => other,
+    }
 }
 
 /// How a token that had to be cut is spelled: its head, and its real length.
@@ -284,7 +317,9 @@ pub fn addresses(list: &[std::net::SocketAddr]) -> impl fmt::Display + '_ {
 
 #[cfg(test)]
 mod tests {
-    use super::{addresses, bounded, bounded_bytes, escaped_bytes, or_dash, Sampler, ABSENT};
+    use super::{
+        addresses, bounded, bounded_bytes, escaped_bytes, or_dash, peer_error, Sampler, ABSENT,
+    };
     use std::net::SocketAddr;
 
     /// A value present prints as itself, with no wrapper and no quotes.
@@ -402,6 +437,41 @@ mod tests {
         let long = escaped_bytes(&vec![b'r'; 4096]);
         assert!(long.len() < 80, "{long}");
         assert!(long.contains("4096"), "{long}");
+    }
+
+    /// Both kinds of QUIC close carry a peer-written reason phrase, and the
+    /// handshake door in [`crate::quic`] meets both: a transport close is what a
+    /// peer's TLS stack sends when it refuses the certificate, and an
+    /// application close is what a peer sends the moment it has 1-RTT keys.
+    #[test]
+    fn a_peer_authored_reason_phrase_is_bounded_and_escaped() {
+        let forged = b"bye\nINFO volto: all is well".as_slice();
+
+        let transport = peer_error(quinn::ConnectionError::ConnectionClosed(
+            quinn::ConnectionClose {
+                error_code: quinn::TransportErrorCode::crypto(40),
+                frame_type: None,
+                reason: forged.into(),
+            },
+        ))
+        .to_string();
+        assert!(!transport.contains('\n'), "{transport}");
+        assert!(transport.contains("bye"), "{transport}");
+
+        let application = peer_error(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(0x0100),
+                reason: forged.into(),
+            },
+        ))
+        .to_string();
+        assert!(!application.contains('\n'), "{application}");
+        assert!(application.contains("bye"), "{application}");
+
+        // What this server said about itself is not a peer's to rewrite, and is
+        // passed through as it was.
+        let ours = peer_error(quinn::ConnectionError::TimedOut).to_string();
+        assert_eq!(ours, quinn::ConnectionError::TimedOut.to_string());
     }
 
     /// The first occurrence is never held back — a bound that made an operator
