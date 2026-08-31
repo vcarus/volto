@@ -1040,6 +1040,101 @@ async fn a_request_past_the_buffering_budget_costs_only_that_request() {
     );
 }
 
+/// The name of the cheapest field that still costs a whole field's worth of the
+/// advertised section size.
+const TINY_NAME: &[u8] = b"a";
+
+/// Its value, one byte for the same reason.
+const TINY_VALUE: &[u8] = b"v";
+
+/// Tiny fields enough for the *decoded* section to overshoot
+/// `MAX_FIELD_SECTION_SIZE` while the encoded block stays a few kilobytes.
+///
+/// At 34 bytes apiece — see [`a_field_section_decoding_past_the_advertised_size_costs_only_that_request`]
+/// for where the number comes from — this is roughly 68000 against an advertised
+/// 65536, and the test asserts both halves of that rather than trusting the
+/// arithmetic here.
+const TINY_FIELDS_PAST_THE_SECTION_SIZE: usize = 2000;
+
+/// A field section that is small on the wire and past the advertised size once
+/// decoded costs the request that sent it and nothing else.
+///
+/// The third source of a 431 (`Violation::field_section_too_large`, `src/h3/error.rs`),
+/// and the one neither of the others can stand in for: the per-frame buffering
+/// limit and D77's connection-wide budget both judge a frame by the length it
+/// announces, while this one is knowable only once the block has been decoded.
+///
+/// RFC 9114 §4.2.2 is why the two numbers can differ so far: "The size of a
+/// field list is calculated based on the uncompressed size of fields, including
+/// the length of the name and value in bytes plus an overhead of 32 bytes for
+/// each field." A one-byte name and a one-byte value therefore cost 34 bytes of
+/// the bound and four bytes of the wire, so a few kilobytes of them decode past
+/// a 64 KiB section — and the test asserts the encoded frame stays under both of
+/// the other two limits, so the answer here can only have come from the decoder.
+///
+/// What that answer has to be is the shape D77's budget uses: 431, the receiving
+/// side stopped with H3_EXCESSIVE_LOAD, and a connection that carries on serving
+/// requests. A verdict that were merely a stream error would reset the stream
+/// with no 431 to say which part of the request to shrink; a connection error
+/// would cost the peer every tunnel on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_section_decoding_past_the_advertised_size_costs_only_that_request() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let fields = vec![(TINY_NAME, TINY_VALUE); TINY_FIELDS_PAST_THE_SECTION_SIZE];
+    let frame = common::rawstream::headers_frame(fields);
+
+    let accounted = TINY_FIELDS_PAST_THE_SECTION_SIZE as u64
+        * (TINY_NAME.len() as u64 + TINY_VALUE.len() as u64 + 32);
+    let advertised = volto::h3::MAX_FIELD_SECTION_SIZE;
+    assert!(
+        accounted > advertised,
+        "{TINY_FIELDS_PAST_THE_SECTION_SIZE} fields account for {accounted} bytes, which has \
+         to be past the advertised {advertised} for this to be a test of anything"
+    );
+    assert!(
+        (frame.len() as u64) < advertised && frame.len() < volto::h3::HEADERS_BUFFER_BUDGET,
+        "a {}-byte frame is under both of the limits judged from an announced length -- the \
+         {advertised} bytes one frame may buffer and the {} a connection may -- so a refusal \
+         can only have come from the decoded size",
+        frame.len(),
+        volto::h3::HEADERS_BUFFER_BUDGET
+    );
+
+    // Raw rather than through `client.send`: this client holds itself to RFC
+    // 9114 §7.2.4.2 and refuses to send a section past what the server
+    // advertised, which is the very request this test has to make. The
+    // connection is still the client's, so the last assertion can ask it for a
+    // working tunnel afterwards.
+    let (mut send, mut recv) = client.quic.open_bi().await.expect("open a request stream");
+    send.write_all(&frame)
+        .await
+        .expect("send a field section past the advertised size");
+
+    let (frame_type, payload) = read_frame(&mut recv).await;
+    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
+    assert_eq!(
+        status_of(&payload),
+        "431",
+        "a section this server declined to decode is refused as a request, not as a stream"
+    );
+    assert_eq!(
+        stopped_code(&mut send).await,
+        H3_EXCESSIVE_LOAD,
+        "the rest of the section is what this server declined to read, and the peer is told \
+         which code with"
+    );
+
+    assert!(
+        client.quic.close_reason().is_none(),
+        "a field section one request oversized must not cost the connection"
+    );
+    // And it is still a working connection, not merely an unclosed one.
+    let _tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
+}
+
 /// The `:status` of a response read whole from a raw request stream.
 fn status_of_response(response: &[u8]) -> String {
     let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
