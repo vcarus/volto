@@ -19,10 +19,12 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     auth_section, connect_quic, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client,
     TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
 };
+
 /// The configured idle timeout is the one that applies.
 ///
 /// Asserting both bounds matters: that the connection closes at all proves the
@@ -101,15 +103,6 @@ const INITIAL_STREAMS: usize = 16;
 /// clamp having been applied in the first place.
 const CONFIGURED_STREAMS: usize = 24;
 
-/// H3_REQUEST_CANCELLED (RFC 9114 §8.1), the code a client gives up a request
-/// stream with.
-///
-/// Spelled out rather than imported for the reason above, and used rather than
-/// simply dropping the stream: a request stream that *finishes* part-way
-/// through a frame is a connection error (H3_FRAME_ERROR), while one that is
-/// reset is the everyday abandonment this suite's threat table calls `p`.
-const H3_REQUEST_CANCELLED: u32 = 0x10c;
-
 /// A peer that has not authenticated gets the clamp, not `max_streams_bidi`.
 ///
 /// The configured allowance is what a connection is worth once a request on it
@@ -177,7 +170,7 @@ async fn an_unauthenticated_connection_is_held_to_the_initial_stream_allowance()
     // and a request that ends part-way through a frame is a connection error
     // (H3_FRAME_ERROR) rather than a stream that was given back.
     for (send, _) in &mut streams {
-        send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED))
+        send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
             .expect("abandon a request stream");
     }
     drop(streams);

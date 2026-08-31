@@ -123,6 +123,22 @@ tokio = { version = "1", features = ["test-util"] }
 # reaches the Huffman decoder).
 proptest = "1"
 
+# Debug info narrowed to what this tree actually reads back.
+#
+# `line-tables-only` keeps the file and line of every frame, which is all a
+# backtrace and `#[track_caller]` need -- and both are load-bearing here, since
+# D66 shapes the asserting test helpers around `#[track_caller]` surviving to
+# the poll that panics. What it drops is the variable, type and scope records a
+# stepping debugger would want, and nothing in this workflow is one. The saving
+# is link time and disk across the forty-three integration test binaries.
+#
+# `[profile.dev.package."*"] opt-level = 2` is the usual companion to this and
+# is deliberately absent: optimising the dependency graph moves what the D86
+# config-space property tests and `cargo mutants` are measuring, so it was
+# weighed and declined rather than overlooked.
+[profile.dev]
+debug = "line-tables-only"
+
 # TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion
 # loss burst during a bulk transfer as the path having stopped carrying the
 # current MTU: the connection drops back to the 1200-byte floor, and on the

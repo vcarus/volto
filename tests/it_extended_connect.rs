@@ -10,16 +10,13 @@
 mod common;
 
 use bytes::{Bytes, BytesMut};
-use common::rawstream::close_reason;
+use common::rawstream::{close_reason, QPACK_DECOMPRESSION_FAILED};
 use common::{
     auth_section, authorize, basic_credentials, connect_request, read_at_least, respond_to,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::h3::frame;
 use volto::h3api::{Method, Request, Status};
-
-/// QPACK_DECOMPRESSION_FAILED (RFC 9204 §6, registered in §8.3).
-const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
 
 /// The user the requests below authenticate as.
 const USER: (&str, &str) = ("surge", "s3cret-p4ssw0rd");

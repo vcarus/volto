@@ -15,6 +15,7 @@
 mod common;
 
 use bytes::{Bytes, BytesMut};
+use common::rawstream::QPACK_DECOMPRESSION_FAILED;
 use common::{
     auth_section, authorized_connect, huffman, open_tcp_tunnel, open_udp_session, read_at_least,
     respond_to, spawn_echo_target, spawn_udp_echo_target, udp_round_trip, H3Client, TestServer,
@@ -22,14 +23,6 @@ use common::{
 };
 use volto::h3::frame;
 use volto::h3api::Status;
-
-/// QPACK_DECOMPRESSION_FAILED (RFC 9204 §6, registered in §8.3).
-///
-/// The code every failure in `src/h3/huffman.rs` carries, as a stream error:
-/// RFC 7541 §5.2 calls a bad literal a "decoding error" without naming a class,
-/// and D75 settles it as a stream one because a zero-capacity dynamic table
-/// leaves nothing desynchronised behind a section that would not decode.
-const QPACK_DECOMPRESSION_FAILED: u64 = 0x200;
 
 /// The user the authenticated cases below log in as.
 const USER: (&str, &str) = ("surge", "s3cret-p4ssw0rd");
@@ -197,6 +190,12 @@ async fn a_literal_padded_with_zeroes_is_a_stream_error() {
 /// Sends `literal` as a Huffman-coded field value on a request stream of its
 /// own, and asserts the server resets that stream -- both halves -- with
 /// QPACK_DECOMPRESSION_FAILED while the connection carries on serving.
+///
+/// That code is what every failure in `src/h3/huffman.rs` carries, and a stream
+/// error rather than a connection one: RFC 7541 §5.2 calls a bad literal a
+/// "decoding error" without naming a class, and D75 settles it as a stream one
+/// because a zero-capacity dynamic table leaves nothing desynchronised behind a
+/// section that would not decode.
 async fn assert_reset_and_survives(literal: &[u8]) {
     let server = TestServer::start().await;
     let target = spawn_echo_target().await;

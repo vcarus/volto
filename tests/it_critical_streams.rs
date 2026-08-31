@@ -14,41 +14,12 @@ mod common;
 use bytes::BytesMut;
 use common::rawstream::{
     application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
-    status_of,
+    status_of, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
+    H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR, H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR,
+    QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use common::{connect_quic, TestServer, TIMEOUT};
 use volto::datagram;
-
-/// Control stream type (RFC 9114 §6.2.1).
-const STREAM_TYPE_CONTROL: u64 = 0x00;
-/// QPACK encoder stream type (RFC 9204 §4.2).
-const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
-/// QPACK decoder stream type (RFC 9204 §4.2).
-const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
-
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
-/// CANCEL_PUSH frame type (RFC 9114 §7.2.3).
-const FRAME_CANCEL_PUSH: u64 = 0x03;
-/// SETTINGS frame type (RFC 9114 §7.2.4).
-const FRAME_SETTINGS: u64 = 0x04;
-/// MAX_PUSH_ID frame type (RFC 9114 §7.2.7).
-const FRAME_MAX_PUSH_ID: u64 = 0x0d;
-
-/// H3_CLOSED_CRITICAL_STREAM (RFC 9114 §8.1).
-const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
-/// H3_ID_ERROR (RFC 9114 §8.1).
-const H3_ID_ERROR: u64 = 0x108;
-/// H3_REQUEST_CANCELLED (RFC 9114 §8.1), which the test below stops a stream
-/// with; any code would do, and this one says why without claiming a fault.
-///
-/// A `u32` because this one is *sent* by a test, and that is what
-/// [`quinn::VarInt::from_u32`] takes without a fallible conversion.
-const H3_REQUEST_CANCELLED: u32 = 0x10c;
-/// QPACK_ENCODER_STREAM_ERROR (RFC 9204 §6).
-const QPACK_ENCODER_STREAM_ERROR: u64 = 0x201;
-/// QPACK_DECODER_STREAM_ERROR (RFC 9204 §6).
-const QPACK_DECODER_STREAM_ERROR: u64 = 0x202;
 
 /// A target the destination policy refuses before the resolver is asked.
 ///
@@ -92,7 +63,7 @@ async fn server_control_stream(connection: &quinn::Connection) -> quinn::RecvStr
             .expect("the server opens its critical streams")
             .expect("accept a unidirectional stream");
 
-        if read_varint(&mut recv).await == STREAM_TYPE_CONTROL {
+        if read_varint(&mut recv).await == STREAM_CONTROL {
             return recv;
         }
     }
@@ -141,8 +112,11 @@ async fn a_stopped_control_stream_ends_the_connection() {
     let (_endpoint, connection) = connect_quic(&server).await;
 
     let mut control = server_control_stream(&connection).await;
+    // Any code would do here -- what is under test is the server's answer to
+    // being stopped at all, not what it was stopped with. H3_REQUEST_CANCELLED
+    // says why without claiming a fault of the server's.
     control
-        .stop(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED))
+        .stop(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
         .expect("stop the server's control stream");
 
     // So the STOP_SENDING is not merely queued here but processed there: it was
@@ -169,7 +143,7 @@ async fn a_cancel_push_is_an_id_error() {
 
     expect_close(
         "CANCEL_PUSH",
-        STREAM_TYPE_CONTROL,
+        STREAM_CONTROL,
         &control,
         H3_ID_ERROR,
         "CANCEL_PUSH",
@@ -189,7 +163,7 @@ async fn a_shrinking_max_push_id_is_an_id_error() {
 
     expect_close(
         "a shrinking MAX_PUSH_ID",
-        STREAM_TYPE_CONTROL,
+        STREAM_CONTROL,
         &control,
         H3_ID_ERROR,
         "shrank to 5",
@@ -225,7 +199,7 @@ async fn encoder_instructions_beyond_a_zero_table_are_refused() {
     ] {
         expect_close(
             name,
-            STREAM_TYPE_QPACK_ENCODER,
+            STREAM_QPACK_ENCODER,
             &bytes,
             QPACK_ENCODER_STREAM_ERROR,
             names,
@@ -283,7 +257,7 @@ async fn decoder_instructions_for_a_table_never_used_are_refused() {
     ] {
         expect_close(
             name,
-            STREAM_TYPE_QPACK_DECODER,
+            STREAM_QPACK_DECODER,
             &bytes,
             QPACK_DECODER_STREAM_ERROR,
             names,

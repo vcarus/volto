@@ -425,6 +425,15 @@ pub enum IpFamilyPreference {
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Seconds a UDP session may sit idle before it is closed.
+    ///
+    /// It bounds the TCP path too, despite the name: once one direction of a
+    /// TCP tunnel has ended cleanly, each write in the surviving direction has
+    /// this long to complete, which is the only thing keeping a half-closed
+    /// tunnel from holding its socket and its slot for as long as the QUIC
+    /// connection lasts (`tunnel::tcp` module docs). Both uses reach the tunnel
+    /// as [`crate::tunnel::Context::stall_budget`]. The name is the CONNECT-UDP
+    /// half alone because it is the older one and a configuration key cannot be
+    /// renamed without breaking every deployed config file.
     pub udp_session_timeout: u64,
     /// Concurrent tunnels allowed on one QUIC connection.
     pub max_targets_per_conn: u32,

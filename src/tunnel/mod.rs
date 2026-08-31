@@ -241,9 +241,16 @@ pub struct Context {
     /// the connection ends to report it on the closing line (D72); nothing here
     /// ever reads it back.
     pub tunnels: Arc<AtomicU64>,
-    /// How long a UDP session may sit idle, and how long a write in a
-    /// half-closed TCP tunnel's surviving direction has to complete in.
-    pub idle_timeout: Duration,
+    /// The longest one tunnel may make no progress before it is given up on.
+    ///
+    /// Both tunnel kinds spend it, which is why it is not named for either: a
+    /// CONNECT-UDP session that goes this long without a packet in either
+    /// direction is reclaimed, and once one direction of a TCP tunnel has ended
+    /// cleanly, each write in the surviving direction has this long to complete
+    /// (`tcp` module docs). Both come from `[limits] udp_session_timeout`,
+    /// whose name is the CONNECT-UDP half alone for compatibility -- the field
+    /// documents the other half.
+    pub stall_budget: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///
     /// Spent twice per request and separately — once on name resolution, once on
@@ -315,7 +322,7 @@ impl Context {
             quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
             max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
-            idle_timeout: config.limits.udp_session_timeout(),
+            stall_budget: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
             resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,

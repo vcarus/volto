@@ -58,62 +58,16 @@ use std::time::Duration;
 use bytes::BytesMut;
 use proptest::prelude::*;
 
-use common::rawstream::{application_close, connect_headers_frame, frame, read_frame, status_of};
+use common::rawstream::{
+    application_close, connect_headers_frame, frame, read_frame, status_of, FRAME_CANCEL_PUSH,
+    FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_PUSH_PROMISE, FRAME_SETTINGS,
+    H3_CLOSED_CRITICAL_STREAM, H3_FRAME_ERROR, H3_FRAME_UNEXPECTED, H3_ID_ERROR,
+    H3_MISSING_SETTINGS, H3_REQUEST_INCOMPLETE, H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR,
+    RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL,
+    STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+};
 use common::{connect_quic, spawn_echo_target, TestServer, TIMEOUT};
 use volto::datagram;
-
-// ---------------------------------------------------------------------------
-// The vocabulary, spelled out rather than imported
-// ---------------------------------------------------------------------------
-
-/// DATA frame type (RFC 9114 §7.2.1).
-const FRAME_DATA: u64 = 0x00;
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
-/// CANCEL_PUSH frame type (RFC 9114 §7.2.3).
-const FRAME_CANCEL_PUSH: u64 = 0x03;
-/// SETTINGS frame type (RFC 9114 §7.2.4).
-const FRAME_SETTINGS: u64 = 0x04;
-/// PUSH_PROMISE frame type (RFC 9114 §7.2.5).
-const FRAME_PUSH_PROMISE: u64 = 0x05;
-/// GOAWAY frame type (RFC 9114 §7.2.6).
-const FRAME_GOAWAY: u64 = 0x07;
-/// MAX_PUSH_ID frame type (RFC 9114 §7.2.7).
-const FRAME_MAX_PUSH_ID: u64 = 0x0d;
-
-/// The frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
-const RESERVED_HTTP2_TYPES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
-
-/// SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1): harmless from a client.
-const SETTING_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-/// SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1), whose value must be 0 or 1.
-const SETTING_H3_DATAGRAM: u64 = 0x33;
-
-/// Control stream type (RFC 9114 §6.2.1).
-const STREAM_CONTROL: u64 = 0x00;
-/// Push stream type (RFC 9114 §6.2.2), which only a server may open.
-const STREAM_PUSH: u64 = 0x01;
-/// QPACK encoder stream type (RFC 9204 §4.2).
-const STREAM_QPACK_ENCODER: u64 = 0x02;
-/// QPACK decoder stream type (RFC 9204 §4.2).
-const STREAM_QPACK_DECODER: u64 = 0x03;
-
-/// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1).
-const H3_STREAM_CREATION_ERROR: u64 = 0x103;
-/// H3_CLOSED_CRITICAL_STREAM (RFC 9114 §8.1).
-const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
-/// H3_FRAME_UNEXPECTED (RFC 9114 §8.1).
-const H3_FRAME_UNEXPECTED: u64 = 0x105;
-/// H3_FRAME_ERROR (RFC 9114 §8.1).
-const H3_FRAME_ERROR: u64 = 0x106;
-/// H3_ID_ERROR (RFC 9114 §8.1).
-const H3_ID_ERROR: u64 = 0x108;
-/// H3_SETTINGS_ERROR (RFC 9114 §8.1).
-const H3_SETTINGS_ERROR: u64 = 0x109;
-/// H3_MISSING_SETTINGS (RFC 9114 §8.1).
-const H3_MISSING_SETTINGS: u64 = 0x10a;
-/// H3_REQUEST_INCOMPLETE (RFC 9114 §8.1).
-const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
 
 /// A reserved "grease" type of the form `0x1f * N + 0x21` (RFC 9114 §7.2.8).
 fn grease_type(n: u64) -> u64 {
@@ -298,7 +252,7 @@ impl ControlEvent {
     /// The event's bytes on the wire.
     fn bytes(&self) -> Vec<u8> {
         match self {
-            Self::Settings => settings_frame(&[(SETTING_MAX_FIELD_SECTION_SIZE, 65536)]),
+            Self::Settings => settings_frame(&[(SETTINGS_MAX_FIELD_SECTION_SIZE, 65536)]),
             // 0x1f * N + 0x21 is reserved for greasing settings identifiers
             // too (RFC 9114 §7.2.4.1), so this is exactly what a greasing
             // client sends.
@@ -306,17 +260,17 @@ impl ControlEvent {
             // SETTINGS_ENABLE_CONNECT_PROTOCOL is 0x08 (RFC 8441 §3).
             Self::SettingsConnectProtocolOutOfRange => settings_frame(&[(0x08, 5)]),
             Self::SettingsDuplicatePair => settings_frame(&[
-                (SETTING_MAX_FIELD_SECTION_SIZE, 65536),
-                (SETTING_MAX_FIELD_SECTION_SIZE, 65536),
+                (SETTINGS_MAX_FIELD_SECTION_SIZE, 65536),
+                (SETTINGS_MAX_FIELD_SECTION_SIZE, 65536),
             ]),
             // 0x00 is SETTINGS_HEADER_TABLE_SIZE in HTTP/2 and reserved here.
             Self::SettingsReservedId => settings_frame(&[(0x00, 0)]),
-            Self::SettingsBadDatagramValue => settings_frame(&[(SETTING_H3_DATAGRAM, 2)]),
+            Self::SettingsBadDatagramValue => settings_frame(&[(SETTINGS_H3_DATAGRAM, 2)]),
             Self::SettingsTruncatedPair => {
                 // An identifier with no value behind it, inside a length that
                 // is honest about it: the payload itself ends mid-pair.
                 let mut payload = BytesMut::new();
-                datagram::put_varint(&mut payload, SETTING_MAX_FIELD_SECTION_SIZE);
+                datagram::put_varint(&mut payload, SETTINGS_MAX_FIELD_SECTION_SIZE);
                 frame(FRAME_SETTINGS, &payload)
             }
             Self::Goaway(id) => varint_frame(FRAME_GOAWAY, *id),
@@ -821,7 +775,7 @@ proptest! {
                         let stream = open_uni_tolerant(
                             &connection,
                             STREAM_CONTROL,
-                            &settings_frame(&[(SETTING_MAX_FIELD_SECTION_SIZE, 65536)]),
+                            &settings_frame(&[(SETTINGS_MAX_FIELD_SECTION_SIZE, 65536)]),
                         )
                         .await;
                         control = stream;
@@ -1242,7 +1196,7 @@ async fn commit_fatal(
             let bytes = if kind == FRAME_PUSH_PROMISE {
                 frame(kind, b"\x00")
             } else if kind == FRAME_SETTINGS {
-                settings_frame(&[(SETTING_MAX_FIELD_SECTION_SIZE, 65536)])
+                settings_frame(&[(SETTINGS_MAX_FIELD_SECTION_SIZE, 65536)])
             } else {
                 varint_frame(kind, 4)
             };

@@ -30,7 +30,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::rawstream::{
     assert_closed_with, authenticated_connect_headers_frame, connect_headers_frame, read_frame,
-    status_of,
+    status_of, FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
 };
 use common::{
     auth_section, authorized_connect, basic_credentials, client_endpoint,
@@ -46,22 +46,14 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::NamedGroup;
 use volto::h3api::Status;
 
-/// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1), the code the server hangs up with.
-const H3_STREAM_CREATION_ERROR: u64 = 0x103;
-
-/// H3_NO_ERROR (RFC 9114 §8.1): a close with nothing to report.
-const H3_NO_ERROR: u64 = 0x100;
-
 /// APPLICATION_ERROR (RFC 9000 §20.1), the transport code a server sends when it
 /// closes for an application reason before the handshake has completed
 /// (RFC 9000 §10.2.3).
+///
+/// Kept here rather than beside `common::rawstream`'s codes: those are the
+/// HTTP/3 registry of RFC 9114 §8.1, and this is a QUIC transport code from a
+/// different one.
 const APPLICATION_ERROR: u64 = 0x0c;
-
-/// H3_REQUEST_INCOMPLETE (RFC 9114 §8.1).
-const H3_REQUEST_INCOMPLETE: u64 = 0x10d;
-
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
 
 /// Room for two connections at a time, on top of the 1s idle timeout.
 ///

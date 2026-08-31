@@ -192,7 +192,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         },
         oversize_reported: false,
         eviction_reported: false,
-        deadline: tokio::time::Instant::now() + ctx.idle_timeout,
+        deadline: tokio::time::Instant::now() + ctx.stall_budget,
         ctx,
     };
 
@@ -371,7 +371,7 @@ impl Session {
             let Some(event) = before_deadline(self.deadline, sources).await else {
                 debug!(
                     stream_id,
-                    timeout_secs = self.ctx.idle_timeout.as_secs(),
+                    timeout_secs = self.ctx.stall_budget.as_secs(),
                     "udp session idle timeout"
                 );
                 break;
@@ -428,7 +428,7 @@ impl Session {
     /// drops counts for nothing, because the budget exists precisely to doubt
     /// that consent.
     fn touch(&mut self) {
-        self.deadline = tokio::time::Instant::now() + self.ctx.idle_timeout;
+        self.deadline = tokio::time::Instant::now() + self.ctx.stall_budget;
     }
 
     /// Forwards a payload received from the client to the target.
@@ -616,7 +616,7 @@ impl Session {
         // ends with would then FIN a truncated capsule — malformed by RFC 9297
         // §3.3. So the stream is reset instead, which says the same thing
         // without leaving a half-written frame behind.
-        match tokio::time::timeout(self.ctx.idle_timeout, self.writer.send_data(encoded)).await {
+        match tokio::time::timeout(self.ctx.stall_budget, self.writer.send_data(encoded)).await {
             Ok(Ok(())) => Step::Continue,
             Ok(Err(error)) => {
                 debug!(%error, "failed to send a DATAGRAM capsule");
@@ -625,7 +625,7 @@ impl Session {
             Err(_elapsed) => {
                 debug!(
                     quarter_stream_id = self.quarter_stream_id,
-                    timeout_secs = self.ctx.idle_timeout.as_secs(),
+                    timeout_secs = self.ctx.stall_budget.as_secs(),
                     "client stopped reading the capsule stream, resetting it"
                 );
                 self.writer.reset(h3api::REQUEST_CANCELLED);

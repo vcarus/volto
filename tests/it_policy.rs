@@ -9,6 +9,7 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::rawstream::H3_NO_ERROR;
 use common::Response;
 use common::{
     assert_peer_reset, auth_section, authorize, authorized_connect, basic_credentials,
@@ -369,10 +370,6 @@ async fn a_blackholed_udp_target_is_accepted_then_closed() {
 /// path, which reaches the shared close through a different route.
 #[tokio::test]
 async fn a_tunnel_closed_on_the_spot_stops_the_client_with_no_error() {
-    /// RFC 9114 §8.1: "no error. This is used when the connection or stream
-    /// needs to be closed, but there is no error to signal."
-    const H3_NO_ERROR: u64 = 0x100;
-
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 

@@ -354,7 +354,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
             HalfClose {
                 mine: client_finished,
                 other: target_eof_rx,
-                budget: ctx.idle_timeout,
+                budget: ctx.stall_budget,
             },
         ),
         target_to_client(
@@ -365,7 +365,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
             HalfClose {
                 mine: target_eof,
                 other: client_finished_rx,
-                budget: ctx.idle_timeout,
+                budget: ctx.stall_budget,
             },
         ),
     );

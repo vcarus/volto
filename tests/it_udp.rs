@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::rawstream::{H3_DATAGRAM_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     assert_peer_reset, closed_udp_address, connect_udp_request, open_udp_session,
     open_udp_session_to, respond_to, spawn_flooding_udp_target, spawn_large_reply_udp_target,
@@ -14,17 +15,6 @@ use common::{
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
-
-/// H3_DATAGRAM_ERROR, the code RFC 9297 §2.1 names for an unusable datagram.
-const H3_DATAGRAM_ERROR: u64 = 0x33;
-
-/// H3_NO_ERROR, RFC 9114 §8.1: "no error. This is used when the connection or
-/// stream needs to be closed, but there is no error to signal."
-const H3_NO_ERROR: u64 = 0x100;
-
-/// H3_REQUEST_CANCELLED, RFC 9114 §8.1: "the request or its response --
-/// including pushed response -- is cancelled".
-const H3_REQUEST_CANCELLED: u64 = 0x10c;
 
 /// Waits for the server to close the QUIC connection, returning its error code.
 ///

@@ -9,21 +9,12 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::connect_headers_frame;
+use common::rawstream::{connect_headers_frame, H3_REQUEST_REJECTED};
 use common::{
     connect_request, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
     spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT,
     TIMEOUT,
 };
-
-/// H3_REQUEST_REJECTED, RFC 9114 §8.1: "A server rejected a request without
-/// performing any application processing."
-///
-/// §4.1.1 is where it is asked for: "When the server cancels a request without
-/// performing any application processing, the request is considered
-/// 'rejected'. The server SHOULD abort its response stream with the error code
-/// H3_REQUEST_REJECTED."
-const H3_REQUEST_REJECTED: u64 = 0x10b;
 
 /// The distance between consecutive client-initiated bidirectional stream ids
 /// (RFC 9000 §2.1), and so between one request and the next.

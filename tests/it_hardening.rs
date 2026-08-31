@@ -10,25 +10,16 @@ mod common;
 use std::time::Duration;
 
 use bytes::BytesMut;
-use common::rawstream::{assert_closed_with, authenticate, read_frame, status_of, stopped_code};
+use common::rawstream::{
+    assert_closed_with, authenticate, read_frame, status_of, stopped_code, FRAME_HEADERS,
+    H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
+};
 use common::{
     auth_section, authorized_connect, connect_quic, connect_request, open_tcp_tunnel,
     spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
 };
 use volto::datagram;
 use volto::h3api::{Request, Status};
-
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
-
-/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
-const H3_EXCESSIVE_LOAD: u64 = 0x107;
-
-/// H3_REQUEST_CANCELLED (RFC 9114 §8.1).
-const H3_REQUEST_CANCELLED: u64 = 0x10c;
-
-/// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1).
-const H3_STREAM_CREATION_ERROR: u32 = 0x103;
 
 /// A 2s idle timeout, which is also how long an answer to a request may take.
 ///
@@ -772,7 +763,7 @@ async fn a_unidirectional_stream_that_never_names_its_type_is_abandoned() {
         .expect("the stalled stream must be stopped, not broken");
     assert_eq!(
         stopped,
-        Some(quinn::VarInt::from_u32(H3_STREAM_CREATION_ERROR)),
+        Some(quinn::VarInt::from_u32(H3_STREAM_CREATION_ERROR as u32)),
         "a stream that never declared itself is aborted the way an unknown one is"
     );
 

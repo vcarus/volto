@@ -68,13 +68,11 @@ use volto::h3::varint;
 use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
 
 use super::huffman;
+use super::rawstream::{
+    RESERVED_HTTP2_TYPES, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+};
 use super::{client_endpoint_with_transport, connect_quic, connect_quic_with_ca, finish_connect};
 use super::{TestServer, TIMEOUT};
-
-/// Unidirectional stream types this client opens (RFC 9114 §6.2, RFC 9204 §4.2).
-const STREAM_CONTROL: u64 = 0x00;
-const STREAM_QPACK_ENCODER: u64 = 0x02;
-const STREAM_QPACK_DECODER: u64 = 0x03;
 
 /// Largest control-stream frame payload this client will buffer.
 ///
@@ -84,19 +82,6 @@ const STREAM_QPACK_DECODER: u64 = 0x03;
 /// bound `volto::h3::frame` puts on every frame it buffers, so a server that
 /// outgrew what it will itself accept is refused at both ends.
 const MAX_CONTROL_FRAME: u64 = volto::h3::MAX_FIELD_SECTION_SIZE;
-
-/// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
-///
-/// §7.2.8: "Frame types that were used in HTTP/2 where there is no
-/// corresponding HTTP/3 frame have also been reserved (Section 11.2.1). These
-/// frame types MUST NOT be sent, and their receipt MUST be treated as a
-/// connection error of type H3_FRAME_UNEXPECTED."
-///
-/// Transcribed from that section rather than shared with the server's own list:
-/// what this sends is what the RFC reserves, so a type the server has forgotten
-/// fails the test instead of quietly agreeing with it. Same reasoning as
-/// [`super::huffman`].
-const RESERVED_HTTP2_FRAMES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
 
 /// Sentinel for "the server has not sent GOAWAY yet".
 ///
@@ -1079,7 +1064,7 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
                 ));
             }
 
-            kind if RESERVED_HTTP2_FRAMES.contains(&kind) => {
+            kind if RESERVED_HTTP2_TYPES.contains(&kind) => {
                 peer.broke(format!(
                     "the server sent frame type {kind:#x}, reserved because HTTP/2 used it"
                 ));

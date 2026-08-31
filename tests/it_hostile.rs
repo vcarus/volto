@@ -88,6 +88,10 @@ use bytes::{Bytes, BytesMut};
 use common::rawstream::{
     application_close, assert_closed_with, authenticate, authenticated_connect_headers_frame,
     connect_headers_frame, frame, headers_frame, open_uni_stream, read_frame, status_of,
+    FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
+    FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
+    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
+    STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use common::{
     auth_section, basic_credentials, client_endpoint, client_endpoint_with_transport, connect_quic,
@@ -97,60 +101,19 @@ use common::{
 use volto::datagram;
 
 // ---------------------------------------------------------------------------
-// The vocabulary, spelled out rather than imported
+// The numbers this file spells out for itself
 // ---------------------------------------------------------------------------
 //
-// These are the bytes the server is asked to parse and the codes it is asked to
-// answer with. A test that took them from the server's own constants would agree
-// with it whatever it held.
-
-/// DATA frame type (RFC 9114 §7.2.1).
-const FRAME_DATA: u64 = 0x00;
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
-/// CANCEL_PUSH frame type (RFC 9114 §7.2.3).
-const FRAME_CANCEL_PUSH: u64 = 0x03;
-/// SETTINGS frame type (RFC 9114 §7.2.4).
-const FRAME_SETTINGS: u64 = 0x04;
-/// PUSH_PROMISE frame type (RFC 9114 §7.2.5).
-const FRAME_PUSH_PROMISE: u64 = 0x05;
-/// GOAWAY frame type (RFC 9114 §7.2.6).
-const FRAME_GOAWAY: u64 = 0x07;
-/// MAX_PUSH_ID frame type (RFC 9114 §7.2.7).
-const FRAME_MAX_PUSH_ID: u64 = 0x0d;
-
-/// Control stream type (RFC 9114 §6.2.1).
-const STREAM_CONTROL: u64 = 0x00;
-/// Push stream type (RFC 9114 §6.2.2), which only a server may open.
-const STREAM_PUSH: u64 = 0x01;
-/// QPACK encoder stream type (RFC 9204 §4.2).
-const STREAM_QPACK_ENCODER: u64 = 0x02;
-/// QPACK decoder stream type (RFC 9204 §4.2).
-const STREAM_QPACK_DECODER: u64 = 0x03;
+// The frame types, stream types and error codes are `common::rawstream`'s,
+// transcribed from the RFCs there for the reason the bounds below are written
+// out here: what a test asks the server to parse, holds it to answering with,
+// or drives it one past must not be read from the server's own constants.
 
 /// A reserved stream or frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
 ///
 /// N is arbitrary: every value of it names something an endpoint must ignore or
 /// abort rather than fault on.
 const GREASE: u64 = 0x1f * 7 + 0x21;
-
-/// H3_NO_ERROR (RFC 9114 §8.1): a close with nothing to report.
-const H3_NO_ERROR: u64 = 0x100;
-/// H3_STREAM_CREATION_ERROR (RFC 9114 §8.1).
-const H3_STREAM_CREATION_ERROR: u64 = 0x103;
-/// H3_CLOSED_CRITICAL_STREAM (RFC 9114 §8.1).
-const H3_CLOSED_CRITICAL_STREAM: u64 = 0x104;
-/// H3_FRAME_UNEXPECTED (RFC 9114 §8.1).
-const H3_FRAME_UNEXPECTED: u64 = 0x105;
-/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
-const H3_EXCESSIVE_LOAD: u64 = 0x107;
-/// H3_ID_ERROR (RFC 9114 §8.1).
-const H3_ID_ERROR: u64 = 0x108;
-/// H3_REQUEST_CANCELLED (RFC 9114 §8.1).
-///
-/// A `u32` because this one is also *sent* by the tests below, and that is what
-/// [`quinn::VarInt::from_u32`] takes without a fallible conversion.
-const H3_REQUEST_CANCELLED: u32 = 0x10c;
 
 /// The most unidirectional streams this server lets a peer have at once.
 ///
@@ -1145,7 +1108,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
         );
 
         for mut send in senders {
-            let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED));
+            let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32));
         }
     }
 
@@ -1744,7 +1707,7 @@ async fn the_shipped_write_deadline_ends_an_unread_refusal() {
         .expect("the request stream must be reset, not broken");
     assert_eq!(
         reset.map(quinn::VarInt::into_inner),
-        Some(u64::from(H3_REQUEST_CANCELLED)),
+        Some(H3_REQUEST_CANCELLED),
         "an abandoned answer is a cancelled request"
     );
 

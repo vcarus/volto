@@ -15,20 +15,13 @@
 mod common;
 
 use bytes::Bytes;
-use common::rawstream::open_uni_stream;
+use common::rawstream::{open_uni_stream, STREAM_PUSH};
 use common::{
     connect_quic, open_tcp_tunnel, open_udp_session, read_at_least, recv_datagram,
     spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
     IMPATIENT, STOP_TIMEOUT, TIMEOUT,
 };
 use volto::datagram;
-
-/// Push stream type (RFC 9114 §6.2.2), which only a server may open.
-///
-/// Spelled out rather than imported: these are the bytes the server is asked to
-/// read, and a test that took them from its own constants would agree with it
-/// whatever it held.
-const STREAM_PUSH: u64 = 0x01;
 
 /// Reads a numeric field's value off a formatted log line.
 ///

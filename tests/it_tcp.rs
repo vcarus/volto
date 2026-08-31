@@ -10,6 +10,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::rawstream::{
     assert_closed_with, connect_headers_frame, frame, headers_frame, read_frame, status_of,
+    FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
+    H3_REQUEST_CANCELLED,
 };
 use common::{
     assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
@@ -22,25 +24,6 @@ use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
-
-/// H3_CONNECT_ERROR (RFC 9114 §8.1).
-const H3_CONNECT_ERROR: u64 = 0x010f;
-
-/// H3_MESSAGE_ERROR (RFC 9114 §8.1), the answer to a malformed request.
-const H3_MESSAGE_ERROR: u64 = 0x010e;
-
-/// H3_FRAME_UNEXPECTED (RFC 9114 §8.1), the answer to a frame out of place.
-const H3_FRAME_UNEXPECTED: u64 = 0x0105;
-
-/// H3_REQUEST_CANCELLED (RFC 9114 §8.1): "The request or its response
-/// (including pushed response) is cancelled."
-const H3_REQUEST_CANCELLED: u64 = 0x010c;
-
-/// DATA frame type (RFC 9114 §7.2.1).
-const FRAME_DATA: u64 = 0x00;
-
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
 
 /// A 2s idle timeout, which is also how long any one response may take.
 ///

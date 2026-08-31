@@ -14,7 +14,9 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
     self, connect_headers_frame, connect_udp_headers_frame, open_uni_stream, read_frame, status_of,
-    stopped_code,
+    stopped_code, FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, H3_EXCESSIVE_LOAD,
+    H3_MISSING_SETTINGS, SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM,
+    SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL,
 };
 use common::{
     client_endpoint_with_transport, connect_quic, finish_connect, spawn_udp_echo_target,
@@ -23,29 +25,8 @@ use common::{
 use volto::capsule::{Capsule, CapsuleDecoder};
 use volto::datagram;
 
-/// Unidirectional stream type of the HTTP/3 control stream (RFC 9114 §6.2.1).
-const STREAM_TYPE_CONTROL: u64 = 0x00;
-
-/// SETTINGS frame type (RFC 9114 §7.2.4).
-const FRAME_SETTINGS: u64 = 0x04;
-
-/// SETTINGS_ENABLE_CONNECT_PROTOCOL (RFC 9220 / RFC 8441 §3).
-const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
-
-/// SETTINGS_H3_DATAGRAM (RFC 9297 §2.1.1).
-const SETTINGS_H3_DATAGRAM: u64 = 0x33;
-
-/// SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1).
-const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
-
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
-
-/// HEADERS frame type (RFC 9114 §7.2.2).
-const FRAME_HEADERS: u64 = 0x01;
-
-/// DATA frame type (RFC 9114 §7.2.1).
-const FRAME_DATA: u64 = 0x00;
 
 /// How many unidirectional streams to inspect before giving up.
 ///
@@ -101,9 +82,6 @@ async fn server_advertises_a_header_size_limit() {
         "the advertised limit must be a real bound, got {advertised}"
     );
 }
-
-/// H3_EXCESSIVE_LOAD (RFC 9114 §8.1).
-const H3_EXCESSIVE_LOAD: u64 = 0x107;
 
 /// A client that respects SETTINGS never sends an oversized field section, so
 /// this asserts what happens to the one that does not.
@@ -203,9 +181,6 @@ async fn server_advertises_max_datagram_frame_size() {
     );
 }
 
-/// H3_MISSING_SETTINGS (RFC 9114 §8.1).
-const H3_MISSING_SETTINGS: u64 = 0x10a;
-
 /// The control stream must *open* with SETTINGS — a frame the server skips is
 /// still a frame, and so is one that carries nothing.
 ///
@@ -237,7 +212,7 @@ async fn a_frame_before_settings_ends_the_connection() {
         // sending nothing after the offending frame would leave the server
         // waiting rather than deciding.
         control.extend_from_slice(&settings_frame());
-        let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &control).await;
+        let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
         let (code, reason) = rawstream::application_close(&connection, TIMEOUT).await;
         assert_eq!(
@@ -255,7 +230,7 @@ async fn read_settings(connection: &quinn::Connection) -> HashMap<u64, u64> {
             .expect("a unidirectional stream arrived")
             .expect("unidirectional stream");
 
-        if read_varint(&mut recv).await != STREAM_TYPE_CONTROL {
+        if read_varint(&mut recv).await != STREAM_CONTROL {
             // A grease stream or a QPACK stream; keep looking.
             continue;
         }
@@ -418,7 +393,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 
     // Only now does the peer say datagrams are allowed. The control stream is
     // kept open for the rest of the test: closing it is H3_CLOSED_CRITICAL_STREAM.
-    let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
 
     // From here the reply must arrive as a QUIC datagram. Retried rather than
     // slept on: the SETTINGS frame and this datagram are in flight at the same
@@ -495,7 +470,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     // and no `max_datagram_frame_size` to send one with.
 
     // The contradiction, on the control stream: datagrams are welcome.
-    let _control = open_uni_stream(&connection, STREAM_TYPE_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     send.write_all(&connect_udp_headers_frame(
