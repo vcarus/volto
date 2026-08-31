@@ -1814,11 +1814,32 @@ mod tests {
     ///
     /// Bounded on both sides: the sessions do a fixed number of rounds, and the
     /// router stops on their last one or on its own deadline, whichever comes
-    /// first, so nothing here can spin.
+    /// first, so nothing here can spin. Each session also *waits* for its first
+    /// delivery rather than sampling for one -- `FIRST_DELIVERY` below says why
+    /// -- so that what the assertions judge is the table rather than how the
+    /// machine happened to schedule the router.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delivery_racing_registration_neither_misroutes_nor_leaks() {
         const SESSIONS: u64 = 24;
         const ROUNDS: usize = 128;
+        /// How long a session waits for its first delivery before the run is
+        /// judged to have failed rather than to have been unlucky.
+        ///
+        /// The sessions and the router race by design, and on a loaded machine
+        /// the router can lose that race outright: it is one task against
+        /// `SESSIONS` of them, and a session that only ever `try_recv`s can run
+        /// all `ROUNDS` of its loop through an empty queue and finish having
+        /// received nothing. That is this test's own scheduling, not a routing
+        /// fault, and it used to surface as the "nothing was ever routed"
+        /// assertion failing under parallel load.
+        ///
+        /// Waiting once per session fixes the shape rather than the symptom --
+        /// every session now starts from a delivery it can account for, and the
+        /// churn of claims and drops that actually runs the race is unchanged
+        /// in the `ROUNDS - 1` rounds after it. Nothing here is being measured,
+        /// so the number only has to outlast any scheduling delay while staying
+        /// well inside the router's own 30s deadline.
+        const FIRST_DELIVERY: Duration = Duration::from_secs(10);
 
         let shared = Arc::new(Shared::default());
         let stop = Arc::new(AtomicBool::new(false));
@@ -1857,6 +1878,34 @@ mod tests {
                         let mut inbound = shared.register_datagrams(id).unwrap_or_else(|| {
                             panic!("session {id} could not re-claim its own id on round {round}")
                         });
+
+                        // The one blocking wait, and only on the round that has
+                        // no predecessor to have left anything in the queue.
+                        // What arrives here is a delivery like any other, so it
+                        // is held to the same misroute assertion and counted
+                        // the same way.
+                        if round == 0 {
+                            let first = tokio::time::timeout(
+                                FIRST_DELIVERY,
+                                inbound.inbound.recv(),
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                panic!(
+                                    "session {id} was not delivered to within {FIRST_DELIVERY:?}"
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                panic!("session {id}'s queue closed while it held the receiver")
+                            });
+                            assert_eq!(
+                                first.as_ref(),
+                                id.to_be_bytes().as_slice(),
+                                "session {id} was handed another session's payload"
+                            );
+                            received += 1;
+                        }
+
                         while let Ok(payload) = inbound.inbound.try_recv() {
                             assert_eq!(
                                 payload.as_ref(),
