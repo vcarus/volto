@@ -58,6 +58,38 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  msrv:
+    # `rust-version = "1.88"` in Cargo.toml and the "Rust 1.88+" in the public
+    # docs are claims about the oldest toolchain that builds this crate, but
+    # every other job runs `stable`: nothing would notice a newer API slipping
+    # in, because the field itself only stops a *user* whose cargo is older --
+    # it never checks our code against the declared version. This job builds on
+    # exactly that version, so the claim stays true rather than asserted.
+    name: msrv
+    runs-on: ubuntu-latest
+    env:
+      # The single place this workflow spells the version; the first step
+      # asserts it against Cargo.toml, so the two cannot drift apart silently.
+      MSRV: "1.88"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert the pin matches Cargo.toml
+        run: |
+          declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "$declared" != "$MSRV" ]; then
+            echo "::error::Cargo.toml declares rust-version ${declared:-<none>} but this job pins $MSRV"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # `check` rather than `test`: whether the suite passes is the `test`
+      # job's question, on the toolchain deployments actually build with. The
+      # MSRV question is only whether every target still compiles, dev-deps
+      # included -- which is also why this is `--all-targets`.
+      - run: cargo check --all-targets --locked
+
   audit:
     # RustSec advisories against the committed `Cargo.lock`. Dependabot already
     # proposes version bumps, but a Dependabot PR is only a suggestion: nothing
