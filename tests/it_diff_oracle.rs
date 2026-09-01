@@ -25,7 +25,7 @@ use std::borrow::Cow;
 
 use volto::h3::error::Code;
 use volto::h3::qpack::{self, Field};
-use volto::h3::{huffman, stream, MAX_FIELD_SECTION_SIZE};
+use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman, stream};
 
 /// A field section: the `0x00 0x00` prefix of RFC 9204 §4.5.1, then `body`.
 fn section(body: &[u8]) -> Vec<u8> {

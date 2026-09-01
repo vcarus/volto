@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing::{error, info, warn, Event, Level, Subscriber};
+use tracing::{Event, Level, Subscriber, error, info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
@@ -135,7 +135,7 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
 /// it means a revoked user keeps their current tunnels until they reconnect.
 #[cfg(unix)]
 async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut hangup = match signal(SignalKind::hangup()) {
         Ok(stream) => stream,
@@ -170,7 +170,7 @@ async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
 async fn watch_for_signals(trigger: Trigger) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut terminate = match signal(SignalKind::terminate()) {
             Ok(stream) => stream,
@@ -311,9 +311,9 @@ where
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tracing_subscriber::fmt::format::{DefaultFields, Format};
-    use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::Registry;
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::fmt::format::{DefaultFields, Format};
 
     use super::*;
 

@@ -21,7 +21,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
-use common::{open_tcp_tunnel, H3Client, TestServer, TIMEOUT};
+use common::{H3Client, TIMEOUT, TestServer, open_tcp_tunnel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

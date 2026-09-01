@@ -22,8 +22,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    connect_request, open_udp_session, respond_to, send_udp_payload, spawn_large_reply_udp_target,
-    H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, open_udp_session,
+    respond_to, send_udp_payload, spawn_large_reply_udp_target,
 };
 use volto::h3api::Status;
 

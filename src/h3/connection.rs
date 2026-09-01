@@ -48,8 +48,8 @@
 //! *reason*, which quinn overwrites with "closed locally" -- so it is recorded
 //! on the way past and read back by [`Connection::accept`].
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -65,7 +65,7 @@ use crate::datagram::{self, peek_varint, put_varint, varint_len};
 use super::error::{Code, ConnectionError, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use super::stream::Resolver;
-use super::{varint, MAX_VARINT};
+use super::{MAX_VARINT, varint};
 
 /// Control stream (RFC 9114 §6.2.1).
 const STREAM_CONTROL: u64 = 0x00;
@@ -592,7 +592,7 @@ impl Connection {
                 return Err(handle.fail(Violation::connection(
                     Code::H3_STREAM_CREATION_ERROR,
                     "the HTTP/3 handshake did not complete within one idle timeout",
-                )))
+                )));
             }
         };
 
@@ -1101,7 +1101,7 @@ impl Control {
                     unexpected("a DATA frame on the control stream")
                 } else {
                     missing_settings()
-                })
+                });
             }
 
             // RFC 9114 §9's rule that unknown values are ignored, quoted in

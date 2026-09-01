@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{closed_address, connect_request, respond_to, H3Client, SharedBuffer, TestServer};
+use common::{H3Client, SharedBuffer, TestServer, closed_address, connect_request, respond_to};
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {

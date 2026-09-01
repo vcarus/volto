@@ -83,8 +83,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
@@ -431,7 +431,7 @@ where
                             io::ErrorKind::TimedOut,
                             "the connect budget expired before the target answered",
                         ),
-                    })
+                    });
                 }
             },
             None => attempt.await,
@@ -944,8 +944,8 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        connect_any_with, ensure_window, split_authority, HalfClose, RELAY_BLOCK_SIZE,
-        RELAY_BUF_SIZE,
+        HalfClose, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, connect_any_with, ensure_window,
+        split_authority,
     };
     // The deadlines here and the resolver's are asserted the same way; the
     // helper lives beside the first of them rather than in both files.

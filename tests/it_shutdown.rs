@@ -9,11 +9,11 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::{connect_headers_frame, H3_REQUEST_REJECTED};
+use common::rawstream::{H3_REQUEST_REJECTED, connect_headers_frame};
 use common::{
-    close_and_drain, connect_request, echoes, open_tcp_tunnel, open_udp_session, spawn_echo_target,
-    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE, STOP_TIMEOUT,
-    TIMEOUT,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, TIMEOUT, TestServer, close_and_drain, connect_request,
+    echoes, open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target,
+    udp_round_trip,
 };
 
 /// The distance between consecutive client-initiated bidirectional stream ids

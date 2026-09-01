@@ -27,11 +27,11 @@
 
 use bytes::Bytes;
 
+pub use crate::h3::MAX_FIELD_SECTION_SIZE;
 pub use crate::h3::connection::{Connection, DatagramReceiver};
 pub use crate::h3::error::{Code, ConnectionError, StreamError};
 pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};
 pub use crate::h3::stream::{Reader, Resolver, RespondError, Stream, Writer};
-pub use crate::h3::MAX_FIELD_SECTION_SIZE;
 
 /// The buffer type carried over HTTP/3 streams.
 pub type Buffer = Bytes;

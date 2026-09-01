@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::{
-    connect_request, open_tcp_tunnel, open_udp_session, send_and_respond, spawn_echo_target,
-    spawn_udp_echo_target, udp_round_trip, ClientStream, H3Client, TestServer, TIMEOUT,
+    ClientStream, H3Client, TIMEOUT, TestServer, connect_request, open_tcp_tunnel,
+    open_udp_session, send_and_respond, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 use volto::datagram::put_varint;
 use volto::h3api::{FieldValue, Request, Status};

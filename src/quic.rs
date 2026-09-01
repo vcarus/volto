@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use quinn::crypto::rustls::{HandshakeData, QuicServerConfig};
 use quinn::{IdleTimeout, VarInt};
 use socket2::SockRef;
@@ -793,7 +793,7 @@ impl Server {
     /// future drops the HTTP/3 connection, whose own `Drop` closes the QUIC
     /// connection with H3_NO_ERROR — nothing went wrong, the slot was simply
     /// owed to somebody else.
-    fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> {
+    fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> + use<> {
         // Snapshotted per connection, not read live: a reload changes what new
         // connections get, while a connection already running keeps the
         // credentials and policy it started with for its whole life. Anything else

@@ -23,26 +23,27 @@ mod common;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::Location;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::rawstream::{
+    FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
     assert_closed_with, authenticate, authenticated_connect_headers_frame, read_frame, status_of,
-    still_serving, FRAME_HEADERS, H3_NO_ERROR, H3_REQUEST_INCOMPLETE, H3_STREAM_CREATION_ERROR,
+    still_serving,
 };
 use common::{
-    auth_section, authorized_connect, basic_credentials, client_endpoint,
-    client_endpoint_with_transport, echoes, finish_connect, open_tcp_tunnel, send_and_respond,
-    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, authorized_connect,
+    basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, finish_connect,
+    open_tcp_tunnel, send_and_respond, spawn_echo_target,
 };
 use quinn::crypto::rustls::QuicClientConfig;
+use rustls::NamedGroup;
 use rustls::client::{
     ClientSessionMemoryCache, ClientSessionStore, Resumption, Tls12ClientSessionValue,
     Tls13ClientSessionValue,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::NamedGroup;
 use volto::h3api::Status;
 
 /// APPLICATION_ERROR (RFC 9000 §20.1), the transport code a server sends when it
@@ -1128,7 +1129,9 @@ fn is_retry(datagram: &[u8]) -> bool {
 /// than about the transport's: with it, every ACK restarts the server's idle
 /// timer, so the transport can never be the thing that closes the connection.
 #[track_caller]
-fn silent_peer(server: &TestServer) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> {
+fn silent_peer(
+    server: &TestServer,
+) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> + use<> {
     let caller = Location::caller();
     let ca = server.ca.clone();
     let addr = server.addr;

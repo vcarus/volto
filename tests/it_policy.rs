@@ -9,14 +9,14 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::rawstream::H3_NO_ERROR;
 use common::Response;
+use common::rawstream::H3_NO_ERROR;
 use common::{
-    assert_peer_reset, auth_section, authorize, authorized_connect, basic_credentials,
-    close_and_drain, connect_request, connect_udp_request, echoes, open_tcp_tunnel,
-    open_udp_session, proxy_status, respond_to, send_and_respond, send_udp_payload,
-    spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target, udp_round_trip, H3Client,
-    TestServer, ALLOW_PRIVATE, TIMEOUT,
+    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
+    authorized_connect, basic_credentials, close_and_drain, connect_request, connect_udp_request,
+    echoes, open_tcp_tunnel, open_udp_session, proxy_status, respond_to, send_and_respond,
+    send_udp_payload, spawn_echo_target, spawn_silent_udp_target, spawn_udp_echo_target,
+    udp_round_trip,
 };
 use volto::h3api::{FieldValue, Request, Status};
 

@@ -52,12 +52,12 @@ use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
 use common::{
-    close_and_drain, open_tcp_tunnel, open_udp_session, read_to_end, H3Client, TestServer,
-    ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, TestServer, close_and_drain, open_tcp_tunnel, open_udp_session,
+    read_to_end,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use volto::datagram;
 
 // ---------------------------------------------------------------------------

@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use common::{
-    open_tcp_tunnel, open_udp_session_to, read_at_least, udp_round_trip, H3Client, TestServer,
-    ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, TestServer, open_tcp_tunnel, open_udp_session_to, read_at_least,
+    udp_round_trip,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};

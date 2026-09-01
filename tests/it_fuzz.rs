@@ -66,7 +66,7 @@ use volto::h3::frame::{self, BufferBudget, Frame, FrameDecoder, FrameReader, Ite
 use volto::h3::message::{self, FieldValue, Fields, Method, Request, Status};
 use volto::h3::qpack::{self, Field};
 use volto::h3::stream::build_request;
-use volto::h3::{huffman, MAX_FIELD_SECTION_SIZE};
+use volto::h3::{MAX_FIELD_SECTION_SIZE, huffman};
 
 /// The per-field overhead in RFC 9114 §4.2.2's field-section size formula.
 ///

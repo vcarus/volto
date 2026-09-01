@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
-    auth_section, connect_quic, open_tcp_tunnel, read_at_least, spawn_echo_target, H3Client,
-    TestServer, ALLOW_PRIVATE, IMPATIENT, TIMEOUT,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, connect_quic,
+    open_tcp_tunnel, read_at_least, spawn_echo_target,
 };
 
 /// The configured idle timeout is the one that applies.
@@ -211,15 +211,17 @@ async fn authenticating_raises_the_stream_allowance_to_the_configured_one() {
 
     let mut tunnels = Vec::new();
     for n in 0..CONFIGURED_STREAMS {
-        let tunnel =
-            tokio::time::timeout(TIMEOUT, open_tcp_tunnel(&mut client, &target.to_string()))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!(
-                    "tunnel {n} was never granted a request stream: the allowance was not raised \
+        let tunnel = tokio::time::timeout(
+            TIMEOUT,
+            open_tcp_tunnel(&mut client, &target.to_string()),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "tunnel {n} was never granted a request stream: the allowance was not raised \
                      past the {INITIAL_STREAMS} an unauthenticated connection gets"
-                )
-                });
+            )
+        });
         tunnels.push(tunnel);
     }
 

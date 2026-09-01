@@ -11,8 +11,8 @@
 //! The accept loop is also where graceful shutdown is observed: see
 //! [`handle`] for the GOAWAY and drain sequence.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tracing::{debug, info, warn};
 
@@ -22,7 +22,7 @@ use crate::h3api::{self, FieldValue, Request, Status};
 use crate::logfmt::bounded;
 use crate::quic::AuthGate;
 use crate::shutdown::Shutdown;
-use crate::tunnel::{self, udp, Context, ProxyError, Route};
+use crate::tunnel::{self, Context, ProxyError, Route, udp};
 
 /// Drives one QUIC connection until the peer stops sending requests.
 ///

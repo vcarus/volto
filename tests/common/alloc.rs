@@ -65,31 +65,39 @@ impl<R> Default for PassThrough<R> {
 // binaries only touch atomics -- so it cannot re-enter the allocator.
 unsafe impl<R: Record> GlobalAlloc for PassThrough<R> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc(layout);
-        if !ptr.is_null() {
-            R::allocated(layout.size());
+        unsafe {
+            let ptr = System.alloc(layout);
+            if !ptr.is_null() {
+                R::allocated(layout.size());
+            }
+            ptr
         }
-        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        let ptr = System.alloc_zeroed(layout);
-        if !ptr.is_null() {
-            R::allocated(layout.size());
+        unsafe {
+            let ptr = System.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                R::allocated(layout.size());
+            }
+            ptr
         }
-        ptr
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let moved = System.realloc(ptr, layout, new_size);
-        if !moved.is_null() {
-            R::reallocated(layout.size(), new_size);
+        unsafe {
+            let moved = System.realloc(ptr, layout, new_size);
+            if !moved.is_null() {
+                R::reallocated(layout.size(), new_size);
+            }
+            moved
         }
-        moved
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
-        R::freed(layout.size());
+        unsafe {
+            System.dealloc(ptr, layout);
+            R::freed(layout.size());
+        }
     }
 }

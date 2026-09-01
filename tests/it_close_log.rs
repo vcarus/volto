@@ -14,11 +14,11 @@
 
 mod common;
 
-use common::rawstream::{open_uni_stream, STREAM_PUSH};
+use common::rawstream::{STREAM_PUSH, open_uni_stream};
 use common::{
+    ALLOW_PRIVATE, H3Client, IMPATIENT, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
     connect_quic, echoes, numeric_field, open_tcp_tunnel, open_udp_session, recv_datagram,
-    send_udp_payload, spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer,
-    ALLOW_PRIVATE, IMPATIENT, STOP_TIMEOUT, TIMEOUT,
+    send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
 };
 use volto::datagram;
 

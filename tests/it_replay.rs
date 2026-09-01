@@ -205,11 +205,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::h3client::NoClient;
 use common::{
-    basic_credentials, spawn_echo_target, spawn_udp_echo_target, ClientStream, H3Client,
-    SharedBuffer, TestServer, CONNECT_UDP,
+    CONNECT_UDP, ClientStream, H3Client, SharedBuffer, TestServer, basic_credentials,
+    spawn_echo_target, spawn_udp_echo_target,
 };
-use tokio::sync::{mpsc, Semaphore};
-use tokio::time::{sleep_until, timeout, Instant};
+use tokio::sync::{Semaphore, mpsc};
+use tokio::time::{Instant, sleep_until, timeout};
 use volto::datagram;
 use volto::h3api::{Method, Request, Status};
 

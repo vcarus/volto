@@ -13,12 +13,13 @@ mod common;
 
 use bytes::BytesMut;
 use common::rawstream::{
-    application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
-    status_of, DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
+    DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
     H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR, H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR,
     QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
+    status_of,
 };
-use common::{connect_quic, TestServer, TIMEOUT};
+use common::{TIMEOUT, TestServer, connect_quic};
 use volto::datagram;
 
 /// A frame whose whole payload is one varint: CANCEL_PUSH or MAX_PUSH_ID.

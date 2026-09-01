@@ -13,7 +13,7 @@ pub mod h3client;
 pub mod huffman;
 pub mod rawstream;
 
-pub use h3client::{ClientStream, H3Client, Response, CONNECT_UDP};
+pub use h3client::{CONNECT_UDP, ClientStream, H3Client, Response};
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -585,7 +585,7 @@ pub fn open_udp_session_to<'a>(
     server: &'a TestServer,
     host: &str,
     port: u16,
-) -> impl Future<Output = (u64, ClientStream)> + 'a {
+) -> impl Future<Output = (u64, ClientStream)> + 'a + use<'a> {
     let caller = Location::caller();
     udp_session(client, server, host.to_owned(), port, caller)
 }

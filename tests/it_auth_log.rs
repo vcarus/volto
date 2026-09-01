@@ -10,8 +10,8 @@
 mod common;
 
 use common::{
-    auth_section, authorize, authorized_connect, basic_credentials, connect_request, field_value,
-    respond_to, spawn_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, auth_section, authorize, authorized_connect,
+    basic_credentials, connect_request, field_value, respond_to, spawn_echo_target,
 };
 use volto::h3api::Status;
 

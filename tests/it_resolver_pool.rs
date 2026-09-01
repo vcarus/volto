@@ -59,10 +59,10 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    connect_request, echoes, respond_to, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, TestServer, connect_request, echoes, respond_to, spawn_echo_target,
 };
 use volto::h3api::Status;
-use volto::net::{blocking_pool_size, BURST_LOOKUPS, SHARED_LOOKUPS};
+use volto::net::{BURST_LOOKUPS, SHARED_LOOKUPS, blocking_pool_size};
 
 /// Seconds the injected resolver makes one lookup take.
 ///

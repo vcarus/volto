@@ -15,7 +15,7 @@ mod common;
 
 use std::sync::LazyLock;
 
-use common::{open_tcp_tunnel, spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE};
+use common::{ALLOW_PRIVATE, H3Client, TestServer, open_tcp_tunnel, spawn_echo_target};
 use tokio::sync::Mutex;
 
 /// Serializes the two tests: `SSLKEYLOGFILE` is process-wide, and rustls reads it
@@ -37,7 +37,7 @@ async fn enabling_keylog_writes_the_tls_secrets() {
     // `KeyLogFile` reads this once, when the rustls configuration is built, so it
     // has to be set before the server starts. Safe here: single test, single
     // thread, nothing else in this binary depends on the environment.
-    std::env::set_var("SSLKEYLOGFILE", &keylog);
+    unsafe { std::env::set_var("SSLKEYLOGFILE", &keylog) };
 
     let server = TestServer::start_with_log(ALLOW_PRIVATE, "keylog = true\n").await;
 
@@ -88,7 +88,9 @@ async fn keylog_is_off_unless_asked_for() {
     let dir = std::env::temp_dir().join(format!("volto-keylog-off-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     let keylog = dir.join("must-not-appear.log");
-    std::env::set_var("SSLKEYLOGFILE", &keylog);
+    // Safe for the same reason as above: serialized by `ENV`, set before the
+    // server builds its TLS configuration.
+    unsafe { std::env::set_var("SSLKEYLOGFILE", &keylog) };
 
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let target = spawn_echo_target().await;

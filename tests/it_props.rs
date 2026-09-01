@@ -30,10 +30,10 @@ use proptest::prelude::*;
 use props::{config, pattern, payload, put_varint_in};
 
 use volto::capsule::{
-    self, Capsule, CapsuleDecoder, CAPSULE_TYPE_DATAGRAM, MAX_DATAGRAM_CAPSULE_VALUE,
+    self, CAPSULE_TYPE_DATAGRAM, Capsule, CapsuleDecoder, MAX_DATAGRAM_CAPSULE_VALUE,
 };
 use volto::datagram::{
-    self, DecodeError, CONTEXT_ID_UDP_PAYLOAD, MAX_QUARTER_STREAM_ID, MAX_UDP_PAYLOAD, VARINT_MAX,
+    self, CONTEXT_ID_UDP_PAYLOAD, DecodeError, MAX_QUARTER_STREAM_ID, MAX_UDP_PAYLOAD, VARINT_MAX,
 };
 use volto::tunnel::udp::parse_target;
 

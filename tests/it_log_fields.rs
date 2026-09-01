@@ -22,8 +22,8 @@
 mod common;
 
 use common::{
-    auth_section, authorized_connect, open_tcp_tunnel, open_udp_session, respond_to,
-    spawn_echo_target, spawn_udp_echo_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, auth_section, authorized_connect,
+    open_tcp_tunnel, open_udp_session, respond_to, spawn_echo_target, spawn_udp_echo_target,
 };
 use volto::h3api::Status;
 

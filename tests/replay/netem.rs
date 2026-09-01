@@ -206,7 +206,7 @@ impl Spec {
                         return Err(format!(
                             "netem: `{other}` is neither a preset \
                              (clean, steady, spike, severe) nor a key=value"
-                        ))
+                        ));
                     }
                 }
                 spec.name = text.to_owned();

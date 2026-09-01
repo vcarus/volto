@@ -30,8 +30,8 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use common::{
-    echoes, open_tcp_tunnel, open_udp_session, send_udp_payload, spawn_echo_target,
-    spawn_flooding_udp_target, spawn_udp_echo_target, ClientStream, H3Client, TestServer, TIMEOUT,
+    ClientStream, H3Client, TIMEOUT, TestServer, echoes, open_tcp_tunnel, open_udp_session,
+    send_udp_payload, spawn_echo_target, spawn_flooding_udp_target, spawn_udp_echo_target,
 };
 use volto::capsule::{self, Capsule, CapsuleDecoder};
 

@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use common::{
-    open_udp_session, spawn_silent_udp_target, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, open_udp_session, spawn_silent_udp_target,
 };
 use tokio::time::Instant;
 use volto::datagram;

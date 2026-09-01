@@ -17,8 +17,8 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    close_and_drain, echoes, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
-    spawn_udp_echo_target, udp_round_trip, H3Client, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, TestServer, close_and_drain, echoes, open_tcp_tunnel,
+    open_udp_session, read_at_least, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 
 /// Slots to run the churn tests with.

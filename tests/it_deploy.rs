@@ -582,9 +582,11 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
 
     // And no systemd unit was written anywhere under the root.
     assert!(!root.join("etc/systemd/system/volto-deploy.timer").exists());
-    assert!(!root
-        .join("etc/systemd/system/volto-deploy.service")
-        .exists());
+    assert!(
+        !root
+            .join("etc/systemd/system/volto-deploy.service")
+            .exists()
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

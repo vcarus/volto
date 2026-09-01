@@ -36,7 +36,7 @@ use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
 use super::message::{self, FieldValue, Fields, Method, Request, Status};
 use super::qpack::{self, Field};
-use super::{varint, MAX_FIELD_SECTION_SIZE, MAX_VARINT};
+use super::{MAX_FIELD_SECTION_SIZE, MAX_VARINT, varint};
 
 /// An accepted request stream whose headers have not been read yet.
 pub struct Resolver {
@@ -239,7 +239,7 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
                     Code::H3_FRAME_UNEXPECTED,
                     "a request stream that does not begin with HEADERS",
                 )
-                .into())
+                .into());
             }
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -256,7 +256,7 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
                     Code::H3_REQUEST_INCOMPLETE,
                     "the request stream ended before its HEADERS frame",
                 )
-                .into())
+                .into());
             }
         }
     };
@@ -382,11 +382,11 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         // ways to name the target, so a Host field cannot stand in for it.
         let named = match (authority.as_deref(), fields.get("host")) {
             (Some(authority), Some(host)) if authority != host.as_bytes() => {
-                return Err(malformed(":authority and Host disagree"))
+                return Err(malformed(":authority and Host disagree"));
             }
             (Some(authority), _) => authority,
             (None, _) if protocol.is_some() => {
-                return Err(malformed("an extended CONNECT request without :authority"))
+                return Err(malformed("an extended CONNECT request without :authority"));
             }
             (None, Some(host)) => host.as_bytes(),
             (None, None) => return Err(malformed("a request with neither :authority nor Host")),
@@ -917,7 +917,9 @@ impl Writer {
     /// is reported as this endpoint's own clean ending, since no peer said
     /// anything. All three mean the same thing to a caller: nothing more will be
     /// sent on this stream.
-    pub fn stopped(&self) -> impl std::future::Future<Output = StreamError> + Send + 'static {
+    pub fn stopped(
+        &self,
+    ) -> impl std::future::Future<Output = StreamError> + Send + 'static + use<> {
         let stopped = self.send.stopped();
 
         async move {
@@ -1007,7 +1009,7 @@ impl Reader {
                             "a frame other than DATA once the CONNECT method had completed",
                         )
                         .into(),
-                    ))
+                    ));
                 }
             }
         }
@@ -1098,13 +1100,13 @@ impl Reader {
                 Err(quinn::ReadError::Reset(code)) => {
                     return StreamError::RemoteTerminate {
                         code: Code::new(code.into_inner()),
-                    }
+                    };
                 }
 
                 // The connection under the stream went away, which is an ending
                 // this half can report: no reader is left to meet it either.
                 Err(quinn::ReadError::ConnectionLost(error)) => {
-                    return StreamError::Connection(error.into())
+                    return StreamError::Connection(error.into());
                 }
 
                 // A stream this endpoint has already stopped or finished with,
@@ -1388,14 +1390,16 @@ mod tests {
 
         // And the :authority/Host agreement of RFC 9114 §4.3.1 is judged on the
         // values rather than on their padding.
-        assert!(build_request(vec![
-            field(":method", "GET"),
-            field(":scheme", "https"),
-            field(":authority", "example.com"),
-            field(":path", "/"),
-            field("host", "  example.com "),
-        ])
-        .is_ok());
+        assert!(
+            build_request(vec![
+                field(":method", "GET"),
+                field(":scheme", "https"),
+                field(":authority", "example.com"),
+                field(":path", "/"),
+                field("host", "  example.com "),
+            ])
+            .is_ok()
+        );
     }
 
     /// The one exception §4.2 makes for TE.

@@ -31,9 +31,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    auth_section, authorize, authorized_connect, basic_credentials, closed_udp_address,
-    connect_request, connect_udp_request, open_tcp_tunnel, respond_to, spawn_echo_target, H3Client,
-    SharedBuffer, TestServer, ALLOW_PRIVATE,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, auth_section, authorize, authorized_connect,
+    basic_credentials, closed_udp_address, connect_request, connect_udp_request, open_tcp_tunnel,
+    respond_to, spawn_echo_target,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};

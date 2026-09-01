@@ -9,16 +9,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::rawstream::{
-    assert_closed_with, connect_headers_frame, frame, headers_frame, read_frame, status_of,
     FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
-    H3_REQUEST_CANCELLED,
+    H3_REQUEST_CANCELLED, assert_closed_with, connect_headers_frame, frame, headers_frame,
+    read_frame, status_of,
 };
 use common::{
-    assert_peer_reset, client_endpoint_with_transport, closed_address, connect_request,
-    finish_connect, open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to,
-    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
+    client_endpoint_with_transport, closed_address, connect_request, finish_connect,
+    open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to, send_and_respond,
+    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
     spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_transport,
-    ConnectionEnd, H3Client, TestServer, ALLOW_PRIVATE, DELIBERATE, TIMEOUT,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -707,8 +707,8 @@ async fn a_client_stop_sending_cancels_the_request_direction_too() {
 /// blocked write fail with `ConnectionReset` or `BrokenPipe`, and a proxy that
 /// never closed the socket leaves it blocked for ever, which is the failure this
 /// reports by silence.
-async fn spawn_deaf_flooding_target(
-) -> (SocketAddr, tokio::sync::mpsc::Receiver<std::io::ErrorKind>) {
+async fn spawn_deaf_flooding_target()
+-> (SocketAddr, tokio::sync::mpsc::Receiver<std::io::ErrorKind>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
     let addr = listener.local_addr().expect("target address");
     let (tx, rx) = tokio::sync::mpsc::channel(1);

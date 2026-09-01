@@ -71,8 +71,8 @@ use super::huffman;
 use super::rawstream::{
     RESERVED_HTTP2_TYPES, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
+use super::{TIMEOUT, TestServer};
 use super::{client_endpoint_with_transport, connect_quic, connect_quic_with_ca, finish_connect};
-use super::{TestServer, TIMEOUT};
 
 /// Largest control-stream frame payload this client will buffer.
 ///
@@ -636,7 +636,7 @@ impl ClientStream {
 
                 Some(Item::Data(data)) if !self.trailers => return Ok(Some(data)),
                 Some(Item::Data(_)) => {
-                    return Err(unexpected("a DATA frame after the trailer section"))
+                    return Err(unexpected("a DATA frame after the trailer section"));
                 }
 
                 // The trailer section. A tunnel has no use for its fields --
@@ -645,12 +645,12 @@ impl ClientStream {
                 // follow.
                 Some(Item::Frame(Frame::Headers(_))) if !self.trailers => self.trailers = true,
                 Some(Item::Frame(Frame::Headers(_))) => {
-                    return Err(unexpected("a second trailer section"))
+                    return Err(unexpected("a second trailer section"));
                 }
                 Some(Item::Frame(_)) => {
                     return Err(unexpected(
                         "a frame that may not appear on a request stream",
-                    ))
+                    ));
                 }
 
                 None => return Ok(None),
@@ -700,7 +700,7 @@ impl ClientStream {
     /// take it before the event it is waiting for can happen.
     pub fn stopped(
         &self,
-    ) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> {
+    ) -> impl Future<Output = Result<Option<quinn::VarInt>, quinn::StoppedError>> + use<> {
         self.send.stopped()
     }
 

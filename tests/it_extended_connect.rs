@@ -10,10 +10,10 @@
 mod common;
 
 use bytes::BytesMut;
-use common::rawstream::{close_reason, QPACK_DECOMPRESSION_FAILED};
+use common::rawstream::{QPACK_DECOMPRESSION_FAILED, close_reason};
 use common::{
-    auth_section, authorize, basic_credentials, connect_request, echoes, respond_to,
-    spawn_echo_target, H3Client, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, auth_section, authorize, basic_credentials,
+    connect_request, echoes, respond_to, spawn_echo_target,
 };
 use volto::h3::frame;
 use volto::h3api::{Method, Request, Status};

@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{echoes, open_tcp_tunnel, spawn_echo_target, H3Client, TestServer};
+use common::{H3Client, TestServer, echoes, open_tcp_tunnel, spawn_echo_target};
 
 #[tokio::test]
 async fn a_tcp_tunnel_survives_the_client_changing_address() {

@@ -40,8 +40,8 @@
 //! `select!` with a timeout, so that property is load-bearing.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Buf, Bytes, BytesMut};
 

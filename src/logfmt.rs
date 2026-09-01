@@ -318,7 +318,7 @@ pub fn addresses(list: &[std::net::SocketAddr]) -> impl fmt::Display + '_ {
 #[cfg(test)]
 mod tests {
     use super::{
-        addresses, bounded, bounded_bytes, escaped_bytes, or_dash, peer_error, Sampler, ABSENT,
+        ABSENT, Sampler, addresses, bounded, bounded_bytes, escaped_bytes, or_dash, peer_error,
     };
     use std::net::SocketAddr;
 

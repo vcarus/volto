@@ -20,7 +20,7 @@
 mod common;
 
 use bytes::BytesMut;
-use common::{closed_udp_address, open_udp_session, H3Client, SharedBuffer, TestServer};
+use common::{H3Client, SharedBuffer, TestServer, closed_udp_address, open_udp_session};
 use volto::{capsule, datagram};
 
 /// Loopback targets reachable, with the RFC 9298 §7 amplification cap lifted.

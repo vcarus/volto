@@ -61,7 +61,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 /// ALPN protocol identifiers advertised when the config does not say otherwise.
@@ -2534,7 +2534,10 @@ pub(crate) mod tests {
         // something a later release might add.
         for (table, text) in [
             ("top level (key)", format!("stray_key = 1\n{SERVER}")),
-            ("top level (table)", format!("{SERVER}\n[metrics]\nlisten = \"\"")),
+            (
+                "top level (table)",
+                format!("{SERVER}\n[metrics]\nlisten = \"\""),
+            ),
             ("[server]", format!("{SERVER}lisen = \"typo\"")),
             ("[auth]", format!("{SERVER}\n[auth]\nuesrs = []")),
             (
@@ -2543,7 +2546,10 @@ pub(crate) mod tests {
                     "{SERVER}\n[auth]\nusers = [{{ username = \"u\", password = \"p\", role = \"admin\" }}]"
                 ),
             ),
-            ("[limits]", format!("{SERVER}\n[limits]\nmax_connection = 8")),
+            (
+                "[limits]",
+                format!("{SERVER}\n[limits]\nmax_connection = 8"),
+            ),
             (
                 "[security]",
                 format!("{SERVER}\n[security]\ndenied_port = [25]"),

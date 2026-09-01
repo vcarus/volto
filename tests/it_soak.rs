@@ -67,9 +67,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use common::{
-    close_and_drain, echoes, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end,
-    recv_datagram, send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
-    ClientStream, H3Client, SharedBuffer, TestServer, ALLOW_PRIVATE, TIMEOUT,
+    ALLOW_PRIVATE, ClientStream, H3Client, SharedBuffer, TIMEOUT, TestServer, close_and_drain,
+    echoes, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end, recv_datagram,
+    send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 use volto::datagram;
 
