@@ -1,0 +1,59 @@
+name: Cross
+
+# The release workflow is the only thing that normally exercises the musl
+# cross-builds, so a dependency bump that breaks one -- aws-lc-sys carries a
+# large C build that only these targets compile through a cross toolchain --
+# would otherwise surface at tag time, after the fix window has closed. This
+# runs the exact build step release.yml runs, gated to the paths that can
+# change the dependency surface, so a Dependabot PR pays for it and an
+# ordinary code PR does not.
+#
+# A workflow of its own rather than a job in ci.yml because the gate is the
+# `paths` filter, and `on.paths` is workflow-scoped.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/cross.yml
+  pull_request:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/cross.yml
+
+concurrency:
+  group: cross-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Mirrors the build step in release.yml verbatim -- same action, same
+      # pinned SHA, same arguments -- so a green run here is evidence about
+      # the release build itself, not about a similar one. When release.yml's
+      # build step changes, change this one with it.
+      - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--locked --release"
+          strip: true
