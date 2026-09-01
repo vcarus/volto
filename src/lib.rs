@@ -38,6 +38,14 @@
 //!   reach, port 25 is closed, and an unanswered UDP session cannot be used as an
 //!   amplifier.
 
+// The two raw syscalls this crate used to make by hand -- `getrlimit` for the
+// startup fd check and `IP_MTU_DISCOVER` for the DF bit -- now go through
+// rustix's safe wrappers, so "no `unsafe` in the server" is a property worth
+// pinning rather than one that merely happens to hold. `forbid` rather than
+// `deny` so it cannot be opted out of module by module: a future need for
+// `unsafe` should be an argued change to this line, not a local `allow`.
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod capsule;
 pub mod config;

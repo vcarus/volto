@@ -49,7 +49,6 @@
 
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
 
-use std::future::Future;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

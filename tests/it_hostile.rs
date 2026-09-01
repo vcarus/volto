@@ -80,7 +80,6 @@
 
 mod common;
 
-use std::future::Future;
 use std::panic::Location;
 use std::time::{Duration, Instant};
 

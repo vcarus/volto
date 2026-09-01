@@ -59,6 +59,7 @@ use common::{
     proxy_status, respond_to, send_and_respond, send_udp_payload, spawn_echo_target,
     spawn_udp_echo_target, udp_round_trip,
 };
+use rustix::process::{Resource, Rlimit};
 use volto::datagram;
 use volto::h3api::Status;
 
@@ -109,7 +110,7 @@ const FD_SLACK: usize = 8;
 
 /// The process's descriptor budget, clamped for the length of a scope.
 ///
-/// `rlim_cur` goes down to the lowest descriptor number that is free right now,
+/// The soft limit goes down to the lowest descriptor number that is free now,
 /// which is the whole trick: the kernel refuses an allocation whose descriptor
 /// number would reach the limit, and a descriptor already open is never
 /// re-checked against it. So the server's live tunnels are untouched and its
@@ -120,7 +121,7 @@ const FD_SLACK: usize = 8;
 /// open a descriptor, and the failure would be reported as whatever unrelated
 /// thing broke next.
 struct FdClamp {
-    saved: libc::rlimit,
+    saved: Rlimit,
 }
 
 impl FdClamp {
@@ -134,13 +135,15 @@ impl FdClamp {
         let free = socket.as_raw_fd();
         drop(socket);
 
-        let clamped = libc::rlimit {
-            rlim_cur: free as libc::rlim_t,
-            rlim_max: saved.rlim_max,
+        // The hard limit is carried across as the `Option` it arrived as rather
+        // than reconstructed: `None` is `RLIM_INFINITY` on both sides of the
+        // call, so round-tripping it is what leaves an unlimited ceiling
+        // unlimited.
+        let clamped = Rlimit {
+            current: Some(u64::try_from(free).expect("a descriptor number is not negative")),
+            maximum: saved.maximum,
         };
-        // SAFETY: `setrlimit` reads the struct and writes nothing.
-        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &clamped) };
-        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        rustix::process::setrlimit(Resource::Nofile, clamped).expect("clamp RLIMIT_NOFILE");
 
         let clamp = Self { saved };
 
@@ -161,19 +164,17 @@ impl FdClamp {
 
 impl Drop for FdClamp {
     fn drop(&mut self) {
-        // SAFETY: as above; what is restored is what this guard read.
-        let result = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &self.saved) };
-        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        // What is restored is exactly what this guard read.
+        rustix::process::setrlimit(Resource::Nofile, self.saved).expect("restore RLIMIT_NOFILE");
     }
 }
 
 /// The process's current `RLIMIT_NOFILE`.
-fn read_limit() -> libc::rlimit {
-    // SAFETY: `getrlimit` fills the struct and reads nothing else.
-    let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
-    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-    assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
-    limit
+///
+/// `getrlimit` cannot fail for a resource the kernel always knows about, which
+/// is why rustix's wrapper hands back the limits rather than a `Result`.
+fn read_limit() -> Rlimit {
+    rustix::process::getrlimit(Resource::Nofile)
 }
 
 /// The descriptors this process holds, if the platform will say.

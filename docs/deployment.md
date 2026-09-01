@@ -5,7 +5,7 @@ the test suite is expected to pass on both.
 
 ## Building
 
-Rust 1.85 or newer. `Cargo.lock` is committed, and `quinn-proto` is redirected
+Rust 1.88 or newer. `Cargo.lock` is committed, and `quinn-proto` is redirected
 by a `[patch.crates-io]` stanza to a commit carrying an MTU fix no release has
 yet (see
 [architecture.md](architecture.md#why-quinn-proto-is-patched-temporary)), so

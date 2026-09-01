@@ -40,6 +40,11 @@
 //! | `VOLTO_BENCH_REPS` | 3 | measured repetitions after the warm-up |
 //! | `VOLTO_BENCH_SECONDS` | 0 | if set, UDP repetitions run for this long instead of a packet count (for profiling) |
 
+// An argued exception to the package's `unsafe_code = "deny"`: `getrusage` is
+// raw libc FFI because rustix wraps no equivalent, and it only fills a struct
+// the two call sites read once.
+#![allow(unsafe_code)]
+
 mod common;
 
 #[path = "common/alloc.rs"]
@@ -233,7 +238,7 @@ enum Kind {
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a measurement"));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -640,12 +645,11 @@ async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
             n += 1;
             counted.store(n, Ordering::Relaxed);
 
-            if n % 64 == 0 {
-                if let Some(budget) = budget {
-                    if started.elapsed() >= budget {
-                        break;
-                    }
-                }
+            if n.is_multiple_of(64)
+                && let Some(budget) = budget
+                && started.elapsed() >= budget
+            {
+                break;
             }
         }
     })
@@ -748,13 +752,13 @@ async fn udp_downlink(size: usize, count: u64, budget: Option<Duration>) -> Rep 
                     requested += 1;
                 }
 
-                if received % 64 == 0 {
+                if received.is_multiple_of(64) {
                     last_seen = Instant::now();
                     idle.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(400));
-                    if let Some(budget) = budget {
-                        if started.elapsed() >= budget {
-                            break last_seen;
-                        }
+                    if let Some(budget) = budget
+                        && started.elapsed() >= budget
+                    {
+                        break last_seen;
                     }
                 }
                 if requested == requests && received >= requests * BURST as u64 {

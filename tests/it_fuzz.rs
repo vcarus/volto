@@ -2609,10 +2609,10 @@ proptest! {
                 // survived says what the authority says. Except on a classic
                 // CONNECT, where §4.4's branch reads `:authority` alone and a
                 // Host field is an ordinary field like any other.
-                if !classic {
-                    if let Some(host) = request.fields.get("host") {
-                        prop_assert_eq!(host.as_bytes(), authority.as_bytes(), "{:?}", request);
-                    }
+                if !classic
+                    && let Some(host) = request.fields.get("host")
+                {
+                    prop_assert_eq!(host.as_bytes(), authority.as_bytes(), "{:?}", request);
                 }
                 prop_assert!(request.fields.get_all("host").count() <= 1, "{:?}", request);
 

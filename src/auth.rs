@@ -266,14 +266,16 @@ fn basic_token(value: &str) -> Result<&str, Denied> {
 /// the input is an authentication credential, and lenient only about the unused
 /// low bits of a padded quantum, which some encoders leave non-zero.
 fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
-    if input.is_empty() || input.len() % 4 != 0 {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
         return None;
     }
 
     let quanta = input.len() / 4;
     let mut out = Vec::with_capacity(quanta * 3);
 
-    for (index, quantum) in input.chunks_exact(4).enumerate() {
+    // The length check above is what makes the remainder half of `as_chunks`
+    // empty, so nothing is dropped by looking only at the quanta.
+    for (index, quantum) in input.as_chunks::<4>().0.iter().enumerate() {
         let padding = if index + 1 == quanta {
             quantum.iter().filter(|byte| **byte == b'=').count()
         } else {

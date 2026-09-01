@@ -36,10 +36,10 @@ async fn recv_payload_for(
     quarter_stream_id: u64,
     pending: &mut HashMap<u64, Vec<Bytes>>,
 ) -> Bytes {
-    if let Some(queued) = pending.get_mut(&quarter_stream_id) {
-        if !queued.is_empty() {
-            return queued.remove(0);
-        }
+    if let Some(queued) = pending.get_mut(&quarter_stream_id)
+        && !queued.is_empty()
+    {
+        return queued.remove(0);
     }
 
     loop {

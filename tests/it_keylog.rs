@@ -11,6 +11,11 @@
 //! other tests. The two tests here serialize against each other explicitly, so
 //! the guarantee does not depend on how the runner is invoked.
 
+// An argued exception to the package's `unsafe_code = "deny"`: the two
+// `set_var` calls are the process-wide write edition 2024 makes explicit, and
+// the `ENV` mutex below is the argument for why they are sound here.
+#![allow(unsafe_code)]
+
 mod common;
 
 use std::sync::LazyLock;

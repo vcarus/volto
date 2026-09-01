@@ -1137,8 +1137,11 @@ impl ReloadHandle {
 /// does so for every connection at once and for anything else the process needs
 /// a descriptor for, a certificate reload included (spec §5.2).
 fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
+    // `None` is `RLIM_INFINITY` rather than a failed read (the call cannot
+    // fail): no ceiling means no budget to be tight against, so the check has
+    // passed rather than been skipped.
     let Some(limit) = crate::net::fd_soft_limit() else {
-        debug!("could not read RLIMIT_NOFILE; skipping the fd budget check");
+        debug!("RLIMIT_NOFILE is unlimited; the fd budget cannot be exceeded");
         return;
     };
 
@@ -2029,7 +2032,6 @@ mod tests {
     /// it.
     #[tokio::test]
     async fn an_eviction_a_lost_race_consumed_is_still_delivered() {
-        use std::future::Future;
         use std::task::{Context as TaskContext, Poll, Waker};
 
         let roster = Roster::new();

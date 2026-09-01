@@ -2,7 +2,7 @@
 name = "volto"
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
 documentation = "https://vcarus.github.io/volto/"
@@ -76,9 +76,29 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 anyhow = "1"
 
-# Raw syscalls with no portable equivalent in std: getrlimit(RLIMIT_NOFILE) for
-# the startup fd-budget check (POSIX, both hosts) and IP_MTU_DISCOVER for the DF
-# bit (Linux only, behind cfg in net.rs).
+# Safe wrappers around the syscalls that have no portable equivalent in std:
+# getrlimit(RLIMIT_NOFILE) for the startup fd-budget check (POSIX, both hosts)
+# and IP_MTU_DISCOVER for the DF bit (Linux only, behind cfg in net.rs). Both
+# used to be hand-written `libc` FFI, and replacing them is what lets `src/`
+# carry `#![forbid(unsafe_code)]`.
+#
+# It is pure Rust with no C to build -- on Linux it issues the syscalls itself
+# rather than linking libc's -- so it adds nothing to the musl cross-build that
+# release.yml and cross.yml run. It was already being compiled here anyway, as a
+# dev dependency: proptest -> tempfile -> rustix.
+#
+# `net` is the sockopt module and `process` is getrlimit/setrlimit; `std` is
+# rustix's own default and is spelled out because the default set is off.
+rustix = { version = "1", default-features = false, features = [
+    "net",
+    "process",
+    "std",
+] }
+
+# Errno constants only -- `EMFILE`, `ENOBUFS` and their neighbours, which
+# `tunnel` matches on to tell a per-target failure from a process-wide one.
+# There are no `libc` calls left in `src/`; the one remaining call in the tree is
+# `getrusage` in `tests/it_bench.rs`, which rustix does not wrap.
 libc = "0.2"
 
 # SO_RCVBUF/SO_SNDBUF on the endpoint's UDP socket (D56). Already in the tree via
@@ -193,5 +213,12 @@ debug = "line-tables-only"
 # rewriting that one source line back to the registry before it scans -- the
 # pinned commit's version *is* the upstream tag, so advisories filed against
 # quinn-proto 0.11.17 apply to us unchanged.
+[lints.rust]
+# The default for every target in the package, tests and examples included: a
+# new file that wants `unsafe` must argue for a file-level `allow` (today there
+# are three, all in tests). `src/` is stricter still -- its two crate roots
+# carry `forbid`, which an inner `allow` cannot weaken.
+unsafe_code = "deny"
+
 [patch.crates-io]
 quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "f650e0f213b01ea7bebd60023e5df7df65e5c2bd" }

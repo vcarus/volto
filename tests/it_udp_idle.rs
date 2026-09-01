@@ -122,7 +122,7 @@ async fn a_datagram_flood_does_not_hold_a_session_past_its_idle_timeout() {
         let mut sent = 0u64;
         while quic.send_datagram(payload.clone()).is_ok() {
             sent += 1;
-            if sent % 16 == 0 {
+            if sent.is_multiple_of(16) {
                 tokio::task::yield_now().await;
             }
         }

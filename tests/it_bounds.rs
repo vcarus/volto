@@ -25,7 +25,6 @@ mod common;
 #[path = "common/alloc.rs"]
 mod alloc;
 
-use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 

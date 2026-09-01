@@ -1,5 +1,9 @@
 //! `volto` — MASQUE proxy server binary: CLI, logging, assembly.
 
+// As in `lib.rs`: the binary crate is assembly over the library, and there is
+// nothing here that could need `unsafe` either.
+#![forbid(unsafe_code)]
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};

@@ -22,7 +22,6 @@
 
 #![allow(dead_code)] // Each integration test binary uses a subset of this.
 
-use std::future::Future;
 use std::panic::Location;
 use std::time::Duration;
 

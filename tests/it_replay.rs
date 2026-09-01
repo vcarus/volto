@@ -1121,10 +1121,10 @@ async fn futures_join(handles: Vec<tokio::task::JoinHandle<()>>) {
 /// takes the run down with it.
 async fn join_drivers(handles: Vec<tokio::task::JoinHandle<()>>) {
     for handle in handles {
-        if let Err(error) = handle.await {
-            if let Ok(panic) = error.try_into_panic() {
-                std::panic::resume_unwind(panic);
-            }
+        if let Err(error) = handle.await
+            && let Ok(panic) = error.try_into_panic()
+        {
+            std::panic::resume_unwind(panic);
         }
     }
 }

@@ -1391,6 +1391,7 @@ dependencies = [
  "proptest",
  "quinn",
  "rcgen",
+ "rustix",
  "rustls",
  "serde",
  "socket2",

@@ -340,7 +340,7 @@ enum LookupSlot {
     },
 }
 
-/// The process's soft limit on open file descriptors.
+/// The process's soft limit on open file descriptors, or `None` if it has none.
 ///
 /// Every tunnel holds one, so this is the ceiling the tunnel quota has to fit
 /// under: exhausting it does not degrade the proxy gracefully, it makes every
@@ -349,19 +349,14 @@ enum LookupSlot {
 /// rather than discovered at 3am.
 ///
 /// `getrlimit` needs no `cfg` split: it is POSIX and present on both the Linux
-/// production host and the macOS dev host. `None` means the call failed, which
-/// should not happen for `RLIMIT_NOFILE` but is not worth a panic.
+/// production host and the macOS dev host. It also cannot fail for a resource
+/// the kernel always knows about, which is why rustix's wrapper returns no
+/// `Result` — so `None` here is `RLIM_INFINITY` rather than a failed read: the
+/// process has no ceiling at all, and there is nothing for the startup check to
+/// compare a budget against. See [`crate::quic`]'s `warn_if_fd_budget_is_tight`,
+/// which treats that as room to spare.
 pub fn fd_soft_limit() -> Option<u64> {
-    // SAFETY: `getrlimit` writes a `rlimit` and reads nothing else; the struct is
-    // fully initialized by the call before we read it.
-    let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
-    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
-
-    if result != 0 {
-        return None;
-    }
-
-    Some(limit.rlim_cur as u64)
+    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
 }
 
 /// Binds a UDP socket and connects it to `target`.
@@ -393,44 +388,26 @@ pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
 /// fatal — the tunnel still works, it just may lose oversized packets silently.
 #[cfg(target_os = "linux")]
 fn set_dont_fragment(socket: &UdpSocket) {
-    use std::os::fd::AsRawFd;
+    use rustix::net::sockopt::{Ipv4PathMtuDiscovery, Ipv6PathMtuDiscovery};
     use tracing::debug;
 
-    let fd = socket.as_raw_fd();
     let is_ipv4 = socket
         .local_addr()
         .map(|address| address.is_ipv4())
         .unwrap_or(true);
 
-    let (level, option, value) = if is_ipv4 {
-        (
-            libc::IPPROTO_IP,
-            libc::IP_MTU_DISCOVER,
-            libc::IP_PMTUDISC_DO,
-        )
+    // The socket is borrowed as an `AsFd` rather than a raw descriptor, so the
+    // setsockopt cannot outlive it. rustix's own `cfg` on these two is
+    // `linux_kernel`, which the `cfg` on this function is already inside.
+    let result = if is_ipv4 {
+        rustix::net::sockopt::set_ip_mtu_discover(socket, Ipv4PathMtuDiscovery::DO)
     } else {
-        (
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MTU_DISCOVER,
-            libc::IPV6_PMTUDISC_DO,
-        )
+        rustix::net::sockopt::set_ipv6_mtu_discover(socket, Ipv6PathMtuDiscovery::DO)
     };
 
-    // SAFETY: `fd` is owned by `socket` and outlives this call; `value` is a
-    // 4-byte int matching the length passed to setsockopt.
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            option,
-            std::ptr::from_ref(&value).cast(),
-            std::mem::size_of_val(&value) as libc::socklen_t,
-        )
-    };
-
-    if result != 0 {
+    if let Err(errno) = result {
         debug!(
-            error = %io::Error::last_os_error(),
+            error = %io::Error::from(errno),
             "failed to enable path MTU discovery on the target socket"
         );
     }
@@ -460,7 +437,6 @@ mod tests {
     mod resolver_budget {
         use super::*;
 
-        use std::future::Future;
         use std::task::{Context as TaskContext, Poll};
 
         /// The value `future` has *without waiting*, or `None` if it would wait.
@@ -771,11 +747,15 @@ mod tests {
     }
 
     /// The startup fd check is only useful if the probe works on both hosts.
+    ///
+    /// `None` is not a failure to read the limit — it is `RLIM_INFINITY`, and a
+    /// host that grants it is answering the question rather than refusing to.
+    /// So what is pinned is the only answer that would be wrong: a finite
+    /// ceiling no running process could be under.
     #[test]
     fn the_fd_soft_limit_is_readable() {
-        let limit = fd_soft_limit().expect("RLIMIT_NOFILE is always readable");
         assert!(
-            limit > 0,
+            fd_soft_limit().is_none_or(|limit| limit > 0),
             "a process with no descriptors could not run this"
         );
     }

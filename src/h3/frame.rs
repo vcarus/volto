@@ -655,11 +655,11 @@ impl FrameDecoder {
     fn take_frame_header(&mut self) -> Option<(u64, u64)> {
         loop {
             let header = &self.header[..self.header_len];
-            if let Some((kind, used)) = peek_varint(header) {
-                if let Some((length, _)) = peek_varint(&header[used..]) {
-                    self.header_len = 0;
-                    return Some((kind, length));
-                }
+            if let Some((kind, used)) = peek_varint(header)
+                && let Some((length, _)) = peek_varint(&header[used..])
+            {
+                self.header_len = 0;
+                return Some((kind, length));
             }
 
             let byte = *self.chunk.first()?;

@@ -17,6 +17,10 @@
 //! way `it_bounds` already did it and the other two did not. A null return is
 //! the allocator failing, and nothing was handed out to count.
 
+// One of the package's argued exceptions to `unsafe_code = "deny"`: a global
+// allocator is an `unsafe` contract by definition, and these methods only
+// forward to `System` and touch atomics on the way past.
+#![allow(unsafe_code)]
 #![allow(dead_code)] // Each measuring binary uses a subset of this.
 
 use std::alloc::{GlobalAlloc, Layout, System};

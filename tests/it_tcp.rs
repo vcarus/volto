@@ -2,7 +2,6 @@
 
 mod common;
 
-use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;

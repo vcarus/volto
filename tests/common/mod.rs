@@ -15,7 +15,6 @@ pub mod rawstream;
 
 pub use h3client::{CONNECT_UDP, ClientStream, H3Client, Response};
 
-use std::future::Future;
 use std::net::SocketAddr;
 use std::panic::Location;
 use std::path::{Path, PathBuf};
