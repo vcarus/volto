@@ -306,7 +306,7 @@ fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
     let certificate = issued.cert.der().clone();
     let key = rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
 
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3")

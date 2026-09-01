@@ -2,8 +2,9 @@
 //!
 //! QUIC mandates TLS 1.3, so the configuration is pinned to it explicitly
 //! rather than relying on rustls' defaults. The crypto provider is also passed
-//! explicitly (ring) instead of going through the process-wide default, which
-//! keeps behaviour independent of initialisation order elsewhere in the process.
+//! explicitly (aws-lc-rs, D102) instead of going through the process-wide
+//! default, which keeps behaviour independent of initialisation order elsewhere
+//! in the process.
 
 use std::fs::File;
 use std::path::Path;
@@ -24,10 +25,10 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
     let certs = load_certs(&server.cert)?;
     let key = load_key(&server.key)?;
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .context("the ring crypto provider does not support TLS 1.3")?
+        .context("the aws-lc-rs crypto provider does not support TLS 1.3")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("server.cert and server.key do not form a usable certificate/key pair")?;

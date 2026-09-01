@@ -17,15 +17,17 @@ cargo build --release --locked      # target/release/volto
 
 On Debian or Ubuntu that needs `build-essential` and `pkg-config`. Compiling on
 the server itself is the simplest route; the dependency stack is pure Rust apart
-from ring's build, so cross-compiling works as well:
+from the C code aws-lc-rs builds, so cross-compiling works as well:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
-Cross-compiling to musl needs a C toolchain for ring (`musl-tools` for the
-x86_64 target, a cross toolchain for aarch64). The release workflow builds both
+Cross-compiling to musl needs a C toolchain for aws-lc-rs (`musl-tools` for the
+x86_64 target, a cross toolchain for aarch64). The non-FIPS build used here
+ships pre-generated bindings, so no cmake, bindgen or Go is involved -- a C
+compiler is enough. The release workflow builds both
 targets with [`cross`](https://github.com/cross-rs/cross); the resulting static
 binaries are attached to each tagged release together with a `SHA256SUMS` file
 and the contents of `script/`.

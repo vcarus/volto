@@ -363,7 +363,7 @@ fn build_wire() -> Wire {
         let key =
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(issued.signing_key.serialize_der()));
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .expect("TLS 1.3")

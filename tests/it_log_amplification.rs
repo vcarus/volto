@@ -326,7 +326,7 @@ async fn a_handshake_close_reason_never_forges_a_line(buffer: &SharedBuffer) {
 /// description into the CONNECTION_CLOSE reason phrase, and the server reads
 /// `detail` off the wire without having accepted anything.
 fn endpoint_refusing_the_certificate(detail: &'static str) -> quinn::Endpoint {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let verifier = RefuseWith {
         detail,
         schemes: provider

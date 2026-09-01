@@ -30,12 +30,22 @@ publish = false
 # the bound and a later one shows the bound. Neither is a leak.
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
-    "rustls-ring",
+    "rustls-aws-lc-rs",
     "bloom",
     "log",
 ] }
+# The crypto backend is aws-lc-rs rather than ring (D102). It is what rustls
+# enables by default upstream and the only provider that carries ML-KEM, so a
+# hybrid key exchange becomes a client-side question rather than a server
+# rebuild -- see D101. `prefer-post-quantum` is deliberately *not* enabled: it
+# only reorders the key exchange list, and a server picks from what the client
+# offers rather than proposing an order of its own, so enabling it would change
+# nothing here. X25519MLKEM768 is in `DEFAULT_KX_GROUPS` either way.
+#
+# `default-features = false` also keeps `tls12` off, which QUIC requires anyway;
+# with it off both providers reduce to the same three TLS 1.3 suites.
 rustls = { version = "0.23", default-features = false, features = [
-    "ring",
+    "aws_lc_rs",
     "std",
     "logging",
 ] }
@@ -90,7 +100,16 @@ name = "diff_oracle"
 path = "tests/interop/difforacle/oracle.rs"
 
 [dev-dependencies]
-rcgen = "0.14"
+# Pinned to the same crypto backend as the server (D102). rcgen's default
+# feature set is `crypto` + `pem` + `ring`, so the backend has to be selected by
+# hand or ring comes back into the lockfile through the test certificates alone.
+# `aws_lc_rs` implies `crypto`; `pem` is what `cert.pem()` and
+# `signing_key.serialize_pem()` need. The generated key is unchanged either way:
+# `KeyPair::generate` is ECDSA P-256 on both backends.
+rcgen = { version = "0.14", default-features = false, features = [
+    "aws_lc_rs",
+    "pem",
+] }
 
 # `test-util` gives the tests a clock they drive themselves: `start_paused` plus
 # `tokio::time::advance` make "three hours pass" free and exact, which is the

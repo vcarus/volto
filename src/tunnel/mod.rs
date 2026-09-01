@@ -1285,7 +1285,7 @@ mod tests {
         let key =
             rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
             .expect("TLS 1.3")
