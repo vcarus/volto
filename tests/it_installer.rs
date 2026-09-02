@@ -342,6 +342,38 @@ fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// A binary that is not there must be refused with the flag that gets you out of
+/// it, not only with the advice to build one.
+///
+/// The default `./target/release/volto` is a checkout's path. Run out of an
+/// unpacked release tarball, where nothing has been built and the binary is
+/// already sitting there, "build it first" was the whole message and it was the
+/// wrong advice — the fix is `--binary ./volto`, which the message never named.
+/// The same text guards the install path a few lines further down, which needs
+/// root and so cannot be reached from here; this covers the wording for both.
+#[test]
+fn a_missing_binary_is_refused_with_the_flag_that_points_at_another_one() {
+    let root = install_root("no-binary");
+    let script = repo_root().join("script/install-selfsigned.sh");
+
+    let (ok, stdout, stderr) = run_check_config(&root, &script, &root.join("nowhere/volto"));
+
+    assert!(
+        !ok,
+        "a binary that is not on disk must stop the run: {stdout}"
+    );
+    assert!(
+        stderr.contains("no volto binary at"),
+        "the refusal must name the path it looked at: {stderr}"
+    );
+    assert!(
+        stderr.contains("--binary"),
+        "and the flag that points it somewhere else: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// The branch that decides whether the check may exist at all: a binary from
 /// before the flag.
 ///

@@ -293,7 +293,7 @@ if [ "$PRINT_CONFIG" -eq 1 ] || [ "$CHECK_CONFIG" -eq 1 ]; then
     if [ "$CHECK_CONFIG" -eq 1 ]; then
         # The binary is needed here and only here: --print-config never runs it,
         # which is why it works in a checkout with nothing built.
-        [ -f "$BINARY" ] || die "no volto binary at $BINARY — build it first: cargo build --release"
+        [ -f "$BINARY" ] || die "no volto binary at $BINARY — pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
         [ -x "$BINARY" ] || die "$BINARY is not executable"
         check_generated_config "$tmp"
     fi
@@ -317,7 +317,7 @@ esac
 
 check_credentials
 
-[ -f "$BINARY" ] || die "no volto binary at $BINARY — build it first: cargo build --release"
+[ -f "$BINARY" ] || die "no volto binary at $BINARY — pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
 [ -x "$BINARY" ] || die "$BINARY is not executable"
 
 [ -f "$UNIT_SRC" ] || die "missing $UNIT_SRC"
