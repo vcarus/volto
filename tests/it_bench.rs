@@ -382,10 +382,19 @@ fn header() {
             "bench header: client, proxy and target share this process; every cpu figure is the \
              sum of all three."
         );
-        println!(
-            "bench header: loopback on macOS, where quinn-udp has no GSO/GRO and a batch size of \
-             one; absolute udp rates do not carry to linux, the cost breakdown does."
-        );
+        // The platform caveat is the one line a captured log is read against
+        // later, so it must describe the host it ran on rather than the host
+        // it was written on.
+        match std::env::consts::OS {
+            "linux" => println!(
+                "bench header: loopback on linux, where quinn-udp batches with GSO/GRO as the \
+                 deployment does; absolute udp rates are still loopback rates, not a path's."
+            ),
+            os => println!(
+                "bench header: loopback on {os}, where quinn-udp has no GSO/GRO and a batch size \
+                 of one; absolute udp rates do not carry to linux, the cost breakdown does."
+            ),
+        }
         println!(
             "bench header: threads={}, mb={}, packets={}, cycles={}, concurrent={}, reps={}, \
              seconds={:?}",
