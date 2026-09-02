@@ -66,20 +66,36 @@ pub const DELIBERATE: &str = "[limits]\nmax_idle_timeout = 2\nkeep_alive_interva
 /// grace period. Failing this means the grace period is not being enforced.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A path under the system temp directory, named for this process.
+///
+/// The pid is what keeps two `cargo test` runs at once from writing to the same
+/// path; `name` is what tells one caller's scratch from another's in a directory
+/// listing after a crash.
+///
+/// The harness side of `tests/common/scripts.rs`'s `scratch_dir`. There are two
+/// because the leaf modules and this one cannot see each other by construction
+/// (D66): a binary that only runs `bash` reaches the leaf without linking any of
+/// what is below, and everything here would come with it.
+pub fn scratch_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("volto-{name}-{}", std::process::id()))
+}
+
 /// A directory that deletes itself when dropped.
+///
+/// However the test ends, including a panic: the run somebody is about to go and
+/// look at is exactly the run whose scratch would otherwise be left behind, and
+/// what one of these holds may be TLS secrets.
 pub struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new(tag: &str) -> Self {
+    pub fn new(tag: &str) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = format!(
-            "volto-test-{tag}-{}-{}",
-            std::process::id(),
+        let path = scratch_path(&format!(
+            "test-{tag}-{}",
             COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let path = std::env::temp_dir().join(unique);
+        ));
         std::fs::create_dir_all(&path).expect("create temp dir");
         Self { path }
     }

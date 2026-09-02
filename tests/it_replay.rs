@@ -295,11 +295,7 @@ impl Settings {
             "{}/tests/replay/profiles/host-b.json",
             env!("CARGO_MANIFEST_DIR")
         );
-        let default_log = std::env::temp_dir().join(format!(
-            "volto-replay-{}-{}.log",
-            std::process::id(),
-            "server"
-        ));
+        let default_log = common::scratch_path("replay-server").with_extension("log");
 
         Self {
             profile: std::env::var("VOLTO_REPLAY_PROFILE").unwrap_or(default_profile),

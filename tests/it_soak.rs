@@ -63,6 +63,9 @@
 
 mod common;
 
+#[path = "common/fds.rs"]
+mod fds;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -71,6 +74,7 @@ use common::{
     echoes, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end, recv_datagram,
     send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
+use fds::settled_fds;
 use volto::datagram;
 
 /// Sequential mixed cycles the committed soak runs.
@@ -176,43 +180,12 @@ const RECLAIM_BOUND: Duration = Duration::from_secs(3);
 /// two orders below what a descriptor leaked per cycle would come to.
 const FD_SLACK: usize = 12;
 
-/// The file descriptors this process holds, if the platform will say.
+/// How long to leave between the descriptor samples [`fds::settled_fds`] takes.
 ///
-/// `/dev/fd` on macOS and `/proc/self/fd` on Linux are the same directory under
-/// two names: one entry per open descriptor of the calling process. Both CI
-/// platforms have one, so the assertion built on this is never skipped where it
-/// matters; anywhere else it returns `None` and the caller says so rather than
-/// passing quietly.
-fn open_fds() -> Option<usize> {
-    let listing = if cfg!(target_os = "macos") {
-        "/dev/fd"
-    } else {
-        "/proc/self/fd"
-    };
-
-    std::fs::read_dir(listing)
-        .ok()
-        .map(std::iter::Iterator::count)
-}
-
-/// [`open_fds`] once the descriptors a just-finished tunnel owned are gone.
-///
-/// A tunnel is over from the client's point of view as soon as it has read the
-/// server's FIN, and the server task that owned the target socket is finished a
-/// scheduling turn or two later. Sampling the moment the client is done would
-/// therefore count descriptors that are on their way out, and would count a
-/// different number of them each run. The lowest of several samples is the
-/// steady state; anything above it is that tail.
-async fn settled_fds() -> Option<usize> {
-    let mut lowest = open_fds()?;
-
-    for _ in 0..8 {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        lowest = lowest.min(open_fds()?);
-    }
-
-    Some(lowest)
-}
+/// Longer than `it_os_faults` uses, because what has to drain here is a target
+/// socket the server closes after the client has seen the FIN, rather than a
+/// refusal that owned nothing.
+const FD_SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Sends the three drop-worthy datagram shapes at `live`'s session.
 ///
@@ -352,7 +325,7 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
         }
 
         if cycle == CYCLES / 3 {
-            baseline_fds = settled_fds().await;
+            baseline_fds = settled_fds(FD_SAMPLE_INTERVAL).await;
         }
     }
 
@@ -413,7 +386,9 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
 
     // --- Phase 3: descriptors are flat between the two samples. ---
     let baseline_fds = baseline_fds.expect("both CI platforms list this process's descriptors");
-    let final_fds = settled_fds().await.expect("descriptor listing");
+    let final_fds = settled_fds(FD_SAMPLE_INTERVAL)
+        .await
+        .expect("descriptor listing");
     assert!(
         final_fds <= baseline_fds + FD_SLACK,
         "descriptors grew with the run: {baseline_fds} a third of the way in, {final_fds} after \
@@ -500,12 +475,14 @@ async fn connections_release_everything_they_held() {
         drop(client);
 
         if cycle == CONNECTION_CYCLES / 3 {
-            baseline_fds = settled_fds().await;
+            baseline_fds = settled_fds(FD_SAMPLE_INTERVAL).await;
         }
     }
 
     let baseline_fds = baseline_fds.expect("both CI platforms list this process's descriptors");
-    let final_fds = settled_fds().await.expect("descriptor listing");
+    let final_fds = settled_fds(FD_SAMPLE_INTERVAL)
+        .await
+        .expect("descriptor listing");
     assert!(
         final_fds <= baseline_fds + FD_SLACK,
         "descriptors grew with the connections: {baseline_fds} a third of the way in, \

@@ -50,6 +50,9 @@
 
 mod common;
 
+#[path = "common/fds.rs"]
+mod fds;
+
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -59,6 +62,7 @@ use common::{
     proxy_status, respond_to, send_and_respond, send_udp_payload, spawn_echo_target,
     spawn_udp_echo_target, udp_round_trip,
 };
+use fds::settled_fds;
 use rustix::process::{Resource, Rlimit};
 use volto::datagram;
 use volto::h3api::Status;
@@ -177,38 +181,12 @@ fn read_limit() -> Rlimit {
     rustix::process::getrlimit(Resource::Nofile)
 }
 
-/// The descriptors this process holds, if the platform will say.
+/// How long to leave between the descriptor samples [`fds::settled_fds`] takes.
 ///
-/// `/dev/fd` on macOS and `/proc/self/fd` on Linux are the same directory under
-/// two names, and both CI platforms have one. Reading it needs a descriptor of
-/// its own, so it is only ever called with the budget intact.
-fn open_fds() -> Option<usize> {
-    let listing = if cfg!(target_os = "macos") {
-        "/dev/fd"
-    } else {
-        "/proc/self/fd"
-    };
-
-    std::fs::read_dir(listing)
-        .ok()
-        .map(std::iter::Iterator::count)
-}
-
-/// [`open_fds`] once the descriptors a just-finished request owned are gone.
-///
-/// A request is over from the client's point of view as soon as it has read the
-/// response; the server task that owned anything is finished a scheduling turn
-/// or two later. The lowest of several samples is the steady state.
-async fn settled_fds() -> Option<usize> {
-    let mut lowest = open_fds()?;
-
-    for _ in 0..8 {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        lowest = lowest.min(open_fds()?);
-    }
-
-    Some(lowest)
-}
+/// A refused request holds nothing but the stream it was answered on, so what
+/// has to drain here is a scheduling turn rather than a socket close: the
+/// shorter of the two intervals this suite uses.
+const FD_SAMPLE_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The `Proxy-Status` field of a response, or `"<none>"`.
 ///
@@ -308,7 +286,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         b"before"
     );
 
-    let fds_before = settled_fds()
+    let fds_before = settled_fds(FD_SAMPLE_INTERVAL)
         .await
         .expect("both CI platforms list this process's descriptors");
 
@@ -428,7 +406,9 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         .reload()
         .expect("with descriptors back, a reload works again");
 
-    let fds_after = settled_fds().await.expect("descriptor listing");
+    let fds_after = settled_fds(FD_SAMPLE_INTERVAL)
+        .await
+        .expect("descriptor listing");
     assert!(
         fds_after <= fds_before + FD_SLACK,
         "descriptors grew across the fault: {fds_before} before, {fds_after} after"

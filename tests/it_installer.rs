@@ -24,18 +24,14 @@
 mod scripts;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use scripts::repo_root;
+use scripts::{
+    plant_binary_without_the_flag, plant_placeholder_certificates, real_binary, repo_root,
+    scratch_dir,
+};
 use volto::config::Config;
-
-/// The binary a first install would put on the host, and the only thing that can
-/// answer whether it accepts the config the script generates.
-fn real_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_volto"))
-}
 
 /// A stand-in for the host filesystem the installer writes into, carrying the
 /// certificate and key the generated config names.
@@ -44,12 +40,10 @@ fn real_binary() -> PathBuf {
 /// exactly the rule that makes `--check-config` unusable from a bare checkout and
 /// the reason this seam exists at all.
 fn install_root(name: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!("volto-install-{}-{name}", std::process::id()));
-    let _ = fs::remove_dir_all(&root);
+    let root = scratch_dir("install", name);
     let conf_dir = root.join("etc/volto");
     fs::create_dir_all(&conf_dir).expect("the temporary install root must be creatable");
-    fs::write(conf_dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
-    fs::write(conf_dir.join("key.pem"), "not a key\n").expect("key must be writable");
+    plant_placeholder_certificates(&conf_dir);
     root
 }
 
@@ -81,32 +75,6 @@ fn plant_script_dir(root: &Path, example_suffix: &str) -> PathBuf {
     fs::write(&example, text).expect("the example copy must be writable");
 
     dir.join("install-selfsigned.sh")
-}
-
-/// A stand-in for a volto from before `--check-config` existed.
-///
-/// It answers `--help` the way clap does, without the flag, and anything it does
-/// not know the way clap does too: a usage error and a non-zero status. That
-/// second half is the trap — a script that tried the flag and read the failure as
-/// a verdict on the configuration would fail every install with an older binary,
-/// so the stand-in fails loudly rather than quietly.
-fn plant_binary_without_the_flag(root: &Path) -> PathBuf {
-    let path = root.join("volto-old");
-    fs::write(
-        &path,
-        "#!/bin/sh\n\
-         if [ \"$1\" = --help ]; then\n\
-         \x20 echo 'Usage: volto [OPTIONS] --config <FILE>'\n\
-         \x20 echo '  -c, --config <FILE>  Path to the TOML configuration file'\n\
-         \x20 exit 0\n\
-         fi\n\
-         echo \"error: unexpected argument '$1' found\" >&2\n\
-         exit 2\n",
-    )
-    .expect("the stand-in binary must be writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("the stand-in binary must be executable");
-    path
 }
 
 /// Runs `--check-config` on the installer at `script`, with its install paths
@@ -390,7 +358,7 @@ fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
 fn a_binary_that_predates_the_flag_leaves_the_config_unchecked() {
     let root = install_root("too-old");
     let script = plant_script_dir(&root, "\na_key_a_later_release_added = 2\n");
-    let binary = plant_binary_without_the_flag(&root);
+    let binary = plant_binary_without_the_flag(&root, "volto-old");
 
     let (ok, stdout, stderr) = run_check_config(&root, &script, &binary);
 

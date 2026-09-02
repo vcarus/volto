@@ -43,9 +43,8 @@
 mod scripts;
 
 use std::fs;
-use std::path::PathBuf;
 
-use scripts::{code_only, repo_root, rust_files};
+use scripts::{code_only, rust_files, source_root};
 
 /// The identifiers that would put a wall-clock reading into this crate.
 ///
@@ -53,10 +52,6 @@ use scripts::{code_only, repo_root, rust_files};
 /// the two crates that would arrive with a date type of their own, named here
 /// so that adding one is a decision rather than an import.
 const WALL_CLOCK: [&str; 4] = ["SystemTime", "UNIX_EPOCH", "chrono", "OffsetDateTime"];
-
-fn source_root() -> PathBuf {
-    repo_root().join("src")
-}
 
 #[test]
 fn no_source_file_reads_the_wall_clock() {

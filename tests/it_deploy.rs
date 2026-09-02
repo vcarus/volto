@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use scripts::{
-    loadable_config_text, plant_placeholder_certificates, repo_root, scratch_dir, stderr_of,
-    stdout_of,
+    loadable_config_text, plant_binary_without_the_flag, plant_placeholder_certificates,
+    real_binary, repo_root, scratch_dir, stderr_of, stdout_of,
 };
 
 fn deploy_script() -> PathBuf {
@@ -131,37 +131,6 @@ fn plant_loadable_config(root: &Path, body: &str) {
         loadable_config_text(&cert, &key, "127.0.0.1:4433", "planted", body),
     )
     .expect("config must be writable");
-}
-
-/// The binary a release would install, for the tests that need a real verdict.
-fn real_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_volto"))
-}
-
-/// A stand-in for a volto from before `--check-config` existed.
-///
-/// It answers `--help` the way clap does, without the flag, and treats anything
-/// it does not know the way clap does too: a usage error on stderr and a
-/// non-zero status. That second half is the trap — a script that tried the flag
-/// and read the failure as a verdict on the configuration would abandon the
-/// rollback here, so the stand-in fails loudly rather than quietly.
-fn plant_binary_without_the_flag(root: &Path) -> PathBuf {
-    let path = root.join("candidate-old");
-    fs::write(
-        &path,
-        "#!/bin/sh\n\
-         if [ \"$1\" = --help ]; then\n\
-         \x20 echo 'Usage: volto [OPTIONS] --config <FILE>'\n\
-         \x20 echo '  -c, --config <FILE>  Path to the TOML configuration file'\n\
-         \x20 exit 0\n\
-         fi\n\
-         echo \"error: unexpected argument '$1' found\" >&2\n\
-         exit 2\n",
-    )
-    .expect("the stand-in binary must be writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("the stand-in binary must be executable");
-    path
 }
 
 /// `-h` must work and describe the flags the documentation relies on.
@@ -482,7 +451,7 @@ fn a_candidate_that_predates_the_flag_falls_back_to_the_advisory() {
     plant_binary(&root, "0.5.1");
     plant_loadable_config(&root, "\n[limits]\na_key_a_later_release_added = 2\n");
     plant_unit(&root);
-    let candidate = plant_binary_without_the_flag(&root);
+    let candidate = plant_binary_without_the_flag(&root, "candidate-old");
 
     let output = run_deploy_with_candidate(&root, &candidate, &["--dry-run", "--tag", "v0.4.4"]);
 

@@ -45,9 +45,8 @@ mod scripts;
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
 
-use scripts::{code_only, repo_root, rust_files};
+use scripts::{code_only, rust_files, source_root};
 
 /// What keeps one production log statement from becoming a flood.
 ///
@@ -350,10 +349,6 @@ const ACCOUNTED: &[Accounted] = &[
                  session's `evictions` sampler bounds it the same way.",
     },
 ];
-
-fn source_root() -> PathBuf {
-    repo_root().join("src")
-}
 
 /// The macros a production log line is written with.
 ///

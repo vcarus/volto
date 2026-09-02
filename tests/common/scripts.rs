@@ -17,12 +17,15 @@
 //! quinn and rustls into a process that only runs `bash`; that objection is
 //! about `mod common;`, and this is the way round it.
 //!
-//! Nothing here asserts anything about volto. It is paths, process output and
-//! the two files a configuration needs to exist beside it.
+//! Nothing here asserts anything about volto. It is paths, process output, and
+//! the files a run has to plant before it can ask a question: the certificate
+//! pair a configuration names, and the stand-in for a volto too old to know a
+//! flag.
 
 #![allow(dead_code)] // Each of these binaries uses a subset of this.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -32,6 +35,27 @@ use std::process::Output;
 /// does not promise and a test that spawns a shell cannot rely on.
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The `src/` tree, which is what the two gates that read this crate as text
+/// scan.
+///
+/// Beside [`rust_files`] rather than inside it, because "which directory" and
+/// "which files in it" are separate questions: the callers below hand the root
+/// to `strip_prefix` as well, so a failure names `src/foo.rs` rather than an
+/// absolute path.
+pub fn source_root() -> PathBuf {
+    repo_root().join("src")
+}
+
+/// The volto binary this test run built, which is the only thing that can answer
+/// what the real program does with a file.
+///
+/// `CARGO_BIN_EXE_volto` is cargo's promise to an integration test: the path to
+/// the freshly built binary, so a script asked to run `volto --check-config`
+/// runs the one under test rather than whatever is on `PATH`.
+pub fn real_binary() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_volto"))
 }
 
 /// Every `.rs` file under `root`, in a stable order so a failure names the same
@@ -120,6 +144,39 @@ pub fn plant_placeholder_certificates(dir: &Path) -> (PathBuf, PathBuf) {
     fs::write(&cert, "not a certificate\n").expect("cert must be writable");
     fs::write(&key, "not a key\n").expect("key must be writable");
     (cert, key)
+}
+
+/// Writes a stand-in for a volto from before `--check-config` existed, at
+/// `root/name`, and returns its path.
+///
+/// It answers `--help` the way clap does, without the flag, and treats anything
+/// it does not know the way clap does too: a usage error on stderr and a
+/// non-zero status. That second half is the trap both scripts have to get right
+/// — a script that tried the flag and read the failure as a verdict on the
+/// configuration would fail every install with an older binary, and would
+/// abandon `deploy.sh`'s rollback — so the stand-in fails loudly rather than
+/// quietly.
+///
+/// The file name is the caller's because it is what a failure names: the
+/// installer's stand-in is the volto it would install, the deploy script's is
+/// the candidate it just unpacked.
+pub fn plant_binary_without_the_flag(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(name);
+    fs::write(
+        &path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = --help ]; then\n\
+         \x20 echo 'Usage: volto [OPTIONS] --config <FILE>'\n\
+         \x20 echo '  -c, --config <FILE>  Path to the TOML configuration file'\n\
+         \x20 exit 0\n\
+         fi\n\
+         echo \"error: unexpected argument '$1' found\" >&2\n\
+         exit 2\n",
+    )
+    .expect("the stand-in binary must be writable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("the stand-in binary must be executable");
+    path
 }
 
 /// The smallest configuration file the real binary will load.

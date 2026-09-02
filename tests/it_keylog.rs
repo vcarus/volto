@@ -20,7 +20,7 @@ mod common;
 
 use std::sync::LazyLock;
 
-use common::{ALLOW_PRIVATE, H3Client, TestServer, open_tcp_tunnel, spawn_echo_target};
+use common::{ALLOW_PRIVATE, H3Client, TempDir, TestServer, open_tcp_tunnel, spawn_echo_target};
 use tokio::sync::Mutex;
 
 /// Serializes the two tests: `SSLKEYLOGFILE` is process-wide, and rustls reads it
@@ -35,9 +35,8 @@ static ENV: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 async fn enabling_keylog_writes_the_tls_secrets() {
     let _guard = ENV.lock().await;
 
-    let dir = std::env::temp_dir().join(format!("volto-keylog-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let keylog = dir.join("keys.log");
+    let dir = TempDir::new("keylog");
+    let keylog = dir.path().join("keys.log");
 
     // `KeyLogFile` reads this once, when the rustls configuration is built, so it
     // has to be set before the server starts. Safe here: single test, single
@@ -80,8 +79,6 @@ async fn enabling_keylog_writes_the_tls_secrets() {
             );
         }
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// With the switch off — the default — nothing is written even though the
@@ -90,9 +87,8 @@ async fn enabling_keylog_writes_the_tls_secrets() {
 async fn keylog_is_off_unless_asked_for() {
     let _guard = ENV.lock().await;
 
-    let dir = std::env::temp_dir().join(format!("volto-keylog-off-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    let keylog = dir.join("must-not-appear.log");
+    let dir = TempDir::new("keylog-off");
+    let keylog = dir.path().join("must-not-appear.log");
     // Safe for the same reason as above: serialized by `ENV`, set before the
     // server builds its TLS configuration.
     unsafe { std::env::set_var("SSLKEYLOGFILE", &keylog) };
@@ -107,6 +103,4 @@ async fn keylog_is_off_unless_asked_for() {
         !keylog.exists(),
         "secrets must not be written unless log.keylog is on"
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
