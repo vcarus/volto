@@ -1313,6 +1313,8 @@ impl Server {
 pub(crate) mod tests {
     use super::*;
 
+    use std::collections::{BTreeMap, BTreeSet};
+
     use proptest::prelude::*;
 
     #[test]
@@ -2467,8 +2469,7 @@ pub(crate) mod tests {
     /// fails the build rather than the operator's first startup.
     #[test]
     fn the_shipped_example_configuration_is_valid() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/script/config.example.toml");
-        let text = std::fs::read_to_string(path).expect("the example config must exist");
+        let text = example_text();
 
         let cfg: Config = toml::from_str(&text).expect("the example config must parse");
         assert_eq!(cfg.server.listen.port(), 443);
@@ -2485,6 +2486,242 @@ pub(crate) mod tests {
             error.contains("server.cert"),
             "the example must be valid apart from its certificate paths, got: {error}"
         );
+    }
+
+    /// The shipped example configuration, as text.
+    fn example_text() -> String {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/script/config.example.toml");
+        std::fs::read_to_string(path).expect("the example config must exist")
+    }
+
+    /// The key a line assigns, if it is a top-level assignment.
+    ///
+    /// Column zero and a bare `lower_snake` identifier, which is what keeps the
+    /// `# { username = "user2", ... }` inside the example's `users` array --
+    /// indented, and inside a value besides -- from being read as a key of the
+    /// table it sits in.
+    fn assigned_key(line: &str) -> Option<&str> {
+        let (name, _) = line.split_once(" = ")?;
+        let plausible =
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+        plausible.then_some(name)
+    }
+
+    /// Every key the example must document, section by section.
+    ///
+    /// The exhaustive destructuring in [`the_example_documents_every_key_and_pins_every_default`]
+    /// is what keeps this list honest in one direction: a field added to
+    /// `Limits`, `Security`, `Log` or `Server` stops that test compiling until it
+    /// is named and answered there, and this is the half a value assertion cannot
+    /// do -- a key left out of the example parses to exactly the default the
+    /// assertion is comparing against, so only the key set can catch it.
+    /// `deny_unknown_fields` covers the other direction.
+    ///
+    /// `[auth]` is not here: `users` is the operator's own and has no default.
+    const DOCUMENTED_KEYS: [(&str, &[&str]); 4] = [
+        (
+            "server",
+            &["listen", "cert", "key", "alpn", "shutdown_grace"],
+        ),
+        (
+            "limits",
+            &[
+                "udp_session_timeout",
+                "max_targets_per_conn",
+                "max_connections",
+                "connect_timeout",
+                "ip_family_preference",
+                "max_streams_bidi",
+                "max_idle_timeout",
+                "keep_alive_interval",
+                "initial_mtu",
+                "mtu_discovery",
+                "mtu_upper_bound",
+                "congestion_control",
+                "initial_rtt_ms",
+                "socket_recv_buffer",
+                "socket_send_buffer",
+            ],
+        ),
+        (
+            "security",
+            &[
+                "allow_private_networks",
+                "denied_ports",
+                "unanswered_packet_budget",
+                "max_auth_failures",
+            ],
+        ),
+        ("log", &["level", "keylog"]),
+    ];
+
+    /// The example with every commented-out key uncommented, and the keys it
+    /// documents in each section.
+    ///
+    /// The file writes an optional key as `#key = value` -- the `#` hard against
+    /// the key -- and prose as `# sentence`, with a space. That whole convention
+    /// is one character wide, so it is checked rather than trusted: a `#`
+    /// followed by anything that is not a space and not an assignment panics
+    /// here, instead of quietly leaving a key commented out and letting the
+    /// default it was supposed to pin answer for itself.
+    fn example_with_every_key_uncommented() -> (String, BTreeMap<String, BTreeSet<String>>) {
+        let mut uncommented = String::new();
+        let mut documented: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut section = String::new();
+
+        for line in example_text().lines() {
+            let code = match line.strip_prefix('#') {
+                Some(rest) if rest.starts_with(' ') || rest.is_empty() => line,
+                Some(rest) => {
+                    assert!(
+                        assigned_key(rest).is_some(),
+                        "script/config.example.toml writes an optional key as \
+                         `#key = value` and prose as `# sentence`; this line is \
+                         neither: {line}"
+                    );
+                    rest
+                }
+                None => line,
+            };
+
+            if let Some(name) = code.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                section = name.to_owned();
+            } else if let Some(key) = assigned_key(code) {
+                documented
+                    .entry(section.clone())
+                    .or_default()
+                    .insert(key.to_owned());
+            }
+
+            uncommented.push_str(code);
+            uncommented.push('\n');
+        }
+
+        (uncommented, documented)
+    }
+
+    /// Uncommented, the example is the defaults key for key -- apart from three
+    /// values it deliberately raises.
+    ///
+    /// [`the_shipped_example_configuration_is_valid`] proves the file parses,
+    /// which is a weaker claim than it looks: `Limits`, `Security` and `Log` all
+    /// carry a container-level `#[serde(default)]`, so a key dropped from the
+    /// example and a `DEFAULT_*` moved under it both leave that test green. What
+    /// this one pins is the documentation itself. Every `# Default: N` in the
+    /// file is a promise to the operator reading it, and the value beside the key
+    /// is what that operator uncomments and gets.
+    ///
+    /// The three values the file ships uncommented are its own deviations, for
+    /// the reasons it gives beside them:
+    ///
+    /// * `initial_mtu = 1242`, which "keeps the handshake inside a 1270-byte IPv4
+    ///   packet -- under the 1280 bytes any practical path carries", against a
+    ///   program default of 1200 the file calls "the conservative" one.
+    /// * `mtu_upper_bound = 1464`, "what an IPv4 uplink behind a 1492-byte
+    ///   first-hop IP MTU (a single PPPoE-sized deduction) leaves, and the most a
+    ///   measured path commonly yields", against quinn's 1452.
+    /// * `initial_rtt_ms = 150`, "sized with margin for the ~60-100 ms long-haul
+    ///   paths a fronted deployment typically serves", cutting "the worst-case
+    ///   handshake stall from ~1 s to a few hundred ms", against RFC 9002's
+    ///   conservative 333.
+    ///
+    /// Listing them is what stops a fourth arriving quietly: every other field is
+    /// asserted equal to its default, and each of these three is asserted to
+    /// still *be* a deviation, so a default moved onto one of them fails here
+    /// rather than silently making the paragraph above untrue.
+    #[test]
+    fn the_example_documents_every_key_and_pins_every_default() {
+        let (text, documented) = example_with_every_key_uncommented();
+
+        for (section, keys) in DOCUMENTED_KEYS {
+            let found = documented
+                .get(section)
+                .unwrap_or_else(|| panic!("the example must have a [{section}] section"));
+            let expected: BTreeSet<String> = keys.iter().map(|key| (*key).to_owned()).collect();
+            assert_eq!(
+                found, &expected,
+                "[{section}] in script/config.example.toml documents the wrong set of keys"
+            );
+        }
+
+        let cfg: Config =
+            toml::from_str(&text).expect("the example with every key uncommented must still parse");
+        assert_valid_apart_from_certs(&cfg, "the example with every key uncommented");
+
+        // Destructured rather than read field by field: this is what stops
+        // compiling when a field is added, which is the only thing that can force
+        // a new key to be documented above and answered here.
+        let Limits {
+            udp_session_timeout,
+            max_targets_per_conn,
+            max_connections,
+            connect_timeout,
+            ip_family_preference,
+            max_streams_bidi,
+            max_idle_timeout,
+            keep_alive_interval,
+            initial_mtu,
+            mtu_discovery,
+            mtu_upper_bound,
+            congestion_control,
+            initial_rtt_ms,
+            socket_recv_buffer,
+            socket_send_buffer,
+        } = cfg.limits.clone();
+        let limits = Limits::default();
+
+        assert_eq!(udp_session_timeout, limits.udp_session_timeout);
+        assert_eq!(max_targets_per_conn, limits.max_targets_per_conn);
+        assert_eq!(max_connections, limits.max_connections);
+        assert_eq!(connect_timeout, limits.connect_timeout);
+        assert_eq!(ip_family_preference, limits.ip_family_preference);
+        assert_eq!(max_streams_bidi, limits.max_streams_bidi);
+        assert_eq!(max_idle_timeout, limits.max_idle_timeout);
+        assert_eq!(keep_alive_interval, limits.keep_alive_interval);
+        assert_eq!(mtu_discovery, limits.mtu_discovery);
+        assert_eq!(congestion_control, limits.congestion_control);
+        assert_eq!(socket_recv_buffer, limits.socket_recv_buffer);
+        assert_eq!(socket_send_buffer, limits.socket_send_buffer);
+
+        // The three deviations, each still a deviation.
+        assert_eq!(initial_mtu, 1242);
+        assert_ne!(initial_mtu, DEFAULT_INITIAL_MTU);
+        assert_eq!(mtu_upper_bound, 1464);
+        assert_ne!(mtu_upper_bound, DEFAULT_MTU_UPPER_BOUND);
+        assert_eq!(initial_rtt_ms, 150);
+        assert_ne!(initial_rtt_ms, DEFAULT_INITIAL_RTT_MS);
+
+        let Security {
+            allow_private_networks,
+            denied_ports,
+            unanswered_packet_budget,
+            max_auth_failures,
+        } = cfg.security.clone();
+        let security = Security::default();
+
+        assert_eq!(allow_private_networks, security.allow_private_networks);
+        assert_eq!(denied_ports, security.denied_ports);
+        assert_eq!(unanswered_packet_budget, security.unanswered_packet_budget);
+        assert_eq!(max_auth_failures, security.max_auth_failures);
+
+        let Log { level, keylog } = cfg.log.clone();
+        let log = Log::default();
+
+        assert_eq!(level, log.level);
+        assert_eq!(keylog, log.keylog);
+
+        // `listen`, `cert` and `key` are the operator's own and have no default
+        // to be compared against; the other two `[server]` keys do.
+        let Server {
+            listen: _,
+            cert: _,
+            key: _,
+            alpn,
+            shutdown_grace,
+        } = cfg.server.clone();
+
+        assert_eq!(alpn, default_alpn());
+        assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
     }
 
     /// Both socket buffer keys parse, and `0` is a legal value rather than a
