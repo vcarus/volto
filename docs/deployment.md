@@ -99,6 +99,12 @@ sudo script/install-selfsigned.sh \
   --password 'or let it generate one'
 ```
 
+The binary it installs is `./target/release/volto` unless `-b, --binary PATH`
+names another; that is how `deploy.sh` points a first install at the binary it
+unpacked from a release tarball rather than at a local build. Each option that
+takes a value can come from the environment instead — `BINARY`, `SNI`, `PORT`,
+`USERNAME`, `PASSWORD` — and `--help` lists the full set.
+
 A username may not contain a colon (RFC 7617) and may not be longer than 32
 bytes (see [configuration.md](configuration.md#auth)), and neither a username
 nor a password may contain `"`, `\`, `|` or `&`: the first two cannot be

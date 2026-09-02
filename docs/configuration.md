@@ -1,9 +1,10 @@
 # Configuration
 
-volto reads one TOML file, named with `--config`:
+volto reads one TOML file, named with `--config`, or `-c` for short:
 
 ```sh
 volto --config /etc/volto/config.toml
+volto -c /etc/volto/config.toml
 ```
 
 Only `[server]` is required; every other section and key has a default. Unknown
@@ -233,6 +234,24 @@ every install derived from it — ships 150 for that reason; the compiled-in
 fallback used when the key is absent stays at 333. Keep the margin: a value
 below the real RTT makes the timer fire early and retransmit packets that were
 never lost.
+
+**The two MTU keys are shipped tuned as well.** The example configuration in
+`script/` ships `initial_mtu = 1242` and `mtu_upper_bound = 1464` as live keys,
+and the installer substitutes only the listen address, the certificate paths
+and the user — so every install derived from it runs above the compiled-in 1200
+and 1452 that apply when the keys are absent. 1242 keeps the handshake inside a
+1270-byte IPv4 packet: under the 1280 bytes any practical path carries, and
+below what Chromium (1250) and quic-go (1280) send everywhere. Over IPv6 the
+same packets are 1290 bytes, past that guarantee, so put it back to 1200 if
+clients reach the server over IPv6 — this is the key that is sent blind, and a
+size the path cannot carry kills the connection with nothing to fall back to.
+1464 is what an IPv4 uplink behind a 1492-byte first-hop IP MTU (one
+PPPoE-sized deduction) leaves, and it is a ceiling for a search rather than a
+size that gets sent, so overshooting costs a probe and nothing else; 1472,
+clean Ethernet over IPv4, is the most volto accepts. Neither value is a
+measurement of *your* path: measure with `ping -M do` before raising either,
+and lower `initial_mtu` on the first sign that a handshake is not getting
+through.
 
 **`ip_family_preference` decides which half of a dual-stack target is tried
 first, and it is an operator's call rather than the resolver's.** `getaddrinfo`

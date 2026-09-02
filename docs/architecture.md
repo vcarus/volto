@@ -620,6 +620,20 @@ client that writes its own Context ID prefix can send. The clients live in
 `tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python script),
 so `cargo test` neither sees nor needs them.
 
+A third independent implementation judges the field-section encoding in
+particular, and its verdicts are checked in rather than re-run: the differential
+oracle in `tests/interop/difforacle/` puts generated and mutated field sections
+through this server's QPACK and Huffman decoders and through ls-qpack (via
+`pylsqpack`), comparing both the accept/reject verdict and the decoded fields.
+It needs a pinned Python environment and so runs on demand like the fuzz
+targets, but what it settled lives in `tests/it_diff_oracle.rs` and is
+re-checked on every `cargo test`: the five inputs the two implementations
+answer differently, none of them a fault here, and ls-qpack's own copy of the
+RFC 9204 static table, entry by entry. That table is the one thing the in-tree
+tests cannot check for themselves, since `src/h3/qpack.rs` transcribes RFC 9204
+Appendix A by hand and its unit test can only compare that transcription with
+itself.
+
 Every hand-written parser that reads bytes a peer chose also has a
 coverage-guided fuzz target under `fuzz/`, run on demand on a nightly toolchain
 in a Linux container rather than in CI; `fuzz/README.md` maps each target to the
