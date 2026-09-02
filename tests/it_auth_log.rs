@@ -6,6 +6,15 @@
 //! request log). The two are complementary: that one proves credentials *are*
 //! logged verbatim by the request log until M6 redacts them, this one proves the
 //! authentication path never adds a second copy in plaintext.
+//!
+//! One test function, like every other binary that reads log lines, and for a
+//! reason this file needs more than most: the whole product here is a *negative*
+//! assertion -- this string appears nowhere -- and the two scenarios drive the
+//! same username and the same password. Run as two `#[tokio::test]`s they run at
+//! once and write into one buffer, so the scenario that reads it is reading the
+//! other one's lines too, and a leak on the other one's path would be reported
+//! against this one. Running them in order and reading only the lines logged
+//! after a mark is what makes each verdict the scenario's own.
 
 mod common;
 
@@ -19,8 +28,20 @@ const USERNAME: &str = "user1";
 const PASSWORD: &str = "unlikely-plaintext-password";
 
 #[tokio::test]
-async fn a_rejected_password_is_never_logged() {
+async fn the_authentication_path_never_puts_a_credential_in_the_log() {
     let buffer = SharedBuffer::install("volto=debug");
+
+    a_rejected_password_is_never_logged(&buffer).await;
+    credentials_padded_with_whitespace_are_still_credentials().await;
+}
+
+/// A guess is refused, and nothing derived from it -- or from the credential it
+/// was guessing at -- survives in the log.
+async fn a_rejected_password_is_never_logged(buffer: &SharedBuffer) {
+    // Before the server starts, not after: what is asserted below is that the
+    // password appears in *no* line this scenario produced, and startup is where
+    // a configuration dump would put one.
+    let mark = buffer.mark();
 
     let server = TestServer::start_with(&auth_section(&[(USERNAME, PASSWORD)])).await;
     let mut client = H3Client::connect(&server).await;
@@ -34,7 +55,7 @@ async fn a_rejected_password_is_never_logged() {
     let response = respond_to(&mut client, request).await;
     assert_eq!(response.status, Status::PROXY_AUTHENTICATION_REQUIRED);
 
-    let logged = buffer.contents();
+    let logged = buffer.since(mark);
 
     // The failure is visible, and says who and why.
     let failure = logged
@@ -77,7 +98,10 @@ async fn a_rejected_password_is_never_logged() {
 ///
 /// A live target rather than a refusal, so what is asserted is the tunnel
 /// opening and not merely a different way of being turned away.
-#[tokio::test]
+///
+/// Reads no log lines, and takes no mark: it is here because it belongs to the
+/// credential-handling story this binary tells, and its only claim is on the
+/// wire.
 async fn credentials_padded_with_whitespace_are_still_credentials() {
     let server = TestServer::start_with(&format!(
         "{ALLOW_PRIVATE}{}",
