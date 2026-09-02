@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tracing::{debug, info, warn};
 
@@ -153,54 +154,11 @@ pub async fn handle(
             () = shutdown.fired(), if !going_away => {
                 going_away = true;
 
-                // Bounded like every other write that depends on the peer
-                // taking it ([`h3api::Stream::respond_within`]): the control
-                // stream applies the peer's flow control, and this write is a
-                // `select!` arm of the loop that drains the connection, so a
-                // peer granting no window parks the drain with it -- the arm
-                // below never polled again, the connection never reported
-                // finished, and the whole process waiting out
-                // `server.shutdown_grace` for one peer that is under no
-                // obligation to read anything (adversarial pass 2026-08-29).
-                let sent = match tokio::time::timeout(
+                if let Drain::Finished = announce_goaway(
+                    &mut connection,
+                    &context,
                     goaway_within,
-                    connection.shutdown(),
                 ).await {
-                    Ok(Ok(())) => true,
-                    Ok(Err(error)) => {
-                        // The connection is unusable, so there is nothing left
-                        // to drain politely.
-                        debug!(%error, "failed to send GOAWAY");
-                        break Ok(());
-                    }
-                    // Not a break: the GOAWAY is a courtesy, and this
-                    // connection's tunnels are somebody's live traffic. Giving
-                    // up on the frame and draining anyway is what keeps the
-                    // promise the grace period makes to them; returning here
-                    // would drop the HTTP/3 connection and cut every one.
-                    Err(_elapsed) => false,
-                };
-
-                let live = context.quota.live();
-                if sent {
-                    info!(live_tunnels = live, "sent GOAWAY, draining tunnels");
-                } else {
-                    debug!(
-                        remote = %context.remote,
-                        live_tunnels = live,
-                        timeout_secs = goaway_within.as_secs(),
-                        "the peer would not take a GOAWAY; draining without one"
-                    );
-                }
-                // Not `live == 0`: a request accepted before the signal whose
-                // headers are still arriving holds no tunnel slot yet, and it
-                // is below the identifier this GOAWAY just published -- one the
-                // peer was told "might have been processed" (RFC 9114 §5.2).
-                // This server serves those rather than rejecting them
-                // individually, and reading only the tunnel count closed the
-                // connection out from under it instead (adversarial pass
-                // 2026-08-30).
-                if !context.quota.is_busy() {
                     break Ok(());
                 }
             }
@@ -281,6 +239,73 @@ pub async fn handle(
 /// `validate` itself never multiplies -- it compares against the ceiling
 /// constant, and this is the number that ceiling was chosen for.
 pub(crate) const SILENCE_FACTOR: u32 = 2;
+
+/// Whether a connection still has work to do once its GOAWAY is out.
+enum Drain {
+    /// Requests are still in flight; keep serving them.
+    Pending,
+    /// Nothing is left to serve, or nothing can be: close now.
+    Finished,
+}
+
+/// Tells the peer this connection is going away, and reports whether anything
+/// is left to drain.
+///
+/// Split out of the accept loop's `select!` arm, where it was the only branch
+/// that could end the connection two ways.
+///
+/// The GOAWAY write is bounded like every other write that depends on the peer
+/// taking it ([`h3api::Stream::respond_within`]): the control stream applies
+/// the peer's flow control, and this runs inside the loop that drains the
+/// connection, so a peer granting no window parks the drain with it -- the
+/// accept arm never polled again, the connection never reported finished, and
+/// the whole process waiting out `server.shutdown_grace` for one peer that is
+/// under no obligation to read anything (adversarial pass 2026-08-29).
+async fn announce_goaway(
+    connection: &mut h3api::Connection,
+    context: &Context,
+    within: Duration,
+) -> Drain {
+    let sent = match tokio::time::timeout(within, connection.shutdown()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            // The connection is unusable, so there is nothing left to drain
+            // politely.
+            debug!(%error, "failed to send GOAWAY");
+            return Drain::Finished;
+        }
+        // Not a `Finished`: the GOAWAY is a courtesy, and this connection's
+        // tunnels are somebody's live traffic. Giving up on the frame and
+        // draining anyway is what keeps the promise the grace period makes to
+        // them; returning here would drop the HTTP/3 connection and cut every
+        // one.
+        Err(_elapsed) => false,
+    };
+
+    let live = context.quota.live();
+    if sent {
+        info!(live_tunnels = live, "sent GOAWAY, draining tunnels");
+    } else {
+        debug!(
+            remote = %context.remote,
+            live_tunnels = live,
+            timeout_secs = within.as_secs(),
+            "the peer would not take a GOAWAY; draining without one"
+        );
+    }
+
+    // Not `live == 0`: a request accepted before the signal whose headers are
+    // still arriving holds no tunnel slot yet, and it is below the identifier
+    // this GOAWAY just published -- one the peer was told "might have been
+    // processed" (RFC 9114 §5.2). This server serves those rather than
+    // rejecting them individually, and reading only the tunnel count closed the
+    // connection out from under it instead (adversarial pass 2026-08-30).
+    if context.quota.is_busy() {
+        Drain::Pending
+    } else {
+        Drain::Finished
+    }
+}
 
 /// What waiting for the next request stream produced.
 enum NextRequest {

@@ -569,9 +569,9 @@ impl Server {
             // ordering a steady stream of new connections would starve that
             // branch, and finished tasks would pile up in the set for as long as
             // the stream lasted. Nothing about the cap rides on this any more --
-            // that is decided against the roster a few lines down -- so what is
-            // at stake is the memory of the join handles and the length of the
-            // walk `drain` does at shutdown.
+            // that is decided against the roster, in [`Self::admit`] -- so what
+            // is at stake is the memory of the join handles and the length of
+            // the walk `drain` does at shutdown.
             while connections.try_join_next().is_some() {}
 
             tokio::select! {
@@ -582,158 +582,14 @@ impl Server {
                 () = shutdown.fired() => break,
 
                 incoming = self.endpoint.accept() => {
-                    let Some(mut incoming) = incoming else {
+                    let Some(incoming) = incoming else {
                         // The endpoint was closed from elsewhere.
                         break;
                     };
 
-                    // Read per accepted connection rather than snapshotted
-                    // before the loop: `docs/deployment.md#reloading` promises a
-                    // reload applies to connections accepted from then on, and
-                    // lowering this cap during an incident is exactly the sort of
-                    // thing that promise is for. The cost is an `Arc` load on a
-                    // path that is already opening a QUIC connection.
-                    let max_connections = self.config().limits.max_connections;
-
-                    // The roster rather than the `JoinSet`: a slot is entered
-                    // before the QUIC handshake starts and given up by a guard,
-                    // so the roster counts exactly the connections that hold
-                    // one. The set is kept for draining, and its length *leads*
-                    // the roster rather than trailing it -- a task that has
-                    // finished but not been reaped has already dropped its
-                    // registration, and an evicted one leaves the roster before
-                    // its task ends, so the set holds everything the roster does
-                    // and sometimes more.
-                    if max_connections > 0 && self.roster.len() >= max_connections as usize {
-                        // Read before `retry()` or `refuse()` consumes the
-                        // `Incoming`, so either branch can still name the peer.
-                        let remote = incoming.remote_address();
-                        let live = self.roster.len();
-
-                        // Taking somebody else's slot is a privilege, and a
-                        // source address that has proved nothing does not have
-                        // it: one spoofed Initial per datagram, from addresses
-                        // that never have to receive anything, would otherwise
-                        // walk the whole roster out of the door -- and every one
-                        // of those datagrams would start a TLS server flight,
-                        // since `serve` accepts the connection eagerly. So at
-                        // the cap the unvalidated newcomer is asked to come back
-                        // with a token instead, which costs this server no
-                        // crypto and no slot, and is what QUIC provides for the
-                        // purpose.
-                        //
-                        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
-                        //# A server might wish to validate the client address
-                        //# before starting the cryptographic handshake.  QUIC
-                        //# uses a token in the Initial packet to provide
-                        //# address validation prior to completing the
-                        //# handshake.  This token is delivered to the client
-                        //# during connection establishment with a Retry packet
-                        //# (see Section 8.1.2) or in a previous connection
-                        //# using the NEW_TOKEN frame (see Section 8.1.3).
-                        //
-                        // The second of those is why the round trip is rarer
-                        // than it looks. quinn's `bloom` feature is on (see
-                        // `Cargo.toml`), so this server sends two NEW_TOKEN
-                        // frames on every connection whose path it validated,
-                        // and a client that keeps them -- quinn's own default
-                        // token store does -- comes back already validated and
-                        // evicts without a Retry. What pays the extra round trip
-                        // is an address this server holds no token from: a first
-                        // contact, a token past its two-week lifetime, or one
-                        // sealed by a key this process no longer has, since
-                        // `ServerConfig::with_crypto` draws a fresh one every
-                        // time `server_config` builds a config -- at startup and
-                        // again on every `SIGHUP`. And it is paid only while the
-                        // server is full: below the cap this branch is not
-                        // entered at all, so an ordinary Surge handshake is
-                        // untouched.
-                        if !incoming.remote_address_validated() {
-                            if incoming.may_retry() {
-                                match incoming.retry() {
-                                    Ok(()) => {
-                                        // DEBUG for the same reason the refusal
-                                        // below is: a flood is exactly when this
-                                        // fires.
-                                        debug!(
-                                            %remote,
-                                            live,
-                                            max_connections,
-                                            "the server is full: asking an unvalidated address \
-                                             to prove itself before it may take a slot"
-                                        );
-                                        continue;
-                                    }
-                                    // Unreachable as quinn stands -- it
-                                    // documents `may_retry()` as guaranteed true
-                                    // whenever the address is unvalidated -- and
-                                    // handled rather than unwrapped because the
-                                    // fallback is the safe one either way.
-                                    //
-                                    //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
-                                    //# In response to processing an Initial packet
-                                    //# containing a token that was provided in a Retry
-                                    //# packet, a server cannot send another Retry
-                                    //# packet; it can only refuse the connection or
-                                    //# permit it to proceed.
-                                    Err(error) => incoming = error.into_incoming(),
-                                }
-                            }
-
-                            debug!(
-                                %remote,
-                                live,
-                                max_connections,
-                                "refusing a connection: the server is full and this address \
-                                 cannot be asked to validate itself"
-                            );
-                            incoming.refuse();
-                            continue;
-                        }
-
-                        // A loop rather than a single eviction, because the cap
-                        // this is measured against can move; `evict_until_below`
-                        // carries the whole of that argument and is what the
-                        // roster's own tests run. A connection that has never
-                        // had a request pass the credentials check is not owed
-                        // the slot it is sitting on, and a peer that completes a
-                        // handshake a second and never authenticates would
-                        // otherwise hold every slot there is for as long as it
-                        // cared to -- each one bounded, all of them replaced
-                        // (audit 2026-08-23).
-                        for victim in self.roster.evict_until_below(max_connections as usize) {
-                            // DEBUG, not INFO: this fires once per arrival for
-                            // as long as a flood lasts, which is exactly the
-                            // shape the refusal beside it is DEBUG for. The
-                            // victim's own closing line stays at INFO -- that one
-                            // is once per connection actually lost, and it is
-                            // what an operator is looking for.
-                            debug!(
-                                evicted = %victim,
-                                %remote,
-                                max_connections,
-                                "the server is full: evicting the oldest connection that has \
-                                 not authenticated"
-                            );
-                        }
-
-                        // Still full, so every live connection has authenticated
-                        // and there is nothing to take a slot from. Refused at
-                        // the QUIC layer: the peer is told immediately instead of
-                        // timing out, and nothing per-connection is built on our
-                        // side. Logged at DEBUG because a flood is exactly when
-                        // this fires.
-                        if self.roster.len() >= max_connections as usize {
-                            debug!(
-                                %remote,
-                                live = self.roster.len(),
-                                max_connections,
-                                "refusing a connection: the server is at its connection limit"
-                            );
-                            incoming.refuse();
-                            continue;
-                        }
-                    }
+                    let Some(incoming) = self.admit(incoming) else {
+                        continue;
+                    };
 
                     connections.spawn(self.serve(incoming));
                 }
@@ -747,6 +603,156 @@ impl Server {
         if shutdown.is_fired() {
             self.drain(&mut connections).await;
         }
+    }
+
+    /// Decides whether an arriving connection may have a slot, and answers
+    /// it itself when it may not.
+    ///
+    /// `Some` is a connection the accept loop should go on and serve. `None`
+    /// means this arrival has already been dealt with -- asked for a Retry,
+    /// or refused -- and there is nothing left for the caller to do with it.
+    ///
+    /// Below the cap this is a configuration read and a length read and
+    /// nothing else: every branch past the first belongs to a full server.
+    fn admit(&self, mut incoming: quinn::Incoming) -> Option<quinn::Incoming> {
+        // Read per accepted connection rather than snapshotted before the
+        // loop: `docs/deployment.md#reloading` promises a reload applies to
+        // connections accepted from then on, and lowering this cap during an
+        // incident is exactly the sort of thing that promise is for. The cost
+        // is an `Arc` load on a path that is already opening a QUIC
+        // connection.
+        let max_connections = self.config().limits.max_connections;
+
+        // The roster rather than the `JoinSet`: a slot is entered before the
+        // QUIC handshake starts and given up by a guard, so the roster counts
+        // exactly the connections that hold one. The set is kept for draining,
+        // and its length *leads* the roster rather than trailing it -- a task
+        // that has finished but not been reaped has already dropped its
+        // registration, and an evicted one leaves the roster before its task
+        // ends, so the set holds everything the roster does and sometimes
+        // more.
+        if max_connections == 0 || self.roster.len() < max_connections as usize {
+            return Some(incoming);
+        }
+
+        // Read before `retry()` or `refuse()` consumes the `Incoming`, so
+        // either branch can still name the peer.
+        let remote = incoming.remote_address();
+        let live = self.roster.len();
+
+        // Taking somebody else's slot is a privilege, and a source address
+        // that has proved nothing does not have it: one spoofed Initial per
+        // datagram, from addresses that never have to receive anything, would
+        // otherwise walk the whole roster out of the door -- and every one of
+        // those datagrams would start a TLS server flight, since `serve`
+        // accepts the connection eagerly. So at the cap the unvalidated
+        // newcomer is asked to come back with a token instead, which costs
+        // this server no crypto and no slot, and is what QUIC provides for the
+        // purpose.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+        //# A server might wish to validate the client address
+        //# before starting the cryptographic handshake.  QUIC
+        //# uses a token in the Initial packet to provide
+        //# address validation prior to completing the
+        //# handshake.  This token is delivered to the client
+        //# during connection establishment with a Retry packet
+        //# (see Section 8.1.2) or in a previous connection
+        //# using the NEW_TOKEN frame (see Section 8.1.3).
+        //
+        // The second of those is why the round trip is rarer than it looks.
+        // quinn's `bloom` feature is on (see `Cargo.toml`), so this server
+        // sends two NEW_TOKEN frames on every connection whose path it
+        // validated, and a client that keeps them -- quinn's own default token
+        // store does -- comes back already validated and evicts without a
+        // Retry. What pays the extra round trip is an address this server
+        // holds no token from: a first contact, a token past its two-week
+        // lifetime, or one sealed by a key this process no longer has, since
+        // `ServerConfig::with_crypto` draws a fresh one every time
+        // `server_config` builds a config -- at startup and again on every
+        // `SIGHUP`. And it is paid only while the server is full: below the
+        // cap this branch is not entered at all, so an ordinary Surge
+        // handshake is untouched.
+        if !incoming.remote_address_validated() {
+            if incoming.may_retry() {
+                match incoming.retry() {
+                    Ok(()) => {
+                        // DEBUG for the same reason the refusal below is: a
+                        // flood is exactly when this fires.
+                        debug!(
+                            %remote,
+                            live,
+                            max_connections,
+                            "the server is full: asking an unvalidated address \
+                             to prove itself before it may take a slot"
+                        );
+                        return None;
+                    }
+                    // Unreachable as quinn stands -- it documents
+                    // `may_retry()` as guaranteed true whenever the address is
+                    // unvalidated -- and handled rather than unwrapped because
+                    // the fallback is the safe one either way.
+                    //
+                    //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                    //# In response to processing an Initial packet
+                    //# containing a token that was provided in a Retry
+                    //# packet, a server cannot send another Retry
+                    //# packet; it can only refuse the connection or
+                    //# permit it to proceed.
+                    Err(error) => incoming = error.into_incoming(),
+                }
+            }
+
+            debug!(
+                %remote,
+                live,
+                max_connections,
+                "refusing a connection: the server is full and this address \
+                 cannot be asked to validate itself"
+            );
+            incoming.refuse();
+            return None;
+        }
+
+        // A loop rather than a single eviction, because the cap this is
+        // measured against can move; `evict_until_below` carries the whole of
+        // that argument and is what the roster's own tests run. A connection
+        // that has never had a request pass the credentials check is not owed
+        // the slot it is sitting on, and a peer that completes a handshake a
+        // second and never authenticates would otherwise hold every slot there
+        // is for as long as it cared to -- each one bounded, all of them
+        // replaced (audit 2026-08-23).
+        for victim in self.roster.evict_until_below(max_connections as usize) {
+            // DEBUG, not INFO: this fires once per arrival for as long as a
+            // flood lasts, which is exactly the shape the refusal beside it is
+            // DEBUG for. The victim's own closing line stays at INFO -- that
+            // one is once per connection actually lost, and it is what an
+            // operator is looking for.
+            debug!(
+                evicted = %victim,
+                %remote,
+                max_connections,
+                "the server is full: evicting the oldest connection that has \
+                 not authenticated"
+            );
+        }
+
+        // Still full, so every live connection has authenticated and there is
+        // nothing to take a slot from. Refused at the QUIC layer: the peer is
+        // told immediately instead of timing out, and nothing per-connection
+        // is built on our side. Logged at DEBUG because a flood is exactly
+        // when this fires.
+        if self.roster.len() >= max_connections as usize {
+            debug!(
+                %remote,
+                live = self.roster.len(),
+                max_connections,
+                "refusing a connection: the server is at its connection limit"
+            );
+            incoming.refuse();
+            return None;
+        }
+        Some(incoming)
     }
 
     /// Runs one accepted connection to completion.
@@ -970,50 +976,13 @@ impl Server {
                     },
             };
 
-            // One snapshot for every transport field below, so they all
-            // describe the same instant — and the only read of them there is, so
-            // the counters cost nothing while the connection runs.
-            let stats = rtt_probe.stats();
-            let path = stats.path;
-            let tunnels = tunnels.load(Ordering::Relaxed);
-            let dropped_datagrams = dropped_datagrams.load(Ordering::Relaxed);
-
-            match closed {
-                Ok(reason) => {
-                    info!(
-                        remote = %peer.remote,
-                        remote_now = %rtt_probe.remote_address(),
-                        reason,
-                        rtt_ms = rtt_probe.rtt().as_millis(),
-                        mtu = path.current_mtu,
-                        mtu_black_holes = path.black_holes_detected,
-                        tunnels,
-                        dropped_datagrams,
-                        tx_bytes = stats.udp_tx.bytes,
-                        rx_bytes = stats.udp_rx.bytes,
-                        sent_packets = path.sent_packets,
-                        lost_packets = path.lost_packets,
-                        "connection closed"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        remote = %peer.remote,
-                        remote_now = %rtt_probe.remote_address(),
-                        %error,
-                        rtt_ms = rtt_probe.rtt().as_millis(),
-                        mtu = path.current_mtu,
-                        mtu_black_holes = path.black_holes_detected,
-                        tunnels,
-                        dropped_datagrams,
-                        tx_bytes = stats.udp_tx.bytes,
-                        rx_bytes = stats.udp_rx.bytes,
-                        sent_packets = path.sent_packets,
-                        lost_packets = path.lost_packets,
-                        "connection closed with error"
-                    );
-                }
-            }
+            log_connection_closed(
+                peer.remote,
+                &rtt_probe,
+                closed,
+                tunnels.load(Ordering::Relaxed),
+                dropped_datagrams.load(Ordering::Relaxed),
+            );
         }
     }
 
@@ -1061,6 +1030,70 @@ impl Server {
         // Give the CONNECTION_CLOSE frames a moment to leave the socket. Bounded,
         // because this is the last thing standing between us and exiting.
         let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
+    }
+}
+
+/// The line one connection ends on: INFO with the reason it stopped, WARN with
+/// the error that stopped it.
+///
+/// Written here rather than at the end of [`Server::serve`] so the two field
+/// lists cannot drift apart. They carry the same twelve fields and differ only
+/// in `reason` against `error`, which is what makes an operator able to grep
+/// one journal for both -- and what a second copy of a twelve-field list
+/// invites losing, as D72's traffic counters would have been had they landed on
+/// only one of them.
+///
+/// `closed` is graded from the error *value* rather than from
+/// `Connection::close_reason()`, for the reason [`Server::serve`] gives where it
+/// is decided.
+fn log_connection_closed(
+    remote: SocketAddr,
+    quic: &quinn::Connection,
+    closed: Result<&'static str, h3api::ConnectionError>,
+    tunnels: u64,
+    dropped_datagrams: u64,
+) {
+    // One snapshot for every transport field below, so they all describe the
+    // same instant — and the only read of them there is, so the counters cost
+    // nothing while the connection runs.
+    let stats = quic.stats();
+    let path = stats.path;
+
+    match closed {
+        Ok(reason) => {
+            info!(
+                remote = %remote,
+                remote_now = %quic.remote_address(),
+                reason,
+                rtt_ms = quic.rtt().as_millis(),
+                mtu = path.current_mtu,
+                mtu_black_holes = path.black_holes_detected,
+                tunnels,
+                dropped_datagrams,
+                tx_bytes = stats.udp_tx.bytes,
+                rx_bytes = stats.udp_rx.bytes,
+                sent_packets = path.sent_packets,
+                lost_packets = path.lost_packets,
+                "connection closed"
+            );
+        }
+        Err(error) => {
+            warn!(
+                remote = %remote,
+                remote_now = %quic.remote_address(),
+                %error,
+                rtt_ms = quic.rtt().as_millis(),
+                mtu = path.current_mtu,
+                mtu_black_holes = path.black_holes_detected,
+                tunnels,
+                dropped_datagrams,
+                tx_bytes = stats.udp_tx.bytes,
+                rx_bytes = stats.udp_rx.bytes,
+                sent_packets = path.sent_packets,
+                lost_packets = path.lost_packets,
+                "connection closed with error"
+            );
+        }
     }
 }
 
