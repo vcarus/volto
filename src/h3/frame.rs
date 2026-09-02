@@ -67,23 +67,59 @@ pub const MAX_PUSH_ID: u64 = 0x0d;
 
 /// The frame types this server parses, and so has to buffer whole.
 ///
-/// The one list the two decisions that turn on it read: what `begin` puts in
-/// [`State::Buffering`], and which types `misplaced` refuses once a stream has
-/// become a tunnel (RFC 9114 §4.4's "any other known frame type"). DATA is not
-/// here because it is never buffered, and a type absent from this list is one
-/// §9 has this server skip rather than judge.
+/// The one place the three decisions that turn on it are written: what `begin`
+/// puts in [`State::Buffering`], which types `misplaced` refuses once a stream
+/// has become a tunnel (RFC 9114 §4.4's "any other known frame type"), and what
+/// `parse` does with the payload once it is whole. DATA is not here because it
+/// is never buffered, and a type this enum does not name is one §9 has this
+/// server skip rather than judge.
 ///
-/// Written once because `parse`'s `unreachable!` is only sound while the two
-/// agree: a seventh type added to one list and not the other compiles, and the
-/// first frame of it reaches an arm that says it cannot happen.
-const BUFFERED_TYPES: [u64; 6] = [
-    HEADERS,
-    SETTINGS,
-    GOAWAY,
-    CANCEL_PUSH,
-    MAX_PUSH_ID,
-    PUSH_PROMISE,
-];
+/// A type rather than a list of codes, so that `parse` can be exhaustive over
+/// it: a seventh buffered frame is then a compiler error at the one place that
+/// would have to parse it, where a seventh entry in a list of codes compiled
+/// and let the first frame of it reach an arm that said it could not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferedKind {
+    /// HEADERS (RFC 9114 §7.2.2).
+    Headers,
+    /// SETTINGS (RFC 9114 §7.2.4).
+    Settings,
+    /// GOAWAY (RFC 9114 §7.2.6).
+    Goaway,
+    /// CANCEL_PUSH (RFC 9114 §7.2.3).
+    CancelPush,
+    /// MAX_PUSH_ID (RFC 9114 §7.2.7).
+    MaxPushId,
+    /// PUSH_PROMISE (RFC 9114 §7.2.5).
+    PushPromise,
+}
+
+impl BufferedKind {
+    /// The buffered frame `kind` names, or `None` if that type is not one.
+    fn from_type(kind: u64) -> Option<Self> {
+        Some(match kind {
+            HEADERS => Self::Headers,
+            SETTINGS => Self::Settings,
+            GOAWAY => Self::Goaway,
+            CANCEL_PUSH => Self::CancelPush,
+            MAX_PUSH_ID => Self::MaxPushId,
+            PUSH_PROMISE => Self::PushPromise,
+            _ => return None,
+        })
+    }
+
+    /// The type code this frame carries on the wire.
+    fn frame_type(self) -> u64 {
+        match self {
+            Self::Headers => HEADERS,
+            Self::Settings => SETTINGS,
+            Self::Goaway => GOAWAY,
+            Self::CancelPush => CANCEL_PUSH,
+            Self::MaxPushId => MAX_PUSH_ID,
+            Self::PushPromise => PUSH_PROMISE,
+        }
+    }
+}
 
 /// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
 ///
@@ -424,7 +460,7 @@ enum State {
     /// Buffering the payload of a frame that has to be seen whole.
     Buffering {
         /// Which frame is being buffered.
-        kind: u64,
+        kind: BufferedKind,
         /// Payload bytes still to arrive.
         remaining: usize,
     },
@@ -854,30 +890,31 @@ fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
         return Err(Violation::connection(Code::H3_FRAME_UNEXPECTED, detail).into());
     }
 
-    Ok(match kind {
-        DATA => State::Data { remaining: length },
+    if kind == DATA {
+        return Ok(State::Data { remaining: length });
+    }
 
-        kind if BUFFERED_TYPES.contains(&kind) => {
-            if length > MAX_BUFFERED_FRAME {
-                return Err(Violation::field_section_too_large(format!(
-                    "a {length}-byte frame is past what this server buffers"
-                ))
-                .into());
-            }
-            State::Buffering {
-                kind,
-                remaining: length as usize,
-            }
-        }
-
+    let Some(buffered) = BufferedKind::from_type(kind) else {
         // RFC 9114 §9's rule that unknown values are ignored, quoted in full in
         // `super`'s module comment. Ignoring is what every reader does with the
         // `Item::Skipped` this ends up producing; the payload is discarded here
         // and never buffered.
-        _ => State::Skipping {
+        return Ok(State::Skipping {
             kind,
             remaining: length,
-        },
+        });
+    };
+
+    if length > MAX_BUFFERED_FRAME {
+        return Err(Violation::field_section_too_large(format!(
+            "a {length}-byte frame is past what this server buffers"
+        ))
+        .into());
+    }
+
+    Ok(State::Buffering {
+        kind: buffered,
+        remaining: length as usize,
     })
 }
 
@@ -964,7 +1001,7 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
         // same section rather than by reopening it.
         StreamKind::Tunnel => match kind {
             DATA => None,
-            kind if BUFFERED_TYPES.contains(&kind) => {
+            _ if BufferedKind::from_type(kind).is_some() => {
                 Some("a frame other than DATA once the CONNECT method had completed")
             }
             _ => None,
@@ -973,17 +1010,19 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
 }
 
 /// Parses a buffered frame payload.
-fn parse(kind: u64, payload: Bytes) -> Result<Frame, Violation> {
+///
+/// Exhaustive over [`BufferedKind`] and so total: only `begin` can put a frame
+/// in [`State::Buffering`], and it can only put one of these there.
+fn parse(kind: BufferedKind, payload: Bytes) -> Result<Frame, Violation> {
     match kind {
-        HEADERS => Ok(Frame::Headers(payload)),
-        SETTINGS => parse_settings(&payload).map(Frame::Settings),
-        GOAWAY => single_varint(GOAWAY, &payload).map(Frame::Goaway),
-        CANCEL_PUSH => single_varint(CANCEL_PUSH, &payload).map(Frame::CancelPush),
-        MAX_PUSH_ID => single_varint(MAX_PUSH_ID, &payload).map(Frame::MaxPushId),
-        PUSH_PROMISE => Ok(Frame::PushPromise),
-        // `begin` buffers exactly `BUFFERED_TYPES`, which is exactly the six
-        // arms above.
-        other => unreachable!("frame type {other:#x} is not buffered"),
+        BufferedKind::Headers => Ok(Frame::Headers(payload)),
+        BufferedKind::Settings => parse_settings(&payload).map(Frame::Settings),
+        BufferedKind::Goaway => single_varint(kind.frame_type(), &payload).map(Frame::Goaway),
+        BufferedKind::CancelPush => {
+            single_varint(kind.frame_type(), &payload).map(Frame::CancelPush)
+        }
+        BufferedKind::MaxPushId => single_varint(kind.frame_type(), &payload).map(Frame::MaxPushId),
+        BufferedKind::PushPromise => Ok(Frame::PushPromise),
     }
 }
 
