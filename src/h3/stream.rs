@@ -36,7 +36,7 @@ use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
 use super::message::{self, FieldValue, Fields, Method, Request, Status};
 use super::qpack::{self, Field};
-use super::{MAX_FIELD_SECTION_SIZE, MAX_VARINT, varint};
+use super::{MAX_FIELD_SECTION_SIZE, VARINT_MAX_LEN, varint};
 
 /// An accepted request stream whose headers have not been read yet.
 pub struct Resolver {
@@ -110,7 +110,7 @@ impl Resolver {
             handle,
             send,
             frames,
-            header: BytesMut::with_capacity(2 * MAX_VARINT),
+            header: BytesMut::with_capacity(2 * VARINT_MAX_LEN),
         };
 
         match read {

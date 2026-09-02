@@ -81,16 +81,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::h3api::{
-    self, Buffer, Fields, Reader, RespondError, Status, Stream, StreamError, Writer,
-};
+use crate::h3api::{self, Fields, Reader, RespondError, Status, Stream, StreamError, Writer};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
@@ -695,7 +693,7 @@ async fn target_to_client(
             }
             Ok(_) => {
                 // `split` hands the filled bytes over without copying them.
-                let data: Buffer = buf.split().freeze();
+                let data: Bytes = buf.split().freeze();
 
                 // The write is under the same signal as the read, for the
                 // reason its opposite number in `client_to_target` is: a client

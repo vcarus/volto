@@ -511,8 +511,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
     match tunnel::route(&req) {
         Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {
-                let authority = authority.to_owned();
-                tunnel::tcp::run(&authority, stream, stream_id, &context).await;
+                tunnel::tcp::run(authority, stream, stream_id, &context).await;
             }
             None => {
                 // RFC 9114 §4.4: a CONNECT request must carry :authority.

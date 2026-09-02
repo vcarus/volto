@@ -129,7 +129,7 @@ const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
 /// Longest frame header there can be: a type and a length, both varints.
-const MAX_FRAME_HEADER: usize = 2 * super::MAX_VARINT;
+const MAX_FRAME_HEADER: usize = 2 * super::VARINT_MAX_LEN;
 
 /// How many reserved or unknown frames one request stream may make this server
 /// skip before it is a stream error of type H3_EXCESSIVE_LOAD.

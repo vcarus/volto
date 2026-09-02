@@ -65,7 +65,7 @@ use crate::datagram::{self, peek_varint, put_varint, varint_len};
 use super::error::{Code, ConnectionError, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use super::stream::Resolver;
-use super::{MAX_VARINT, varint};
+use super::{VARINT_MAX_LEN, varint};
 
 /// Control stream (RFC 9114 §6.2.1).
 const STREAM_CONTROL: u64 = 0x00;
@@ -152,6 +152,24 @@ pub(crate) struct Shared {
     malformed_drops: crate::logfmt::Sampler,
 }
 
+/// Which way an inbound HTTP Datagram was dropped, and so which of [`Shared`]'s
+/// four samplers keeps its schedule.
+///
+/// Naming the shape rather than handing [`Shared::count_drop`] one of its own
+/// fields keeps the choice of sampler in one place, and lets the compiler say
+/// so when a fifth shape appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropKind {
+    /// A Context ID this server has no extension for (RFC 9298 §5).
+    UnknownContext,
+    /// A Quarter Stream ID no session claims.
+    Unroutable,
+    /// A session whose inbound queue was full.
+    QueueFull,
+    /// A datagram cut short of its Context ID.
+    Malformed,
+}
+
 impl Shared {
     /// Records why this endpoint is closing the connection, keeping the first
     /// reason, and reports the one that was kept.
@@ -207,7 +225,7 @@ impl Shared {
             // one to a future extension, and this proxy implements none, so
             // buffering would be holding packets for a registration that has no
             // way to arrive.
-            self.count_drop(&self.unknown_context_drops, |drops| {
+            self.count_drop(DropKind::UnknownContext, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
                     context_id = decoded.context_id,
@@ -229,7 +247,7 @@ impl Shared {
 
         match delivered {
             Some(true) => {}
-            None => self.count_drop(&self.unroutable_drops, |drops| {
+            None => self.count_drop(DropKind::Unroutable, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
                     drops,
@@ -239,7 +257,7 @@ impl Shared {
             }),
             // Never block the router on one slow session: dropping a UDP
             // packet is legitimate, stalling every other session is not.
-            Some(false) => self.count_drop(&self.queue_full_drops, |drops| {
+            Some(false) => self.count_drop(DropKind::QueueFull, |drops| {
                 debug!(
                     quarter_stream_id = decoded.quarter_stream_id,
                     drops,
@@ -259,7 +277,13 @@ impl Shared {
     /// got rather than only that it started. Everything is `Relaxed` because
     /// nothing is published through either atomic: each is a single
     /// read-modify-write ordered against nothing else.
-    fn count_drop(&self, sampler: &crate::logfmt::Sampler, report: impl FnOnce(u64)) {
+    fn count_drop(&self, kind: DropKind, report: impl FnOnce(u64)) {
+        let sampler = match kind {
+            DropKind::UnknownContext => &self.unknown_context_drops,
+            DropKind::Unroutable => &self.unroutable_drops,
+            DropKind::QueueFull => &self.queue_full_drops,
+            DropKind::Malformed => &self.malformed_drops,
+        };
         if let Some(drops) = sampler.record() {
             report(drops);
         }
@@ -493,7 +517,7 @@ impl Handle {
         // The control stream goes out first, so that a peer reading streams in
         // the order they arrive sees SETTINGS before anything else.
         let settings = frame::settings_payload();
-        let mut preface = BytesMut::with_capacity(settings.len() + 2 * MAX_VARINT);
+        let mut preface = BytesMut::with_capacity(settings.len() + 2 * VARINT_MAX_LEN);
         put_varint(&mut preface, STREAM_CONTROL);
         frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
         preface.extend_from_slice(&settings);
@@ -695,7 +719,7 @@ impl Connection {
         let identifier = self.going_away.map_or(next, |sent| sent.min(next));
         self.going_away = Some(identifier);
 
-        let mut goaway = BytesMut::with_capacity(2 * MAX_VARINT + varint_len(identifier));
+        let mut goaway = BytesMut::with_capacity(2 * VARINT_MAX_LEN + varint_len(identifier));
         frame::put_header(&mut goaway, frame::GOAWAY, varint_len(identifier) as u64);
         put_varint(&mut goaway, identifier);
 
@@ -872,16 +896,14 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
             // The one malformation §2.1 does not make a connection error: a
             // datagram cut short of its Context ID. Dropped like the routing
             // misses in [`Shared::deliver`], and counted with them.
-            handle
-                .shared
-                .count_drop(&handle.shared.malformed_drops, |drops| {
-                    debug!(
-                        %error,
-                        drops,
-                        "dropping malformed HTTP datagrams; further ones are logged as the \
-                         count doubles"
-                    )
-                });
+            handle.shared.count_drop(DropKind::Malformed, |drops| {
+                debug!(
+                    %error,
+                    drops,
+                    "dropping malformed HTTP datagrams; further ones are logged as the \
+                     count doubles"
+                )
+            });
             ControlFlow::Continue(())
         }
     }
@@ -1375,7 +1397,7 @@ fn qpack_instruction(kind: QpackStream, first: u8) -> Result<bool, Violation> {
 /// `Ok(None)` means the stream ended before the type was complete, which
 /// RFC 9114 §6.2 requires a receiver to tolerate.
 async fn read_stream_type(recv: &mut quinn::RecvStream) -> Result<Option<u64>, StreamError> {
-    let mut buf = [0u8; MAX_VARINT];
+    let mut buf = [0u8; VARINT_MAX_LEN];
 
     match recv.read_exact(&mut buf[..1]).await {
         Ok(()) => {}
@@ -2086,7 +2108,7 @@ mod tests {
         let shared = Shared::default();
         let mut reports: Vec<u64> = Vec::new();
         for _ in 0..8 {
-            shared.count_drop(&shared.unroutable_drops, |drops| reports.push(drops));
+            shared.count_drop(DropKind::Unroutable, |drops| reports.push(drops));
         }
         assert_eq!(
             reports,
@@ -2100,7 +2122,7 @@ mod tests {
             "every drop is counted, reported or not"
         );
         // A different shape keeps its own schedule, from its own first drop.
-        shared.count_drop(&shared.queue_full_drops, |drops| reports.push(drops));
+        shared.count_drop(DropKind::QueueFull, |drops| reports.push(drops));
         assert_eq!(reports, vec![1, 2, 4, 8, 1], "each shape speaks for itself");
     }
 
