@@ -38,11 +38,210 @@ jobs:
       - run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
-      # rustdoc puts the crate one directory down and leaves a lock file behind;
-      # the site root sends a reader to the crate, and the lock does not ship.
-      - run: |
-          printf '<!doctype html><meta http-equiv="refresh" content="0; url=volto/">\n' > target/doc/index.html
-          rm -f target/doc/.lock
+
+      # rustdoc writes the crate one directory down, so the published site used
+      # to answer `/volto/volto/` and the site root was a redirect into it. This
+      # lifts the crate's own pages to the site root: `/volto/` is the crate
+      # page itself, `/volto/config/struct.Config.html` is a type, and the
+      # shared trees (`src/`, `static.files/`, `search.index/`, `trait.impl/`)
+      # stay where rustdoc put them.
+      #
+      # Two halves, and the second is why this is a script rather than a `mv`.
+      # Moving a page one level up makes every reference it holds *to the doc
+      # root* one `../` too deep, so those are rewritten -- and only those: a
+      # link from one module to its sibling is relative to the subtree that
+      # moved with it, and must not be touched. A reference is root-anchored
+      # exactly when it climbs as many levels as the page is deep, which is what
+      # the rewrite tests for.
+      #
+      # The second half is the crate directory rustdoc's own JavaScript still
+      # asks for. Search results, the crates list and the trait implementor
+      # links are all built at runtime as `rootPath + "volto/" + ...` from paths
+      # inside `search.index/` and `trait.impl/`, none of which is a document
+      # this step can honestly rewrite. So `volto/` survives the move as a tree
+      # of redirect stubs -- the same device rustdoc emits for a re-exported
+      # item -- and every one of them is checked to point at a file that exists.
+      - name: Lay the crate out at the site root
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import shutil
+
+          doc = pathlib.Path("target/doc")
+          crate = "volto"
+          crate_dir = doc / crate
+          if not crate_dir.is_dir():
+              raise SystemExit(f"{crate_dir} is missing; did `cargo doc` run?")
+
+          # A module named like one of rustdoc's own root entries would land on
+          # top of it. Nothing in this crate does today; this is what says so
+          # tomorrow.
+          clashes = {p.name for p in crate_dir.iterdir()} & {
+              p.name for p in doc.iterdir() if p.name != crate
+          }
+          if clashes:
+              raise SystemExit(f"moving the crate to the root would overwrite {sorted(clashes)}")
+
+          reference = re.compile(r"((?:\.\./)+)([A-Za-z0-9_./%-]*)")
+          rewritten = 0
+
+          for path in sorted(crate_dir.rglob("*")):
+              if not path.is_file() or path.suffix not in {".html", ".js", ".css"}:
+                  continue
+              # How many levels of `../` a reference from this file needs to
+              # reach the doc root -- which is exactly what a root-anchored one
+              # spells, and one more than it will need after the move.
+              depth = len(path.relative_to(doc).parts) - 1
+
+              def lift(match):
+                  ups, rest = match.group(1), match.group(2)
+                  if len(ups) // 3 != depth:
+                      return match.group(0)
+                  if rest.startswith(f"{crate}/"):
+                      rest = rest[len(crate) + 1 :]
+                  return ("../" * (depth - 1) if depth > 1 else "./") + rest
+
+              text = path.read_text(encoding="utf-8")
+              lifted = reference.sub(lift, text)
+              if lifted != text:
+                  path.write_text(lifted, encoding="utf-8")
+                  rewritten += 1
+
+          pages = [p.relative_to(crate_dir) for p in sorted(crate_dir.rglob("*.html"))]
+          for entry in list(crate_dir.iterdir()):
+              shutil.move(str(entry), str(doc / entry.name))
+          crate_dir.rmdir()
+
+          # The stubs rustdoc's JavaScript still navigates to.
+          for page in pages:
+              target = doc / page
+              if not target.is_file():
+                  raise SystemExit(f"{page} did not survive the move")
+              stub = crate_dir / page
+              stub.parent.mkdir(parents=True, exist_ok=True)
+              back = "../" * len(stub.relative_to(doc).parts[:-1])
+              href = f"{back}{page.as_posix()}"
+              # The script carries the fragment across, which the meta refresh
+              # cannot: a search result for a method arrives as
+              # `struct.Config.html#method.warnings`, and landing at the top of
+              # the right page would be a worse answer than the one asked for.
+              # The meta refresh stays as the answer for a reader without
+              # JavaScript.
+              stub.write_text(
+                  "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+                  f"<script>location.replace(\"{href}\" + location.hash)</script>"
+                  f"<meta http-equiv=\"refresh\" content=\"0;URL={href}\">"
+                  "<title>Redirection</title></head><body>"
+                  f"<a href=\"{href}\">Click here if you are not redirected.</a>"
+                  "</body></html>\n",
+                  encoding="utf-8",
+              )
+
+          (doc / ".lock").unlink(missing_ok=True)
+
+          if rewritten == 0 or len(pages) == 0:
+              raise SystemExit("the layout step found nothing to do, which cannot be right")
+          print(f"lifted {len(pages)} pages to the site root, rewriting {rewritten} files")
+          print(f"left {len(pages)} redirect stubs under {crate}/")
+          PY
+
+      # A published page that 404s on its stylesheet looks like a broken crate,
+      # and nothing else in this workflow would notice: `cargo doc` is happy, the
+      # upload is happy, and the site is wrong. So the artifact is served exactly
+      # as Pages will serve it and crawled from the root, following every `href`
+      # and `src` -- pages, stylesheets, scripts and images alike -- and failing
+      # on the first status that is not 200. Only this host is fetched, so the
+      # crawl neither needs the network nor judges rustdoc's links to
+      # doc.rust-lang.org. The visited count is asserted as well: a server that
+      # answered nothing would otherwise pass, having found no broken link among
+      # the zero pages it visited.
+      #
+      # A hand-written crawl rather than `wget --spider -r -p`, for one reason
+      # that matters here: wget scans script *bodies* for anything URL-shaped,
+      # so rustdoc's inline JavaScript has it invent paths like `/config/
+      # dispatcher` and report them as broken links. `html.parser` reads script
+      # content as text, which is what it is.
+      - name: Verify the site has no broken links
+        run: |
+          python3 -m http.server 8080 --bind 127.0.0.1 --directory target/doc &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 1 50); do
+            curl -sf -o /dev/null http://127.0.0.1:8080/ && break
+            sleep 0.2
+          done
+          python3 - <<'PY'
+          import collections
+          import html.parser
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          base = "http://127.0.0.1:8080/"
+
+          class Links(html.parser.HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.found = []
+
+              def handle_starttag(self, tag, attrs):
+                  for name, value in attrs:
+                      if name in ("href", "src") and value:
+                          self.found.append(value)
+
+          status = {}
+          origin = {base: "the crawl root"}
+          queue = collections.deque([base])
+
+          while queue:
+              url = queue.popleft()
+              if url in status:
+                  continue
+              try:
+                  with urllib.request.urlopen(url) as response:
+                      status[url] = response.status
+                      kind = response.headers.get_content_type()
+                      body = response.read() if kind == "text/html" else b""
+              except urllib.error.HTTPError as error:
+                  status[url] = error.code
+                  continue
+              if not body:
+                  continue
+              links = Links()
+              links.feed(body.decode("utf-8", "replace"))
+              for link in links.found:
+                  target, _ = urllib.parse.urldefrag(urllib.parse.urljoin(url, link))
+                  if target.startswith(base) and target not in status:
+                      origin.setdefault(target, url)
+                      queue.append(target)
+
+          # rustdoc renders tracing's blanket `WithSubscriber` and `Instrument`
+          # impls onto this crate's own types, and those doc comments carry
+          # tracing's own relative link `dispatcher#setting-the-default-subscriber`.
+          # It resolves inside tracing's documentation and nowhere else, so
+          # `cargo doc --no-deps` has always emitted it dangling -- 17 of them,
+          # the same 17 before this layout step and after it. Excused by name
+          # rather than ignored, and the excuse has to be used: if the link stops
+          # appearing, this fails and the allowance goes with it.
+          allowed = ("/dispatcher",)
+
+          failed = sorted(url for url, code in status.items() if code != 200)
+          excused = [url for url in failed if url.endswith(allowed)]
+          broken = [url for url in failed if not url.endswith(allowed)]
+
+          for url in broken:
+              print(f"{url} -> {status[url]}, linked from {origin[url]}")
+          if broken:
+              raise SystemExit(f"the published site would serve {len(broken)} broken links")
+          for pattern in allowed:
+              if not any(url.endswith(pattern) for url in excused):
+                  raise SystemExit(f"nothing matched the allowance for {pattern}; delete it")
+          if len(status) < 100:
+              raise SystemExit(f"only {len(status)} URLs crawled; the crawl, not the site, is broken")
+          print(f"crawled {len(status)} URLs: {len(status) - len(excused)} served, {len(excused)} excused upstream links")
+          PY
+
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: target/doc
