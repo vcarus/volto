@@ -7,7 +7,7 @@
 [![CI](https://github.com/vcarus/volto/actions/workflows/ci.yml/badge.svg)](https://github.com/vcarus/volto/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vcarus/volto?display_name=tag)](https://github.com/vcarus/volto/releases/latest)
 [![MSRV](https://img.shields.io/badge/rust-1.95%2B-blue)](docs/deployment.md#building)
-[![Docs](https://img.shields.io/badge/docs-rustdoc-8da0cb)](https://vcarus.github.io/volto/)
+[![Docs](https://img.shields.io/badge/docs-manual-8da0cb)](https://vcarus.github.io/volto/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Quickstart](#quickstart) · [Features](#features) · [Compatibility](#compatibility) · [Documentation](#documentation) · [Testing](#testing)
@@ -94,10 +94,11 @@ A commented example configuration is [script/config.example.toml](script/config.
 
 | Page | What is in it |
 |---|---|
+| [The manual](https://vcarus.github.io/volto/) | The three pages below as one searchable book, rebuilt from `main` on every push. |
 | [docs/configuration.md](docs/configuration.md) | Every key, its default, and what it costs to change. |
 | [docs/deployment.md](docs/deployment.md) | Building, certificates (ACME DNS-01 or self-signed + pinning), releases and rollback, systemd, firewall, fd budget, reloads, relays, fail2ban. |
 | [docs/architecture.md](docs/architecture.md) | How a request becomes a tunnel, the in-tree HTTP/3 layer, why quinn-proto is patched, what the tests assert. |
-| [API docs](https://vcarus.github.io/volto/) | The crate's rustdoc, rebuilt from `main` on every push. |
+| [API docs](https://vcarus.github.io/volto/api/) | The crate's rustdoc, rebuilt from `main` on every push. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability privately. |
 
 ## Testing
