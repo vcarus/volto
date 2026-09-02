@@ -19,7 +19,13 @@ Each target does more than "does not crash": where an encoder exists, odd-number
 
 Two parsers on attacker bytes are deliberately not here, because neither can be reached without a live QUIC connection and neither has a panic surface to reach: `h3::connection::serve_qpack`, whose whole state is a bounded counter over the peer's QPACK streams (`it_critical_streams.rs` drives it), and `h3::connection::read_stream_type`, whose read length is `1 << (byte >> 6)` into an 8-byte buffer.
 
-This crate is its own cargo workspace, so the root `[patch.crates-io]` pin is repeated in `Cargo.toml` here; keep the two in lockstep.
+## What this workspace does not inherit
+
+Being its own cargo workspace is what cargo-fuzz wants, and it also means nothing from the root manifest reaches here on its own. Four things are therefore restated in `Cargo.toml` beside this file, and each has to move when the root moves: the `[patch.crates-io]` pin on quinn-proto, so the targets fuzz the QUIC stack the server actually runs; `edition = "2024"`, so a target cannot keep an idiom `src/` has left behind; `rust-version`, which is a resolver floor rather than a support claim (edition 2024 implies the MSRV-aware resolver, and with the field absent that resolver floors on whatever toolchain is installed, which is how the two lockfiles drift apart); and `[lints.rust] unsafe_code = "deny"`, the root's policy for every target in the package. Only the first is asserted — `tests/it_release_assets.rs` fails if the two quinn-proto revisions differ — so the other three are on the reader, and the reason for each is written next to it.
+
+`fuzz/Cargo.lock` is committed, and the `fuzz` job in `.github/workflows/ci.yml` type-checks the targets on stable with `--locked`. The graph the fuzzers run against is the one that was reviewed, then, rather than whatever resolves on the morning of the run — which is what makes a green CI check and a green container run weeks later statements about the same thing. Refresh it with `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`, which rewrites this workspace's lockfile and not the root's; a bare `cargo update` at the root is never the move, for the reason the `[patch.crates-io]` comment in `../Cargo.toml` gives.
+
+One entry in that lockfile is worth not re-litigating: `ring` is in it, and in the root's too, as a dependency quinn-proto declares for targets we do not build. `cargo tree -i ring --manifest-path fuzz/Cargo.toml` is empty on every platform this project ships, and the crate only appears under `--target all`. It is a lockfile row, not a second crypto backend, and D102's move to aws-lc-rs stands.
 
 ## Running
 
@@ -34,4 +40,4 @@ docker run --rm -v "$(git rev-parse --show-toplevel)":/src -w /src \
     cargo +nightly fuzz run frame -- -max_total_time=600 -rss_limit_mb=4096'
 ```
 
-Swap `frame` for any of the names in the table above; `cargo +nightly fuzz list` enumerates them. The corpus accumulates under `fuzz/corpus/<target>/` on the host and is deliberately not committed; crash inputs land in `fuzz/artifacts/<target>/`.
+Swap `frame` for any of the names in the table above; `cargo +nightly fuzz list` enumerates the eight. The corpus accumulates under `fuzz/corpus/<target>/` on the host and is deliberately not committed; crash inputs land in `fuzz/artifacts/<target>/`.

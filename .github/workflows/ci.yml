@@ -135,11 +135,21 @@ jobs:
     # release.yml now needs this workflow green, and a nightly regression is not
     # a reason to hold a release.
     #
-    # No `--locked`. `fuzz/Cargo.lock` is committed but stale -- it still
-    # records volto 0.5.3 and the pre-D102 `ring` graph -- so `--locked` refuses
-    # to run at all today. Refreshing that lockfile is a dependency decision of
-    # its own and not this job's to make; without the flag cargo resolves fresh,
-    # which is the right behaviour for a rot check anyway.
+    # `--locked`, which this job did without for as long as `fuzz/Cargo.lock`
+    # was too stale for the flag to run at all -- it recorded volto 0.5.3 and
+    # the pre-D102 `ring` graph. With that lockfile regenerated the flag earns
+    # its place twice over. It makes the job answer for the graph that is
+    # committed rather than for whatever cargo resolves on the morning it runs,
+    # which is the only way a green check here and a green container run weeks
+    # later are statements about the same thing. And it stops a silent resolve:
+    # without it, a rot check quietly updates the lockfile in the runner and
+    # reports on a graph nobody chose, so a dependency that broke the targets
+    # and a `src` change that broke them read identically in the log.
+    #
+    # Refreshing it is `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`
+    # -- inside `fuzz/` only. A bare `cargo update` at the root is never the
+    # move (see the `[patch.crates-io]` note in `Cargo.toml`), and these are two
+    # workspaces with two lockfiles: touching one does not touch the other.
     name: fuzz targets compile
     runs-on: ubuntu-latest
     steps:
@@ -152,7 +162,7 @@ jobs:
           # A separate workspace with a target directory of its own; without
           # this the action caches the root workspace and this job warms nothing.
           workspaces: fuzz
-      - run: cargo check --manifest-path fuzz/Cargo.toml
+      - run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
   audit:
     # RustSec advisories against the committed `Cargo.lock`. Dependabot already
