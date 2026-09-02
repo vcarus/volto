@@ -227,6 +227,20 @@ async fn credential_less_failures_alone_close_the_connection() {
         .expect("credential-less failures must count against the failure budget");
 }
 
+/// A five-second idle timeout, for the one test that measures against it.
+///
+/// `DELIBERATE`'s two seconds is what the rest of this binary wants: long enough
+/// that a deadline lapsing is deliberate, short enough to wait out. The test
+/// below wants the opposite, because there the idle timeout is the *wrong*
+/// answer's price tag: it asserts that a close does not wait behind a bounded
+/// write, and that write is bounded by exactly this value. So the gap between
+/// what the test allows and this number is the whole assertion, and at two
+/// seconds the test could allow at most one — the narrowest timing bound in the
+/// suite, against `it_udp`, `it_policy` and `it_shutdown` all allowing two. Five
+/// buys the same two seconds they allow while keeping the 2.5x ratio between the
+/// wrong answer's cost and the bound that `it_shutdown` has.
+const UNHURRIED: &str = "[limits]\nmax_idle_timeout = 5\nkeep_alive_interval = 0\n";
+
 /// A peer that will not read its 407 must still spend the budget.
 ///
 /// The failure is counted before the answer goes out, and the answer itself is
@@ -238,7 +252,7 @@ async fn credential_less_failures_alone_close_the_connection() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     let server = TestServer::start_with(&format!(
-        "{DELIBERATE}{}[security]\nmax_auth_failures = 3\n",
+        "{UNHURRIED}{}[security]\nmax_auth_failures = 3\n",
         auth_section(&[("user1", "s3cret")])
     ))
     .await;
@@ -273,9 +287,11 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 
     // The close is decided before the 407 is written, so it does not wait on
     // the bounded write: the last guess ends the connection at once, not one
-    // idle timeout (2 s here) later.
+    // idle timeout ([`UNHURRIED`]'s five seconds here) later. Measured at about
+    // twenty microseconds on the dev host, so the two seconds is headroom for a
+    // loaded runner rather than a figure anything approaches.
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(2),
         "the close must not wait behind the unanswerable 407; took {:?}",
         started.elapsed()
     );
