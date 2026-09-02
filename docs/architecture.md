@@ -65,6 +65,12 @@ server has heard of. The token is carried through as the bytes that arrived, so
 RFC 9220 asks for and logged under the name the client actually sent, rather
 than being refused as malformed before anything can look at them.
 
+The routing above and the per-connection context both live in `tunnel/mod.rs`,
+beside the target resolution the two tunnel kinds share. Two concerns that are
+neither are files of their own: `tunnel/status.rs` holds every refusal and the
+RFC 9209 `Proxy-Status` vocabulary refusals are written in, and
+`tunnel/quota.rs` the per-connection tunnel budget and the guards that spend it.
+
 Every wait that stands between a packet arriving and a tunnel opening is
 bounded, whatever the connection's authentication state, and two limits share
 the job. All but two of those waits are bounded by `limits.max_idle_timeout`:
