@@ -126,14 +126,14 @@ pub async fn handle(
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
     // what the copy cost.
-    let context = Context::new(
+    let context = Arc::new(Context::new(
         &config,
         datagrams,
         connection.peer_datagrams(),
         resolver,
         tunnels,
         authenticated,
-    );
+    ));
 
     let mut going_away = false;
     // The one idle timeout every peer-dependent write in this server gets; see
@@ -224,7 +224,7 @@ pub async fn handle(
                     // (RFC 9114 §5.2) -- for a connection with nothing left to
                     // do.
                     let pending = context.quota.enter();
-                    let context = context.clone();
+                    let context = Arc::clone(&context);
                     tokio::spawn(async move {
                         let _pending = pending;
                         handle_request(resolver, context).await;
@@ -371,7 +371,7 @@ async fn next_request(
 }
 
 /// Resolves one request, authenticates it, and routes it to a tunnel.
-async fn handle_request(resolver: h3api::Resolver, context: Context) {
+async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     // Bounded for the same reason the accept loop is: a peer may open a request
     // stream, send one byte and stop, and `max_streams_bidi` of those would be
     // `max_streams_bidi` parked tasks per connection, from a peer that has not

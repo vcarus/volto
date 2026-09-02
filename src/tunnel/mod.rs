@@ -170,11 +170,15 @@ impl AuthFailures {
 
 /// Everything a request handler needs from the connection it arrived on.
 ///
-/// Cloned per request — the cost is a handful of refcount bumps. The UDP-specific
-/// members are here rather than in [`udp`] because a connection owns them
-/// regardless of which tunnel type ends up using them: both are settled at the
-/// handshake, before the first request arrives.
-#[derive(Clone)]
+/// Built once per connection and held in an `Arc`, so sharing it with a request
+/// costs one refcount bump rather than a copy of eighteen fields. Deliberately
+/// not [`Clone`]: every member that could be copied is already behind an `Arc`
+/// of its own, so a second whole `Context` would be a second view of the same
+/// connection and nothing else.
+///
+/// The UDP-specific members are here rather than in [`udp`] because a connection
+/// owns them regardless of which tunnel type ends up using them: both are
+/// settled at the handshake, before the first request arrives.
 pub struct Context {
     /// The QUIC connection this request arrived on.
     ///

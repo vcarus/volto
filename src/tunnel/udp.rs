@@ -33,6 +33,8 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use tokio::net::UdpSocket;
@@ -56,7 +58,7 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 pub(super) const CONNECT_UDP: &str = "connect-udp";
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
-pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context) {
+pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Arc<Context>) {
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
         tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
@@ -246,7 +248,7 @@ struct Session {
     /// by nothing else — see [`Self::run`] for why arrival alone must not
     /// count.
     deadline: tokio::time::Instant,
-    ctx: Context,
+    ctx: Arc<Context>,
 }
 
 /// What a single step of the session loop decided.
