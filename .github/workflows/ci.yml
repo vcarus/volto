@@ -40,6 +40,24 @@ jobs:
           components: rustfmt
       - run: cargo fmt --check
 
+      # `tests/it_deploy.rs` and `tests/it_installer.rs` both name shellcheck as
+      # the coverage for the half of `script/*.sh` no test on either host can
+      # run -- the download, the checksum, the rollback, the certificate, the
+      # systemd unit, everything behind `must run as root`. That claim was an
+      # assertion until this step: nothing in CI ran shellcheck, so a new
+      # unquoted expansion in the rollback path would have shipped. It lives in
+      # this job because this is the job that compiles nothing, and shellcheck
+      # is preinstalled on the ubuntu runner image, so it costs the checkout it
+      # was already paying for.
+      #
+      # Default severity, which is `style`: the two scripts are clean at it
+      # today, including the info-level checks, and a finding that is wrong for
+      # a particular line is turned off in place with a
+      # `# shellcheck disable=SCxxxx` carrying its reason (there is one, on the
+      # `trap` in install-selfsigned.sh).
+      - name: shellcheck
+        run: shellcheck script/*.sh
+
   clippy:
     name: clippy
     runs-on: ubuntu-latest
@@ -50,7 +68,13 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      # `--all-features` is what keeps the `operator-runs` targets honest.
+      # `it_bench` and `it_resolver_pool` are gated out of `cargo test`
+      # (see Cargo.toml), so nothing else in CI compiles them at all and a
+      # rename in `src/` or `tests/common/` would break them silently, to be
+      # discovered by whoever next runs a benchmark. This is the only job that
+      # sees them.
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       # rustdoc's own lints -- a link to an item that does not exist, or that a
       # public reader cannot see -- are warnings by default and nothing else
       # runs rustdoc, so they would accumulate unseen.
@@ -89,6 +113,46 @@ jobs:
       # MSRV question is only whether every target still compiles, dev-deps
       # included -- which is also why this is `--all-targets`.
       - run: cargo check --all-targets --locked
+
+  fuzz:
+    # `fuzz/` is its own cargo workspace (the cargo-fuzz convention), so no
+    # other job in this file so much as parses it. Its eight targets reach into
+    # `src` for items that are `pub` only because they ask for them --
+    # `h3::stream::build_request`, `tunnel::tcp::split_authority`,
+    # `tunnel::udp::parse_target` -- and a rename or a signature change to any
+    # of them compiles green everywhere here while leaving the fuzzers broken.
+    # Nothing would notice until somebody started the on-demand container run in
+    # fuzz/README.md, which is weeks apart by design; the whole point of that
+    # crate is to be runnable on the day a parser changes.
+    #
+    # `cargo check` rather than a build or a run: this job answers "do the
+    # targets still compile against today's `src`", not "is there a crash". The
+    # runs stay on demand, where a fuzzer's minutes belong.
+    #
+    # Stable, not the nightly `cargo fuzz` itself needs: libfuzzer-sys type-checks
+    # on stable, and this job only asks whether the targets still compile
+    # against today's `src`. That keeps the answer about this tree alone --
+    # release.yml now needs this workflow green, and a nightly regression is not
+    # a reason to hold a release.
+    #
+    # No `--locked`. `fuzz/Cargo.lock` is committed but stale -- it still
+    # records volto 0.5.3 and the pre-D102 `ring` graph -- so `--locked` refuses
+    # to run at all today. Refreshing that lockfile is a dependency decision of
+    # its own and not this job's to make; without the flag cargo resolves fresh,
+    # which is the right behaviour for a rot check anyway.
+    name: fuzz targets compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # A separate workspace with a target directory of its own; without
+          # this the action caches the root workspace and this job warms nothing.
+          workspaces: fuzz
+      - run: cargo check --manifest-path fuzz/Cargo.toml
 
   audit:
     # RustSec advisories against the committed `Cargo.lock`. Dependabot already

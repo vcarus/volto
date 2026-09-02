@@ -636,8 +636,11 @@ itself.
 
 Every hand-written parser that reads bytes a peer chose also has a
 coverage-guided fuzz target under `fuzz/`, run on demand on a nightly toolchain
-in a Linux container rather than in CI; `fuzz/README.md` maps each target to the
-parser it covers and has the invocation. Beside the five codecs — the frame
+in a Linux container rather than in CI -- which only type-checks them, since
+`fuzz/` is a workspace of its own and its targets reach items that are public
+only because they ask for them, so a rename in `src/` would otherwise break the
+fuzzers silently between runs. `fuzz/README.md` maps each target to the parser
+it covers and has the invocation. Beside the five codecs — the frame
 state machine, QPACK, Huffman, the capsule parser and the datagram codec — that
 means the request validator that reaches RFC 9114 §4.1.2's malformed verdict,
 the two parsers that turn a client-named target into a host and a port, and the
