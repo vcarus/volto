@@ -965,6 +965,20 @@ impl Config {
             );
         }
 
+        // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
+        // only thing this server can serve once a connection is up. A list
+        // without it is legal -- the key exists for interop debugging -- but it
+        // is a server nobody can reach.
+        if !self.server.alpn.iter().any(|id| id == "h3") {
+            warnings.push(format!(
+                "server.alpn = [{}] does not offer \"h3\", the only protocol this server \
+                 speaks: every client is turned away during the TLS handshake with \
+                 no_application_protocol, an alert that carries no explanation of its own, \
+                 so the server reads as unreachable rather than as misconfigured",
+                self.server.alpn.join(", ")
+            ));
+        }
+
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
                 "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
@@ -2723,6 +2737,37 @@ pub(crate) mod tests {
         let msg = err.to_string();
         assert!(msg.contains("server.alpn[0]"), "{msg}");
         assert!(msg.contains("255"), "the limit must be named: {msg}");
+    }
+
+    /// An ALPN list without `h3` is legal and starts a server every client
+    /// fails against: TLS ends the handshake with `no_application_protocol`,
+    /// which says nothing about why, so without the warning the only trace is a
+    /// handshake error at each end.
+    #[test]
+    fn an_alpn_list_without_h3_is_allowed_but_warned_about() {
+        let cfg = parse(r#"alpn = ["h3-29"]"#);
+        assert_valid_apart_from_certs(&cfg, "an ALPN list without h3");
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.contains("server.alpn") && w.contains("h3-29")),
+            "{:?}",
+            cfg.warnings()
+        );
+
+        // A list that still offers h3 alongside another identifier is exactly
+        // what the key is for, and draws nothing.
+        let quiet = parse(r#"alpn = ["h3", "h3-29"]"#).warnings();
+        assert!(
+            !quiet.iter().any(|w| w.contains("server.alpn")),
+            "{quiet:?}"
+        );
+
+        let default = parse("").warnings();
+        assert!(
+            !default.iter().any(|w| w.contains("server.alpn")),
+            "the default list must draw no warning: {default:?}"
+        );
     }
 
     #[test]

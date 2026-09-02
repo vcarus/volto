@@ -28,7 +28,7 @@ whole and the running configuration keeps serving; see
 | `listen` | string | required | UDP address to listen on, e.g. `"0.0.0.0:443"`. QUIC is UDP; there is no TCP listener |
 | `cert` | path | required | PEM certificate chain, leaf first |
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
-| `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging |
+| `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging. A list that does not offer `h3` starts a server no client can reach — HTTP/3 is the only protocol volto serves, so TLS ends every handshake with `no_application_protocol`, an alert that says nothing about why — and volto warns about it at startup |
 | `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. systemd's `TimeoutStopSec` must be larger — and the ceiling is there because the value is a bound: a drain longer than an hour has outlived any service manager's patience, so it would only replace the graceful ending with a `SIGKILL` |
 
 ## `[auth]`
