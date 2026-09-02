@@ -1,9 +1,15 @@
 name: Docs
 
-# The crate's rustdoc, rebuilt from `main` on every push and published with
-# GitHub Pages. The CI workflow already builds it as a lint gate; this one keeps
-# the result. It runs only on `main`: a pull request cannot publish, and nothing
-# in it needs more than read access to the repository.
+# The published site at https://vcarus.github.io/volto/, rebuilt from `main` on
+# every push. It has two halves, and one job builds both into `site/`:
+#
+#   * the **manual** at the root -- mdBook over `docs/`, the same pages that
+#     ship in the release tarball, with `docs/SUMMARY.md` as its contents; and
+#   * the crate's **rustdoc** under `/api/`, laid out so that `/api/` is the
+#     crate page itself rather than a redirect into `/api/volto/`.
+#
+# It runs only on `main`: a pull request cannot publish, and nothing in it needs
+# more than read access to the repository.
 
 on:
   push:
@@ -25,26 +31,57 @@ env:
 
 jobs:
   build:
-    name: rustdoc
+    name: site
     runs-on: ubuntu-latest
+    env:
+      # mdBook 0.5.4, the latest release at the time this was pinned
+      # (2026-09-02). Pinned by version *and* by digest of the exact asset:
+      # a release tarball can be replaced in place, and this step runs with the
+      # repository checked out. `cargo install` is deliberately not used -- it
+      # would build a second dependency tree on every run and pin nothing.
+      MDBOOK_VERSION: "0.5.4"
+      MDBOOK_SHA256: "5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          tarball="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL -o "$tarball" \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/${tarball}"
+          echo "${MDBOOK_SHA256}  ${tarball}" | sha256sum --check --strict -
+          mkdir -p "$HOME/.local/bin"
+          tar xzf "$tarball" -C "$HOME/.local/bin" mdbook
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # `book.toml` points mdBook straight at `docs/`, so the book is built from
+      # the tracked pages with nothing copied or generated in between.
+      - name: Build the manual
+        run: |
+          set -euo pipefail
+          mdbook --version
+          mdbook build
+          mkdir -p site
+          cp -R target/book/. site/
+          test -f site/index.html
+
       # The same invocation the CI gate runs, so what gets published is exactly
       # what passed.
       - run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
-      # rustdoc writes the crate one directory down, so the published site used
-      # to answer `/volto/volto/` and the site root was a redirect into it. This
-      # lifts the crate's own pages to the site root: `/volto/` is the crate
-      # page itself, `/volto/config/struct.Config.html` is a type, and the
-      # shared trees (`src/`, `static.files/`, `search.index/`, `trait.impl/`)
-      # stay where rustdoc put them.
+      # rustdoc writes the crate one directory down, so `/api/` would answer
+      # with a redirect page into `/api/volto/`. This lifts the crate's own
+      # pages to the root of the API subtree: `/api/` is the crate page itself,
+      # `/api/config/struct.Config.html` is a type, and the shared trees
+      # (`src/`, `static.files/`, `search.index/`, `trait.impl/`) stay where
+      # rustdoc put them, one level below `/api/`.
       #
       # Two halves, and the second is why this is a script rather than a `mv`.
       # Moving a page one level up makes every reference it holds *to the doc
@@ -52,27 +89,33 @@ jobs:
       # link from one module to its sibling is relative to the subtree that
       # moved with it, and must not be touched. A reference is root-anchored
       # exactly when it climbs as many levels as the page is deep, which is what
-      # the rewrite tests for.
+      # the rewrite tests for. The doc root here is `site/api`, so nothing in
+      # the rewrite reaches out of the API subtree and into the book.
       #
       # The second half is the crate directory rustdoc's own JavaScript still
       # asks for. Search results, the crates list and the trait implementor
       # links are all built at runtime as `rootPath + "volto/" + ...` from paths
       # inside `search.index/` and `trait.impl/`, none of which is a document
-      # this step can honestly rewrite. So `volto/` survives the move as a tree
-      # of redirect stubs -- the same device rustdoc emits for a re-exported
-      # item -- and every one of them is checked to point at a file that exists.
-      - name: Lay the crate out at the site root
+      # this step can honestly rewrite. So `api/volto/` survives the move as a
+      # tree of redirect stubs -- the same device rustdoc emits for a
+      # re-exported item -- and every one of them is checked to point at a file
+      # that exists.
+      - name: Lay the crate out under /api/
         run: |
           python3 - <<'PY'
           import pathlib
           import re
           import shutil
 
-          doc = pathlib.Path("target/doc")
+          built = pathlib.Path("target/doc")
+          doc = pathlib.Path("site/api")
           crate = "volto"
+          if not (built / crate).is_dir():
+              raise SystemExit(f"{built / crate} is missing; did `cargo doc` run?")
+          if doc.exists():
+              shutil.rmtree(doc)
+          shutil.copytree(built, doc)
           crate_dir = doc / crate
-          if not crate_dir.is_dir():
-              raise SystemExit(f"{crate_dir} is missing; did `cargo doc` run?")
 
           # A module named like one of rustdoc's own root entries would land on
           # top of it. Nothing in this crate does today; this is what says so
@@ -81,7 +124,7 @@ jobs:
               p.name for p in doc.iterdir() if p.name != crate
           }
           if clashes:
-              raise SystemExit(f"moving the crate to the root would overwrite {sorted(clashes)}")
+              raise SystemExit(f"moving the crate to {doc} would overwrite {sorted(clashes)}")
 
           reference = re.compile(r"((?:\.\./)+)([A-Za-z0-9_./%-]*)")
           rewritten = 0
@@ -142,20 +185,30 @@ jobs:
 
           if rewritten == 0 or len(pages) == 0:
               raise SystemExit("the layout step found nothing to do, which cannot be right")
-          print(f"lifted {len(pages)} pages to the site root, rewriting {rewritten} files")
-          print(f"left {len(pages)} redirect stubs under {crate}/")
+          print(f"lifted {len(pages)} pages to site/api/, rewriting {rewritten} files")
+          print(f"left {len(pages)} redirect stubs under api/{crate}/")
           PY
 
-      # A published page that 404s on its stylesheet looks like a broken crate,
-      # and nothing else in this workflow would notice: `cargo doc` is happy, the
-      # upload is happy, and the site is wrong. So the artifact is served exactly
-      # as Pages will serve it and crawled from the root, following every `href`
-      # and `src` -- pages, stylesheets, scripts and images alike -- and failing
-      # on the first status that is not 200. Only this host is fetched, so the
-      # crawl neither needs the network nor judges rustdoc's links to
-      # doc.rust-lang.org. The visited count is asserted as well: a server that
-      # answered nothing would otherwise pass, having found no broken link among
-      # the zero pages it visited.
+      # A published page that 404s on its stylesheet looks like a broken site,
+      # and nothing else in this workflow would notice: `mdbook build` is happy,
+      # `cargo doc` is happy, the upload is happy, and the site is wrong. So the
+      # artifact is served exactly as Pages will serve it and crawled from both
+      # roots -- the book at `/` and the crate at `/api/`, which no page links to
+      # with a same-host href because the manual names it by its public URL --
+      # following every `href` and `src`, pages, stylesheets, scripts and images
+      # alike, and failing on the first status that is not 200. Only this host is
+      # fetched, so the crawl neither needs the network nor judges rustdoc's
+      # links to doc.rust-lang.org. The visited count is asserted as well: a
+      # server that answered nothing would otherwise pass, having found no broken
+      # link among the zero pages it visited.
+      #
+      # Fragments are checked too, for the book: a link to `x.html#y` has to find
+      # `id="y"` in `x.html`. That is the half `tests/it_docs.rs` cannot see -- it
+      # judges anchors by GitHub's slug rules on the markdown, and mdBook has a
+      # slugger of its own, so agreement between the two is a claim this proves
+      # rather than assumes. rustdoc's fragments are left out: many of its ids
+      # arrive with the page's own JavaScript, and a static reader would call
+      # them missing.
       #
       # A hand-written crawl rather than `wget --spider -r -p`, for one reason
       # that matters here: wget scans script *bodies* for anything URL-shaped,
@@ -164,7 +217,7 @@ jobs:
       # content as text, which is what it is.
       - name: Verify the site has no broken links
         run: |
-          python3 -m http.server 8080 --bind 127.0.0.1 --directory target/doc &
+          python3 -m http.server 8080 --bind 127.0.0.1 --directory site &
           server=$!
           trap 'kill $server' EXIT
           for _ in $(seq 1 50); do
@@ -179,20 +232,26 @@ jobs:
           import urllib.request
 
           base = "http://127.0.0.1:8080/"
+          api = base + "api/"
 
-          class Links(html.parser.HTMLParser):
+          class Page(html.parser.HTMLParser):
               def __init__(self):
                   super().__init__()
-                  self.found = []
+                  self.links = []
+                  self.ids = set()
 
               def handle_starttag(self, tag, attrs):
                   for name, value in attrs:
                       if name in ("href", "src") and value:
-                          self.found.append(value)
+                          self.links.append(value)
+                      elif name == "id" and value:
+                          self.ids.add(value)
 
           status = {}
-          origin = {base: "the crawl root"}
-          queue = collections.deque([base])
+          ids = {}
+          origin = {base: "the crawl root", api: "the crawl root"}
+          anchors = []
+          queue = collections.deque([base, api])
 
           while queue:
               url = queue.popleft()
@@ -208,20 +267,25 @@ jobs:
                   continue
               if not body:
                   continue
-              links = Links()
-              links.feed(body.decode("utf-8", "replace"))
-              for link in links.found:
-                  target, _ = urllib.parse.urldefrag(urllib.parse.urljoin(url, link))
-                  if target.startswith(base) and target not in status:
+              page = Page()
+              page.feed(body.decode("utf-8", "replace"))
+              ids[url] = page.ids
+              for link in page.links:
+                  target, fragment = urllib.parse.urldefrag(urllib.parse.urljoin(url, link))
+                  if not target.startswith(base):
+                      continue
+                  if target not in status:
                       origin.setdefault(target, url)
                       queue.append(target)
+                  if fragment and not target.startswith(api):
+                      anchors.append((target, fragment, url))
 
           # rustdoc renders tracing's blanket `WithSubscriber` and `Instrument`
           # impls onto this crate's own types, and those doc comments carry
           # tracing's own relative link `dispatcher#setting-the-default-subscriber`.
           # It resolves inside tracing's documentation and nowhere else, so
           # `cargo doc --no-deps` has always emitted it dangling -- 17 of them,
-          # the same 17 before this layout step and after it. Excused by name
+          # the same 17 before the layout step and after it. Excused by name
           # rather than ignored, and the excuse has to be used: if the link stops
           # appearing, this fails and the allowance goes with it.
           allowed = ("/dispatcher",)
@@ -237,14 +301,28 @@ jobs:
           for pattern in allowed:
               if not any(url.endswith(pattern) for url in excused):
                   raise SystemExit(f"nothing matched the allowance for {pattern}; delete it")
+
+          dangling = sorted(
+              f"{urllib.parse.urlparse(target).path}#{fragment}, linked from {source}"
+              for target, fragment, source in anchors
+              if status.get(target) == 200 and fragment not in ids.get(target, set())
+          )
+          for entry in dangling:
+              print(entry)
+          if dangling:
+              raise SystemExit(f"the manual would serve {len(dangling)} links into nothing")
+
           if len(status) < 100:
               raise SystemExit(f"only {len(status)} URLs crawled; the crawl, not the site, is broken")
+          if len(anchors) < 20:
+              raise SystemExit(f"only {len(anchors)} fragments seen; the anchor check is broken")
           print(f"crawled {len(status)} URLs: {len(status) - len(excused)} served, {len(excused)} excused upstream links")
+          print(f"checked {len(anchors)} fragments against the ids of {len(ids)} pages")
           PY
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: target/doc
+          path: site
 
   deploy:
     name: deploy

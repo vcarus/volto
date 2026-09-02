@@ -1,6 +1,11 @@
 # Rust
 /target
 
+# The Pages site .github/workflows/docs.yml assembles: the mdBook manual at
+# the root and the rustdoc laid out under api/. Running those steps by hand
+# leaves it in the working tree.
+/site/
+
 # cargo-fuzz build tree and run outputs (fuzz/ is its own workspace, so the
 # /target entry above does not cover it; the corpus is machine-local on purpose)
 /fuzz/target/
