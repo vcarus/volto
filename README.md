@@ -18,12 +18,12 @@
 
 The server terminates TLS, speaks HTTP/3 to the client and carries **TCP through classic CONNECT** (RFC 9114 §4.4) and **UDP through CONNECT-UDP** (RFC 9298, HTTP Datagrams per RFC 9297). Both paths matter: a server that only speaks CONNECT-UDP carries almost none of an ordinary client's traffic. It runs unattended on a small Linux host, reloads certificates and credentials on `SIGHUP`, and ships as a static binary.
 
-```mermaid
-flowchart LR
-    S["Surge<br/>(masque policy)"] -- "one QUIC connection<br/>HTTP/3 · TLS 1.3" --> V["volto"]
-    V -- "CONNECT (TCP)" --> T1["TCP targets"]
-    V -- "CONNECT-UDP" --> T2["UDP targets"]
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/topology-dark.svg">
+    <img src="docs/assets/topology-light.svg" alt="Surge opens one QUIC connection carrying CONNECT and CONNECT-UDP tunnels to volto, optionally through an L4 UDP relay; volto reaches TCP targets over plain TCP and UDP targets over plain UDP" width="880">
+  </picture>
+</p>
 
 ## Quickstart
 
