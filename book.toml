@@ -1,0 +1,29 @@
+# The published manual at https://vcarus.github.io/volto/.
+#
+# The book's source directory *is* `docs/`, the same three pages that ship in
+# every release tarball and that `tests/it_docs.rs` reads. Nothing is copied or
+# generated into a second place: mdBook renders what is already tracked, and
+# `docs/SUMMARY.md` plus `docs/index.md` are the only files this adds -- table
+# of contents and landing page, structure rather than prose.
+#
+# The crate's rustdoc is not built by mdBook. It is published beside the book,
+# under `/api/`, by `.github/workflows/docs.yml`.
+
+[book]
+title = "volto"
+src = "docs"
+language = "en"
+
+[build]
+build-dir = "target/book"
+
+[output.html]
+git-repository-url = "https://github.com/vcarus/volto"
+# What the site is served from, so the 404 page can find its own assets from
+# any depth. GitHub Pages puts a project site under the repository name.
+site-url = "/volto/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+# Collapse the table of contents to its top level; the book is four pages and
+# the sections inside them are long.
+fold = { enable = true, level = 0 }

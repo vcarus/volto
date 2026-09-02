@@ -12,7 +12,7 @@ keys are an error at startup rather than being silently ignored, so a typo fails
 loudly — in every table, not only in `[server]`. That also makes a config file
 forward-only, which matters when rolling a release back; see
 [version compatibility](#version-compatibility). A commented reference file
-ships as [`script/config.example.toml`](../script/config.example.toml).
+ships as [`script/config.example.toml`](https://github.com/vcarus/volto/blob/main/script/config.example.toml).
 
 `--check-config` answers whether a given binary can read a given file without
 starting anything; see

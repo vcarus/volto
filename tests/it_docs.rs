@@ -85,7 +85,19 @@ use volto::config::Config;
 /// Named rather than globbed: a page added to `docs/` should arrive with a
 /// decision about whether these gates cover it, and an empty glob would be one
 /// more way for the whole file to pass without asserting anything.
-const DOC_PAGES: [&str; 3] = ["architecture.md", "configuration.md", "deployment.md"];
+///
+/// `index.md` is the manual's landing page (D105) and is read like the rest, so
+/// a link it writes to a section of another page is held to the same promise.
+/// `docs/SUMMARY.md` is deliberately *not* here: it is the book's table of
+/// contents rather than prose, it carries no anchors and quotes no constants,
+/// and the chapter files it names are checked by the site crawl in
+/// `.github/workflows/docs.yml`, which fails on a chapter that does not build.
+const DOC_PAGES: [&str; 4] = [
+    "architecture.md",
+    "configuration.md",
+    "deployment.md",
+    "index.md",
+];
 
 /// Keys the example must document and the page must carry, at the very least.
 ///

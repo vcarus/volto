@@ -202,7 +202,7 @@ What pinning changes, and why each point matters:
 
 ## Deploying from releases
 
-[`script/deploy.sh`](../script/deploy.sh) turns the release page into the
+[`script/deploy.sh`](https://github.com/vcarus/volto/blob/main/script/deploy.sh) turns the release page into the
 deployment mechanism: it resolves the newest release (or the one given with
 `--tag`), downloads the tarball for the host's architecture, verifies it
 against the release's `SHA256SUMS`, and then does whichever of three things the
@@ -331,7 +331,7 @@ per-host action at all.
 
 ## systemd
 
-The shipped unit is [`script/masque.service`](../script/masque.service). Manual
+The shipped unit is [`script/masque.service`](https://github.com/vcarus/volto/blob/main/script/masque.service). Manual
 installation:
 
 ```sh
