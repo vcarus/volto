@@ -42,7 +42,10 @@ panel.
 ## Quickstart
 
 Grab a static binary from the [releases page](https://github.com/vcarus/volto/releases)
-(`x86_64` and `aarch64` musl builds), or build from source with Rust 1.88+.
+(`x86_64` and `aarch64` musl builds) — the download URL, the `SHA256SUMS` check
+and the install are one snippet in
+[docs/deployment.md](docs/deployment.md#self-signed-with-fingerprint-pinning) —
+or build from source with Rust 1.88+.
 Every cargo command below passes `--locked`: `Cargo.lock` is committed and
 redirects `quinn-proto` at a patched commit, so a build without it is not the
 same build (see [docs/deployment.md](docs/deployment.md#building)).

@@ -3,6 +3,12 @@
 Target platform is a Linux host with systemd; the development host is macOS and
 the test suite is expected to pass on both.
 
+A stock Ubuntu 24.04 image already carries everything the release path needs:
+`curl`, `tar`, `sha256sum`, `openssl` and systemd itself. `ufw` is not among
+them and neither script requires it — the installer notices its absence and says
+so instead of failing. Building on the host instead of downloading a release is
+what adds requirements, and they are named under [building](#building).
+
 ## Building
 
 Rust 1.88 or newer. `Cargo.lock` is committed, and `quinn-proto` is redirected
@@ -79,6 +85,33 @@ sudo /etc/letsencrypt/renewal-hooks/deploy/volto.sh   # run it once by hand
 The right choice for a handful of your own devices when maintaining a domain and
 DNS-01 credentials is not worth it. The client verifies one specific certificate
 by its SHA-256 fingerprint instead of a chain.
+
+Start from a release tarball; nothing has to be built on the host. The archives
+are named `volto-<version>-<target>.tar.gz` for the two published targets,
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` — which is what
+`uname -m` already answers on a Linux host:
+
+```sh
+version=0.7.0                 # whatever the releases page shows
+name="volto-${version}-$(uname -m)-unknown-linux-musl"
+base="https://github.com/vcarus/volto/releases/download/v${version}"
+
+curl -fsSLO "$base/$name.tar.gz"
+curl -fsSLO "$base/SHA256SUMS"
+sha256sum --ignore-missing -c SHA256SUMS
+
+tar xzf "$name.tar.gz"
+cd "$name"
+sudo script/install-selfsigned.sh --binary ./volto
+```
+
+`--ignore-missing` is what lets that check pass at all: `SHA256SUMS` lists the
+archive for both architectures and you downloaded one, so without it the other
+is reported as `FAILED open or read` and `sha256sum` exits 1. It still fails, as
+it should, when the archive it can read does not match.
+
+From a checkout instead; `--binary` is unnecessary there, because its default is
+exactly what the build produces:
 
 ```sh
 cargo build --release --locked
@@ -257,6 +290,11 @@ Rolling back is the same flow pinned to an older release:
 sudo volto-deploy --tag v0.1.0
 ```
 
+Before pinning anything older than v0.4.5, comment `mtu_upper_bound` out of
+`/etc/volto/config.toml`: every install carries that key, no earlier release
+knows it, and a volto refuses the whole file rather than the one key it cannot
+read.
+
 It is also the one flow nobody rehearses, so the script says the two things
 that bite on the way back before it does anything about them.
 
@@ -338,9 +376,14 @@ QUIC is UDP. This is the single most common reason for "it works locally but the
 client cannot connect":
 
 ```sh
-sudo ufw allow 443/udp
+sudo ufw allow 443/udp       # only if ufw is installed and active
 sudo ss -lunp | grep 443     # confirm volto is actually listening on UDP
 ```
+
+A stock Ubuntu image has no `ufw`, so that first line is a `command not found`
+rather than a missing rule — the installer says as much in its own words, "no
+active ufw detected — open UDP 443 yourself if a firewall is in the way". Open
+the port wherever this host actually filters, if it filters at all.
 
 A cloud provider's security group needs the same rule, on UDP.
 
