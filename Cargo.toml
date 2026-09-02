@@ -225,6 +225,23 @@ proptest = "1"
 [profile.dev]
 debug = "line-tables-only"
 
+# Fat LTO with a single codegen unit, measured rather than assumed. On a Linux
+# container on 2026-09-02, against the profile cargo ships by default, it took
+# 11.5% off the stripped binary and 13-17% off the CPU cost of a 64-byte
+# datagram each way -- the shape of the DNS queries Surge sends through the
+# tunnel -- while MTU-sized datagrams and bulk TCP moved 2-8%, half of it inside
+# the run-to-run noise. The encode path alone got 24-41% faster; the rest of
+# the pipeline is syscalls and crypto, which LTO cannot reach. The price is the
+# final link: about 8 s to about 65 s on an 8-thread host, paid only by the
+# release workflows and by whoever rebuilds `it_bench` in release. `thin` was
+# measured too and produced a *larger* binary, so it is not the middle option
+# it looks like. Re-measure before keeping this if the per-packet allocation on
+# the outbound datagram path ever goes away (D29): that allocation is much of
+# what LTO is inlining today.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 # TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion
 # loss burst during a bulk transfer as the path having stopped carrying the
 # current MTU: the connection drops back to the 1200-byte floor, and on the
