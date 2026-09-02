@@ -173,12 +173,22 @@ async fn a_datagram_flood_does_not_hold_a_session_past_its_idle_timeout() {
 
     // The flood really did run while the deadline did, so the close above was
     // reached through a busy session rather than a quiet one: every one of these
-    // lines is a payload that arrived, was dropped, and bought no time.
+    // lines is a payload that arrived after the first one armed the deadline,
+    // was dropped, and bought no time.
+    //
+    // A count, not a rate. What it has to rule out is a flood that never ran
+    // (no line at all) and the shape seen once before the ordering above was
+    // fixed, a flood whose first dropped payload landed only after the close
+    // (one line); two lines is the smallest count that does, and no scheduling
+    // can defeat it. A rate is what a starved runner defeats: this once asked
+    // for more than a hundred, and a busy CI host delivered thirty-two in the
+    // window against thousands on the dev host, with the property under test
+    // unchanged by the number.
     let dropped = buffer
         .lines_since(mark, &["unanswered packet budget exhausted"])
         .len();
     assert!(
-        dropped > 100,
+        dropped > 1,
         "the session must have been flooded while its deadline ran, got {dropped} dropped payloads"
     );
 
