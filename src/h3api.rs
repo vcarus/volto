@@ -25,11 +25,11 @@
 //! already holds for the send-buffer and datagram-size questions it asks per
 //! packet.
 
-pub use crate::h3::MAX_FIELD_SECTION_SIZE;
 pub use crate::h3::connection::{Connection, DatagramReceiver};
 pub use crate::h3::error::{Code, ConnectionError, StreamError};
 pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};
 pub use crate::h3::stream::{Reader, Resolver, RespondError, Stream, Writer};
+pub use crate::h3::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
 
 /// No error -- a clean teardown.
 pub const NO_ERROR: Code = Code::H3_NO_ERROR;

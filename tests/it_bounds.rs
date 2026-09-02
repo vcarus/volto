@@ -18,7 +18,10 @@
 //! answered by refusing it: what bounds them is arithmetic, and this is where
 //! that arithmetic is pinned. `docs/configuration.md` quotes the same numbers
 //! for an operator sizing a host, which is the other reason they belong in a
-//! test rather than in a comment.
+//! test rather than in a comment. That last sentence is itself checked:
+//! `it_docs` reads every constant those pages quote in the `` `IDENT` = value ``
+//! notation back against the crate, so "the same numbers" is a gate rather than
+//! a claim.
 
 mod common;
 

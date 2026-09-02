@@ -438,8 +438,9 @@ them is a ceiling:
   Raising it does nothing at all for a program that does not ask.
 
 volto asks. `limits.socket_recv_buffer` and `limits.socket_send_buffer` are
-requested when the socket is created — 2 MiB each by default — so on this server
-the ceiling is the sysctl that matters:
+requested when the socket is created — `DEFAULT_SOCKET_RECV_BUFFER` = 2 MiB and
+`DEFAULT_SOCKET_SEND_BUFFER` = 2 MiB by default — so on this server the ceiling
+is the sysctl that matters:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=4194304

@@ -98,7 +98,7 @@ use crate::tunnel::{Context, Responded, Unreachable};
 /// than this many bytes are left in it, so every read still has at least 16 KiB
 /// of room. It is also the size of the *first* allocation a tunnel makes, so a
 /// tunnel that never carries a byte costs 16 KiB rather than a whole block.
-const RELAY_BUF_SIZE: usize = 16 * 1024;
+pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 
 /// The block reads are cut from once the initial 16 KiB is used up.
 ///
@@ -131,7 +131,7 @@ const RELAY_BUF_SIZE: usize = 16 * 1024;
 /// 1.3 MB per connection. The amplification is what produces the memory peaks
 /// worth avoiding, and 1.33x beats 2x there; `docs/configuration.md` says the
 /// same to operators.
-const RELAY_BLOCK_SIZE: usize = 64 * 1024;
+pub const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Why the tunnel is being torn down, carried on the teardown channel.
 ///

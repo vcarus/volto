@@ -55,7 +55,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit and never evicts. At the cap a new connection takes the slot of the oldest connection that has never had a request pass the credentials check — closed with `H3_NO_ERROR` and logged with `reason=evicted` — so a peer that keeps handshaking without ever authenticating cannot hold the server shut. Only a newcomer whose address QUIC has validated may evict: at the cap an unvalidated one is answered with a Retry (RFC 9000 §8.1) and takes no slot, which costs a spoofed Initial the flood it was for. A client that has connected before pays nothing — it returns a NEW_TOKEN token (RFC 9000 §8.1.3) and is already validated — so the extra round trip falls on first contact, on a token older than two weeks, and on the first reconnection after a restart or `SIGHUP`, and only while the server is full. Only when every live connection has authenticated is the newcomer refused during the handshake, before any per-connection state exists here |
 | `connect_timeout` | seconds | `10` | Budget for reaching a target; `0` disables it, and the ceiling is 3600. Spent twice per request and separately — once on name resolution, once on the whole list of addresses it resolved to — so a request holds its tunnel slot for at most twice this before any byte flows. A lookup that runs out answers 504 with `Proxy-Status: volto; error=dns_timeout`, a connect that runs out answers 504 with `error=connection_timeout` |
 | `ip_family_preference` | string | `"ipv4"` | Which address family a resolved target name is tried on first: `ipv4`, `ipv6` or `system` (the resolver's own RFC 6724 order). Applies to both tunnel kinds |
-| `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel — **once a request on that connection has passed the credentials check.** It is not what the handshake advertises: a connection is accepted on a fixed allowance of 16 (`INITIAL_BIDI_STREAMS` in `quic.rs`) and granted this value in a single step by its first authenticated request, so a peer that has proved nothing can neither hold a thousand request streams open nor draw a refusal on each. A client that opens more than 16 tunnels before its first one is answered finds the seventeenth held — QUIC backpressure, not an error — until that answer comes back, which is a wait it was already having. An operator who configures *fewer* than 16 gets what they configured, before authentication as well as after it. Range 1..65536, and the ceiling is there because of where the cost falls: a stream slot is reserved for every unit of the credit when the allowance is *granted*, not when a stream is opened, so the value is work paid in one go by the connection's first authenticated request rather than by every handshake — milliseconds at the ceiling on the dev host and whole seconds at a million, which is why the range stops where it does. quinn's own default of 100 runs out during ordinary browsing. The peer's *unidirectional* streams are not a key: they are fixed at 16 (`MAX_PEER_UNI_STREAMS` in `quic.rs`), where HTTP/3 needs exactly three — the control stream and the QPACK encoder/decoder pair, RFC 9114 §6.2 and RFC 9204 §4.2. Exceeding a transport parameter is a QUIC-level failure with no HTTP-level explanation attached, which is why there is margin rather than three |
+| `max_streams_bidi` | integer | `1024` | Concurrent bidirectional streams per connection — one per tunnel — **once a request on that connection has passed the credentials check.** It is not what the handshake advertises: a connection is accepted on a fixed allowance of `INITIAL_BIDI_STREAMS` = 16 (in `quic.rs`) and granted this value in a single step by its first authenticated request, so a peer that has proved nothing can neither hold a thousand request streams open nor draw a refusal on each. A client that opens more than 16 tunnels before its first one is answered finds the seventeenth held — QUIC backpressure, not an error — until that answer comes back, which is a wait it was already having. An operator who configures *fewer* than 16 gets what they configured, before authentication as well as after it. Range 1..65536, and the ceiling is there because of where the cost falls: a stream slot is reserved for every unit of the credit when the allowance is *granted*, not when a stream is opened, so the value is work paid in one go by the connection's first authenticated request rather than by every handshake — milliseconds at the ceiling on the dev host and whole seconds at a million, which is why the range stops where it does. quinn's own default of 100 runs out during ordinary browsing. The peer's *unidirectional* streams are not a key: they are fixed by `MAX_PEER_UNI_STREAMS` = 16 (in `quic.rs`), where HTTP/3 needs exactly three — the control stream and the QPACK encoder/decoder pair, RFC 9114 §6.2 and RFC 9204 §4.2. Exceeding a transport parameter is a QUIC-level failure with no HTTP-level explanation attached, which is why there is margin rather than three |
 | `max_idle_timeout` | seconds | `60` | How long a connection may go without traffic before it is closed. Range 1..3600. It also bounds every application-level wait that precedes a tunnel, whatever the connection's authentication state: the QUIC/TLS handshake, the HTTP/3 handshake, the read of each peer unidirectional stream's type, the read of a request stream's HEADERS, and every refusal this proxy writes. A separate bound of twice this applies only while a connection has never had a request pass the credentials check — counted from the handshake and never re-armed by a new stream, so it bounds the connection rather than a pause in it — and is lifted for good once a request authenticates, so a client that keeps an idle connection between requests is unaffected |
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
@@ -71,11 +71,11 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 **The fd budget is one number split in two.** Every tunnel costs one file
 descriptor, so `max_targets_per_conn` and systemd's `LimitNOFILE` are two halves
 of the same budget. What volto compares against `RLIMIT_NOFILE` at startup is
-`max_connections` × `max_targets_per_conn` **plus 64 descriptors of headroom**
-for the listening socket, the request streams and a certificate reload — 65600
-for the defaults, which the shipped unit's `LimitNOFILE=131072` has room for.
-Raise either limit past that point and `LimitNOFILE` has to go up with it, or
-the startup warning fires.
+`max_connections` × `max_targets_per_conn` **plus `FD_HEADROOM` = 64 descriptors
+of headroom** for the listening socket, the request streams and a certificate
+reload — 65600 for the defaults, which the shipped unit's `LimitNOFILE=131072`
+has room for. Raise either limit past that point and `LimitNOFILE` has to go up
+with it, or the startup warning fires.
 
 **A CONNECT-UDP session costs memory as well as a descriptor**, and only the
 descriptors are checked at startup. Each session holds three buffers for its
@@ -91,25 +91,26 @@ lowers it proportionally. It is a ceiling rather than a resting size: the queue
 is only full while a client sends faster than the proxy forwards, and the capsule
 buffer only fills for a client that leaves a capsule unfinished.
 
-**A TCP tunnel costs less, not nothing.** Its relay buffer starts at 16 KiB, and
-settles on a single 64 KiB block once the tunnel has relayed anything: reads are
-cut from one block until too little of it is left to offer a full-sized window,
-and that is also why the first 16 KiB is let go after the first read. So the
-saturation product for TCP is `max_connections` × `max_targets_per_conn` ×
-64 KiB = 4 GiB at the defaults, beside the 9.8 GiB of the UDP one. What a tunnel
-holds beyond that one block is bounded by quinn's per-connection send window:
-the pieces cut from a block share it, and each is held until the segment
-carrying it has been acknowledged, so the block outlives them all.
+**A TCP tunnel costs less, not nothing.** Its relay buffer starts at
+`RELAY_BUF_SIZE` = 16 KiB, and settles on a single `RELAY_BLOCK_SIZE` = 64 KiB
+block once the tunnel has relayed anything: reads are cut from one block until
+too little of it is left to offer a full-sized window, and that is also why the
+first 16 KiB is let go after the first read. So the saturation product for TCP
+is `max_connections` × `max_targets_per_conn` × 64 KiB = 4 GiB at the defaults,
+beside the 9.8 GiB of the UDP one. What a tunnel holds beyond that one block is
+bounded by quinn's per-connection send window (`SEND_WINDOW` = 10 MB): the
+pieces cut from a block share it, and each is held until the segment carrying it
+has been acknowledged, so the block outlives them all.
 
 **Every tunnel also holds its request's header fields.** volto advertises
-`SETTINGS_MAX_FIELD_SECTION_SIZE = 65536`, and a client is entitled to send a
-request that large; decoded, it costs roughly that much again — about 77 KiB
-measured — and it is kept for the whole life of the tunnel the request opened,
-not just until the target has been named. At the defaults that is another
-19 MiB per connection and about 4.8 GiB across the server, on top of the tunnel
-figures above. Real clients send a few hundred bytes of headers, so this is a
-ceiling reached only by a client that chooses to fill the advertised limit; it is
-listed because nothing else in this section accounts for it.
+`MAX_FIELD_SECTION_SIZE` = 65536 in its SETTINGS, and a client is entitled to
+send a request that large; decoded, it costs roughly that much again — about 77
+KiB measured — and it is kept for the whole life of the tunnel the request
+opened, not just until the target has been named. At the defaults that is
+another 19 MiB per connection and about 4.8 GiB across the server, on top of the
+tunnel figures above. Real clients send a few hundred bytes of headers, so this
+is a ceiling reached only by a client that chooses to fill the advertised limit;
+it is listed because nothing else in this section accounts for it.
 
 **`connect_timeout` is spent per request, not per connection.** Without it a
 target that silently drops SYNs holds a tunnel slot and its file descriptor for

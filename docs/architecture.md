@@ -38,13 +38,13 @@ change.
 
 Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and
-`SETTINGS_H3_DATAGRAM` (0x33). Surge checks for both and disconnects if either is
-missing; this is the first thing to suspect when a client drops immediately after
-a successful TLS handshake. The frame also carries `SETTINGS_MAX_FIELD_SECTION_SIZE`
-(64 KiB), both QPACK settings as zero, and one reserved "grease" identifier of
-RFC 9114 §7.2.4.1's `0x1f * N + 0x21` form, which that section says endpoints
-SHOULD send so peers keep exercising the rule that unknown identifiers are
-ignored.
+`SETTINGS_H3_DATAGRAM` (0x33). Surge checks for both and disconnects if either
+is missing; this is the first thing to suspect when a client drops immediately
+after a successful TLS handshake. The frame also carries
+`SETTINGS_MAX_FIELD_SECTION_SIZE` (`MAX_FIELD_SECTION_SIZE` = 64 KiB), both
+QPACK settings as zero, and one reserved "grease" identifier of RFC 9114
+§7.2.4.1's `0x1f * N + 0x21` form, which that section says endpoints SHOULD send
+so peers keep exercising the rule that unknown identifiers are ignored.
 
 `conn.rs` runs the accept loop and dispatches each request stream on the
 `:protocol` pseudo-header, after authenticating it:
@@ -113,21 +113,22 @@ write resets it with `H3_REQUEST_CANCELLED`, leaving everything else on the
 connection running.
 
 That bound is on time. The second one on an unauthenticated connection is on
-size, and it is a transport parameter: the handshake advertises 16 concurrent
-bidirectional streams (`INITIAL_BIDI_STREAMS`) rather than the configured
-`limits.max_streams_bidi`, and the first request to pass the credentials check
-raises the connection to the configured value in one step. Before it, a peer that
-has proved nothing holds at most 16 request streams — 16 parked request tasks and
-16 refusals to write, where 1024 of each were free — and its whole HEADERS
-buffering is bounded twice over by the same number, since 16 field sections at the
-64 KiB per-frame cap are exactly the 1 MiB budget below. Running into the
+size, and it is a transport parameter: the handshake advertises
+`INITIAL_BIDI_STREAMS` = 16 concurrent bidirectional streams rather than the
+configured `limits.max_streams_bidi`, and the first request to pass the
+credentials check raises the connection to the configured value in one step.
+Before it, a peer that has proved nothing holds at most 16 request streams — 16
+parked request tasks and 16 refusals to write, where 1024 of each were free —
+and its whole HEADERS buffering is bounded twice over by the same number, since
+16 field sections at the `MAX_FIELD_SECTION_SIZE` = 64 KiB per-frame cap are
+exactly the `HEADERS_BUFFER_BUDGET` = 1 MiB budget below. Running into the
 allowance is backpressure rather than an error: the peer's own stack holds the
 stream, and closing streams returns credit before authentication as after it. A
 client that fires more than 16 CONNECTs at once therefore waits for the raise,
-which happens before its first request has resolved a name or opened a socket, so
-what it waits is the round trip it was already waiting for that first answer. An
-operator who configures fewer than 16 gets what they configured throughout: the
-clamp only ever lowers.
+which happens before its first request has resolved a name or opened a socket,
+so what it waits is the round trip it was already waiting for that first answer.
+An operator who configures fewer than 16 gets what they configured throughout:
+the clamp only ever lowers.
 
 That bound holds one connection; it does not bound how many of the
 `limits.max_connections` slots unauthenticated peers hold between them, and a
@@ -239,10 +240,10 @@ stopped reading after its own FIN, `H3_CONNECT_ERROR` when it is the target that
 stopped reading after its own EOF) and the target socket is closed abortively —
 though on the client-FIN path the proxy's clean FIN has already reached the
 target, and a kernel that does not reset from FIN_WAIT_2 (Linux) closes silently
-behind it, so only the resources are reclaimed there.
-Every write gets its own budget, so a client that keeps reading may take hours to
-drain a download after its FIN — but progress alone does not save a write that
-never finishes, which puts a floor of roughly one 64 KiB relay chunk per budget
+behind it, so only the resources are reclaimed there. Every write gets its own
+budget, so a client that keeps reading may take hours to drain a download after
+its FIN — but progress alone does not save a write that never finishes, which
+puts a floor of roughly one `RELAY_BLOCK_SIZE` = 64 KiB relay chunk per budget
 under how slowly a half-closed download may be drained (about one 1.4 KB piece
 per budget in the other direction). A tunnel whose two directions are both still
 open is never on a timer at all, however long a write parks.
@@ -299,29 +300,30 @@ Two ordering rules that are easy to get wrong:
   waiting for the target", not "without resolving".
 
 The target socket is connected, so packets from anywhere else are dropped by the
-kernel. Sessions have their own idle timeout (default 180 s; RFC 9298 §3.1 asks
-for at least 120), where idle means no packet crossed the proxy: the clock is
-re-armed by a payload reaching the target or the target answering, never by
-bytes alone, so a peer dripping fragments of a capsule that never completes is
-reclaimed on schedule. As on the connection bound above, that clock is read on
-each pass and not only awaited: a peer with another payload always queued — the
-ones the amplification cap drops re-arm nothing, and cost it only bandwidth —
-kept the session's wait finishing on its own and the deadline was never measured
-against it. Closing the socket must also close the request stream.
+kernel. Sessions have their own idle timeout (default
+`DEFAULT_UDP_SESSION_TIMEOUT` = 180 s; RFC 9298 §3.1 asks for at least 120),
+where idle means no packet crossed the proxy: the clock is re-armed by a payload
+reaching the target or the target answering, never by bytes alone, so a peer
+dripping fragments of a capsule that never completes is reclaimed on schedule.
+As on the connection bound above, that clock is read on each pass and not only
+awaited: a peer with another payload always queued — the ones the amplification
+cap drops re-arm nothing, and cost it only bandwidth — kept the session's wait
+finishing on its own and the deadline was never measured against it. Closing the
+socket must also close the request stream.
 
 ## Datagram routing
 
 Each connection routes inbound datagrams to per-session channels from its own
 background task, in `src/h3/connection.rs` — the same task that reads the peer's
 unidirectional streams, since both belong to the connection and both end with
-it. A peer may hold sixteen of those open at once (`MAX_PEER_UNI_STREAMS`, a
+it. A peer may hold `MAX_PEER_UNI_STREAMS` = 16 of those open at once (a
 transport parameter rather than a configuration key) where HTTP/3 needs three,
 and each one's type has to arrive within an idle timeout. Routing is per
 *request stream*, which is why it lives in the HTTP/3 layer: a session claims
 its Quarter Stream ID by asking its stream for a `DatagramReceiver` and holds
 the claim exactly as long as it holds that receiver, so a session that ends —
-however it ends — takes its routing entry with it. Sending is the other half
-and stays outside: a UDP session writes its datagrams straight onto the
+however it ends — takes its routing entry with it. Sending is the other half and
+stays outside: a UDP session writes its datagrams straight onto the
 `quinn::Connection`.
 
 Two fields decide where a packet goes, and getting either subtly wrong is
@@ -457,33 +459,34 @@ connection error too. Ordering these ahead of the size checks is what keeps a
 `431` from being the answer to something that is not a field section, and what
 stops a frame the peer was never allowed to send from being charged for.
 
-Field sections are bounded at 64 KiB, advertised as
+Field sections are bounded at `MAX_FIELD_SECTION_SIZE` = 64 KiB, advertised as
 `SETTINGS_MAX_FIELD_SECTION_SIZE` so a peer that respects SETTINGS never sends
 more, and enforced on receipt so one that does not gets no further. The frame
-layer refuses an oversized non-DATA frame from its declared length, before a byte
-is allocated for it.
+layer refuses an oversized non-DATA frame from its declared length, before a
+byte is allocated for it.
 
 That bound is per frame, and a peer may open as many streams as its transport
-parameters allow. What one connection may hold in frames it has announced but not
-finished is therefore bounded separately, at 1 MiB summed over its request
-streams: a frame is charged for the length it announced the moment the decoder
-commits to buffering it, and the charge is returned when the frame completes or
-when the stream carrying it ends. The request that would take a connection past
-that is refused with **431 and stopped** with `H3_EXCESSIVE_LOAD`, which is the
-same answer a single oversized field section gets; the connection and its tunnels
-are untouched. A CONNECT request with credentials is a few hundred bytes, so
-every request stream the transport allows could be mid-HEADERS at once and still
-be using a tenth of the budget — what reaches it is sixteen field sections of the
-largest advertised size in flight together, and the seventeenth of those is what
-is refused. Sixteen streams at once is also the whole of what an unauthenticated
-connection may hold, so a peer that has proved nothing can meet this budget and
-never overshoot it: the 431 belongs to a connection past the credentials check,
-and against such a connection's 1024 streams it is the only thing standing. Only frames that are legal where they arrived are counted, since the
-type verdict comes first: a peer cannot hold the budget with PUSH_PROMISE frames
-on request streams, nor with field sections announced on tunnels that may carry
-none. The peer's control stream is not counted in it either: there is one of it
-per connection, it buffers one frame at a time, and nothing on it can be refused
-stream by stream.
+parameters allow. What one connection may hold in frames it has announced but
+not finished is therefore bounded separately, at `HEADERS_BUFFER_BUDGET` = 1 MiB
+summed over its request streams: a frame is charged for the length it announced
+the moment the decoder commits to buffering it, and the charge is returned when
+the frame completes or when the stream carrying it ends. The request that would
+take a connection past that is refused with **431 and stopped** with
+`H3_EXCESSIVE_LOAD`, which is the same answer a single oversized field section
+gets; the connection and its tunnels are untouched. A CONNECT request with
+credentials is a few hundred bytes, so every request stream the transport allows
+could be mid-HEADERS at once and still be using a tenth of the budget — what
+reaches it is sixteen field sections of the largest advertised size in flight
+together, and the seventeenth of those is what is refused. Sixteen streams at
+once is also the whole of what an unauthenticated connection may hold, so a peer
+that has proved nothing can meet this budget and never overshoot it: the 431
+belongs to a connection past the credentials check, and against such a
+connection's 1024 streams it is the only thing standing. Only frames that are
+legal where they arrived are counted, since the type verdict comes first: a peer
+cannot hold the budget with PUSH_PROMISE frames on request streams, nor with
+field sections announced on tunnels that may carry none. The peer's control
+stream is not counted in it either: there is one of it per connection, it
+buffers one frame at a time, and nothing on it can be refused stream by stream.
 
 One choice here is worth stating, though it is within the RFC: a malformed
 request is answered with a bare **400 and a clean stream close** rather than a
@@ -603,6 +606,15 @@ Two tests are load-bearing beyond their names:
 `it_stress` keeps a heavy tier behind `#[ignore]` (500 concurrent tunnels, 10000
 setup/teardown rounds) and a light tier in the default run that catches slot
 leaks by shrinking the quota until a leak turns into an observable 503.
+
+These pages are checked too. `it_docs` reads `docs/` as text and asserts three
+things a machine can settle: that the configuration keys documented here and the
+ones `script/config.example.toml` ships are one set, and that the documented set
+still parses as a `Config`; that every constant a page quotes in the
+`` `IDENT` = value `` notation holds the value the crate compiles; and that every
+`docs/<page>.md#<anchor>` reference in `src/`, in `tests/` and in these pages
+themselves names a heading that exists. What no gate can check is whether a
+sentence is *true*, so that half stays a review question.
 
 Test infrastructure lives in `tests/common/`: an in-process server plus
 self-signed certificates from `rcgen`, so no test needs a fixture on disk, and

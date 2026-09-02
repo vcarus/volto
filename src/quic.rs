@@ -1413,7 +1413,7 @@ fn socket_buffer_was_capped(requested: usize, granted: usize) -> bool {
 /// 16 MiB against the 2 MiB per-stream window: eight simultaneously saturated
 /// tunnels still get their full stream windows, while the worst case stops being
 /// a function of `max_streams_bidi`.
-const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
+pub const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
 
 /// Per-stream flow-control window, in bytes.
 ///
@@ -1441,7 +1441,7 @@ const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
 /// the 1.33:1 the peer itself runs (16 MiB of `initial_max_data` against 12 MiB
 /// per stream). The per-tunnel ceiling in the download direction is whatever the
 /// client advertises to us and is not settable here.
-const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(2 * 1024 * 1024);
+pub const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(2 * 1024 * 1024);
 
 /// quinn's own default per-stream receive window, in bytes.
 ///
@@ -1473,11 +1473,11 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// accepted decision, not an oversight — lifting the outbound cap to match would
 /// add roughly 1.6 GiB of theoretical worst case across `max_connections` (256 by
 /// default) in exchange for throughput we cannot measure a need for.
-const SEND_WINDOW: u64 = 10_000_000;
+pub const SEND_WINDOW: u64 = 10_000_000;
 
 /// Descriptors assumed to be needed beyond the tunnel quota: the endpoint
 /// socket, the request streams, stdio, and the certificate reads a reload does.
-const FD_HEADROOM: u64 = 64;
+pub const FD_HEADROOM: u64 = 64;
 
 /// Unidirectional streams a peer may have open on one connection at a time.
 ///
@@ -1495,7 +1495,7 @@ const FD_HEADROOM: u64 = 64;
 /// HTTP/3 layer would refuse anyway. The number this replaces is quinn's own
 /// default of 100, which this server had never taken a position on — the bidi
 /// limit beside it has been a configuration key all along (review L3).
-const MAX_PEER_UNI_STREAMS: u32 = 16;
+pub const MAX_PEER_UNI_STREAMS: u32 = 16;
 
 /// Bidirectional streams a peer may have open before it has authenticated.
 ///
@@ -1552,7 +1552,7 @@ const MAX_PEER_UNI_STREAMS: u32 = 16;
 /// advertising additional credit, since doing so will mean that the peer will be
 /// blocked for at least an entire round trip, and potentially indefinitely if
 /// the peer chooses not to send STREAMS_BLOCKED frames."
-const INITIAL_BIDI_STREAMS: u32 = 16;
+pub const INITIAL_BIDI_STREAMS: u32 = 16;
 
 /// How long to wait for `CONNECTION_CLOSE` frames to be flushed on shutdown.
 const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
