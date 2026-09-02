@@ -14,8 +14,57 @@ permissions:
   contents: read
 
 jobs:
+  ci-passed:
+    # A tag is a push like any other, and nothing here used to ask whether the
+    # commit it names had ever been green: `git tag && git push --tags` on a
+    # commit whose CI was red published binaries anyway, and the failing run sat
+    # next to the release on the same commit page. The workflows are separate on
+    # purpose (ci.yml runs on pushes and pull requests, this one on tags), so the
+    # link has to be made explicitly, which is what this job is.
+    #
+    # It asks a question, it does not wait for an answer: a tag pushed in the
+    # same breath as the commit will find CI still running and fail here. That is
+    # the intended shape -- push the tag once the commit is green, or re-run this
+    # workflow from the Actions tab afterwards. Nothing has been published at
+    # this point, since every other job needs this one.
+    name: require CI on the tagged commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `gh run list` reads workflow runs, which `contents: read` does not cover.
+      actions: read
+    steps:
+      - name: Require a successful ci.yml run for the tagged commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Set so the query needs no checkout: `gh` would otherwise look for a
+          # git remote in the working directory and find none.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # `github.sha` is the full 40-character commit the tag points at, and
+          # that matters more than it looks: `--commit` matches the string
+          # literally and answers an *empty list* for an abbreviated SHA,
+          # without an error. The empty case is therefore failed explicitly
+          # below rather than left to a `select` that finds nothing.
+          runs="$(gh run list --commit "${{ github.sha }}" --workflow ci.yml \
+            --limit 20 --json databaseId,status,conclusion,event)"
+          echo "$runs"
+
+          green="$(printf '%s' "$runs" |
+            jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')"
+
+          if [ "$green" -eq 0 ]; then
+            echo "::error::no successful ci.yml run for ${{ github.sha }} — refusing to publish ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+          echo "ci.yml is green for ${{ github.sha }} ($green successful run(s))"
+
   build:
     name: build (${{ matrix.target }})
+    needs: ci-passed
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,12 +80,19 @@ jobs:
       # provides; the non-FIPS build ships pre-generated bindings, so it wants a
       # C compiler but neither cmake nor bindgen nor Go. --locked keeps the
       # committed lockfile, quinn-proto patch included.
+      #
+      # cross.yml runs this exact step on the pull requests that can break it,
+      # which is only worth anything while the two are identical. The markers
+      # below delimit what `tests/it_release_assets.rs` compares between the two
+      # files; the prose stays outside them, since only the step has to match.
+      # >>> mirrored build step (release.yml <-> cross.yml) >>>
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build
           target: ${{ matrix.target }}
           args: "--locked --release"
           strip: true
+      # <<< mirrored build step (release.yml <-> cross.yml) <<<
 
       - name: Package
         run: |
@@ -53,6 +109,15 @@ jobs:
           cp LICENSE README.md "dist/${name}/"
           cp script/install-selfsigned.sh script/deploy.sh \
              script/config.example.toml script/masque.service "dist/${name}/script/"
+          # Both scripts point the operator at `docs/configuration.md` or
+          # `docs/deployment.md` at the moment they refuse to install -- an
+          # unknown config key on a downgrade, a config the new binary cannot
+          # load, a host that is not Debian. That is the worst moment for the
+          # file to be absent, and on a host bootstrapped from a tarball it was:
+          # nothing but the binary, the licence, the README and `script/` ever
+          # reached it. Copied as a directory rather than by name, so a new page
+          # needs no change here.
+          cp -R docs "dist/${name}/"
           tar -C dist -czf "${name}.tar.gz" "${name}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -99,7 +164,7 @@ jobs:
 
           Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
 
-          Each archive carries the binary, `LICENSE`, `README.md` and the `script/` directory, so the self-signed installer runs straight out of it:
+          Each archive carries the binary, `LICENSE`, `README.md` and the `script/` and `docs/` directories, so the self-signed installer runs straight out of it — and so does the documentation it refers you to:
 
           ```sh
           tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz

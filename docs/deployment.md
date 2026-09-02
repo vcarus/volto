@@ -29,8 +29,10 @@ x86_64 target, a cross toolchain for aarch64). The non-FIPS build used here
 ships pre-generated bindings, so no cmake, bindgen or Go is involved -- a C
 compiler is enough. The release workflow builds both
 targets with [`cross`](https://github.com/cross-rs/cross); the resulting static
-binaries are attached to each tagged release together with a `SHA256SUMS` file
-and the contents of `script/`.
+binaries are attached to each tagged release together with a `SHA256SUMS` file.
+Each archive unpacks to the binary, `LICENSE`, `README.md`, `script/` and
+`docs/` -- so the installer runs straight out of it, and the pages both scripts
+name when they refuse to install are on the host rather than only on the web.
 
 ## Certificates
 

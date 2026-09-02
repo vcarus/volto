@@ -11,6 +11,9 @@ name: Cross
 # A workflow of its own rather than a job in ci.yml because the gate is the
 # `paths` filter, and `on.paths` is workflow-scoped.
 
+# `release.yml` is in the filter because the build step below is a copy of its
+# own: a change to that step is exactly the change this workflow exists to run,
+# and without the entry it would be the one change that runs nothing.
 on:
   push:
     branches: [main]
@@ -18,11 +21,13 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/cross.yml
+      - .github/workflows/release.yml
   pull_request:
     paths:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/cross.yml
+      - .github/workflows/release.yml
 
 concurrency:
   group: cross-${{ github.ref }}
@@ -49,11 +54,15 @@ jobs:
 
       # Mirrors the build step in release.yml verbatim -- same action, same
       # pinned SHA, same arguments -- so a green run here is evidence about
-      # the release build itself, not about a similar one. When release.yml's
-      # build step changes, change this one with it.
+      # the release build itself, not about a similar one. "Verbatim" is not a
+      # request: `tests/it_release_assets.rs` compares the two blocks between
+      # the markers below and fails if they differ by a byte, and release.yml is
+      # in this workflow's `paths` filter so editing that side runs this side.
+      # >>> mirrored build step (release.yml <-> cross.yml) >>>
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build
           target: ${{ matrix.target }}
           args: "--locked --release"
           strip: true
+      # <<< mirrored build step (release.yml <-> cross.yml) <<<

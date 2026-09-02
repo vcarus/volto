@@ -1,28 +1,51 @@
-//! Everything in `script/` must be inside the release tarball.
+//! The release plumbing, which otherwise only fails at tag time.
 //!
-//! The four deployment assets are siblings on purpose: `install-selfsigned.sh`
-//! resolves the other two through `SCRIPT_DIR`, and `deploy.sh` runs the
-//! bundled installer straight out of an unpacked release. `release.yml` copies
-//! them in by name, so a new asset that nobody adds to that list — or a renamed
-//! one nobody updates — produces a tarball that looks fine and fails on the
-//! host: the first-install branch cannot find the installer, or the update
-//! branch cannot find the unit file. The symptom would surface a release later,
-//! in one line of `journalctl -u volto-deploy`. This turns it into a test
-//! failure instead.
+//! Everything here reads a tracked file as text and asserts a relationship
+//! between two of them. They share a shape: each pins an agreement that is
+//! today held together by a comment asking the next reader to keep it, and each
+//! one's failure mode is a release that builds, publishes and then does not
+//! work — discovered on a host, days later, in one line of
+//! `journalctl -u volto-deploy`.
+//!
+//! * **Everything in `script/` is inside the tarball.** The four deployment
+//!   assets are siblings on purpose: `install-selfsigned.sh` resolves the other
+//!   two through `SCRIPT_DIR`, and `deploy.sh` runs the bundled installer
+//!   straight out of an unpacked release. `release.yml` copies them in by name,
+//!   so a new asset that nobody adds to that list — or a renamed one nobody
+//!   updates — produces a tarball that looks fine and fails on the host: the
+//!   first-install branch cannot find the installer, or the update branch
+//!   cannot find the unit file.
+//! * **`docs/` is inside it too.** Both scripts name `docs/configuration.md` or
+//!   `docs/deployment.md` in the message they print when they refuse to
+//!   install, which is precisely when a host has no browser open.
+//! * **cross.yml runs release.yml's build step, not one like it.** That
+//!   workflow exists so a dependency bump that breaks the musl cross-build
+//!   fails on the pull request rather than at tag time, and it is worth exactly
+//!   as much as the two steps are identical.
+//! * **`fuzz/Cargo.toml` pins the quinn-proto revision `Cargo.toml` pins.** The
+//!   fuzz crate is its own workspace, so the root `[patch.crates-io]` does not
+//!   reach it and the stanza is duplicated; a bump applied to one and not the
+//!   other fuzzes a QUIC stack the server does not use.
 
 #[path = "common/scripts.rs"]
 mod scripts;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 use scripts::repo_root;
+
+/// The text of a tracked file, or a failure naming it.
+fn read(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
+}
 
 /// Every `script/…` path the release workflow copies into the tarball.
 fn packaged_paths() -> BTreeSet<String> {
     let workflow = repo_root().join(".github/workflows/release.yml");
-    let text = fs::read_to_string(&workflow)
-        .unwrap_or_else(|error| panic!("{} must be readable: {error}", workflow.display()));
+    let text = read(&workflow);
 
     // A `cp` invocation may be spread over several lines with trailing
     // backslashes; fold those back into one line before looking at it.
@@ -93,5 +116,194 @@ fn every_packaged_path_still_exists() {
     assert!(
         missing.is_empty(),
         ".github/workflows/release.yml packages paths that do not exist: {missing:?}"
+    );
+}
+
+/// The `docs/` directory has to reach the host as well.
+///
+/// Not by name, because `release.yml` copies the directory whole and a new page
+/// needs no change there — but the copy itself is one line, and deleting it
+/// would put every `docs/…` pointer both scripts print back to naming a file
+/// that is not on the host.
+#[test]
+fn the_documentation_the_scripts_point_at_is_packaged() {
+    let workflow = repo_root().join(".github/workflows/release.yml");
+    let folded = read(&workflow).replace("\\\n", " ");
+
+    let packages_docs = folded
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("cp "))
+        .any(|line| line.split_whitespace().any(|token| token == "docs"));
+
+    assert!(
+        packages_docs,
+        "{} no longer copies `docs` into the tarball, but script/deploy.sh and \
+         script/install-selfsigned.sh still send the operator to \
+         docs/configuration.md and docs/deployment.md when they refuse to install",
+        workflow.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cross.yml mirrors release.yml's build step
+// ---------------------------------------------------------------------------
+
+/// Opens the block both workflow files must spell identically.
+const MIRROR_OPEN: &str = ">>> mirrored build step";
+/// And closes it.
+const MIRROR_CLOSE: &str = "<<< mirrored build step";
+
+/// The lines between the mirror markers in `.github/workflows/<name>`.
+///
+/// Markers rather than line numbers: the two blocks sit at different offsets in
+/// files of different lengths, and an offset is wrong the first time either file
+/// grows a line — silently, since a wrong offset still yields *some* text to
+/// compare. The prose above each block differs on purpose and stays outside the
+/// markers; only the step itself has to match.
+fn mirrored_build_step(name: &str) -> String {
+    let path = repo_root().join(".github/workflows").join(name);
+    let text = read(&path);
+
+    let mut block: Vec<&str> = Vec::new();
+    let mut inside = false;
+    let mut closed = false;
+
+    for line in text.lines() {
+        if line.contains(MIRROR_OPEN) {
+            assert!(
+                !inside && !closed,
+                "{} opens the mirrored block more than once",
+                path.display()
+            );
+            inside = true;
+        } else if line.contains(MIRROR_CLOSE) {
+            assert!(
+                inside,
+                "{} closes a mirrored block it never opened",
+                path.display()
+            );
+            inside = false;
+            closed = true;
+        } else if inside {
+            block.push(line);
+        }
+    }
+
+    assert!(
+        closed,
+        "{} carries no `{MIRROR_OPEN}` … `{MIRROR_CLOSE}` block — has the build \
+         step moved, or were the markers dropped?",
+        path.display()
+    );
+    assert!(
+        !block.is_empty(),
+        "the mirrored block in {} is empty",
+        path.display()
+    );
+
+    block.join("\n")
+}
+
+/// A green cross build is only evidence about the release build if it *is* the
+/// release build.
+#[test]
+fn cross_yml_runs_the_release_build_step_verbatim() {
+    let release = mirrored_build_step("release.yml");
+    let cross = mirrored_build_step("cross.yml");
+
+    assert_eq!(
+        release, cross,
+        "the build step in .github/workflows/cross.yml has drifted from the one \
+         in release.yml. cross.yml exists so a dependency bump that breaks the \
+         musl cross-build fails on the pull request instead of at tag time; a \
+         step that differs proves something about a build nobody ships.\n\n\
+         release.yml:\n{release}\n\ncross.yml:\n{cross}"
+    );
+}
+
+/// And it is only evidence at all if editing release.yml runs it.
+#[test]
+fn editing_release_yml_triggers_the_cross_workflow() {
+    let path = repo_root().join(".github/workflows/cross.yml");
+    let text = read(&path);
+
+    // Two `paths:` filters, one under `push` and one under `pull_request`, and
+    // the entry has to be in both: a pull request that only the `push` filter
+    // named would run the check after the merge that needed it.
+    let filters = text.matches("- .github/workflows/release.yml").count();
+
+    assert_eq!(
+        filters,
+        2,
+        "{} must list `.github/workflows/release.yml` in both its `push` and \
+         `pull_request` paths filters, found {filters}. Without it, the one \
+         change this workflow most needs to react to — an edit to the build \
+         step it mirrors — is the one change that runs nothing.",
+        path.display()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The two quinn-proto pins
+// ---------------------------------------------------------------------------
+
+/// The `rev` of the `quinn-proto` `[patch.crates-io]` entry in `manifest`.
+fn quinn_proto_rev(manifest: &Path) -> String {
+    let text = read(manifest);
+
+    let entry = text
+        .split_once("quinn-proto = {")
+        .unwrap_or_else(|| {
+            panic!(
+                "{} carries no `quinn-proto = {{ … }}` patch entry — has the \
+                 stanza been removed? If a quinn-proto 0.11.x release now ships \
+                 the fixes, both manifests lose it together and this test goes \
+                 with them.",
+                manifest.display()
+            )
+        })
+        .1;
+    let entry = entry
+        .split_once('}')
+        .unwrap_or_else(|| panic!("{}: unterminated quinn-proto entry", manifest.display()))
+        .0;
+
+    let rev = entry
+        .split_once("rev = \"")
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: the quinn-proto patch carries no `rev`: {entry}",
+                manifest.display()
+            )
+        })
+        .1;
+
+    rev.split_once('"')
+        .unwrap_or_else(|| panic!("{}: unterminated rev string", manifest.display()))
+        .0
+        .to_string()
+}
+
+/// The fuzz crate must fuzz the QUIC stack the server runs.
+///
+/// `fuzz/` is its own cargo workspace, which is how cargo-fuzz wants it, and a
+/// `[patch.crates-io]` does not reach across that boundary — so the pin is
+/// written twice and kept equal by a comment in each file asking for it. Moving
+/// the rev in one place and not the other leaves the fuzz targets exercising a
+/// quinn-proto nothing deploys: a finding nobody can reproduce, or one nobody
+/// ever sees.
+#[test]
+fn the_fuzz_crate_pins_the_same_quinn_proto_revision() {
+    let root = repo_root();
+    let crate_rev = quinn_proto_rev(&root.join("Cargo.toml"));
+    let fuzz_rev = quinn_proto_rev(&root.join("fuzz/Cargo.toml"));
+
+    assert_eq!(
+        crate_rev, fuzz_rev,
+        "Cargo.toml pins quinn-proto at {crate_rev} and fuzz/Cargo.toml at \
+         {fuzz_rev}. The two are separate workspaces, so the root's \
+         [patch.crates-io] does not reach the fuzz crate and both revisions have \
+         to move together; the reasoning and the exit condition live in Cargo.toml."
     );
 }
