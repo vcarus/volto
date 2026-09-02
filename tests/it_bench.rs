@@ -1,10 +1,12 @@
 //! Loopback performance baseline: throughput, packet rates and churn.
 //!
-//! Every test here is `#[ignore]`d, so `cargo test` neither runs nor is slowed
-//! by them. Run the set with
+//! Every test here is `#[ignore]`d, and the binary itself is behind the
+//! `operator-runs` feature, so `cargo test` neither builds, runs nor is slowed
+//! by them. Naming the target without the feature is an error rather than an
+//! empty pass — see the feature's comment in `Cargo.toml`. Run the set with
 //!
 //! ```sh
-//! cargo test --release --test it_bench -- --ignored --nocapture --test-threads=1
+//! cargo test --release --features operator-runs --test it_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
 //! # What the numbers mean, and what they do not
@@ -982,7 +984,8 @@ async fn bench_tunnel_churn() {
 /// `ru_maxrss` is a high-water mark: once another benchmark in the same process
 /// has pushed the peak up, a later delta reads as zero however much memory the
 /// tunnels really take. Run this one on its own —
-/// `--ignored bench_concurrent_tunnels` — and the peak it reports is its own.
+/// `--features operator-runs --test it_bench -- --ignored bench_concurrent_tunnels`
+/// — and the peak it reports is its own.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "benchmark: run it deliberately, with --release --nocapture"]
 async fn bench_concurrent_tunnels() {

@@ -16,11 +16,15 @@
 //! port-unreachable and the stub fails fast, which is the opposite of the fault
 //! under test. Both are process- and host-wide, so this binary holds exactly one
 //! test, is `#[ignore]`d, and refuses to run outside a container it may modify —
-//! see [`BlackholeResolver`]. The run takes about [`RESOLVER_HANG`] seconds.
+//! see [`BlackholeResolver`]. The binary is behind the `operator-runs` feature
+//! for the same reason, so `cargo test` does not build it at all; naming the
+//! target without the feature is an error rather than an empty pass (see the
+//! feature's comment in `Cargo.toml`). The run takes about [`RESOLVER_HANG`]
+//! seconds.
 //!
 //! ```sh
 //! docker run --rm -v "$PWD":/w -w /w -e CARGO_TARGET_DIR=/tmp/target rust:1 \
-//!     cargo test --test it_resolver_pool -- --ignored --nocapture
+//!     cargo test --features operator-runs --test it_resolver_pool -- --ignored --nocapture
 //! ```
 //!
 //! # What is pinned

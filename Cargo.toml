@@ -119,6 +119,51 @@ socket2 = "0.6"
 name = "diff_oracle"
 path = "tests/interop/difforacle/oracle.rs"
 
+# Test binaries that hold no test `cargo test` can run: every test in the two
+# targets below is `#[ignore]`d, because each one is a deliberate run an
+# operator starts by hand and reads the output of, not an assertion a suite can
+# make. `it_bench` measures throughput, packet rates and churn over minutes and
+# wants `--release`; `it_resolver_pool` binds `127.0.0.1:53` and rewrites
+# `/etc/resolv.conf`, so it refuses to run outside a container it may modify.
+# Both are still worth compiling and still worth running -- just never as part
+# of a suite, which is what this feature says out loud. `cargo test` was already
+# linking both (`it_bench` pulls in the whole harness) to run nothing at all.
+#
+# Not "bench": `it_resolver_pool` is a fault injection, not a measurement, and
+# what the two have in common is the operator, not the benchmark.
+#
+# Forgetting the flag cannot be mistaken for a green run. Cargo refuses the
+# invocation rather than filtering the target away:
+#
+#     $ cargo test --test it_bench
+#     error: target `it_bench` in package `volto` requires the features:
+#     `operator-runs`
+#     Consider enabling them by passing, e.g., `--features="operator-runs"`
+#
+# and exits non-zero. A plain `cargo test` simply does not build them, which is
+# the point of the gate; what would be dangerous is `--test <name>` reporting a
+# green run of nothing, and it does not.
+#
+# `cargo clippy --all-targets --all-features -- -D warnings` in ci.yml keeps
+# them typechecked and linted, so they cannot rot behind the flag.
+#
+# `tests/it_replay.rs` is deliberately not here even though its one heavy test
+# is `#[ignore]`d too: it compiles `tests/replay/shape.rs` and `replay/netem.rs`,
+# whose eleven unit tests do run in `cargo test`, and gating the binary would
+# take those out of CI.
+[features]
+operator-runs = []
+
+[[test]]
+name = "it_bench"
+path = "tests/it_bench.rs"
+required-features = ["operator-runs"]
+
+[[test]]
+name = "it_resolver_pool"
+path = "tests/it_resolver_pool.rs"
+required-features = ["operator-runs"]
+
 [dev-dependencies]
 # Pinned to the same crypto backend as the server (D102). rcgen's default
 # feature set is `crypto` + `pem` + `ring`, so the backend has to be selected by
@@ -169,7 +214,9 @@ proptest = "1"
 # D66 shapes the asserting test helpers around `#[track_caller]` surviving to
 # the poll that panics. What it drops is the variable, type and scope records a
 # stepping debugger would want, and nothing in this workflow is one. The saving
-# is link time and disk across the forty-three integration test binaries.
+# is link time and disk, and it is paid once per integration test binary in
+# `tests/` -- of which there are enough for that multiplier to be the whole
+# reason this setting is here (a number would be out of date within a week).
 #
 # `[profile.dev.package."*"] opt-level = 2` is the usual companion to this and
 # is deliberately absent: optimising the dependency graph moves what the D86
