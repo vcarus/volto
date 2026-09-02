@@ -307,3 +307,54 @@ fn the_fuzz_crate_pins_the_same_quinn_proto_revision() {
          to move together; the reasoning and the exit condition live in Cargo.toml."
     );
 }
+
+/// The `version` a `[[package]]` block records in a lockfile, by package name.
+fn locked_version(lockfile: &Path, package: &str) -> String {
+    let text = read(lockfile);
+    let needle = format!("name = \"{package}\"\n");
+    let start = text
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{} records no package named {package}", lockfile.display()));
+    let block = &text[start..];
+    block
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.starts_with("[[package]]"))
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{} has no version line for {package}", lockfile.display()))
+        .to_owned()
+}
+
+/// The `version` under `[package]` in a manifest.
+fn package_version(manifest: &Path) -> String {
+    let text = format!("\n{}", read(manifest));
+    let package = text
+        .split("\n[")
+        .find(|section| section.starts_with("package]"))
+        .unwrap_or_else(|| panic!("{} has no [package] table", manifest.display()));
+    package
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{} has no version under [package]", manifest.display()))
+        .to_owned()
+}
+
+/// `fuzz/Cargo.lock` names the root crate as a path dependency, version
+/// included, and the `fuzz` job in ci.yml checks that workspace with
+/// `--locked`. A release bump that touches only the root manifest therefore
+/// fails CI on the fuzz job with "cannot update the lock file", which is what
+/// happened at v0.8.0; this pins the two together where a bump is made.
+#[test]
+fn the_fuzz_lockfile_records_the_current_crate_version() {
+    let root = repo_root();
+    let manifest = package_version(&root.join("Cargo.toml"));
+    let locked = locked_version(&root.join("fuzz/Cargo.lock"), "volto");
+
+    assert_eq!(
+        manifest, locked,
+        "Cargo.toml says volto is {manifest} but fuzz/Cargo.lock records {locked}; run \
+         `cargo update -p volto --manifest-path fuzz/Cargo.toml` alongside the version bump"
+    );
+}
