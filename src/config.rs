@@ -776,8 +776,8 @@ impl Config {
             bail!(
                 "limits.max_streams_bidi = {} exceeds the {MAX_STREAMS_BIDI_CEILING} this \
                  server allows; a stream slot is reserved for every unit of the credit when \
-                 a connection is created, so the value is paid at every handshake rather \
-                 than when a stream is opened",
+                 the allowance is granted, so the value is paid in one go by a connection's \
+                 first authenticated request rather than when a stream is opened",
                 self.limits.max_streams_bidi
             );
         }
