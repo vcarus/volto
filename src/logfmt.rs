@@ -87,14 +87,10 @@ pub fn bounded(token: &str) -> Cow<'_, str> {
         return Cow::Borrowed(token);
     }
 
-    // A search over a fixed range rather than a hand-stepped index: this runs
-    // on logging paths, where a defect must come out as a wrong cut, never as
-    // a hang. Position 0 is always a boundary, so the fallback is unreachable
-    // and total either way.
-    let end = (0..=MAX_TOKEN)
-        .rev()
-        .find(|&end| token.is_char_boundary(end))
-        .unwrap_or(0);
+    // The largest boundary at or below the cap. Position 0 is always one, so
+    // this is total: on a logging path a defect must come out as a wrong cut,
+    // never as a panic.
+    let end = token.floor_char_boundary(MAX_TOKEN);
     Cow::Owned(truncated(&token[..end], token.len()))
 }
 
@@ -294,25 +290,19 @@ const MAX_ADDRESSES: usize = 8;
 /// assert_eq!(addresses(&one).to_string(), "[127.0.0.1:443]");
 /// ```
 pub fn addresses(list: &[std::net::SocketAddr]) -> impl fmt::Display + '_ {
-    struct Addresses<'a>(&'a [std::net::SocketAddr]);
-
-    impl fmt::Display for Addresses<'_> {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.write_str("[")?;
-            for (index, address) in self.0.iter().take(MAX_ADDRESSES).enumerate() {
-                if index > 0 {
-                    f.write_str(", ")?;
-                }
-                write!(f, "{address}")?;
+    fmt::from_fn(move |f| {
+        f.write_str("[")?;
+        for (index, address) in list.iter().take(MAX_ADDRESSES).enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
             }
-            if let Some(rest) = self.0.len().checked_sub(MAX_ADDRESSES).filter(|n| *n > 0) {
-                write!(f, ", and {rest} more")?;
-            }
-            f.write_str("]")
+            write!(f, "{address}")?;
         }
-    }
-
-    Addresses(list)
+        if let Some(rest) = list.len().checked_sub(MAX_ADDRESSES).filter(|n| *n > 0) {
+            write!(f, ", and {rest} more")?;
+        }
+        f.write_str("]")
+    })
 }
 
 #[cfg(test)]
