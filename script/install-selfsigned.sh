@@ -313,7 +313,9 @@ command -v openssl >/dev/null 2>&1 || die "openssl is required (apt install open
 case "$PORT" in
     ''|*[!0-9]*) die "port must be a number, got: $PORT" ;;
 esac
-[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "port out of range: $PORT"
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "port out of range: $PORT"
+fi
 
 check_credentials
 
