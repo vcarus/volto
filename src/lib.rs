@@ -45,6 +45,15 @@
 // `deny` so it cannot be opted out of module by module: a future need for
 // `unsafe` should be an argued change to this line, not a local `allow`.
 #![forbid(unsafe_code)]
+// Every public item carries prose, and the gate says so rather than the habit.
+// `cargo doc` is published for this crate, so a `pub` item without a doc comment
+// is a hole in the page a reader lands on; `warn` here rather than `deny`,
+// because CI already runs clippy with `-D warnings` and rustdoc with
+// `RUSTDOCFLAGS=-D warnings`, so the gate is an error where it matters and a
+// hint where somebody is mid-edit. Deliberately not `[lints]` in `Cargo.toml`:
+// that would reach `tests/` and `fuzz/`, whose items are scaffolding rather
+// than a published surface.
+#![warn(missing_docs)]
 
 pub mod auth;
 pub mod capsule;

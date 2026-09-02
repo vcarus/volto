@@ -3,6 +3,8 @@
 // As in `lib.rs`: the binary crate is assembly over the library, and there is
 // nothing here that could need `unsafe` either.
 #![forbid(unsafe_code)]
+// And, as in `lib.rs`, every item here is documented; this keeps it that way.
+#![warn(missing_docs)]
 
 use std::ffi::OsStr;
 use std::fmt;
