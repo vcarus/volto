@@ -88,9 +88,9 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::watch;
 use tracing::{debug, info};
 
-use crate::h3api::{self, Fields, Reader, RespondError, Status, Stream, StreamError, Writer};
+use crate::h3api::{self, Fields, Reader, Status, Stream, StreamError, Writer};
 use crate::tunnel;
-use crate::tunnel::{Context, Unreachable};
+use crate::tunnel::{Context, Responded, Unreachable};
 
 /// Smallest window `read_buf` is ever offered on the target → client relay.
 ///
@@ -250,7 +250,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, authority, reason, "malformed CONNECT authority");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+            tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
             return;
         }
     };
@@ -259,8 +259,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
     // every refusal already answered by the time this returns — see
     // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
     // fields of its own, so the 200-then-close path is handed an empty list.
-    let Some(allowed) =
-        tunnel::admit_target(&host, port, ctx, &mut stream, stream_id, Fields::new).await
+    let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, Fields::new).await
     else {
         return;
     };
@@ -280,7 +279,7 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
                 error = %failure.error,
                 "failed to connect to target"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
+            tunnel::refuse_unreachable(&mut stream, &failure).await;
             return;
         }
     };
@@ -292,20 +291,23 @@ pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Cont
 
     let target = tcp.peer_addr().ok();
 
-    // Bounded exactly as every refusal is, and for the same reason
-    // ([`h3api::Stream::respond_within`]): a peer that grants no flow-control
-    // credit never takes even the few bytes of a 200, and nothing else would
-    // ever end the wait -- the pumps below do not exist until this write
-    // returns. On expiry the stream has already been reset with
-    // H3_REQUEST_CANCELLED, and returning here drops `tcp`, closing the target
-    // connection that will now carry nothing.
-    match stream.respond_within(Status::OK, Fields::new()).await {
-        Ok(()) => {}
-        Err(RespondError::Failed(error)) => {
-            debug!(stream_id, %error, "failed to send 200 for CONNECT");
-            return;
-        }
-        Err(RespondError::Expired) => {
+    // Bounded exactly as every refusal is, and for the reason
+    // [`tunnel::respond`] gives: the pumps below do not exist until this write
+    // returns, so nothing else would ever end the wait. On expiry the stream
+    // has already been reset with H3_REQUEST_CANCELLED, and returning here
+    // drops `tcp`, closing the target connection that will now carry nothing.
+    let sent = tunnel::respond(
+        &mut stream,
+        Status::OK,
+        Fields::new(),
+        "failed to send 200 for CONNECT",
+    )
+    .await;
+
+    match sent {
+        Responded::Sent => {}
+        Responded::Failed => return,
+        Responded::Expired => {
             debug!(
                 stream_id,
                 authority, "gave up on a 200 for CONNECT the peer would not take"

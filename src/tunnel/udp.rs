@@ -41,10 +41,9 @@ use tracing::{debug, info, warn};
 use crate::capsule::{self, Capsule, CapsuleDecoder};
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{
-    self, DatagramReceiver, FieldValue, Fields, Reader, Request, RespondError, Status, Stream,
-    Writer,
+    self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
 };
-use crate::tunnel::{Context, Unreachable};
+use crate::tunnel::{Context, Responded, Unreachable};
 use crate::{net, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
@@ -60,7 +59,7 @@ pub(super) const CONNECT_UDP: &str = "connect-udp";
 pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context) {
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
         return;
     }
 
@@ -69,7 +68,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, path, reason, "malformed connect-udp request");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+            tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
             return;
         }
     };
@@ -99,7 +98,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
             stream_id,
             "the datagrams of this stream are already claimed"
         );
-        tunnel::refuse(&mut stream, Status::INTERNAL_SERVER_ERROR, stream_id).await;
+        tunnel::refuse(&mut stream, Status::INTERNAL_SERVER_ERROR).await;
         return;
     };
 
@@ -117,8 +116,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
     // whatever the client sent optimistically; the router then drops later
     // datagrams for that id silently, exactly as it does for a session that has
     // just closed.
-    let Some(allowed) =
-        tunnel::admit_target(&host, port, &ctx, &mut stream, stream_id, capsule_fields).await
+    let Some(allowed) = tunnel::admit_target(&host, port, &ctx, &mut stream, capsule_fields).await
     else {
         return;
     };
@@ -135,25 +133,28 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
                 error = %failure.error,
                 "failed to open target UDP socket"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure, stream_id).await;
+            tunnel::refuse_unreachable(&mut stream, &failure).await;
             return;
         }
     };
 
-    // Bounded exactly as every refusal is, and for the same reason
-    // ([`h3api::Stream::respond_within`]): a peer that grants no flow-control
-    // credit never takes even the few bytes of a 200, and nothing else would
-    // ever end the wait -- the session below does not exist until this write
-    // returns. On expiry the stream has already been reset with
-    // H3_REQUEST_CANCELLED, and returning here drops the socket and the
-    // Quarter Stream ID claim with it.
-    match stream.respond_within(Status::OK, capsule_fields()).await {
-        Ok(()) => {}
-        Err(RespondError::Failed(error)) => {
-            debug!(stream_id, %error, "failed to send 200 for connect-udp");
-            return;
-        }
-        Err(RespondError::Expired) => {
+    // Bounded exactly as every refusal is, and for the reason
+    // [`tunnel::respond`] gives: the session below does not exist until this
+    // write returns, so nothing else would ever end the wait. On expiry the
+    // stream has already been reset with H3_REQUEST_CANCELLED, and returning
+    // here drops the socket and the Quarter Stream ID claim with it.
+    let sent = tunnel::respond(
+        &mut stream,
+        Status::OK,
+        capsule_fields(),
+        "failed to send 200 for connect-udp",
+    )
+    .await;
+
+    match sent {
+        Responded::Sent => {}
+        Responded::Failed => return,
+        Responded::Expired => {
             debug!(
                 stream_id,
                 "gave up on a 200 for connect-udp the peer would not take"
@@ -178,6 +179,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
 
     let (writer, reader) = stream.split();
     let mut session = Session {
+        stream_id,
         quarter_stream_id,
         socket,
         inbound,
@@ -196,13 +198,19 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Context
         ctx,
     };
 
-    session.run(stream_id).await;
+    session.run().await;
 
     debug!(stream_id, quarter_stream_id, "udp session closed");
 }
 
 /// A running UDP session.
 struct Session {
+    /// The request stream's id, and the Quarter Stream ID that follows from it.
+    ///
+    /// Both are fixed for the life of the session and every line it writes
+    /// names one or the other, so they are carried beside the halves of the
+    /// stream rather than threaded through each method as an argument.
+    stream_id: u64,
     quarter_stream_id: u64,
     socket: UdpSocket,
     /// Payloads the connection's router decoded for this session, and this
@@ -321,7 +329,9 @@ async fn before_deadline<T>(
 
 impl Session {
     /// Pumps the session until it closes, one direction at a time.
-    async fn run(&mut self, stream_id: u64) {
+    async fn run(&mut self) {
+        let stream_id = self.stream_id;
+
         // A UDP datagram can be at most this big, so one buffer serves forever.
         // It cannot be smaller: `UdpSocket::recv` truncates a longer packet
         // silently rather than reporting it, and the capsule fallback forwards
@@ -382,16 +392,14 @@ impl Session {
                 // Only reachable if the routing table lost this session's
                 // entry, which nothing but dropping `inbound` can do.
                 Event::Inbound(None) => Step::Stop,
-                Event::Socket(Ok(length)) => {
-                    self.forward_to_client(stream_id, &packet[..length]).await
-                }
+                Event::Socket(Ok(length)) => self.forward_to_client(&packet[..length]).await,
                 Event::Socket(Err(error)) => {
                     // ICMP errors surface here on a connected socket. RFC 9298
                     // §3.1: the request stream must be closed.
                     debug!(stream_id, %error, "target socket failed");
                     Step::Stop
                 }
-                Event::Stream(chunk) => self.handle_stream_chunk(stream_id, chunk).await,
+                Event::Stream(chunk) => self.handle_stream_chunk(chunk).await,
             };
 
             match step {
@@ -499,7 +507,9 @@ impl Session {
     }
 
     /// Forwards a packet received from the target to the client.
-    async fn forward_to_client(&mut self, stream_id: u64, packet: &[u8]) -> Step {
+    async fn forward_to_client(&mut self, packet: &[u8]) -> Step {
+        let stream_id = self.stream_id;
+
         // The socket is connected, so anything arriving here really is from the
         // target: the conversation is two-way and the amplification cap is done.
         // A target that is answering is also the other direction of progress,
@@ -645,9 +655,10 @@ impl Session {
     /// forwarded exactly the same way.
     async fn handle_stream_chunk(
         &mut self,
-        stream_id: u64,
         chunk: Result<Option<Bytes>, h3api::StreamError>,
     ) -> Step {
+        let stream_id = self.stream_id;
+
         match chunk {
             Ok(Some(data)) => {
                 self.decoder.push(&data);

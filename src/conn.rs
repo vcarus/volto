@@ -402,7 +402,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             stream_id,
             field, "request carries a connection-specific field"
         );
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
         return;
     }
 
@@ -471,7 +471,6 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 &mut stream,
                 Status::PROXY_AUTHENTICATION_REQUIRED,
                 auth::challenge_fields(),
-                stream_id,
             )
             .await;
             return;
@@ -499,7 +498,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             ),
             None => debug!(stream_id, live, "connection is at its tunnel limit"),
         }
-        tunnel::refuse_because(&mut stream, ProxyError::ConnectionLimitReached, stream_id).await;
+        tunnel::refuse_because(&mut stream, ProxyError::ConnectionLimitReached).await;
         return;
     };
 
@@ -516,7 +515,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
             None => {
                 // RFC 9114 §4.4: a CONNECT request must carry :authority.
                 debug!(stream_id, "CONNECT request without :authority");
-                tunnel::refuse(&mut stream, Status::BAD_REQUEST, stream_id).await;
+                tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
             }
         },
         Route::ConnectUdp => {
@@ -532,7 +531,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
-            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED).await;
         }
         Route::NotConnect => {
             debug!(
@@ -540,7 +539,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Context) {
                 method = %req.method,
                 "not a CONNECT request; this server only proxies"
             );
-            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED, stream_id).await;
+            tunnel::refuse(&mut stream, Status::NOT_IMPLEMENTED).await;
         }
     }
 }
