@@ -18,6 +18,8 @@ language = "en"
 build-dir = "target/book"
 
 [output.html]
+# Only the favicon is overridden; every other theme file stays mdBook's default.
+theme = "docs/theme"
 git-repository-url = "https://github.com/vcarus/volto"
 # What the site is served from, so the 404 page can find its own assets from
 # any depth. GitHub Pages puts a project site under the repository name.

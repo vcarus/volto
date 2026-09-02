@@ -54,6 +54,8 @@
 // that would reach `tests/` and `fuzz/`, whose items are scaffolding rather
 // than a published surface.
 #![warn(missing_docs)]
+#![doc(html_logo_url = "https://vcarus.github.io/volto/assets/logo.png")]
+#![doc(html_favicon_url = "https://vcarus.github.io/volto/theme/favicon.png")]
 
 pub mod auth;
 pub mod capsule;

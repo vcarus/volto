@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.png" width="120" alt="">
+
 # volto
 
 **A MASQUE proxy server in Rust — HTTP/3 CONNECT and CONNECT-UDP over one QUIC connection, built for [Surge](https://nssurge.com)'s `masque` policy.**

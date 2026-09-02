@@ -1,6 +1,8 @@
+<p align="center"><img src="assets/logo.png" width="96" alt=""></p>
+
 # volto
 
-volto is a MASQUE proxy server written in Rust. One QUIC connection from the client carries TCP through classic CONNECT (RFC 9114 §4.4) and UDP through CONNECT-UDP (RFC 9298, HTTP Datagrams per RFC 9297), both dispatched by the `:protocol` pseudo-header. It terminates TLS itself, runs unattended on a small Linux host, reloads certificates and credentials on `SIGHUP`, and ships as a static binary. It is built to interoperate with Surge's `masque` policy.
+This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connection from the client carries TCP through classic CONNECT (RFC 9114 §4.4) and UDP through CONNECT-UDP (RFC 9298, HTTP Datagrams per RFC 9297), both dispatched by the `:protocol` pseudo-header. It terminates TLS itself, runs unattended on a small Linux host, reloads certificates and credentials on `SIGHUP`, and ships as a static binary. It is built to interoperate with Surge's `masque` policy.
 
 <p align="center">
   <picture>
