@@ -2,7 +2,7 @@
 name = "volto"
 version = "0.8.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.95"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
 documentation = "https://vcarus.github.io/volto/"

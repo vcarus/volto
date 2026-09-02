@@ -264,13 +264,13 @@ impl BufferBudget {
     /// a connection's whole buffering allowance in frames it never finishes is
     /// -- the same reading [`super::qpack`] takes of the same code.
     ///
-    /// `fetch_update` rather than an add-then-check: a rejected charge must
+    /// `try_update` rather than an add-then-check: a rejected charge must
     /// leave the counter untouched, or two streams failing at once would each
     /// see the other's rolled-back bytes and the bound would hold only on
     /// average.
     fn charge(&self, bytes: usize) -> Result<(), Violation> {
         self.held
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 let wanted = held.saturating_add(bytes);
                 (wanted <= HEADERS_BUFFER_BUDGET).then_some(wanted)
             })
@@ -297,12 +297,12 @@ impl BufferBudget {
         if bytes > 0 {
             let held = self
                 .held
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-                    Some(held.saturating_sub(bytes))
+                .update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                    held.saturating_sub(bytes)
                 });
             debug_assert!(
-                held.is_ok_and(|held| held >= bytes),
-                "released {bytes} bytes from a budget holding {held:?}"
+                held >= bytes,
+                "released {bytes} bytes from a budget holding {held}"
             );
         }
     }
@@ -1798,7 +1798,7 @@ mod tests {
     /// The test above walks the streams one at a time, which is the one order
     /// that cannot show what [`BufferBudget::charge`] is written for: a peer
     /// opens as many request streams as it likes and their HEADERS frames arrive
-    /// together, so the charges really do contend. `fetch_update` is what makes a
+    /// together, so the charges really do contend. `try_update` is what makes a
     /// refused charge leave the counter alone -- an add-then-check would let two
     /// streams failing at once each subtract the other's rolled-back bytes, and
     /// the bound would then hold on average rather than at every instant.
@@ -1876,7 +1876,7 @@ mod tests {
     /// arithmetic afterwards: the counter goes over the bound for as long as it
     /// takes to roll the refused bytes back, and any stream that reads it in that
     /// window is refused a frame the connection had room for -- a 431 to a client
-    /// that broke no rule. `fetch_update` never publishes the rejected value at
+    /// that broke no rule. `try_update` never publishes the rejected value at
     /// all, so a reader cannot see one.
     ///
     /// Bounded by construction twice over: every worker does a fixed number of

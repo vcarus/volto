@@ -83,7 +83,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   msrv:
-    # `rust-version = "1.88"` in Cargo.toml and the "Rust 1.88+" in the public
+    # `rust-version = "1.95"` in Cargo.toml and the "Rust 1.95+" in the public
     # docs are claims about the oldest toolchain that builds this crate, but
     # every other job runs `stable`: nothing would notice a newer API slipping
     # in, because the field itself only stops a *user* whose cargo is older --
@@ -94,7 +94,7 @@ jobs:
     env:
       # The single place this workflow spells the version; the first step
       # asserts it against Cargo.toml, so the two cannot drift apart silently.
-      MSRV: "1.88"
+      MSRV: "1.95"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Assert the pin matches Cargo.toml

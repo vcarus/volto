@@ -12,13 +12,13 @@ edition = "2024"
 # A resolver input, not a support claim. Edition 2024 implies resolver 3, which
 # is MSRV-aware, and with no `rust-version` here that resolver floors on
 # whatever toolchain happens to be installed -- so a regeneration on a newer
-# host could pull a dependency version the root's own 1.88 floor would have
+# host could pull a dependency version the root's own 1.95 floor would have
 # refused, and this workspace would stop fuzzing the graph the server ships.
 # Naming the root's floor keeps the two resolutions the same by construction.
-# Nothing supports *building* this crate on 1.88: `cargo fuzz` needs nightly.
+# Nothing supports *building* this crate on 1.95: `cargo fuzz` needs nightly.
 # The `msrv` job in ci.yml asserts the root's `rust-version` and not this one,
 # which is why this is written as the resolver knob it is.
-rust-version = "1.88"
+rust-version = "1.95"
 
 [package.metadata]
 cargo-fuzz = true
