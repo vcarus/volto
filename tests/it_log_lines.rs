@@ -255,6 +255,15 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         file: "quic.rs",
+        message: "server.listen changed, but a reload cannot move the listening socket; the \
+                  server is still bound where it started. Restart to apply it.",
+        bound: Bound::Lifecycle,
+        reason: "At most one per reload, and only when the operator's own file \
+                 names a different address than the one the endpoint was bound \
+                 with; a reload starts with SIGHUP.",
+    },
+    Accounted {
+        file: "quic.rs",
         message: "{warning}",
         bound: Bound::Lifecycle,
         reason: "One per warning the reloaded configuration produced, on the same \

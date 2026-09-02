@@ -452,6 +452,16 @@ pub struct Server {
     trigger: Trigger,
     /// The other end of the same latch, cloned into every connection.
     shutdown: Shutdown,
+    /// The `[server] listen` this endpoint was bound with.
+    ///
+    /// Kept beside the endpoint rather than read back off it, because the two
+    /// are not the same answer: `local_addr()` reports the port the kernel
+    /// chose, so a configured `:0` would never compare equal to itself. It is
+    /// the *configured* address a reload has to be judged against, and it
+    /// cannot come from the live configuration either -- a reload swaps that
+    /// whole value in, so the second reload naming a new address would find
+    /// the first one's already there and say nothing.
+    listen: SocketAddr,
 }
 
 impl Server {
@@ -490,6 +500,7 @@ impl Server {
         Ok(Self {
             endpoint,
             socket_buffers,
+            listen: config.server.listen,
             config: Arc::new(RwLock::new(config)),
             roster: Roster::new(),
             resolver: crate::net::ResolverBudget::new(),
@@ -513,6 +524,7 @@ impl Server {
             endpoint: self.endpoint.clone(),
             config: self.config.clone(),
             shutdown: self.shutdown.clone(),
+            listen: self.listen,
         }
     }
 
@@ -1114,6 +1126,9 @@ pub struct ReloadHandle {
     endpoint: quinn::Endpoint,
     config: LiveConfig,
     shutdown: Shutdown,
+    /// The `[server] listen` the endpoint was bound with, for the one key a
+    /// reload has to say it is ignoring.
+    listen: SocketAddr,
 }
 
 impl ReloadHandle {
@@ -1147,6 +1162,23 @@ impl ReloadHandle {
             cert = %config.server.cert.display(),
             "configuration reloaded; new connections will use it"
         );
+
+        // Said rather than done. A reload never rebinds -- `docs/configuration.md`
+        // and `docs/deployment.md` both promise that, because the usual sender of
+        // SIGHUP is a renewal hook that rewrites the whole file and a rebind
+        // would take the proxy off the air over a key nobody meant to change.
+        // What was missing was the operator being told: the rest of the file
+        // applied, this one key silently did not, and until now the only way to
+        // find out was to notice the socket had not moved.
+        if config.server.listen != self.listen {
+            warn!(
+                bound = %self.listen,
+                configured = %config.server.listen,
+                "server.listen changed, but a reload cannot move the listening socket; \
+                 the server is still bound where it started. Restart to apply it."
+            );
+        }
+
         for warning in config.warnings() {
             warn!("{warning}");
         }

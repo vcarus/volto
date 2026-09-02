@@ -20,12 +20,32 @@ use bytes::Bytes;
 use common::Response;
 use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::{
-    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, TIMEOUT, TestServer, auth_section, authorized_connect,
-    close_and_drain, connect_request, echoes, open_tcp_tunnel, open_udp_session, read_at_least,
-    respond_to, send_and_respond, spawn_echo_target, spawn_end_reporting_target,
-    spawn_udp_echo_target, udp_round_trip,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section,
+    authorized_connect, close_and_drain, connect_request, echoes, open_tcp_tunnel,
+    open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
+    spawn_end_reporting_target, spawn_udp_echo_target, udp_round_trip,
 };
 use volto::h3api::{FieldValue, Status};
+
+/// Reloads the server with a subscriber of this test's own, and returns
+/// everything it logged.
+///
+/// Scoped rather than process-wide (`SharedBuffer::install`) because this file
+/// is many `#[tokio::test]`s and `tracing_subscriber::fmt().init()` may run only
+/// once per process. `ReloadHandle::reload` is synchronous and runs on the
+/// caller's own thread, which is exactly what a thread-local default subscriber
+/// covers -- so this captures the reload's lines and nothing else's.
+fn reload_capturing_logs(server: &TestServer) -> (anyhow::Result<()>, String) {
+    let logs = SharedBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter("volto=info")
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .finish();
+
+    let result = tracing::subscriber::with_default(subscriber, || server.reload());
+    (result, logs.contents())
+}
 
 /// Sends a CONNECT with credentials and returns the response.
 async fn connect_as(
@@ -603,14 +623,20 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
 }
 
 /// `[server] listen` and the socket buffers are startup keys: a reload carrying
-/// new values for them is accepted and moves nothing.
+/// new values for them is accepted and moves nothing -- and says so.
 ///
-/// `docs/configuration.md` and `docs/deployment.md` both promise this, and the
-/// silence is the point: the usual sender of `SIGHUP` is a renewal hook that
-/// re-writes the whole file, and a reload that refused it -- or worse, tried to
-/// rebind -- would take the proxy off the air over a key the operator did not
-/// mean to change. So the rest of the same file still applies, which is what
-/// separates "this key is a no-op" from "the reload failed".
+/// `docs/configuration.md` and `docs/deployment.md` both promise the no-op: the
+/// usual sender of `SIGHUP` is a renewal hook that re-writes the whole file, and
+/// a reload that refused it -- or worse, tried to rebind -- would take the proxy
+/// off the air over a key the operator did not mean to change. So the rest of
+/// the same file still applies, which is what separates "this key is a no-op"
+/// from "the reload failed".
+///
+/// The silence, though, was never the point. An operator who *did* mean to move
+/// the socket had nothing to read: the reload succeeded, the line said so, and
+/// the one key that did not apply was the one nothing mentioned. So the no-op
+/// carries a `warn!` naming both addresses, and this test pins it -- the
+/// promise is "does not rebind", not "does not tell you".
 #[tokio::test]
 async fn a_reload_cannot_move_the_listening_socket() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
@@ -624,9 +650,26 @@ async fn a_reload_cannot_move_the_listening_socket() {
         server.dir().join("cert.pem").display(),
         server.dir().join("key.pem").display(),
     ));
-    server
-        .reload()
-        .expect("a startup-only key is not a reason to refuse a whole reload");
+    let (reloaded, logs) = reload_capturing_logs(&server);
+    reloaded.expect("a startup-only key is not a reason to refuse a whole reload");
+
+    // Named, both halves: what the socket is on and what the file asked for.
+    let warning = logs
+        .lines()
+        .find(|line| line.contains("a reload cannot move the listening socket"))
+        .unwrap_or_else(|| panic!("the ignored key must be reported; log was:\n{logs}"));
+    assert!(
+        warning.contains("WARN"),
+        "a key that silently did not apply is a warning, not an aside: {warning}"
+    );
+    assert!(
+        warning.contains(&format!("configured={elsewhere}")),
+        "the warning must name the address the file asked for: {warning}"
+    );
+    assert!(
+        warning.contains("bound=127.0.0.1:0"),
+        "the warning must name the address the endpoint was bound with: {warning}"
+    );
 
     // Still answering where it was bound, and the reloadable key from the same
     // file did take effect.

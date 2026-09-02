@@ -158,6 +158,19 @@ the value that was in force when it was **accepted**, not whatever a later reloa
 set. A reload during a connection's unauthenticated window changes nothing about
 that connection either.
 
+**`[server].listen` is startup-only.** A reload carrying a new value for it is
+accepted — the rest of the file still applies, because the usual sender of
+`SIGHUP` is a renewal hook that rewrites the whole file and refusing the reload
+over one key would be worse than ignoring it — but the socket does not move.
+The reload says so, naming both addresses, so an operator who did mean to move
+it is not left reading a successful reload that quietly did not apply:
+
+```
+WARN volto::quic: server.listen changed, but a reload cannot move the listening
+socket; the server is still bound where it started. Restart to apply it.
+bound=0.0.0.0:443 configured=0.0.0.0:8443
+```
+
 **The two socket buffer keys are startup-only, not reloadable at all.** They are
 applied to the UDP socket when it is created, and a reload does not rebind that
 socket — changing them needs a restart, the same as `[server].listen`. Each
