@@ -36,6 +36,68 @@ warning rather than silent packet loss. Being a property of the socket rather
 than of a connection, these two are the only `[limits]` keys a reload cannot
 change.
 
+### The SNI gate
+
+`gate.rs` sits between that socket and quinn. It is an `AsyncUdpSocket` wrapper,
+so it sees every datagram before the QUIC layer does, and it is off unless
+`[security] expected_sni` names at least one host — an empty list, the shipped
+default, passes everything through untouched.
+
+It exists because quinn's endpoint is conservative but not silent. A long-header
+packet naming a version it does not speak draws a Version Negotiation packet; an
+Initial whose Destination Connection ID is shorter than the eight bytes RFC 9000
+§7.2 requires draws a `CONNECTION_CLOSE`; a short-header packet for no live
+connection can draw a Stateless Reset. All three are correct answers to a QUIC
+peer, and all three are answers to a port scan. With the gate open, a datagram
+that would draw one is discarded first.
+
+The judgement is made on the first packet in the datagram, which is enough for
+the whole of it: RFC 9000 §12.2 both lets a receiver "route based on the
+information in the first packet contained in a UDP datagram" and forbids a sender
+from coalescing packets with different connection IDs into one. A short header passes — the gate
+holds no connection state to judge it with. A long header naming a version other
+than 1 is refused. A long header that is not an Initial passes, because quinn
+drops those for an unknown connection without a word. An Initial in a datagram
+below 1200 bytes passes for the same reason: RFC 9000 §14.1 has the server
+discard it, and quinn does, silently. What is left is an Initial that could start
+a connection, and that one is opened: the keys for it are derived from the
+Destination Connection ID in the packet itself (RFC 9001 §5.2), so no connection
+state is needed to read it. Its CRYPTO frames are assembled from offset zero, the
+ClientHello is parsed, and the `server_name` extension (RFC 6066 §3) is compared
+with the configured list — ASCII case-insensitively, with a trailing root dot
+ignored, name for name and no wildcards.
+
+A refused datagram is not removed from the receive batch, because one buffer can
+hold a whole GRO run described by a single stride. It is left in place with its
+Destination Connection ID *length* byte overwritten by a value larger than the 20
+bytes RFC 9000 §17.2 allows, which quinn's own packet decoder rejects before it
+reads the version, the type or anything else — and rejects by returning rather
+than by answering.
+
+Two deviations from a SHOULD are deliberate and are the point of the feature.
+RFC 9000 §5.2.2 says a server "SHOULD send a Version Negotiation packet" for a
+large enough packet naming an unsupported version; with the gate open it sends
+nothing. RFC 6066 §3 says a server that does not recognise the name "SHOULD take
+one of two actions: either abort the handshake by sending a fatal-level
+`unrecognized_name(112)` alert or continue the handshake"; the socket-level check
+does neither, and the second check below aborts with a different alert.
+
+That second check is in `tls.rs`. The gate reads only what arrives in the first
+Initial packet, and a ClientHello large enough to be split across several of them
+is passed through on purpose — refusing a first flight whose extensions have not
+arrived would make a large ClientHello unreachable. Such a handshake is stopped
+by a `ResolvesServerCert` that declines to present a certificate for a name that
+is not on the list, which rustls turns into a fatal `access_denied` alert. It is
+not a certificate selector: there is still one certificate and one key, and
+naming several hosts means answering to all of them with the same certificate.
+
+Stateless resets are deliberately left uncovered — see D106 and the
+[configuration reference](configuration.md#the-sni-gate) for what that leaves
+visible and why filtering on the address instead would break connection
+migration. None of this is traffic obfuscation, which stays a non-goal: the gate
+hides that a service is here from somebody who does not know the name to ask
+for, and says nothing about what a connection looks like once one is open.
+
 Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and
 `SETTINGS_H3_DATAGRAM` (0x33). Surge checks for both and disconnects if either

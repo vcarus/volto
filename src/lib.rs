@@ -11,6 +11,7 @@
 //! * [`config`] — TOML configuration and its validation.
 //! * [`policy`] — the destination ACL: which targets may be reached.
 //! * [`tls`] — certificate/key loading and the rustls server configuration.
+//! * [`gate`] — the SNI gate: which handshakes reach quinn at all.
 //! * [`quic`] — the QUIC endpoint, transport parameters and the accept loop.
 //! * [`shutdown`] — the graceful-shutdown signal shared by endpoint and connections.
 //! * [`h3`] — HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
@@ -36,7 +37,10 @@
 //!   state only while debugging interop on a private network;
 //! * `[security]` defaults *are* the safe ones: private address space is out of
 //!   reach, port 25 is closed, and an unanswered UDP session cannot be used as an
-//!   amplifier.
+//!   amplifier — with one deliberate exception, `expected_sni`, whose default
+//!   empty list leaves the port answering anybody who speaks QUIC to it, because
+//!   turning the [`gate`] on without knowing the name is a server nobody can
+//!   reach.
 
 // The two raw syscalls this crate used to make by hand -- `getrlimit` for the
 // startup fd check and `IP_MTU_DISCOVER` for the DF bit -- now go through
@@ -62,6 +66,7 @@ pub mod capsule;
 pub mod config;
 pub mod conn;
 pub mod datagram;
+pub mod gate;
 pub mod h3;
 pub mod h3api;
 pub mod logfmt;

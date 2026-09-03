@@ -164,9 +164,26 @@ impl TestServer {
     /// Starts a server with `extra` after the `[server]` keys and `log_extra`
     /// appended inside the `[log]` section.
     pub async fn start_with_log(extra: &str, log_extra: &str) -> Self {
+        Self::start_named(extra, log_extra, &[]).await
+    }
+
+    /// [`TestServer::start_with`] with a certificate that also covers `names`.
+    ///
+    /// The escape hatch for the SNI gate (`it_sni_gate`), which is the one
+    /// subject that needs *two* names a client can complete a handshake under:
+    /// with a single-name certificate, "the gate let this through" and "the
+    /// certificate did not match" are the same outcome from the client's side.
+    pub async fn start_with_certificate_names(extra: &str, names: &[&str]) -> Self {
+        Self::start_named(extra, "", names).await
+    }
+
+    /// The body behind all of the constructors above.
+    async fn start_named(extra: &str, log_extra: &str, extra_names: &[&str]) -> Self {
         let dir = TempDir::new("server");
-        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate self-signed certificate");
+        let mut subject = vec!["localhost".to_owned()];
+        subject.extend(extra_names.iter().map(|name| (*name).to_owned()));
+        let issued =
+            rcgen::generate_simple_self_signed(subject).expect("generate self-signed certificate");
 
         let cert = dir.path().join("cert.pem");
         let key = dir.path().join("key.pem");
@@ -420,10 +437,24 @@ pub fn finish_connect(
     endpoint: &quinn::Endpoint,
     addr: SocketAddr,
 ) -> impl Future<Output = Result<quinn::Connection, quinn::ConnectionError>> + '_ {
+    finish_connect_as(endpoint, addr, "localhost")
+}
+
+/// [`finish_connect`] asking for `server_name` instead of `localhost`.
+///
+/// The name goes into the ClientHello's `server_name` extension and is also what
+/// the client verifies the certificate against, so a test using this is choosing
+/// both at once — which is what makes it the way to drive the SNI gate.
+#[track_caller]
+pub fn finish_connect_as<'a>(
+    endpoint: &'a quinn::Endpoint,
+    addr: SocketAddr,
+    server_name: &'a str,
+) -> impl Future<Output = Result<quinn::Connection, quinn::ConnectionError>> + 'a {
     let caller = Location::caller();
     async move {
         let connecting = endpoint
-            .connect(addr, "localhost")
+            .connect(addr, server_name)
             .expect("start connecting");
 
         tokio::time::timeout(TIMEOUT, connecting)

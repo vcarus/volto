@@ -36,6 +36,7 @@
 //! denied_ports             = [25]
 //! unanswered_packet_budget = 64
 //! max_auth_failures        = 5
+//! expected_sni             = []   # non-empty turns the SNI gate on
 //!
 //! [log]
 //! level  = "info"      # optional, this is the default
@@ -557,6 +558,15 @@ pub struct Security {
     /// Not a rate limit: it raises the cost of guessing from "one handshake, then
     /// unlimited attempts" to "one handshake per N attempts". Zero disables it.
     pub max_auth_failures: u32,
+    /// Host names this server answers to, or an empty list to answer to any.
+    ///
+    /// Empty is the default and the behaviour every release before this one had:
+    /// the name a client asks for is logged and otherwise ignored. A non-empty
+    /// list turns on the SNI gate (D106): a handshake whose ClientHello does not
+    /// name one of these hosts is dropped at the socket, before quinn sees it,
+    /// so a port scan of this address gets no answer at all. See
+    /// [`crate::gate`] for what that covers and what it does not.
+    pub expected_sni: Vec<String>,
 }
 
 /// `[server]` — the QUIC listener and its TLS identity.
@@ -638,6 +648,7 @@ impl Default for Security {
             denied_ports: DEFAULT_DENIED_PORTS.to_vec(),
             unanswered_packet_budget: DEFAULT_UNANSWERED_PACKET_BUDGET,
             max_auth_failures: DEFAULT_MAX_AUTH_FAILURES,
+            expected_sni: Vec::new(),
         }
     }
 }
@@ -928,6 +939,10 @@ impl Config {
             .position(|port| *port == 0)
         {
             bail!("security.denied_ports[{i}] is 0, which is not a usable port");
+        }
+
+        for (i, name) in self.security.expected_sni.iter().enumerate() {
+            validate_expected_sni(i, name)?;
         }
 
         if !self.server.cert.is_file() {
@@ -1297,6 +1312,62 @@ fn validate_log_level(level: &str) -> Result<()> {
     Ok(())
 }
 
+/// The longest host name a `server_name` extension can carry, in bytes.
+///
+/// A fully qualified DNS name is at most 255 bytes on the wire, of which two are
+/// the root label's length byte and the trailing zero, leaving 253 for the
+/// presentation form. A configured name longer than that could never be matched,
+/// because no client could have asked for it.
+pub const MAX_EXPECTED_SNI: usize = 253;
+
+/// Validates one `security.expected_sni` entry.
+///
+/// Rejected rather than normalised away, because every one of these is a name an
+/// operator meant to type and none of them can ever match: a name that cannot
+/// appear in a ClientHello turns the gate into a server nobody can reach, and
+/// that failure is silent by construction — the whole point of the gate is that
+/// a refused handshake gets no answer, so the operator would see a working
+/// service that no client can open.
+///
+//= https://www.rfc-editor.org/rfc/rfc6066#section-3
+//# The hostname is represented as a byte
+//# string using ASCII encoding without a trailing dot.
+fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
+    let bare = name.strip_suffix('.').unwrap_or(name);
+
+    if bare.is_empty() {
+        bail!("security.expected_sni[{index}] is empty, which is not a host name");
+    }
+
+    if bare.len() > MAX_EXPECTED_SNI {
+        bail!(
+            "security.expected_sni[{index}] is {} bytes; a DNS host name is at most \
+             {MAX_EXPECTED_SNI}, so no ClientHello could ever carry it",
+            bare.len()
+        );
+    }
+
+    if bare.contains('*') {
+        bail!(
+            "security.expected_sni[{index}] = {name:?} looks like a wildcard, and this \
+             list is matched name for name: write out each host it should accept"
+        );
+    }
+
+    if let Some(bad) = bare
+        .chars()
+        .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '.' | '_'))
+    {
+        bail!(
+            "security.expected_sni[{index}] = {name:?} contains {bad:?}; a server_name \
+             carries an ASCII DNS host name, so an internationalized domain goes here \
+             in its A-label form (xn--...)"
+        );
+    }
+
+    Ok(())
+}
+
 impl Server {
     /// The ALPN identifiers in the byte-vector form rustls expects.
     pub fn alpn_wire(&self) -> Vec<Vec<u8>> {
@@ -1379,6 +1450,8 @@ pub(crate) mod tests {
         assert_eq!(cfg.security.denied_ports, vec![25]);
         assert!(!cfg.security.denied_ports.contains(&53));
         assert_eq!(cfg.security.unanswered_packet_budget, 64);
+        // The SNI gate is off, which is what makes an absent key change nothing.
+        assert!(cfg.security.expected_sni.is_empty());
 
         // No users at all is legal and means "no authentication".
         assert!(cfg.auth.users.is_empty());
@@ -2349,6 +2422,47 @@ pub(crate) mod tests {
         );
     }
 
+    /// A list of names parses, and the trailing dot a client may or may not send
+    /// is accepted on the configuration side too.
+    #[test]
+    fn expected_sni_accepts_the_names_a_client_hello_can_carry() {
+        let cfg = parse(
+            "[security]\nexpected_sni = [\"proxy.example\", \"alt.example.\", \"xn--80ak6aa92e.example\"]",
+        );
+        assert_eq!(cfg.security.expected_sni.len(), 3);
+        assert_valid_apart_from_certs(&cfg, "a list of expected SNI names");
+    }
+
+    /// Every rejection names the entry, because a gate misconfigured this way
+    /// fails silently by design: the server starts and no client can open it.
+    #[test]
+    fn expected_sni_rejects_names_no_client_hello_could_carry() {
+        for (entry, wanted) in [
+            ("\"\"", "is empty"),
+            ("\"*.example\"", "wildcard"),
+            ("\"proxy example\"", "contains"),
+            ("\"[2001:db8::1]\"", "contains"),
+        ] {
+            let err = parse(&format!("[security]\nexpected_sni = [{entry}]"))
+                .validate()
+                .expect_err("must be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains("security.expected_sni[0]") && message.contains(wanted),
+                "{entry}: {message}"
+            );
+        }
+
+        let long = "a".repeat(MAX_EXPECTED_SNI + 1);
+        let err = parse(&format!("[security]\nexpected_sni = [\"{long}\"]"))
+            .validate()
+            .expect_err("must be rejected");
+        assert!(
+            err.to_string().contains("security.expected_sni[0]"),
+            "{err}"
+        );
+    }
+
     /// The open-proxy warning is the single most important thing an operator can
     /// be told at startup, so it is asserted rather than assumed.
     #[test]
@@ -2550,6 +2664,7 @@ pub(crate) mod tests {
                 "denied_ports",
                 "unanswered_packet_budget",
                 "max_auth_failures",
+                "expected_sni",
             ],
         ),
         ("log", &["level", "keylog"]),
@@ -2696,6 +2811,7 @@ pub(crate) mod tests {
             denied_ports,
             unanswered_packet_budget,
             max_auth_failures,
+            expected_sni,
         } = cfg.security.clone();
         let security = Security::default();
 
@@ -2703,6 +2819,7 @@ pub(crate) mod tests {
         assert_eq!(denied_ports, security.denied_ports);
         assert_eq!(unanswered_packet_budget, security.unanswered_packet_budget);
         assert_eq!(max_auth_failures, security.max_auth_failures);
+        assert_eq!(expected_sni, security.expected_sni);
 
         let Log { level, keylog } = cfg.log.clone();
         let log = Log::default();

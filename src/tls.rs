@@ -13,8 +13,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 
 use crate::config;
+use crate::gate::Names;
 
 /// Builds the rustls server configuration.
 ///
@@ -26,12 +29,42 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
     let key = load_key(&server.key)?;
 
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("the aws-lc-rs crypto provider does not support TLS 1.3")?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("server.cert and server.key do not form a usable certificate/key pair")?;
+        .with_no_client_auth();
+
+    // The second SNI gate (D106). The first one is at the socket, in
+    // [`crate::gate`], and it cannot see a ClientHello that arrives split across
+    // several Initial packets -- it passes those through deliberately, because
+    // refusing a first flight it has not finished reading would turn a large
+    // ClientHello into an unreachable server. This is where such a handshake is
+    // stopped instead: no certificate is resolved for a name that is not ours,
+    // and rustls ends the handshake with a fatal alert rather than presenting a
+    // certificate and answering the request behind it.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc6066#section-3
+    //# If the server understood the ClientHello extension but
+    //# does not recognize the server name, the server SHOULD take one of two
+    //# actions: either abort the handshake by sending a fatal-level
+    //# unrecognized_name(112) alert or continue the handshake.
+    //
+    // The first of those two, with a different alert: rustls sends
+    // `access_denied`. Which alert it is has no bearing on the client, which
+    // fails the handshake either way, and volto does not choose it.
+    let names = Names::new(&config.security.expected_sni);
+    let mut crypto = if names.is_empty() {
+        builder
+            .with_single_cert(certs, key)
+            .context("server.cert and server.key do not form a usable certificate/key pair")?
+    } else {
+        let certified = CertifiedKey::from_der(certs, key, &provider)
+            .context("server.cert and server.key do not form a usable certificate/key pair")?;
+        builder.with_cert_resolver(Arc::new(OneOfTheseNames {
+            names,
+            certified: Arc::new(certified),
+        }))
+    };
 
     // Stated rather than inherited. rustls already defaults this to 0, so not a
     // byte on the wire changes, and QUIC allows only 0 or `u32::MAX` anyway --
@@ -60,6 +93,27 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
     }
 
     Ok(crypto)
+}
+
+/// Presents the certificate only to a client that asked for a name we answer to.
+///
+/// Not a certificate *selection* mechanism -- there is one certificate and one
+/// key, exactly as `with_single_cert` installs -- but a refusal: the resolver is
+/// the only place in rustls where a server can see the requested name and decline
+/// before anything is sent back.
+#[derive(Debug)]
+struct OneOfTheseNames {
+    names: Names,
+    certified: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for OneOfTheseNames {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        // `None` from rustls means the ClientHello carried no `server_name` at
+        // all, which is a client that cannot be asking for this server by name.
+        let name = client_hello.server_name()?;
+        self.names.accepts(name).then(|| self.certified.clone())
+    }
 }
 
 /// Loads a PEM certificate chain, leaf first.

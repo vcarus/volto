@@ -291,6 +291,7 @@ family, an IP literal above all, is unaffected by any of the three.
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
+| `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default and what every release before this one did. A non-empty list turns on the SNI gate: a handshake whose ClientHello does not name one of these hosts is dropped at the socket before the QUIC layer sees it, so a port scan of this address gets nothing back — no Version Negotiation packet, no `CONNECTION_CLOSE`, no TLS alert. Matched name for name, ASCII case-insensitive, with a trailing root dot ignored; no wildcards and no suffix matching. Every client must then send the name as SNI (in Surge, the `sni=` parameter), or it sees the port as closed with no error anywhere but this server's debug log — so change this key and the clients together. See below |
 
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
   `::127.0.0.1` gets past `allow_private_networks = false`.
@@ -315,6 +316,55 @@ family, an IP literal above all, is unaffected by any of the three.
   guessing from "one handshake, then unlimited attempts" to "one handshake per N
   attempts", without any cross-connection state to keep or evict. Pair it with
   fail2ban for actual banning — see [deployment.md](deployment.md#fail2ban).
+
+### The SNI gate
+
+`expected_sni` is the one key here that changes what an outsider sees rather than
+what a client may reach. With it set, the UDP port stops answering anybody who
+cannot name the host: the check runs on the datagram itself, under the QUIC
+layer, and a handshake that fails it is discarded rather than refused. There is
+no reply of any kind, so a scan of the address finds a closed port.
+
+What it is for is a deployment whose address is not the name — volto behind a
+relay, where the port is on an IP that nothing else advertises. What it is *not*
+is traffic obfuscation: it says nothing about what a connection looks like once
+one is open, and it does not stop a probe that already knows the name.
+
+**Turning it on is a two-sided change.** Set it to the name on the certificate,
+and make sure every client sends that name as SNI. Surge does when the policy
+line names the host; when the policy points at a relay's IP instead, that is the
+`sni=` parameter (with `server-cert-verify-name=`), which such a deployment
+already needs. A client that sends the wrong name — or none — gets silence, and
+silence is indistinguishable from the server being down, so the two halves belong
+in the same change window.
+
+Some details worth knowing before relying on it:
+
+- **A name is checked twice.** The socket-level check reads the ClientHello out
+  of the client's first Initial packet, which is where a ClientHello normally
+  fits whole. One that is split across several packets is deliberately let
+  through — refusing a first flight before its extensions have arrived would make
+  a large ClientHello unreachable — and is stopped a layer up instead, by a
+  certificate resolver that declines to present a certificate for a name it does
+  not know. That second refusal is a TLS alert rather than silence, which is the
+  one case where a probe learns something.
+- **Reloadable.** `SIGHUP` applies a new list to handshakes from then on;
+  connections already open are unaffected, exactly like the rest of the file.
+- **Not a certificate selector.** There is still one certificate and one key.
+  Naming several hosts means volto answers to all of them with the same
+  certificate, so they all have to be on it.
+- **Stateless resets are not covered.** A short-header packet for a connection
+  this server does not hold can still draw one (RFC 9000 §10.3), because telling
+  a live connection's packets from a stranger's needs state the gate does not
+  have, and filtering on the address instead would break the connection migration
+  a phone behind a relay's NAT depends on. The residue is narrow: the packet has
+  to be at least 22 bytes, start with the bits `01`, and carry eight bytes that
+  pass the endpoint's own keyed connection-ID check. A scanner's probe does not.
+- **Rejected names.** A name that no ClientHello could carry is refused at
+  startup rather than accepted and never matched — an empty string, a wildcard, a
+  name over 253 bytes, anything outside the ASCII letters, digits, `-`, `.` and
+  `_` an A-label is made of. The failure mode this avoids is a gate that starts
+  cleanly and silently refuses every client.
 
 ## `[log]`
 

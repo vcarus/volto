@@ -293,6 +293,29 @@ initial_rtt_ms = 150
 # Default: 5
 #max_auth_failures = 5
 
+# Host names this server answers to. An EMPTY LIST (the default) answers to any.
+#
+# Non-empty turns on the SNI gate: a handshake whose ClientHello does not name
+# one of these hosts is dropped at the socket, before the QUIC layer sees it, so
+# a port scan of this address gets nothing back at all — no Version Negotiation
+# packet, no CONNECTION_CLOSE, no TLS alert. It is what makes the port invisible
+# to somebody who does not already know the name to ask for. It is NOT traffic
+# obfuscation: it says nothing about what a connection looks like once one is
+# open, and it does not defend against a probe that already knows the name.
+#
+# Set it to the domain on your certificate. Every client must then send that
+# name as SNI — in Surge that is the `sni=` parameter on the policy line, which
+# you already need when the policy points at a relay's IP rather than the
+# domain. A client that sends no SNI, or the wrong one, sees the port as closed:
+# there is no error message anywhere but this server's own debug log, so change
+# this key and the client together.
+#
+# Matching is name for name, ASCII case-insensitive, with a trailing dot
+# ignored. No wildcards: list each host. Names are checked at startup and a
+# reload, and the new list applies to handshakes from then on.
+# Default: []
+#expected_sni = []
+
 [log]
 # A tracing filter: a bare level (trace/debug/info/warn/error) or a directive list
 # such as "volto=debug,quinn=info". RUST_LOG overrides this without editing the

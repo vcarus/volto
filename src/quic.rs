@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::{Config, CongestionControl};
+use crate::gate::{Expected, Gate, Names};
 use crate::shutdown::{self, Shutdown, Trigger};
 use crate::{conn, h3api, tls};
 
@@ -448,6 +449,12 @@ pub struct Server {
     /// time and never reloaded -- it is sized against the runtime the process
     /// was started with, which a `SIGHUP` cannot resize.
     resolver: crate::net::ResolverBudget,
+    /// The host names the SNI gate admits, shared with the socket wrapper.
+    ///
+    /// Held here so [`Server::reload_handle`] can hand it on: the gate lives
+    /// under the endpoint, on a socket that a reload cannot rebind, so the list
+    /// is the only part of it a `SIGHUP` can move (D106).
+    expected: Expected,
     /// Fires the graceful shutdown. Handed to whoever watches for signals.
     trigger: Trigger,
     /// The other end of the same latch, cloned into every connection.
@@ -473,10 +480,22 @@ impl Server {
     /// so a server that does not ask keeps `net.core.rmem_default` — around
     /// 208 KiB — however high `net.core.rmem_max` is set, that sysctl being a
     /// ceiling on requests rather than an allocation (D56). Everything passed to
-    /// [`quinn::Endpoint::new`] below is what the helper passes internally; none
-    /// of it may be dropped in the name of tidiness.
+    /// [`quinn::Endpoint::new_with_abstract_socket`] below is what the helper
+    /// passes internally; none of it may be dropped in the name of tidiness.
+    ///
+    /// The second reason for expanding it is [`Gate`], which wraps the socket
+    /// the runtime hands back so that a datagram quinn would *answer* can be
+    /// refused before quinn sees it (D106). The wrapper is installed whether or
+    /// not `[security] expected_sni` is set, because the list is reloadable and
+    /// the socket is not: with an empty list every datagram passes through
+    /// untouched, and a `SIGHUP` can then turn the gate on without a restart.
     pub fn bind(config: Arc<Config>) -> Result<Self> {
         let quic_config = server_config(&config)?;
+        // Taken before the configuration moves into the endpoint. The Initial
+        // keys the gate needs are a function of the client's own Destination
+        // Connection ID rather than of the certificate (RFC 9001 §5.2), so this
+        // handle stays good across every reload.
+        let crypto = quic_config.crypto.clone();
 
         let socket = std::net::UdpSocket::bind(config.server.listen)
             .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
@@ -485,7 +504,14 @@ impl Server {
 
         let runtime = quinn::default_runtime()
             .ok_or_else(|| anyhow!("no async runtime is available for the QUIC endpoint"))?;
-        let endpoint = quinn::Endpoint::new(
+        let socket = runtime
+            .wrap_udp_socket(socket)
+            .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
+
+        let expected = Expected::new(Names::new(&config.security.expected_sni));
+        let socket = Arc::new(Gate::new(socket, expected.clone(), crypto));
+
+        let endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
             Some(quic_config),
             socket,
@@ -504,6 +530,7 @@ impl Server {
             config: Arc::new(RwLock::new(config)),
             roster: Roster::new(),
             resolver: crate::net::ResolverBudget::new(),
+            expected,
             trigger,
             shutdown,
         })
@@ -524,6 +551,7 @@ impl Server {
             endpoint: self.endpoint.clone(),
             config: self.config.clone(),
             shutdown: self.shutdown.clone(),
+            expected: self.expected.clone(),
             listen: self.listen,
         }
     }
@@ -563,6 +591,9 @@ impl Server {
             version = env!("CARGO_PKG_VERSION"),
             listen = %config.server.listen,
             alpn = ?config.server.alpn,
+            // Empty when the SNI gate is off, which is the shipped default and
+            // the behaviour of every release before it (D106).
+            expected_sni = ?config.security.expected_sni,
             grace_secs = config.server.shutdown_grace,
             // The kernel's numbers, not the configured ones: these are what
             // `ss -uanpm` prints as `rb` and `tb`, so a log line and an `ss`
@@ -1126,6 +1157,8 @@ pub struct ReloadHandle {
     endpoint: quinn::Endpoint,
     config: LiveConfig,
     shutdown: Shutdown,
+    /// The SNI gate's list, which is swapped with the rest (D106).
+    expected: Expected,
     /// The `[server] listen` the endpoint was bound with, for the one key a
     /// reload has to say it is ignoring.
     listen: SocketAddr,
@@ -1152,7 +1185,16 @@ impl ReloadHandle {
             bail!("the server is shutting down; the configuration was not reloaded");
         }
 
-        // Past this point nothing can fail, so the two swaps cannot half-apply.
+        // Past this point nothing can fail, so the swaps cannot half-apply.
+        //
+        // The gate's list goes first, and deliberately: between the two writes
+        // the socket admits the new set of names while the endpoint still holds
+        // the old certificate, which is a handshake that gets as far as the TLS
+        // layer and is refused there. The other order would have the endpoint
+        // present the new certificate to a name the socket still drops, which is
+        // the same refusal with the reply removed -- and the gate's whole point
+        // is that a name it does not know gets no reply at all.
+        self.expected.set(Names::new(&config.security.expected_sni));
         self.endpoint.set_server_config(Some(quic_config));
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
 
