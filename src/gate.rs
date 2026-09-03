@@ -30,9 +30,15 @@
 //!   packet for an unknown connection without a word.
 //! * **An Initial in a datagram below 1200 bytes** — passes, because RFC 9000
 //!   §14.1 has the server discard it and quinn does exactly that, silently.
-//! * **An Initial this server cannot open** — refused. The keys come from the
-//!   Destination Connection ID in the packet itself (RFC 9001 §5.2), so anything
-//!   that is really a QUIC v1 Initial decrypts here.
+//! * **An Initial this server cannot open** — passes. Only a client's *first*
+//!   Initial packets are keyed by their own Destination Connection ID: once the
+//!   server has answered, the client addresses it by the connection ID the
+//!   server chose (RFC 9000 §7.2) while the Initial keys stay the ones derived
+//!   from the first packet (RFC 9001 §5.2), so the acknowledgements and later
+//!   fragments of a handshake already admitted here cannot be opened without
+//!   its state. They belong to a flight that was judged when it started; a
+//!   forgery that is not one of them fails quinn's own decryption and is
+//!   dropped there without a reply.
 //! * **An Initial with no CRYPTO frame at offset 0** — passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started.
@@ -280,10 +286,6 @@ impl Gate {
                 version = format_args!("{version:#010x}"),
                 "dropping a QUIC packet: the SNI gate answers no version but 1"
             ),
-            Refusal::Undecipherable => debug!(
-                %remote,
-                "dropping an Initial packet: the SNI gate could not decrypt it"
-            ),
             Refusal::NotClientHello => debug!(
                 %remote,
                 "dropping an Initial packet: its first handshake message is not a ClientHello"
@@ -353,7 +355,22 @@ impl Gate {
 
         let payload = match self.open(datagram) {
             Opened::Unreadable => return Verdict::Pass,
-            Opened::Failed => return Verdict::Refuse(Refusal::Undecipherable),
+            // Keyed by a connection ID this packet does not carry: the client
+            // has heard back and switched to the server's connection ID,
+            // while its Initial keys stay those of its first packet. Such a
+            // packet is an acknowledgement or a later fragment of a first
+            // flight this gate already judged — and the Handshake packet that
+            // carries the client's Finished is often coalesced behind it, so
+            // dropping the datagram would cost every admitted handshake a
+            // probe timeout. A packet that is none of that fails quinn's own
+            // decryption and is dropped there without a reply.
+            //
+            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+            //# Upon first receiving an Initial or Retry packet from the server, the
+            //# client uses the Source Connection ID supplied by the server as the
+            //# Destination Connection ID for subsequent packets, including any 0-RTT
+            //# packets.
+            Opened::Failed => return Verdict::Pass,
             Opened::Payload(payload) => payload,
         };
 
@@ -382,8 +399,12 @@ impl Gate {
     /// either — a header that runs off the end of the datagram, a length field
     /// that claims more than arrived — and the caller passes those through
     /// rather than judging them, because quinn drops them without a reply.
-    /// [`Opened::Failed`] is an authentication failure, which is a packet that
-    /// says it is a QUIC v1 Initial and is not.
+    /// [`Opened::Failed`] is an authentication failure under the keys this
+    /// packet's own Destination Connection ID derives: a later Initial of a
+    /// handshake in progress, keyed by the client's first packet instead, or a
+    /// packet that only says it is a QUIC v1 Initial. The caller passes both
+    /// through, because quinn tells them apart with the state this gate lacks
+    /// and drops the second kind without a reply.
     fn open(&self, datagram: &[u8]) -> Opened {
         let Some(opened) = self.decrypt(datagram) else {
             return Opened::Unreadable;
@@ -467,7 +488,8 @@ impl Gate {
 enum Opened {
     /// Not a packet quinn could decode either; the gate does not judge it.
     Unreadable,
-    /// A QUIC v1 Initial that failed authentication under its own keys.
+    /// A QUIC v1 Initial that failed authentication under the keys its own
+    /// Destination Connection ID derives.
     Failed,
     /// The decrypted frames.
     Payload(Vec<u8>),
@@ -557,8 +579,6 @@ enum Verdict {
 enum Refusal {
     /// A long header naming a QUIC version this server does not speak.
     Version(u32),
-    /// An Initial packet that failed authentication under its own keys.
-    Undecipherable,
     /// A first flight that does not begin with a ClientHello.
     NotClientHello,
     /// A complete ClientHello with no `server_name` extension.
@@ -1129,5 +1149,138 @@ mod tests {
                 .collect();
             let _ = crypto_stream_prefix(&payload);
         }
+    }
+
+    /// A quinn crypto configuration around a throwaway certificate: the source
+    /// of Initial keys, which do not depend on the certificate at all.
+    fn throwaway_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("a self-signed certificate");
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let crypto = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_single_cert(vec![issued.cert.der().clone()], key)
+            .expect("a usable certificate/key pair");
+        Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+                .expect("a QUIC-capable configuration"),
+        )
+    }
+
+    /// A gate over a socket nothing will ever send to, for judging datagrams.
+    async fn gate(crypto: Arc<dyn quinn::crypto::ServerConfig>) -> Gate {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
+        let inner = quinn::default_runtime()
+            .expect("a runtime")
+            .wrap_udp_socket(socket)
+            .expect("wrap the socket");
+        Gate::new(inner, Expected::new(Names::new(&[])), crypto)
+    }
+
+    /// A CRYPTO frame at offset 0 carrying `data`.
+    fn crypto_frame(data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x06, 0x00];
+        let length = u16::try_from(data.len()).expect("a short handshake message");
+        frame.extend_from_slice(&(0x4000 | length).to_be_bytes());
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// A 1200-byte QUIC v1 Initial addressed to `dcid` and carrying `frames`,
+    /// protected with the keys `keyed_by` derives.
+    ///
+    /// With `keyed_by == dcid` this is a client's first packet. With the two
+    /// different it is the shape of every client Initial after the server has
+    /// answered: the Destination Connection ID is now the server's, while the
+    /// keys stay those of the first packet (RFC 9000 §7.2, RFC 9001 §5.2).
+    fn initial(
+        crypto: &dyn quinn::crypto::ServerConfig,
+        dcid: &[u8],
+        keyed_by: &[u8],
+        frames: &[u8],
+    ) -> Vec<u8> {
+        let keys = crypto
+            .initial_keys(QUIC_V1, &ConnectionId::new(keyed_by))
+            .expect("Initial keys for QUIC v1");
+        let tag_len = keys.packet.remote.tag_len();
+
+        let mut datagram = vec![0xc0]; // long header, Initial, one-byte packet number
+        datagram.extend_from_slice(&QUIC_V1.to_be_bytes());
+        datagram.push(u8::try_from(dcid.len()).unwrap());
+        datagram.extend_from_slice(dcid);
+        datagram.push(8);
+        datagram.extend_from_slice(&[0xcc; 8]);
+        datagram.push(0); // no token
+        // What follows the Length field: packet number, frames, PADDING to
+        // 1200 bytes, tag.
+        let header_len = datagram.len() + 2 + 1;
+        let payload_len = MIN_INITIAL_DATAGRAM - header_len - tag_len;
+        assert!(frames.len() <= payload_len, "frames do not fit one Initial");
+        let length = u16::try_from(1 + payload_len + tag_len).unwrap();
+        datagram.extend_from_slice(&(0x4000 | length).to_be_bytes());
+        let packet_number_offset = datagram.len();
+        datagram.push(0); // packet number 0
+        datagram.extend_from_slice(frames);
+        datagram.resize(packet_number_offset + 1 + payload_len, 0);
+        datagram.resize(MIN_INITIAL_DATAGRAM, 0);
+
+        keys.packet
+            .remote
+            .encrypt(0, &mut datagram, packet_number_offset + 1);
+        keys.header
+            .remote
+            .encrypt(packet_number_offset, &mut datagram);
+        datagram
+    }
+
+    const CLIENT_CID: [u8; 8] = [0xaa; 8];
+    const SERVER_CID: [u8; 8] = [0xbb; 8];
+
+    /// The control: a first packet, keyed by its own Destination Connection
+    /// ID, is opened and judged by the name it carries.
+    #[tokio::test]
+    async fn a_first_initial_is_opened_under_its_own_keys() {
+        let crypto = throwaway_crypto();
+        let gate = gate(crypto.clone()).await;
+        let names = Names::new(&["localhost".to_owned()]);
+
+        let hello = client_hello(&sni_extension("other.example"));
+        let stranger = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
+        assert_eq!(
+            gate.judge(&stranger, &names),
+            Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned()))
+        );
+
+        let hello = client_hello(&sni_extension("localhost"));
+        let ours = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
+        assert_eq!(gate.judge(&ours, &names), Verdict::Pass);
+    }
+
+    /// A later Initial of an admitted handshake cannot be opened here, and
+    /// must not be refused for it: the Handshake packet carrying the client's
+    /// Finished rides in the same datagram, and blinding it costs the
+    /// handshake a probe timeout. Seen on a production host on 2026-09-03 as
+    /// every handshake's RTT stuck at the configured initial estimate.
+    #[tokio::test]
+    async fn a_later_initial_keyed_by_the_first_packet_is_not_a_stranger() {
+        let crypto = throwaway_crypto();
+        let gate = gate(crypto.clone()).await;
+        let names = Names::new(&["localhost".to_owned()]);
+
+        // An acknowledgement of the server's Initial: ACK frame for packet 0.
+        let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
+        let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &ack);
+        assert_eq!(gate.judge(&later, &names), Verdict::Pass);
+
+        // Even one that looks like a stranger's ClientHello once opened under
+        // the wrong keys cannot be told from an acknowledgement without the
+        // connection's state; quinn, which has it, is the one to judge.
+        let hello = client_hello(&sni_extension("other.example"));
+        let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &crypto_frame(&hello));
+        assert_eq!(gate.judge(&later, &names), Verdict::Pass);
     }
 }
