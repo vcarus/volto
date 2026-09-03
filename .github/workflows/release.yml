@@ -164,19 +164,7 @@ jobs:
 
           Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
 
-          Each archive carries the binary, `LICENSE`, `README.md` and the `script/` and `docs/` directories, so the self-signed installer runs straight out of it — and so does the documentation it refers you to:
-
-          ```sh
-          tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz
-          cd volto-*-x86_64-unknown-linux-musl
-          sudo script/install-selfsigned.sh --binary ./volto
-          ```
-
-          Or skip the manual download entirely: `script/deploy.sh` fetches the newest release itself, verifies it against `SHA256SUMS` and installs or updates in place — with `--enable-timer` it keeps the host on the latest release with a daily systemd timer. It bootstraps a bare host in one line:
-
-          ```sh
-          curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh | sudo bash -s -- --enable-timer
-          ```
+          Each archive carries the binary, `LICENSE`, `README.md` and the `script/` and `docs/` directories. Installing and updating is described in [docs/deployment.md](https://github.com/vcarus/volto/blob/main/docs/deployment.md).
           BOILERPLATE
           cat notes.md
 
