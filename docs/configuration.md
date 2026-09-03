@@ -488,6 +488,7 @@ with the table below and the line number in the journal.
 | `[limits].socket_recv_buffer`, `[limits].socket_send_buffer` | v0.2.8 |
 | `[limits].ip_family_preference` | v0.2.9 |
 | `[limits].mtu_upper_bound` | v0.4.5 |
+| `[security].expected_sni` | v0.9.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
 bites in practice, because the shipped example sets it and every install made by
