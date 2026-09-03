@@ -994,6 +994,30 @@ impl Config {
             ));
         }
 
+        // The SNI gate admits exactly the names in `expected_sni`, and a name the
+        // certificate does not cover is one no client that verifies the
+        // certificate by it can complete a handshake under: the gate was told to
+        // expect a name nobody will send. A typo here makes the server silent,
+        // and silence is what the gate is for, so this is the one place the
+        // mistake can be noticed. The certificate is read here rather than
+        // threaded through because this runs before the TLS configuration
+        // exists at startup and again on every reload; one that cannot be read
+        // is left for the bind to refuse, loudly.
+        if !self.security.expected_sni.is_empty()
+            && let Ok(certs) = crate::tls::load_certs(&self.server.cert)
+        {
+            for name in crate::tls::names_not_covered(&certs[0], &self.security.expected_sni) {
+                warnings.push(format!(
+                    "security.expected_sni names \"{name}\", which server.cert = {} does not \
+                     cover: a client that verifies the certificate by that name fails its \
+                     handshake, and one that sends any other name is dropped by the SNI gate \
+                     without a reply. Check the name for a typo, or that the certificate was \
+                     issued for it.",
+                    self.server.cert.display()
+                ));
+            }
+        }
+
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
                 "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
@@ -2485,6 +2509,93 @@ pub(crate) mod tests {
         .warnings();
         assert!(
             !warnings.iter().any(|w| w.contains("open proxy")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A certificate for `names`, written to a fresh directory; returns the
+    /// paths a `[server]` section can point at.
+    fn minted_certificate(names: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
+        let issued = rcgen::generate_simple_self_signed(
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("a self-signed certificate");
+        // Distinct per call, not per instant: two tests minting in the same
+        // microsecond would otherwise share a directory and read each other's
+        // certificate.
+        static MINTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = MINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("volto-config-test-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the directory");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
+        std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
+        (cert, key)
+    }
+
+    fn parse_with_certificate(cert: &std::path::Path, key: &std::path::Path, body: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = {cert:?}
+            key = {key:?}
+            {body}
+            "#,
+            cert = cert.display().to_string(),
+            key = key.display().to_string(),
+        ))
+        .expect("parses")
+    }
+
+    /// The gate's one failure mode is silence, so the misconfiguration that
+    /// causes it -- a name the certificate cannot vouch for -- is the one
+    /// warning that has to be there.
+    #[test]
+    fn an_expected_name_the_certificate_does_not_cover_is_warned_about() {
+        let (cert, key) = minted_certificate(&["proxy.example"]);
+        let warnings = parse_with_certificate(
+            &cert,
+            &key,
+            "[security]\nexpected_sni = [\"proxy.example\", \"porxy.example\"]",
+        )
+        .warnings();
+        let about_names: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("does not cover"))
+            .collect();
+        assert_eq!(about_names.len(), 1, "{warnings:?}");
+        assert!(
+            about_names[0].contains("\"porxy.example\"") && about_names[0].contains("cert.pem"),
+            "{warnings:?}"
+        );
+    }
+
+    /// Covered names, in any case and with the root dot the gate also ignores,
+    /// draw nothing; and a certificate that is not there is the bind's
+    /// complaint, not this one's.
+    #[test]
+    fn covered_expected_names_draw_no_warning() {
+        let (cert, key) = minted_certificate(&["proxy.example", "localhost"]);
+        let warnings = parse_with_certificate(
+            &cert,
+            &key,
+            "[security]\nexpected_sni = [\"PROXY.example.\", \"localhost\"]",
+        )
+        .warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("does not cover")),
+            "{warnings:?}"
+        );
+
+        let warnings = parse("[security]\nexpected_sni = [\"proxy.example\"]").warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("does not cover")),
             "{warnings:?}"
         );
     }

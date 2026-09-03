@@ -116,8 +116,36 @@ impl ResolvesServerCert for OneOfTheseNames {
     }
 }
 
+/// The names in `names` that the leaf certificate `cert` is not valid for.
+///
+/// Judged the way a client judges it, with rustls's own name check over the
+/// certificate's Subject Alternative Names, so what is reported here is what a
+/// client verifying the certificate by that name would refuse. A certificate
+/// webpki cannot parse reports nothing: rustls refuses that one at bind, with
+/// the reason, and a second complaint would only bury it.
+pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> Vec<String> {
+    let Ok(parsed) = rustls::server::ParsedCertificate::try_from(cert) else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .filter(|name| {
+            // The gate ignores a trailing root dot (`Names::new`); the name
+            // check does not take one.
+            let bare = name.trim_end_matches('.');
+            match rustls::pki_types::ServerName::try_from(bare) {
+                Ok(server_name) => {
+                    rustls::client::verify_server_name(&parsed, &server_name).is_err()
+                }
+                Err(_) => true,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
 /// Loads a PEM certificate chain, leaf first.
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)
         .with_context(|| format!("failed to open server.cert = {}", path.display()))?;
     let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(file)
