@@ -567,7 +567,7 @@ impl Server {
             .ok_or_else(|| anyhow!("no async runtime is available for the QUIC endpoint"))?;
         let socket = runtime
             .wrap_udp_socket(socket)
-            .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
+            .context("failed to hand the UDP socket to the async runtime")?;
 
         let expected = Expected::new(Names::new(&config.security.expected_sni));
         let socket = Arc::new(Gate::new(socket, expected.clone(), crypto));
@@ -578,7 +578,7 @@ impl Server {
             socket,
             runtime,
         )
-        .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
+        .context("failed to build the QUIC endpoint over the gated socket")?;
 
         warn_if_fd_budget_is_tight(&config.limits);
 
