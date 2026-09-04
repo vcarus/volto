@@ -228,16 +228,35 @@ impl Names {
     /// already lowercase. Nothing else is: no wildcards, no suffix matching. A
     /// name that is not on the list is not this server's.
     pub fn accepts(&self, name: &str) -> bool {
-        let name = name.strip_suffix('.').unwrap_or(name);
+        let name = root_relative(name);
         self.names
             .iter()
             .any(|held| held.eq_ignore_ascii_case(name))
     }
 }
 
+/// `name` without its trailing root dot, which is the same name spelled
+/// relative to the root.
+///
+/// The whole of the rule "a configured host name may end in a root dot", in one
+/// place because it was in four and one of them was a different rule.
+/// `trim_end_matches('.')` in [`crate::tls::names_not_covered`] removed *every*
+/// trailing dot where the other three removed one, so `expected_sni =
+/// ["host.tw.."]` was held by the gate as `host.tw.`, a form no ClientHello can
+/// carry, because RFC 6066 §3 has the name represented "without a trailing
+/// dot"; it was then judged covered by the certificate as `host.tw`, so the
+/// D106 warning that exists for exactly this silent typo did not fire.
+///
+/// One dot and no more, because a second dot is an empty label rather than a
+/// spelling of the root. `Config::validate` refuses those outright, so the four
+/// callers now agree on every name that can reach them.
+pub(crate) fn root_relative(name: &str) -> &str {
+    name.strip_suffix('.').unwrap_or(name)
+}
+
 /// Lowercased, with one trailing root dot removed.
 fn normalise(name: &str) -> String {
-    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+    root_relative(name).to_ascii_lowercase()
 }
 
 /// The list the gate is enforcing right now.
@@ -1088,6 +1107,25 @@ mod tests {
         assert!(!names.accepts("www.example.com"));
         assert!(!names.accepts("example.co"));
         assert!(!names.accepts(""));
+    }
+
+    /// One dot and no more, which is what makes the four callers agree.
+    ///
+    /// `trim_end_matches('.')`, which this replaced in `tls::names_not_covered`,
+    /// answers `host.tw` for the last two of these; the gate and the validator
+    /// answered `host.tw.` and `host.tw..`, so a certificate check and a
+    /// ClientHello match were run on different strings.
+    #[test]
+    fn only_one_trailing_dot_is_the_root() {
+        assert_eq!(root_relative("host.tw"), "host.tw");
+        assert_eq!(root_relative("host.tw."), "host.tw");
+        assert_eq!(root_relative("host.tw.."), "host.tw.");
+        assert_eq!(root_relative("host.tw..."), "host.tw..");
+        assert_eq!(root_relative("."), "");
+        assert_eq!(root_relative(""), "");
+        // Nothing else about the name is touched: not the case, not a leading
+        // dot, not an inner one.
+        assert_eq!(root_relative(".Host.TW"), ".Host.TW");
     }
 
     #[test]

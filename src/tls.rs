@@ -131,8 +131,11 @@ pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> 
         .iter()
         .filter(|name| {
             // The gate ignores a trailing root dot (`Names::new`); the name
-            // check does not take one.
-            let bare = name.trim_end_matches('.');
+            // check does not take one. The same helper, so the two cannot judge
+            // the same string differently -- this line read
+            // `trim_end_matches('.')` and so removed every trailing dot, which
+            // reported a name the gate held in an unmatchable form as covered.
+            let bare = crate::gate::root_relative(name);
             match rustls::pki_types::ServerName::try_from(bare) {
                 Ok(server_name) => {
                     rustls::client::verify_server_name(&parsed, &server_name).is_err()

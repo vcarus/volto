@@ -1357,10 +1357,26 @@ pub const MAX_EXPECTED_SNI: usize = 253;
 //# The hostname is represented as a byte
 //# string using ASCII encoding without a trailing dot.
 fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
-    let bare = name.strip_suffix('.').unwrap_or(name);
+    let bare = crate::gate::root_relative(name);
 
     if bare.is_empty() {
         bail!("security.expected_sni[{index}] is empty, which is not a host name");
+    }
+
+    // One trailing dot spells the root and is stripped above; a second one, or a
+    // dot at the start, or two in a row, is an empty label. Refused here rather
+    // than left to rustls, for the reason the whole function exists: `Names`
+    // would hold `host.tw.` for `host.tw..`, no ClientHello can carry that form
+    // (RFC 6066 §3 has the name represented "without a trailing dot"), and the
+    // gate would refuse every client in silence. `ServerName::try_from` would refuse
+    // it too, but only in the certificate-coverage warning, which is a warning
+    // and not a refusal to start.
+    if bare.split('.').any(str::is_empty) {
+        bail!(
+            "security.expected_sni[{index}] = {name:?} has an empty label; a host name \
+             has no leading dot and no two dots in a row, and only one trailing dot, \
+             which spells the root"
+        );
     }
 
     if bare.len() > MAX_EXPECTED_SNI {
@@ -2463,6 +2479,15 @@ pub(crate) mod tests {
     fn expected_sni_rejects_names_no_client_hello_could_carry() {
         for (entry, wanted) in [
             ("\"\"", "is empty"),
+            ("\".\"", "is empty"),
+            // One trailing dot spells the root and is accepted above; a second
+            // is an empty label, and the gate would hold the name in a form no
+            // ClientHello can carry while the certificate check read it as the
+            // name without either dot. Refused here instead (D106).
+            ("\"host.tw..\"", "empty label"),
+            ("\"host..\"", "empty label"),
+            ("\"host..tw\"", "empty label"),
+            ("\".host.tw\"", "empty label"),
             ("\"*.example\"", "wildcard"),
             ("\"proxy example\"", "contains"),
             ("\"[2001:db8::1]\"", "contains"),

@@ -20,8 +20,8 @@ use bytes::Bytes;
 use common::Response;
 use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::{
-    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer, auth_section,
-    authorized_connect, close_and_drain, connect_request, echoes, open_tcp_tunnel,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
+    auth_section, authorized_connect, close_and_drain, connect_request, echoes, open_tcp_tunnel,
     open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
     spawn_end_reporting_target, spawn_udp_echo_target, udp_round_trip,
 };
@@ -848,4 +848,79 @@ async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
         Status::OK,
         "the server must still serve after an abandonment crossed with a reload storm"
     );
+}
+
+/// A gate name with an empty label is refused at reload, not held unmatchably.
+///
+/// `expected_sni = ["local..host"]` used to pass validation, because the
+/// character class allows `.` and only one trailing dot was ever stripped. The
+/// gate then held a name no ClientHello can carry, so every client was dropped
+/// in silence, and the D106 warning that exists for that failure did not fire
+/// either: `tls::names_not_covered` stripped every trailing dot and found the
+/// name covered. The two spellings are now one helper, `gate::root_relative`,
+/// and an empty label is refused where a misconfiguration can still be reported.
+#[tokio::test]
+async fn a_reloaded_gate_name_with_an_empty_label_is_refused() {
+    let mut server = TestServer::start_with(GATE_LOCALHOST).await;
+
+    server.rewrite_config(
+        "[security]\nallow_private_networks = true\nexpected_sni = [\"local..host\"]\n",
+    );
+    let error = server
+        .reload()
+        .expect_err("a name with an empty label must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("security.expected_sni[0]") && message.contains("empty label"),
+        "the refusal must name the entry and say what is wrong with it: {message}"
+    );
+
+    // The refusal left the gate where it was, so the name the certificate covers
+    // still opens a connection. A reload that had applied would have made this
+    // time out with nothing on the wire, which is the failure being prevented.
+    let client = H3Client::connect(&server).await;
+    drop(client);
+
+    server.shutdown();
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+}
+
+/// A reloaded name the certificate cannot prove draws the D106 warning.
+///
+/// One name the certificate covers and one it does not, both spelled with the
+/// trailing root dot a client may or may not send. The uncovered one has to be
+/// reported, because a gate that admits a name no certificate covers refuses the
+/// handshake at TLS and the operator has nothing else to go on; the covered one
+/// must be silent, or a configuration written the absolute way draws a warning
+/// it does not deserve. The warning had unit coverage in `src/config.rs` and
+/// none through `reload`, which is where an operator meets it.
+///
+/// Not a red proof of the trailing-dot helper. `rustls::pki_types::ServerName`
+/// parses `localhost.` and matches it against the certificate itself, so for
+/// every name that passes validation the coverage check reads the same either
+/// way; what the helper closes is the two-dot form, and that is refused at
+/// validation now.
+#[tokio::test]
+async fn a_reloaded_name_the_certificate_cannot_prove_draws_the_warning() {
+    let mut server = TestServer::start_with(GATE_LOCALHOST).await;
+
+    server.rewrite_config(
+        "[security]\nallow_private_networks = true\n\
+         expected_sni = [\"localhost.\", \"porxy.example.\"]\n",
+    );
+    let (result, logs) = reload_capturing_logs(&server);
+    result.expect("the reload itself is valid; the names are only warned about");
+
+    assert_eq!(
+        logs.matches("does not cover").count(),
+        1,
+        "exactly one of the two names is uncovered; log was:\n{logs}"
+    );
+    assert!(
+        logs.contains("porxy.example."),
+        "the warning must name the entry as the operator wrote it; log was:\n{logs}"
+    );
+
+    server.shutdown();
+    server.wait_until_stopped(STOP_TIMEOUT).await;
 }
