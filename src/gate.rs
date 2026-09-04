@@ -1483,4 +1483,495 @@ mod tests {
             seed(name, AS_CRYPTO_BYTES, &bytes);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Shape metamorphism: an unusual but legal first flight is judged by its
+    // name and by nothing else
+    // -----------------------------------------------------------------------
+    //
+    // Everything below is one property with many witnesses. A first flight has
+    // a great deal of freedom in how it is laid out -- how many CRYPTO frames
+    // carry it and in what order, what else rides in front of them, how long
+    // the connection IDs and the packet number are, whether a token is there,
+    // whether a second packet is coalesced behind it, and how the ClientHello
+    // itself is spelled -- and none of that freedom may move the verdict. So
+    // each shape is built twice, once naming a host on the list and once naming
+    // a host that is not, and both halves are asserted: a shape that turns a
+    // listed name into a refusal is a client this server has become unreachable
+    // to, and a shape that turns an unlisted name into a pass is the gate gone
+    // blind. A parser that gives up reads as the second.
+
+    /// How a first flight's bytes are spread over the frames of one payload.
+    type Layout = fn(&[u8]) -> Vec<u8>;
+
+    /// How a ClientHello naming a host is written out.
+    type Spelling = fn(&str) -> Vec<u8>;
+
+    /// A name the list holds, and one it does not.
+    const LISTED: &str = "listed.example";
+    const UNLISTED: &str = "other.example";
+
+    /// A QUIC variable-length integer, in the shortest encoding that holds it.
+    fn varint(value: usize) -> Vec<u8> {
+        match u64::try_from(value).expect("a length that fits a varint") {
+            small @ 0..=63 => vec![u8::try_from(small).expect("six bits")],
+            medium @ 64..=16383 => (0x4000 | u16::try_from(medium).expect("fourteen bits"))
+                .to_be_bytes()
+                .to_vec(),
+            large => (0x8000_0000 | u32::try_from(large).expect("thirty bits"))
+                .to_be_bytes()
+                .to_vec(),
+        }
+    }
+
+    /// A CRYPTO frame carrying `data` at `offset` in the handshake stream.
+    fn crypto_frame_at(offset: usize, data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0x06];
+        frame.extend_from_slice(&varint(offset));
+        frame.extend_from_slice(&varint(data.len()));
+        frame.extend_from_slice(data);
+        frame
+    }
+
+    /// A TLS extension of `kind` carrying `body`.
+    fn extension(kind: u16, body: &[u8]) -> Vec<u8> {
+        let mut bytes = kind.to_be_bytes().to_vec();
+        bytes.extend_from_slice(
+            &u16::try_from(body.len())
+                .expect("a short extension")
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// [`client_hello`] with the fields a real client varies ahead of its
+    /// extensions: the middlebox-compatibility `legacy_session_id` Chrome sends
+    /// 32 bytes of (RFC 8446 §4.1.2), and the cipher suites it offers.
+    fn client_hello_with(session_id: usize, ciphers: &[u16], extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        body.extend_from_slice(&[0x00; 32]); // random
+        body.push(u8::try_from(session_id).expect("a session id of at most 255 bytes"));
+        body.extend_from_slice(&vec![0x5a; session_id]);
+        let suites: Vec<u8> = ciphers.iter().flat_map(|c| c.to_be_bytes()).collect();
+        body.extend_from_slice(
+            &u16::try_from(suites.len())
+                .expect("a short suite list")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(&suites);
+        body.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods
+        body.extend_from_slice(
+            &u16::try_from(extensions.len())
+                .expect("short extensions")
+                .to_be_bytes(),
+        );
+        body.extend_from_slice(extensions);
+
+        let mut message = vec![CLIENT_HELLO];
+        let length = body.len();
+        message.extend_from_slice(&[
+            u8::try_from(length >> 16).expect("a short message"),
+            u8::try_from((length >> 8) & 0xff).expect("a byte"),
+            u8::try_from(length & 0xff).expect("a byte"),
+        ]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    /// The parts of an Initial header a legitimate client chooses for itself.
+    #[derive(Clone)]
+    struct Shape {
+        /// The Destination Connection ID, which is also what keys the packet.
+        dcid: Vec<u8>,
+        /// The Source Connection ID, which may be empty.
+        scid: Vec<u8>,
+        /// A `NEW_TOKEN` or Retry token, or nothing.
+        token: Vec<u8>,
+        /// How many bytes the Packet Number field takes, one to four.
+        number_length: usize,
+        /// How long the Initial packet itself is, before anything coalesced.
+        packet_length: usize,
+    }
+
+    impl Default for Shape {
+        fn default() -> Self {
+            Self {
+                dcid: CLIENT_CID.to_vec(),
+                scid: vec![0xcc; 8],
+                token: Vec::new(),
+                number_length: 1,
+                packet_length: MIN_INITIAL_DATAGRAM,
+            }
+        }
+    }
+
+    /// [`initial`] with every header field the caller's to choose.
+    ///
+    /// Keyed by its own Destination Connection ID, which is what a client's
+    /// first packet is (RFC 9001 §5.2) — and still is after a Retry, since the
+    /// keys are recomputed from the connection ID the Retry supplied.
+    fn shaped_initial(
+        crypto: &dyn quinn::crypto::ServerConfig,
+        shape: &Shape,
+        frames: &[u8],
+    ) -> Vec<u8> {
+        let keys = crypto
+            .initial_keys(QUIC_V1, &ConnectionId::new(&shape.dcid))
+            .expect("Initial keys for QUIC v1");
+        let tag_len = keys.packet.remote.tag_len();
+        assert!(
+            (1..=4).contains(&shape.number_length),
+            "a packet number is one to four bytes"
+        );
+
+        let mut packet =
+            vec![0xc0 | u8::try_from(shape.number_length - 1).expect("two bits of length")];
+        packet.extend_from_slice(&QUIC_V1.to_be_bytes());
+        packet.push(u8::try_from(shape.dcid.len()).expect("a legal connection id"));
+        packet.extend_from_slice(&shape.dcid);
+        packet.push(u8::try_from(shape.scid.len()).expect("a legal connection id"));
+        packet.extend_from_slice(&shape.scid);
+        packet.extend_from_slice(&varint(shape.token.len()));
+        packet.extend_from_slice(&shape.token);
+
+        // A two-byte Length field, which is what every real Initial uses.
+        let number_offset = packet.len() + 2;
+        let payload_len = shape
+            .packet_length
+            .checked_sub(number_offset + shape.number_length + tag_len)
+            .expect("a packet long enough to hold its own header");
+        assert!(frames.len() <= payload_len, "frames do not fit one Initial");
+        let length = u16::try_from(shape.number_length + payload_len + tag_len)
+            .expect("a length that fits two bytes");
+        packet.extend_from_slice(&(0x4000 | length).to_be_bytes());
+
+        packet.resize(number_offset + shape.number_length, 0); // packet number 0
+        packet.extend_from_slice(frames);
+        packet.resize(number_offset + shape.number_length + payload_len, 0); // PADDING
+        packet.resize(shape.packet_length, 0); // room for the tag
+
+        keys.packet
+            .remote
+            .encrypt(0, &mut packet, number_offset + shape.number_length);
+        keys.header.remote.encrypt(number_offset, &mut packet);
+        packet
+    }
+
+    /// Asserts that a datagram laid out by `build` is judged by its name alone.
+    ///
+    /// Written as a plain function taking a builder rather than two datagrams so
+    /// that the listed and the unlisted half can never drift apart: they are the
+    /// same shape twice.
+    #[track_caller]
+    fn judged_by_its_name_alone(shape: &str, build: impl Fn(&str) -> Vec<u8>) {
+        let names = Names::new(&[LISTED.to_owned()]);
+
+        assert_eq!(
+            judgement(&build(LISTED), &names),
+            Verdict::Pass,
+            "{shape}: a first flight naming {LISTED} must reach quinn"
+        );
+        let refusal = judgement(&build(UNLISTED), &names);
+        assert!(
+            matches!(refusal, Verdict::Refuse(Refusal::OtherName(_))),
+            "{shape}: a first flight naming {UNLISTED} must be refused for its name, not {refusal:?}"
+        );
+    }
+
+    /// How a first flight's bytes are distributed over the frames of one packet.
+    ///
+    /// Every one of these is a legal Initial payload that a client is free to
+    /// send, and RFC 9000 §19.6 puts no order on CRYPTO frames within a packet.
+    #[test]
+    fn the_frames_a_first_flight_is_laid_out_in_do_not_change_the_verdict() {
+        let crypto = throwaway_crypto();
+
+        let layouts: Vec<(&str, Layout)> = vec![
+            ("one CRYPTO frame", |hello| crypto_frame_at(0, hello)),
+            ("two CRYPTO frames in order", |hello| {
+                let (head, tail) = hello.split_at(hello.len() / 2);
+                let mut frames = crypto_frame_at(0, head);
+                frames.extend_from_slice(&crypto_frame_at(head.len(), tail));
+                frames
+            }),
+            ("two CRYPTO frames in reverse order", |hello| {
+                let (head, tail) = hello.split_at(hello.len() / 2);
+                let mut frames = crypto_frame_at(head.len(), tail);
+                frames.extend_from_slice(&crypto_frame_at(0, head));
+                frames
+            }),
+            ("three CRYPTO frames, middle one first", |hello| {
+                let third = hello.len() / 3;
+                let mut frames = crypto_frame_at(third, &hello[third..third * 2]);
+                frames.extend_from_slice(&crypto_frame_at(third * 2, &hello[third * 2..]));
+                frames.extend_from_slice(&crypto_frame_at(0, &hello[..third]));
+                frames
+            }),
+            ("PADDING before the CRYPTO frame", |hello| {
+                let mut frames = vec![0x00; 32];
+                frames.extend_from_slice(&crypto_frame_at(0, hello));
+                frames
+            }),
+            ("PING before the CRYPTO frame", |hello| {
+                let mut frames = vec![0x01];
+                frames.extend_from_slice(&crypto_frame_at(0, hello));
+                frames
+            }),
+            ("an ACK frame before the CRYPTO frame", |hello| {
+                // Largest Acknowledged 10, delay 27, no further ranges, first
+                // range 3. Every field is distinct and non-zero on purpose: an
+                // ACK of zeroes is indistinguishable from PADDING, so a walk
+                // that lands one varint out still finds the CRYPTO frame and
+                // the shape proves nothing.
+                let mut frames = vec![0x02, 0x0a, 0x1b, 0x00, 0x03];
+                frames.extend_from_slice(&crypto_frame_at(0, hello));
+                frames
+            }),
+            ("a two-range ACK frame before the CRYPTO frame", |hello| {
+                // Largest 10, delay 27, two further ranges, first range 1, then
+                // the gap and length of each of them.
+                let mut frames = vec![0x02, 0x0a, 0x1b, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05];
+                frames.extend_from_slice(&crypto_frame_at(0, hello));
+                frames
+            }),
+            ("an ACK_ECN frame before the CRYPTO frame", |hello| {
+                // The same, with the three ECN counts an ACK_ECN carries.
+                let mut frames = vec![0x03, 0x0a, 0x1b, 0x00, 0x03, 0x11, 0x12, 0x13];
+                frames.extend_from_slice(&crypto_frame_at(0, hello));
+                frames
+            }),
+            ("PADDING, PING and ACK around two CRYPTO frames", |hello| {
+                let (head, tail) = hello.split_at(hello.len() / 2);
+                let mut frames = vec![0x00; 8];
+                frames.push(0x01);
+                frames.extend_from_slice(&[0x02, 0x0a, 0x1b, 0x00, 0x03]);
+                frames.extend_from_slice(&crypto_frame_at(head.len(), tail));
+                frames.push(0x01);
+                frames.extend_from_slice(&crypto_frame_at(0, head));
+                frames.extend_from_slice(&[0x00; 8]);
+                frames
+            }),
+        ];
+
+        for (shape, lay_out) in layouts {
+            judged_by_its_name_alone(shape, |name| {
+                let hello = client_hello(&sni_extension(name));
+                shaped_initial(&*crypto, &Shape::default(), &lay_out(&hello))
+            });
+        }
+    }
+
+    /// The header fields a client picks, none of which the name depends on.
+    #[test]
+    fn the_header_a_first_flight_wears_does_not_change_the_verdict() {
+        let crypto = throwaway_crypto();
+
+        let mut shapes = vec![
+            ("the baseline header".to_owned(), Shape::default()),
+            (
+                "a 20-byte Destination Connection ID".to_owned(),
+                Shape {
+                    dcid: vec![0xa1; MAX_CONNECTION_ID],
+                    ..Shape::default()
+                },
+            ),
+            (
+                "an empty Source Connection ID".to_owned(),
+                Shape {
+                    scid: Vec::new(),
+                    ..Shape::default()
+                },
+            ),
+            (
+                "a 20-byte Source Connection ID".to_owned(),
+                Shape {
+                    scid: vec![0xc5; MAX_CONNECTION_ID],
+                    ..Shape::default()
+                },
+            ),
+            (
+                "a token, as a client returning a NEW_TOKEN sends".to_owned(),
+                Shape {
+                    token: vec![0x7e; 64],
+                    ..Shape::default()
+                },
+            ),
+            (
+                "a token, the longest connection IDs and a four-byte number".to_owned(),
+                Shape {
+                    dcid: vec![0xa1; MAX_CONNECTION_ID],
+                    scid: vec![0xc5; MAX_CONNECTION_ID],
+                    token: vec![0x7e; 200],
+                    number_length: 4,
+                    ..Shape::default()
+                },
+            ),
+            (
+                "a datagram larger than the minimum".to_owned(),
+                Shape {
+                    packet_length: 1500,
+                    ..Shape::default()
+                },
+            ),
+        ];
+        shapes.extend((1..=4).map(|number_length| {
+            (
+                format!("a {number_length}-byte packet number"),
+                Shape {
+                    number_length,
+                    ..Shape::default()
+                },
+            )
+        }));
+
+        for (shape, header) in shapes {
+            judged_by_its_name_alone(&shape, |name| {
+                let hello = client_hello(&sni_extension(name));
+                shaped_initial(&*crypto, &header, &crypto_frame_at(0, &hello))
+            });
+        }
+    }
+
+    /// A packet coalesced behind the Initial is not what the gate judges.
+    ///
+    /// RFC 9000 §12.2 lets a receiver route on the first packet of a datagram
+    /// alone, and this gate does. The witness is a second packet that names the
+    /// *other* host: if any of it were read, both halves of the property would
+    /// come out inverted rather than merely wrong.
+    #[test]
+    fn a_packet_coalesced_behind_the_initial_is_not_what_is_judged() {
+        let crypto = throwaway_crypto();
+        let head = Shape {
+            packet_length: 700,
+            ..Shape::default()
+        };
+
+        // A long header of each type a client may coalesce behind an Initial,
+        // and a short header, which RFC 9000 §12.2 allows only last.
+        let followers: [(&str, u8); 3] = [
+            ("a 0-RTT packet", 0xd0),
+            ("a Handshake packet", 0xe0),
+            ("a short-header packet", 0x40),
+        ];
+
+        for (shape, first_byte) in followers {
+            judged_by_its_name_alone(shape, |name| {
+                let ours = client_hello(&sni_extension(name));
+                let mut datagram = shaped_initial(&*crypto, &head, &crypto_frame_at(0, &ours));
+
+                // The bait: everything the judge would find if it read on.
+                let theirs = client_hello(&sni_extension(if name == LISTED {
+                    UNLISTED
+                } else {
+                    LISTED
+                }));
+                let mut follower = vec![first_byte];
+                if first_byte & LONG_HEADER_FORM != 0 {
+                    follower.extend_from_slice(&QUIC_V1.to_be_bytes());
+                    follower.push(u8::try_from(head.dcid.len()).expect("a legal length"));
+                    follower.extend_from_slice(&head.dcid);
+                    follower.push(0); // Source Connection ID
+                    follower.extend_from_slice(&varint(400)); // Length
+                    follower.push(0); // packet number
+                }
+                follower.extend_from_slice(&crypto_frame_at(0, &theirs));
+                follower.resize(500, 0);
+                datagram.extend_from_slice(&follower);
+                datagram
+            });
+        }
+    }
+
+    /// How the ClientHello itself is spelled, which is where a real stack's
+    /// idiosyncrasies live: Chrome's 32-byte session id, the GREASE values
+    /// RFC 8701 has clients scatter through it, and where in the extension list
+    /// `server_name` happens to fall.
+    #[test]
+    fn the_way_a_client_hello_is_spelled_does_not_change_the_verdict() {
+        let crypto = throwaway_crypto();
+
+        /// A GREASE extension, which carries nothing and means nothing.
+        fn grease(kind: u16) -> Vec<u8> {
+            extension(kind, &[])
+        }
+
+        /// `supported_versions`, offering TLS 1.3.
+        fn supported_versions() -> Vec<u8> {
+            extension(0x002b, &[0x02, 0x03, 0x04])
+        }
+
+        let spellings: Vec<(&str, Spelling)> = vec![
+            ("server_name as the only extension", |name| {
+                client_hello(&sni_extension(name))
+            }),
+            ("server_name first of three", |name| {
+                let mut extensions = sni_extension(name);
+                extensions.extend_from_slice(&supported_versions());
+                extensions.extend_from_slice(&grease(0x1a1a));
+                client_hello(&extensions)
+            }),
+            ("server_name last of three", |name| {
+                let mut extensions = grease(0x0a0a);
+                extensions.extend_from_slice(&supported_versions());
+                extensions.extend_from_slice(&sni_extension(name));
+                client_hello(&extensions)
+            }),
+            ("a 32-byte legacy_session_id", |name| {
+                client_hello_with(32, &[0x1301], &sni_extension(name))
+            }),
+            ("GREASE cipher suites around the real one", |name| {
+                client_hello_with(32, &[0x0a0a, 0x1301, 0x1302, 0x5a5a], &sni_extension(name))
+            }),
+            ("GREASE extensions on both sides of server_name", |name| {
+                let mut extensions = grease(0x0a0a);
+                extensions.extend_from_slice(&sni_extension(name));
+                extensions.extend_from_slice(&grease(0x3a3a));
+                client_hello_with(32, &[0x0a0a, 0x1301], &extensions)
+            }),
+            ("an unknown name_type ahead of the host_name", |name| {
+                let host = name.as_bytes();
+                // An entry of some other NameType, then the host_name.
+                let mut list = vec![0x42, 0x00, 0x03, b'x', b'y', b'z'];
+                list.push(HOST_NAME);
+                list.extend_from_slice(
+                    &u16::try_from(host.len())
+                        .expect("a short name")
+                        .to_be_bytes(),
+                );
+                list.extend_from_slice(host);
+                let mut body = u16::try_from(list.len())
+                    .expect("a short list")
+                    .to_be_bytes()
+                    .to_vec();
+                body.extend_from_slice(&list);
+                client_hello(&extension(SERVER_NAME_EXTENSION, &body))
+            }),
+            ("the name in upper case", |name| {
+                client_hello(&sni_extension(&name.to_ascii_uppercase()))
+            }),
+            ("the name with its root dot", |name| {
+                client_hello(&sni_extension(&format!("{name}.")))
+            }),
+            ("everything a Chrome-shaped hello does at once", |name| {
+                let mut extensions = grease(0x0a0a);
+                extensions.extend_from_slice(&supported_versions());
+                extensions.extend_from_slice(&sni_extension(&name.to_ascii_uppercase()));
+                extensions.extend_from_slice(&extension(0x0010, &[0x00, 0x03, 0x02, b'h', b'3']));
+                extensions.extend_from_slice(&grease(0x5a5a));
+                client_hello_with(32, &[0x0a0a, 0x1301, 0x1302, 0x1303], &extensions)
+            }),
+        ];
+
+        for (shape, spell) in spellings {
+            judged_by_its_name_alone(shape, |name| {
+                shaped_initial(
+                    &*crypto,
+                    &Shape::default(),
+                    &crypto_frame_at(0, &spell(name)),
+                )
+            });
+        }
+    }
 }
