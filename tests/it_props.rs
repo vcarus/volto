@@ -828,6 +828,25 @@ proptest! {
         prop_assert!(parse_target(&path, None).is_err(), "port {:?}", port);
     }
 
+    /// A port is `*DIGIT` (RFC 3986 §3.2.3), so a sign is not a port however
+    /// well `u16::from_str` reads it. Percent-encoded signs are generated too,
+    /// because the template is decoded before the number is read: `%2B443` and
+    /// `+443` are one request.
+    #[test]
+    fn a_signed_port_is_refused(
+        host in literal_host(),
+        sign in prop_oneof![
+            Just("+".to_owned()),
+            Just("-".to_owned()),
+            Just("%2B".to_owned()),
+            Just("%2D".to_owned()),
+        ],
+        port in 1u16..=u16::MAX,
+    ) {
+        let path = format!("{PREFIX}{host}/{sign}{port}/");
+        prop_assert!(parse_target(&path, None).is_err(), "port {sign}{port}");
+    }
+
     /// Arbitrary input never panics, and a success is always a usable target:
     /// a non-empty host and a non-zero port.
     #[test]
@@ -846,17 +865,15 @@ proptest! {
 /// What the template accepts that a reader might not expect, pinned so that a
 /// future tightening is a deliberate change rather than a surprise.
 ///
-/// None of it is a defect: the port is parsed with `u16::from_str`, which takes
-/// a leading `+` and leading zeros, and the host is percent-decoded and handed
-/// on without a syntax check -- name resolution and the destination policy are
-/// what refuse a host, and they see the decoded string either way.
+/// None of it is a defect: the port is digits and nothing else (RFC 3986
+/// §3.2.3) but leading zeros are digits, and the host is percent-decoded and
+/// handed on without a syntax check -- name resolution and the destination
+/// policy are what refuse a host, and they see the decoded string either way.
+///
+/// A leading `+` used to be on this list, because `u16::from_str` takes a sign.
+/// It is refused now, and `a_signed_port_is_refused` below is where that lives.
 #[test]
 fn the_template_accepts_more_spellings_than_it_advertises() {
-    // Ports, via `u16::from_str`.
-    assert_eq!(
-        parse_target("/.well-known/masque/udp/example.com/+53/", None),
-        Ok(("example.com".to_owned(), 53))
-    );
     assert_eq!(
         parse_target("/.well-known/masque/udp/example.com/00053/", None),
         Ok(("example.com".to_owned(), 53))

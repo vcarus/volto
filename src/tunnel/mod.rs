@@ -99,6 +99,37 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "upgrade",
 ];
 
+/// Whether `text` is a port the way RFC 3986 §3.2.3 spells one.
+///
+/// That section: "The port subcomponent of authority is designated by an
+/// optional port number in decimal following the host and delimited from it by a
+/// single colon (":") character", with the grammar
+///
+/// ```text
+/// port        = *DIGIT
+/// ```
+///
+/// Asked by both parsers before `u16::from_str`, which is more generous than the
+/// grammar: it takes a leading `+` or `-`, so `example.com:+443` was dialled as
+/// 443 and `/.well-known/masque/udp/example.com/+443/` with it. Nothing was
+/// bypassed, because `Policy::allows_port` judges the number that came out of
+/// the parse and that is the number the socket is opened on. What it cost is
+/// normalisation: one target had two spellings, the authority in the log and the
+/// port on the wire disagreed, and RFC 9110 §9.3.6 asks a server to "reject a
+/// CONNECT request that targets an empty or invalid port number".
+///
+/// The empty string is refused here as well, which is not what `*DIGIT` says on
+/// its own. RFC 9298 §3 requires `target_port` to "represent an integer between
+/// 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty port beside an
+/// invalid one; both callers already refused it by way of the parse that
+/// follows, and saying so here keeps the two rules in one place.
+///
+/// Written once because it is one rule. Two copies of a spelling rule is how the
+/// trailing-dot defect happened.
+pub(crate) fn is_port(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 /// How many times over a connection may spend `unanswered_packet_budget` before
 /// its sessions are closed instead of muted.
 ///

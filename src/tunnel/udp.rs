@@ -1055,6 +1055,12 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
     let port = percent_decode_str(port)
         .decode_utf8()
         .map_err(|_| "target_port is not valid UTF-8")?;
+    // RFC 9298 §3 writes `target_port = port`, which is RFC 3986 §3.2.3's
+    // `*DIGIT`; the template is decoded first, so `%2B443` meets the same rule
+    // as `+443` does. See [`tunnel::is_port`].
+    if !tunnel::is_port(&port) {
+        return Err("invalid target_port");
+    }
     let port: u16 = port.parse().map_err(|_| "invalid target_port")?;
     if port == 0 {
         return Err("target_port must not be zero");
@@ -1249,6 +1255,24 @@ mod tests {
         assert!(parse("/.well-known/masque/udp/192.0.2.1/0").is_err());
         assert!(parse("/.well-known/masque/udp/192.0.2.1/65536").is_err());
         assert!(parse("/.well-known/masque/udp/192.0.2.1/domain").is_err());
+    }
+
+    /// RFC 9298 §3 writes `target_port = port`, which is RFC 3986 §3.2.3's
+    /// `*DIGIT`, and `u16::from_str` accepts a leading sign on top of that. The
+    /// percent-encoded spellings are here because this template is decoded
+    /// before the number is read, so `%2B443` is the same request as `+443` and
+    /// has to meet the same rule.
+    #[test]
+    fn rejects_a_port_that_is_not_digits() {
+        for path in [
+            "/.well-known/masque/udp/192.0.2.1/+443/",
+            "/.well-known/masque/udp/192.0.2.1/-443/",
+            "/.well-known/masque/udp/192.0.2.1/%2B443/",
+            "/.well-known/masque/udp/192.0.2.1/%20443/",
+            "/.well-known/masque/udp/192.0.2.1/443%20/",
+        ] {
+            assert!(parse(path).is_err(), "{path} must not be dialled");
+        }
     }
 
     #[test]

@@ -933,6 +933,11 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
         }
     };
 
+    // RFC 3986 §3.2.3's `port = *DIGIT`, asked before the parse because
+    // `u16::from_str` also takes a sign: see [`tunnel::is_port`].
+    if !tunnel::is_port(port) {
+        return Err("invalid port");
+    }
     let port: u16 = port.parse().map_err(|_| "invalid port")?;
     if port == 0 {
         return Err("port must not be zero");
@@ -1331,6 +1336,27 @@ mod tests {
         assert!(split_authority("example.com:http").is_err());
         assert!(split_authority("[2001:db8::1]").is_err());
         assert!(split_authority("[2001:db8::1]443").is_err());
+    }
+
+    /// RFC 3986 §3.2.3 spells a port `*DIGIT`, and `u16::from_str` is more
+    /// generous than that: it takes a leading sign, so `+443` used to be dialled
+    /// as 443. Two spellings of one target is a normalisation defect rather than
+    /// a bypass, since the policy judges the number that was parsed, but the
+    /// authority that is logged and the port that is dialled must not disagree.
+    #[test]
+    fn rejects_a_port_that_is_not_digits() {
+        for authority in [
+            "example.com:+443",
+            "example.com:-443",
+            "example.com: 443",
+            "example.com:443 ",
+            "[2001:db8::1]:+443",
+        ] {
+            assert!(
+                split_authority(authority).is_err(),
+                "{authority} must not be dialled"
+            );
+        }
     }
 
     #[test]
