@@ -572,7 +572,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     match tunnel::route(&req) {
         Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {
-                tunnel::tcp::run(authority, stream, stream_id, &context).await;
+                tunnel::tcp::run(authority, stream, &context).await;
             }
             None => {
                 // RFC 9114 §4.4: a CONNECT request must carry :authority.
@@ -581,7 +581,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             }
         },
         Route::ConnectUdp => {
-            udp::run(&req, stream, stream_id, context).await;
+            udp::run(&req, stream, &context).await;
         }
         Route::UnsupportedProtocol(protocol) => {
             debug!(

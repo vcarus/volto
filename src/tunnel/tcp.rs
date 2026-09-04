@@ -245,7 +245,9 @@ impl HalfClose {
 }
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
-pub async fn run(authority: &str, mut stream: Stream, stream_id: u64, ctx: &Context) {
+pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
+    let stream_id = stream.id();
+
     let (host, port) = match split_authority(authority) {
         Ok(target) => target,
         Err(reason) => {

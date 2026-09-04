@@ -33,8 +33,6 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use tokio::net::UdpSocket;
@@ -58,7 +56,9 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 pub(super) const CONNECT_UDP: &str = "connect-udp";
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
-pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Arc<Context>) {
+pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
+    let stream_id = stream.id();
+
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
         tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
@@ -118,7 +118,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Arc<Con
     // whatever the client sent optimistically; the router then drops later
     // datagrams for that id silently, exactly as it does for a session that has
     // just closed.
-    let Some(allowed) = tunnel::admit_target(&host, port, &ctx, &mut stream, capsule_fields).await
+    let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, capsule_fields).await
     else {
         return;
     };
@@ -202,7 +202,7 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Arc<Con
 }
 
 /// A running UDP session.
-struct Session {
+struct Session<'a> {
     /// The request stream's id, and the Quarter Stream ID that follows from it.
     ///
     /// Both are fixed for the life of the session and every line it writes
@@ -249,7 +249,12 @@ struct Session {
     /// by nothing else — see [`Self::run`] for why arrival alone must not
     /// count.
     deadline: tokio::time::Instant,
-    ctx: Arc<Context>,
+    /// The connection state this session reads its budgets and its QUIC
+    /// connection from.
+    ///
+    /// Borrowed rather than an `Arc` share: the session is built and awaited
+    /// inside [`run`], which already holds the borrow, so it never outlives it.
+    ctx: &'a Context,
 }
 
 /// What a single step of the session loop decided.
@@ -330,7 +335,7 @@ async fn before_deadline<T>(
     tokio::time::timeout_at(deadline, work).await.ok()
 }
 
-impl Session {
+impl Session<'_> {
     /// Pumps the session until it closes, one direction at a time.
     async fn run(&mut self) {
         let stream_id = self.stream_id;
