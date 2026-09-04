@@ -1597,7 +1597,12 @@ pub const MAX_PEER_UNI_STREAMS: u32 = 16;
 pub const INITIAL_BIDI_STREAMS: u32 = 16;
 
 /// How long to wait for `CONNECTION_CLOSE` frames to be flushed on shutdown.
-const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+///
+/// `pub(crate)` for [`crate::shutdown::blocking_grace`], which adds it to the
+/// grace period: the two together are the whole of what the async side of the
+/// shutdown may spend, and the wait for the blocking pool is measured against
+/// the same total.
+pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(test)]
 mod tests {

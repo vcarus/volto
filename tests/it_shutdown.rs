@@ -598,3 +598,81 @@ async fn a_peer_that_will_not_take_a_goaway_does_not_hold_up_shutdown() {
     // GOAWAY is allowed.
     server.wait_until_stopped(Duration::from_secs(15)).await;
 }
+
+/// A name lookup parked on the blocking pool does not hold the process past the
+/// shutdown bound.
+///
+/// The mechanism this is about is not the accept loop's, which the cases above
+/// cover, but the exit that follows it. Name resolution runs `getaddrinfo` on
+/// the runtime's blocking pool and cannot be cancelled, so a thread stays there
+/// until the stub resolver gives up, tens of seconds where a nameserver answers
+/// nothing (D90). tokio documents dropping a runtime as blocking indefinitely
+/// for blocking tasks that have started, so the implicit drop the binary used to
+/// end on made the exit as long as the slowest lookup a client had asked for,
+/// and `script/masque.service` turns anything past `TimeoutStopSec` into a
+/// SIGKILL.
+///
+/// What is asserted is [`volto::shutdown::stop_runtime`], the call the binary
+/// makes after `block_on` returns, against a blocking task standing in for the
+/// resolver: it is spawned the same way, it has genuinely started before the
+/// signal, and it outlasts the bound by a wide margin. The stand-in is a sleep
+/// rather than a real black-holed lookup because a lookup's duration is the host
+/// resolver's to decide and differs between macOS and Linux, while what is under
+/// test is the wait, not the resolver.
+///
+/// The grace period is zero so the whole bound is the endpoint's close flush
+/// plus `volto::shutdown::EXIT_SLACK`, which keeps the test's own wall time to a
+/// couple of seconds.
+#[test]
+fn a_parked_name_lookup_does_not_hold_the_exit_past_the_bound() {
+    /// How long the stand-in for `getaddrinfo` stays on its thread.
+    const PARKED: Duration = Duration::from_secs(30);
+    /// Scheduling margin on top of the bound, for a loaded test machine.
+    const MARGIN: Duration = Duration::from_secs(5);
+
+    let grace = Duration::ZERO;
+    let bound = volto::shutdown::blocking_grace(grace);
+    assert!(
+        bound + MARGIN < PARKED,
+        "the bound plus its margin must be well under the parked task, or this \
+         measures nothing: {bound:?} + {MARGIN:?} against {PARKED:?}"
+    );
+
+    // Built exactly as `main` builds it, blocking pool included: a bound that
+    // held only on a runtime with a different pool would not be the one the
+    // binary gets.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(volto::net::blocking_pool_size(
+            volto::config::Limits::default().max_connections,
+        ))
+        .build()
+        .expect("build the runtime the way the binary does");
+
+    runtime.block_on(async {
+        let mut server =
+            TestServer::start_with(&format!("shutdown_grace = 0\n{ALLOW_PRIVATE}")).await;
+
+        // Started, not merely spawned: tokio waits only for blocking tasks that
+        // have begun running, so a task still in the queue would prove nothing.
+        let (started, has_started) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            std::thread::sleep(PARKED);
+        });
+        has_started.await.expect("the blocking task started");
+
+        server.shutdown();
+        server.wait_until_stopped(STOP_TIMEOUT).await;
+    });
+
+    let began = std::time::Instant::now();
+    volto::shutdown::stop_runtime(runtime, grace);
+    let waited = began.elapsed();
+
+    assert!(
+        waited <= bound + MARGIN,
+        "the exit must be bounded by the shutdown budget: waited {waited:?} against \
+         a bound of {bound:?}"
+    );
+}

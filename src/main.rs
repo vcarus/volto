@@ -64,7 +64,25 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build the async runtime")?;
 
-    runtime.block_on(run(cli, config))
+    // Read before the configuration moves into `run`: it is what bounds the
+    // wait below, and a `SIGHUP` cannot change it, since the runtime it applies
+    // to was built from the file this process started on.
+    let grace = config.server.shutdown_grace();
+
+    let served = runtime.block_on(run(cli, config));
+
+    // Deliberately not the implicit drop this used to end on. tokio's
+    // `Runtime::drop` waits without limit for blocking tasks that have started,
+    // and name resolution is one of those: `getaddrinfo` cannot be cancelled,
+    // the thread stays in the stub resolver for as long as it takes, and a
+    // client chooses the name (D90). So the process used to exit one resolver
+    // timeout after the grace period rather than one grace period after the
+    // signal, which `script/masque.service` turns into a SIGKILL at
+    // `TimeoutStopSec`. Bounding it leaks the thread instead, which the process
+    // is about to end anyway.
+    volto::shutdown::stop_runtime(runtime, grace);
+
+    served
 }
 
 /// Says that the file loaded, and repeats what starting on it would warn about.
