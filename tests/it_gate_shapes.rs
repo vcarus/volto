@@ -13,15 +13,16 @@
 //! here as bytes.
 //!
 //! **What still answers a stranger with the gate on?** The gate judges a
-//! datagram's first packet and refuses only what it can read a name out of.
-//! Everything it passes reaches quinn, and quinn is not silent about all of it:
-//! an Initial with a Destination Connection ID shorter than the eight bytes
-//! RFC 9000 §7.2 requires draws a CONNECTION_CLOSE before a single frame is
-//! read, and an Initial carrying an ack-eliciting frame draws an
-//! acknowledgement. None of that needs the name. The probes below send each of
-//! those shapes at a server with the gate on and record what comes back; the
-//! ones that are answered are `#[ignore]`d rather than deleted, so the shape and
-//! its evidence stay in the tree.
+//! datagram's first packet, and two things it refuses are decided without a
+//! name: the version in the long header, and — since only a first Initial is
+//! keyed by the connection ID written in it — a Destination Connection ID
+//! shorter than the eight bytes RFC 9000 §7.2 requires, which quinn answers
+//! with a CONNECTION_CLOSE before a single frame is read. Everything else it
+//! passes reaches quinn, and an Initial carrying an ack-eliciting frame draws
+//! an acknowledgement whether or not it names anybody. The probes below send
+//! each of those shapes at a server with the gate on and record what comes
+//! back; the ones still answered are `#[ignore]`d rather than deleted, so the
+//! shape and its evidence stay in the tree.
 //!
 //! Every probe is paired with the same datagram sent at a server with the gate
 //! *off*, which is what proves the probe is well formed enough to be answered at
@@ -567,16 +568,14 @@ async fn both_ways(what: &str, dcid: &[u8], shape: &[u8]) -> Vec<Vec<u8>> {
 
 /// An Initial with nothing in it but PADDING, and a connection ID too short.
 ///
-/// The gate has nothing to judge — no CRYPTO frame at offset 0 means a later
-/// fragment of a flight already admitted, which is the pass the design argues
-/// for — so this reaches quinn, and quinn rejects a client-chosen Destination
-/// Connection ID under eight bytes with a CONNECTION_CLOSE before it looks at a
-/// single frame (`early_validate_first_packet`, quinn-proto `48455d3`).
-///
-/// FAILS: this shape is answered with the gate on. Left `#[ignore]`d so the
-/// probe and its evidence stay in the tree; see the report on this branch.
+/// There is no name in this datagram anywhere, and it is still refused: the
+/// packet opens, which says its keys came from the connection ID written in it
+/// and therefore that it is a client's first Initial, and a first Initial's
+/// Destination Connection ID is at least eight bytes (RFC 9000 §7.2). quinn
+/// answers a shorter one with a CONNECTION_CLOSE before it looks at a single
+/// frame (`early_validate_first_packet`, quinn-proto `48455d3`), which is what
+/// the gate-off half of this probe records.
 #[tokio::test]
-#[ignore = "the shape is answered: a PADDING-only Initial with a short DCID draws a CONNECTION_CLOSE"]
 async fn a_padding_only_initial_with_a_short_connection_id_is_silent() {
     let crypto = nameless_crypto();
     let dcid = [0x11; 4];

@@ -353,6 +353,13 @@ Some details worth knowing before relying on it:
 - **Not a certificate selector.** There is still one certificate and one key.
   Naming several hosts means volto answers to all of them with the same
   certificate, so they all have to be on it.
+- **A packet that names nobody can still draw an acknowledgement.** The check
+  refuses a first Initial whose Destination Connection ID is under the eight
+  bytes RFC 9000 §7.2 requires, since no client's first packet is that shape;
+  what it passes, it passes to quinn, which acknowledges an Initial carrying an
+  ack-eliciting frame whether or not a name is in it. Sending one means building
+  a QUIC Initial packet on purpose, which is a probe aimed at this server rather
+  than a scan of the address.
 - **Stateless resets are not covered.** A short-header packet for a connection
   this server does not hold can still draw one (RFC 9000 §10.3), because telling
   a live connection's packets from a stranger's needs state the gate does not

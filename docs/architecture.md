@@ -62,10 +62,15 @@ below 1200 bytes passes for the same reason: RFC 9000 §14.1 has the server
 discard it, and quinn does, silently. What is left is an Initial that could start
 a connection, and that one is opened: the keys for it are derived from the
 Destination Connection ID in the packet itself (RFC 9001 §5.2), so no connection
-state is needed to read it. Its CRYPTO frames are assembled from offset zero, the
-ClientHello is parsed, and the `server_name` extension (RFC 6066 §3) is compared
-with the configured list — ASCII case-insensitively, with a trailing root dot
-ignored, name for name and no wildcards.
+state is needed to read it. That it opens at all says it is a client's *first*
+Initial, because only a first Initial is keyed that way, and RFC 9000 §7.2 gives
+a first Initial a Destination Connection ID of at least eight bytes — every
+later one is addressed by the eight bytes this endpoint chose, and so is the one
+a Retry supplies. A shorter one is refused here, which is the `CONNECTION_CLOSE`
+above never sent. Otherwise its CRYPTO frames are assembled from offset zero,
+the ClientHello is parsed, and the `server_name` extension (RFC 6066 §3) is
+compared with the configured list — ASCII case-insensitively, with a trailing
+root dot ignored, name for name and no wildcards.
 
 A refused datagram is not removed from the receive batch, because one buffer can
 hold a whole GRO run described by a single stride. It is left in place with its
@@ -94,9 +99,13 @@ naming several hosts means answering to all of them with the same certificate.
 Stateless resets are deliberately left uncovered — see D106 and the
 [configuration reference](configuration.md#the-sni-gate) for what that leaves
 visible and why filtering on the address instead would break connection
-migration. None of this is traffic obfuscation, which stays a non-goal: the gate
-hides that a service is here from somebody who does not know the name to ask
-for, and says nothing about what a connection looks like once one is open.
+migration. So is the acknowledgement quinn returns for an Initial the gate
+passes that carries an ack-eliciting frame and no name — a PING on its own, or a
+ClientHello the gate could not finish reading — because refusing those means
+refusing a large first flight, which this design will not do. None of this is
+traffic obfuscation, which stays a non-goal: the gate hides that a service is
+here from somebody who does not know the name to ask for, and says nothing about
+what a connection looks like once one is open.
 
 Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and

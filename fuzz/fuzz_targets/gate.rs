@@ -34,6 +34,10 @@ const LONG_PACKET_TYPE: u8 = 0x30;
 /// The smallest UDP payload a server judges an Initial in (RFC 9000 §14.1).
 const MIN_INITIAL_DATAGRAM: usize = 1200;
 
+/// The shortest Destination Connection ID a client's first Initial may carry
+/// (RFC 9000 §7.2).
+const MIN_CLIENT_CONNECTION_ID: usize = 8;
+
 /// The TLS `client_hello` handshake message type (RFC 8446 §4).
 const CLIENT_HELLO: u8 = 1;
 
@@ -133,9 +137,10 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
             assert_ne!(*refused, 1, "version 1 is the one we speak");
             assert!(long_header, "a short header names no version");
         }
-        // The three that are decided on a ClientHello, which is only reachable
-        // by opening the packet: the gate must have had a v1 Initial, in a
-        // datagram large enough for a server to look at, to get here at all.
+        // The four that are decided behind the packet protection, which is only
+        // reachable by opening the packet: the gate must have had a v1 Initial,
+        // in a datagram large enough for a server to look at, to get here at
+        // all.
         Verdict::Refuse(refusal) => {
             assert!(
                 long_header
@@ -144,8 +149,25 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
                     && datagram.len() >= MIN_INITIAL_DATAGRAM,
                 "{refusal:?} on a datagram that carries no Initial packet"
             );
-            if let Refusal::OtherName(name) = refusal {
-                assert!(name.len() < MAX_BOUNDED, "an unbounded name reached a log");
+            match refusal {
+                Refusal::OtherName(name) => {
+                    assert!(name.len() < MAX_BOUNDED, "an unbounded name reached a log");
+                }
+                // The one refusal decided on the header behind the protection:
+                // the length it names is the length byte the datagram carries,
+                // and it is under the floor RFC 9000 §7.2 sets.
+                Refusal::ShortConnectionId(length) => {
+                    assert_eq!(
+                        Some(*length),
+                        datagram.get(5).map(|byte| usize::from(*byte)),
+                        "a refused length that is not the one in the header"
+                    );
+                    assert!(
+                        *length < MIN_CLIENT_CONNECTION_ID,
+                        "a connection ID a client may choose was refused for its length"
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -154,7 +176,8 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
 }
 
 /// The v0.9.1 rule: only a packet the gate could open may be refused for what
-/// its ClientHello said.
+/// was behind its packet protection — the ClientHello, or the connection ID
+/// length that opening the packet turns into a statement about a first flight.
 ///
 /// The keys are derived from the Destination Connection ID in the datagram
 /// itself, so changing that field must turn any such refusal into a pass — a
@@ -166,11 +189,16 @@ fn refusing_needs_the_keys_this_datagram_carries(
     names: &Names,
     verdict: &Verdict,
 ) {
-    let refused_by_name = matches!(
+    let refused_by_what_was_opened = matches!(
         verdict,
-        Verdict::Refuse(Refusal::NotClientHello | Refusal::Anonymous | Refusal::OtherName(_))
+        Verdict::Refuse(
+            Refusal::ShortConnectionId(_)
+                | Refusal::NotClientHello
+                | Refusal::Anonymous
+                | Refusal::OtherName(_)
+        )
     );
-    if !refused_by_name {
+    if !refused_by_what_was_opened {
         return;
     }
 

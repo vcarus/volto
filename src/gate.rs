@@ -39,6 +39,14 @@
 //!   its state. They belong to a flight that was judged when it started; a
 //!   forgery that is not one of them fails quinn's own decryption and is
 //!   dropped there without a reply.
+//! * **An Initial this server can open whose Destination Connection ID is
+//!   shorter than eight bytes** — refused. Opening it is what says its keys
+//!   came from the connection ID written in it, and that is a client's first
+//!   Initial, which RFC 9000 §7.2 gives a floor of eight bytes. Every later
+//!   Initial of an admitted handshake is addressed by the eight bytes this
+//!   endpoint chose, and so is the one a Retry supplies, so nothing legitimate
+//!   is this shape — and quinn answers it with the CONNECTION_CLOSE named
+//!   above before it reads a frame.
 //! * **An Initial with no CRYPTO frame at offset 0** — passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started.
@@ -65,6 +73,19 @@
 //! turned off, and it defaults to on.
 //!
 //! # What is left uncovered
+//!
+//! An Initial the gate passes because it can read no name out of it still
+//! reaches quinn, and quinn acknowledges it if anything in it is ack-eliciting:
+//! a PING and nothing else, a ClientHello cut short before its extensions, a
+//! lone CRYPTO frame at a non-zero offset. Each draws an acknowledgement with
+//! no name anywhere in it. The second and the third are the fail-open branch
+//! above, and refusing them is refusing the large first flight this module
+//! deliberately lets through; the first could be refused on its own, and doing
+//! so would leave the other two answering, so it would change nothing about
+//! what somebody able to build an Initial packet can learn here. All three cost
+//! that somebody a QUIC v1 Initial keyed the way RFC 9001 §5.2 says, which is a
+//! probe aimed at this server rather than the scan of an address the gate is
+//! for.
 //!
 //! A short-header packet for a connection this endpoint does not hold can still
 //! draw a Stateless Reset (RFC 9000 §10.3), and this module deliberately does
@@ -131,6 +152,20 @@ const MAX_CONNECTION_ID: usize = 20;
 //# datagram with a payload that is smaller than the smallest allowed
 //# maximum datagram size of 1200 bytes.
 const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+/// The shortest Destination Connection ID a client's first Initial may carry.
+///
+/// A packet the gate can open is keyed by the connection ID written in it, and
+/// only a first Initial is (RFC 9001 §5.2, quoted at [`Judge::decrypt`]), so the
+/// sentence below applies to every packet that gets that far.
+///
+//= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+//# When an Initial packet is sent by a client that has not previously
+//# received an Initial or Retry packet from the server, the client
+//# populates the Destination Connection ID field with an unpredictable
+//# value.  This Destination Connection ID MUST be at least 8 bytes in
+//# length.
+const MIN_CLIENT_CONNECTION_ID: usize = 8;
 
 /// The value written over a refused datagram's Destination Connection ID length.
 ///
@@ -280,6 +315,12 @@ impl Gate {
                 version = format_args!("{version:#010x}"),
                 "dropping a QUIC packet: the SNI gate answers no version but 1"
             ),
+            Refusal::ShortConnectionId(length) => debug!(
+                %remote,
+                connection_id_length = length,
+                "dropping an Initial packet: its destination connection ID is shorter than \
+                 eight bytes"
+            ),
             Refusal::NotClientHello => debug!(
                 %remote,
                 "dropping an Initial packet: its first handshake message is not a ClientHello"
@@ -385,7 +426,25 @@ impl Judge {
             //# Destination Connection ID for subsequent packets, including any 0-RTT
             //# packets.
             Opened::Failed => return Verdict::Pass,
-            Opened::Payload(payload) => payload,
+            Opened::Payload {
+                dcid_length,
+                frames,
+            } => {
+                // It opened, so its keys came from the Destination Connection ID
+                // written in it, and only a client's first Initial is keyed that
+                // way — which is a packet RFC 9000 §7.2 gives a floor of eight
+                // bytes to (quoted at `MIN_CLIENT_CONNECTION_ID`). Every later
+                // Initial of an admitted handshake is addressed by the eight
+                // bytes this endpoint's own generator chose, and so is the one a
+                // Retry supplies, so nothing legitimate is ever this shape.
+                // quinn answers what is with a CONNECTION_CLOSE carrying
+                // PROTOCOL_VIOLATION before it reads a single frame, which is
+                // one of the three replies this gate exists to take away.
+                if dcid_length < MIN_CLIENT_CONNECTION_ID {
+                    return Verdict::Refuse(Refusal::ShortConnectionId(dcid_length));
+                }
+                frames
+            }
         };
 
         let Some(crypto) = crypto_stream_prefix(&payload) else {
@@ -492,7 +551,10 @@ impl Judge {
             .remote
             .decrypt(number, &associated, &mut protected)
         {
-            Ok(()) => Some(Opened::Payload(protected.to_vec())),
+            Ok(()) => Some(Opened::Payload {
+                dcid_length: header.dcid.len(),
+                frames: protected.to_vec(),
+            }),
             Err(_) => Some(Opened::Failed),
         }
     }
@@ -505,8 +567,10 @@ enum Opened {
     /// A QUIC v1 Initial that failed authentication under the keys its own
     /// Destination Connection ID derives.
     Failed,
-    /// The decrypted frames.
-    Payload(Vec<u8>),
+    /// The decrypted frames, and how long the Destination Connection ID that
+    /// keyed them was — which the caller judges, so it is carried here rather
+    /// than read off the datagram a second time.
+    Payload { dcid_length: usize, frames: Vec<u8> },
 }
 
 impl fmt::Debug for Gate {
@@ -602,6 +666,9 @@ pub enum Verdict {
 pub enum Refusal {
     /// A long header naming a QUIC version this server does not speak.
     Version(u32),
+    /// A first Initial whose Destination Connection ID is under
+    /// [`MIN_CLIENT_CONNECTION_ID`] bytes, carrying the length it had.
+    ShortConnectionId(usize),
     /// A first flight that does not begin with a ClientHello.
     NotClientHello,
     /// A complete ClientHello with no `server_name` extension.
@@ -1380,6 +1447,64 @@ mod tests {
         let hello = client_hello(&sni_extension("other.example"));
         let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &crypto_frame(&hello));
         assert_eq!(judge.judge(&later, &names), Verdict::Pass);
+    }
+
+    /// A first Initial whose Destination Connection ID is under eight bytes.
+    ///
+    /// That it opens at all is what makes it a first Initial rather than a
+    /// later packet of a flight already admitted, and a first Initial has a
+    /// floor of eight bytes (RFC 9000 §7.2, quoted at
+    /// [`MIN_CLIENT_CONNECTION_ID`]). quinn answers this one with
+    /// CONNECTION_CLOSE(PROTOCOL_VIOLATION) before it reads a frame, which is
+    /// one of the three replies this gate exists to take away — so the header
+    /// is judged ahead of anything the packet carries, and the two witnesses
+    /// here carry nothing and carry a name on the list.
+    #[test]
+    fn a_first_initial_with_a_short_connection_id_is_refused() {
+        let crypto = throwaway_crypto();
+        let judge = Judge {
+            crypto: crypto.clone(),
+        };
+        let names = Names::new(&["localhost".to_owned()]);
+
+        let short = [0x11; 4];
+        let padding_only = initial(&*crypto, &short, &short, &[]);
+        assert_eq!(padding_only.len(), MIN_INITIAL_DATAGRAM);
+        assert_eq!(
+            judge.judge(&padding_only, &names),
+            Verdict::Refuse(Refusal::ShortConnectionId(short.len())),
+            "a PADDING-only Initial behind a four-byte connection ID"
+        );
+
+        let hello = client_hello(&sni_extension("localhost"));
+        let named = initial(&*crypto, &short, &short, &crypto_frame(&hello));
+        assert_eq!(
+            judge.judge(&named, &names),
+            Verdict::Refuse(Refusal::ShortConnectionId(short.len())),
+            "a name on the list does not buy a connection ID no client may choose"
+        );
+    }
+
+    /// The same packet behind a connection ID a client may actually choose.
+    ///
+    /// The sibling of the test above and the half that says the rule is about
+    /// the length rather than about the shape: eight bytes is the floor, and a
+    /// datagram carrying nothing to judge is passed through as it always was.
+    #[test]
+    fn a_first_initial_with_a_full_connection_id_is_not_refused_for_its_length() {
+        let crypto = throwaway_crypto();
+        let judge = Judge {
+            crypto: crypto.clone(),
+        };
+        let names = Names::new(&["localhost".to_owned()]);
+
+        assert_eq!(CLIENT_CID.len(), MIN_CLIENT_CONNECTION_ID);
+        let padding_only = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &[]);
+        assert_eq!(
+            judge.judge(&padding_only, &names),
+            Verdict::Pass,
+            "an eight-byte connection ID is the shortest one a client may choose"
+        );
     }
 
     /// Writes the seed corpus for `fuzz/fuzz_targets/gate.rs`, and pins it.
