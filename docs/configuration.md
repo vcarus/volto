@@ -293,6 +293,15 @@ family, an IP literal above all, is unaffected by any of the three.
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
 | `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default and what every release before this one did. A non-empty list turns on the SNI gate: a handshake whose ClientHello does not name one of these hosts is dropped at the socket before the QUIC layer sees it, so a port scan of this address gets nothing back — no Version Negotiation packet, no `CONNECTION_CLOSE`, no TLS alert. Matched name for name, ASCII case-insensitive, with one trailing root dot ignored; no wildcards and no suffix matching, and a name with an empty label (a leading dot, two dots in a row, or a second trailing dot) is refused at startup. Every client must then send the name as SNI (in Surge, the `sni=` parameter), or it sees the port as closed with no error anywhere but this server's debug log — so change this key and the clients together. A name the certificate does not cover draws a warning at startup and on reload, because a typo here is otherwise indistinguishable from a dead server. See below |
 
+- **This whole section is snapshotted per connection, at accept.** A reload
+  applies it to connections accepted after it, and a connection already open
+  keeps the rules it was accepted with for its whole life, tunnels opened on it
+  later included, so a tightened `allow_private_networks` or a new entry in
+  `denied_ports` reaches a client that is holding a connection open only when
+  that connection ends. Use `systemctl restart volto` when the tightening has to
+  apply to everything at once; the same reasoning and the same remedy as for
+  credentials, worked through under
+  [Reloading](deployment.md#reloading) in deployment.md.
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
   `::127.0.0.1` gets past `allow_private_networks = false`.
 - IPv6 transition addresses are judged by the IPv4 address they carry, because

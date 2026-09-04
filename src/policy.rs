@@ -300,11 +300,13 @@ fn is_discard_only(v6: Ipv6Addr) -> bool {
 ///
 /// * `64:ff9b::/96` — the well-known NAT64 prefix (RFC 6052 §2.1), with the
 ///   address in the last 32 bits;
-/// * `64:ff9b:1::/48` — the local-use NAT64 prefix (RFC 8215). At a /48 prefix
-///   RFC 6052 §2.2 splits the address around the reserved octet at bits 64-71,
-///   which is why this is not simply the last four octets. The reserved octet is
-///   not checked: a host translating the address ignores it too, and refusing to
-///   look would let a single non-zero byte hide a private target.
+/// * `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215), **decoded at the
+///   /48 layout and at no other**; see below.
+///   At a /48 prefix RFC 6052 §2.2 splits the address around the reserved octet
+///   at bits 64-71, which is why this is not simply the last four octets. The
+///   reserved octet is not checked: a host translating the address ignores it
+///   too, and refusing to look would let a single non-zero byte hide a private
+///   target.
 /// * `2002::/16` — 6to4 (RFC 3056), with the address at bits 16-47;
 /// * `2001::/32` — Teredo (RFC 4380 §4). The client's own IPv4 address is the
 ///   last 32 bits with every bit inverted, which is the one this proxy would
@@ -313,6 +315,49 @@ fn is_discard_only(v6: Ipv6Addr) -> bool {
 /// The deprecated `::/96` IPv4-compatible range is deliberately **not** here:
 /// unwrapping it would turn `::1` into 0.0.0.1 and lose the loopback meaning, so
 /// [`is_ipv4_compatible`] keeps claiming it wholesale instead.
+///
+/// # The local-use prefix has more than one layout, and this reads one of them
+///
+/// The well-known prefix is fixed at /96 by RFC 6052 §3.1, so there is one
+/// answer for it. `64:ff9b:1::/48` is not like that. RFC 8215 §5: "64:ff9b:1::/48
+/// is intended as a technology-agnostic and generic reservation. A network
+/// operator may freely use it in combination with any kind of IPv4/IPv6
+/// translation mechanism deployed within their network." The same section says
+/// what that costs a reader of one of these addresses: "By default, IPv6 nodes
+/// and applications must not treat IPv6 addresses within 64:ff9b:1::/48
+/// differently from other globally scoped IPv6 addresses. In particular, they
+/// must not make any assumptions regarding the syntax or properties of those
+/// addresses (e.g., the existence and location of embedded IPv4 addresses)". An
+/// operator may therefore run a translator on a /56, /64 or /96 taken out of
+/// that /48. RFC 6052 §2.2 allows prefix lengths of 32, 40, 48, 56, 64 and 96,
+/// and the four that are /48 or longer fit inside this reservation. The
+/// embedded address sits somewhere else in each of them.
+///
+/// This function reads the /48 layout, where the address is octets 6 and 7 then
+/// 9 and 10, so an address deployed at another layout is judged by four octets
+/// that are not the address a translator would reach. What that verdict is,
+/// layout by layout:
+///
+/// * **/56**: the address is octet 7 then octets 9, 10 and 11, so the read is
+///   the address shifted by one octet with the operator's octet 6 in front of
+///   it: `prefix.a.b.c` for a real `a.b.c.d`.
+/// * **/64**: the address is octets 9 to 12, and octets 6 and 7 are the
+///   operator's subnet, so the read is `subnet.subnet.a.b`. Zero subnet bits
+///   make that `0.0.a.b`, which `is_never_allowed` or the `0.0.0.0/8` entry of
+///   the private bucket refuses.
+/// * **/96**: the address is the last four octets, and octets 6, 7, 9 and 10
+///   are all inside the operator's prefix. A prefix whose low bits are zero
+///   reads as `0.0.0.0`, which is never allowed.
+///
+/// So the mislayouts land in the refused direction rather than the permissive
+/// one, which is why this is documented rather than changed. The exception is
+/// narrow and worth naming: a /64 deployment whose subnet bits happen to spell a
+/// public IPv4 prefix while the embedded address is private would be allowed on
+/// the strength of an address nothing will be sent to. Closing it means refusing
+/// the whole `64:ff9b:1::/48` rather than guessing better, because nothing in
+/// the address says which layout produced it, and that is the change to make if
+/// a translator on this prefix at another layout ever turns up on a path this
+/// proxy can reach.
 fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     let IpAddr::V6(v6) = ip else {
         return None;
