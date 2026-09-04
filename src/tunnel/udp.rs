@@ -45,7 +45,7 @@ use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{
     self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
 };
-use crate::tunnel::{Context, Responded, Unreachable};
+use crate::tunnel::{Context, Unreachable};
 use crate::{net, tunnel};
 
 /// Path prefix of the RFC 9298 §2 default URI template.
@@ -153,16 +153,12 @@ pub async fn run(req: &Request, mut stream: Stream, stream_id: u64, ctx: Arc<Con
     )
     .await;
 
-    match sent {
-        Responded::Sent => {}
-        Responded::Failed => return,
-        Responded::Expired => {
-            debug!(
-                stream_id,
-                "gave up on a 200 for connect-udp the peer would not take"
-            );
-            return;
-        }
+    if !sent.landed(
+        stream_id,
+        Status::OK,
+        "gave up on a 200 for connect-udp the peer would not take",
+    ) {
+        return;
     }
 
     let target = socket.peer_addr().ok();

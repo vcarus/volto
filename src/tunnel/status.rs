@@ -284,11 +284,34 @@ pub(crate) enum Responded {
     /// The write did not complete within its bound, and the stream has already
     /// been reset with H3_REQUEST_CANCELLED.
     ///
-    /// Deliberately unreported here: what a lapsed response leaves behind
-    /// differs at every call site — the status a refusal was carrying, the
-    /// authority a CONNECT named, a target socket that has to be aborted — so
-    /// the line and the cleanup stay where those things are.
+    /// [`Responded::landed`] is the follow-up three of the four callers share:
+    /// it writes the line and answers that the write did not land. `tcp::run`
+    /// keeps a `match` of its own, because a lapse there also leaves a target
+    /// connection that RFC 9114 section 4.4 asks to be aborted, and an
+    /// authority worth naming beside the line.
     Expired,
+}
+
+impl Responded {
+    /// Whether the response reached the stream, reporting a lapse as `gave_up`.
+    ///
+    /// The follow-up is the same at every call site that has nothing else to
+    /// clean up: a sent response is what the caller asked for, a failed one has
+    /// already been reported by [`respond`], and a lapsed one owes one line.
+    /// Written here so a fourth caller cannot answer it a fourth way.
+    ///
+    /// What a lapse leaves behind is still the caller's business. `false` says
+    /// to stop; anything past that stays where the thing to undo is.
+    pub(crate) fn landed(self, stream_id: u64, status: Status, gave_up: &'static str) -> bool {
+        match self {
+            Self::Sent => true,
+            Self::Failed => false,
+            Self::Expired => {
+                debug!(stream_id, status = status.as_str(), "{gave_up}");
+                false
+            }
+        }
+    }
 }
 
 /// Sends `status` with `fields` under the bound
@@ -364,17 +387,15 @@ pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fie
     let stream_id = stream.id();
     stream.stop_receiving(h3api::NO_ERROR);
 
-    match respond(stream, status, fields, "failed to send error response").await {
-        Responded::Sent => {}
-        Responded::Failed => return,
-        Responded::Expired => {
-            debug!(
-                stream_id,
-                status = status.as_str(),
-                "gave up on an error response the peer would not take"
-            );
-            return;
-        }
+    if !respond(stream, status, fields, "failed to send error response")
+        .await
+        .landed(
+            stream_id,
+            status,
+            "gave up on an error response the peer would not take",
+        )
+    {
+        return;
     }
 
     if let Err(error) = stream.finish() {
@@ -441,16 +462,12 @@ pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields) {
     )
     .await;
 
-    match sent {
-        Responded::Sent => {}
-        Responded::Failed => return,
-        Responded::Expired => {
-            debug!(
-                stream_id,
-                "gave up on a 200 the peer would not take for a tunnel closed on the spot"
-            );
-            return;
-        }
+    if !sent.landed(
+        stream_id,
+        Status::OK,
+        "gave up on a 200 the peer would not take for a tunnel closed on the spot",
+    ) {
+        return;
     }
 
     if let Err(error) = stream.finish() {
