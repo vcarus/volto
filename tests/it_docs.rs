@@ -388,7 +388,7 @@ fn crate_constants() -> BTreeMap<&'static str, u64> {
         ),
         (
             "HEADERS_BUFFER_BUDGET",
-            volto::h3api::HEADERS_BUFFER_BUDGET as u64,
+            volto::h3::HEADERS_BUFFER_BUDGET as u64,
         ),
         (
             "CONNECTION_UNANSWERED_MULTIPLIER",
