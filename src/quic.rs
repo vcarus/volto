@@ -110,6 +110,12 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
     // the arithmetic quoted against it cannot go stale; see [`SEND_WINDOW`].
     transport.send_window(SEND_WINDOW);
 
+    // The other two buffers an unauthenticated peer can fill, pinned at quinn's
+    // own values for the same reason as the window above them; see
+    // [`DATAGRAM_RECEIVE_BUFFER`] and [`CRYPTO_BUFFER_SIZE`].
+    transport.datagram_receive_buffer_size(Some(DATAGRAM_RECEIVE_BUFFER));
+    transport.crypto_buffer_size(CRYPTO_BUFFER_SIZE);
+
     transport.max_idle_timeout(Some(
         IdleTimeout::try_from(limits.max_idle_timeout())
             .context("limits.max_idle_timeout is out of range for QUIC")?,
@@ -150,7 +156,9 @@ fn transport_config(limits: &crate::config::Limits) -> Result<quinn::TransportCo
 
     // QUIC datagram support stays at quinn's default (enabled), which is
     // what makes `max_datagram_frame_size` appear in our transport
-    // parameters. CONNECT-UDP sizes the datagram buffers explicitly.
+    // parameters. What a session does with the datagrams once they are
+    // received is CONNECT-UDP's own bound, `INBOUND_QUEUE_DEPTH`; what the
+    // transport holds before that is [`DATAGRAM_RECEIVE_BUFFER`] above.
 
     transport.congestion_controller_factory(congestion_factory(limits.congestion_control));
 
@@ -1605,6 +1613,40 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// default) in exchange for throughput we cannot measure a need for.
 pub const SEND_WINDOW: u64 = 10_000_000;
 
+/// Inbound QUIC DATAGRAM bytes the transport buffers per connection.
+///
+/// Exactly what quinn already defaults to, and stated here for the reason D47
+/// gives for [`SEND_WINDOW`]: upstream derives it from `STREAM_RWND`, a private
+/// constant inside `TransportConfig::default` with no stability promise, and
+/// Dependabot proposes cargo bumps weekly. A patch release that moved that
+/// constant would move this buffer with it and change what an unauthenticated
+/// peer can make this process hold, silently and without a line of this tree
+/// changing.
+///
+/// It is 1.25 MB per connection, 320 MB across the default `max_connections`,
+/// and every byte of it is reachable before a credential has been seen: quinn
+/// buffers whatever the peer sends, `serve_peer` drains the queue, and before
+/// authentication every datagram in it is routed to the `Unroutable` drop
+/// because the session table is empty. Small next to the 16 MiB of
+/// [`CONNECTION_RECEIVE_WINDOW`] beside it, which is why the value is kept
+/// rather than lowered; what was missing was the pin, not a different number.
+///
+/// Not `None`, which would disable inbound datagrams altogether and with them
+/// CONNECT-UDP, and not a `[limits]` key, for D47's reason: three coupled
+/// numbers that operations can diagnose neither failure mode of.
+const DATAGRAM_RECEIVE_BUFFER: usize = 1_250_000;
+
+/// Out-of-order CRYPTO frame bytes the transport buffers per connection.
+///
+/// Pinned at quinn's own 16 KiB, on the same argument as
+/// [`DATAGRAM_RECEIVE_BUFFER`]: it is held by a peer that has authenticated
+/// nothing, so it belongs in the inventory of what an unauthenticated
+/// connection costs, and an inventory that reads a dependency's private default
+/// is not an inventory. 16 KiB is ample for the one client flight this server
+/// ever reassembles, a ClientHello, which is 1.2 KB and up with a
+/// post-quantum key share.
+const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
+
 /// Descriptors assumed to be needed beyond the tunnel quota: the endpoint
 /// socket, the request streams, stdio, and the certificate reads a reload does.
 pub const FD_HEADROOM: u64 = 64;
@@ -1924,6 +1966,27 @@ mod tests {
         );
     }
 
+    /// The two buffers that used to be inherited really reach the wire.
+    ///
+    /// Both are held by a peer that has authenticated nothing, so what they are
+    /// set to is part of what an unauthenticated connection costs; see
+    /// [`DATAGRAM_RECEIVE_BUFFER`] and [`CRYPTO_BUFFER_SIZE`].
+    #[test]
+    fn the_datagram_and_crypto_buffers_are_stated_rather_than_inherited() {
+        let rendered = transport_debug(&crate::config::Limits::default());
+
+        assert!(
+            rendered.contains(&format!(
+                "datagram_receive_buffer_size: Some({DATAGRAM_RECEIVE_BUFFER})"
+            )),
+            "the inbound datagram buffer must be the pinned 1.25 MB: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("crypto_buffer_size: {CRYPTO_BUFFER_SIZE}")),
+            "the out-of-order CRYPTO buffer must be the pinned 16 KiB: {rendered}"
+        );
+    }
+
     /// quinn's own defaults still agree with what this module says about them.
     ///
     /// The drift alarm covers two different claims, neither of which can change
@@ -1952,6 +2015,19 @@ mod tests {
             "a quinn bump changed the default per-stream receive window: we no longer \
              use it, but STREAM_RECEIVE_WINDOW is justified as a raise above it, so \
              that arithmetic needs re-checking: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "datagram_receive_buffer_size: Some({DATAGRAM_RECEIVE_BUFFER})"
+            )),
+            "a quinn bump changed the default inbound datagram buffer: our pin is \
+             unaffected, but it was chosen as a pin at that default, so the choice \
+             needs re-making rather than inheriting silently: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("crypto_buffer_size: {CRYPTO_BUFFER_SIZE}")),
+            "a quinn bump changed the default CRYPTO reassembly buffer: as above, \
+             our pin holds and the reason for the number needs re-checking: {rendered}"
         );
     }
 
