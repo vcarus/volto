@@ -166,6 +166,51 @@ async fn a_shrinking_max_push_id_is_an_id_error() {
     .await;
 }
 
+/// Closing either of the peer's QPACK streams ends the connection.
+///
+/// RFC 9204 §4.2: "The sender MUST NOT close either of these streams, and the
+/// receiver MUST NOT request that the sender close either of these streams.
+/// Closure of either unidirectional stream type MUST be treated as a connection
+/// error of type H3_CLOSED_CRITICAL_STREAM."
+///
+/// This was deliberately not enforced, and the reason it was not is a race
+/// rather than the rule: a peer tearing a connection down finishes its send
+/// streams and sends CONNECTION_CLOSE in the same breath, and answering an
+/// ordinary goodbye with a protocol error puts a fault in the operator's log.
+/// The control stream answers that with an exemption rather than with silence --
+/// `control_stream_finished` reports nothing once `close_reason` is `Some` --
+/// and the QPACK streams now use the same construction (audit N3).
+///
+/// So what is asserted is the case the exemption does not cover: a peer that
+/// closes one of these streams and leaves the connection up. A reset is the same
+/// verdict by the same rule and reaches it through the sibling arm.
+///
+/// The stream carries no instruction at all, so nothing here can be mistaken for
+/// one of the instruction rules the cases below cover.
+#[tokio::test]
+async fn closing_a_qpack_stream_ends_the_connection() {
+    for (name, stream_type) in [
+        ("encoder", STREAM_QPACK_ENCODER),
+        ("decoder", STREAM_QPACK_DECODER),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        let mut stream = open_uni_stream(&connection, stream_type, &[]).await;
+        stream.finish().expect("finish the QPACK stream");
+
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_CLOSED_CRITICAL_STREAM,
+            "{name}: closing a QPACK stream must be a critical-stream error; reason was {reason:?}"
+        );
+        assert!(
+            reason.contains(name) && reason.contains("closed"),
+            "{name}: the reason {reason:?} does not say which stream ended, or how"
+        );
+    }
+}
+
 /// RFC 9204 §4.3.1 and §3.2.2: with the zero table capacity this server
 /// advertises, any capacity above zero and any insertion is a connection error
 /// on the encoder stream. The third case sends a capacity of zero first, which

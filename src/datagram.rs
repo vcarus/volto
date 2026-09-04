@@ -60,7 +60,7 @@ impl DecodeError {
     /// connection error of type H3_DATAGRAM_ERROR (0x33)". Both are quoted
     /// verbatim, with their machine-readable anchors, where they are acted on --
     /// `h3::connection::route_datagram` -- and this is the pointer to them
-    /// rather than a second copy (D74).
+    /// rather than a second copy (D79).
     ///
     /// A truncated Context ID is deliberately *not* one of them. Nothing in
     /// RFC 9298 §5 says what to do with it, so dropping the datagram is

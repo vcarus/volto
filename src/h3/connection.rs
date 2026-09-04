@@ -872,7 +872,7 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
     //
     // Both are decided by `datagram::decode` and reported by
     // `DecodeError::is_connection_error`; the arm below is where they are
-    // acted on, so this is the one copy of them (D74).
+    // acted on, so this is the one copy of them (D79).
     match datagram::decode(datagram) {
         Ok(decoded) => {
             handle.shared.deliver(decoded);
@@ -1250,6 +1250,43 @@ impl QpackStream {
             Self::Decoder => Code::QPACK_DECODER_STREAM_ERROR,
         }
     }
+
+    /// What to call this stream in a message.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Encoder => "encoder",
+            Self::Decoder => "decoder",
+        }
+    }
+}
+
+/// What an end of one of the peer's QPACK streams means, given `close_reason`.
+///
+/// `detail` says which ending it was, for the message only: RFC 9204 §4.2 makes
+/// a clean finish and a reset the same verdict.
+///
+/// The same rule and the same exemption as [`control_stream_finished`], which
+/// carries the reasoning: a peer tearing a connection down finishes its send
+/// streams and sends CONNECTION_CLOSE in the same breath, and answering an
+/// ordinary goodbye with a protocol error would put a fault in the operator's
+/// log on behalf of a connection there is nothing left to protect.
+fn qpack_stream_ended(
+    detail: String,
+    close_reason: Option<&quinn::ConnectionError>,
+) -> Option<Violation> {
+    if close_reason.is_some() {
+        return None;
+    }
+
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //# The sender MUST NOT close either of these streams, and the receiver
+    //# MUST NOT request that the sender close either of these streams.
+    //# Closure of either unidirectional stream type MUST be treated as a
+    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+    Some(Violation::connection(
+        Code::H3_CLOSED_CRITICAL_STREAM,
+        detail,
+    ))
 }
 
 /// The most continuation bytes an instruction's prefixed integer may run to.
@@ -1272,11 +1309,11 @@ const MAX_INTEGER_CONTINUATION: usize = 9;
 /// of each is ever needed, so the rest of an accepted instruction is read past.
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
-/// connection error of type H3_CLOSED_CRITICAL_STREAM. That is deliberately not
-/// enforced: the streams carry nothing this server acts on, while a client
-/// tearing a connection down may well finish its send streams a moment before
-/// its CONNECTION_CLOSE arrives -- and answering an ordinary goodbye with a
-/// protocol error would turn a race into a fault report in the operator's log.
+/// connection error of type H3_CLOSED_CRITICAL_STREAM, and
+/// [`qpack_stream_ended`] reports it, with the one exemption the control stream
+/// makes for the same race: a connection that has already ended is not
+/// disturbed. Both endings count, a clean finish and a reset alike, which is
+/// what §4.2 says.
 async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
     if kind.seen(&handle.shared).swap(true, Ordering::Relaxed) {
         handle.fail(duplicate("a second QPACK stream of the same kind"));
@@ -1288,7 +1325,33 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
     let mut continuing = false;
     let mut continuation = 0usize;
 
-    while let Ok(Some(chunk)) = recv.read_chunk(usize::MAX, true).await {
+    loop {
+        let chunk = match recv.read_chunk(usize::MAX, true).await {
+            Ok(Some(chunk)) => chunk,
+
+            // The two endings §4.2 forbids. A read error that is the connection
+            // itself ending needs no arm of its own: `close_reason` is `Some`
+            // by then, which is exactly the exemption.
+            Ok(None) => {
+                let detail = format!("the peer closed its QPACK {} stream", kind.name());
+                if let Some(violation) =
+                    qpack_stream_ended(detail, handle.quic.close_reason().as_ref())
+                {
+                    handle.fail(violation);
+                }
+                return;
+            }
+            Err(error) => {
+                let detail = format!("the peer reset its QPACK {} stream: {error}", kind.name());
+                if let Some(violation) =
+                    qpack_stream_ended(detail, handle.quic.close_reason().as_ref())
+                {
+                    handle.fail(violation);
+                }
+                return;
+            }
+        };
+
         for &byte in &chunk.bytes {
             if continuing {
                 continuation += 1;
