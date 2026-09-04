@@ -256,6 +256,47 @@ fn congestion_factory(
 /// await — only long enough to clone the `Arc`.
 type LiveConfig = Arc<RwLock<Arc<Config>>>;
 
+/// Serialises everything that decides what a new connection is accepted with.
+///
+/// Three writes make a reload, the SNI gate's list, the live [`Config`] and the
+/// endpoint's `quinn::ServerConfig`, and a fourth closes the listener at the
+/// start of the drain. Held apart, they are two check-then-act races on the
+/// same state.
+///
+/// The first is [`ReloadHandle::reload`] against [`Server::drain`]: the reload
+/// reads the shutdown latch and then re-opens the listener, so a `SIGTERM`
+/// landing between the two puts the endpoint back to accepting handshakes the
+/// drain has just refused, and quinn's unaccepted `Incoming` queue grows for the
+/// whole grace period. D22 states that this must not happen. The second is the
+/// reload against an accept: a connection taken off `endpoint.accept()` between
+/// two of the three writes runs on one generation's transport parameters and
+/// another's `Authenticator`, `Policy` and quotas for its whole life, which is
+/// the half-applied state the same ADR says there is none of.
+///
+/// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
+/// the values themselves each have their own lock. It is never held across an
+/// await, since `reload` is synchronous throughout and `drain` holds it for one
+/// `set_server_config` call, and the slow half of a reload, parsing the file
+/// and the certificate, happens before it is taken.
+#[derive(Clone)]
+struct ConfigSwap(Arc<Mutex<()>>);
+
+impl ConfigSwap {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(())))
+    }
+
+    /// Holds the swap for as long as the returned guard lives.
+    ///
+    /// Poisoning would mean a panic between two of the writes, which is a
+    /// half-applied reload however the lock is treated; taking the guard anyway
+    /// leaves the next reload able to finish the job, where refusing would
+    /// freeze the configuration for the life of the process.
+    fn hold(&self) -> MutexGuard<'_, ()> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// One connection this endpoint is serving.
 struct Slot {
     /// The peer's address, so the eviction can say whose slot was taken.
@@ -355,27 +396,6 @@ impl Roster {
         )
     }
 
-    /// Evicts the oldest connection that has never authenticated, reporting
-    /// whose slot was taken.
-    ///
-    /// The victim is removed from the roster here rather than by its own task,
-    /// so that a burst of accepts at the cap evicts successive connections
-    /// instead of picking the same one over and over while it winds down.
-    /// `None` means every live connection has authenticated.
-    fn evict_oldest_unauthenticated(&self) -> Option<SocketAddr> {
-        let mut slots = self.slots();
-
-        let sequence = *slots
-            .iter()
-            .find(|(_, slot)| !slot.authenticated.is_open())
-            .map(|(sequence, _)| sequence)?;
-
-        let slot = slots.remove(&sequence)?;
-        slot.evict.notify_one();
-
-        Some(slot.remote)
-    }
-
     /// Evicts until the roster is below `cap`, naming the victims in the order
     /// they were taken.
     ///
@@ -395,11 +415,20 @@ impl Roster {
     /// what the unit tests run is what the server runs (audit follow-up
     /// 2026-08-24): the tests used to walk a copy of it, and changing the
     /// server's own loop back to a single eviction left every one of them green.
+    ///
+    /// One guard for the whole loop rather than two acquisitions per pass. With
+    /// the lock taken and released between the length read and the eviction, a
+    /// connection ending on another thread in that window left the roster below
+    /// the cap and the next pass evicted somebody who no longer had to go: one
+    /// extra unauthenticated connection dropped from a population that is
+    /// already churning. Benign, and recorded as F2 of D96 with the instruction
+    /// to fix it the next time this file changed.
     fn evict_until_below(&self, cap: usize) -> Vec<SocketAddr> {
         let mut victims = Vec::new();
+        let mut slots = self.slots();
 
-        while self.len() >= cap {
-            let Some(victim) = self.evict_oldest_unauthenticated() else {
+        while slots.len() >= cap {
+            let Some(victim) = evict_oldest_from(&mut slots) else {
                 break;
             };
             victims.push(victim);
@@ -407,6 +436,28 @@ impl Roster {
 
         victims
     }
+}
+
+/// Takes the oldest never-authenticated connection out of `slots` and ends it.
+///
+/// The victim is removed from the roster here rather than by its own task, so
+/// that a burst of accepts at the cap evicts successive connections instead of
+/// picking the same one over and over while it winds down. `None` means every
+/// entry left has authenticated.
+///
+/// A free function over the guard rather than a method that takes its own, so
+/// that [`Roster::evict_until_below`] can run it repeatedly under one guard and
+/// the roster's own tests can run exactly what the server runs.
+fn evict_oldest_from(slots: &mut BTreeMap<u64, Slot>) -> Option<SocketAddr> {
+    let sequence = *slots
+        .iter()
+        .find(|(_, slot)| !slot.authenticated.is_open())
+        .map(|(sequence, _)| sequence)?;
+
+    let slot = slots.remove(&sequence)?;
+    slot.evict.notify_one();
+
+    Some(slot.remote)
 }
 
 /// A connection's place on the [`Roster`], given up when its task ends.
@@ -455,6 +506,8 @@ pub struct Server {
     /// under the endpoint, on a socket that a reload cannot rebind, so the list
     /// is the only part of it a `SIGHUP` can move (D106).
     expected: Expected,
+    /// Orders a reload against the drain and against itself; see [`ConfigSwap`].
+    swap: ConfigSwap,
     /// Fires the graceful shutdown. Handed to whoever watches for signals.
     trigger: Trigger,
     /// The other end of the same latch, cloned into every connection.
@@ -531,6 +584,7 @@ impl Server {
             roster: Roster::new(),
             resolver: crate::net::ResolverBudget::new(),
             expected,
+            swap: ConfigSwap::new(),
             trigger,
             shutdown,
         })
@@ -552,6 +606,7 @@ impl Server {
             config: self.config.clone(),
             shutdown: self.shutdown.clone(),
             expected: self.expected.clone(),
+            swap: self.swap.clone(),
             listen: self.listen,
         }
     }
@@ -1039,7 +1094,16 @@ impl Server {
         // Stop new handshakes at the source. Packets for existing connections are
         // unaffected; a client that arrives now sees the port as closed and can
         // fail over immediately rather than after a timeout.
+        //
+        // Under the swap, because the latch this drain runs on is read by
+        // `ReloadHandle::reload` as a plain predicate: without it a reload that
+        // had already passed that read would install a server configuration
+        // after this line and re-open the listener for the whole grace period.
+        // Dropped explicitly and at once: it is a `std::sync::Mutex` guard and
+        // the wait below is an await, so it must not still be alive there.
+        let swapping = self.swap.hold();
         self.endpoint.set_server_config(None);
+        drop(swapping);
 
         let grace = self.config().server.shutdown_grace();
         info!(
@@ -1159,6 +1223,9 @@ pub struct ReloadHandle {
     shutdown: Shutdown,
     /// The SNI gate's list, which is swapped with the rest (D106).
     expected: Expected,
+    /// The server's own, so a reload and the drain cannot interleave their
+    /// writes; see [`ConfigSwap`].
+    swap: ConfigSwap,
     /// The `[server] listen` the endpoint was bound with, for the one key a
     /// reload has to say it is ignoring.
     listen: SocketAddr,
@@ -1179,6 +1246,15 @@ impl ReloadHandle {
         let quic_config = server_config(&config)
             .context("the new configuration's certificate and key are not usable")?;
 
+        // Everything from the latch read to the last write is one step, and the
+        // drain takes the same lock around its own `set_server_config`. Held
+        // here rather than only around the writes because the latch is a
+        // check-then-act: reading it and then re-opening the listener is
+        // precisely the race D22 forbids. The parsing above is deliberately
+        // outside it, so a `SIGHUP` with a large certificate cannot delay a
+        // drain that is waiting for this.
+        let _swapping = self.swap.hold();
+
         // A reload during shutdown must not re-open the listener that `drain` just
         // closed. Refusing is safer than racing it.
         if self.shutdown.is_fired() {
@@ -1187,16 +1263,28 @@ impl ReloadHandle {
 
         // Past this point nothing can fail, so the swaps cannot half-apply.
         //
-        // The gate's list goes first, and deliberately: between the two writes
-        // the socket admits the new set of names while the endpoint still holds
-        // the old certificate, which is a handshake that gets as far as the TLS
-        // layer and is refused there. The other order would have the endpoint
-        // present the new certificate to a name the socket still drops, which is
-        // the same refusal with the reply removed -- and the gate's whole point
-        // is that a name it does not know gets no reply at all.
+        // The gate's list goes first, and deliberately: between it and the
+        // endpoint's own configuration the socket admits the new set of names
+        // while the endpoint still holds the old certificate, which is a
+        // handshake that gets as far as the TLS layer and is refused there. The
+        // other order would have the endpoint present the new certificate to a
+        // name the socket still drops, which is the same refusal with the reply
+        // removed -- and the gate's whole point is that a name it does not know
+        // gets no reply at all.
+        //
+        // The live `Config` goes before `set_server_config` for the same kind of
+        // reason. `Server::serve` snapshots it per connection without taking
+        // this lock, so an accept landing between the two still sees one
+        // generation's transport parameters beside the other's `Authenticator`,
+        // `Policy` and quotas. In this order the half that is new is the half
+        // that decides who gets in: a credential the reload revoked is refused
+        // on that connection, and a destination it opened is reachable. In the
+        // other order the endpoint presented the new certificate and the
+        // connection kept the old users for its whole life, which is the tear
+        // worth avoiding.
         self.expected.set(Names::new(&config.security.expected_sni));
-        self.endpoint.set_server_config(Some(quic_config));
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
+        self.endpoint.set_server_config(Some(quic_config));
 
         info!(
             path = %path.display(),
@@ -1608,7 +1696,184 @@ pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
     use proptest::prelude::*;
+
+    /// How long a thread blocked on the swap is given to prove it is blocked.
+    ///
+    /// Nothing in the green direction depends on it: a reload waiting for the
+    /// lock waits for as long as the test holds it. It is there for the red
+    /// direction, where a reload that does not take the lock has to have
+    /// finished before the assertions run, and parsing a configuration file and
+    /// a certificate is milliseconds.
+    const SETTLE: Duration = Duration::from_millis(300);
+
+    /// A bound server, and the files it was built from so a reload has
+    /// something new to read.
+    struct Bound {
+        server: Server,
+        config_path: PathBuf,
+        cert: PathBuf,
+        key: PathBuf,
+    }
+
+    /// Writes a configuration file naming `cert` and `key`, with `extra` after
+    /// the `[server]` keys.
+    fn write_config(path: &Path, cert: &Path, key: &Path, extra: &str) {
+        std::fs::write(
+            path,
+            format!(
+                "[server]\nlisten = \"127.0.0.1:0\"\ncert = {:?}\nkey = {:?}\n{extra}",
+                cert.display().to_string(),
+                key.display().to_string(),
+            ),
+        )
+        .expect("write the configuration file");
+    }
+
+    /// Binds a real endpoint on an ephemeral loopback port.
+    ///
+    /// The reload race is between [`Server::drain`] and
+    /// [`ReloadHandle::reload`], and both of those are methods on the real
+    /// thing, so the test drives the real thing: a certificate on disk, a
+    /// configuration file `reload` can re-read, and an endpoint whose server
+    /// configuration those two write.
+    fn bound_server(extra: &str) -> Bound {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("a self-signed certificate");
+
+        // Distinct per call, not per instant: two tests minting in the same
+        // microsecond would otherwise share a directory.
+        static MINTED: AtomicU64 = AtomicU64::new(0);
+        let serial = MINTED.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("volto-quic-test-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the directory");
+
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
+        std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
+
+        let config_path = dir.join("config.toml");
+        write_config(&config_path, &cert, &key, extra);
+        let config = Config::load(&config_path).expect("the test configuration loads");
+
+        Bound {
+            server: Server::bind(Arc::new(config)).expect("bind the test endpoint"),
+            config_path,
+            cert,
+            key,
+        }
+    }
+
+    /// Starts a reload on its own thread, and answers when it has begun.
+    fn reload_on_another_thread(
+        handle: ReloadHandle,
+        path: PathBuf,
+    ) -> std::thread::JoinHandle<Result<Arc<Config>>> {
+        let (started, has_started) = std::sync::mpsc::channel();
+        let reloading = std::thread::spawn(move || {
+            started.send(()).expect("announce the reload");
+            handle.reload(&path)
+        });
+        has_started.recv().expect("the reload thread started");
+        std::thread::sleep(SETTLE);
+        reloading
+    }
+
+    /// A reload that has not got the swap yet has applied none of its writes.
+    ///
+    /// The three are the SNI gate's list, the live `Config` and the endpoint's
+    /// server configuration, and a connection accepted between any two of them
+    /// runs on one generation's transport parameters beside another's
+    /// credentials and policy for its whole life. Under the swap they are one
+    /// step, which is what D22 means by no half-applied state.
+    #[tokio::test]
+    async fn a_reload_applies_none_of_its_writes_before_it_has_the_swap() {
+        let bound = bound_server(
+            "[limits]\nmax_streams_bidi = 64\n\
+             [security]\nexpected_sni = [\"localhost\"]\n",
+        );
+        write_config(
+            &bound.config_path,
+            &bound.cert,
+            &bound.key,
+            "[limits]\nmax_streams_bidi = 32\n\
+             [security]\nexpected_sni = [\"other.example\"]\n",
+        );
+
+        let swapping = bound.server.swap.hold();
+        let reloading =
+            reload_on_another_thread(bound.server.reload_handle(), bound.config_path.clone());
+
+        assert_eq!(
+            bound.server.config().limits.max_streams_bidi,
+            64,
+            "a reload waiting for the swap must not have replaced the live configuration"
+        );
+        assert!(
+            bound.server.expected.current().accepts("localhost"),
+            "nor the gate's list"
+        );
+        assert!(
+            !bound.server.expected.current().accepts("other.example"),
+            "nor the gate's list"
+        );
+
+        drop(swapping);
+        reloading
+            .join()
+            .expect("the reload thread")
+            .expect("the reload applies once the swap is free");
+
+        assert_eq!(bound.server.config().limits.max_streams_bidi, 32);
+        assert!(bound.server.expected.current().accepts("other.example"));
+    }
+
+    /// A reload cannot re-open the listener the drain has just closed.
+    ///
+    /// D22: "a listener that `drain` has just closed must not be reopened".
+    /// `reload` reads the shutdown latch and then writes, so before the swap a
+    /// `SIGTERM` landing between the two put the endpoint back to accepting
+    /// handshakes for the whole grace period, with quinn's unaccepted
+    /// `Incoming` queue growing behind it. The sequential case is
+    /// `it_reload::a_reload_during_the_shutdown_drain_is_refused`; this is the
+    /// racing one, made deterministic by holding the swap the drain holds.
+    #[tokio::test]
+    async fn a_reload_racing_the_drain_cannot_reopen_the_listener() {
+        let bound = bound_server("[limits]\nmax_streams_bidi = 64\n");
+        write_config(
+            &bound.config_path,
+            &bound.cert,
+            &bound.key,
+            "[limits]\nmax_streams_bidi = 32\n",
+        );
+
+        let swapping = bound.server.swap.hold();
+        let reloading =
+            reload_on_another_thread(bound.server.reload_handle(), bound.config_path.clone());
+
+        // What `Server::drain` does under this same guard, in its order.
+        bound.server.endpoint.set_server_config(None);
+        bound.server.trigger.fire();
+        drop(swapping);
+
+        let error = reloading
+            .join()
+            .expect("the reload thread")
+            .expect_err("a reload that resumes after the drain must be refused");
+        assert!(
+            format!("{error:#}").contains("shutting down"),
+            "the refusal must say why: {error:#}"
+        );
+        assert_eq!(
+            bound.server.config().limits.max_streams_bidi,
+            64,
+            "a refused reload changes nothing"
+        );
+    }
 
     /// Renders the built transport parameters for inspection.
     ///
@@ -2112,7 +2377,7 @@ mod tests {
         let roster = Roster::new();
         let (evict, _registration) = roster.register(peer(0), AuthGate::closed());
 
-        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+        assert_eq!(evict_oldest_from(&mut roster.slots()), Some(peer(0)));
 
         // Nothing was awaiting the signal when it was sent, and it is still
         // there to be collected.
@@ -2156,7 +2421,7 @@ mod tests {
         assert_eq!(first.as_mut().poll(&mut cx), Poll::Pending);
 
         // The eviction arrives while it is parked, and is handed to it.
-        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+        assert_eq!(evict_oldest_from(&mut roster.slots()), Some(peer(0)));
 
         // The other arm of that `select!` wins the wake-up: this one is dropped
         // without ever being polled again.
@@ -2189,11 +2454,11 @@ mod tests {
 
         // The oldest is evicted, and its guard is dropped afterwards: the entry
         // is already gone, and the drop must not reach the third connection's.
-        assert_eq!(roster.evict_oldest_unauthenticated(), Some(peer(0)));
+        assert_eq!(evict_oldest_from(&mut roster.slots()), Some(peer(0)));
         drop(parked.remove(0));
         assert_eq!(roster.len(), 1);
         assert_eq!(
-            roster.evict_oldest_unauthenticated(),
+            evict_oldest_from(&mut roster.slots()),
             Some(peer(2)),
             "the survivor must be the one nobody gave up"
         );
