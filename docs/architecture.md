@@ -588,7 +588,9 @@ at the floor re-triggers the detector and pushes the next probe out again, so th
 MTU stays there for as long as the transfer lasts. That branch was also missing
 two comparison fixes that upstream had landed on `main` only.
 
-The pinned commit, `f650e0f`, is the `quinn-proto-0.11.17` tag plus four fixes.
+The pinned commit, `48455d3`, is the `quinn-proto-0.11.17` tag plus five fixes
+(and two unrelated backports the branch picked up in between: ACK frames
+bundled into DATAGRAM/STREAM packets, and a minimum-RTT path statistic).
 Three are in `quinn-proto/src/connection/mtud.rs`, brought to `0.11.x` by
 [quinn-rs/quinn#2799](https://github.com/quinn-rs/quinn/pull/2799):
 
@@ -607,9 +609,17 @@ ends in a panic inside `send_datagram` while the connection lock is held. The
 bug is [#2805](https://github.com/quinn-rs/quinn/issues/2805) and the fix
 [#2806](https://github.com/quinn-rs/quinn/pull/2806), landed on `0.11.x`.
 
+The fifth is in `quinn-proto/src/endpoint.rs`: a datagram carrying an
+unsupported QUIC version elicited a Version Negotiation packet whatever its
+size, where RFC 9000 Section 5.2.2 says servers MUST drop the small ones. A
+spoofed 15-byte probe therefore got a larger reply, an amplification vector
+aimed squarely at the port scanner the SNI gate exists to defeat. The fix is
+[#2822](https://github.com/quinn-rs/quinn/pull/2822) on `main`, backported to
+`0.11.x` by [#2823](https://github.com/quinn-rs/quinn/pull/2823).
+
 No 0.11.x *release* carries these yet, which is why the stanza pins a commit
 rather than a version. Because that commit's version *is* the upstream tag,
-anything true of quinn-proto 0.11.17 is true here except those four fixes.
+anything true of quinn-proto 0.11.17 is true here except those five fixes.
 
 **Exit condition:** drop the stanza as soon as a quinn-proto 0.11.x release
 includes the fix, then `cargo update -p quinn-proto` and remove the CI audit
