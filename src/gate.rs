@@ -85,7 +85,7 @@ use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::task::{Context, Poll};
 
 use bytes::BytesMut;
@@ -245,14 +245,8 @@ impl Expected {
 pub struct Gate {
     inner: Arc<dyn AsyncUdpSocket>,
     expected: Expected,
-    /// The source of Initial keys.
-    ///
-    /// Held from bind time and never reloaded, because the initial secrets do
-    /// not depend on the certificate: RFC 9001 §5.2 derives them from the
-    /// Destination Connection ID in the client's own packet and a salt fixed by
-    /// the version. What a `SIGHUP` can change — the certificate, the key — is
-    /// not an input to any of it.
-    crypto: Arc<dyn quinn::crypto::ServerConfig>,
+    /// Everything that decides, which is everything that is not the socket.
+    judge: Judge,
 }
 
 impl Gate {
@@ -265,13 +259,13 @@ impl Gate {
         Self {
             inner,
             expected,
-            crypto,
+            judge: Judge { crypto },
         }
     }
 
     /// Judges one datagram and blinds it if it is refused.
     fn screen(&self, remote: SocketAddr, datagram: &mut [u8], expected: &Names) {
-        let Verdict::Refuse(refusal) = self.judge(datagram, expected) else {
+        let Verdict::Refuse(refusal) = self.judge.judge(datagram, expected) else {
             return;
         };
 
@@ -303,7 +297,27 @@ impl Gate {
 
         blind(datagram);
     }
+}
 
+/// The half of the gate that decides, held by [`Gate`] and needing no socket.
+///
+/// Separate from the socket because none of it reads one: a verdict is a
+/// function of the datagram's bytes, the list in force and the Initial keys.
+/// So judging is reachable without a bound port — by a unit test, and through
+/// the [`judgement`] seam by a fuzz target — and the receive path is left as the
+/// only thing that has to know about batches, strides and blinding.
+struct Judge {
+    /// The source of Initial keys.
+    ///
+    /// Held from bind time and never reloaded, because the initial secrets do
+    /// not depend on the certificate: RFC 9001 §5.2 derives them from the
+    /// Destination Connection ID in the client's own packet and a salt fixed by
+    /// the version. What a `SIGHUP` can change — the certificate, the key — is
+    /// not an input to any of it.
+    crypto: Arc<dyn quinn::crypto::ServerConfig>,
+}
+
+impl Judge {
     /// What should happen to one datagram.
     fn judge(&self, datagram: &[u8], expected: &Names) -> Verdict {
         let Some(&first) = datagram.first() else {
@@ -496,8 +510,9 @@ enum Opened {
 }
 
 impl fmt::Debug for Gate {
-    /// Hand-written because neither the inner socket's crypto configuration nor
-    /// the trait object holding it is `Debug`, and `AsyncUdpSocket` requires one.
+    /// Hand-written because neither the crypto configuration the judge holds
+    /// nor the trait object holding it is `Debug`, and `AsyncUdpSocket` requires
+    /// one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Gate")
             .field("inner", &self.inner)
@@ -566,8 +581,13 @@ impl AsyncUdpSocket for Gate {
 }
 
 /// What the gate decided about one datagram.
+///
+/// Public, and hidden, for the one caller outside this module: the fuzz target
+/// behind [`judgement`] has to be able to say which verdict it got. Nothing in
+/// this crate names it.
+#[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
-enum Verdict {
+pub enum Verdict {
     /// Hand it to quinn unchanged.
     Pass,
     /// Make quinn's decoder throw it away.
@@ -575,8 +595,11 @@ enum Verdict {
 }
 
 /// Why a datagram was refused, in the words its log line uses.
+///
+/// Hidden, and public for the same reason [`Verdict`] is.
+#[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
-enum Refusal {
+pub enum Refusal {
     /// A long header naming a QUIC version this server does not speak.
     Version(u32),
     /// A first flight that does not begin with a ClientHello.
@@ -752,8 +775,12 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 }
 
 /// What a first flight's CRYPTO bytes said about the name being asked for.
+///
+/// Hidden, and public for the same reason [`Verdict`] is: [`first_flight`] hands
+/// it to a fuzz target.
+#[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
-enum FirstFlight {
+pub enum FirstFlight {
     /// The ClientHello is not all here yet.
     Truncated,
     /// The first handshake message is something other than a ClientHello.
@@ -888,6 +915,83 @@ impl<'a> Reader<'a> {
     fn vector16(&mut self) -> Option<&'a [u8]> {
         let length = usize::from(self.u16()?);
         self.take(length)
+    }
+}
+
+// The two seams `fuzz/fuzz_targets/gate.rs` reaches this module through (D83).
+//
+// Everything above judges bytes an internet scanner chose, before any peer has
+// authenticated and before quinn has seen them, which is exactly the shape a
+// coverage-guided fuzzer is for. Neither seam is an entry point of its own:
+// each calls the function the socket path calls, so a finding here is a finding
+// in what the server runs.
+
+/// The gate's verdict on one datagram, for the fuzz target.
+///
+/// This is `Gate::screen`'s own `Judge::judge`, over a judge built once per
+/// process, so the judgement a fuzzer explores is the judgement a received
+/// datagram gets — the socket, the batch walk and the blinding are the only
+/// parts left out, and none of them is a parser.
+///
+/// Hidden rather than API: nothing outside `fuzz/` has any reason to call it,
+/// and nothing in this crate does.
+#[doc(hidden)]
+pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
+    static JUDGE: OnceLock<Judge> = OnceLock::new();
+    JUDGE.get_or_init(nameless_judge).judge(datagram, expected)
+}
+
+/// What a first flight's CRYPTO bytes name, for the fuzz target.
+///
+/// The ClientHello reader (`client_hello_name` and the `Reader` under it) is
+/// the hand-written TLS parsing in this module, and the only way to reach it
+/// through [`judgement`] is to spell a whole Initial packet that authenticates
+/// — which a fuzzer cannot do by luck. So it is also offered on its own, with
+/// the CRYPTO bytes handed over directly.
+#[doc(hidden)]
+pub fn first_flight(crypto: &[u8]) -> FirstFlight {
+    client_hello_name(crypto)
+}
+
+/// A judge over a TLS configuration with no identity at all.
+///
+/// Initial keys come from the client's Destination Connection ID and a salt
+/// fixed by the version (RFC 9001 §5.2, quoted at `Judge::decrypt`), never
+/// from the server's certificate — which is what `Judge::crypto` already rests
+/// on for `SIGHUP`. So a configuration carrying no certificate derives exactly
+/// the keys the running server derives, and the fuzz target needs no key
+/// material, no file and no clock to open the packets the real gate opens. The
+/// resolver is never asked for anything: nothing here starts a TLS session.
+///
+/// The panics are unreachable in the only build that calls this, and would be a
+/// crypto provider without TLS 1.3 — the same condition [`crate::tls`] turns
+/// into a startup error.
+fn nameless_judge() -> Judge {
+    /// A resolver with nothing to present.
+    #[derive(Debug)]
+    struct NoIdentity;
+
+    impl rustls::server::ResolvesServerCert for NoIdentity {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("the aws-lc-rs crypto provider supports TLS 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(NoIdentity));
+
+    Judge {
+        crypto: Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+                .expect("a TLS 1.3 configuration carries an initial cipher suite"),
+        ),
     }
 }
 
@@ -1171,16 +1275,6 @@ mod tests {
         )
     }
 
-    /// A gate over a socket nothing will ever send to, for judging datagrams.
-    async fn gate(crypto: Arc<dyn quinn::crypto::ServerConfig>) -> Gate {
-        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket");
-        let inner = quinn::default_runtime()
-            .expect("a runtime")
-            .wrap_udp_socket(socket)
-            .expect("wrap the socket");
-        Gate::new(inner, Expected::new(Names::new(&[])), crypto)
-    }
-
     /// A CRYPTO frame at offset 0 carrying `data`.
     fn crypto_frame(data: &[u8]) -> Vec<u8> {
         let mut frame = vec![0x06, 0x00];
@@ -1242,22 +1336,24 @@ mod tests {
 
     /// The control: a first packet, keyed by its own Destination Connection
     /// ID, is opened and judged by the name it carries.
-    #[tokio::test]
-    async fn a_first_initial_is_opened_under_its_own_keys() {
+    #[test]
+    fn a_first_initial_is_opened_under_its_own_keys() {
         let crypto = throwaway_crypto();
-        let gate = gate(crypto.clone()).await;
+        let judge = Judge {
+            crypto: crypto.clone(),
+        };
         let names = Names::new(&["localhost".to_owned()]);
 
         let hello = client_hello(&sni_extension("other.example"));
         let stranger = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
         assert_eq!(
-            gate.judge(&stranger, &names),
+            judge.judge(&stranger, &names),
             Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned()))
         );
 
         let hello = client_hello(&sni_extension("localhost"));
         let ours = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
-        assert_eq!(gate.judge(&ours, &names), Verdict::Pass);
+        assert_eq!(judge.judge(&ours, &names), Verdict::Pass);
     }
 
     /// A later Initial of an admitted handshake cannot be opened here, and
@@ -1265,22 +1361,126 @@ mod tests {
     /// Finished rides in the same datagram, and blinding it costs the
     /// handshake a probe timeout. Seen on a production host on 2026-09-03 as
     /// every handshake's RTT stuck at the configured initial estimate.
-    #[tokio::test]
-    async fn a_later_initial_keyed_by_the_first_packet_is_not_a_stranger() {
+    #[test]
+    fn a_later_initial_keyed_by_the_first_packet_is_not_a_stranger() {
         let crypto = throwaway_crypto();
-        let gate = gate(crypto.clone()).await;
+        let judge = Judge {
+            crypto: crypto.clone(),
+        };
         let names = Names::new(&["localhost".to_owned()]);
 
         // An acknowledgement of the server's Initial: ACK frame for packet 0.
         let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
         let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &ack);
-        assert_eq!(gate.judge(&later, &names), Verdict::Pass);
+        assert_eq!(judge.judge(&later, &names), Verdict::Pass);
 
         // Even one that looks like a stranger's ClientHello once opened under
         // the wrong keys cannot be told from an acknowledgement without the
         // connection's state; quinn, which has it, is the one to judge.
         let hello = client_hello(&sni_extension("other.example"));
         let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &crypto_frame(&hello));
-        assert_eq!(gate.judge(&later, &names), Verdict::Pass);
+        assert_eq!(judge.judge(&later, &names), Verdict::Pass);
+    }
+
+    /// Writes the seed corpus for `fuzz/fuzz_targets/gate.rs`, and pins it.
+    ///
+    /// A fuzzer cannot spell an Initial packet that authenticates, so without
+    /// seeds the target would explore the header parser and nothing behind it.
+    /// These are five datagrams — one per branch the judgement can end on — and
+    /// two bare ClientHellos, written where `cargo fuzz run gate` looks for
+    /// them. `fuzz/corpus/` is machine-local and gitignored (D83), so this runs
+    /// with every `cargo test` rather than leaving the corpus to a step
+    /// somebody has to remember; each file carries the target's mode byte in
+    /// front of the bytes under test.
+    ///
+    /// The assertions are the other half of it. They pin what each seed is a
+    /// seed *for*, so a verdict that moves is a red test rather than a corpus
+    /// that quietly stops covering anything — and they pin the claim
+    /// [`nameless_judge`] rests on, since these packets are built under a real
+    /// self-signed certificate and opened here by a configuration that has
+    /// none. Initial keys do not depend on the certificate; if they ever did,
+    /// both of the refusals below would fall through to [`Verdict::Pass`].
+    #[test]
+    fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
+        /// The target's mode byte for a whole datagram.
+        const AS_A_DATAGRAM: u8 = 0x00;
+        /// The target's mode byte for bare CRYPTO bytes.
+        const AS_CRYPTO_BYTES: u8 = 0x01;
+
+        let crypto = throwaway_crypto();
+        // The list the target configures for mode byte `AS_A_DATAGRAM`.
+        let names = Names::new(&["localhost".to_owned()]);
+
+        let ours = client_hello(&sni_extension("localhost"));
+        let stranger = client_hello(&sni_extension("other.example"));
+        let anonymous = client_hello(&[]);
+        let cut = ours[..ours.len() - 4].to_vec();
+        // An acknowledgement of the server's Initial, keyed by the client's
+        // first packet: the shape v0.9.1 stopped refusing.
+        let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
+
+        let datagrams = [
+            (
+                "a-name-we-answer-to",
+                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&ours)),
+                Verdict::Pass,
+            ),
+            (
+                "a-name-we-do-not",
+                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&stranger)),
+                Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned())),
+            ),
+            (
+                "no-server-name",
+                initial(
+                    &*crypto,
+                    &CLIENT_CID,
+                    &CLIENT_CID,
+                    &crypto_frame(&anonymous),
+                ),
+                Verdict::Refuse(Refusal::Anonymous),
+            ),
+            (
+                "a-client-hello-cut-short",
+                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&cut)),
+                Verdict::Pass,
+            ),
+            (
+                "a-second-flight-initial",
+                initial(&*crypto, &SERVER_CID, &CLIENT_CID, &ack),
+                Verdict::Pass,
+            ),
+        ];
+
+        let crypto_bytes = [
+            (
+                "crypto-a-whole-client-hello",
+                ours.clone(),
+                FirstFlight::Named(b"localhost".to_vec()),
+            ),
+            (
+                "crypto-a-client-hello-cut-short",
+                cut.clone(),
+                FirstFlight::Truncated,
+            ),
+        ];
+
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/gate");
+        std::fs::create_dir_all(&directory).expect("a corpus directory to write seeds into");
+        let seed = |name: &str, mode: u8, body: &[u8]| {
+            let mut file = Vec::with_capacity(1 + body.len());
+            file.push(mode);
+            file.extend_from_slice(body);
+            std::fs::write(directory.join(name), file).expect("a seed file");
+        };
+
+        for (name, datagram, verdict) in datagrams {
+            assert_eq!(judgement(&datagram, &names), verdict, "the seed {name}");
+            seed(name, AS_A_DATAGRAM, &datagram);
+        }
+        for (name, bytes, flight) in crypto_bytes {
+            assert_eq!(first_flight(&bytes), flight, "the seed {name}");
+            seed(name, AS_CRYPTO_BYTES, &bytes);
+        }
     }
 }
