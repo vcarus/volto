@@ -19,6 +19,12 @@ use rustls::sign::CertifiedKey;
 use crate::config;
 use crate::gate::Names;
 
+/// What an operator is told when the two configured files do not pair up.
+///
+/// Written once so the gate-on and the gate-off branch of [`server_crypto`]
+/// cannot report the same failure in two wordings.
+const UNUSABLE_PAIR: &str = "server.cert and server.key do not form a usable certificate/key pair";
+
 /// Builds the rustls server configuration.
 ///
 /// Called again on `SIGHUP`, which is how a renewed certificate is picked up: the
@@ -56,10 +62,9 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
     let mut crypto = if names.is_empty() {
         builder
             .with_single_cert(certs, key)
-            .context("server.cert and server.key do not form a usable certificate/key pair")?
+            .context(UNUSABLE_PAIR)?
     } else {
-        let certified = CertifiedKey::from_der(certs, key, &provider)
-            .context("server.cert and server.key do not form a usable certificate/key pair")?;
+        let certified = CertifiedKey::from_der(certs, key, &provider).context(UNUSABLE_PAIR)?;
         builder.with_cert_resolver(Arc::new(OneOfTheseNames {
             names,
             certified: Arc::new(certified),
