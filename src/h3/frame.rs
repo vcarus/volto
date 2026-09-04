@@ -167,6 +167,16 @@ const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 /// Longest frame header there can be: a type and a length, both varints.
 const MAX_FRAME_HEADER: usize = 2 * super::VARINT_MAX_LEN;
 
+/// Why a stream carrying a tunnel is closed when a frame that is not DATA
+/// arrives on it.
+///
+/// Two places refuse that frame: [`misplaced`] here, which is the judgement a
+/// request stream's reader acts on, and the arm in `super::stream` that repeats
+/// the verdict for a decoder already in tunnel mode. Both name the same rule,
+/// so both name it with the same words.
+pub(super) const NON_DATA_FRAME_ON_A_TUNNEL: &str =
+    "a frame other than DATA once the CONNECT method had completed";
+
 /// How many reserved or unknown frames one request stream may make this server
 /// skip before it is a stream error of type H3_EXCESSIVE_LOAD.
 ///
@@ -196,9 +206,9 @@ const MAX_FRAME_HEADER: usize = 2 * super::VARINT_MAX_LEN;
 /// another stream's request. The value is generous on purpose: a real client
 /// greases with a handful of small frames, so several thousand leaves orders of
 /// magnitude of headroom while still bounding the count. The refusal is a
-/// *stream* error, so only the one request
-/// is lost -- §10.5's "false positives" caution is why this is not a connection
-/// error and why the limit is nowhere near what a client could reach.
+/// *stream* error, so only the one request is lost -- §10.5's "false positives"
+/// caution is why this is not a connection error and why the limit is nowhere
+/// near what a client could reach.
 const MAX_SKIPPED_FRAMES: u32 = 4096;
 
 /// What one connection may hold in `FrameDecoder` payload buffers, as a
@@ -1017,9 +1027,7 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
         // same section rather than by reopening it.
         StreamKind::Tunnel => match kind {
             DATA => None,
-            _ if BufferedKind::from_type(kind).is_some() => {
-                Some("a frame other than DATA once the CONNECT method had completed")
-            }
+            _ if BufferedKind::from_type(kind).is_some() => Some(NON_DATA_FRAME_ON_A_TUNNEL),
             _ => None,
         },
     }

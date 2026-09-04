@@ -1044,7 +1044,7 @@ impl Reader {
                     return Err(self.report(
                         Violation::connection(
                             Code::H3_FRAME_UNEXPECTED,
-                            "a frame other than DATA once the CONNECT method had completed",
+                            frame::NON_DATA_FRAME_ON_A_TUNNEL,
                         )
                         .into(),
                     ));
