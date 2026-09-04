@@ -340,6 +340,30 @@ enum LookupSlot {
     },
 }
 
+/// Whether this host holds `ip`, meaning a socket of this process may be bound
+/// to it.
+///
+/// One `bind(2)` on a UDP socket at an ephemeral port, and the socket is dropped
+/// on the way out. The kernel answers `EADDRNOTAVAIL` for an address no local
+/// interface carries and succeeds for one it does, on both Linux and macOS, so
+/// this asks the kernel the question directly. There is no interface
+/// enumeration in `std` to ask instead.
+///
+/// Nothing is cached. The call is on the tunnel-open path, which is per request
+/// and never per packet, an interface can come and go while the server runs, and
+/// a cache would need invalidating by an event this process has no portable way
+/// to see.
+///
+/// An error that is not "this address is not ours", an empty descriptor table
+/// or an exhausted ephemeral port range, answers `false` as well. That is D89's
+/// rule: local exhaustion is this proxy's own fault and must not turn into a
+/// verdict about the target. The tunnel that follows fails on its own socket a
+/// moment later and reports `proxy_internal_error`, which is the truthful
+/// answer.
+pub fn holds_address(ip: std::net::IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
 /// The process's soft limit on open file descriptors, or `None` if it has none.
 ///
 /// Every tunnel holds one, so this is the ceiling the tunnel quota has to fit
@@ -757,6 +781,25 @@ mod tests {
         assert!(
             fd_soft_limit().is_none_or(|limit| limit > 0),
             "a process with no descriptors could not run this"
+        );
+    }
+
+    /// The two answers the bind probe has to get right, on every host this
+    /// crate runs on.
+    ///
+    /// 127.0.0.1 is held by any host that can run this test at all. 192.0.2.1 is
+    /// RFC 5737's TEST-NET-1, reserved for documentation, so no interface
+    /// carries it and `bind` has nothing to bind to. A host that did carry it
+    /// would be misconfigured in a way this test is right to report.
+    #[test]
+    fn the_bind_probe_tells_this_hosts_addresses_from_everything_else() {
+        assert!(
+            holds_address("127.0.0.1".parse().unwrap()),
+            "loopback is held by every host"
+        );
+        assert!(
+            !holds_address("192.0.2.1".parse().unwrap()),
+            "a documentation address is on no interface"
         );
     }
 

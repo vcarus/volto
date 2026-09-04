@@ -304,6 +304,16 @@ family, an IP literal above all, is unaffected by any of the three.
   **regardless** of that setting. They are amplification primitives, not
   destinations. What the client is *told* about the unspecified address is a
   separate question — see the note on blackholed names under [`[log]`](#log).
+- **This host's own addresses are never dialled either**, at any port and
+  **regardless** of that setting, because the reason is a different one: a tunnel
+  to an address this machine carries reaches the machine's own services with the
+  proxy's own source address, which is the privilege escalation RFC 9298 §7
+  names. Loopback is the exception, and it is the exception the RFC makes too:
+  it lists "localhost" as a class of its own, and here that class is the private
+  one above, off by default and opened by `allow_private_networks`. So a target
+  is refused with `403` and `destination_ip_prohibited` when it resolves to an
+  address of this host other than loopback, whether that address is public, on
+  the LAN, or the one the server listens on.
 - **UDP/53 must stay reachable.** Surge's UDP availability test is a DNS query
   through the tunnel, so denying port 53 makes Surge report the policy as broken.
   volto warns if 53 appears in `denied_ports`.

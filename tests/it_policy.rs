@@ -284,6 +284,61 @@ async fn connect_udp_to_a_prohibited_address_is_refused() {
     }
 }
 
+/// An address this host holds, which RFC 9298 §7 names as a class of its own:
+/// "the UDP proxy's own addresses". Refused on both routes, at any port, and
+/// with private space open. The reason is not that the address is private but
+/// that it is this proxy's, and `allow_private_networks` says nothing about
+/// that.
+///
+/// The address is discovered rather than assumed, because only the host running
+/// the test knows which addresses it carries. Loopback is deliberately not the
+/// one used: the same RFC sentence names "localhost" separately, this proxy
+/// implements that class in the private bucket, and `ALLOW_PRIVATE` here is
+/// what opens it.
+#[tokio::test]
+async fn an_address_this_host_holds_is_refused_on_both_routes() {
+    let Some(own) = own_non_loopback_address() else {
+        eprintln!("skipped: this host carries no non-loopback address to test with");
+        return;
+    };
+
+    // The connect budget is pinned low so that a host which drops rather than
+    // refuses traffic to its own address still answers inside the test timeout
+    // when the policy is the thing being asserted absent.
+    let server =
+        TestServer::start_with(&format!("[limits]\nconnect_timeout = 1\n{ALLOW_PRIVATE}")).await;
+    let mut client = H3Client::connect(&server).await;
+
+    // Two ports, neither of them the proxy's own, because the address is the
+    // whole of the rule.
+    for port in [80u16, 9] {
+        let tcp = respond_to(&mut client, connect_request(&format!("{own}:{port}"))).await;
+        assert_refused(&tcp, Status::FORBIDDEN, "destination_ip_prohibited");
+
+        let udp = respond_to(
+            &mut client,
+            connect_udp_request(server.addr, &own.to_string(), port),
+        )
+        .await;
+        assert_refused(&udp, Status::FORBIDDEN, "destination_ip_prohibited");
+    }
+}
+
+/// An address this host holds that is not loopback, or `None` on a host that
+/// has none.
+///
+/// Read off a UDP socket connected towards a documentation address: `connect`
+/// on a UDP socket sends nothing, and what it fixes is the source address the
+/// route to that destination would use, which is one of this host's own. A host
+/// with no route at all, a container on no network, has no such address, and
+/// the caller says so rather than inventing one.
+fn own_non_loopback_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let address = socket.local_addr().ok()?.ip();
+    (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
 /// A name whose every address is the unspecified one was blackholed by the
 /// resolver upstream, not refused by this proxy, so it is not answered like a
 /// refusal (decision D49): the tunnel is accepted and closed at once, which is

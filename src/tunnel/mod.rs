@@ -556,7 +556,11 @@ where
 ///   so on a dual-stack target the non-preferred family is only reached after
 ///   the preferred one fails.
 /// * A name resolving to a mix of public and private addresses keeps only the
-///   public ones, so DNS rebinding onto loopback gains nothing.
+///   public ones, so DNS rebinding onto loopback gains nothing. What survives
+///   that filter is then asked one more question, [`is_the_proxys_own`]: an
+///   address this host holds is refused whatever the policy says about its
+///   address space, because reaching it means borrowing the proxy's own source
+///   address against the proxy's own services (RFC 9298 §7).
 ///
 /// Nothing left after that filter splits two ways (decision D49). A name whose
 /// every address is the unspecified one was blocked by a filtering resolver
@@ -575,6 +579,44 @@ where
 /// type has to carry — nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
 /// field for CONNECT-UDP. Deferred, so only the one path that sends a 200 pays
 /// for building it.
+/// Whether a resolved address is one of this proxy's own.
+///
+/// RFC 9298 §7, on the software that trusts a request for having come from the
+/// host it runs on: "This could lead to unauthorized access by UDP proxying
+/// clients unless the UDP proxy disallows UDP proxying requests to vulnerable
+/// targets, such as the UDP proxy's own addresses and localhost, link-local,
+/// multicast, and broadcast addresses. UDP proxies can use the
+/// destination_ip_prohibited Proxy Error Type from Section 2.3.5 of
+/// [PROXY-STATUS] when rejecting such requests." Four of those five classes are
+/// [`Policy`]'s two buckets. This is the fifth, and it is the one no address
+/// range describes: which addresses are the proxy's own is a fact about the host
+/// rather than about the address, so it is asked of the kernel
+/// ([`crate::net::holds_address`]) rather than matched against a list.
+///
+/// The class is not lifted by `allow_private_networks`, because the reason is a
+/// different one. That switch is the operator saying which *address space* this
+/// proxy may reach; this rule is about the proxy itself, and a target that is
+/// this host is the escalation the section describes whatever the address space
+/// says.
+///
+/// **Loopback is deliberately not here.** The sentence above names "localhost"
+/// as a class beside "the proxy's own addresses", and this crate implements that
+/// class in the private bucket, where `allow_private_networks` decides it: off
+/// by default, and reachable only where an operator has said in the
+/// configuration file that local address space is a legitimate destination.
+/// Folding loopback in here would overrule that decision, and it would do it for
+/// every service on the host rather than for this proxy.
+///
+/// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
+/// request and never per packet, and it is paid only by addresses the policy has
+/// already let through, and the loopback test above it is free.
+fn is_the_proxys_own(ip: std::net::IpAddr) -> bool {
+    // Canonical first: `::ffff:127.0.0.1` is loopback wearing an IPv6 hat, and
+    // the kernel would bind it happily.
+    let ip = policy::canonical(ip);
+    !ip.is_loopback() && crate::net::holds_address(ip)
+}
+
 pub(crate) async fn admit_target(
     host: &str,
     port: u16,
@@ -608,7 +650,19 @@ pub(crate) async fn admit_target(
         }
     };
 
-    let allowed = ctx.policy.allowed_addresses(&addresses);
+    let mut allowed = ctx.policy.allowed_addresses(&addresses);
+    let judged = allowed.len();
+    allowed.retain(|address| !is_the_proxys_own(address.ip()));
+    if allowed.len() < judged {
+        debug!(
+            stream_id,
+            host,
+            port,
+            refused = judged - allowed.len(),
+            "refused an address this host holds as one of the proxy's own"
+        );
+    }
+
     if allowed.is_empty() {
         if policy::is_dns_blackhole(&addresses) {
             info!(
@@ -709,6 +763,39 @@ mod tests {
                 .fields
                 .append(name, FieldValue::from_static("anything"));
             assert_eq!(connection_specific_field(&request), Some(name), "{name}");
+        }
+    }
+
+    /// The RFC 9298 §7 class, in both directions.
+    ///
+    /// Loopback is the case worth pinning: it *is* an address this host holds,
+    /// the kernel binds it happily, and it must still answer `false` here
+    /// because "localhost" is the private bucket's class and
+    /// `allow_private_networks` is what decides it. `::ffff:127.0.0.1` is the
+    /// same address in an IPv6 hat and has to be canonicalised before the
+    /// question is asked at all.
+    #[test]
+    fn only_a_non_loopback_address_of_this_host_is_the_proxys_own() {
+        for literal in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+            assert!(
+                !is_the_proxys_own(literal.parse().expect("an address")),
+                "{literal} is the localhost class, not this one"
+            );
+        }
+
+        // RFC 5737 TEST-NET-1: on no interface anywhere.
+        assert!(!is_the_proxys_own("192.0.2.1".parse().expect("an address")));
+
+        // And the class itself, on a host that has an address to show it with.
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a probe socket");
+        if socket.connect("192.0.2.1:9").is_ok() {
+            let own = socket.local_addr().expect("a local address").ip();
+            if !own.is_loopback() && !own.is_unspecified() {
+                assert!(
+                    is_the_proxys_own(own),
+                    "{own} is an address this host holds"
+                );
+            }
         }
     }
 
