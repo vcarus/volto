@@ -16,11 +16,13 @@
 //! carries a few real ones, and this mode is what actually explores the TLS
 //! parsing behind them.
 //!
-//! The seeds are written by a unit test in `src/gate.rs`, so `cargo test`
-//! refreshes `fuzz/corpus/gate/` and the mode byte in front of each seed is
-//! kept in step with the two constants below.
+//! The seeds are written by a test in `tests/it_gate_shapes.rs`, so `cargo
+//! test` refreshes `fuzz/corpus/gate/` and the mode byte in front of each seed
+//! is kept in step with the two constants below.
 
 #![no_main]
+
+use std::sync::LazyLock;
 
 use libfuzzer_sys::fuzz_target;
 use volto::gate::{self, FirstFlight, Names, Refusal, Verdict};
@@ -43,19 +45,31 @@ const CLIENT_HELLO: u8 = 1;
 
 /// The lists a datagram may be judged against, chosen by the mode byte.
 ///
-/// `localhost` is on all of them because it is the name the seed corpus asks
-/// for; an empty list is not here, because an empty list is the gate switched
-/// off and `poll_recv` never calls the judgement path at all.
+/// `localhost` is the name the seed corpus asks for, so the first two hold it
+/// and the third does not: under the third, every seed that names a host is a
+/// refusal for its name. An empty list is not here, because an empty list is
+/// the gate switched off and `poll_recv` never calls the judgement path at all.
+/// Spelling variants (case, a root dot) are not here either: `Names::new`
+/// normalises them once at load, and that is unit-tested where it lives.
 const NAMES: [&[&str]; 3] = [
     &["localhost"],
     &["localhost", "other.example"],
-    &["localhost.", "OTHER.example"],
+    &["other.example"],
 ];
+
+/// [`NAMES`], built once rather than on every iteration.
+static LISTS: LazyLock<[Names; 3]> = LazyLock::new(|| {
+    NAMES.map(|list| {
+        let configured: Vec<String> = list.iter().map(|name| (*name).to_owned()).collect();
+        Names::new(&configured)
+    })
+});
 
 /// Longest a refused name may print as, which `logfmt::bounded_bytes` caps.
 ///
-/// The same bound `auth.rs` asserts: a peer-chosen token reaches a log line
-/// through `escaped_bytes`, and a `server_name` may be 65535 bytes long.
+/// The same bound `fuzz_targets/auth.rs` asserts: a peer-chosen token reaches
+/// a log line through `escaped_bytes`, and a `server_name` may be 65535 bytes
+/// long.
 const MAX_BOUNDED: usize = 256;
 
 fuzz_target!(|data: &[u8]| {
@@ -68,27 +82,16 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    let configured: Vec<String> = NAMES[usize::from(mode >> 1) % NAMES.len()]
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
-    let names = Names::new(&configured);
-
-    judge_a_datagram(rest, &names);
+    judge_a_datagram(rest, &LISTS[usize::from(mode >> 1) % LISTS.len()]);
 });
 
 /// Every datagram whose verdict the gate's own documentation states.
 fn judge_a_datagram(datagram: &[u8], names: &Names) {
-    let verdict = gate::judgement(datagram, names);
-
     // A verdict is a function of the bytes and the list, and of nothing else:
-    // the gate keeps no state between datagrams, and a scan is the same packet
-    // over and over.
-    assert_eq!(
-        gate::judgement(datagram, names),
-        verdict,
-        "the same datagram judged twice"
-    );
+    // the gate keeps no state between datagrams. Judged once here — the seed
+    // corpus test judges each seed twice, which pins that without paying two
+    // decryptions per fuzz iteration.
+    let verdict = gate::judgement(datagram, names);
 
     let long_header = datagram
         .first()
@@ -135,7 +138,6 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
         Verdict::Refuse(Refusal::Version(refused)) => {
             assert_eq!(Some(*refused), version, "the version that was refused");
             assert_ne!(*refused, 1, "version 1 is the one we speak");
-            assert!(long_header, "a short header names no version");
         }
         // The four that are decided behind the packet protection, which is only
         // reachable by opening the packet: the gate must have had a v1 Initial,

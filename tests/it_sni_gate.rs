@@ -28,25 +28,21 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    H3Client, TIMEOUT, TestServer, client_endpoint_with_transport, finish_connect_as,
-    open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target, spawn_udp_echo_target,
-    udp_round_trip,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TIMEOUT, TestServer, bulk_alpn,
+    client_endpoint_with_transport, finish_connect_as, open_tcp_tunnel, open_udp_session,
+    read_at_least, spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_round_trip,
 };
 use rustls::pki_types::CertificateDer;
 
 /// A second name on the test certificate, so a refusal and a mismatch differ.
 const OTHER: &str = "other.example";
 
-/// The gate on, naming only `localhost`, with loopback targets reachable.
-const GATE_LOCALHOST: &str =
-    "[security]\nallow_private_networks = true\nexpected_sni = [\"localhost\"]\n";
-
 /// The gate on, naming only [`OTHER`].
 const GATE_OTHER: &str =
     "[security]\nallow_private_networks = true\nexpected_sni = [\"other.example\"]\n";
 
 /// The gate off, which is the shipped default.
-const GATE_OFF: &str = "[security]\nallow_private_networks = true\n";
+const GATE_OFF: &str = ALLOW_PRIVATE;
 
 /// How long a refused handshake is given to prove it is not coming back.
 ///
@@ -186,20 +182,7 @@ fn unknown_version_probe() -> Vec<u8> {
 
 /// Sends `probe` from a fresh socket and returns whatever comes back.
 async fn probe(addr: SocketAddr, probe: &[u8]) -> Option<Vec<u8>> {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind a probing socket");
-    socket.send_to(probe, addr).await.expect("send the probe");
-
-    let mut answer = vec![0u8; 2048];
-    match tokio::time::timeout(CLIENT_IDLE, socket.recv(&mut answer)).await {
-        Ok(Ok(read)) => {
-            answer.truncate(read);
-            Some(answer)
-        }
-        Ok(Err(error)) => panic!("the probing socket failed: {error}"),
-        Err(_elapsed) => None,
-    }
+    udp_answer(addr, probe, CLIENT_IDLE).await
 }
 
 #[tokio::test]
@@ -257,19 +240,6 @@ async fn an_empty_probe_draws_nothing_either_way() {
 // ---------------------------------------------------------------------------
 // The second gate: a ClientHello too large for one Initial packet
 // ---------------------------------------------------------------------------
-
-/// ALPN identifiers padded until the ClientHello cannot fit in one packet.
-///
-/// A first flight larger than an Initial packet is what the socket-level check
-/// deliberately lets through, so this is the only way to reach the certificate
-/// resolver that catches it. `h3` stays on the list and is what gets negotiated:
-/// rustls picks the first of the *server's* protocols the client also offered,
-/// and the server offers only that one.
-fn bulk_alpn() -> Vec<String> {
-    let mut alpn = vec!["h3".to_owned()];
-    alpn.extend((0..8).map(|i| format!("{i}{}", "padding-".repeat(31))));
-    alpn
-}
 
 /// A big ClientHello naming a host on the list still opens a connection.
 ///

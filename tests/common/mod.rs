@@ -46,6 +46,13 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// policy build their own `[security]` section instead; see `it_policy`.
 pub const ALLOW_PRIVATE: &str = "[security]\nallow_private_networks = true\n";
 
+/// The SNI gate on, naming only `localhost`, with loopback targets reachable.
+///
+/// Shared by the two binaries about the gate: `it_sni_gate` asks whether it
+/// admits the right names, `it_gate_shapes` what still answers with it on.
+pub const GATE_LOCALHOST: &str =
+    "[security]\nallow_private_networks = true\nexpected_sni = [\"localhost\"]\n";
+
 /// One second of idle timeout, with keep-alives off so nothing refreshes it.
 ///
 /// Keep-alives have to be disabled explicitly: the default 20s interval would both
@@ -332,6 +339,69 @@ impl Drop for TestServer {
             task.abort();
         }
     }
+}
+
+/// ALPN identifiers padded until a ClientHello cannot fit in one Initial packet.
+///
+/// A first flight larger than an Initial packet is what the SNI gate's
+/// socket-level check deliberately lets through, so this is the way to reach
+/// the branch behind it. `h3` stays on the list and is what gets negotiated:
+/// rustls picks the first of the *server's* protocols the client also offered,
+/// and the server offers only that one.
+pub fn bulk_alpn() -> Vec<String> {
+    let mut alpn = vec!["h3".to_owned()];
+    alpn.extend((0..8).map(|i| format!("{i}{}", "padding-".repeat(31))));
+    alpn
+}
+
+/// Sends `bytes` once from a fresh socket and returns the first datagram back,
+/// or `None` if nothing arrives within `patience`.
+///
+/// Returns as soon as one datagram lands, so a server that answers is a fast
+/// answer; only a server that does not costs the whole wait.
+pub async fn udp_answer(addr: SocketAddr, bytes: &[u8], patience: Duration) -> Option<Vec<u8>> {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a probing socket");
+    socket.send_to(bytes, addr).await.expect("send the probe");
+
+    let mut answer = vec![0u8; 2048];
+    match tokio::time::timeout(patience, socket.recv(&mut answer)).await {
+        Ok(Ok(read)) => {
+            answer.truncate(read);
+            Some(answer)
+        }
+        Ok(Err(error)) => panic!("the probing socket failed: {error}"),
+        Err(_elapsed) => None,
+    }
+}
+
+/// Sends `bytes` once from a fresh socket and collects every datagram that
+/// arrives within `patience`.
+///
+/// Every datagram rather than the first, because "the server answered" and
+/// "the server answered twice" are different facts about how loud a shape is —
+/// and because proving silence takes the whole wait.
+pub async fn udp_answers(addr: SocketAddr, bytes: &[u8], patience: Duration) -> Vec<Vec<u8>> {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a probing socket");
+    socket.send_to(bytes, addr).await.expect("send the probe");
+
+    let deadline = Instant::now() + patience;
+    let mut heard = Vec::new();
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        let mut buffer = vec![0u8; 2048];
+        match tokio::time::timeout(left, socket.recv(&mut buffer)).await {
+            Ok(Ok(read)) => {
+                buffer.truncate(read);
+                heard.push(buffer);
+            }
+            Ok(Err(error)) => panic!("the probing socket failed: {error}"),
+            Err(_elapsed) => break,
+        }
+    }
+    heard
 }
 
 /// A QUIC client endpoint that trusts `ca` and offers `alpn`.

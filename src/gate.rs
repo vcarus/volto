@@ -223,12 +223,15 @@ impl Names {
     /// Whether `name` is one of them.
     ///
     /// DNS names are case-insensitive and a trailing dot is the same name
-    /// spelled absolutely, so both are normalised away on each side. Nothing
-    /// else is: no wildcards, no suffix matching. A name that is not on the list
-    /// is not this server's.
+    /// spelled absolutely, so both are normalised away on each side — the held
+    /// side at load, this side without an allocation, since the held names are
+    /// already lowercase. Nothing else is: no wildcards, no suffix matching. A
+    /// name that is not on the list is not this server's.
     pub fn accepts(&self, name: &str) -> bool {
-        let name = normalise(name);
-        self.names.contains(&name)
+        let name = name.strip_suffix('.').unwrap_or(name);
+        self.names
+            .iter()
+            .any(|held| held.eq_ignore_ascii_case(name))
     }
 }
 
@@ -344,9 +347,10 @@ impl Gate {
 ///
 /// Separate from the socket because none of it reads one: a verdict is a
 /// function of the datagram's bytes, the list in force and the Initial keys.
-/// So judging is reachable without a bound port — by a unit test, and through
-/// the [`judgement`] seam by a fuzz target — and the receive path is left as the
-/// only thing that has to know about batches, strides and blinding.
+/// So judging is reachable without a bound port — through the [`judgement`]
+/// seam, by a fuzz target and by the tests that spell packets — and the receive
+/// path is left as the only thing that has to know about batches, strides and
+/// blinding.
 struct Judge {
     /// The source of Initial keys.
     ///
@@ -408,52 +412,54 @@ impl Judge {
             return Verdict::Pass;
         }
 
-        let payload = match self.open(datagram) {
-            Opened::Unreadable => return Verdict::Pass,
-            // Keyed by a connection ID this packet does not carry: the client
-            // has heard back and switched to the server's connection ID,
-            // while its Initial keys stay those of its first packet. Such a
-            // packet is an acknowledgement or a later fragment of a first
-            // flight this gate already judged — and the Handshake packet that
-            // carries the client's Finished is often coalesced behind it, so
-            // dropping the datagram would cost every admitted handshake a
-            // probe timeout. A packet that is none of that fails quinn's own
-            // decryption and is dropped there without a reply.
+        let Some(header) = InitialHeader::parse(datagram) else {
+            // Not a packet quinn could decode either — a header that runs off
+            // the end of the datagram, a length field that claims more than
+            // arrived — and one it drops without a reply.
+            return Verdict::Pass;
+        };
+
+        let Some(frames) = self.decrypt(datagram, &header) else {
+            // Authentication failed under the keys this packet's own
+            // Destination Connection ID derives. That is every client Initial
+            // after the server has answered: the client has switched to the
+            // server's connection ID while its Initial keys stay those of its
+            // first packet, so such a packet is an acknowledgement or a later
+            // fragment of a first flight this gate already judged — and the
+            // Handshake packet that carries the client's Finished is often
+            // coalesced behind it, so dropping the datagram would cost every
+            // admitted handshake a probe timeout. A packet that is none of that
+            // fails quinn's own decryption and is dropped there without a reply.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
             //# Upon first receiving an Initial or Retry packet from the server, the
             //# client uses the Source Connection ID supplied by the server as the
             //# Destination Connection ID for subsequent packets, including any 0-RTT
             //# packets.
-            Opened::Failed => return Verdict::Pass,
-            Opened::Payload {
-                dcid_length,
-                frames,
-            } => {
-                // It opened, so its keys came from the Destination Connection ID
-                // written in it, and only a client's first Initial is keyed that
-                // way — which is a packet RFC 9000 §7.2 gives a floor of eight
-                // bytes to (quoted at `MIN_CLIENT_CONNECTION_ID`). Every later
-                // Initial of an admitted handshake is addressed by the eight
-                // bytes this endpoint's own generator chose, and so is the one a
-                // Retry supplies, so nothing legitimate is ever this shape.
-                // quinn answers what is with a CONNECTION_CLOSE carrying
-                // PROTOCOL_VIOLATION before it reads a single frame, which is
-                // one of the three replies this gate exists to take away.
-                if dcid_length < MIN_CLIENT_CONNECTION_ID {
-                    return Verdict::Refuse(Refusal::ShortConnectionId(dcid_length));
-                }
-                frames
-            }
+            return Verdict::Pass;
         };
 
-        let Some(crypto) = crypto_stream_prefix(&payload) else {
+        // It opened, so its keys came from the Destination Connection ID
+        // written in it, and only a client's first Initial is keyed that way —
+        // which is a packet RFC 9000 §7.2 gives a floor of eight bytes to
+        // (quoted at `MIN_CLIENT_CONNECTION_ID`). Every later Initial of an
+        // admitted handshake is addressed by the eight bytes this endpoint's
+        // own generator chose, and so is the one a Retry supplies, so nothing
+        // legitimate is ever this shape. quinn answers what is with a
+        // CONNECTION_CLOSE carrying PROTOCOL_VIOLATION before it reads a single
+        // frame, which is one of the three replies this gate exists to take
+        // away.
+        if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
+            return Verdict::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
+        }
+
+        let Some(crypto) = crypto_stream_prefix(&frames) else {
             // No CRYPTO frame at offset 0: an acknowledgement, or a later
             // fragment of a first flight whose beginning was already judged.
             return Verdict::Pass;
         };
 
-        match client_hello_name(&crypto) {
+        match first_flight(&crypto) {
             // A ClientHello that does not fit in this packet is judged by the
             // certificate resolver instead; see the module documentation.
             FirstFlight::Truncated => Verdict::Pass,
@@ -466,29 +472,17 @@ impl Judge {
         }
     }
 
-    /// Removes header protection and packet protection from an Initial packet.
+    /// Removes header protection and packet protection from an Initial packet,
+    /// returning its frames.
     ///
-    /// [`Opened::Unreadable`] means the packet is not one quinn could read
-    /// either — a header that runs off the end of the datagram, a length field
-    /// that claims more than arrived — and the caller passes those through
-    /// rather than judging them, because quinn drops them without a reply.
-    /// [`Opened::Failed`] is an authentication failure under the keys this
-    /// packet's own Destination Connection ID derives: a later Initial of a
-    /// handshake in progress, keyed by the client's first packet instead, or a
-    /// packet that only says it is a QUIC v1 Initial. The caller passes both
-    /// through, because quinn tells them apart with the state this gate lacks
-    /// and drops the second kind without a reply.
-    fn open(&self, datagram: &[u8]) -> Opened {
-        let Some(opened) = self.decrypt(datagram) else {
-            return Opened::Unreadable;
-        };
-        opened
-    }
-
-    /// The body of [`Self::open`], written with `?` over the bounds checks.
-    fn decrypt(&self, datagram: &[u8]) -> Option<Opened> {
-        let header = InitialHeader::parse(datagram)?;
-
+    /// `None` is either a packet too short for the keys to be applied — one
+    /// quinn could not read either — or an authentication failure under the
+    /// keys this packet's own Destination Connection ID derives: a later
+    /// Initial of a handshake in progress, keyed by the client's first packet
+    /// instead, or a packet that only says it is a QUIC v1 Initial. The caller
+    /// passes both through, because quinn tells them apart with the state this
+    /// gate lacks and drops the second kind without a reply.
+    fn decrypt(&self, datagram: &[u8], header: &InitialHeader) -> Option<BytesMut> {
         // The keys are a function of the Destination Connection ID and the
         // version alone, which is what makes this possible at all without any
         // connection state.
@@ -543,34 +537,13 @@ impl Judge {
             return None;
         }
 
-        let associated = packet[..number_end].to_vec();
-        let mut protected = BytesMut::from(&packet[number_end..]);
-
-        match keys
-            .packet
+        let mut frames = BytesMut::from(&packet[number_end..]);
+        keys.packet
             .remote
-            .decrypt(number, &associated, &mut protected)
-        {
-            Ok(()) => Some(Opened::Payload {
-                dcid_length: header.dcid.len(),
-                frames: protected.to_vec(),
-            }),
-            Err(_) => Some(Opened::Failed),
-        }
+            .decrypt(number, &packet[..number_end], &mut frames)
+            .ok()?;
+        Some(frames)
     }
-}
-
-/// What came of trying to open an Initial packet.
-enum Opened {
-    /// Not a packet quinn could decode either; the gate does not judge it.
-    Unreadable,
-    /// A QUIC v1 Initial that failed authentication under the keys its own
-    /// Destination Connection ID derives.
-    Failed,
-    /// The decrypted frames, and how long the Destination Connection ID that
-    /// keyed them was — which the caller judges, so it is carried here rather
-    /// than read off the datagram a second time.
-    Payload { dcid_length: usize, frames: Vec<u8> },
 }
 
 impl fmt::Debug for Gate {
@@ -646,9 +619,9 @@ impl AsyncUdpSocket for Gate {
 
 /// What the gate decided about one datagram.
 ///
-/// Public, and hidden, for the one caller outside this module: the fuzz target
-/// behind [`judgement`] has to be able to say which verdict it got. Nothing in
-/// this crate names it.
+/// Public, and hidden, for the callers outside this module: the fuzz target and
+/// the tests behind [`judgement`] have to be able to say which verdict they got.
+/// Nothing in this crate names it.
 #[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -866,7 +839,14 @@ pub enum FirstFlight {
 /// flight into an unreachable server. So every read that runs off the end of the
 /// message *length* is [`FirstFlight::Truncated`], and only a message whose declared
 /// length is entirely present can be [`FirstFlight::Anonymous`].
-fn client_hello_name(crypto: &[u8]) -> FirstFlight {
+///
+/// Hidden, and public for the fuzz target: this and the `Reader` under it are
+/// the hand-written TLS parsing in this module, and the only way to reach them
+/// through [`judgement`] is to spell a whole Initial packet that authenticates
+/// — which a fuzzer cannot do by luck. So the CRYPTO bytes can be handed over
+/// directly.
+#[doc(hidden)]
+pub fn first_flight(crypto: &[u8]) -> FirstFlight {
     let mut reader = Reader::new(crypto);
 
     let Some(kind) = reader.byte() else {
@@ -985,55 +965,51 @@ impl<'a> Reader<'a> {
     }
 }
 
-// The two seams `fuzz/fuzz_targets/gate.rs` reaches this module through (D83).
+// The seams `fuzz/fuzz_targets/gate.rs` and `tests/it_gate_shapes.rs` reach
+// this module through (D83): [`judgement`], [`first_flight`] above, and
+// [`nameless_crypto`] for building the packets they judge.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
-// coverage-guided fuzzer is for. Neither seam is an entry point of its own:
-// each calls the function the socket path calls, so a finding here is a finding
-// in what the server runs.
+// coverage-guided fuzzer is for. Neither judging seam is an entry point of its
+// own: each calls the function the socket path calls, so a finding here is a
+// finding in what the server runs.
 
-/// The gate's verdict on one datagram, for the fuzz target.
+/// The gate's verdict on one datagram, for the fuzz target and the tests.
 ///
 /// This is `Gate::screen`'s own `Judge::judge`, over a judge built once per
 /// process, so the judgement a fuzzer explores is the judgement a received
 /// datagram gets — the socket, the batch walk and the blinding are the only
 /// parts left out, and none of them is a parser.
 ///
-/// Hidden rather than API: nothing outside `fuzz/` has any reason to call it,
-/// and nothing in this crate does.
+/// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
+/// to call it, and nothing in this crate does.
 #[doc(hidden)]
 pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
     static JUDGE: OnceLock<Judge> = OnceLock::new();
-    JUDGE.get_or_init(nameless_judge).judge(datagram, expected)
+    JUDGE
+        .get_or_init(|| Judge {
+            crypto: nameless_crypto(),
+        })
+        .judge(datagram, expected)
 }
 
-/// What a first flight's CRYPTO bytes name, for the fuzz target.
-///
-/// The ClientHello reader (`client_hello_name` and the `Reader` under it) is
-/// the hand-written TLS parsing in this module, and the only way to reach it
-/// through [`judgement`] is to spell a whole Initial packet that authenticates
-/// — which a fuzzer cannot do by luck. So it is also offered on its own, with
-/// the CRYPTO bytes handed over directly.
-#[doc(hidden)]
-pub fn first_flight(crypto: &[u8]) -> FirstFlight {
-    client_hello_name(crypto)
-}
-
-/// A judge over a TLS configuration with no identity at all.
+/// A TLS configuration with no identity at all, as a source of Initial keys.
 ///
 /// Initial keys come from the client's Destination Connection ID and a salt
 /// fixed by the version (RFC 9001 §5.2, quoted at `Judge::decrypt`), never
 /// from the server's certificate — which is what `Judge::crypto` already rests
 /// on for `SIGHUP`. So a configuration carrying no certificate derives exactly
-/// the keys the running server derives, and the fuzz target needs no key
-/// material, no file and no clock to open the packets the real gate opens. The
-/// resolver is never asked for anything: nothing here starts a TLS session.
+/// the keys the running server derives, and [`judgement`], the fuzz target and
+/// the tests that spell Initial packets need no key material, no file and no
+/// clock to open — or to build — the packets the real gate opens. The resolver
+/// is never asked for anything: nothing here starts a TLS session.
 ///
-/// The panics are unreachable in the only build that calls this, and would be a
+/// The panics are unreachable in the builds that call this, and would be a
 /// crypto provider without TLS 1.3 — the same condition [`crate::tls`] turns
 /// into a startup error.
-fn nameless_judge() -> Judge {
+#[doc(hidden)]
+pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
     /// A resolver with nothing to present.
     #[derive(Debug)]
     struct NoIdentity;
@@ -1054,12 +1030,10 @@ fn nameless_judge() -> Judge {
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(NoIdentity));
 
-    Judge {
-        crypto: Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-                .expect("a TLS 1.3 configuration carries an initial cipher suite"),
-        ),
-    }
+    Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+            .expect("a TLS 1.3 configuration carries an initial cipher suite"),
+    )
 }
 
 #[cfg(test)]
@@ -1139,7 +1113,7 @@ mod tests {
     fn a_client_hello_naming_a_host_is_read_back() {
         let hello = client_hello(&sni_extension("proxy.example"));
         assert_eq!(
-            client_hello_name(&hello),
+            first_flight(&hello),
             FirstFlight::Named(b"proxy.example".to_vec())
         );
     }
@@ -1152,7 +1126,7 @@ mod tests {
         let hello = client_hello(&extensions);
 
         assert_eq!(
-            client_hello_name(&hello),
+            first_flight(&hello),
             FirstFlight::Named(b"proxy.example".to_vec())
         );
     }
@@ -1160,7 +1134,7 @@ mod tests {
     #[test]
     fn a_complete_client_hello_without_the_extension_names_nobody() {
         let hello = client_hello(&[]);
-        assert_eq!(client_hello_name(&hello), FirstFlight::Anonymous);
+        assert_eq!(first_flight(&hello), FirstFlight::Anonymous);
     }
 
     /// The fail-open branch: a first flight larger than one Initial packet.
@@ -1174,7 +1148,7 @@ mod tests {
 
         for cut in 0..hello.len() {
             assert_eq!(
-                client_hello_name(&hello[..cut]),
+                first_flight(&hello[..cut]),
                 FirstFlight::Truncated,
                 "a ClientHello cut at {cut} of {} bytes must fail open",
                 hello.len()
@@ -1182,7 +1156,7 @@ mod tests {
         }
 
         assert_eq!(
-            client_hello_name(&hello),
+            first_flight(&hello),
             FirstFlight::Named(b"proxy.example".to_vec())
         );
     }
@@ -1197,16 +1171,13 @@ mod tests {
 
         // Anywhere inside the extensions block, which is the tail of the message.
         let inside = hello.len() - 4;
-        assert_eq!(client_hello_name(&hello[..inside]), FirstFlight::Truncated);
+        assert_eq!(first_flight(&hello[..inside]), FirstFlight::Truncated);
     }
 
     #[test]
     fn a_first_message_that_is_not_a_client_hello_is_refused() {
         // A ServerHello (2) is not something a client's first flight opens with.
-        assert_eq!(
-            client_hello_name(&[0x02, 0, 0, 0]),
-            FirstFlight::NotAClientHello
-        );
+        assert_eq!(first_flight(&[0x02, 0, 0, 0]), FirstFlight::NotAClientHello);
     }
 
     /// A `server_name` list whose declared lengths do not fit its own extension
@@ -1219,7 +1190,7 @@ mod tests {
         extension.extend_from_slice(&[0xff, 0xff, 0x00, 0x00]); // list length lies
         let hello = client_hello(&extension);
 
-        assert_eq!(client_hello_name(&hello), FirstFlight::Anonymous);
+        assert_eq!(first_flight(&hello), FirstFlight::Anonymous);
     }
 
     #[test]
@@ -1319,784 +1290,6 @@ mod tests {
                 .map(|i| u8::try_from((i.wrapping_mul(31).wrapping_add(seed)) & 0xff).unwrap())
                 .collect();
             let _ = crypto_stream_prefix(&payload);
-        }
-    }
-
-    /// A quinn crypto configuration around a throwaway certificate: the source
-    /// of Initial keys, which do not depend on the certificate at all.
-    fn throwaway_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
-        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("a self-signed certificate");
-        let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let crypto = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3")
-            .with_no_client_auth()
-            .with_single_cert(vec![issued.cert.der().clone()], key)
-            .expect("a usable certificate/key pair");
-        Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-                .expect("a QUIC-capable configuration"),
-        )
-    }
-
-    /// A CRYPTO frame at offset 0 carrying `data`.
-    fn crypto_frame(data: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0x06, 0x00];
-        let length = u16::try_from(data.len()).expect("a short handshake message");
-        frame.extend_from_slice(&(0x4000 | length).to_be_bytes());
-        frame.extend_from_slice(data);
-        frame
-    }
-
-    /// A 1200-byte QUIC v1 Initial addressed to `dcid` and carrying `frames`,
-    /// protected with the keys `keyed_by` derives.
-    ///
-    /// With `keyed_by == dcid` this is a client's first packet. With the two
-    /// different it is the shape of every client Initial after the server has
-    /// answered: the Destination Connection ID is now the server's, while the
-    /// keys stay those of the first packet (RFC 9000 §7.2, RFC 9001 §5.2).
-    fn initial(
-        crypto: &dyn quinn::crypto::ServerConfig,
-        dcid: &[u8],
-        keyed_by: &[u8],
-        frames: &[u8],
-    ) -> Vec<u8> {
-        let keys = crypto
-            .initial_keys(QUIC_V1, &ConnectionId::new(keyed_by))
-            .expect("Initial keys for QUIC v1");
-        let tag_len = keys.packet.remote.tag_len();
-
-        let mut datagram = vec![0xc0]; // long header, Initial, one-byte packet number
-        datagram.extend_from_slice(&QUIC_V1.to_be_bytes());
-        datagram.push(u8::try_from(dcid.len()).unwrap());
-        datagram.extend_from_slice(dcid);
-        datagram.push(8);
-        datagram.extend_from_slice(&[0xcc; 8]);
-        datagram.push(0); // no token
-        // What follows the Length field: packet number, frames, PADDING to
-        // 1200 bytes, tag.
-        let header_len = datagram.len() + 2 + 1;
-        let payload_len = MIN_INITIAL_DATAGRAM - header_len - tag_len;
-        assert!(frames.len() <= payload_len, "frames do not fit one Initial");
-        let length = u16::try_from(1 + payload_len + tag_len).unwrap();
-        datagram.extend_from_slice(&(0x4000 | length).to_be_bytes());
-        let packet_number_offset = datagram.len();
-        datagram.push(0); // packet number 0
-        datagram.extend_from_slice(frames);
-        datagram.resize(packet_number_offset + 1 + payload_len, 0);
-        datagram.resize(MIN_INITIAL_DATAGRAM, 0);
-
-        keys.packet
-            .remote
-            .encrypt(0, &mut datagram, packet_number_offset + 1);
-        keys.header
-            .remote
-            .encrypt(packet_number_offset, &mut datagram);
-        datagram
-    }
-
-    const CLIENT_CID: [u8; 8] = [0xaa; 8];
-    const SERVER_CID: [u8; 8] = [0xbb; 8];
-
-    /// The control: a first packet, keyed by its own Destination Connection
-    /// ID, is opened and judged by the name it carries.
-    #[test]
-    fn a_first_initial_is_opened_under_its_own_keys() {
-        let crypto = throwaway_crypto();
-        let judge = Judge {
-            crypto: crypto.clone(),
-        };
-        let names = Names::new(&["localhost".to_owned()]);
-
-        let hello = client_hello(&sni_extension("other.example"));
-        let stranger = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
-        assert_eq!(
-            judge.judge(&stranger, &names),
-            Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned()))
-        );
-
-        let hello = client_hello(&sni_extension("localhost"));
-        let ours = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&hello));
-        assert_eq!(judge.judge(&ours, &names), Verdict::Pass);
-    }
-
-    /// A later Initial of an admitted handshake cannot be opened here, and
-    /// must not be refused for it: the Handshake packet carrying the client's
-    /// Finished rides in the same datagram, and blinding it costs the
-    /// handshake a probe timeout. Seen on a production host on 2026-09-03 as
-    /// every handshake's RTT stuck at the configured initial estimate.
-    #[test]
-    fn a_later_initial_keyed_by_the_first_packet_is_not_a_stranger() {
-        let crypto = throwaway_crypto();
-        let judge = Judge {
-            crypto: crypto.clone(),
-        };
-        let names = Names::new(&["localhost".to_owned()]);
-
-        // An acknowledgement of the server's Initial: ACK frame for packet 0.
-        let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
-        let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &ack);
-        assert_eq!(judge.judge(&later, &names), Verdict::Pass);
-
-        // Even one that looks like a stranger's ClientHello once opened under
-        // the wrong keys cannot be told from an acknowledgement without the
-        // connection's state; quinn, which has it, is the one to judge.
-        let hello = client_hello(&sni_extension("other.example"));
-        let later = initial(&*crypto, &SERVER_CID, &CLIENT_CID, &crypto_frame(&hello));
-        assert_eq!(judge.judge(&later, &names), Verdict::Pass);
-    }
-
-    /// A first Initial whose Destination Connection ID is under eight bytes.
-    ///
-    /// That it opens at all is what makes it a first Initial rather than a
-    /// later packet of a flight already admitted, and a first Initial has a
-    /// floor of eight bytes (RFC 9000 §7.2, quoted at
-    /// [`MIN_CLIENT_CONNECTION_ID`]). quinn answers this one with
-    /// CONNECTION_CLOSE(PROTOCOL_VIOLATION) before it reads a frame, which is
-    /// one of the three replies this gate exists to take away — so the header
-    /// is judged ahead of anything the packet carries, and the two witnesses
-    /// here carry nothing and carry a name on the list.
-    #[test]
-    fn a_first_initial_with_a_short_connection_id_is_refused() {
-        let crypto = throwaway_crypto();
-        let judge = Judge {
-            crypto: crypto.clone(),
-        };
-        let names = Names::new(&["localhost".to_owned()]);
-
-        let short = [0x11; 4];
-        let padding_only = initial(&*crypto, &short, &short, &[]);
-        assert_eq!(padding_only.len(), MIN_INITIAL_DATAGRAM);
-        assert_eq!(
-            judge.judge(&padding_only, &names),
-            Verdict::Refuse(Refusal::ShortConnectionId(short.len())),
-            "a PADDING-only Initial behind a four-byte connection ID"
-        );
-
-        let hello = client_hello(&sni_extension("localhost"));
-        let named = initial(&*crypto, &short, &short, &crypto_frame(&hello));
-        assert_eq!(
-            judge.judge(&named, &names),
-            Verdict::Refuse(Refusal::ShortConnectionId(short.len())),
-            "a name on the list does not buy a connection ID no client may choose"
-        );
-    }
-
-    /// The same packet behind a connection ID a client may actually choose.
-    ///
-    /// The sibling of the test above and the half that says the rule is about
-    /// the length rather than about the shape: eight bytes is the floor, and a
-    /// datagram carrying nothing to judge is passed through as it always was.
-    #[test]
-    fn a_first_initial_with_a_full_connection_id_is_not_refused_for_its_length() {
-        let crypto = throwaway_crypto();
-        let judge = Judge {
-            crypto: crypto.clone(),
-        };
-        let names = Names::new(&["localhost".to_owned()]);
-
-        assert_eq!(CLIENT_CID.len(), MIN_CLIENT_CONNECTION_ID);
-        let padding_only = initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &[]);
-        assert_eq!(
-            judge.judge(&padding_only, &names),
-            Verdict::Pass,
-            "an eight-byte connection ID is the shortest one a client may choose"
-        );
-    }
-
-    /// Writes the seed corpus for `fuzz/fuzz_targets/gate.rs`, and pins it.
-    ///
-    /// A fuzzer cannot spell an Initial packet that authenticates, so without
-    /// seeds the target would explore the header parser and nothing behind it.
-    /// These are five datagrams — one per branch the judgement can end on — and
-    /// two bare ClientHellos, written where `cargo fuzz run gate` looks for
-    /// them. `fuzz/corpus/` is machine-local and gitignored (D83), so this runs
-    /// with every `cargo test` rather than leaving the corpus to a step
-    /// somebody has to remember; each file carries the target's mode byte in
-    /// front of the bytes under test.
-    ///
-    /// The assertions are the other half of it. They pin what each seed is a
-    /// seed *for*, so a verdict that moves is a red test rather than a corpus
-    /// that quietly stops covering anything — and they pin the claim
-    /// [`nameless_judge`] rests on, since these packets are built under a real
-    /// self-signed certificate and opened here by a configuration that has
-    /// none. Initial keys do not depend on the certificate; if they ever did,
-    /// both of the refusals below would fall through to [`Verdict::Pass`].
-    #[test]
-    fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
-        /// The target's mode byte for a whole datagram.
-        const AS_A_DATAGRAM: u8 = 0x00;
-        /// The target's mode byte for bare CRYPTO bytes.
-        const AS_CRYPTO_BYTES: u8 = 0x01;
-
-        let crypto = throwaway_crypto();
-        // The list the target configures for mode byte `AS_A_DATAGRAM`.
-        let names = Names::new(&["localhost".to_owned()]);
-
-        let ours = client_hello(&sni_extension("localhost"));
-        let stranger = client_hello(&sni_extension("other.example"));
-        let anonymous = client_hello(&[]);
-        let cut = ours[..ours.len() - 4].to_vec();
-        // An acknowledgement of the server's Initial, keyed by the client's
-        // first packet: the shape v0.9.1 stopped refusing.
-        let ack = [0x02, 0x00, 0x00, 0x00, 0x00];
-
-        let datagrams = [
-            (
-                "a-name-we-answer-to",
-                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&ours)),
-                Verdict::Pass,
-            ),
-            (
-                "a-name-we-do-not",
-                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&stranger)),
-                Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned())),
-            ),
-            (
-                "no-server-name",
-                initial(
-                    &*crypto,
-                    &CLIENT_CID,
-                    &CLIENT_CID,
-                    &crypto_frame(&anonymous),
-                ),
-                Verdict::Refuse(Refusal::Anonymous),
-            ),
-            (
-                "a-client-hello-cut-short",
-                initial(&*crypto, &CLIENT_CID, &CLIENT_CID, &crypto_frame(&cut)),
-                Verdict::Pass,
-            ),
-            (
-                "a-second-flight-initial",
-                initial(&*crypto, &SERVER_CID, &CLIENT_CID, &ack),
-                Verdict::Pass,
-            ),
-        ];
-
-        let crypto_bytes = [
-            (
-                "crypto-a-whole-client-hello",
-                ours.clone(),
-                FirstFlight::Named(b"localhost".to_vec()),
-            ),
-            (
-                "crypto-a-client-hello-cut-short",
-                cut.clone(),
-                FirstFlight::Truncated,
-            ),
-        ];
-
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/gate");
-        std::fs::create_dir_all(&directory).expect("a corpus directory to write seeds into");
-        let seed = |name: &str, mode: u8, body: &[u8]| {
-            let mut file = Vec::with_capacity(1 + body.len());
-            file.push(mode);
-            file.extend_from_slice(body);
-            std::fs::write(directory.join(name), file).expect("a seed file");
-        };
-
-        for (name, datagram, verdict) in datagrams {
-            assert_eq!(judgement(&datagram, &names), verdict, "the seed {name}");
-            seed(name, AS_A_DATAGRAM, &datagram);
-        }
-        for (name, bytes, flight) in crypto_bytes {
-            assert_eq!(first_flight(&bytes), flight, "the seed {name}");
-            seed(name, AS_CRYPTO_BYTES, &bytes);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Shape metamorphism: an unusual but legal first flight is judged by its
-    // name and by nothing else
-    // -----------------------------------------------------------------------
-    //
-    // Everything below is one property with many witnesses. A first flight has
-    // a great deal of freedom in how it is laid out -- how many CRYPTO frames
-    // carry it and in what order, what else rides in front of them, how long
-    // the connection IDs and the packet number are, whether a token is there,
-    // whether a second packet is coalesced behind it, and how the ClientHello
-    // itself is spelled -- and none of that freedom may move the verdict. So
-    // each shape is built twice, once naming a host on the list and once naming
-    // a host that is not, and both halves are asserted: a shape that turns a
-    // listed name into a refusal is a client this server has become unreachable
-    // to, and a shape that turns an unlisted name into a pass is the gate gone
-    // blind. A parser that gives up reads as the second.
-
-    /// How a first flight's bytes are spread over the frames of one payload.
-    type Layout = fn(&[u8]) -> Vec<u8>;
-
-    /// How a ClientHello naming a host is written out.
-    type Spelling = fn(&str) -> Vec<u8>;
-
-    /// A name the list holds, and one it does not.
-    const LISTED: &str = "listed.example";
-    const UNLISTED: &str = "other.example";
-
-    /// A QUIC variable-length integer, in the shortest encoding that holds it.
-    fn varint(value: usize) -> Vec<u8> {
-        match u64::try_from(value).expect("a length that fits a varint") {
-            small @ 0..=63 => vec![u8::try_from(small).expect("six bits")],
-            medium @ 64..=16383 => (0x4000 | u16::try_from(medium).expect("fourteen bits"))
-                .to_be_bytes()
-                .to_vec(),
-            large => (0x8000_0000 | u32::try_from(large).expect("thirty bits"))
-                .to_be_bytes()
-                .to_vec(),
-        }
-    }
-
-    /// A CRYPTO frame carrying `data` at `offset` in the handshake stream.
-    fn crypto_frame_at(offset: usize, data: &[u8]) -> Vec<u8> {
-        let mut frame = vec![0x06];
-        frame.extend_from_slice(&varint(offset));
-        frame.extend_from_slice(&varint(data.len()));
-        frame.extend_from_slice(data);
-        frame
-    }
-
-    /// A TLS extension of `kind` carrying `body`.
-    fn extension(kind: u16, body: &[u8]) -> Vec<u8> {
-        let mut bytes = kind.to_be_bytes().to_vec();
-        bytes.extend_from_slice(
-            &u16::try_from(body.len())
-                .expect("a short extension")
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(body);
-        bytes
-    }
-
-    /// [`client_hello`] with the fields a real client varies ahead of its
-    /// extensions: the middlebox-compatibility `legacy_session_id` Chrome sends
-    /// 32 bytes of (RFC 8446 §4.1.2), and the cipher suites it offers.
-    fn client_hello_with(session_id: usize, ciphers: &[u16], extensions: &[u8]) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        body.extend_from_slice(&[0x00; 32]); // random
-        body.push(u8::try_from(session_id).expect("a session id of at most 255 bytes"));
-        body.extend_from_slice(&vec![0x5a; session_id]);
-        let suites: Vec<u8> = ciphers.iter().flat_map(|c| c.to_be_bytes()).collect();
-        body.extend_from_slice(
-            &u16::try_from(suites.len())
-                .expect("a short suite list")
-                .to_be_bytes(),
-        );
-        body.extend_from_slice(&suites);
-        body.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods
-        body.extend_from_slice(
-            &u16::try_from(extensions.len())
-                .expect("short extensions")
-                .to_be_bytes(),
-        );
-        body.extend_from_slice(extensions);
-
-        let mut message = vec![CLIENT_HELLO];
-        let length = body.len();
-        message.extend_from_slice(&[
-            u8::try_from(length >> 16).expect("a short message"),
-            u8::try_from((length >> 8) & 0xff).expect("a byte"),
-            u8::try_from(length & 0xff).expect("a byte"),
-        ]);
-        message.extend_from_slice(&body);
-        message
-    }
-
-    /// The parts of an Initial header a legitimate client chooses for itself.
-    #[derive(Clone)]
-    struct Shape {
-        /// The Destination Connection ID, which is also what keys the packet.
-        dcid: Vec<u8>,
-        /// The Source Connection ID, which may be empty.
-        scid: Vec<u8>,
-        /// A `NEW_TOKEN` or Retry token, or nothing.
-        token: Vec<u8>,
-        /// How many bytes the Packet Number field takes, one to four.
-        number_length: usize,
-        /// How long the Initial packet itself is, before anything coalesced.
-        packet_length: usize,
-    }
-
-    impl Default for Shape {
-        fn default() -> Self {
-            Self {
-                dcid: CLIENT_CID.to_vec(),
-                scid: vec![0xcc; 8],
-                token: Vec::new(),
-                number_length: 1,
-                packet_length: MIN_INITIAL_DATAGRAM,
-            }
-        }
-    }
-
-    /// [`initial`] with every header field the caller's to choose.
-    ///
-    /// Keyed by its own Destination Connection ID, which is what a client's
-    /// first packet is (RFC 9001 §5.2) — and still is after a Retry, since the
-    /// keys are recomputed from the connection ID the Retry supplied.
-    fn shaped_initial(
-        crypto: &dyn quinn::crypto::ServerConfig,
-        shape: &Shape,
-        frames: &[u8],
-    ) -> Vec<u8> {
-        let keys = crypto
-            .initial_keys(QUIC_V1, &ConnectionId::new(&shape.dcid))
-            .expect("Initial keys for QUIC v1");
-        let tag_len = keys.packet.remote.tag_len();
-        assert!(
-            (1..=4).contains(&shape.number_length),
-            "a packet number is one to four bytes"
-        );
-
-        let mut packet =
-            vec![0xc0 | u8::try_from(shape.number_length - 1).expect("two bits of length")];
-        packet.extend_from_slice(&QUIC_V1.to_be_bytes());
-        packet.push(u8::try_from(shape.dcid.len()).expect("a legal connection id"));
-        packet.extend_from_slice(&shape.dcid);
-        packet.push(u8::try_from(shape.scid.len()).expect("a legal connection id"));
-        packet.extend_from_slice(&shape.scid);
-        packet.extend_from_slice(&varint(shape.token.len()));
-        packet.extend_from_slice(&shape.token);
-
-        // A two-byte Length field, which is what every real Initial uses.
-        let number_offset = packet.len() + 2;
-        let payload_len = shape
-            .packet_length
-            .checked_sub(number_offset + shape.number_length + tag_len)
-            .expect("a packet long enough to hold its own header");
-        assert!(frames.len() <= payload_len, "frames do not fit one Initial");
-        let length = u16::try_from(shape.number_length + payload_len + tag_len)
-            .expect("a length that fits two bytes");
-        packet.extend_from_slice(&(0x4000 | length).to_be_bytes());
-
-        packet.resize(number_offset + shape.number_length, 0); // packet number 0
-        packet.extend_from_slice(frames);
-        packet.resize(number_offset + shape.number_length + payload_len, 0); // PADDING
-        packet.resize(shape.packet_length, 0); // room for the tag
-
-        keys.packet
-            .remote
-            .encrypt(0, &mut packet, number_offset + shape.number_length);
-        keys.header.remote.encrypt(number_offset, &mut packet);
-        packet
-    }
-
-    /// Asserts that a datagram laid out by `build` is judged by its name alone.
-    ///
-    /// Written as a plain function taking a builder rather than two datagrams so
-    /// that the listed and the unlisted half can never drift apart: they are the
-    /// same shape twice.
-    #[track_caller]
-    fn judged_by_its_name_alone(shape: &str, build: impl Fn(&str) -> Vec<u8>) {
-        let names = Names::new(&[LISTED.to_owned()]);
-
-        assert_eq!(
-            judgement(&build(LISTED), &names),
-            Verdict::Pass,
-            "{shape}: a first flight naming {LISTED} must reach quinn"
-        );
-        let refusal = judgement(&build(UNLISTED), &names);
-        assert!(
-            matches!(refusal, Verdict::Refuse(Refusal::OtherName(_))),
-            "{shape}: a first flight naming {UNLISTED} must be refused for its name, not {refusal:?}"
-        );
-    }
-
-    /// How a first flight's bytes are distributed over the frames of one packet.
-    ///
-    /// Every one of these is a legal Initial payload that a client is free to
-    /// send, and RFC 9000 §19.6 puts no order on CRYPTO frames within a packet.
-    #[test]
-    fn the_frames_a_first_flight_is_laid_out_in_do_not_change_the_verdict() {
-        let crypto = throwaway_crypto();
-
-        let layouts: Vec<(&str, Layout)> = vec![
-            ("one CRYPTO frame", |hello| crypto_frame_at(0, hello)),
-            ("two CRYPTO frames in order", |hello| {
-                let (head, tail) = hello.split_at(hello.len() / 2);
-                let mut frames = crypto_frame_at(0, head);
-                frames.extend_from_slice(&crypto_frame_at(head.len(), tail));
-                frames
-            }),
-            ("two CRYPTO frames in reverse order", |hello| {
-                let (head, tail) = hello.split_at(hello.len() / 2);
-                let mut frames = crypto_frame_at(head.len(), tail);
-                frames.extend_from_slice(&crypto_frame_at(0, head));
-                frames
-            }),
-            ("three CRYPTO frames, middle one first", |hello| {
-                let third = hello.len() / 3;
-                let mut frames = crypto_frame_at(third, &hello[third..third * 2]);
-                frames.extend_from_slice(&crypto_frame_at(third * 2, &hello[third * 2..]));
-                frames.extend_from_slice(&crypto_frame_at(0, &hello[..third]));
-                frames
-            }),
-            ("PADDING before the CRYPTO frame", |hello| {
-                let mut frames = vec![0x00; 32];
-                frames.extend_from_slice(&crypto_frame_at(0, hello));
-                frames
-            }),
-            ("PING before the CRYPTO frame", |hello| {
-                let mut frames = vec![0x01];
-                frames.extend_from_slice(&crypto_frame_at(0, hello));
-                frames
-            }),
-            ("an ACK frame before the CRYPTO frame", |hello| {
-                // Largest Acknowledged 10, delay 27, no further ranges, first
-                // range 3. Every field is distinct and non-zero on purpose: an
-                // ACK of zeroes is indistinguishable from PADDING, so a walk
-                // that lands one varint out still finds the CRYPTO frame and
-                // the shape proves nothing.
-                let mut frames = vec![0x02, 0x0a, 0x1b, 0x00, 0x03];
-                frames.extend_from_slice(&crypto_frame_at(0, hello));
-                frames
-            }),
-            ("a two-range ACK frame before the CRYPTO frame", |hello| {
-                // Largest 10, delay 27, two further ranges, first range 1, then
-                // the gap and length of each of them.
-                let mut frames = vec![0x02, 0x0a, 0x1b, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05];
-                frames.extend_from_slice(&crypto_frame_at(0, hello));
-                frames
-            }),
-            ("an ACK_ECN frame before the CRYPTO frame", |hello| {
-                // The same, with the three ECN counts an ACK_ECN carries.
-                let mut frames = vec![0x03, 0x0a, 0x1b, 0x00, 0x03, 0x11, 0x12, 0x13];
-                frames.extend_from_slice(&crypto_frame_at(0, hello));
-                frames
-            }),
-            ("PADDING, PING and ACK around two CRYPTO frames", |hello| {
-                let (head, tail) = hello.split_at(hello.len() / 2);
-                let mut frames = vec![0x00; 8];
-                frames.push(0x01);
-                frames.extend_from_slice(&[0x02, 0x0a, 0x1b, 0x00, 0x03]);
-                frames.extend_from_slice(&crypto_frame_at(head.len(), tail));
-                frames.push(0x01);
-                frames.extend_from_slice(&crypto_frame_at(0, head));
-                frames.extend_from_slice(&[0x00; 8]);
-                frames
-            }),
-        ];
-
-        for (shape, lay_out) in layouts {
-            judged_by_its_name_alone(shape, |name| {
-                let hello = client_hello(&sni_extension(name));
-                shaped_initial(&*crypto, &Shape::default(), &lay_out(&hello))
-            });
-        }
-    }
-
-    /// The header fields a client picks, none of which the name depends on.
-    #[test]
-    fn the_header_a_first_flight_wears_does_not_change_the_verdict() {
-        let crypto = throwaway_crypto();
-
-        let mut shapes = vec![
-            ("the baseline header".to_owned(), Shape::default()),
-            (
-                "a 20-byte Destination Connection ID".to_owned(),
-                Shape {
-                    dcid: vec![0xa1; MAX_CONNECTION_ID],
-                    ..Shape::default()
-                },
-            ),
-            (
-                "an empty Source Connection ID".to_owned(),
-                Shape {
-                    scid: Vec::new(),
-                    ..Shape::default()
-                },
-            ),
-            (
-                "a 20-byte Source Connection ID".to_owned(),
-                Shape {
-                    scid: vec![0xc5; MAX_CONNECTION_ID],
-                    ..Shape::default()
-                },
-            ),
-            (
-                "a token, as a client returning a NEW_TOKEN sends".to_owned(),
-                Shape {
-                    token: vec![0x7e; 64],
-                    ..Shape::default()
-                },
-            ),
-            (
-                "a token, the longest connection IDs and a four-byte number".to_owned(),
-                Shape {
-                    dcid: vec![0xa1; MAX_CONNECTION_ID],
-                    scid: vec![0xc5; MAX_CONNECTION_ID],
-                    token: vec![0x7e; 200],
-                    number_length: 4,
-                    ..Shape::default()
-                },
-            ),
-            (
-                "a datagram larger than the minimum".to_owned(),
-                Shape {
-                    packet_length: 1500,
-                    ..Shape::default()
-                },
-            ),
-        ];
-        shapes.extend((1..=4).map(|number_length| {
-            (
-                format!("a {number_length}-byte packet number"),
-                Shape {
-                    number_length,
-                    ..Shape::default()
-                },
-            )
-        }));
-
-        for (shape, header) in shapes {
-            judged_by_its_name_alone(&shape, |name| {
-                let hello = client_hello(&sni_extension(name));
-                shaped_initial(&*crypto, &header, &crypto_frame_at(0, &hello))
-            });
-        }
-    }
-
-    /// A packet coalesced behind the Initial is not what the gate judges.
-    ///
-    /// RFC 9000 §12.2 lets a receiver route on the first packet of a datagram
-    /// alone, and this gate does. The witness is a second packet that names the
-    /// *other* host: if any of it were read, both halves of the property would
-    /// come out inverted rather than merely wrong.
-    #[test]
-    fn a_packet_coalesced_behind_the_initial_is_not_what_is_judged() {
-        let crypto = throwaway_crypto();
-        let head = Shape {
-            packet_length: 700,
-            ..Shape::default()
-        };
-
-        // A long header of each type a client may coalesce behind an Initial,
-        // and a short header, which RFC 9000 §12.2 allows only last.
-        let followers: [(&str, u8); 3] = [
-            ("a 0-RTT packet", 0xd0),
-            ("a Handshake packet", 0xe0),
-            ("a short-header packet", 0x40),
-        ];
-
-        for (shape, first_byte) in followers {
-            judged_by_its_name_alone(shape, |name| {
-                let ours = client_hello(&sni_extension(name));
-                let mut datagram = shaped_initial(&*crypto, &head, &crypto_frame_at(0, &ours));
-
-                // The bait: everything the judge would find if it read on.
-                let theirs = client_hello(&sni_extension(if name == LISTED {
-                    UNLISTED
-                } else {
-                    LISTED
-                }));
-                let mut follower = vec![first_byte];
-                if first_byte & LONG_HEADER_FORM != 0 {
-                    follower.extend_from_slice(&QUIC_V1.to_be_bytes());
-                    follower.push(u8::try_from(head.dcid.len()).expect("a legal length"));
-                    follower.extend_from_slice(&head.dcid);
-                    follower.push(0); // Source Connection ID
-                    follower.extend_from_slice(&varint(400)); // Length
-                    follower.push(0); // packet number
-                }
-                follower.extend_from_slice(&crypto_frame_at(0, &theirs));
-                follower.resize(500, 0);
-                datagram.extend_from_slice(&follower);
-                datagram
-            });
-        }
-    }
-
-    /// How the ClientHello itself is spelled, which is where a real stack's
-    /// idiosyncrasies live: Chrome's 32-byte session id, the GREASE values
-    /// RFC 8701 has clients scatter through it, and where in the extension list
-    /// `server_name` happens to fall.
-    #[test]
-    fn the_way_a_client_hello_is_spelled_does_not_change_the_verdict() {
-        let crypto = throwaway_crypto();
-
-        /// A GREASE extension, which carries nothing and means nothing.
-        fn grease(kind: u16) -> Vec<u8> {
-            extension(kind, &[])
-        }
-
-        /// `supported_versions`, offering TLS 1.3.
-        fn supported_versions() -> Vec<u8> {
-            extension(0x002b, &[0x02, 0x03, 0x04])
-        }
-
-        let spellings: Vec<(&str, Spelling)> = vec![
-            ("server_name as the only extension", |name| {
-                client_hello(&sni_extension(name))
-            }),
-            ("server_name first of three", |name| {
-                let mut extensions = sni_extension(name);
-                extensions.extend_from_slice(&supported_versions());
-                extensions.extend_from_slice(&grease(0x1a1a));
-                client_hello(&extensions)
-            }),
-            ("server_name last of three", |name| {
-                let mut extensions = grease(0x0a0a);
-                extensions.extend_from_slice(&supported_versions());
-                extensions.extend_from_slice(&sni_extension(name));
-                client_hello(&extensions)
-            }),
-            ("a 32-byte legacy_session_id", |name| {
-                client_hello_with(32, &[0x1301], &sni_extension(name))
-            }),
-            ("GREASE cipher suites around the real one", |name| {
-                client_hello_with(32, &[0x0a0a, 0x1301, 0x1302, 0x5a5a], &sni_extension(name))
-            }),
-            ("GREASE extensions on both sides of server_name", |name| {
-                let mut extensions = grease(0x0a0a);
-                extensions.extend_from_slice(&sni_extension(name));
-                extensions.extend_from_slice(&grease(0x3a3a));
-                client_hello_with(32, &[0x0a0a, 0x1301], &extensions)
-            }),
-            ("an unknown name_type ahead of the host_name", |name| {
-                let host = name.as_bytes();
-                // An entry of some other NameType, then the host_name.
-                let mut list = vec![0x42, 0x00, 0x03, b'x', b'y', b'z'];
-                list.push(HOST_NAME);
-                list.extend_from_slice(
-                    &u16::try_from(host.len())
-                        .expect("a short name")
-                        .to_be_bytes(),
-                );
-                list.extend_from_slice(host);
-                let mut body = u16::try_from(list.len())
-                    .expect("a short list")
-                    .to_be_bytes()
-                    .to_vec();
-                body.extend_from_slice(&list);
-                client_hello(&extension(SERVER_NAME_EXTENSION, &body))
-            }),
-            ("the name in upper case", |name| {
-                client_hello(&sni_extension(&name.to_ascii_uppercase()))
-            }),
-            ("the name with its root dot", |name| {
-                client_hello(&sni_extension(&format!("{name}.")))
-            }),
-            ("everything a Chrome-shaped hello does at once", |name| {
-                let mut extensions = grease(0x0a0a);
-                extensions.extend_from_slice(&supported_versions());
-                extensions.extend_from_slice(&sni_extension(&name.to_ascii_uppercase()));
-                extensions.extend_from_slice(&extension(0x0010, &[0x00, 0x03, 0x02, b'h', b'3']));
-                extensions.extend_from_slice(&grease(0x5a5a));
-                client_hello_with(32, &[0x0a0a, 0x1301, 0x1302, 0x1303], &extensions)
-            }),
-        ];
-
-        for (shape, spell) in spellings {
-            judged_by_its_name_alone(shape, |name| {
-                shaped_initial(
-                    &*crypto,
-                    &Shape::default(),
-                    &crypto_frame_at(0, &spell(name)),
-                )
-            });
         }
     }
 }
