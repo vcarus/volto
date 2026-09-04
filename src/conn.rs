@@ -587,9 +587,12 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             debug!(
                 stream_id,
                 // As a `str` rather than through `%`: `bounded` cuts the length
-                // and nothing else, and a `:protocol` token is only checked for
-                // being UTF-8, so a newline in one would forge a journal line
-                // straight through `Display` (review M5). See `logfmt`.
+                // and nothing else. A `:protocol` is an RFC 9110 §5.6.2 token
+                // by the time it gets here, so it carries no control character
+                // to forge a journal line with; this stays because the escaping
+                // is what made that true before the check existed, and neither
+                // half is worth depending on alone (review M5, audit L6). See
+                // `logfmt`.
                 protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
@@ -640,11 +643,11 @@ fn log_request(req: &Request, stream_id: u64) {
 
     // Every `:protocol` token alike, through `bounded`, which cuts the length
     // and nothing else: a token may be a whole field section's worth of bytes.
-    // What keeps a newline in one from forging a journal line is the `?` it is
-    // recorded with below -- a `:protocol` token is only checked for being
-    // UTF-8, and Debug formatting escapes control characters, which is the same
-    // division of labour the 501 path above states for the `str` it logs. See
-    // `logfmt`.
+    // A newline cannot reach here -- a `:protocol` is an RFC 9110 §5.6.2 token
+    // and a request carrying anything else is malformed (audit L6) -- and the
+    // `?` it is recorded with escapes control characters anyway, which is the
+    // same division of labour the 501 path above states for the `str` it logs.
+    // See `logfmt`.
     let protocol = req.protocol.as_deref().map(bounded);
 
     debug!(

@@ -122,15 +122,7 @@ impl Method {
     /// is not CONNECT and is answered with a 501 like any other method this
     /// server does not implement.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if bytes.is_empty() || !bytes.iter().all(|byte| is_tchar(*byte)) {
-            return None;
-        }
-
-        // `tchar` is a subset of ASCII, so this cannot fail; it is written as a
-        // fallible conversion rather than an `expect` because the bytes are a
-        // peer's and nothing on that path should be able to panic.
-        let token = std::str::from_utf8(bytes).ok()?;
-        Some(match token {
+        Some(match token(bytes)? {
             "CONNECT" => Self::Connect,
             other => Self::Other(other.into()),
         })
@@ -372,6 +364,20 @@ impl Request {
             fields: Fields::new(),
         }
     }
+}
+
+/// One RFC 9110 §5.6.2 `token`, if `bytes` are one.
+///
+/// One or more `tchar` and nothing else. Case is kept, since a token is
+/// case-sensitive unless the rule that uses it says otherwise.
+pub fn token(bytes: &[u8]) -> Option<&str> {
+    if bytes.is_empty() || !bytes.iter().all(|byte| is_tchar(*byte)) {
+        return None;
+    }
+
+    // `tchar` is a subset of ASCII, so this cannot fail; written fallibly for
+    // the reason `Method::parse` gives.
+    std::str::from_utf8(bytes).ok()
 }
 
 /// The name of one field line, if it is one this server will accept.

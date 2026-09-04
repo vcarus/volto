@@ -413,11 +413,7 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     };
 
     let protocol = protocol
-        .map(|protocol| {
-            std::str::from_utf8(&protocol)
-                .map(Into::into)
-                .map_err(|_| malformed("a :protocol that is not valid UTF-8"))
-        })
+        .map(|protocol| connect_protocol(&protocol).map(Into::into))
         .transpose()?;
 
     Ok(Request {
@@ -429,6 +425,37 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         protocol,
         fields,
     })
+}
+
+/// Checks a `:protocol` value (RFC 8441 §4).
+///
+/// The value names a registered upgrade token, and an upgrade token is a
+/// `token`: RFC 9110 §16.7 says the registry "defines the namespace for
+/// protocol-name tokens", and §7.8 defines `protocol-name = token`. So a value
+/// that is not a token names nothing that could be in the registry, which makes
+/// it an invalid pseudo-header field and the message malformed.
+///
+/// This was the one pseudo-header with no character-set check: `:method`,
+/// `:scheme`, `:authority` and `:path` each have one, and a `:protocol` was only
+/// required to be UTF-8. A value carrying CR or LF was answered 501, as a
+/// protocol this server has not implemented, where the RFC verdict is malformed
+/// (audit L6). RFC 9114 §10.3 names carriage return, line feed and the null
+/// character as octets an intermediary might translate verbatim, and
+/// `Request.protocol` was the only field on an *accepted* request carrying
+/// unvalidated octets, so this is also what keeps a future reader of it from
+/// inheriting the problem.
+fn connect_protocol(protocol: &[u8]) -> Result<&str, Violation> {
+    //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+    //# A new pseudo-header field :protocol MAY be included on request
+    //# HEADERS indicating the desired protocol to be spoken on the tunnel
+    //# created by CONNECT.  The pseudo-header field is single valued and
+    //# contains a value from the "Hypertext Transfer Protocol (HTTP)
+    //# Upgrade Token Registry"
+
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-4.3
+    //# Endpoints MUST treat a request or response that contains
+    //# undefined or invalid pseudo-header fields as malformed.
+    message::token(protocol).ok_or_else(|| malformed("a :protocol that is not a token"))
 }
 
 /// Checks a `:scheme` value (RFC 3986 §3.1).

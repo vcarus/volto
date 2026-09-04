@@ -10,10 +10,10 @@
 mod common;
 
 use bytes::BytesMut;
-use common::rawstream::{QPACK_DECOMPRESSION_FAILED, close_reason};
+use common::rawstream::{H3_MESSAGE_ERROR, QPACK_DECOMPRESSION_FAILED, close_reason};
 use common::{
-    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, auth_section, authorize, basic_credentials,
-    connect_request, echoes, respond_to, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
+    basic_credentials, connect_request, echoes, respond_to, spawn_echo_target,
 };
 use volto::h3::frame;
 use volto::h3api::{Method, Request, Status};
@@ -50,6 +50,54 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
     // the same connection must still open an ordinary tunnel.
     let mut tunnel = open_tcp_tunnel_as_user(&mut client, &target.to_string()).await;
     echoes(&mut tunnel, b"after 501").await;
+}
+
+/// A `:protocol` that is not a token makes the request malformed.
+///
+/// RFC 8441 §4: "A new pseudo-header field :protocol MAY be included on request
+/// HEADERS indicating the desired protocol to be spoken on the tunnel created by
+/// CONNECT.  The pseudo-header field is single valued and contains a value from
+/// the 'Hypertext Transfer Protocol (HTTP) Upgrade Token Registry'". RFC 9110
+/// §16.7 says that registry "defines the namespace for protocol-name tokens" and
+/// §7.8 defines `protocol-name = token`, so a value that is not an RFC 9110
+/// §5.6.2 token names nothing the registry could hold. RFC 9114 §4.3:
+/// "Endpoints MUST treat a request or response that contains undefined or
+/// invalid pseudo-header fields as malformed."
+///
+/// CR LF because it is the pair that matters: this was the one pseudo-header
+/// with no character-set check, so a value carrying them was answered 501 as an
+/// unimplemented protocol and reached two log lines and `Request.protocol` on an
+/// *accepted* request. RFC 9114 §10.3 names carriage return and line feed among
+/// the three octets an intermediary might translate verbatim (audit L6).
+///
+/// The credentials are here for the reason the 501 case gives: without them a
+/// 407 would hide which verdict was reached.
+#[tokio::test]
+async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
+    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // A prefix that would have routed, followed by a field line of the peer's
+    // own: the 501 arm compares the whole value, so nothing but the character
+    // set stands between this and an answer.
+    let mut request = connect_ip_request(&server.addr.to_string());
+    request.protocol = Some("connect-udp\r\nx-injected: 1".into());
+
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .expect("send a request carrying a :protocol that is not a token");
+    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the server must answer promptly")
+        .expect_err("a :protocol that is not a token must be refused as malformed");
+    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+
+    // A malformed request is a stream error, so the connection carries on.
+    let mut tunnel = open_tcp_tunnel_as_user(&mut client, &target.to_string()).await;
+    echoes(&mut tunnel, b"after the malformed :protocol").await;
 }
 
 /// The whole connection ends when a field section references the dynamic table.

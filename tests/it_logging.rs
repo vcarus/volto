@@ -12,12 +12,17 @@
 //!
 //! The second half of the test is about the other DEBUG line a request can
 //! produce -- the one naming an unimplemented `:protocol`. That token is the
-//! peer's bytes and is only ever checked for being UTF-8, so it may carry a
-//! newline; what it may not do is put that newline into the journal unescaped.
+//! peer's bytes, and since audit L6 it must be an RFC 9110 §5.6.2 token, so a
+//! newline in one is refused before anything is logged. Both halves of that are
+//! asserted: the refusal, and the line the token that *is* a token still draws.
 
 mod common;
 
-use common::{H3Client, SharedBuffer, TestServer, closed_address, connect_request, respond_to};
+use common::rawstream::H3_MESSAGE_ERROR;
+use common::{
+    H3Client, SharedBuffer, TIMEOUT, TestServer, assert_peer_reset, closed_address,
+    connect_request, respond_to,
+};
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {
@@ -71,24 +76,57 @@ async fn inbound_requests_are_logged_with_every_header() {
         "arbitrary headers must be logged; log was:\n{logged}"
     );
 
-    // A `:protocol` this server does not implement is echoed into a DEBUG line
-    // of its own. systemd splits a service's stdout on `\n`, so a token
-    // containing one must reach the journal escaped -- printed through
+    // A token carrying a newline reaches no log line at all: it is not an
+    // RFC 9110 §5.6.2 token, so the request is malformed and the stream is reset
+    // before anything is logged (audit L6). It used to be accepted, classified
+    // as an unimplemented protocol and echoed into a DEBUG line of its own --
+    // and systemd splits a service's stdout on `\n`, so printed through
     // `Display` it was a complete forged entry, stamped with volto's unit and a
-    // timestamp of its own (review M5).
+    // timestamp of its own (review M5). The escaping that answered M5 is still
+    // there and neither half is worth depending on alone, so what is asserted
+    // here is the outcome both of them exist for.
     let mut forgery = connect_request(&target.to_string());
     forgery.scheme = Some("https".into());
     forgery.path = Some("/".into());
     forgery.protocol = Some("x\nWARN volto - forged".into());
-    let _ = respond_to(&mut client, forgery).await;
+
+    let mut stream = client
+        .send
+        .send_request(forgery)
+        .await
+        .expect("send a :protocol that is not a token");
+    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the server must answer promptly")
+        .expect_err("a :protocol that is not a token must be refused as malformed");
+    assert_peer_reset(&error, H3_MESSAGE_ERROR);
 
     let logged = buffer.contents();
     assert!(
-        logged.contains(r#"protocol="x\nWARN volto - forged""#),
-        "the peer's token must print quoted and escaped; log was:\n{logged}"
-    );
-    assert!(
         !logged.lines().any(|line| line == "WARN volto - forged"),
         "a newline in a peer's token must not buy it a journal entry; log was:\n{logged}"
+    );
+    assert!(
+        !logged.contains("forged"),
+        "a refused :protocol reaches no log line at all; log was:\n{logged}"
+    );
+
+    // The DEBUG line an unimplemented `:protocol` draws is still reachable, by a
+    // value that is a token: it is the other half of what this log exists for,
+    // and a malformed verdict must not have swallowed it.
+    let mut unimplemented = connect_request(&target.to_string());
+    unimplemented.scheme = Some("https".into());
+    unimplemented.path = Some("/".into());
+    unimplemented.protocol = Some("connect-ip".into());
+    let _ = respond_to(&mut client, unimplemented).await;
+
+    let logged = buffer.contents();
+    assert!(
+        logged.contains("unsupported :protocol"),
+        "an unimplemented :protocol must draw its own line; log was:\n{logged}"
+    );
+    assert!(
+        logged.contains("connect-ip"),
+        "and that line must name the token; log was:\n{logged}"
     );
 }

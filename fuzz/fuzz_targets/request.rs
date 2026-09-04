@@ -27,7 +27,7 @@
 use std::borrow::Cow;
 
 use libfuzzer_sys::fuzz_target;
-use volto::h3::message::{field_name, FieldValue, Method, Request};
+use volto::h3::message::{field_name, token, FieldValue, Method, Request};
 use volto::h3::qpack::{self, Field};
 use volto::h3::stream::build_request;
 use volto::h3::MAX_FIELD_SECTION_SIZE;
@@ -229,6 +229,23 @@ fn check(request: &Request) {
         assert!(
             scheme.starts_with(|first: char| first.is_ascii_alphabetic()),
             "a scheme begins with a letter: {scheme:?}"
+        );
+    }
+
+    if let Some(protocol) = request.protocol.as_deref() {
+        //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+        //# The pseudo-header field is single valued and
+        //# contains a value from the "Hypertext Transfer Protocol (HTTP)
+        //# Upgrade Token Registry"
+        //
+        // An upgrade token is a `protocol-name` (RFC 9110 §16.7) and
+        // `protocol-name = token` (§7.8), so an accepted `:protocol` carries no
+        // octet outside `tchar` -- CR, LF and NUL among them, which is what
+        // makes it safe for the two log lines that record it and for whatever
+        // reads `Request.protocol` next.
+        assert!(
+            token(protocol.as_bytes()).is_some(),
+            "a :protocol is a token: {protocol:?}"
         );
     }
 
