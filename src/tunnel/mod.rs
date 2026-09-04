@@ -12,7 +12,7 @@ mod status;
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -98,6 +98,32 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+/// How many times over a connection may spend `unanswered_packet_budget` before
+/// its sessions are closed instead of muted.
+///
+/// The per-session budget is the RFC 9298 §7 mitigation and it is the right unit
+/// for one conversation: a handshake that legitimately needs several packets
+/// before the first reply must not break, and the default of 64 is generous for
+/// exactly that reason. What it does not bound is how many conversations a
+/// connection may start, so this multiplier is what turns the mitigation into a
+/// bound.
+///
+/// Eight, because a client with several targets that are slow or unreachable at
+/// once is ordinary (a resolver that is down, a peer-to-peer application
+/// probing a stale address list), and one that has spent eight full session
+/// budgets without a single target ever answering is not doing that any more.
+/// The product is what a connection can reflect at silent targets in its whole
+/// life: 512 packets at the defaults, against an unbounded number before this
+/// existed. A client that wants another allowance pays for another handshake,
+/// which is the price this server charges everywhere else.
+///
+/// Not a configuration key. `unanswered_packet_budget` already carries the
+/// meaning "how much this proxy will send into silence", an operator who
+/// changes it moves both halves together, and zero switches both off. A second
+/// key would be a second thing to get wrong for a bound that is a multiple of
+/// the first (D86 counts the configuration surface as a cost).
+pub const CONNECTION_UNANSWERED_MULTIPLIER: u32 = 8;
 
 /// The authentication failures one connection has run up, in buckets.
 ///
@@ -292,6 +318,35 @@ pub struct Context {
     pub ip_family_preference: IpFamilyPreference,
     /// Packets a UDP session may send before its target has answered.
     pub unanswered_packet_budget: u32,
+    /// Packets *this connection* may still send towards targets that have never
+    /// answered, across every session it opens.
+    ///
+    /// The per-session budget above is what RFC 9298 §7 asks for and it is
+    /// recreated by opening a session, which is free: a client that spends one
+    /// session's allowance closes the stream and opens another, and the
+    /// mitigation becomes a constant factor rather than a bound. Stream turnover
+    /// is not bounded by anything (`max_streams_bidi` bounds how many are open
+    /// at once and quinn issues fresh credit as streams complete), so this is
+    /// the counter an attacker cannot recreate: it is created with the
+    /// connection and it is only ever spent.
+    ///
+    /// **Nothing credits it back.** A target that answers lifts its own
+    /// session's cap, as it always has, and pays nothing back here. Crediting on
+    /// an answer would let a client keep one consenting target on the side and
+    /// buy back, packet for packet, the allowance it is spending on a silent
+    /// one, which is the churn this exists to stop. The allowance is therefore
+    /// a total for the life of the connection, and a client that wants another
+    /// one pays for another handshake.
+    ///
+    /// Zero means uncapped, the same way `unanswered_packet_budget = 0` does:
+    /// the operator switched the mitigation off.
+    pub unanswered_connection_budget: AtomicU32,
+    /// How many sessions this connection has lost to that total, and when that
+    /// is worth saying out loud again.
+    ///
+    /// One line per closed session would be one line per stream a peer opens,
+    /// which is the flood [`crate::logfmt::Sampler`] exists to stop.
+    pub unanswered_closures: Arc<crate::logfmt::Sampler>,
     /// How many destinations this connection's policy has refused, and when
     /// that is worth saying out loud again.
     ///
@@ -346,9 +401,45 @@ impl Context {
             resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
+            unanswered_connection_budget: AtomicU32::new(
+                config
+                    .security
+                    .unanswered_packet_budget
+                    .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER),
+            ),
             policy_refusals: Arc::new(crate::logfmt::Sampler::new()),
             limit_refusals: Arc::new(crate::logfmt::Sampler::new()),
+            unanswered_closures: Arc::new(crate::logfmt::Sampler::new()),
         }
+    }
+
+    /// Spends one packet of the connection's unanswered allowance, reporting
+    /// whether there was one to spend.
+    ///
+    /// `false` is the end of the session that asked, not of the packet: a
+    /// session that finds this empty is closed rather than muted. Muting it
+    /// would leave a socket, a routing entry and a stream in place until the
+    /// idle timeout for a client that has already shown what it is doing with
+    /// them, and it would let the next session pay nothing to be created.
+    ///
+    /// Charged only where the per-session budget is charged, so a session whose
+    /// target has answered spends nothing here, and neither does a session whose
+    /// own budget is already spent: a muted session sends no packet, and this
+    /// counts packets that were sent.
+    ///
+    /// `Relaxed` throughout: the counter is ordered against nothing but itself,
+    /// and `fetch_update`'s compare-and-swap is what makes two sessions racing
+    /// for the last packet give it to exactly one of them.
+    pub(crate) fn charge_unanswered(&self) -> bool {
+        if self.unanswered_packet_budget == 0 {
+            return true;
+        }
+
+        self.unanswered_connection_budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
     }
 
     /// Records an authentication failure, reporting whether that was one too many.
@@ -890,6 +981,68 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             AuthGate::closed(),
         )
+    }
+
+    /// A context whose `[security]` says how much silence this connection is
+    /// worth, and nothing else worth reading.
+    async fn context_with_budget(budget: u32) -> Context {
+        let config: Config = toml::from_str(&format!(
+            r#"
+                [server]
+                listen = "127.0.0.1:0"
+                cert = "unused.pem"
+                key = "unused.pem"
+
+                [security]
+                unanswered_packet_budget = {budget}
+            "#
+        ))
+        .expect("the test configuration must parse");
+
+        Context::new(
+            &config,
+            loopback_connection().await,
+            Arc::new(AtomicBool::new(false)),
+            &crate::net::ResolverBudget::new(),
+            Arc::new(AtomicU64::new(0)),
+            AuthGate::closed(),
+        )
+    }
+
+    /// The connection's allowance is spent once and never given back, and the
+    /// operator's off switch turns it off too.
+    ///
+    /// Charged one packet at a time because that is how a session spends it, and
+    /// the number that has to be exact is the last one: the packet after the
+    /// total is the one whose session is closed.
+    #[tokio::test]
+    async fn the_connections_unanswered_total_is_spent_exactly_once() {
+        const BUDGET: u32 = 3;
+
+        let context = context_with_budget(BUDGET).await;
+        for packet in 0..BUDGET * CONNECTION_UNANSWERED_MULTIPLIER {
+            assert!(
+                context.charge_unanswered(),
+                "packet {packet} is inside the connection's total"
+            );
+        }
+
+        assert!(
+            !context.charge_unanswered(),
+            "the packet after the total must find nothing left"
+        );
+        assert!(
+            !context.charge_unanswered(),
+            "and nothing gives it back afterwards"
+        );
+
+        // Zero is the operator switching the mitigation off, which has to switch
+        // off both halves of it: a session that is never capped must never be
+        // closed for having reached a cap.
+        let uncapped = context_with_budget(0).await;
+        for _ in 0..1000 {
+            assert!(uncapped.charge_unanswered());
+        }
     }
 
     /// A guess at a user-id nobody has must not become a key.

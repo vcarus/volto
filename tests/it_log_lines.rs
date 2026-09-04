@@ -351,6 +351,17 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         file: "tunnel/udp.rs",
+        message: "the connection's unanswered packet budget is spent, closing this session; \
+                  further closures on this connection are logged at debug level until the count \
+                  doubles",
+        bound: Bound::Sampled,
+        reason: "One per session a peer opens once the connection's total is \
+                 spent, and opening a session costs a stream and a HEADERS frame \
+                 -- cheap enough to repeat, so the connection's \
+                 `unanswered_closures` sampler picks the 1st, 2nd, 4th and so on.",
+    },
+    Accounted {
+        file: "tunnel/udp.rs",
         message: "QUIC datagram send buffer full, older datagrams evicted; further evictions on \
                   this session are logged at debug level until the count doubles",
         bound: Bound::Sampled,

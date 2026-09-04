@@ -321,7 +321,12 @@ family, an IP literal above all, is unaffected by any of the three.
   port scanner (RFC 9298 §7). The first reply from the target lifts the limit for
   the rest of the session, so it only bites on one-way floods. The default is
   generous on purpose: handshakes that legitimately need several packets before
-  the first reply must not break.
+  the first reply must not break. The **connection** carries a total of its own,
+  `CONNECTION_UNANSWERED_MULTIPLIER` = 8 times this value (512 packets at the
+  default), spent by every session on it that sends into silence and given back
+  by nothing, so opening a new session no longer restores the allowance, and a
+  session that finds the total spent is closed rather than left running and
+  muted. `0` switches both halves off.
 - `max_auth_failures` is not a rate limit and not a ban. It raises the cost of
   guessing from "one handshake, then unlimited attempts" to "one handshake per N
   attempts", without any cross-connection state to keep or evict. What it counts

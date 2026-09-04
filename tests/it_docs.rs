@@ -390,6 +390,10 @@ fn crate_constants() -> BTreeMap<&'static str, u64> {
             "HEADERS_BUFFER_BUDGET",
             volto::h3api::HEADERS_BUFFER_BUDGET as u64,
         ),
+        (
+            "CONNECTION_UNANSWERED_MULTIPLIER",
+            u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER),
+        ),
         ("RELAY_BUF_SIZE", volto::tunnel::tcp::RELAY_BUF_SIZE as u64),
         (
             "RELAY_BLOCK_SIZE",

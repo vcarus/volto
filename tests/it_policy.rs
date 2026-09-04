@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::Response;
-use common::rawstream::H3_NO_ERROR;
+use common::rawstream::{H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
     authorized_connect, basic_credentials, close_and_drain, connect_request, connect_udp_request,
@@ -660,6 +660,71 @@ async fn packets_to_a_silent_target_are_capped() {
         BUDGET,
         "no packet may pass the budget until the target answers"
     );
+}
+
+/// The same cap, against the way around it: a new session used to start with a
+/// budget of its own, so a client could reflect an unbounded number of packets
+/// at one silent victim by opening a session per handful of packets. The
+/// connection carries a total of its own, and it is not restored by anything a
+/// client can do on that connection.
+///
+/// Sessions are opened one after another and each spends its whole session
+/// budget. The count the victim sees must stop at the connection total, and the
+/// session that finds it spent must be closed rather than left running and
+/// muted.
+#[tokio::test]
+async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
+    const BUDGET: u64 = 2;
+    // `tunnel::CONNECTION_UNANSWERED_MULTIPLIER` times the per-session budget.
+    const CONNECTION_TOTAL: u64 = BUDGET * 8;
+    const SESSIONS: u64 = 20;
+
+    let server = TestServer::start_with(&format!(
+        "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
+    ))
+    .await;
+    let (target, received) = spawn_silent_udp_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // Far more sessions than the connection total allows, each spending its own
+    // budget in full. Every stream is held open, so nothing here is the tunnel
+    // quota running out instead.
+    let mut streams = Vec::new();
+    for _ in 0..SESSIONS {
+        let (qsid, stream) = open_udp_session(&mut client, &server, target).await;
+        for i in 0..BUDGET {
+            send_udp_payload(&client.quic, qsid, format!("packet {i}").as_bytes());
+        }
+        streams.push(stream);
+    }
+
+    // Wait for the total to be spent, then keep waiting to catch any leak past
+    // it. Without a connection-level total all 40 packets would arrive.
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    while received.load(std::sync::atomic::Ordering::Relaxed) < CONNECTION_TOTAL {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {} of the {CONNECTION_TOTAL} budgeted packets arrived",
+            received.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        CONNECTION_TOTAL,
+        "a new session must not restore what the connection has already spent"
+    );
+
+    // And the last session was closed, not merely muted: the proxy reset the
+    // request stream rather than leaving it to idle out.
+    let last = streams.last_mut().expect("a session to inspect");
+    let error = tokio::time::timeout(TIMEOUT, last.recv_data())
+        .await
+        .expect("the session ends inside the timeout")
+        .expect_err("a session past the connection total must be ended by the proxy");
+    assert_peer_reset(&error, H3_REQUEST_CANCELLED);
 }
 
 /// Once the target has answered, the conversation is consensual and the cap is

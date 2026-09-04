@@ -229,6 +229,11 @@ struct Session {
     /// emit is capped. `None` means uncapped — either the target has answered,
     /// which lifts the cap for good because the target has consented to the
     /// conversation, or the operator disabled the mitigation.
+    ///
+    /// This half is per session and is recreated by opening one, so it bounds a
+    /// conversation and not a client. The connection's own total
+    /// ([`Context::unanswered_connection_budget`]) is what a new session does
+    /// not restore, and it is charged from here.
     unanswered_budget: Option<u32>,
     /// How many oversized drops this session has had, on a doubling schedule.
     ///
@@ -466,6 +471,34 @@ impl Session {
                 );
                 return Step::Continue;
             }
+
+            // The connection's own total, which a new session does not restore
+            // (`Context::unanswered_connection_budget`). Exhausting it ends this
+            // session rather than muting it: a client that has spent the whole
+            // connection's allowance on targets that never answered has said
+            // what it is doing, and a muted session would hold a socket, a
+            // routing entry and a stream until the idle timeout while the next
+            // one costs it nothing to open.
+            if !self.ctx.charge_unanswered() {
+                match self.ctx.unanswered_closures.record() {
+                    Some(closures) => warn!(
+                        stream_id = self.stream_id,
+                        quarter_stream_id = self.quarter_stream_id,
+                        closures,
+                        "the connection's unanswered packet budget is spent, closing this \
+                         session; further closures on this connection are logged at debug \
+                         level until the count doubles"
+                    ),
+                    None => debug!(
+                        stream_id = self.stream_id,
+                        quarter_stream_id = self.quarter_stream_id,
+                        "the connection's unanswered packet budget is spent, closing this session"
+                    ),
+                }
+                self.writer.reset(h3api::REQUEST_CANCELLED);
+                return Step::Aborted;
+            }
+
             *remaining -= 1;
         }
 
