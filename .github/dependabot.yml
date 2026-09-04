@@ -1,19 +1,22 @@
 # Dependabot only touches registry dependencies and action versions.
 #
-# Four ecosystems are watched below: the crates in `Cargo.toml`, the pinned
-# GitHub Actions, and the Go and Python modules the `interop` job drives the
-# server with. The last two matter as much as the first: masque-go and aioquic
-# are the independent implementations this project is checked against, so an
-# unwatched copy of either would quietly age into agreeing with us by being too
-# old to disagree.
+# Five entries are watched below: the crates in `Cargo.toml`, the crates in
+# `fuzz/Cargo.toml` (its own workspace, so its own entry -- one manifest per
+# `directory`), the pinned GitHub Actions, and the Go and Python modules the
+# `interop` job drives the server with. The last two matter as much as the
+# first: masque-go and aioquic are the independent implementations this
+# project is checked against, so an unwatched copy of either would quietly age
+# into agreeing with us by being too old to disagree.
 #
-# The `[patch.crates-io]` entry redirecting `quinn-proto` at a git commit is
-# outside its reach: Dependabot ignores git dependencies. It is meant to be
-# temporary — the commit is moved by hand until an upstream 0.11.x release
-# carries the MTU black-hole detector fix, at which point the whole stanza goes
-# away. Both the patch and its exit condition are documented in
-# docs/architecture.md. With the three ecosystems below covered, it is the only
-# dependency left in the tree that Dependabot cannot see.
+# Two things stay outside its reach. The `[patch.crates-io]` entry redirecting
+# `quinn-proto` at a git commit (in both Cargo manifests): Dependabot ignores
+# git dependencies. It is meant to be temporary -- the commit is moved by hand
+# until an upstream 0.11.x release carries the MTU black-hole detector fix, at
+# which point the whole stanza goes away. Both the patch and its exit condition
+# are documented in docs/architecture.md. And transitive-only crates: Dependabot
+# proposes bumps for the dependencies a manifest names, never for the ones
+# they pull in, so the lockfiles are refreshed by hand (`cargo update`, root
+# and fuzz/) before a release.
 #
 # Every dependency PR must pass the full CI suite, on Linux and macOS, before it
 # is merged.
@@ -24,6 +27,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+
+  # The fuzz crate is a separate cargo workspace (cargo-fuzz convention) with
+  # its own committed lockfile, so the root entry does not see it.
+  - package-ecosystem: cargo
+    directory: "/fuzz"
+    schedule:
+      interval: weekly
 
   # Actions are pinned to commit SHAs with the release in a trailing comment;
   # Dependabot updates the SHA and the comment together.
