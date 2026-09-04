@@ -122,10 +122,19 @@ impl Resolver {
             //
             // Which is worth the two extra lines: a client that has overshot
             // the limit this server advertised is told which of its requests to
-            // fix, where a bare RESET_STREAM leaves it guessing. The answer goes
-            // out first and that side is finished cleanly; the receiving side is
-            // then stopped with the code, because the rest of the section is
-            // precisely what this server has declined to read.
+            // fix, where a bare RESET_STREAM leaves it guessing. The receiving
+            // side is stopped first, because the rest of the section is
+            // precisely what this server has declined to read; the answer then
+            // goes out and that side is finished cleanly.
+            //
+            // First rather than after the write, which is the order the other
+            // refusal writers keep (`tunnel::status::refuse_with` and
+            // `accept_then_close`): the write is bounded by one idle timeout and
+            // a peer that grants no window parks it for that whole timeout, and
+            // until the stop goes out quinn holds everything that peer sent on
+            // the stream, up to `STREAM_RECEIVE_WINDOW` per stream and
+            // `CONNECTION_RECEIVE_WINDOW` in aggregate. Stopping first cuts the
+            // hold to the duration of the parse (audit L2).
             //
             // Which refusals those are is the verdict's own to say, and
             // `Violation::field_section_too_large` is how it says it. Three
@@ -152,6 +161,8 @@ impl Resolver {
             Err(frame::Error::Protocol(violation))
                 if violation.is_field_section_too_large() && !violation.is_connection_error() =>
             {
+                stream.stop_receiving(violation.code());
+
                 if stream
                     .respond_within(Status::REQUEST_HEADER_FIELDS_TOO_LARGE, Fields::new())
                     .await
@@ -159,7 +170,7 @@ impl Resolver {
                 {
                     let _ = stream.finish();
                 }
-                stream.stop_receiving(violation.code());
+
                 Err(StreamError::Local(violation))
             }
 

@@ -465,6 +465,35 @@ async fn a_431_the_peer_will_not_take_is_reset() {
         .await
         .expect("announce an oversized field section");
 
+    // The receiving side is stopped before the answer is attempted, and the
+    // order is the assertion. The write is bounded by one idle timeout and this
+    // peer grants no window for it, so a stop issued after the write could not
+    // reach the peer until that timeout had lapsed -- and until it does, quinn
+    // holds everything this peer sent on the stream, up to
+    // `STREAM_RECEIVE_WINDOW` per stream and `CONNECTION_RECEIVE_WINDOW` in
+    // aggregate, on demand and for a whole idle timeout (audit L2). It is the
+    // order the other refusal writers keep, `tunnel::status::refuse_with` and
+    // `accept_then_close`.
+    let stopped = tokio::time::timeout(TIMEOUT, send.stopped())
+        .await
+        .expect("the server must stop the side it declined to read")
+        .expect("the refused stream must be stopped, not broken");
+    assert_eq!(
+        stopped,
+        Some(quinn::VarInt::from_u32(H3_EXCESSIVE_LOAD as u32)),
+        "a field section past what the server will buffer is refused as excessive load"
+    );
+
+    // And the reset is still to come when the stop arrives: the answer is parked
+    // on a window that is not coming and has a whole idle timeout left to lapse
+    // in. Answering first put both on the wire together, one timeout later.
+    assert!(
+        tokio::time::timeout(Duration::ZERO, recv.received_reset())
+            .await
+            .is_err(),
+        "the stop must reach the peer before the abandoned answer's reset, not with it"
+    );
+
     // Waited for rather than slept past: `received_reset` observes the reset
     // without granting the flow-control credit an ordinary read would, which is
     // the whole reason a window this small is the setup.
