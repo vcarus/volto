@@ -504,6 +504,10 @@ pub struct FrameDecoder {
     /// How many bytes of [`Self::header`] have arrived.
     header_len: usize,
     /// Payload of the frame currently being buffered.
+    ///
+    /// Taken rather than split when the frame completes, so the allocation
+    /// leaves with the frozen payload and this decoder holds nothing between
+    /// frames (audit L1).
     payload: BytesMut,
     /// The connection's buffering budget, shared with every other decoder on
     /// it (D77).
@@ -653,7 +657,19 @@ impl FrameDecoder {
                         return Ok(None);
                     }
                     self.state = State::Header;
-                    let payload = self.payload.split().freeze();
+                    // `take` rather than `split`: `split` leaves this decoder
+                    // holding a second handle on the allocation the payload
+                    // grew into, so the block survives the frozen half and a
+                    // decoder that outlives its frame keeps it. A tunnel's
+                    // reader and the peer's control stream are exactly that,
+                    // and `release` on the next line says the bytes are no
+                    // longer held, so up to `MAX_BUFFERED_FRAME` per tunnel and
+                    // per connection stayed alive outside the D77 budget and
+                    // the D99 ledger both. Taking the buffer hands the whole
+                    // allocation to the frozen half and leaves an empty one
+                    // here, at the cost of one allocation on a stream that
+                    // buffers a second frame (audit L1).
+                    let payload = std::mem::take(&mut self.payload).freeze();
                     // Before the parse, which may fail: the frame is no longer
                     // being held either way.
                     self.release();

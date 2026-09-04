@@ -96,9 +96,12 @@ const VARINT_MAX_LEN: usize = 8;
 /// A decoded section is a `message::Fields`: a vector of 32-byte entries with an
 /// allocation per name. §4.2.2's 32 bytes a field exist to model exactly that
 /// per-field cost, so a section at this limit costs about this much again once
-/// decoded — measured at ~77 KiB for the widest conformant one, from a request
-/// under 6 KiB on the wire
+/// decoded — measured at ~65 KiB, and at about that whichever way the peer
+/// spends the limit: one 65000-octet value and 1900 one-byte fields are within
+/// one percent of each other
 /// (`tests/it_bounds.rs::a_tunnel_holds_its_requests_field_section_for_its_whole_life`).
+/// The figure was ~77 KiB until audit L1, where the extra was the frame
+/// decoder's own payload buffer rather than the decoded section.
 ///
 /// It is held for as long as the request is: `crate::conn::handle_request` keeps
 /// the decoded [`message::Request`] for the whole life of the tunnel it opened,

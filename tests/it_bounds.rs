@@ -127,15 +127,23 @@ async fn settle(settled: impl Fn(i64) -> bool) {
 // A request's field section, held for the whole life of its tunnel
 // ---------------------------------------------------------------------------
 
-/// Field lines in the widest request a conformant client may send.
+/// Octets in the one padded field value of the widest request.
 ///
-/// `SETTINGS_MAX_FIELD_SECTION_SIZE` is 64 KiB and RFC 9114 §4.2.2 sizes a
-/// section as name plus value plus 32 bytes for each field, so a one-byte name
-/// with an empty value costs 33 of those bytes and about 1985 of them fill the
-/// budget. 1900 leaves room for the CONNECT pseudo-headers, and the suite's
-/// client enforces the advertised limit itself -- so a request this builds and
-/// the client agrees to send is one the server is obliged to accept.
-const PADDING_FIELDS: usize = 1900;
+/// The width that matters here is the *wire*, not only the RFC 9114 §4.2.2 size:
+/// nothing this server sends or receives is Huffman-encoded, so a value this
+/// long is a literal of about the same length and the encoded HEADERS frame
+/// lands just under `MAX_BUFFERED_FRAME`, which is the most the frame decoder
+/// will buffer for one frame. That is what makes the decoder's own payload
+/// buffer visible to the scales: at 1900 short fields the request was under
+/// 6 KiB on the wire, so a decoder holding its whole buffer for the life of the
+/// tunnel cost about 8 KiB and hid inside the ceiling below (audit L1).
+///
+/// The §4.2.2 size stays inside the advertised limit at the same time, which is
+/// what makes the request one the server is obliged to accept: (32+7+7) for
+/// `:method: CONNECT`, (32+10+15) for a loopback `:authority` and (32+1+65000)
+/// for this field is 65136, some 400 bytes clear of the 65536 the server
+/// advertises and the suite's client enforces.
+const PADDING_VALUE: usize = 65000;
 
 /// Tunnels opened per phase: enough that the per-tunnel figure is not noise,
 /// few enough that the phase is quick.
@@ -144,25 +152,27 @@ const TUNNELS: usize = 64;
 /// Live bytes one tunnel's held request may cost, at the widest field section
 /// this server accepts.
 ///
-/// The measured figure on the dev host is about 77 KiB: `Fields` is a vector of
-/// 32-byte entries that doubles its way to 2048 of them, plus one allocation per
-/// field name. That is roughly the advertised 64 KiB section size over again,
-/// which is no accident -- RFC 9114 §4.2.2's 32-byte-per-field charge exists to
-/// model exactly this per-field cost.
+/// The measured figure on the dev host is about 65 KiB, and it is about the same
+/// however the section is spent: 66933 bytes for the one long value below and
+/// 67517 for the 1900 one-byte fields this probe used to send. That is roughly
+/// the advertised 64 KiB section size over again, which is no accident --
+/// RFC 9114 §4.2.2's 32-byte-per-field charge exists to model exactly the
+/// per-field cost of a `Fields`, a vector of 32-byte entries with an allocation
+/// per name.
 ///
 /// The ceiling is 128 KiB: well above the measurement, so an allocator or a
 /// container that pads differently does not make this flap, and low enough that
 /// a field section held in some *third* form as well -- the decoded
 /// `Vec<Field>` kept alongside the `Fields` it was moved into, say -- fails it.
+/// The frame decoder's own payload buffer was such a third form until audit L1,
+/// and against that code this measures 157531 bytes per tunnel.
 const HELD_PER_TUNNEL_CEILING: i64 = 128 * 1024;
 
 /// A CONNECT request as wide as the advertised field-section limit allows.
 fn padded_connect_request(authority: &str) -> Request {
     let mut request = connect_request(authority);
-    let empty = FieldValue::parse(b"").expect("the empty string is a field value");
-    for _ in 0..PADDING_FIELDS {
-        request.fields.append("a", empty.clone());
-    }
+    let padding = FieldValue::parse(&vec![b'a'; PADDING_VALUE]).expect("a valid field value");
+    request.fields.append("a", padding);
     request
 }
 
@@ -189,11 +199,12 @@ fn padded_connect_request(authority: &str) -> Request {
 ///
 /// | phase | live bytes with the tunnels open |
 /// |---|---|
-/// | bare CONNECT | 1.82 MiB |
-/// | 1900 field lines | 6.64 MiB |
+/// | bare CONNECT | 1.90 MiB |
+/// | one 65000-octet field value | 5.98 MiB |
 ///
-/// which is about 77 KiB per tunnel for the field section alone, from a request
-/// that is under 6 KiB on the wire.
+/// which is about 65 KiB per tunnel for the field section alone, from a request
+/// of about 65 KB on the wire. The wire size is the second thing this weighs:
+/// see [`PADDING_VALUE`].
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tunnel_holds_its_requests_field_section_for_its_whole_life() {
     let _scales = SCALES.lock().await;
