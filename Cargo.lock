@@ -744,7 +744,7 @@ dependencies = [
 [[package]]
 name = "quinn-proto"
 version = "0.11.17"
-source = "git+https://github.com/quinn-rs/quinn?rev=f650e0f213b01ea7bebd60023e5df7df65e5c2bd#f650e0f213b01ea7bebd60023e5df7df65e5c2bd"
+source = "git+https://github.com/quinn-rs/quinn?rev=48455d33be98128882d900dfcd7014b9a7beff6f#48455d33be98128882d900dfcd7014b9a7beff6f"
 dependencies = [
  "aws-lc-rs",
  "bytes",
