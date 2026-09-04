@@ -240,7 +240,7 @@ impl ProxyError {
 /// `destination_unavailable`; running out of descriptors is not.
 ///
 /// A plain function over the OS error number, for the reason
-/// `udp::is_per_packet_send_error` gives for the same shape: `std` maps none of
+/// `udp::is_per_packet_error` gives for the same shape: `std` maps none of
 /// these onto an `ErrorKind` that is stable to match on, and both hosts this
 /// server builds for define every constant.
 fn is_local_exhaustion(error: &std::io::Error) -> bool {

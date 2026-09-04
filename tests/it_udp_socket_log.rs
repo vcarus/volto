@@ -4,7 +4,7 @@
 //! closed when "a UDP proxy is notified by its operating system that its socket
 //! is no longer usable"; §5 says a proxy that "can only send out UDP packets of
 //! a certain length due to its underlying link MTU [...] has no choice but to
-//! discard incoming HTTP Datagrams" longer than that. `is_per_packet_send_error`
+//! discard incoming HTTP Datagrams" longer than that. `is_per_packet_error`
 //! decides which of the two a failed send is, and its own unit tests pin the
 //! errno list — but they stay green if the call site stops asking it, because
 //! the session has a *second* reader of the same error. An ICMP error reaches

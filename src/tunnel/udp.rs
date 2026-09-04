@@ -401,10 +401,20 @@ impl Session {
                 Event::Inbound(None) => Step::Stop,
                 Event::Socket(Ok(length)) => self.forward_to_client(&packet[..length]).await,
                 Event::Socket(Err(error)) => {
-                    // ICMP errors surface here on a connected socket. RFC 9298
-                    // §3.1: the request stream must be closed.
-                    debug!(stream_id, %error, "target socket failed");
-                    Step::Stop
+                    // ICMP errors surface here on a connected socket, and they
+                    // are not all the same thing. A socket the operating system
+                    // has given up on ends the session, which is RFC 9298 §3.1;
+                    // an error about one packet costs that packet, which is the
+                    // rule the send side has always applied. See
+                    // [`read_verdict`] for what was measured.
+                    let verdict = read_verdict(&error);
+                    debug!(
+                        stream_id,
+                        %error,
+                        per_packet = verdict == Step::Continue,
+                        "target socket failed"
+                    );
+                    verdict
                 }
                 Event::Stream(chunk) => self.handle_stream_chunk(chunk).await,
             };
@@ -509,7 +519,7 @@ impl Session {
                 self.touch();
                 Step::Continue
             }
-            Err(error) if is_per_packet_send_error(&error) => {
+            Err(error) if is_per_packet_error(&error) => {
                 debug!(
                     quarter_stream_id = self.quarter_stream_id,
                     length = payload.len(),
@@ -865,7 +875,43 @@ fn send_buffer_verdict(len: usize, space: usize, evictions: &crate::logfmt::Samp
     }
 }
 
-/// Whether a target-socket `send` failure affects only this packet.
+/// What a failure of the target socket's *read* side costs.
+///
+/// The old rule was that any error ends the session, on the reading that an
+/// error arriving here is the operating system reporting the socket unusable
+/// (RFC 9298 §3.1). That is true of most of them and not of all: Linux queues an
+/// ICMP-derived error on a connected socket and hands it to whichever syscall
+/// comes next, which is `recv` whenever the session is parked waiting for the
+/// target rather than forwarding to it.
+///
+/// **Measured before it was changed** (2026-09-04, Linux 7.0.14 in Docker, two
+/// network namespaces either side of a router with a 1280-byte link). A UDP
+/// socket with `IP_PMTUDISC_DO`, which is what [`crate::net`] sets on Linux,
+/// sent a 1400-byte payload: the send succeeded, the router answered ICMP type 3
+/// code 4, and the following `recv` returned **`EMSGSIZE`**. That is one of the
+/// four errnos the send side forgives, and it used to end the session here. The
+/// same run measured what else reaches the read side: an ICMP port-unreachable
+/// arrives as `ECONNREFUSED`, `--reject-with icmp-admin-prohibited` as
+/// `EHOSTUNREACH` and `icmp-net-prohibited` as `ENETUNREACH`, all three of which
+/// are verdicts on the socket and still end the session. `EPERM` from a local
+/// firewall rule was reported by `send` itself, synchronously, and never reached
+/// a read.
+///
+/// So the two directions grade errors the same way now, with
+/// [`is_per_packet_error`] as the one rule. A read that is forgiven does **not**
+/// call [`Session::touch`]: nothing crossed the proxy, so the session still ends
+/// at its idle deadline if the target never answers. There is no loop to spin
+/// in either, because the kernel clears a queued error when it is read and only
+/// another packet of ours can produce the next one.
+fn read_verdict(error: &std::io::Error) -> Step {
+    if is_per_packet_error(error) {
+        Step::Continue
+    } else {
+        Step::Stop
+    }
+}
+
+/// Whether a target-socket failure affects only this packet.
 ///
 /// RFC 9298 draws the line in two places. §3.1 requires the request stream to be
 /// closed when "a UDP proxy is notified by its operating system that its socket
@@ -890,7 +936,7 @@ fn send_buffer_verdict(len: usize, space: usize, evictions: &crate::logfmt::Samp
 ///
 /// Kept as a plain function over the OS error number because `std` maps none of
 /// these onto a stable `ErrorKind`.
-fn is_per_packet_send_error(error: &std::io::Error) -> bool {
+fn is_per_packet_error(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(libc::EMSGSIZE | libc::EPERM | libc::EACCES | libc::ENOBUFS)
@@ -1387,10 +1433,43 @@ mod tests {
         for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES, libc::ENOBUFS] {
             let error = std::io::Error::from_raw_os_error(code);
             assert!(
-                is_per_packet_send_error(&error),
+                is_per_packet_error(&error),
                 "errno {code} ({error}) must only cost one packet"
             );
         }
+    }
+
+    /// The read side grades an error the same way the send side does, and for
+    /// the same reason: on Linux a queued ICMP error is handed to whichever
+    /// syscall comes next, and `recv` is the one a session waiting on its target
+    /// is parked in. `EMSGSIZE` reaching a read was measured rather than
+    /// supposed; [`read_verdict`] records the run.
+    #[test]
+    fn a_per_packet_error_on_the_read_side_does_not_end_the_session() {
+        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES, libc::ENOBUFS] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(
+                read_verdict(&error),
+                Step::Continue,
+                "errno {code} ({error}) costs one packet on the send side and must \
+                 cost one packet here"
+            );
+        }
+
+        for code in [libc::ECONNREFUSED, libc::ENETUNREACH, libc::EHOSTUNREACH] {
+            let error = std::io::Error::from_raw_os_error(code);
+            assert_eq!(
+                read_verdict(&error),
+                Step::Stop,
+                "errno {code} ({error}) is a verdict on the socket (RFC 9298 §3.1)"
+            );
+        }
+
+        assert_eq!(
+            read_verdict(&std::io::Error::other("synthetic")),
+            Step::Stop,
+            "an error with no OS number is not a per-packet verdict"
+        );
     }
 
     /// The other half of the rule: RFC 9298 §3.1 requires the request stream to
@@ -1401,15 +1480,13 @@ mod tests {
         for code in [libc::ECONNREFUSED, libc::ENETUNREACH, libc::EHOSTUNREACH] {
             let error = std::io::Error::from_raw_os_error(code);
             assert!(
-                !is_per_packet_send_error(&error),
+                !is_per_packet_error(&error),
                 "errno {code} ({error}) must end the session"
             );
         }
 
         // An error with no OS number at all is not a per-packet verdict either.
-        assert!(!is_per_packet_send_error(&std::io::Error::other(
-            "synthetic"
-        )));
+        assert!(!is_per_packet_error(&std::io::Error::other("synthetic")));
     }
 
     /// What Surge advertises as `max_datagram_frame_size`, and therefore the
