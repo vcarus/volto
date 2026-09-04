@@ -11,6 +11,12 @@
 //! any one of them matching is enough. When the first live Surge connection
 //! settles the question, nothing here needs to change.
 //!
+//! Two values is all that answers for, so [`MAX_CREDENTIAL_VALUES`] is the most
+//! one request may carry and a request carrying more is refused with 400 before
+//! any of them is tried. Every value that *is* tried and refused is charged one
+//! authentication failure, so a request cannot buy more guesses than it pays for
+//! (decision D76, addendum of 2026-09-04).
+//!
 //! # Comparison discipline
 //!
 //! Username *and* password are compared with [`subtle::ConstantTimeEq`], and the
@@ -37,6 +43,16 @@ const PROXY_AUTHENTICATE: &str = "proxy-authenticate";
 /// The two fields credentials are accepted in, in the order they are tried
 /// (decision D3).
 const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
+
+/// The most credential field values one request may carry.
+///
+/// One per accepted field name, which is every value decision D3 asks for: a
+/// client sends its credentials once, and the open question is only which of the
+/// two names it sends them under. A request carrying more than this is refused
+/// with 400 before any of its values is tried (decision D76, addendum of
+/// 2026-09-04), so the work one request can ask for, and the guesses it can
+/// carry, are both bounded by this number.
+pub const MAX_CREDENTIAL_VALUES: usize = CREDENTIAL_FIELDS.len();
 
 /// The challenge offered when credentials are missing or wrong.
 ///
@@ -89,6 +105,58 @@ impl Denied {
         match self {
             Self::Rejected { username } => Some(username),
             _ => None,
+        }
+    }
+}
+
+/// Every refusal one request's credentials drew, in the order they were tried.
+///
+/// There is one entry per credential field value that was tried and refused, and
+/// that is the unit `[security] max_auth_failures` counts (decision D76, addendum
+/// of 2026-09-04). A request carrying no credential value at all draws the single
+/// [`Denied::Missing`] entry, so there is always at least one; a request carrying
+/// more than [`MAX_CREDENTIAL_VALUES`] of them is refused by [`crate::conn`]
+/// before any value is tried, so there are never more than that many.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Denials {
+    /// The refusal the log line names.
+    reported: Denied,
+    /// The refusals the values after it drew, in the order they were tried.
+    others: Vec<Denied>,
+}
+
+impl Denials {
+    /// The refusal that is reported.
+    ///
+    /// The first one, which comes from the highest-priority header, so it is the
+    /// one most likely to be the client's real attempt.
+    pub fn reported(&self) -> &Denied {
+        &self.reported
+    }
+
+    /// The user-id each refused value claimed, in the order they were tried.
+    ///
+    /// One item per failure to charge, which is what [`Self::charged`] counts.
+    pub fn claims(&self) -> impl Iterator<Item = Option<&str>> {
+        std::iter::once(self.reported.username()).chain(self.others.iter().map(Denied::username))
+    }
+
+    /// How many authentication failures this request is charged.
+    pub fn charged(&self) -> usize {
+        1 + self.others.len()
+    }
+
+    /// Records a refusal after the first.
+    fn push(&mut self, denied: Denied) {
+        self.others.push(denied);
+    }
+}
+
+impl From<Denied> for Denials {
+    fn from(denied: Denied) -> Self {
+        Self {
+            reported: denied,
+            others: Vec::new(),
         }
     }
 }
@@ -146,25 +214,31 @@ impl Authenticator {
     /// Authenticates a request's headers.
     ///
     /// `Ok(None)` means authentication is disabled, `Ok(Some(username))` names the
-    /// user that matched.
-    pub fn authenticate(&self, fields: &Fields) -> Result<Option<&str>, Denied> {
+    /// user that matched. The error carries one entry per credential value that
+    /// was tried and refused, because that is the unit the failure budget counts
+    /// (decision D76, addendum of 2026-09-04).
+    ///
+    /// A value that matches ends the loop, so the values after it are neither
+    /// tried nor charged: this returns what the request *is*, and a request that
+    /// authenticates is not a failure.
+    pub fn authenticate(&self, fields: &Fields) -> Result<Option<&str>, Denials> {
         if self.is_disabled() {
             return Ok(None);
         }
 
-        // The first failure is the one reported: it comes from the
-        // highest-priority header, which is the one most likely to be the
-        // client's real attempt.
-        let mut denial: Option<Denied> = None;
+        let mut denials: Option<Denials> = None;
 
         for value in credentials(fields) {
             match self.check(value) {
                 Ok(username) => return Ok(Some(username)),
-                Err(reason) => denial = denial.or(Some(reason)),
+                Err(reason) => match &mut denials {
+                    Some(denials) => denials.push(reason),
+                    empty => *empty = Some(reason.into()),
+                },
             }
         }
 
-        Err(denial.unwrap_or(Denied::Missing))
+        Err(denials.unwrap_or_else(|| Denied::Missing.into()))
     }
 
     /// Validates one credentials field value.
@@ -238,6 +312,15 @@ fn credentials(fields: &Fields) -> impl Iterator<Item = &FieldValue> {
     CREDENTIAL_FIELDS
         .into_iter()
         .flat_map(|name| fields.get_all(name))
+}
+
+/// How many credential field values a request carries, across both names.
+///
+/// Counted rather than judged here, so the caller decides what to do with the
+/// number and this stays the one place that knows which fields carry
+/// credentials. Compare it against [`MAX_CREDENTIAL_VALUES`].
+pub fn credential_values(fields: &Fields) -> usize {
+    credentials(fields).count()
 }
 
 /// Strips the `Basic` scheme, returning the base64 token.
@@ -441,7 +524,8 @@ mod tests {
             auth.authenticate(&fields),
             Err(Denied::Rejected {
                 username: "a".to_owned()
-            })
+            }
+            .into())
         );
     }
 
@@ -451,9 +535,69 @@ mod tests {
 
         for (username, password) in [("user1", "wrong"), ("user2", "s3cret"), ("", "")] {
             let fields = fields(&[(PROXY_AUTHORIZATION, basic(username, password))]);
-            let denied = auth.authenticate(&fields).expect_err("must be rejected");
-            assert_eq!(denied.username(), Some(username), "{denied:?}");
+            let denials = auth.authenticate(&fields).expect_err("must be rejected");
+            assert_eq!(denials.reported().username(), Some(username), "{denials:?}");
         }
+    }
+
+    /// One refusal per credential value tried, each naming its own claim.
+    ///
+    /// The unit the failure budget counts (decision D76, addendum of
+    /// 2026-09-04): two guesses in one request are two failures, and each is
+    /// charged to the user-id its own value claimed rather than all of them to
+    /// the first.
+    #[test]
+    fn every_refused_value_draws_its_own_refusal() {
+        let auth = authenticator(&[("user1", "s3cret")]);
+        let fields = fields(&[
+            (PROXY_AUTHORIZATION, basic("user1", "wrong")),
+            (AUTHORIZATION, basic("user2", "wrong")),
+        ]);
+
+        let denials = auth.authenticate(&fields).expect_err("must be rejected");
+        assert_eq!(denials.charged(), 2);
+        assert_eq!(
+            denials.claims().collect::<Vec<_>>(),
+            vec![Some("user1"), Some("user2")]
+        );
+        // The reported one is the first, from the primary field.
+        assert_eq!(denials.reported().username(), Some("user1"));
+    }
+
+    /// A request carrying no credential value at all is one failure, not none.
+    #[test]
+    fn a_request_without_credentials_is_charged_once() {
+        let auth = authenticator(&[("user1", "s3cret")]);
+
+        let denials = auth
+            .authenticate(&Fields::new())
+            .expect_err("must be rejected");
+        assert_eq!(denials.charged(), 1);
+        assert_eq!(denials.claims().collect::<Vec<_>>(), vec![None]);
+    }
+
+    /// What `conn` compares against [`MAX_CREDENTIAL_VALUES`]: both names, summed.
+    #[test]
+    fn credential_values_counts_both_field_names() {
+        assert_eq!(credential_values(&Fields::new()), 0);
+
+        let one = fields(&[(PROXY_AUTHORIZATION, value("Basic eA=="))]);
+        assert_eq!(credential_values(&one), 1);
+
+        let both = fields(&[
+            (PROXY_AUTHORIZATION, value("Basic eA==")),
+            (AUTHORIZATION, value("Basic eQ==")),
+        ]);
+        assert_eq!(credential_values(&both), MAX_CREDENTIAL_VALUES);
+
+        // Repeating one name is how a request gets past two values, so the
+        // count is over values and not over names.
+        let three = fields(&[
+            (PROXY_AUTHORIZATION, value("Basic eA==")),
+            (PROXY_AUTHORIZATION, value("Basic eQ==")),
+            (AUTHORIZATION, value("Basic ej0=")),
+        ]);
+        assert_eq!(credential_values(&three), 3);
     }
 
     /// The classification a failure's bucket is chosen by: a user-id the
@@ -497,7 +641,10 @@ mod tests {
     #[test]
     fn missing_credentials_are_reported_as_missing() {
         let auth = authenticator(&[("user1", "s3cret")]);
-        assert_eq!(auth.authenticate(&Fields::new()), Err(Denied::Missing));
+        assert_eq!(
+            auth.authenticate(&Fields::new()),
+            Err(Denied::Missing.into())
+        );
         assert_eq!(Denied::Missing.username(), None);
     }
 
@@ -522,7 +669,8 @@ mod tests {
 
         for case in cases {
             let fields = fields(&[(PROXY_AUTHORIZATION, value(case))]);
-            let denied = auth.authenticate(&fields).expect_err("must be rejected");
+            let denials = auth.authenticate(&fields).expect_err("must be rejected");
+            let denied = denials.reported();
             assert!(
                 matches!(denied, Denied::Malformed(_)),
                 "{case:?} gave {denied:?}"

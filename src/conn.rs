@@ -431,6 +431,26 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
         return;
     }
 
+    // Before any credential is tried, and so before any of them is charged: D3
+    // accepts credentials under either of two field names, and one value per
+    // name is every value that answers for. A request carrying more is asking
+    // this server to run the constant-time comparison once per value and to
+    // answer one 407 for all of them, which is a batch of guesses at the price
+    // of a single failure (audit M1, D76 addendum of 2026-09-04). It is a
+    // judgement about the message rather than about who sent it, so it is a 400
+    // like the field check above it.
+    let offered = auth::credential_values(&req.fields);
+    if offered > auth::MAX_CREDENTIAL_VALUES {
+        debug!(
+            stream_id,
+            offered,
+            allowed = auth::MAX_CREDENTIAL_VALUES,
+            "request carries more credential values than it may"
+        );
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
+        return;
+    }
+
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT — TCP or UDP — has to pass through here.
@@ -450,7 +470,13 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
         // having got past it -- otherwise every connection to an unauthenticated
         // proxy would be living under D76's bound, tunnels and all.
         Ok(None) => context.mark_authenticated(None),
-        Err(denied) => {
+        Err(denials) => {
+            // One line per refused request, not one per refused value: the
+            // first refusal comes from the highest-priority header and is the
+            // one most likely to be the client's real attempt, and D97 prices
+            // log volume per line.
+            let denied = denials.reported();
+
             // The attempted user-id is logged, never anything derived from the
             // password. `remote` is here so a fail2ban rule has something to act
             // on; behind a relay it is the relay's address.
@@ -479,7 +505,18 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             // here too, before the 407 is written: a peer that will not take
             // the answer must not keep the connection for another idle timeout
             // while the write waits on it (review H1, re-verification).
-            if context.record_auth_failure(denied.username()) {
+            // One charge per credential value that was tried and refused, each
+            // to the user-id that value claimed: a guess is a guess whether it
+            // arrived alone or beside another one, and charging per request let
+            // a batch of them cost a single failure (audit M1, D76 addendum of
+            // 2026-09-04). Every value is charged before the answer is decided,
+            // so `|` rather than `||`.
+            let mut spent = false;
+            for claim in denials.claims() {
+                spent |= context.record_auth_failure(claim);
+            }
+
+            if spent {
                 warn!(
                     remote = %context.remote,
                     failures = context.max_auth_failures,

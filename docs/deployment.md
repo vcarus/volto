@@ -584,3 +584,8 @@ closest to the internet that still sees real client addresses.
 That connection-level limit needs no configuration and is unaffected by topology:
 after `security.max_auth_failures` failures (default 5) the whole QUIC connection
 is closed, so an attacker pays for a full QUIC and TLS handshake every N guesses.
+A failure is one credential value tried and refused rather than one refused
+request: a request may carry credentials under either of the two accepted field
+names, both are charged, and a request carrying more than two credential values
+is answered `400` without any of them being tried. So a guess costs a guess
+however many the attacker packs into one request.

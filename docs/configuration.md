@@ -290,7 +290,7 @@ family, an IP literal above all, is unaffected by any of the three.
 | `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: "this host on this network" (`0.0.0.0/8`), loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15` and `2001:2::/48`), 6to4 relay anycast (`192.88.99.0/24`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, ORCHID (`2001:10::/28`), the deprecated site-local `fec0::/10`, `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
-| `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
+| `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
 | `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default and what every release before this one did. A non-empty list turns on the SNI gate: a handshake whose ClientHello does not name one of these hosts is dropped at the socket before the QUIC layer sees it, so a port scan of this address gets nothing back — no Version Negotiation packet, no `CONNECTION_CLOSE`, no TLS alert. Matched name for name, ASCII case-insensitive, with a trailing root dot ignored; no wildcards and no suffix matching. Every client must then send the name as SNI (in Surge, the `sni=` parameter), or it sees the port as closed with no error anywhere but this server's debug log — so change this key and the clients together. A name the certificate does not cover draws a warning at startup and on reload, because a typo here is otherwise indistinguishable from a dead server. See below |
 
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
@@ -314,8 +314,14 @@ family, an IP literal above all, is unaffected by any of the three.
   the first reply must not break.
 - `max_auth_failures` is not a rate limit and not a ban. It raises the cost of
   guessing from "one handshake, then unlimited attempts" to "one handshake per N
-  attempts", without any cross-connection state to keep or evict. Pair it with
-  fail2ban for actual banning — see [deployment.md](deployment.md#fail2ban).
+  attempts", without any cross-connection state to keep or evict. What it counts
+  is credential values rather than requests: every value that is tried and
+  refused costs one failure, so a request carrying a guess under each of the two
+  accepted field names spends two. A request carrying more than two credential
+  values is answered `400` before any of them is tried, and costs nothing,
+  because two is all that accepting both field names asks for. N is therefore a
+  number of guesses whatever shape they arrive in. Pair it with fail2ban for
+  actual banning — see [deployment.md](deployment.md#fail2ban).
 
 ### The SNI gate
 

@@ -16,7 +16,8 @@ use common::rawstream::{
 };
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, auth_section, authorized_connect,
-    connect_quic, connect_request, open_tcp_tunnel, spawn_echo_target, windowless_transport,
+    basic_credentials, connect_quic, connect_request, field_value, open_tcp_tunnel,
+    spawn_echo_target, windowless_transport,
 };
 use volto::datagram;
 use volto::h3api::{Request, Status};
@@ -225,6 +226,105 @@ async fn credential_less_failures_alone_close_the_connection() {
     tokio::time::timeout(TIMEOUT, client.quic.closed())
         .await
         .expect("credential-less failures must count against the failure budget");
+}
+
+/// A CONNECT carrying one wrong credential per password named.
+///
+/// The first goes under the field decision D3 treats as primary and the rest
+/// under the other one, which is the order the server tries them in. Two is
+/// every value the accept-both-names rule asks for; more than two is a request
+/// this server refuses without trying any of them.
+fn guesses(authority: &str, passwords: &[&str]) -> Request {
+    let mut request = connect_request(authority);
+    for (index, password) in passwords.iter().enumerate() {
+        let name = if index == 0 {
+            "proxy-authorization"
+        } else {
+            "authorization"
+        };
+        request
+            .fields
+            .append(name, field_value(&basic_credentials("user1", password)));
+    }
+    request
+}
+
+/// A request carrying two guesses pays for both of them.
+///
+/// The budget counts guesses, and one request may carry a guess under each of
+/// the two field names D3 accepts. Charged per request instead, a request was a
+/// batch of guesses at the price of one failure: with the field section limit at
+/// 64 KiB about a thousand of them fit, so one handshake bought about five
+/// thousand guesses at the shipped default rather than five (audit M1).
+///
+/// Two failures at `max_auth_failures = 2` is the whole budget in one request,
+/// so the connection goes after a single one. Charged per request, this same
+/// request is one failure and the connection lives.
+#[tokio::test]
+async fn a_request_of_two_guesses_spends_two_failures() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // Whether the 407 arrives before the close lands is a race, so what is
+    // asserted is the outcome: the connection goes.
+    let _ = attempt_with(
+        &mut client,
+        guesses(&target.to_string(), &["wrong", "wronger"]),
+    )
+    .await;
+
+    tokio::time::timeout(TIMEOUT, client.quic.closed())
+        .await
+        .expect("two guesses in one request must spend two failures");
+}
+
+/// A third credential value is a 400, and no guess in it is charged.
+///
+/// Two values is what the accept-both-names rule needs and nothing else does, so
+/// a request carrying more is malformed rather than a batch of attempts to try.
+/// It is refused before any value is tried, which is what makes it cost the peer
+/// nothing and the server nothing: four such requests at `max_auth_failures = 2`
+/// leave the connection where it was, and the credentials that work still work.
+#[tokio::test]
+async fn a_third_credential_value_is_refused_before_any_is_tried() {
+    let server = TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
+        auth_section(&[("user1", "s3cret")])
+    ))
+    .await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for i in 0..4 {
+        assert_eq!(
+            attempt_with(
+                &mut client,
+                guesses(&target.to_string(), &["wrong", "wronger", "wrongest"])
+            )
+            .await,
+            Some(Status::BAD_REQUEST),
+            "request {i} carries three credential values and must be refused as malformed"
+        );
+    }
+
+    // Nothing was tried, so nothing was charged: twice the budget in refused
+    // requests and the connection is still serving.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), client.quic.closed())
+            .await
+            .is_err(),
+        "a request refused before any credential is tried must not spend the budget"
+    );
+    assert_eq!(
+        attempt(&mut client, &target.to_string(), "s3cret").await,
+        Some(Status::OK),
+        "and the client must still be able to open a tunnel"
+    );
 }
 
 /// A five-second idle timeout, for the one test that measures against it.

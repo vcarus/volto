@@ -23,7 +23,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use volto::auth::{Authenticator, Denied};
+use volto::auth::{Authenticator, MAX_CREDENTIAL_VALUES};
 use volto::config::{Auth, User};
 use volto::h3api::{FieldValue, Fields};
 use volto::logfmt;
@@ -37,7 +37,13 @@ const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
 /// is not a configuration this server would have started with.
 const MAX_SECRET: usize = 32;
 
-/// Most credential fields one request may carry here.
+/// Most credential fields one request built here may carry.
+///
+/// More than [`MAX_CREDENTIAL_VALUES`], which is all a request reaching this
+/// server may carry: `conn` refuses the rest with 400 before any value is tried
+/// (D76 addendum of 2026-09-04). The extra values are kept because they cost
+/// nothing and they drive the scheme split and the base64 decoder, which is what
+/// this target is for.
 const MAX_VALUES: usize = 8;
 
 /// Longest a bounded token may print as: at most [`MAX_SECRET`] bytes of head,
@@ -110,11 +116,23 @@ fuzz_target!(|data: &[u8]| {
             "no users configured is no authentication"
         );
     }
-    if let Err(Denied::Rejected { username }) = &verdict {
+    if let Err(denials) = &verdict {
+        // One refusal per credential value tried and refused, which is the unit
+        // the failure budget charges, and never more than the request offered.
         assert!(
-            username.len() < MAX_BOUNDED,
-            "an unbounded user-id was kept"
+            denials.charged() <= fields.len().max(1),
+            "more failures charged than credential values offered"
         );
+        assert!(
+            fields.len() > MAX_CREDENTIAL_VALUES || denials.charged() <= MAX_CREDENTIAL_VALUES,
+            "a request within the limit charged more than it may"
+        );
+        for username in denials.claims().flatten() {
+            assert!(
+                username.len() < MAX_BOUNDED,
+                "an unbounded user-id was kept"
+            );
+        }
     }
 
     // The same request twice is the same answer: nothing here may depend on
