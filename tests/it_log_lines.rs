@@ -374,7 +374,21 @@ const ACCOUNTED: &[Accounted] = &[
 /// The trailing `(` is part of the name on purpose: it is what tells a macro
 /// invocation from a mention of one, and every call in this crate is written
 /// with parentheses.
-const PRODUCTION_MACROS: [&str; 3] = ["info!(", "warn!(", "error!("];
+///
+/// `event!` is the fourth spelling and the only one nothing in `src/` uses
+/// today. It is listed rather than left as a note because a gate that fails by
+/// default is this file's whole design: `tracing::event!(Level::WARN, ..)` is a
+/// production log statement, and without the entry it would be the one shape
+/// that reaches the journal with no table row behind it.
+///
+/// No level has to be parsed to place one. [`invocation`] takes the last string
+/// literal between the balanced parentheses, and `Level::WARN` carries none, so
+/// an `event!` is read exactly as the other three are. That does make this
+/// stricter in one direction: `event!(Level::DEBUG, ..)` is accounted where a
+/// `debug!` is not. For a spelling this crate has chosen not to use at all,
+/// that is the safe way round -- the first `event!` written here arrives with a
+/// decision about its bound, whatever level it carries.
+const PRODUCTION_MACROS: [&str; 4] = ["info!(", "warn!(", "error!(", "event!("];
 
 /// A production log statement found in `src/`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -759,6 +773,22 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
          fn f() { debug!(\"quiet\"); }\n",
     );
     assert!(log_statements("x.rs", &prose).is_empty());
+
+    // The fourth spelling, with its level where the fields go. Nothing in
+    // `src/` writes one today, which is exactly why the scanner has to be
+    // shown reading it: the first one written must be red, not invisible.
+    let evented = log_statements(
+        "x.rs",
+        "    tracing::event!(Level::WARN, live = n, \"the sentinel fired\");\n",
+    );
+    assert_eq!(evented.len(), 1);
+    assert_eq!(evented[0].message, "the sentinel fired");
+    assert_eq!(
+        log_statements("x.rs", "    event!(Level::DEBUG, \"quiet\");\n").len(),
+        1,
+        "an `event!` is accounted whatever level it names, because the level is \
+         an argument rather than part of the spelling"
+    );
 
     // Parentheses inside a message are message, not structure -- a naive
     // balance would end the invocation early and take the wrong literal.
