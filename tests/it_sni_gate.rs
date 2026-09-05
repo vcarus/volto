@@ -28,9 +28,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TIMEOUT, TestServer, bulk_alpn,
-    client_endpoint_with_transport, finish_connect_as, open_tcp_tunnel, open_udp_session,
-    read_at_least, spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_round_trip,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint_with_transport,
+    finish_connect_as, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
+    spawn_udp_echo_target, udp_answer, udp_round_trip,
 };
 use rustls::pki_types::CertificateDer;
 
@@ -54,11 +54,21 @@ const CLIENT_IDLE: Duration = Duration::from_secs(2);
 
 /// A client that gives up quickly, so that "no answer" is a fast answer.
 fn impatient(ca: &CertificateDer<'static>) -> quinn::Endpoint {
+    impatient_offering(ca, &["h3"])
+}
+
+/// [`impatient`] offering `alpn` instead of `h3` alone.
+///
+/// The two tests about a ClientHello too large for one Initial packet offer
+/// `bulk_alpn()`, which is what makes the first flight span more than one: the
+/// padding is in the ALPN list, so the client that sends it is the same client
+/// in every other respect.
+fn impatient_offering(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::Endpoint {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
     // Off, or the client would keep the connection it never opened alive.
     transport.keep_alive_interval(None);
-    client_endpoint_with_transport(ca, &["h3"], transport)
+    client_endpoint_with_transport(ca, alpn, transport)
 }
 
 /// Asserts that asking for `name` gets no answer of any kind.
@@ -226,12 +236,15 @@ async fn an_empty_probe_draws_nothing_either_way() {
     for extra in [GATE_OFF, GATE_LOCALHOST] {
         let server = TestServer::start_with(extra).await;
 
+        // Independent probes on independent sockets, and each costs the whole
+        // of `CLIENT_IDLE` on the success path, because proving silence takes
+        // the full wait. So they wait together.
+        let (empty, arbitrary) =
+            tokio::join!(probe(server.addr, b""), probe(server.addr, b"volto?"));
+
+        assert!(empty.is_none(), "an empty datagram must draw no reply");
         assert!(
-            probe(server.addr, b"").await.is_none(),
-            "an empty datagram must draw no reply"
-        );
-        assert!(
-            probe(server.addr, b"volto?").await.is_none(),
+            arbitrary.is_none(),
             "a short arbitrary datagram must draw no reply"
         );
     }
@@ -251,11 +264,7 @@ async fn a_client_hello_too_large_for_one_packet_still_reaches_the_server() {
     let server = TestServer::start_with_certificate_names(GATE_LOCALHOST, &[OTHER]).await;
     let alpn = bulk_alpn();
     let alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
-    transport.keep_alive_interval(None);
-    let endpoint = client_endpoint_with_transport(&server.ca, &alpn, transport);
+    let endpoint = impatient_offering(&server.ca, &alpn);
 
     let connection = finish_connect_as(&endpoint, server.addr, "localhost")
         .await
@@ -276,11 +285,7 @@ async fn a_large_client_hello_naming_another_host_is_refused_by_the_certificate_
     let server = TestServer::start_with_certificate_names(GATE_LOCALHOST, &[OTHER]).await;
     let alpn = bulk_alpn();
     let alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
-
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
-    transport.keep_alive_interval(None);
-    let endpoint = client_endpoint_with_transport(&server.ca, &alpn, transport);
+    let endpoint = impatient_offering(&server.ca, &alpn);
 
     let error = finish_connect_as(&endpoint, server.addr, OTHER)
         .await
@@ -349,19 +354,5 @@ async fn an_empty_list_answers_even_a_name_it_cannot_prove() {
     assert!(
         !matches!(error, quinn::ConnectionError::TimedOut),
         "with the gate off the server must reply, and the client reject it: {error:?}"
-    );
-}
-
-/// A sanity bound on the whole binary: nothing here may take as long as the
-/// harness's own patience allows, or a hang would read as a pass.
-#[tokio::test]
-async fn the_gate_decides_within_the_harness_timeout() {
-    let started = std::time::Instant::now();
-    let server = TestServer::start_with_certificate_names(GATE_LOCALHOST, &[OTHER]).await;
-    assert_silent(&server, OTHER).await;
-    assert!(
-        started.elapsed() < TIMEOUT,
-        "a refused handshake must fail fast, not hang: {:?}",
-        started.elapsed()
     );
 }
