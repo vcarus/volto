@@ -54,9 +54,23 @@ const WALL_CLOCK: [&str; 4] = ["SystemTime", "UNIX_EPOCH", "chrono", "OffsetDate
 #[test]
 fn no_source_file_reads_the_wall_clock() {
     let root = source_root();
+
+    // The way a source-scanning gate fails without saying so: it stops finding
+    // anything and reports that nothing offended (`it_scrub`'s lesson, learned
+    // the hard way, and the same latch `it_log_lines` keeps over the same two
+    // helpers). `rust_files` panics on a directory it cannot read, so what is
+    // left to catch here is a scan that found no file at all.
+    let files = rust_files(&root);
+    assert!(
+        !files.is_empty(),
+        "the scan found no Rust file at all in {}, which cannot be true of this \
+         crate: the gate is broken, not satisfied",
+        root.display()
+    );
+
     let mut offences = Vec::new();
 
-    for path in rust_files(&root) {
+    for path in files {
         let text = read_text(&path);
 
         for (number, line) in text.lines().enumerate() {
