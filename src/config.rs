@@ -2516,6 +2516,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// The length rule's own boundary, which the case above only reaches from
+    /// the far side.
+    ///
+    /// [`MAX_EXPECTED_SNI`] bytes is the longest name a ClientHello can carry,
+    /// so it has to be accepted; one more has to be refused, and the refusal has
+    /// to print both the length it got and the limit, because that pair is what
+    /// tells an operator whether the entry is a typo or a name no client could
+    /// ever send. Nothing pinned the accepting side, so `>=` in place of the `>`
+    /// refused the longest legal name and every test stayed green.
+    #[test]
+    fn the_longest_expected_sni_is_accepted_and_one_byte_more_is_not() {
+        let longest = "a".repeat(MAX_EXPECTED_SNI);
+        let cfg = parse(&format!("[security]\nexpected_sni = [\"{longest}\"]"));
+        assert_valid_apart_from_certs(&cfg, "a name of exactly the maximum length");
+
+        let over = "a".repeat(MAX_EXPECTED_SNI + 1);
+        let err = parse(&format!("[security]\nexpected_sni = [\"{over}\"]"))
+            .validate()
+            .expect_err("one byte past the maximum must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("is {} bytes", MAX_EXPECTED_SNI + 1)),
+            "the refusal must print the length it was given: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {MAX_EXPECTED_SNI}")),
+            "and the limit it broke: {message}"
+        );
+    }
+
     /// The open-proxy warning is the single most important thing an operator can
     /// be told at startup, so it is asserted rather than assumed.
     #[test]
