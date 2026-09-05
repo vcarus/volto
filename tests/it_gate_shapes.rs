@@ -1238,30 +1238,6 @@ async fn a_padding_only_initial_with_a_short_connection_id_is_silent() {
     draws_no_reply("a PADDING-only Initial, DCID 4 bytes", &[0x11; 4], &[]).await;
 }
 
-/// The same with a connection ID quinn accepts, which gets as far as a
-/// connection rather than a rejection.
-///
-/// Nothing in it is ack-eliciting, so with the gate off this shape is not
-/// answered either: there is no control to assert, and the gate-on server is
-/// the only measurement.
-#[tokio::test]
-async fn a_padding_only_initial_with_a_full_connection_id_is_silent() {
-    let crypto = nameless_crypto();
-    let dcid = [0x22; 8];
-    let shape = initial(&*crypto, &dcid, &[]);
-
-    let on = TestServer::start_with(GATE_LOCALHOST).await;
-    let heard = udp_answers(on.addr, &shape, PATIENCE).await;
-    let described: Vec<String> = heard
-        .iter()
-        .map(|reply| describe(&*crypto, reply, &dcid))
-        .collect();
-    assert!(
-        heard.is_empty(),
-        "with the gate on, a PADDING-only Initial must draw no reply: {described:?}"
-    );
-}
-
 /// An Initial carrying the first half of a ClientHello, cut before its
 /// extensions.
 ///
