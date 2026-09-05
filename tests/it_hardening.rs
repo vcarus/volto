@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::rawstream::{
-    FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
-    assert_closed_with, authenticate, read_frame, status_of, stopped_code,
+    DENIED_TARGET, FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
+    H3_STREAM_CREATION_ERROR, assert_closed_with, authenticate, connect_headers_frame, read_frame,
+    status_of, stopped_code,
 };
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, auth_section, authorized_connect,
@@ -403,37 +404,52 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 /// leaves, because that is what returns the stream. RFC 9114 §8.1's
 /// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
 /// response) is cancelled", and a reset is the only end that reaches a peer
-/// granting no window at all — a FIN would wait behind bytes that cannot be
-/// sent (review H1).
+/// granting no window at all: a FIN would wait behind bytes that cannot be sent
+/// (review H1).
+///
+/// Driven on raw quinn streams like its neighbour below, and for the same
+/// reason: `quinn::RecvStream::received_reset` observes the reset without
+/// granting the flow-control credit an ordinary read would, which is the
+/// condition this test used to sleep past. The shared HTTP/3 client cannot
+/// offer it, because its receiving half lives inside `FrameReader`
+/// (`tests/common/h3client.rs`) and D78 is what keeps `src/h3` from growing a
+/// public accessor for a test.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refusal_the_peer_will_not_take_is_reset() {
     // No `[auth]` section, so the first request authenticates and the D76 bound
     // on the connection is out of the way: what is under test is the stream.
     let server = TestServer::start_with(DELIBERATE).await;
-    let mut client = H3Client::connect_with_transport(&server, deaf_transport()).await;
+    let endpoint =
+        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
 
     // Port 25 is on the default deny list and is checked before the resolver
-    // runs, so the 403 arrives without touching the network — and it carries an
+    // runs, so the 403 arrives without touching the network, and it carries an
     // RFC 9209 `Proxy-Status` field, which puts it well past the window.
-    let mut stream = client
-        .send
-        .send_request(connect_request("192.0.2.1:25"))
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(DENIED_TARGET))
         .await
         .expect("send a request that will be refused");
 
-    // Past the server's idle timeout, without reading a byte: reading is what
-    // would grow the window and let the answer through.
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
-
-    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+    // Waited for rather than slept past. The answer is parked on a window that
+    // is not coming, and `respond_within`'s deadline is this connection's idle
+    // timeout ([`DELIBERATE`]'s two seconds), so the reset is the first thing
+    // that can arrive.
+    let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
         .await
         .expect("the server must not wait for a window that is not coming")
-        .expect_err("an answer the peer would not take must end in a reset");
-    common::assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+        .expect("an answer the peer would not take must end in a reset");
+    assert_eq!(
+        reset.map(quinn::VarInt::into_inner),
+        Some(H3_REQUEST_CANCELLED),
+        "an abandoned answer is a cancelled request"
+    );
 
     // One abandoned answer is not a reason to drop everything else.
     assert!(
-        client.quic.close_reason().is_none(),
+        connection.close_reason().is_none(),
         "the connection must survive a stream it could not answer"
     );
 }
