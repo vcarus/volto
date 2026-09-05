@@ -1297,6 +1297,48 @@ fn qpack_stream_ended(
 /// server's own rule is to end the stream there rather than read on forever.
 const MAX_INTEGER_CONTINUATION: usize = 9;
 
+/// How far the last accepted instruction's prefixed integer has run.
+///
+/// The whole of [`serve_qpack`]'s per-byte state, in one place rather than in
+/// two bindings inside its loop. The peer chooses where its stream is cut into
+/// `read_chunk` results, and the judgement may not depend on that, so the state
+/// has to live across chunks and the step that advances it has to be a function
+/// of one byte and this. Both halves are testable that way, which the loop
+/// alone was not: driving it needs a live [`quinn::RecvStream`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QpackProgress {
+    /// Whether the last accepted instruction's integer is still running.
+    continuing: bool,
+    /// How many continuation bytes of it have been read.
+    continuation: usize,
+}
+
+impl QpackProgress {
+    /// Judges one byte of the peer's QPACK stream and advances the state.
+    ///
+    /// A byte is either a continuation of the integer the last instruction
+    /// started, in which case only its top bit matters and [`Self::continuation`]
+    /// counts it, or the first byte of a new instruction, which
+    /// [`qpack_instruction`] judges.
+    fn take(&mut self, kind: QpackStream, byte: u8) -> Result<(), Violation> {
+        if self.continuing {
+            self.continuation += 1;
+            if self.continuation > MAX_INTEGER_CONTINUATION {
+                return Err(Violation::connection(
+                    kind.code(),
+                    "an integer past 62 bits",
+                ));
+            }
+            self.continuing = byte & 0b1000_0000 != 0;
+            return Ok(());
+        }
+
+        self.continuing = qpack_instruction(kind, byte)?;
+        self.continuation = 0;
+        Ok(())
+    }
+}
+
 /// Reads one of the peer's QPACK streams for the life of the connection.
 ///
 /// This decoder advertised a table capacity of zero and this encoder never
@@ -1307,6 +1349,9 @@ const MAX_INTEGER_CONTINUATION: usize = 9;
 /// means checking: with no table, nearly every instruction is one the RFC makes
 /// a connection error, and [`qpack_instruction`] says which. Only the first byte
 /// of each is ever needed, so the rest of an accepted instruction is read past.
+/// [`QpackProgress`] is the state that does the reading past, and it is held
+/// across `read_chunk` results rather than inside one: the peer chooses where
+/// its stream is cut into chunks, and the verdict may not depend on that.
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
 /// connection error of type H3_CLOSED_CRITICAL_STREAM, and
@@ -1320,10 +1365,7 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
         return;
     }
 
-    // Whether the last accepted instruction's integer is still running, and how
-    // many continuation bytes of it have been read.
-    let mut continuing = false;
-    let mut continuation = 0usize;
+    let mut progress = QpackProgress::default();
 
     loop {
         let chunk = match recv.read_chunk(usize::MAX, true).await {
@@ -1353,28 +1395,9 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
         };
 
         for &byte in &chunk.bytes {
-            if continuing {
-                continuation += 1;
-                if continuation > MAX_INTEGER_CONTINUATION {
-                    handle.fail(Violation::connection(
-                        kind.code(),
-                        "an integer past 62 bits",
-                    ));
-                    return;
-                }
-                continuing = byte & 0b1000_0000 != 0;
-                continue;
-            }
-
-            match qpack_instruction(kind, byte) {
-                Ok(more) => {
-                    continuing = more;
-                    continuation = 0;
-                }
-                Err(violation) => {
-                    handle.fail(violation);
-                    return;
-                }
+            if let Err(violation) = progress.take(kind, byte) {
+                handle.fail(violation);
+                return;
             }
         }
     }
@@ -1735,6 +1758,65 @@ mod tests {
         let more =
             qpack_instruction(QpackStream::Decoder, 0b0111_1111).expect("cancel a big stream");
         assert!(more, "a stream id of 63 or more continues");
+    }
+
+    /// Feeds `chunks` to a fresh [`QpackProgress`] in order and reports what
+    /// the stream drew.
+    ///
+    /// The first violation, or the state left behind if there was none. Two
+    /// runs agree only if they refused at the same point for the same reason,
+    /// or accepted everything and are equally far through an integer.
+    fn judge_qpack(kind: QpackStream, chunks: &[&[u8]]) -> Result<QpackProgress, Violation> {
+        let mut progress = QpackProgress::default();
+        for chunk in chunks {
+            for &byte in *chunk {
+                progress.take(kind, byte)?;
+            }
+        }
+        Ok(progress)
+    }
+
+    /// The peer chooses where its QPACK stream is cut, and the verdict may not
+    /// depend on that.
+    ///
+    /// `serve_qpack` judges whatever `read_chunk` hands it, and a peer may send
+    /// one instruction a byte at a time or a hundred in one packet. The state
+    /// that has to survive a cut is an integer still running from the last
+    /// instruction, which is the only thing an instruction leaves behind.
+    ///
+    /// Fed as one run and as an arbitrary split of the same bytes, in order.
+    /// The oracle is the whole run rather than a second implementation, which
+    /// is what makes this a property of the cutting alone.
+    #[test]
+    fn a_qpack_stream_is_judged_the_same_however_it_is_cut() {
+        proptest::proptest!(|(bytes: Vec<u8>, cuts: Vec<u8>, encoder: bool)| {
+            let kind = if encoder {
+                QpackStream::Encoder
+            } else {
+                QpackStream::Decoder
+            };
+
+            // Each cut is somewhere in the sequence, including both ends, so an
+            // empty fragment is a shape the peer can send and this can produce.
+            let mut points: Vec<usize> = cuts
+                .iter()
+                .map(|cut| usize::from(*cut) % (bytes.len() + 1))
+                .collect();
+            points.sort_unstable();
+
+            let mut fragments: Vec<&[u8]> = Vec::new();
+            let mut at = 0usize;
+            for point in points {
+                fragments.push(&bytes[at..point]);
+                at = point;
+            }
+            fragments.push(&bytes[at..]);
+
+            proptest::prop_assert_eq!(
+                judge_qpack(kind, &fragments),
+                judge_qpack(kind, &[&bytes[..]])
+            );
+        });
     }
 
     #[test]
