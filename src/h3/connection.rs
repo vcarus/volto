@@ -519,6 +519,9 @@ impl Handle {
         let settings = frame::settings_payload();
         let mut preface = BytesMut::with_capacity(settings.len() + 2 * VARINT_MAX_LEN);
         put_varint(&mut preface, STREAM_CONTROL);
+        // A byte count is a `usize` and a frame length is a `u64`; the widening
+        // is exact on both supported targets and has no `From` to express it.
+        #[allow(clippy::as_conversions)]
         frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
         preface.extend_from_slice(&settings);
 
@@ -720,6 +723,9 @@ impl Connection {
         self.going_away = Some(identifier);
 
         let mut goaway = BytesMut::with_capacity(2 * VARINT_MAX_LEN + varint_len(identifier));
+        // `varint_len` answers in bytes and a frame length is a `u64`; the
+        // widening is exact and has no `From` to express it.
+        #[allow(clippy::as_conversions)]
         frame::put_header(&mut goaway, frame::GOAWAY, varint_len(identifier) as u64);
         put_varint(&mut goaway, identifier);
 
@@ -2293,12 +2299,9 @@ mod tests {
         let shared = Arc::new(Shared::default());
         let mut inbound = shared.register_datagrams(9).expect("a free id");
 
-        for index in 0..INBOUND_QUEUE_DEPTH {
-            shared.deliver(datagram(
-                9,
-                datagram::CONTEXT_ID_UDP_PAYLOAD,
-                &[index as u8],
-            ));
+        let depth = u8::try_from(INBOUND_QUEUE_DEPTH).expect("the depth fits a byte");
+        for index in 0..depth {
+            shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
         }
         shared.deliver(datagram(
             9,
@@ -2306,10 +2309,10 @@ mod tests {
             b"past the depth",
         ));
 
-        for index in 0..INBOUND_QUEUE_DEPTH {
+        for index in 0..depth {
             assert_eq!(
                 recv_within(&mut inbound).await.as_deref(),
-                Some([index as u8].as_slice()),
+                Some([index].as_slice()),
                 "everything within the depth is kept, in order"
             );
         }

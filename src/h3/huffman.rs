@@ -21,7 +21,11 @@ use std::sync::OnceLock;
 use super::error::{Code, Violation};
 
 /// Longest code in the table, in bits.
-const MAX_CODE_BITS: u32 = 30;
+///
+/// A `usize` because every use of it is an array bound or an index into one:
+/// the three per-length tables below are `MAX_CODE_BITS + 1` long, and the
+/// decoder's running bit count is compared against it before it indexes them.
+const MAX_CODE_BITS: usize = 30;
 
 /// The EOS symbol's index in [`CODES`].
 ///
@@ -107,9 +111,9 @@ const CODES: [(u32, u8); 257] = [
 /// Decoding is then: shift a bit in, and check whether the accumulated value
 /// falls inside the run for the current length.
 struct Table {
-    count: [u16; MAX_CODE_BITS as usize + 1],
-    first_code: [u32; MAX_CODE_BITS as usize + 1],
-    first_index: [u16; MAX_CODE_BITS as usize + 1],
+    count: [u16; MAX_CODE_BITS + 1],
+    first_code: [u32; MAX_CODE_BITS + 1],
+    first_index: [u16; MAX_CODE_BITS + 1],
     symbols: [u16; CODES.len()],
 }
 
@@ -122,16 +126,16 @@ fn table() -> &'static Table {
     static TABLE: OnceLock<Table> = OnceLock::new();
 
     TABLE.get_or_init(|| {
-        let mut count = [0u16; MAX_CODE_BITS as usize + 1];
+        let mut count = [0u16; MAX_CODE_BITS + 1];
         for (_, bits) in CODES {
-            count[bits as usize] += 1;
+            count[usize::from(bits)] += 1;
         }
 
-        let mut first_code = [0u32; MAX_CODE_BITS as usize + 1];
-        let mut first_index = [0u16; MAX_CODE_BITS as usize + 1];
+        let mut first_code = [0u32; MAX_CODE_BITS + 1];
+        let mut first_index = [0u16; MAX_CODE_BITS + 1];
         let mut code = 0u32;
         let mut index = 0u16;
-        for bits in 1..=MAX_CODE_BITS as usize {
+        for bits in 1..=MAX_CODE_BITS {
             code = (code + u32::from(count[bits - 1])) << 1;
             first_code[bits] = code;
             first_index[bits] = index;
@@ -142,9 +146,11 @@ fn table() -> &'static Table {
         // walking the symbols in order fills each run left to right.
         let mut symbols = [0u16; CODES.len()];
         let mut next = first_index;
-        for (symbol, (_, bits)) in CODES.iter().enumerate() {
-            let slot = &mut next[*bits as usize];
-            symbols[*slot as usize] = symbol as u16;
+        // Counted in `u16` rather than through `enumerate`, because a symbol is
+        // what `symbols` holds and the table is 257 entries long.
+        for (symbol, (_, bits)) in (0u16..).zip(CODES.iter()) {
+            let slot = &mut next[usize::from(*bits)];
+            symbols[usize::from(*slot)] = symbol;
             *slot += 1;
         }
 
@@ -172,7 +178,7 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
 
     // The bits seen since the last complete symbol, and how many there are.
     let mut code = 0u32;
-    let mut bits = 0u32;
+    let mut bits = 0usize;
 
     for byte in encoded {
         for shift in (0..8).rev() {
@@ -183,18 +189,23 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
                 return Err(failed("no Huffman code matches these bits"));
             }
 
-            let length = bits as usize;
-            let offset = match code.checked_sub(table.first_code[length]) {
-                Some(offset) if offset < u32::from(table.count[length]) => offset,
+            let offset = match code.checked_sub(table.first_code[bits]) {
+                Some(offset) if offset < u32::from(table.count[bits]) => offset,
                 // Not a code of this length; take another bit.
                 _ => continue,
             };
 
-            let symbol = table.symbols[table.first_index[length] as usize + offset as usize];
+            // The guard above put `offset` below `count[bits]`, and the counts
+            // sum to the 257 entries of `CODES`, so this index is one of them.
+            #[allow(clippy::as_conversions)]
+            let symbol = table.symbols[usize::from(table.first_index[bits]) + offset as usize];
             if symbol == EOS {
                 // RFC 7541 §5.2: EOS inside a literal is a decoding error.
                 return Err(failed("the EOS symbol appeared in a string literal"));
             }
+            // Every symbol below `EOS` is a byte, and `EOS` is the only entry
+            // of `CODES` past 255; the line above refused it.
+            #[allow(clippy::as_conversions)]
             out.push(symbol as u8);
 
             code = 0;
@@ -250,7 +261,7 @@ mod tests {
         let table = table();
 
         let mut code = 0u32;
-        for bits in 1..=MAX_CODE_BITS as usize {
+        for bits in 1..=MAX_CODE_BITS {
             code = (code + u32::from(table.count[bits - 1])) << 1;
 
             let mut expected = code;
@@ -270,11 +281,11 @@ mod tests {
     #[test]
     fn the_table_matches_the_rfc_appendix() {
         assert_eq!(CODES[0], (0x1ff8, 13));
-        assert_eq!(CODES[b' ' as usize], (0x14, 6));
-        assert_eq!(CODES[b'0' as usize], (0x0, 5));
-        assert_eq!(CODES[b'a' as usize], (0x3, 5));
+        assert_eq!(CODES[usize::from(b' ')], (0x14, 6));
+        assert_eq!(CODES[usize::from(b'0')], (0x0, 5));
+        assert_eq!(CODES[usize::from(b'a')], (0x3, 5));
         assert_eq!(CODES[255], (0x3ffffee, 26));
-        assert_eq!(CODES[EOS as usize], (0x3fffffff, 30));
+        assert_eq!(CODES[usize::from(EOS)], (0x3fffffff, 30));
     }
 
     /// The literals of RFC 7541 Appendix C.4, which are the ones a real client

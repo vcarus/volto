@@ -730,6 +730,15 @@ impl Server {
     /// Below the cap this is a configuration read and a length read and
     /// nothing else: every branch past the first belongs to a full server.
     fn admit(&self, mut incoming: quinn::Incoming) -> Option<quinn::Incoming> {
+        /// `limits.max_connections` as the roster counts, which is a `usize`.
+        ///
+        /// Saturating rather than truncating, though neither is reachable: a
+        /// `u32` is always a `usize` on both supported targets, and a cap that
+        /// did not fit would be a cap no roster could ever reach.
+        fn live_ceiling(max_connections: u32) -> usize {
+            usize::try_from(max_connections).unwrap_or(usize::MAX)
+        }
+
         // Read per accepted connection rather than snapshotted before the
         // loop: `docs/deployment.md#reloading` promises a reload applies to
         // connections accepted from then on, and lowering this cap during an
@@ -746,7 +755,7 @@ impl Server {
         // registration, and an evicted one leaves the roster before its task
         // ends, so the set holds everything the roster does and sometimes
         // more.
-        if max_connections == 0 || self.roster.len() < max_connections as usize {
+        if max_connections == 0 || self.roster.len() < live_ceiling(max_connections) {
             return Some(incoming);
         }
 
@@ -837,7 +846,7 @@ impl Server {
         // second and never authenticates would otherwise hold every slot there
         // is for as long as it cared to -- each one bounded, all of them
         // replaced (audit 2026-08-23).
-        for victim in self.roster.evict_until_below(max_connections as usize) {
+        for victim in self.roster.evict_until_below(live_ceiling(max_connections)) {
             // DEBUG, not INFO: this fires once per arrival for as long as a
             // flood lasts, which is exactly the shape the refusal beside it is
             // DEBUG for. The victim's own closing line stays at INFO -- that
@@ -857,7 +866,7 @@ impl Server {
         // told immediately instead of timing out, and nothing per-connection
         // is built on our side. Logged at DEBUG because a flood is exactly
         // when this fires.
-        if self.roster.len() >= max_connections as usize {
+        if self.roster.len() >= live_ceiling(max_connections) {
             debug!(
                 %remote,
                 live = self.roster.len(),

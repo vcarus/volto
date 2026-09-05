@@ -48,6 +48,10 @@ pub struct Field {
 
 impl Field {
     /// The field's contribution to the field section size (RFC 9114 §4.2.2).
+    // A byte count is a `usize` and a field section size is a `u64`; both
+    // supported targets are 64 bit, so this widening is exact, and the language
+    // has no `From` between the two to say so.
+    #[allow(clippy::as_conversions)]
     fn size(&self) -> u64 {
         self.name.len() as u64 + self.value.len() as u64 + FIELD_OVERHEAD
     }
@@ -307,14 +311,16 @@ enum Found {
 fn find(name: &[u8], value: &[u8]) -> Found {
     let mut name_only = None;
 
-    for (index, (entry_name, entry_value)) in STATIC_TABLE.iter().enumerate() {
+    // Counted in `u64` rather than through `enumerate`, because a static table
+    // index goes on the wire as one.
+    for (index, (entry_name, entry_value)) in (0u64..).zip(STATIC_TABLE.iter()) {
         if *entry_name != name {
             continue;
         }
         if *entry_value == value {
-            return Found::Entry(index as u64);
+            return Found::Entry(index);
         }
-        name_only.get_or_insert(index as u64);
+        name_only.get_or_insert(index);
     }
 
     name_only.map_or(Found::Nothing, Found::Name)
@@ -401,8 +407,13 @@ impl<'a> Reader<'a> {
         self.buf = rest;
 
         // Computed in `u16` so a full eight-bit prefix -- the Required Insert
-        // Count -- does not shift a `u8` by its own width.
+        // Count -- does not shift a `u8` by its own width. Back to `u8` is
+        // exact both times: no call site passes more than eight prefix bits, so
+        // the mask is at most 255, and the flags are what is left of a byte
+        // after a shift right.
+        #[allow(clippy::as_conversions)]
         let mask = ((1u16 << prefix_bits) - 1) as u8;
+        #[allow(clippy::as_conversions)]
         let flags = (u16::from(*first) >> prefix_bits) as u8;
         let mut value = u64::from(first & mask);
         if value < u64::from(mask) {
@@ -468,6 +479,13 @@ fn truncated() -> Violation {
 }
 
 /// Writes a prefixed integer with `flags` in the bits above the prefix.
+///
+/// Every `as u8` here writes a byte a line above it has already bounded: the
+/// flags are masked to eight bits, `mask` is at most 255 because no call site
+/// passes more than eight prefix bits, the short form is taken only while
+/// `value` is below the mask, a continuation byte is masked to seven bits, and
+/// the last one is written only once `remaining` is below 0x80.
+#[allow(clippy::as_conversions)]
 fn put_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
     let mask = u64::from((1u16 << prefix_bits) - 1);
     let flags = ((u16::from(flags) << prefix_bits) & 0xff) as u8;
@@ -491,6 +509,9 @@ fn put_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
 /// `flags` are the bits above the `H` bit, which this encoder always leaves
 /// clear -- see [`super::huffman`] for why nothing is Huffman-encoded.
 fn put_string(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: &[u8]) {
+    // A byte count is a `usize` and a prefixed integer is a `u64`; the widening
+    // is exact on both supported targets and has no `From` to express it.
+    #[allow(clippy::as_conversions)]
     put_int(out, prefix_bits, flags << 1, value.len() as u64);
     out.put_slice(value);
 }

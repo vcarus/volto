@@ -61,6 +61,10 @@
 //! capturing subscriber and `tracing_subscriber::fmt().init()` may run once per
 //! process — the same reason `it_close_log` is one function.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the loop counts are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 #[path = "common/fds.rs"]

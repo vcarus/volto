@@ -409,14 +409,16 @@ mod tests {
 
         let mut out = String::new();
         for quantum in input.chunks(3) {
-            let mut bits: u32 = 0;
+            // Accumulated as a `usize` because every sextet is an index into
+            // `ALPHABET`; three bytes is 24 bits, well inside one.
+            let mut bits: usize = 0;
             for i in 0..3 {
-                bits = (bits << 8) | u32::from(quantum.get(i).copied().unwrap_or(0));
+                bits = (bits << 8) | usize::from(quantum.get(i).copied().unwrap_or(0));
             }
             let significant = quantum.len() + 1;
             for i in 0..significant {
                 let sextet = (bits >> (18 - 6 * i)) & 0x3f;
-                out.push(char::from(ALPHABET[sextet as usize]));
+                out.push(char::from(ALPHABET[sextet]));
             }
             for _ in significant..4 {
                 out.push('=');

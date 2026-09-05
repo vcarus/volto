@@ -171,6 +171,11 @@ pub fn varint_len(value: u64) -> usize {
 /// # Panics
 ///
 /// If `value` exceeds [`VARINT_MAX`], which is unrepresentable.
+///
+/// Each arm narrows to the width `varint_len` has just proved the value fits:
+/// one byte only below 0x40, two only below 0x4000, four only below
+/// 0x4000_0000.
+#[allow(clippy::as_conversions)]
 pub fn put_varint(buf: &mut BytesMut, value: u64) {
     assert!(
         value <= VARINT_MAX,

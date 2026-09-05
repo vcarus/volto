@@ -23,6 +23,9 @@
 //! finds something can be run again.
 
 #![allow(dead_code)]
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the capture arithmetic is over numbers this module counted itself.
+#![allow(clippy::as_conversions)]
 
 use std::collections::BTreeMap;
 use std::fmt;

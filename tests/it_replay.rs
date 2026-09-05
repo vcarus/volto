@@ -188,6 +188,10 @@
 //! the concurrency the plan asks for, so on any path that can execute the plan
 //! it never binds and every tier runs the plan it was given.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the capture arithmetic is over numbers this file counted itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 #[path = "replay/netem.rs"]

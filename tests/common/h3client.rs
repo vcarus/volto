@@ -47,7 +47,12 @@
 //!   that ends without a HEADERS frame, and must treat that as a stream error
 //!   rather than a connection one.
 
-#![allow(dead_code)] // Each integration test binary uses a subset of this.
+#![allow(dead_code)]
+// Each integration test binary uses a subset of this.
+
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: a client-side encoder, mirroring the server's own byte-level packing.
+#![allow(clippy::as_conversions)]
 
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

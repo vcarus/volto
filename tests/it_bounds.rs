@@ -23,6 +23,10 @@
 //! notation back against the crate, so "the same numbers" is a gate rather than
 //! a claim.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the budget arithmetic is over the constants this file asserts about.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 #[path = "common/alloc.rs"]

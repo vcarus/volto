@@ -43,6 +43,10 @@
 //! properties that put bytes on a QUIC stream, which is why their defaults are
 //! the low ones.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the generated inputs have the lengths this file chose for them.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 #[path = "common/proptest_support.rs"]

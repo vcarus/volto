@@ -12,6 +12,10 @@
 //! `ReloadHandle::reload` that `main`'s `SIGHUP` handler calls, which is where all
 //! the behaviour lives. The handler around it is a `while signal.recv()` loop.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the configuration numbers are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 use std::time::Duration;

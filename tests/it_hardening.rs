@@ -5,6 +5,10 @@
 //! three are asserted the way the rest of this suite asserts things — by watching
 //! what happens on the wire, not by reading counters out of the server.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the attack sizes are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 use std::time::Duration;

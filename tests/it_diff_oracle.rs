@@ -21,6 +21,10 @@
 //!
 //! Every RFC sentence quoted below was read from the RFC, not remembered.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the oracle packs bytes the way the decoder under test reads them.
+#![allow(clippy::as_conversions)]
+
 use std::borrow::Cow;
 
 use volto::h3::error::Code;

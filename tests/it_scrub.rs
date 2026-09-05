@@ -26,6 +26,10 @@
 //! with the gate half open: a renamed or expired secret would otherwise turn the
 //! whole check into a no-op without anyone noticing.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the counting is over the tree this file scans.
+#![allow(clippy::as_conversions)]
+
 #[path = "common/scripts.rs"]
 mod scripts;
 

@@ -7,7 +7,12 @@
 //! check now belongs entirely to the `interop` CI job (a real `volto` process
 //! driven by Go's masque-go), is spelled out in that module's documentation.
 
-#![allow(dead_code)] // Each integration test binary uses a subset of this.
+#![allow(dead_code)]
+// Each integration test binary uses a subset of this.
+
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the scaffolding counts numbers these binaries chose themselves.
+#![allow(clippy::as_conversions)]
 
 pub mod h3client;
 pub mod huffman;

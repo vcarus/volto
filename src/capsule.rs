@@ -46,6 +46,8 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// bytes past a declared value belong to the next capsule and are cut out of the
 /// buffer as they are decoded, and an unknown type is discarded as it arrives
 /// without being buffered at all.
+// 65527 is exact in both types, and a `const` cannot reach `u64::try_from`.
+#[allow(clippy::as_conversions)]
 pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + MAX_UDP_PAYLOAD as u64;
 
 /// Why a capsule sequence could not be decoded.
@@ -174,7 +176,12 @@ impl CapsuleDecoder {
                     }
                     // Discard as it arrives: an unknown capsule is never
                     // accumulated, however large it claims to be.
+                    // Both directions are exact: the minimum is at most the
+                    // buffer's own length, so it is a `usize` value, and the
+                    // widening back is the same number.
+                    #[allow(clippy::as_conversions)]
                     let discard = remaining.min(self.buffer.len() as u64);
+                    #[allow(clippy::as_conversions)]
                     let _ = self.buffer.split_to(discard as usize);
                     self.state = State::Skip {
                         remaining: remaining - discard,
@@ -199,6 +206,10 @@ impl CapsuleDecoder {
                             return Err(Error::DatagramTooLarge { length });
                         }
                         self.state = State::Value {
+                            // The refusal above leaves nothing past
+                            // `MAX_DATAGRAM_CAPSULE_VALUE` here, so the length
+                            // is far inside a `usize`.
+                            #[allow(clippy::as_conversions)]
                             length: length as usize,
                         };
                     } else {
@@ -234,13 +245,16 @@ impl CapsuleDecoder {
 pub fn encode_datagram(context_id: u64, payload: &[u8]) -> Bytes {
     let value_len = datagram::varint_len(context_id) + payload.len();
 
+    // A byte count is a `usize` and a varint is a `u64`; the widening is exact
+    // on both supported targets and has no `From` to express it.
+    #[allow(clippy::as_conversions)]
+    let wire_len = value_len as u64;
+
     let mut buf = BytesMut::with_capacity(
-        datagram::varint_len(CAPSULE_TYPE_DATAGRAM)
-            + datagram::varint_len(value_len as u64)
-            + value_len,
+        datagram::varint_len(CAPSULE_TYPE_DATAGRAM) + datagram::varint_len(wire_len) + value_len,
     );
     datagram::put_varint(&mut buf, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut buf, value_len as u64);
+    datagram::put_varint(&mut buf, wire_len);
     datagram::put_varint(&mut buf, context_id);
     buf.put_slice(payload);
 
@@ -514,6 +528,8 @@ mod tests {
     fn encode_unknown(capsule_type: u64, value: &[u8]) -> Bytes {
         let mut buf = BytesMut::new();
         datagram::put_varint(&mut buf, capsule_type);
+        // The same exact widening the encoder above states.
+        #[allow(clippy::as_conversions)]
         datagram::put_varint(&mut buf, value.len() as u64);
         buf.put_slice(value);
         buf.freeze()

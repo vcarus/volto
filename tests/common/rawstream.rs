@@ -20,7 +20,12 @@
 //! D66 shape: helpers that assert are synchronous functions returning a future,
 //! so `#[track_caller]` survives to the poll that panics.
 
-#![allow(dead_code)] // Each integration test binary uses a subset of this.
+#![allow(dead_code)]
+// Each integration test binary uses a subset of this.
+
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: raw-stream encoding, mirroring the server's own byte-level packing.
+#![allow(clippy::as_conversions)]
 
 use std::panic::Location;
 use std::time::Duration;

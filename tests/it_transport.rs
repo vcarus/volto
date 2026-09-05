@@ -15,6 +15,10 @@
 //! configured value: the bidirectional stream allowance, which a connection
 //! starts below and is raised to by authenticating.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the transport numbers are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 use std::time::{Duration, Instant};

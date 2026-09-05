@@ -46,6 +46,9 @@
 // raw libc FFI because rustix wraps no equivalent, and it only fills a struct
 // the two call sites read once.
 #![allow(unsafe_code)]
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: every `as f64` here renders a number this file counted itself.
+#![allow(clippy::as_conversions)]
 
 mod common;
 

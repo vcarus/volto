@@ -9,6 +9,10 @@
 //! was": several cases send something the server must accept first, and only
 //! the phrase shows it was read past rather than tripped over.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the stream numbers are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 use bytes::BytesMut;

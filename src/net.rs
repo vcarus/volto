@@ -170,6 +170,9 @@ pub const RESERVED_LOOKUP_CEILING: usize = 1024;
 /// Startup-only: a `SIGHUP` that raises `max_connections` does not resize the
 /// pool, so the reservation for the connections it adds is best-effort in the
 /// same way [`RESERVED_LOOKUP_CEILING`] describes.
+// A `u32` is always a `usize` on both supported targets, and a `const fn` may
+// not call `TryFrom` to say so.
+#[allow(clippy::as_conversions)]
 pub const fn blocking_pool_size(max_connections: u32) -> usize {
     // `0` is "uncapped", so there is nothing to size against and the ceiling is
     // the answer. Written out rather than as `min` because a `const fn` may not
@@ -709,7 +712,9 @@ mod tests {
         #[test]
         fn the_pool_covers_every_slot_the_budget_can_hand_out() {
             for max_connections in [1, 16, crate::config::DEFAULT_MAX_CONNECTIONS, 4096] {
-                let reserved = (max_connections as usize).min(RESERVED_LOOKUP_CEILING);
+                let reserved = usize::try_from(max_connections)
+                    .expect("a u32 fits a usize")
+                    .min(RESERVED_LOOKUP_CEILING);
 
                 assert!(
                     blocking_pool_size(max_connections) >= reserved + SHARED_LOOKUPS,

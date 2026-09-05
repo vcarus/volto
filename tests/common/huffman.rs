@@ -19,7 +19,12 @@
 //! QPACK borrows the code unchanged: RFC 9204 §4.1.2 says "the Huffman table
 //! from Appendix B of \[RFC7541\] is used without modification".
 
-#![allow(dead_code)] // Each integration test binary uses a subset of this.
+#![allow(dead_code)]
+// Each integration test binary uses a subset of this.
+
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: an encoder mirroring the decoder under test, bit for bit.
+#![allow(clippy::as_conversions)]
 
 /// RFC 7541 Appendix B: `(code, code length in bits)` for symbols 0..=255,
 /// then EOS at index 256.

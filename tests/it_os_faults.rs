@@ -48,6 +48,10 @@
 //! * **A storm of unresolvable targets is per-request too**, and does not touch
 //!   the healthy tunnel running beside it.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the fault parameters are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 #[path = "common/fds.rs"]

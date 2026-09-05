@@ -116,7 +116,9 @@ impl Quota {
     /// Creates a quota allowing `limit` concurrent tunnels.
     pub fn new(limit: u32) -> Self {
         Self {
-            permits: Arc::new(Semaphore::new(limit as usize)),
+            // Saturating rather than truncating, though neither is reachable:
+            // a `u32` is always a `usize` on both supported targets.
+            permits: Arc::new(Semaphore::new(usize::try_from(limit).unwrap_or(usize::MAX))),
             limit,
             pending: Arc::new(AtomicU32::new(0)),
             idle: Arc::new(Notify::new()),
@@ -151,7 +153,10 @@ impl Quota {
 
     /// How many tunnels are open right now.
     pub fn live(&self) -> u32 {
-        self.limit - self.permits.available_permits() as u32
+        // The semaphore was built with `limit` permits and never gains any, so
+        // the count is at most `limit`; a count past a `u32` would mean no
+        // tunnel is live, which is what the fallback reads as.
+        self.limit - u32::try_from(self.permits.available_permits()).unwrap_or(self.limit)
     }
 
     /// Whether anything on this connection is still being served.

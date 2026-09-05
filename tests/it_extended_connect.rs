@@ -7,6 +7,10 @@
 //! when a field section claims a dynamic-table entry this decoder can never
 //! have. Both are about what a *peer* is told, so both belong on the wire.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the frame lengths are ones this file writes out itself.
+#![allow(clippy::as_conversions)]
+
 mod common;
 
 use bytes::BytesMut;

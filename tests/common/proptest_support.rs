@@ -18,7 +18,12 @@
 //! those would change what a binary generates rather than only where the code
 //! lives.
 
-#![allow(dead_code)] // Each property-test binary uses a subset of this.
+#![allow(dead_code)]
+// Each property-test binary uses a subset of this.
+
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the generated inputs have the lengths this module chose for them.
+#![allow(clippy::as_conversions)]
 
 use bytes::{BufMut, BytesMut};
 use proptest::prelude::*;

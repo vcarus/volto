@@ -741,6 +741,9 @@ impl Stream {
             ),
         );
 
+        // A byte count is a `usize` and a frame length is a `u64`; the widening
+        // is exact on both supported targets and has no `From` to express it.
+        #[allow(clippy::as_conversions)]
         frame::put_header(&mut self.header, frame::HEADERS, block.len() as u64);
         let mut chunks = [self.header.split().freeze(), block.freeze()];
         self.send.write_all_chunks(&mut chunks).await?;
@@ -902,6 +905,8 @@ impl Writer {
     /// the payload is never copied: what arrives here as a `Bytes` is what
     /// quinn queues.
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
+        // The same widening the HEADERS length above states.
+        #[allow(clippy::as_conversions)]
         frame::put_header(&mut self.header, frame::DATA, data.len() as u64);
         let mut chunks = [self.header.split().freeze(), data];
         self.send.write_all_chunks(&mut chunks).await?;

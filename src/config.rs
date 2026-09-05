@@ -823,13 +823,17 @@ impl Config {
         if self.limits.keep_alive_interval > 0
             && self.limits.keep_alive_interval >= self.limits.max_idle_timeout.div_ceil(2)
         {
+            // The ceiling on this field is 3600 seconds, so the halving is
+            // always exact in an `f64`; `From` has no `u64` impl to say so.
+            #[allow(clippy::as_conversions)]
+            let half = self.limits.max_idle_timeout as f64 / 2.0;
             bail!(
                 "limits.keep_alive_interval = {} must be less than half of \
                  limits.max_idle_timeout = {} (i.e. below {}), so that a lost keep-alive \
                  packet cannot let the connection time out",
                 self.limits.keep_alive_interval,
                 self.limits.max_idle_timeout,
-                self.limits.max_idle_timeout as f64 / 2.0
+                half
             );
         }
 
@@ -1455,7 +1459,7 @@ pub(crate) mod tests {
         // The connection cap and the tunnel quota multiply out to the product
         // the startup fd check adds its headroom to.
         assert_eq!(
-            cfg.limits.max_connections as u64 * cfg.limits.max_targets_per_conn as u64,
+            u64::from(cfg.limits.max_connections) * u64::from(cfg.limits.max_targets_per_conn),
             65536
         );
         assert_eq!(cfg.limits.max_idle_timeout, 60);
@@ -3352,6 +3356,13 @@ pub(crate) mod tests {
             u16::try_from(value).unwrap_or(u16::MAX)
         }
 
+        // Byte counts widening exactly into the `u64` this strategy takes,
+        // which `From` has no `usize` impl to express.
+        #[allow(clippy::as_conversions)]
+        let recv_buffer = DEFAULT_SOCKET_RECV_BUFFER as u64;
+        #[allow(clippy::as_conversions)]
+        let send_buffer = DEFAULT_SOCKET_SEND_BUFFER as u64;
+
         (
             (
                 around(MAX_IDLE_TIMEOUT_CEILING),
@@ -3366,8 +3377,8 @@ pub(crate) mod tests {
                 around(u64::from(MAX_INITIAL_MTU)),
                 around(u64::from(MAX_MTU_UPPER_BOUND)),
                 around(*INITIAL_RTT_RANGE_MS.end()),
-                around(DEFAULT_SOCKET_RECV_BUFFER as u64),
-                around(DEFAULT_SOCKET_SEND_BUFFER as u64),
+                around(recv_buffer),
+                around(send_buffer),
                 any::<bool>(),
                 prop::sample::select(vec![
                     CongestionControl::Bbr,

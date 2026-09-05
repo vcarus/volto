@@ -637,6 +637,10 @@ impl FrameDecoder {
                     return Ok(Some(Item::Data(Bytes::new())));
                 }
 
+                // Both directions of the `take` conversion are exact: the
+                // minimum is at most the chunk's own length, so it is a `usize`
+                // value, and it goes back to `u64` as the same number.
+                #[allow(clippy::as_conversions)]
                 State::Data { remaining } => {
                     let take = remaining.min(self.chunk.len() as u64) as usize;
                     if take == 0 {
@@ -686,6 +690,8 @@ impl FrameDecoder {
                     return Ok(Some(Item::Frame(parse(kind, payload)?)));
                 }
 
+                // Exact for the reason the DATA arm above states.
+                #[allow(clippy::as_conversions)]
                 State::Skipping { kind, remaining } => {
                     let take = remaining.min(self.chunk.len() as u64) as usize;
                     self.chunk.advance(take);
@@ -940,6 +946,9 @@ fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
 
     Ok(State::Buffering {
         kind: buffered,
+        // The refusal above leaves nothing above `MAX_BUFFERED_FRAME` here, so
+        // the length is far inside a `usize`.
+        #[allow(clippy::as_conversions)]
         remaining: length as usize,
     })
 }
@@ -1213,6 +1222,11 @@ pub(super) fn settings_payload() -> BytesMut {
 
 #[cfg(test)]
 mod tests {
+    // A test writes the frame lengths and budget arithmetic it is asserting on,
+    // and every one of those numbers is a literal or a constant of this module:
+    // the package-wide `deny` is for the code that reads a peer's lengths.
+    #![allow(clippy::as_conversions)]
+
     use super::*;
 
     fn settings(pairs: &[(u64, u64)]) -> Vec<u8> {

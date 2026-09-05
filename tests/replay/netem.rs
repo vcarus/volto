@@ -99,6 +99,10 @@
 //! replay that believes it is lossy and is not would report the loopback result
 //! under a lossy heading, which is worse than not running at all.
 
+// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
+// allow: the link parameters are ones this module writes out itself.
+#![allow(clippy::as_conversions)]
+
 use std::process::Command;
 
 /// The device every replay socket is on.

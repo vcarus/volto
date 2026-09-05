@@ -291,5 +291,16 @@ codegen-units = 1
 # carry `forbid`, which an inner `allow` cannot weaken.
 unsafe_code = "deny"
 
+[lints.clippy]
+# The same shape as `unsafe_code` above: denied for every target in the package,
+# and a site that wants one argues for its own `allow` with a reason beside it.
+# A numeric `as` narrows silently -- `65536u32 as u16` is 0 and nothing says so
+# -- and the parser modules take their lengths from a peer, so the conversion
+# that has to be checked is exactly the one this forbids writing without
+# thinking. `From`/`Into` where the widening is lossless, `try_from` with a
+# stated fallback where the narrowing is real, and a per-site allow only where
+# the value is already proven in range by the code above it.
+as_conversions = "deny"
+
 [patch.crates-io]
 quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "48455d33be98128882d900dfcd7014b9a7beff6f" }
