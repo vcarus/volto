@@ -4,7 +4,8 @@
 //! A connection owns the things every tunnel on it shares: the credentials and
 //! destination policy each request is checked against, the QUIC connection its
 //! UDP sessions send datagrams on, and the tunnel quota they all draw on. All of
-//! it lives in [`crate::tunnel::Context`], cloned per request. Inbound datagrams
+//! it lives in [`crate::tunnel::Context`], built once and held in an `Arc` that
+//! every request on the connection shares rather than copies. Inbound datagrams
 //! are not among them: they are routed by the HTTP/3 connection, to the request
 //! stream each one names (D79).
 //!
@@ -110,12 +111,14 @@ pub async fn handle(
     dropped_datagrams: Arc<AtomicU64>,
     authenticated: AuthGate,
 ) -> Result<(), h3api::ConnectionError> {
-    // Cloned before the handshake, which takes ownership of the connection: a
-    // UDP session sends its datagrams on the QUIC connection itself, and asks it
-    // per packet how large a datagram may be and how far behind its send queue
-    // is. Only the sending half -- inbound datagrams are routed by the HTTP/3
-    // connection to the request stream that claimed them (D79).
-    let datagrams = quic.clone();
+    // Cloned before the handshake, which takes ownership of the connection. The
+    // context needs the connection itself, not only its datagram half: a UDP
+    // session sends datagrams on it and asks it per packet how large one may be
+    // and how far behind the send queue is, the auth-failure limit closes it,
+    // and the first authenticated request raises its stream allowance (D98).
+    // Inbound datagrams are not among those uses -- they are routed by the
+    // HTTP/3 connection to the request stream that claimed them (D79).
+    let for_context = quic.clone();
 
     // One idle timeout for the whole HTTP/3 handshake -- the same value
     // `quic.rs` puts in this connection's transport parameters. Why a handshake
@@ -129,7 +132,7 @@ pub async fn handle(
     // what the copy cost.
     let context = Arc::new(Context::new(
         &config,
-        datagrams,
+        for_context,
         connection.peer_datagrams(),
         resolver,
         tunnels,

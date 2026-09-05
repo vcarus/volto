@@ -235,14 +235,16 @@ impl Default for ResolverBudget {
 /// The waiting itself is inside the caller's `connect_timeout`, so a lookup that
 /// cannot get a slot in time is refused exactly as a resolver that did not
 /// answer in time is, with the same 504 and the same `Proxy-Status` (D90).
-/// Cloned with [`crate::tunnel::Context`], and every clone counts against the
-/// same slots: a clone that started its own count would be no bound at all.
-#[derive(Clone, Debug)]
+/// One of these per connection, made by [`ResolverBudget::per_connection`] and
+/// held for the connection's whole life by its [`crate::tunnel::Context`].
+/// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
+/// counting separately would be no bound at all.
+#[derive(Debug)]
 pub struct ConnectionResolver {
     slots: Arc<ConnectionSlots>,
 }
 
-/// What one connection's clones share.
+/// What one connection's lookups draw on.
 #[derive(Debug)]
 struct ConnectionSlots {
     /// This connection's own slot. One permit, never shared.
