@@ -1,6 +1,7 @@
 //! The QUIC endpoint: transport parameters, the accept loop and peer metadata.
 
 use std::collections::BTreeMap;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -281,11 +282,19 @@ type LiveConfig = Arc<RwLock<Arc<Config>>>;
 /// another's `Authenticator`, `Policy` and quotas for its whole life, which is
 /// the half-applied state the same ADR says there is none of.
 ///
+/// Three callers take it. `reload` holds it across the latch read and all three
+/// writes, `drain` across its own `set_server_config(None)`, and
+/// [`Server::accept_under_the_swap`] across the pair of reads that decide what
+/// one new connection runs on. The third is what closes the second race rather
+/// than narrowing it: both halves of a connection's configuration are now taken
+/// on one side of a reload.
+///
 /// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
 /// the values themselves each have their own lock. It is never held across an
-/// await, since `reload` is synchronous throughout and `drain` holds it for one
-/// `set_server_config` call, and the slow half of a reload, parsing the file
-/// and the certificate, happens before it is taken.
+/// await, since `reload` is synchronous throughout, `drain` holds it for one
+/// `set_server_config` call, and `accept_under_the_swap` for two synchronous
+/// reads. The slow half of a reload, parsing the file and the certificate,
+/// happens before it is taken.
 #[derive(Clone)]
 struct ConfigSwap(Arc<Mutex<()>>);
 
@@ -861,6 +870,34 @@ impl Server {
         Some(incoming)
     }
 
+    /// The configuration one new connection runs on, and the handshake that
+    /// runs it, taken as one step.
+    ///
+    /// Two reads decide what a connection gets, and they read two different
+    /// generations unless something orders them. The first is the live
+    /// `Config`, which carries the `Authenticator`, the `Policy`, the quotas
+    /// and the timeouts. The second is quinn's endpoint server configuration,
+    /// which carries the transport parameters: `IntoFuture` for
+    /// `quinn::Incoming` is `Incoming::accept()` (quinn `incoming.rs`), and
+    /// `proto::Endpoint::accept` reads `self.server_config` there and fixes the
+    /// parameters for the life of the connection. Left to the first poll of the
+    /// spawned task, that second read could land on the far side of a `SIGHUP`
+    /// from the first, which is the half-applied state D22 says there is none
+    /// of: one generation's transport parameters beside another's users.
+    ///
+    /// Both under [`ConfigSwap`], which `reload` holds across all three of its
+    /// writes, so a connection accepted while a reload is applying waits for it
+    /// and then runs wholly on one generation. The guard covers two synchronous
+    /// reads and no await.
+    ///
+    /// Generic over what is being accepted so the regression test can attempt
+    /// the snapshot with no peer on the other end; `serve` is the only caller
+    /// that passes a `quinn::Incoming`.
+    fn accept_under_the_swap<I: IntoFuture>(&self, incoming: I) -> (Arc<Config>, I::IntoFuture) {
+        let _swapping = self.swap.hold();
+        (self.config(), incoming.into_future())
+    }
+
     /// Runs one accepted connection to completion.
     ///
     /// Split out of the accept loop so it can be a `'static` future for the
@@ -884,11 +921,12 @@ impl Server {
     /// allowed to say nothing at all is not going to finish it. Dropping the
     /// future ends the connection and frees the slot with it.
     ///
-    /// What that drop is *not* is a refusal. `tokio::time::timeout` takes its
-    /// argument by `IntoFuture`, and `Incoming`'s implementation of that calls
-    /// `Incoming::accept()`, so by the time either arm of the select below can
-    /// run there is a `Connecting` rather than an `Incoming`: quinn has answered
-    /// the client's Initial and the TLS server flight is already on its way.
+    /// What that drop is *not* is a refusal. The `Incoming` was turned into a
+    /// future by [`Self::accept_under_the_swap`] before this task existed, and
+    /// `IntoFuture` for `Incoming` is `Incoming::accept()`, so by the time
+    /// either arm of the select below can run there is a `Connecting` rather
+    /// than an `Incoming`: quinn has answered the client's Initial and the TLS
+    /// server flight is already on its way.
     /// Dropping a `Connecting` closes the connection the way an application
     /// close does, and RFC 9000 §10.2.3 has an application close sent before the
     /// handshake completes go out as a transport one, so what the peer receives
@@ -906,14 +944,16 @@ impl Server {
     /// connection with H3_NO_ERROR — nothing went wrong, the slot was simply
     /// owed to somebody else.
     fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> + use<> {
+        let remote = incoming.remote_address();
+
         // Snapshotted per connection, not read live: a reload changes what new
         // connections get, while a connection already running keeps the
         // credentials and policy it started with for its whole life. Anything else
         // would mean a tunnel's rules changing under it mid-transfer.
-        let config = self.config();
+        let (config, accepted) = self.accept_under_the_swap(incoming);
+
         let shutdown = self.shutdown.clone();
         let resolver = self.resolver.clone();
-        let remote = incoming.remote_address();
 
         let handshake_deadline = config.limits.max_idle_timeout();
 
@@ -946,7 +986,7 @@ impl Server {
                     return;
                 }
 
-                handshake = tokio::time::timeout(handshake_deadline, incoming) => match handshake {
+                handshake = tokio::time::timeout(handshake_deadline, accepted) => match handshake {
                     Ok(Ok(quic)) => quic,
                     Ok(Err(error)) => {
                         // A failed handshake is routine on a public port: scanners,
@@ -1280,16 +1320,14 @@ impl ReloadHandle {
         // removed -- and the gate's whole point is that a name it does not know
         // gets no reply at all.
         //
-        // The live `Config` goes before `set_server_config` for the same kind of
-        // reason. `Server::serve` snapshots it per connection without taking
-        // this lock, so an accept landing between the two still sees one
-        // generation's transport parameters beside the other's `Authenticator`,
-        // `Policy` and quotas. In this order the half that is new is the half
-        // that decides who gets in: a credential the reload revoked is refused
-        // on that connection, and a destination it opened is reachable. In the
-        // other order the endpoint presented the new certificate and the
-        // connection kept the old users for its whole life, which is the tear
-        // worth avoiding.
+        // The live `Config` goes before `set_server_config` for a second
+        // reason, now that `Server::accept_under_the_swap` takes this lock
+        // across both of the reads a new connection makes: an accept can no
+        // longer land between the two at all, so the order inside the guard is
+        // what a reader of this function should be able to follow rather than
+        // what a connection depends on. New users before new transport
+        // parameters is the order the sentence above describes for the gate,
+        // read the same way: the half that decides who gets in goes first.
         self.expected.set(Names::new(&config.security.expected_sni));
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         self.endpoint.set_server_config(Some(quic_config));
@@ -1872,6 +1910,67 @@ mod tests {
 
         assert_eq!(bound.server.config().limits.max_streams_bidi, 32);
         assert!(bound.server.expected.current().accepts("other.example"));
+    }
+
+    /// A connection is not accepted between two of a reload's writes.
+    ///
+    /// The mirror of the test above, from the accept side. `Server::serve`
+    /// takes two reads that decide what one connection runs on, the live
+    /// `Config` and, through `IntoFuture for quinn::Incoming`, the endpoint's
+    /// server configuration, and until this batch it took neither under the
+    /// swap. A reload landing between them gave that connection one
+    /// generation's users beside another's transport parameters for its whole
+    /// life, which is the tear D22's 2026-09-04 addendum recorded as narrowed
+    /// rather than closed.
+    ///
+    /// Deterministic because the test holds the swap the reload holds, in place
+    /// of racing one. The accept is stood in for by a future that needs no
+    /// peer: what is under test is that the pair waits.
+    #[tokio::test]
+    async fn a_connection_is_not_accepted_between_two_of_a_reloads_writes() {
+        let bound = bound_server("[limits]\nmax_streams_bidi = 64\n");
+        write_config(
+            &bound.config_path,
+            &bound.cert,
+            &bound.key,
+            "[limits]\nmax_streams_bidi = 32\n",
+        );
+
+        let swapping = bound.server.swap.hold();
+        let (snapshotted, has_snapshotted) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (config, _accepted) =
+                    bound.server.accept_under_the_swap(std::future::ready(()));
+                snapshotted
+                    .send(config.limits.max_streams_bidi)
+                    .expect("report what the connection was accepted on");
+            });
+
+            assert!(
+                has_snapshotted.recv_timeout(SETTLE).is_err(),
+                "a connection accepted while a reload holds the swap must wait for it"
+            );
+
+            // The write the reload makes to the live configuration, while the
+            // accept waits for the rest of them.
+            *bound
+                .server
+                .config
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Arc::new(Config::load(&bound.config_path).expect("the new configuration loads"));
+            drop(swapping);
+
+            assert_eq!(
+                has_snapshotted
+                    .recv_timeout(SETTLE)
+                    .expect("the accept completes once the swap is free"),
+                32,
+                "a connection accepted after the reload runs on the new configuration"
+            );
+        });
     }
 
     /// A reload cannot re-open the listener the drain has just closed.
