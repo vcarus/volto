@@ -1760,6 +1760,21 @@ mod tests {
         assert!(more, "a stream id of 63 or more continues");
     }
 
+    /// Bytes a QPACK stream can be built from without ending at its first one.
+    ///
+    /// Unaimed bytes are no test of the state the property below is about: on
+    /// the decoder stream only `0b01xxxxxx` is an instruction this server
+    /// accepts, and on the encoder stream only `0b0010_0000`, so a generator
+    /// that did not aim would compare two runs that had both refused byte one.
+    ///
+    /// `0x7f` is the Stream Cancellation whose 6-bit prefix is all ones, the
+    /// one instruction in this server's vocabulary whose integer continues, and
+    /// it is here twice so that continuations are common. `0xff` and `0x80`
+    /// carry it on, `0x01` and `0x00` end it, and a long enough run of the
+    /// first two reaches [`MAX_INTEGER_CONTINUATION`]. `0x40` and `0x20` are
+    /// the two instructions that are complete in their first byte.
+    const QPACK_ALPHABET: [u8; 8] = [0x7f, 0x7f, 0xff, 0x80, 0x01, 0x00, 0x40, 0x20];
+
     /// Feeds `chunks` to a fresh [`QpackProgress`] in order and reports what
     /// the stream drew.
     ///
@@ -1789,12 +1804,26 @@ mod tests {
     /// is what makes this a property of the cutting alone.
     #[test]
     fn a_qpack_stream_is_judged_the_same_however_it_is_cut() {
-        proptest::proptest!(|(bytes: Vec<u8>, cuts: Vec<u8>, encoder: bool)| {
+        proptest::proptest!(|(shape: Vec<u8>, cuts: Vec<u8>, encoder: bool)| {
             let kind = if encoder {
                 QpackStream::Encoder
             } else {
                 QpackStream::Decoder
             };
+
+            // Half the bytes are drawn from [`QPACK_ALPHABET`] and half are the
+            // generator's own, so this covers both a stream that runs long
+            // enough to have a state and one that ends at its first byte.
+            let bytes: Vec<u8> = shape
+                .iter()
+                .map(|byte| {
+                    if byte & 1 == 0 {
+                        QPACK_ALPHABET[usize::from(byte >> 1) % QPACK_ALPHABET.len()]
+                    } else {
+                        *byte
+                    }
+                })
+                .collect();
 
             // Each cut is somewhere in the sequence, including both ends, so an
             // empty fragment is a shape the peer can send and this can produce.
