@@ -87,6 +87,18 @@ pub fn rust_files(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The text of a file this gate cannot do its job without.
+///
+/// `it_scrub`'s lesson pointed the other way: a check that reads a file has to
+/// fail loudly when the file is not there, or a rename turns the gate into a
+/// no-op that nobody notices. So this panics naming the path rather than
+/// returning a `Result` a caller could quietly ignore, and the five gates that
+/// read the tree as text share one wording for it.
+pub fn read_text(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
 /// `line` with a trailing `//` comment removed, and `None` for a line that is
 /// nothing but a comment.
 ///

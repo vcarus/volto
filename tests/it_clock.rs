@@ -42,9 +42,7 @@
 #[path = "common/scripts.rs"]
 mod scripts;
 
-use std::fs;
-
-use scripts::{code_only, rust_files, source_root};
+use scripts::{code_only, read_text, rust_files, source_root};
 
 /// The identifiers that would put a wall-clock reading into this crate.
 ///
@@ -59,8 +57,7 @@ fn no_source_file_reads_the_wall_clock() {
     let mut offences = Vec::new();
 
     for path in rust_files(&root) {
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let text = read_text(&path);
 
         for (number, line) in text.lines().enumerate() {
             let Some(code) = code_only(line) else {

@@ -74,10 +74,9 @@
 mod scripts;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
 
-use scripts::{repo_root, rust_files};
+use scripts::{read_text, repo_root, rust_files};
 use volto::config::Config;
 
 /// The prose pages this binary reads.
@@ -115,16 +114,6 @@ const ANCHOR_FLOOR: usize = 10;
 // ---------------------------------------------------------------------------
 // Reading the tree
 // ---------------------------------------------------------------------------
-
-/// A file this gate cannot do its job without.
-///
-/// `it_scrub`'s lesson in the other direction: a check that reads a file has to
-/// fail loudly when the file is not there, or a rename turns the gate into a
-/// no-op that nobody notices.
-fn required(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
-}
 
 /// `docs/<name>`.
 fn doc_path(name: &str) -> PathBuf {
@@ -189,7 +178,7 @@ fn bracket_depth(text: &str) -> i32 {
 /// stays parseable.
 fn example_keys() -> BTreeMap<(String, String), String> {
     let path = repo_root().join("script/config.example.toml");
-    let text = required(&path);
+    let text = read_text(&path);
     let lines: Vec<&str> = text.lines().collect();
 
     let mut keys = BTreeMap::new();
@@ -249,7 +238,7 @@ fn example_keys() -> BTreeMap<(String, String), String> {
 /// nothing else -- see the module documentation for why that is the right
 /// extraction for this page.
 fn documented_keys() -> BTreeSet<(String, String)> {
-    let text = required(&doc_path("configuration.md"));
+    let text = read_text(&doc_path("configuration.md"));
     let mut keys = BTreeSet::new();
     let mut table: Option<String> = None;
 
@@ -467,7 +456,7 @@ fn quotes() -> Vec<Quote> {
     let mut found = Vec::new();
 
     for page in DOC_PAGES {
-        let text = required(&doc_path(page));
+        let text = read_text(&doc_path(page));
         for (line, content) in prose_lines(&text) {
             let mut rest = content;
             while let Some(open) = rest.find('`') {
@@ -565,7 +554,7 @@ fn slug(heading: &str) -> String {
 
 /// Every anchor a markdown file offers, GitHub's duplicate suffixes included.
 fn anchors_of(path: &Path) -> BTreeSet<String> {
-    let text = required(path);
+    let text = read_text(path);
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut anchors = BTreeSet::new();
 
@@ -608,7 +597,7 @@ fn code_references() -> Vec<Reference> {
 
     for directory in ["src", "tests"] {
         for file in rust_files(&root.join(directory)) {
-            let text = required(&file);
+            let text = read_text(&file);
             let source = file
                 .strip_prefix(&root)
                 .unwrap_or(&file)
@@ -654,7 +643,7 @@ fn link_references() -> Vec<Reference> {
             .collect();
 
     for (name, path) in pages {
-        let text = required(&path);
+        let text = read_text(&path);
         for (number, line) in prose_lines(&text) {
             let mut rest = line;
             while let Some(at) = rest.find("](") {

@@ -34,18 +34,12 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use scripts::repo_root;
-
-/// The text of a tracked file, or a failure naming it.
-fn read(path: &Path) -> String {
-    fs::read_to_string(path)
-        .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
-}
+use scripts::{read_text, repo_root};
 
 /// Every `script/…` path the release workflow copies into the tarball.
 fn packaged_paths() -> BTreeSet<String> {
     let workflow = repo_root().join(".github/workflows/release.yml");
-    let text = read(&workflow);
+    let text = read_text(&workflow);
 
     // A `cp` invocation may be spread over several lines with trailing
     // backslashes; fold those back into one line before looking at it.
@@ -128,7 +122,7 @@ fn every_packaged_path_still_exists() {
 #[test]
 fn the_documentation_the_scripts_point_at_is_packaged() {
     let workflow = repo_root().join(".github/workflows/release.yml");
-    let folded = read(&workflow).replace("\\\n", " ");
+    let folded = read_text(&workflow).replace("\\\n", " ");
 
     let packages_docs = folded
         .lines()
@@ -163,7 +157,7 @@ const MIRROR_CLOSE: &str = "<<< mirrored build step";
 /// markers; only the step itself has to match.
 fn mirrored_build_step(name: &str) -> String {
     let path = repo_root().join(".github/workflows").join(name);
-    let text = read(&path);
+    let text = read_text(&path);
 
     let mut block: Vec<&str> = Vec::new();
     let mut inside = false;
@@ -226,7 +220,7 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
 #[test]
 fn editing_release_yml_triggers_the_cross_workflow() {
     let path = repo_root().join(".github/workflows/cross.yml");
-    let text = read(&path);
+    let text = read_text(&path);
 
     // Two `paths:` filters, one under `push` and one under `pull_request`, and
     // the entry has to be in both: a pull request that only the `push` filter
@@ -250,7 +244,7 @@ fn editing_release_yml_triggers_the_cross_workflow() {
 
 /// The `rev` of the `quinn-proto` `[patch.crates-io]` entry in `manifest`.
 fn quinn_proto_rev(manifest: &Path) -> String {
-    let text = read(manifest);
+    let text = read_text(manifest);
 
     let entry = text
         .split_once("quinn-proto = {")
@@ -310,7 +304,7 @@ fn the_fuzz_crate_pins_the_same_quinn_proto_revision() {
 
 /// The `version` a `[[package]]` block records in a lockfile, by package name.
 fn locked_version(lockfile: &Path, package: &str) -> String {
-    let text = read(lockfile);
+    let text = read_text(lockfile);
     let needle = format!("name = \"{package}\"\n");
     let start = text
         .find(&needle)
@@ -328,7 +322,7 @@ fn locked_version(lockfile: &Path, package: &str) -> String {
 
 /// The `version` under `[package]` in a manifest.
 fn package_version(manifest: &Path) -> String {
-    let text = format!("\n{}", read(manifest));
+    let text = format!("\n{}", read_text(manifest));
     let package = text
         .split("\n[")
         .find(|section| section.starts_with("package]"))

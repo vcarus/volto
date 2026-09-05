@@ -44,9 +44,8 @@
 mod scripts;
 
 use std::collections::BTreeSet;
-use std::fs;
 
-use scripts::{code_only, rust_files, source_root};
+use scripts::{code_only, read_text, rust_files, source_root};
 
 /// What keeps one production log statement from becoming a flood.
 ///
@@ -587,8 +586,7 @@ fn scan() -> Vec<Statement> {
 
     let mut found = Vec::new();
     for path in rust_files(&root) {
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let text = read_text(&path);
         let relative = path.strip_prefix(&root).unwrap_or(&path);
         found.extend(log_statements(
             &relative.display().to_string(),
@@ -711,8 +709,7 @@ fn a_sampled_entry_lives_beside_a_sampler() {
 
     for entry in ACCOUNTED.iter().filter(|e| e.bound == Bound::Sampled) {
         let path = root.join(entry.file);
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        let text = read_text(&path);
         assert!(
             production_code(&text).contains(".record()"),
             "src/{}: {:?} is marked as sampled, but nothing in that file records \
