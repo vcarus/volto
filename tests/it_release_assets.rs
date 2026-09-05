@@ -137,6 +137,26 @@ fn the_documentation_the_scripts_point_at_is_packaged() {
          docs/configuration.md and docs/deployment.md when they refuse to install",
         workflow.display()
     );
+
+    // The other half of that same sentence, which nothing checked: the copy is
+    // only worth having while the scripts still point at those pages. Renaming
+    // the directory in both scripts would leave the assertion above green.
+    // Each page is asserted where the pointer actually is -- `deploy.sh` names
+    // the configuration page when it refuses a config from the future,
+    // `install-selfsigned.sh` names the deployment page when it refuses the
+    // host it was run on -- so a check cannot pass on a mention somewhere else.
+    for (script, page) in [
+        ("script/deploy.sh", "docs/configuration.md"),
+        ("script/install-selfsigned.sh", "docs/deployment.md"),
+    ] {
+        let path = repo_root().join(script);
+        assert!(
+            read_text(&path).contains(page),
+            "{script} no longer sends the operator to {page}, which is half the \
+             reason {} has to package `docs`",
+            workflow.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -217,25 +237,43 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
 }
 
 /// And it is only evidence at all if editing release.yml runs it.
+///
+/// One occurrence on each side of the `pull_request:` key rather than two
+/// anywhere in the file. The property is "one under `push` and one under
+/// `pull_request`", and a count of two is also what moving both entries under
+/// `push:` produces, which is precisely the failure the reasoning below
+/// describes: a pull request that only the `push` filter named would run the
+/// check after the merge that needed it. Exact counts rather than minima here,
+/// because "one on each side" is the whole property.
 #[test]
 fn editing_release_yml_triggers_the_cross_workflow() {
     let path = repo_root().join(".github/workflows/cross.yml");
     let text = read_text(&path);
 
-    // Two `paths:` filters, one under `push` and one under `pull_request`, and
-    // the entry has to be in both: a pull request that only the `push` filter
-    // named would run the check after the merge that needed it.
-    let filters = text.matches("- .github/workflows/release.yml").count();
+    let entry = "- .github/workflows/release.yml";
+    let (under_push, under_pull_request) =
+        text.split_once("\n  pull_request:").unwrap_or_else(|| {
+            panic!(
+                "{} carries no `pull_request:` trigger, so half the filter this test \
+             is about does not exist",
+                path.display()
+            )
+        });
 
-    assert_eq!(
-        filters,
-        2,
-        "{} must list `.github/workflows/release.yml` in both its `push` and \
-         `pull_request` paths filters, found {filters}. Without it, the one \
-         change this workflow most needs to react to — an edit to the build \
-         step it mirrors — is the one change that runs nothing.",
-        path.display()
-    );
+    for (half, key, text) in [
+        ("push", "push", under_push),
+        ("pull request", "pull_request", under_pull_request),
+    ] {
+        assert_eq!(
+            text.matches(entry).count(),
+            1,
+            "{} must list `.github/workflows/release.yml` in its `{key}` paths \
+             filter exactly once, and the {half} half does not. Without it, the \
+             one change this workflow most needs to react to, an edit to the \
+             build step it mirrors, is the one change that runs nothing.",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
