@@ -496,6 +496,35 @@ impl Context {
             .is_ok()
     }
 
+    /// Gives back what one session charged, once its target has answered.
+    ///
+    /// The total bounds packets sent to targets that never answer. A session
+    /// whose target did answer was not one of those, so what it spent on the
+    /// way there is returned, and only that: `charged` is the session's own
+    /// count, so a client keeping a consenting target on the side can recover
+    /// no more than that side session's own packets, never what another
+    /// session spent into silence. Without the refund every session's first
+    /// packet is a charge that nothing repays, and a long-lived connection
+    /// opening short answered sessions one after another, which is what DNS
+    /// through the tunnel is, spends the total by session count alone.
+    ///
+    /// Capped at the connection's total so a refund can never exceed what was
+    /// created with the connection, whatever the caller's count.
+    pub(crate) fn refund_unanswered(&self, charged: u32) {
+        if self.unanswered_packet_budget == 0 || charged == 0 {
+            return;
+        }
+
+        let total = self
+            .unanswered_packet_budget
+            .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER);
+        let _ = self.unanswered_connection_budget.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |remaining| Some(remaining.saturating_add(charged).min(total)),
+        );
+    }
+
     /// Records an authentication failure, reporting whether that was one too many.
     ///
     /// Counts across the whole connection, so opening more streams does not reset
@@ -1039,6 +1068,49 @@ mod tests {
     /// Charged one packet at a time because that is how a session spends it, and
     /// the number that has to be exact is the last one: the packet after the
     /// total is the one whose session is closed.
+    /// A refund returns exactly what one session charged, and never lifts the
+    /// counter past the total the connection was created with.
+    #[tokio::test]
+    async fn a_refund_returns_a_sessions_own_charge_and_no_more() {
+        const BUDGET: u32 = 3;
+        const TOTAL: u32 = BUDGET * CONNECTION_UNANSWERED_MULTIPLIER;
+
+        let context = context_with_budget(BUDGET).await;
+        for _ in 0..TOTAL {
+            assert!(context.charge_unanswered());
+        }
+        assert!(!context.charge_unanswered(), "the total is spent");
+
+        // One answered session hands back the two packets it sent into silence
+        // before the answer, and exactly two more packets fit.
+        context.refund_unanswered(2);
+        assert!(context.charge_unanswered());
+        assert!(context.charge_unanswered());
+        assert!(
+            !context.charge_unanswered(),
+            "a refund of two must buy exactly two"
+        );
+
+        // A refund past the total is capped at it: the counter is what the
+        // connection was created with, never more.
+        context.refund_unanswered(u32::MAX);
+        for packet in 0..TOTAL {
+            assert!(
+                context.charge_unanswered(),
+                "packet {packet} after a full refund"
+            );
+        }
+        assert!(
+            !context.charge_unanswered(),
+            "a refund cannot lift the counter past the connection's total"
+        );
+
+        // Uncapped stays uncapped, and a refund of nothing changes nothing.
+        let uncapped = context_with_budget(0).await;
+        uncapped.refund_unanswered(5);
+        assert!(uncapped.charge_unanswered());
+    }
+
     #[tokio::test]
     async fn the_connections_unanswered_total_is_spent_exactly_once() {
         const BUDGET: u32 = 3;
@@ -1057,7 +1129,7 @@ mod tests {
         );
         assert!(
             !context.charge_unanswered(),
-            "and nothing gives it back afterwards"
+            "and a second session opened afterwards finds the same"
         );
 
         // Zero is the operator switching the mitigation off, which has to switch

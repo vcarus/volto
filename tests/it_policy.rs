@@ -727,6 +727,41 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
     assert_peer_reset(&error, H3_REQUEST_CANCELLED);
 }
 
+/// A session whose target answers must give the connection back what it spent
+/// on the way there. Every session's first packet is sent into silence, so
+/// without the refund a long-lived connection that opens short answered sessions
+/// one after another, which is what a DNS query through the tunnel is, spends
+/// the connection total at session `CONNECTION_TOTAL + 1` and is reset with
+/// every target consenting.
+#[tokio::test]
+async fn answered_sessions_give_the_connection_total_back() {
+    const BUDGET: u64 = 1;
+    // `tunnel::CONNECTION_UNANSWERED_MULTIPLIER` times the per-session budget.
+    const CONNECTION_TOTAL: u64 = BUDGET * 8;
+    const SESSIONS: u64 = CONNECTION_TOTAL + 4;
+
+    let server = TestServer::start_with(&format!(
+        "[security]\nallow_private_networks = true\nunanswered_packet_budget = {BUDGET}\n"
+    ))
+    .await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for i in 0..SESSIONS {
+        let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
+        let payload = format!("session {i}");
+        let echoed = udp_round_trip(&client, qsid, payload.as_bytes()).await;
+        assert_eq!(
+            String::from_utf8_lossy(&echoed),
+            payload,
+            "session {i} of {SESSIONS} must be answered: a target that answers \
+             refunds what its session spent, so a connection total of \
+             {CONNECTION_TOTAL} is never reached by answered sessions"
+        );
+        close_and_drain(&mut stream).await;
+    }
+}
+
 /// Once the target has answered, the conversation is consensual and the cap is
 /// gone — a budget of one must not throttle a working flow.
 #[tokio::test]

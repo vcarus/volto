@@ -191,6 +191,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
             0 => None,
             budget => Some(budget),
         },
+        charged_unanswered: 0,
         oversize_drops: crate::logfmt::Sampler::new(),
         evictions: crate::logfmt::Sampler::new(),
         deadline: tokio::time::Instant::now() + ctx.stall_budget,
@@ -230,8 +231,13 @@ struct Session<'a> {
     /// This half is per session and is recreated by opening one, so it bounds a
     /// conversation and not a client. The connection's own total
     /// ([`Context::unanswered_connection_budget`]) is what a new session does
-    /// not restore, and it is charged from here.
+    /// not restore; it is charged from here, and repaid only by this session's
+    /// own target answering (`charged_unanswered` below).
     unanswered_budget: Option<u32>,
+    /// What this session has charged the connection's total so far, returned
+    /// by [`Context::refund_unanswered`] when the target first answers and
+    /// zero from then on: an answered session has cost the connection nothing.
+    charged_unanswered: u32,
     /// How many oversized drops this session has had, on a doubling schedule.
     ///
     /// The drops themselves are per packet and can arrive at line rate, so a
@@ -514,6 +520,7 @@ impl Session<'_> {
             }
 
             *remaining -= 1;
+            self.charged_unanswered += 1;
         }
 
         match self.socket.send(&payload).await {
@@ -564,6 +571,10 @@ impl Session<'_> {
         // A target that is answering is also the other direction of progress,
         // whatever becomes of this particular packet below.
         self.unanswered_budget = None;
+        // And it was not a silent target, so what this session spent of the
+        // connection's total on the way to its first answer goes back, once.
+        let charged = std::mem::take(&mut self.charged_unanswered);
+        self.ctx.refund_unanswered(charged);
         self.touch();
 
         let encoded_len = datagram::encoded_len(
