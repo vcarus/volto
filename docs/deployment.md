@@ -541,6 +541,11 @@ One consequence to plan for: every client then reaches volto from the relay's
 address, so per-IP banning at the server cannot distinguish them — see
 [fail2ban](#fail2ban) below.
 
+A second one: the rule that refuses a tunnel to one of this host's own addresses
+cannot see the relay's, because no interface here carries it, so a target that
+names the relay is judged like any other public address. See
+[`[security]`](configuration.md#security).
+
 ## fail2ban
 
 A failed authentication logs one stable `WARN` line carrying the source address:

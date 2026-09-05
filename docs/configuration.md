@@ -323,6 +323,14 @@ family, an IP literal above all, is unaffected by any of the three.
   is refused with `403` and `destination_ip_prohibited` when it resolves to an
   address of this host other than loopback, whether that address is public, on
   the LAN, or the one the server listens on.
+- **What that rule does not cover, said rather than left to be discovered.**
+  With `allow_private_networks = true` a client can still reach this server's own
+  listener through `127.0.0.1`, exactly as it can reach every other loopback
+  service the operator opened: loopback is the private class above, and that
+  switch is what decides it. And behind a relay the address a client dials the
+  proxy on is the relay's, not one any interface here carries, so a target naming
+  that address is judged like any other public address and it is the relay rather
+  than this rule that stands in the way.
 - **UDP/53 must stay reachable.** Surge's UDP availability test is a DNS query
   through the tunnel, so denying port 53 makes Surge report the policy as broken.
   volto warns if 53 appears in `denied_ports`.
@@ -539,6 +547,22 @@ the empty list, and an empty user list is an open proxy. A configuration that
 silently drops its credentials is a worse failure than a service that refuses to
 start, so the refusal stands and the rollback cost is paid in this section
 instead.
+
+### What is stable from v1.0.0
+
+Configuration keys, their defaults and the command-line arguments are stable
+within 1.x. A key that exists keeps its name and its meaning, a documented
+default is not changed under a running deployment, and a key is removed only
+after at least one minor release has warned about it at startup. A new key keeps
+taking its documented default when the file does not mention it, which is what
+makes the upgrade half of this section a no-op.
+
+Two things are deliberately outside that promise. Log line shapes are not an
+interface: fields are added, reworded and moved between levels as the
+operational picture changes, and a parser built on them is built on something
+that moves. Neither is the `volto` library API: the crate is a library so that
+the tests and the fuzz targets can reach the parsers and the bounds directly,
+and every item it exposes exists for them.
 
 ## A minimal file
 

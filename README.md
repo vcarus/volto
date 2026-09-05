@@ -92,6 +92,8 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Behind a relay** | Works behind a plain L4 UDP DNAT relay; TLS terminates only on volto. See [Running behind a UDP relay](docs/deployment.md#running-behind-a-udp-relay). |
 | **Development** | macOS or Linux, Rust 1.95+. The test suite is green on both. |
 
+From v1.0.0 on, configuration keys, their defaults and the command-line arguments are stable within 1.x, and a key is removed only after at least one minor release has warned about it. Log line shapes and the `volto` library API are outside that promise; see [Version compatibility](docs/configuration.md#version-compatibility).
+
 ## Documentation
 
 | Page | What is in it |
