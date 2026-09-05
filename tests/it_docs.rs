@@ -25,6 +25,11 @@
 //!    `tests/`, and every `](...#anchor)` link inside `docs/` and `README.md`,
 //!    has to name a heading that exists, judged by GitHub's own slug rules.
 //!
+//! The set those three read is itself accounted for. Every `*.md` under `docs/`
+//! is either in `DOC_PAGES` or exempt by name in `EXEMPT`, so a page added
+//! without a decision fails here rather than going unread, the way a new file
+//! under `src/` fails `it_log_lines` by default.
+//!
 //! # How each set is extracted, and why that way
 //!
 //! `docs/configuration.md` documents keys as **markdown table rows** under a
@@ -74,6 +79,7 @@
 mod scripts;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use scripts::{read_text, repo_root, rust_files};
@@ -87,10 +93,9 @@ use volto::config::Config;
 ///
 /// `index.md` is the manual's landing page (D105) and is read like the rest, so
 /// a link it writes to a section of another page is held to the same promise.
-/// `docs/SUMMARY.md` is deliberately *not* here: it is the book's table of
-/// contents rather than prose, it carries no anchors and quotes no constants,
-/// and the chapter files it names are checked by the site crawl in
-/// `.github/workflows/docs.yml`, which fails on a chapter that does not build.
+/// `docs/SUMMARY.md` is deliberately *not* here; [`EXEMPT`] carries it and the
+/// reason. That the two lists together account for every `*.md` under `docs/`
+/// is itself a test, [`every_page_under_docs_is_read_or_exempt_by_name`].
 const DOC_PAGES: [&str; 4] = [
     "architecture.md",
     "configuration.md",
@@ -118,6 +123,67 @@ const ANCHOR_FLOOR: usize = 10;
 /// `docs/<name>`.
 fn doc_path(name: &str) -> PathBuf {
     repo_root().join("docs").join(name)
+}
+
+/// Pages under `docs/` that are deliberately outside [`DOC_PAGES`].
+///
+/// `SUMMARY.md` is the book's table of contents rather than prose: it carries
+/// no anchors, quotes no constants, and the chapter files it names are checked
+/// by the site crawl in `.github/workflows/docs.yml`, which fails on a chapter
+/// that does not build. That is D104's own reason, recorded in its 2026-09-02
+/// addendum, and naming the file here is what keeps the reason attached to the
+/// exemption.
+const EXEMPT: [&str; 1] = ["SUMMARY.md"];
+
+/// Every `*.md` under `docs/` is either read by these gates or exempt by name.
+///
+/// [`DOC_PAGES`] is hand-written and, until this test, nothing compared it with
+/// the directory: a new page's `` `IDENT` = value `` quotes went unchecked and
+/// its outgoing anchors unresolved. `it_log_lines` fails on a new file under
+/// `src/` by default; this is the same latch for `docs/`, and it is what makes
+/// the module comment's "should arrive with a decision" enforceable.
+///
+/// Both directions, because either one alone passes on an empty scan: a page on
+/// disk that no list names, and a name on a list that no file answers to.
+#[test]
+fn every_page_under_docs_is_read_or_exempt_by_name() {
+    let dir = repo_root().join("docs");
+    let entries = fs::read_dir(&dir)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", dir.display()));
+
+    let mut pages = BTreeSet::new();
+    for entry in entries {
+        let path = entry.expect("directory entry").path();
+        if path.extension().is_some_and(|kind| kind == "md")
+            && let Some(name) = path.file_name().and_then(|name| name.to_str())
+        {
+            pages.insert(name.to_owned());
+        }
+    }
+
+    let accounted: BTreeSet<&str> = DOC_PAGES.into_iter().chain(EXEMPT).collect();
+
+    let unread: Vec<&String> = pages
+        .iter()
+        .filter(|name| !accounted.contains(name.as_str()))
+        .collect();
+    assert!(
+        unread.is_empty(),
+        "these pages are under docs/ and no gate in this binary reads them: \
+         {unread:?}. Add each to `DOC_PAGES`, or to `EXEMPT` with the reason a \
+         decision recorded"
+    );
+
+    let missing: Vec<&str> = accounted
+        .iter()
+        .copied()
+        .filter(|name| !pages.contains(*name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`DOC_PAGES` and `EXEMPT` name pages that are not under docs/: \
+         {missing:?}. A renamed page leaves this list guarding nothing"
+    );
 }
 
 /// The lines of a markdown file that are prose, numbered from one.
@@ -351,16 +417,12 @@ fn every_configuration_key_is_documented_and_every_documented_key_parses() {
 /// too. A page that quotes an identifier missing from this table fails as
 /// loudly as one that quotes a wrong value -- otherwise a renamed constant would
 /// simply stop being checked.
+///
+/// Read in the other direction as well, by
+/// [`the_table_names_no_constant_the_pages_stopped_quoting`]: an entry no page
+/// quotes any more is guarding nothing, so it comes out.
 fn crate_constants() -> BTreeMap<&'static str, u64> {
     BTreeMap::from([
-        (
-            "CONNECTION_RECEIVE_WINDOW",
-            volto::quic::CONNECTION_RECEIVE_WINDOW.into_inner(),
-        ),
-        (
-            "STREAM_RECEIVE_WINDOW",
-            volto::quic::STREAM_RECEIVE_WINDOW.into_inner(),
-        ),
         ("SEND_WINDOW", volto::quic::SEND_WINDOW),
         ("FD_HEADROOM", volto::quic::FD_HEADROOM),
         (
@@ -531,6 +593,35 @@ fn every_constant_quoted_in_the_docs_matches_the_crate() {
             "docs/{page}:{line} says `{name}` = {value}, the crate says {actual}"
         );
     }
+}
+
+/// And an entry in the table that no page quotes any more is guarding nothing.
+///
+/// The allowlist was read in one direction only: a page that drops its last
+/// quote of a constant left the entry behind, silently, and the gate above went
+/// on passing over a smaller set than it was written for. This is the asymmetry
+/// `it_log_lines` closes for its own table with
+/// `the_table_names_no_statement_that_is_gone`, and the two gates were written
+/// days apart with the same stated design.
+///
+/// It asserts rather than reports, because a reporting test that cannot fail is
+/// a probe that asserts nothing, which is the standard this file applies
+/// everywhere else.
+#[test]
+fn the_table_names_no_constant_the_pages_stopped_quoting() {
+    let quoted: BTreeSet<String> = quotes().into_iter().map(|quote| quote.name).collect();
+
+    let unquoted: Vec<&str> = crate_constants()
+        .into_keys()
+        .filter(|name| !quoted.contains(*name))
+        .collect();
+
+    assert!(
+        unquoted.is_empty(),
+        "`crate_constants` is the constants a doc page *may* quote, and no page \
+         quotes these any more: {unquoted:?}. Drop the row, or put the quote back \
+         on the page that lost it"
+    );
 }
 
 // ---------------------------------------------------------------------------
