@@ -57,6 +57,10 @@
 //! `src/net.rs`'s own tests.
 
 #![cfg(target_os = "linux")]
+// A test binary, like its siblings: the widening casts below are between
+// counts the test itself chose, and the package-wide deny exists for the
+// parsers in `src/`. Linux-only, so a macOS clippy run never sees this file.
+#![allow(clippy::as_conversions)]
 
 mod common;
 
