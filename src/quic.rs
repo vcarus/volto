@@ -657,6 +657,7 @@ impl Server {
     pub async fn run(&self) {
         let config = self.config();
         info!(
+            log_id = "77jqt7xj",
             // The binary's own version, so a journal read after an upgrade
             // says which build produced the lines that follow without having
             // to be matched against the deploy log or a checksum.
@@ -1028,6 +1029,7 @@ impl Server {
 
             let peer = peer_info(&quic);
             info!(
+                log_id = "7l4svyo3",
                 remote = %peer.remote,
                 alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
                 server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
@@ -1164,6 +1166,7 @@ impl Server {
 
         let grace = self.config().server.shutdown_grace();
         info!(
+            log_id = "7x7xt92f",
             open_connections = self.endpoint.open_connections(),
             grace_secs = grace.as_secs(),
             "shutting down: no new connections, letting existing tunnels finish"
@@ -1176,9 +1179,13 @@ impl Server {
         .is_ok();
 
         if drained {
-            info!("every connection finished within the grace period");
+            info!(
+                log_id = "85kda9tt",
+                "every connection finished within the grace period"
+            );
         } else {
             warn!(
+                log_id = "89143be4",
                 open_connections = self.endpoint.open_connections(),
                 grace_secs = grace.as_secs(),
                 "grace period expired, closing the remaining connections"
@@ -1226,6 +1233,7 @@ fn log_connection_closed(
     match closed {
         Ok(reason) => {
             info!(
+                log_id = "8ro19wv6",
                 remote = %remote,
                 remote_now = %quic.remote_address(),
                 reason,
@@ -1243,6 +1251,7 @@ fn log_connection_closed(
         }
         Err(error) => {
             warn!(
+                log_id = "9pds6tk6",
                 remote = %remote,
                 remote_now = %quic.remote_address(),
                 %error,
@@ -1342,6 +1351,7 @@ impl ReloadHandle {
         self.endpoint.set_server_config(Some(quic_config));
 
         info!(
+            log_id = "aie853ib",
             path = %path.display(),
             users = config.auth.users.len(),
             cert = %config.server.cert.display(),
@@ -1357,6 +1367,7 @@ impl ReloadHandle {
         // find out was to notice the socket had not moved.
         if config.server.listen != self.listen {
             warn!(
+                log_id = "amplq5bv",
                 bound = %self.listen,
                 configured = %config.server.listen,
                 "server.listen changed, but a reload cannot move the listening socket; \
@@ -1365,7 +1376,7 @@ impl ReloadHandle {
         }
 
         for warning in config.warnings() {
-            warn!("{warning}");
+            warn!(log_id = "bg9ux69o", "{warning}");
         }
 
         Ok(config)
@@ -1397,6 +1408,7 @@ fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
 
     if fd_budget_is_tight(limit, limits.max_connections, limits.max_targets_per_conn) {
         warn!(
+            log_id = "bt1hbfco",
             fd_soft_limit = limit,
             max_connections = limits.max_connections,
             max_targets_per_conn = limits.max_targets_per_conn,
@@ -1519,6 +1531,7 @@ fn request_socket_buffer(
             Ok(()) => false,
             Err(error) => {
                 warn!(
+                    log_id = "djabk3lf",
                     key = which.key(),
                     requested,
                     %error,
@@ -1553,6 +1566,7 @@ fn request_socket_buffer(
     // read-back would only repeat it in different words.
     if requested > 0 && !refused && socket_buffer_was_capped(requested, granted) {
         warn!(
+            log_id = "einsvqj5",
             key = which.key(),
             requested,
             actual = granted,

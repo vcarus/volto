@@ -370,6 +370,18 @@ severity filter works rather than needing a text search:
 journalctl -u volto -p warning --since -24h
 ```
 
+Every line at `info` or above also carries a `log_id` field: eight lowercase
+letters and digits naming that one statement, fixed for the life of the line
+even if its wording changes. A runbook or an alert should match on the id rather
+than on the words, which a later release may rewrite. This selects the warning a
+connection that ended badly writes, and nothing else:
+
+```sh
+journalctl -u volto --since -24h | grep log_id=9pds6tk6
+```
+
+See [`[log]`](configuration.md#log) for the rest of the line format.
+
 ## Firewall
 
 QUIC is UDP. This is the single most common reason for "it works locally but the

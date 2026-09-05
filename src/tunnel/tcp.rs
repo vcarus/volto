@@ -330,6 +330,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     }
 
     info!(
+        log_id = "rr3u3t70",
         stream_id,
         authority,
         target = %crate::logfmt::or_dash(target),

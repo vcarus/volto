@@ -163,6 +163,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
 
     let target = socket.peer_addr().ok();
     info!(
+        log_id = "uemzs420",
         stream_id,
         quarter_stream_id,
         host,
@@ -463,6 +464,7 @@ impl Session<'_> {
         // datagram, so the stream is aborted rather than truncating it.
         if payload.len() > MAX_UDP_PAYLOAD {
             warn!(
+                log_id = "wh1im9zt",
                 quarter_stream_id = self.quarter_stream_id,
                 length = payload.len(),
                 "client sent an oversized UDP payload, aborting the session"
@@ -493,6 +495,7 @@ impl Session<'_> {
             if !self.ctx.charge_unanswered() {
                 match self.ctx.unanswered_closures.record() {
                     Some(closures) => warn!(
+                        log_id = "xc3zqhh7",
                         stream_id = self.stream_id,
                         quarter_stream_id = self.quarter_stream_id,
                         closures,
@@ -589,6 +592,7 @@ impl Session<'_> {
                 Oversize::Fits => {}
                 Oversize::DropAndReport(drops) => {
                     info!(
+                        log_id = "ybux2nd9",
                         quarter_stream_id = self.quarter_stream_id,
                         encoded_len,
                         limit,
@@ -631,6 +635,7 @@ impl Session<'_> {
             match send_buffer_verdict(len, space, &self.evictions) {
                 SendBuffer::Room => {}
                 SendBuffer::EvictsAndReport(evictions) => info!(
+                    log_id = "zh8bm6bi",
                     stream_id,
                     quarter_stream_id = self.quarter_stream_id,
                     space,

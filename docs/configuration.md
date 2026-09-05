@@ -434,6 +434,12 @@ everything. The prefix appears only when systemd sets `JOURNAL_STREAM`, so
 running volto in a terminal prints the same lines it always did, and the shipped
 unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true).
 
+Every line at `info` or above carries a `log_id` field, eight lowercase letters
+and digits. It names one statement in the source, is assigned once and is never
+reused, and it stays the same when that line is reworded, so it is what a
+runbook or a journal filter should match on. The message text is not covered by
+the compatibility promise below; the id is the stable half of the pair.
+
 One refusal is deliberately quieter than its neighbours, in the log and on the
 wire. A target whose every resolved address is `0.0.0.0` or `::` is a name a
 filtering resolver has blackholed: that decision belongs to the resolver, not to

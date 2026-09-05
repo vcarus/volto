@@ -764,6 +764,7 @@ pub(crate) async fn admit_target(
     if allowed.is_empty() {
         if policy::is_dns_blackhole(&addresses) {
             info!(
+                log_id = "t9hu0cd2",
                 stream_id,
                 host,
                 port,
@@ -782,6 +783,7 @@ pub(crate) async fn admit_target(
         // itself by. See [`Context::policy_refusals`].
         match ctx.policy_refusals.record() {
             Some(refusals) => warn!(
+                log_id = "ucmaf4w6",
                 stream_id,
                 host,
                 port,

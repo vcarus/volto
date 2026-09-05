@@ -14,7 +14,18 @@
 //! production with nobody having asked the question. This is the other half:
 //! every `info!`, `warn!` and `error!` in `src/` has to appear in the table
 //! below, saying what bounds it and why. Adding a production log line is then a
-//! deliberate act with a diff, and so is deleting or rewording one.
+//! deliberate act with a diff, and so is deleting one.
+//!
+//! # The key is the `log_id`
+//!
+//! Every production statement carries a `log_id` field: eight lowercase letters
+//! and digits, generated once and never changed. That id, and not the message
+//! text, is what this table is keyed by, and it is what an operator greps the
+//! journal for. The rule it buys is in D100: an id is permanent, a reworded line
+//! keeps its id, a new line gets a new one, and an id is never reused. The
+//! message and the file stay in the table as the columns a human reads, so
+//! rewording a line means updating its row without arguing about its bound
+//! again.
 //!
 //! # What is in scope
 //!
@@ -81,10 +92,20 @@ enum Bound {
 
 /// One production log statement, and the answer to "what bounds this?".
 struct Accounted {
+    /// The statement's permanent id: the value of its `log_id` field.
+    ///
+    /// The key. Eight lowercase letters and digits, generated once, never
+    /// changed and never reused (D100).
+    id: &'static str,
     /// The file it lives in, relative to `src/`.
+    ///
+    /// A column for the reader rather than part of the key, so that moving a
+    /// statement between files is a row to update and not a bound to re-argue.
     file: &'static str,
     /// The message it writes, exactly — the last string literal of the macro
     /// invocation, with Rust's escapes resolved.
+    ///
+    /// A column for the reader, for the same reason the file is one.
     message: &'static str,
     /// Which kind of bound applies.
     bound: Bound,
@@ -94,12 +115,14 @@ struct Accounted {
 
 /// Every production log statement in `src/`, and why each cannot become a flood.
 ///
-/// Keyed by file and message: a new line, a deleted line and a reworded line all
-/// fail this gate until somebody edits this table. The four entries D97 calls
-/// deliberately unsampled carry that ADR's own reasoning, so the argument lives
-/// beside the line rather than only in a document `src/` cannot see.
+/// Keyed by [`Accounted::id`]: a new line and a deleted line both fail this gate
+/// until somebody edits this table, and a reworded one keeps its row because it
+/// keeps its id. The four entries D97 calls deliberately unsampled carry that
+/// ADR's own reasoning, so the argument lives beside the line rather than only
+/// in a document `src/` cannot see.
 const ACCOUNTED: &[Accounted] = &[
     Accounted {
+        id: "2rquy1sk",
         file: "conn.rs",
         message: "sent GOAWAY, draining tunnels",
         bound: Bound::PerConnection,
@@ -107,6 +130,7 @@ const ACCOUNTED: &[Accounted] = &[
                  connection, and only after the operator asked for a shutdown.",
     },
     Accounted {
+        id: "2l3q6ors",
         file: "conn.rs",
         message: "every tunnel finished after GOAWAY",
         bound: Bound::PerConnection,
@@ -114,6 +138,7 @@ const ACCOUNTED: &[Accounted] = &[
                  the arm is guarded by `going_away` and the loop breaks on it.",
     },
     Accounted {
+        id: "3gmzhaq7",
         file: "conn.rs",
         message: "authentication failed",
         bound: Bound::Budgeted,
@@ -122,6 +147,7 @@ const ACCOUNTED: &[Accounted] = &[
                  when the budget runs out, so guessing costs a handshake.",
     },
     Accounted {
+        id: "4fmkbtxl",
         file: "conn.rs",
         message: "closing the connection after repeated authentication failures",
         bound: Bound::PerConnection,
@@ -129,6 +155,7 @@ const ACCOUNTED: &[Accounted] = &[
                  connection, so there cannot be a second one on it.",
     },
     Accounted {
+        id: "6qq80h9t",
         file: "conn.rs",
         message: "connection is at its tunnel limit; further refusals on this connection are \
                   logged at debug level until the count doubles",
@@ -138,6 +165,7 @@ const ACCOUNTED: &[Accounted] = &[
                  reports carry the running total.",
     },
     Accounted {
+        id: "f9be058r",
         file: "main.rs",
         message: "{warning}",
         bound: Bound::Lifecycle,
@@ -145,12 +173,14 @@ const ACCOUNTED: &[Accounted] = &[
                  before any peer exists.",
     },
     Accounted {
+        id: "fle471bm",
         file: "main.rs",
         message: "volto stopped",
         bound: Bound::Lifecycle,
         reason: "The last line the process writes.",
     },
     Accounted {
+        id: "huvnt4b6",
         file: "main.rs",
         message: "could not install the SIGHUP handler; reload is unavailable",
         bound: Bound::Lifecycle,
@@ -158,6 +188,7 @@ const ACCOUNTED: &[Accounted] = &[
                  entirely.",
     },
     Accounted {
+        id: "ihxwv0oi",
         file: "main.rs",
         message: "received SIGHUP, reloading configuration",
         bound: Bound::Lifecycle,
@@ -165,48 +196,56 @@ const ACCOUNTED: &[Accounted] = &[
                  or from `certbot`, never from a peer.",
     },
     Accounted {
+        id: "k977pzqe",
         file: "main.rs",
         message: "configuration reload failed; the running configuration is unchanged",
         bound: Bound::Lifecycle,
         reason: "At most one per SIGHUP, on the same operator-driven path.",
     },
     Accounted {
+        id: "kuce6ga8",
         file: "main.rs",
         message: "could not install the SIGTERM handler",
         bound: Bound::Lifecycle,
         reason: "Once at startup; the watcher returns straight after it.",
     },
     Accounted {
+        id: "mkf6oai0",
         file: "main.rs",
         message: "could not wait for SIGINT",
         bound: Bound::Lifecycle,
         reason: "Once, and the signal watcher returns straight after it.",
     },
     Accounted {
+        id: "osdc324g",
         file: "main.rs",
         message: "received a termination signal",
         bound: Bound::Lifecycle,
         reason: "Once: the watcher fires the shutdown trigger and ends.",
     },
     Accounted {
+        id: "r387h9om",
         file: "main.rs",
         message: "could not wait for Ctrl-C",
         bound: Bound::Lifecycle,
         reason: "The non-unix arm of the same watcher, and it returns after it.",
     },
     Accounted {
+        id: "rob6myh8",
         file: "main.rs",
         message: "received Ctrl-C",
         bound: Bound::Lifecycle,
         reason: "The non-unix arm of the same watcher, once per process.",
     },
     Accounted {
+        id: "77jqt7xj",
         file: "quic.rs",
         message: "accepting QUIC connections",
         bound: Bound::Lifecycle,
         reason: "Once, when the endpoint starts its accept loop.",
     },
     Accounted {
+        id: "7l4svyo3",
         file: "quic.rs",
         message: "connection established",
         bound: Bound::PerConnection,
@@ -214,6 +253,7 @@ const ACCOUNTED: &[Accounted] = &[
                  a peer pay before it can write anything at all.",
     },
     Accounted {
+        id: "8ro19wv6",
         file: "quic.rs",
         message: "connection closed",
         bound: Bound::PerConnection,
@@ -221,6 +261,7 @@ const ACCOUNTED: &[Accounted] = &[
                  counters that were collected for it.",
     },
     Accounted {
+        id: "9pds6tk6",
         file: "quic.rs",
         message: "connection closed with error",
         bound: Bound::PerConnection,
@@ -229,30 +270,35 @@ const ACCOUNTED: &[Accounted] = &[
                  held by `logfmt::peer_error`, not by the volume.",
     },
     Accounted {
+        id: "7x7xt92f",
         file: "quic.rs",
         message: "shutting down: no new connections, letting existing tunnels finish",
         bound: Bound::Lifecycle,
         reason: "Once, when `drain` closes the door.",
     },
     Accounted {
+        id: "85kda9tt",
         file: "quic.rs",
         message: "every connection finished within the grace period",
         bound: Bound::Lifecycle,
         reason: "One of the two outcomes of the single drain, written once.",
     },
     Accounted {
+        id: "89143be4",
         file: "quic.rs",
         message: "grace period expired, closing the remaining connections",
         bound: Bound::Lifecycle,
         reason: "The other outcome of the same single drain.",
     },
     Accounted {
+        id: "aie853ib",
         file: "quic.rs",
         message: "configuration reloaded; new connections will use it",
         bound: Bound::Lifecycle,
         reason: "One per successful reload, and a reload starts with SIGHUP.",
     },
     Accounted {
+        id: "amplq5bv",
         file: "quic.rs",
         message: "server.listen changed, but a reload cannot move the listening socket; the \
                   server is still bound where it started. Restart to apply it.",
@@ -262,6 +308,7 @@ const ACCOUNTED: &[Accounted] = &[
                  with; a reload starts with SIGHUP.",
     },
     Accounted {
+        id: "bg9ux69o",
         file: "quic.rs",
         message: "{warning}",
         bound: Bound::Lifecycle,
@@ -269,6 +316,7 @@ const ACCOUNTED: &[Accounted] = &[
                  operator-driven path.",
     },
     Accounted {
+        id: "bt1hbfco",
         file: "quic.rs",
         message: "RLIMIT_NOFILE leaves no room for limits.max_connections x \
                   limits.max_targets_per_conn: clients at their quotas can exhaust the \
@@ -278,6 +326,7 @@ const ACCOUNTED: &[Accounted] = &[
                  configuration against the process's own fd limit.",
     },
     Accounted {
+        id: "djabk3lf",
         file: "quic.rs",
         message: "the kernel refused the UDP socket buffer {} asks for, so the socket keeps the \
                   operating system default. Lower the value, or raise this host's ceiling ({} on \
@@ -287,6 +336,7 @@ const ACCOUNTED: &[Accounted] = &[
                  start.",
     },
     Accounted {
+        id: "einsvqj5",
         file: "quic.rs",
         message: "the kernel granted less UDP socket buffer than {} asks for: a burst that \
                   outruns this socket is dropped there, silently, and has to be sent again. Raise \
@@ -297,6 +347,7 @@ const ACCOUNTED: &[Accounted] = &[
                  entirely when the refusal above already spoke.",
     },
     Accounted {
+        id: "t9hu0cd2",
         file: "tunnel/mod.rs",
         message: "every address of the target is a DNS blackhole",
         bound: Bound::UnsampledOnPurpose,
@@ -306,6 +357,7 @@ const ACCOUNTED: &[Accounted] = &[
                  sample. `logfmt::addresses` is what bounds its length.",
     },
     Accounted {
+        id: "ucmaf4w6",
         file: "tunnel/mod.rs",
         message: "every address of the target is prohibited by policy; further refusals on this \
                   connection are logged at debug level until the count doubles",
@@ -315,6 +367,7 @@ const ACCOUNTED: &[Accounted] = &[
                  them. `Context::policy_refusals` turns that into 17.",
     },
     Accounted {
+        id: "rr3u3t70",
         file: "tunnel/tcp.rs",
         message: "tcp tunnel established",
         bound: Bound::PerTunnel,
@@ -323,6 +376,7 @@ const ACCOUNTED: &[Accounted] = &[
                  floor `it_log_amplification` pins.",
     },
     Accounted {
+        id: "uemzs420",
         file: "tunnel/udp.rs",
         message: "udp session established",
         bound: Bound::PerTunnel,
@@ -331,6 +385,7 @@ const ACCOUNTED: &[Accounted] = &[
                  session and no more.",
     },
     Accounted {
+        id: "wh1im9zt",
         file: "tunnel/udp.rs",
         message: "client sent an oversized UDP payload, aborting the session",
         bound: Bound::UnsampledOnPurpose,
@@ -339,6 +394,7 @@ const ACCOUNTED: &[Accounted] = &[
                  is no flood to bound -- one line per 64 KiB and per session.",
     },
     Accounted {
+        id: "ybux2nd9",
         file: "tunnel/udp.rs",
         message: "target packet too large for a QUIC datagram, dropping; further drops on this \
                   session are logged at debug level until the count doubles",
@@ -349,6 +405,7 @@ const ACCOUNTED: &[Accounted] = &[
                  on.",
     },
     Accounted {
+        id: "xc3zqhh7",
         file: "tunnel/udp.rs",
         message: "the connection's unanswered packet budget is spent, closing this session; \
                   further closures on this connection are logged at debug level until the count \
@@ -360,6 +417,7 @@ const ACCOUNTED: &[Accounted] = &[
                  `unanswered_closures` sampler picks the 1st, 2nd, 4th and so on.",
     },
     Accounted {
+        id: "zh8bm6bi",
         file: "tunnel/udp.rs",
         message: "QUIC datagram send buffer full, older datagrams evicted; further evictions on \
                   this session are logged at debug level until the count doubles",
@@ -397,8 +455,42 @@ struct Statement {
     file: String,
     /// The line the macro's name is on.
     line: usize,
+    /// The value of its `log_id` field, or `None` when it has none.
+    ///
+    /// `None` is the whole point of the option: a statement written without one
+    /// has to be red rather than invisible.
+    id: Option<String>,
     /// The message the statement writes.
     message: String,
+}
+
+impl Statement {
+    /// How the failure messages name it.
+    fn located(&self) -> String {
+        format!("src/{}:{}: {:?}", self.file, self.line, self.message)
+    }
+}
+
+/// The value of the `log_id` field inside one macro invocation.
+///
+/// Read out of the invocation's own source rather than through [`invocation`],
+/// which takes the *last* literal because that is where `tracing` puts the
+/// message. `log_id` is a field, so it is found by name: the first `log_id`,
+/// its `=`, and the string literal after it.
+fn log_id(invocation: &str) -> Option<String> {
+    let after = invocation.split_once("log_id")?.1.trim_start();
+    let value = after.strip_prefix('=')?.trim_start();
+    let rest = value.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Whether `id` is the shape D100 requires: eight lowercase letters and digits.
+fn well_formed(id: &str) -> bool {
+    id.len() == 8
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
 }
 
 /// `text` with the comments and the `#[cfg(test)]` items blanked out, line for
@@ -574,9 +666,16 @@ fn log_statements(file: &str, code: &str) -> Vec<Statement> {
         if let (Some(name), true) = (name, starts_a_name) {
             let open = index + name.chars().count() - 1;
             let (end, message) = invocation(&chars, open);
+            // The invocation's own source, for the field lookup: `end` is an
+            // index into `chars` just past the closing parenthesis, and the
+            // last invocation in a file ends at the end of it.
+            let close = chars
+                .get(end)
+                .map_or(code.len(), |(byte_offset, _)| *byte_offset);
             found.push(Statement {
                 file: file.to_string(),
                 line: line_at(code, offset),
+                id: log_id(&code[offset..close]),
                 message,
             });
             index = end;
@@ -630,31 +729,61 @@ fn every_production_log_statement_is_accounted_for() {
         source_root().display()
     );
 
-    let table: BTreeSet<(&str, &str)> = ACCOUNTED
-        .iter()
-        .map(|entry| (entry.file, entry.message))
-        .collect();
+    let table: BTreeSet<&str> = ACCOUNTED.iter().map(|entry| entry.id).collect();
 
     let unaccounted: Vec<String> = found
         .iter()
-        .filter(|statement| !table.contains(&(statement.file.as_str(), statement.message.as_str())))
-        .map(|statement| {
-            format!(
-                "src/{}:{}: {:?}",
-                statement.file, statement.line, statement.message
-            )
-        })
+        .filter(|statement| statement.id.as_deref().is_none_or(|id| !table.contains(id)))
+        .map(Statement::located)
         .collect();
 
     assert!(
         unaccounted.is_empty(),
         "{} production log statement(s) nobody has answered D97 for. A line at \
-         `info` or above is one a peer may be able to repeat: say what bounds it \
-         -- a `logfmt::Sampler`, a configured budget, one per connection, one per \
-         tunnel -- and add it to `ACCOUNTED` in this file with the reason:\n  {}",
+         `info` or above is one a peer may be able to repeat: give it a fresh \
+         `log_id`, say what bounds it -- a `logfmt::Sampler`, a configured \
+         budget, one per connection, one per tunnel -- and add it to `ACCOUNTED` \
+         in this file with the reason:\n  {}",
         unaccounted.len(),
         unaccounted.join("\n  ")
     );
+}
+
+/// A production log line an operator cannot grep for by id is not one this gate
+/// can key, so the field is required and its shape is fixed.
+///
+/// Three failures in one test because they are one rule: the id has to be there,
+/// it has to be eight lowercase letters and digits, and it has to belong to this
+/// statement alone. A duplicate is the dangerous one -- two lines would share a
+/// row, and the reason written for one of them would silently cover the other.
+#[test]
+fn every_production_log_statement_carries_its_own_well_formed_log_id() {
+    let found = scan();
+    assert!(!found.is_empty(), "the scanner found nothing to check");
+
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for statement in &found {
+        let Some(id) = statement.id.as_deref() else {
+            panic!(
+                "{} has no `log_id` field. Every production log line carries one, \
+                 so that the journal can be grepped by it and this file can key \
+                 its table on it (D100).",
+                statement.located()
+            );
+        };
+        assert!(
+            well_formed(id),
+            "{} has `log_id = {id:?}`, which is not eight lowercase letters and \
+             digits (D100)",
+            statement.located()
+        );
+        assert!(
+            seen.insert(id),
+            "{} repeats `log_id = {id:?}`, which another statement already uses: \
+             an id names one line and is never reused (D100)",
+            statement.located()
+        );
+    }
 }
 
 /// The table may not outlive the lines it describes.
@@ -664,21 +793,19 @@ fn every_production_log_statement_is_accounted_for() {
 /// longer exists to be judged against it.
 #[test]
 fn the_table_names_no_statement_that_is_gone() {
-    let found: BTreeSet<(String, String)> = scan()
-        .into_iter()
-        .map(|statement| (statement.file, statement.message))
-        .collect();
+    let found: BTreeSet<String> = scan().into_iter().filter_map(|s| s.id).collect();
 
     let stale: Vec<String> = ACCOUNTED
         .iter()
-        .filter(|entry| !found.contains(&(entry.file.to_string(), entry.message.to_string())))
-        .map(|entry| format!("src/{}: {:?}", entry.file, entry.message))
+        .filter(|entry| !found.contains(entry.id))
+        .map(|entry| format!("{}: src/{}: {:?}", entry.id, entry.file, entry.message))
         .collect();
 
     assert!(
         stale.is_empty(),
         "{} entr(y/ies) in `ACCOUNTED` match no statement in `src/`. A log line \
-         that was deleted or reworded takes its entry with it:\n  {}",
+         that was deleted takes its entry with it, and an id is never reused for \
+         a different line:\n  {}",
         stale.len(),
         stale.join("\n  ")
     );
@@ -690,22 +817,32 @@ fn every_entry_carries_a_reason_and_a_distinct_key() {
     let mut keys = BTreeSet::new();
     for entry in ACCOUNTED {
         assert!(
+            well_formed(entry.id),
+            "src/{}: {:?} has `id = {:?}`, which is not eight lowercase letters \
+             and digits (D100)",
+            entry.file,
+            entry.message,
+            entry.id
+        );
+        assert!(
             !entry.reason.trim().is_empty(),
-            "src/{}: {:?} has no reason, which is the only thing this table is for",
+            "{}: src/{}: {:?} has no reason, which is the only thing this table \
+             is for",
+            entry.id,
             entry.file,
             entry.message
         );
         assert!(
             !entry.message.trim().is_empty(),
-            "src/{}: an entry with no message matches every statement and guards none",
+            "{}: src/{}: an entry with no message tells a reader nothing about \
+             the line it accounts for",
+            entry.id,
             entry.file
         );
         assert!(
-            keys.insert((entry.file, entry.message)),
-            "src/{}: {:?} is in the table twice, so one of the two reasons is \
-             unreachable",
-            entry.file,
-            entry.message
+            keys.insert(entry.id),
+            "{} is in the table twice, so one of the two reasons is unreachable",
+            entry.id
         );
     }
 }
@@ -738,16 +875,31 @@ fn a_sampled_entry_lives_beside_a_sampler() {
 #[test]
 fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
     // A one-line call, fields and all.
-    let one = log_statements("x.rs", "    info!(live = n, \"sent GOAWAY\");\n");
+    let one = log_statements(
+        "x.rs",
+        "    info!(log_id = \"ab12cd34\", live = n, \"sent GOAWAY\");\n",
+    );
     assert_eq!(one.len(), 1);
     assert_eq!(one[0].line, 1);
     assert_eq!(one[0].message, "sent GOAWAY");
+    assert_eq!(
+        one[0].id.as_deref(),
+        Some("ab12cd34"),
+        "the id is a field read by name, and the message is still the last literal"
+    );
+
+    // The field missing is the case the gate exists to catch, and the scanner
+    // has to report it as absent rather than take some other literal for it.
+    let anonymous = log_statements("x.rs", "    info!(live = n, \"sent GOAWAY\");\n");
+    assert_eq!(anonymous.len(), 1);
+    assert_eq!(anonymous[0].id, None);
 
     // The shape most of this crate's calls take: several lines, the message
     // last, and a `\` continuation inside it.
     let spread = production_code(
         "fn f() {\n\
          \x20   warn!(\n\
+         \x20       log_id = \"9zzq0w1e\",\n\
          \x20       stream_id,\n\
          \x20       \"at the limit; further refusals are logged \\\n\
          \x20        at debug level\"\n\
@@ -756,6 +908,7 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
     );
     let spread = log_statements("x.rs", &spread);
     assert_eq!(spread.len(), 1);
+    assert_eq!(spread[0].id.as_deref(), Some("9zzq0w1e"));
     assert_eq!(
         spread[0].line, 2,
         "a statement is named by the macro's line"
@@ -779,10 +932,11 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
     // shown reading it: the first one written must be red, not invisible.
     let evented = log_statements(
         "x.rs",
-        "    tracing::event!(Level::WARN, live = n, \"the sentinel fired\");\n",
+        "    tracing::event!(Level::WARN, log_id = \"55ab77cd\", \"the sentinel fired\");\n",
     );
     assert_eq!(evented.len(), 1);
     assert_eq!(evented[0].message, "the sentinel fired");
+    assert_eq!(evented[0].id.as_deref(), Some("55ab77cd"));
     assert_eq!(
         log_statements("x.rs", "    event!(Level::DEBUG, \"quiet\");\n").len(),
         1,
@@ -792,9 +946,33 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
 
     // Parentheses inside a message are message, not structure -- a naive
     // balance would end the invocation early and take the wrong literal.
-    let parens = log_statements("x.rs", "info!(n, \"a limit (D77) was reached\");\n");
+    let parens = log_statements(
+        "x.rs",
+        "info!(log_id = \"pp00qq11\", n, \"a limit (D77) was reached\");\n",
+    );
     assert_eq!(parens.len(), 1);
     assert_eq!(parens[0].message, "a limit (D77) was reached");
+    assert_eq!(parens[0].id.as_deref(), Some("pp00qq11"));
+
+    // Two statements in one file: the field lookup is per invocation, so the
+    // second may not pick up the first one's id.
+    let pair = log_statements(
+        "x.rs",
+        "info!(log_id = \"aaaa1111\", \"first\");\ninfo!(log_id = \"bbbb2222\", \"second\");\n",
+    );
+    assert_eq!(
+        pair.iter()
+            .map(|s| (s.id.as_deref(), s.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some("aaaa1111"), "first"), (Some("bbbb2222"), "second")]
+    );
+
+    // The shape rule itself, since nothing in `src/` may break it.
+    assert!(well_formed("ab12cd34"));
+    assert!(!well_formed("ab12cd3"), "seven characters is not eight");
+    assert!(!well_formed("ab12cd345"), "nine characters is not eight");
+    assert!(!well_formed("AB12cd34"), "an id is lowercase");
+    assert!(!well_formed("ab12-d34"), "an id is letters and digits only");
 
     // A test module writes log lines nobody can reach, and is blanked whole --
     // while the production code after it survives, which is what a

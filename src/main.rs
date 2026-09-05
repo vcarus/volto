@@ -128,7 +128,7 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
     // "authentication is off" above all — are useless if they are logged into a
     // subscriber that has not been installed yet.
     for warning in config.warnings() {
-        tracing::warn!("{warning}");
+        tracing::warn!(log_id = "f9be058r", "{warning}");
     }
 
     let server = Server::bind(Arc::new(config))?;
@@ -141,7 +141,7 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
 
     server.run().await;
 
-    info!("volto stopped");
+    info!(log_id = "fle471bm", "volto stopped");
     Ok(())
 }
 
@@ -164,18 +164,27 @@ async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
     let mut hangup = match signal(SignalKind::hangup()) {
         Ok(stream) => stream,
         Err(error) => {
-            warn!(%error, "could not install the SIGHUP handler; reload is unavailable");
+            warn!(
+                log_id = "huvnt4b6",
+                %error,
+                "could not install the SIGHUP handler; reload is unavailable"
+            );
             return;
         }
     };
 
     while hangup.recv().await.is_some() {
-        info!(path = %path.display(), "received SIGHUP, reloading configuration");
+        info!(
+            log_id = "ihxwv0oi",
+            path = %path.display(),
+            "received SIGHUP, reloading configuration"
+        );
 
         if let Err(error) = handle.reload(&path) {
             // `{error:#}` prints the whole anyhow chain, which is where the
             // specific offending field ends up.
             error!(
+                log_id = "k977pzqe",
                 error = format!("{error:#}"),
                 "configuration reload failed; the running configuration is unchanged"
             );
@@ -201,7 +210,7 @@ async fn watch_for_signals(trigger: Trigger) {
             Err(error) => {
                 // Without this the process can still be stopped, just not
                 // gracefully, so it is not worth refusing to start over.
-                warn!(%error, "could not install the SIGTERM handler");
+                warn!(log_id = "kuce6ga8", %error, "could not install the SIGTERM handler");
                 return;
             }
         };
@@ -211,22 +220,26 @@ async fn watch_for_signals(trigger: Trigger) {
             result = tokio::signal::ctrl_c() => match result {
                 Ok(()) => "SIGINT",
                 Err(error) => {
-                    warn!(%error, "could not wait for SIGINT");
+                    warn!(log_id = "mkf6oai0", %error, "could not wait for SIGINT");
                     return;
                 }
             },
         };
 
-        info!(signal = signal_name, "received a termination signal");
+        info!(
+            log_id = "osdc324g",
+            signal = signal_name,
+            "received a termination signal"
+        );
     }
 
     #[cfg(not(unix))]
     {
         if let Err(error) = tokio::signal::ctrl_c().await {
-            warn!(%error, "could not wait for Ctrl-C");
+            warn!(log_id = "r387h9om", %error, "could not wait for Ctrl-C");
             return;
         }
-        info!("received Ctrl-C");
+        info!(log_id = "rob6myh8", "received Ctrl-C");
     }
 
     trigger.fire();

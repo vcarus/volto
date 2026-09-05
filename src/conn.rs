@@ -169,7 +169,7 @@ pub async fn handle(
             // Only meaningful after GOAWAY: before it, an idle connection is
             // simply idle, not finished.
             () = context.quota.wait_until_idle(), if going_away => {
-                info!("every tunnel finished after GOAWAY");
+                info!(log_id = "2l3q6ors", "every tunnel finished after GOAWAY");
                 break Ok(());
             }
 
@@ -287,7 +287,11 @@ async fn announce_goaway(
 
     let live = context.quota.live();
     if sent {
-        info!(live_tunnels = live, "sent GOAWAY, draining tunnels");
+        info!(
+            log_id = "2rquy1sk",
+            live_tunnels = live,
+            "sent GOAWAY, draining tunnels"
+        );
     } else {
         debug!(
             remote = %context.remote,
@@ -484,6 +488,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             // password. `remote` is here so a fail2ban rule has something to act
             // on; behind a relay it is the relay's address.
             warn!(
+                log_id = "3gmzhaq7",
                 stream_id,
                 remote = %context.remote,
                 // Recorded as a `str`, not through `or_dash`: these bytes are the
@@ -521,6 +526,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
 
             if spent {
                 warn!(
+                    log_id = "4fmkbtxl",
                     remote = %context.remote,
                     failures = context.max_auth_failures,
                     "closing the connection after repeated authentication failures"
@@ -555,6 +561,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
         let live = context.quota.live();
         match context.limit_refusals.record() {
             Some(refusals) => warn!(
+                log_id = "6qq80h9t",
                 stream_id,
                 live,
                 refusals,
