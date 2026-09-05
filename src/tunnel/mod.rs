@@ -27,8 +27,8 @@ use crate::quic::AuthGate;
 pub use quota::{Pending, Quota, Slot};
 pub use status::ProxyError;
 pub(crate) use status::{
-    Responded, Unreachable, accept_then_close, refuse, refuse_because, refuse_unreachable,
-    refuse_with, respond,
+    ResolveFailure, Responded, Unreachable, accept_then_close, refuse, refuse_because,
+    refuse_unreachable, refuse_with, respond,
 };
 
 /// How a request should be handled.
@@ -229,9 +229,11 @@ impl AuthFailures {
 ///
 /// Built once per connection and held in an `Arc`, so sharing it with a request
 /// costs one refcount bump rather than a copy of eighteen fields. Deliberately
-/// not [`Clone`]: every member that could be copied is already behind an `Arc`
-/// of its own, so a second whole `Context` would be a second view of the same
-/// connection and nothing else.
+/// not [`Clone`]: a second whole `Context` would be a second view of the same
+/// connection and nothing else. That one `Arc` is also the only sharing the
+/// members need, so they are stored inline. The two that keep an `Arc` of their
+/// own, `peer_datagrams` and `tunnels`, do so because something outside this
+/// connection's request handling holds them as well.
 ///
 /// The UDP-specific members are here rather than in [`udp`] because a connection
 /// owns them regardless of which tunnel type ends up using them: both are
@@ -256,7 +258,7 @@ pub struct Context {
     /// [`crate::h3::connection`] gives.
     pub peer_datagrams: Arc<AtomicBool>,
     /// The credentials every request is checked against.
-    pub auth: Arc<Authenticator>,
+    pub auth: Authenticator,
     /// Authentication failures seen on this connection so far, bucketed by who
     /// they were aimed at.
     ///
@@ -265,7 +267,7 @@ pub struct Context {
     /// `std::sync::Mutex`, held for a bucket lookup and a sum and never across
     /// an await; it is here rather than an atomic because the buckets and the
     /// total taken from them have to move together.
-    pub auth_failures: Arc<Mutex<AuthFailures>>,
+    pub auth_failures: Mutex<AuthFailures>,
     /// Failures tolerated before the connection is closed. Zero disables it.
     pub max_auth_failures: u32,
     /// Whether any request on this connection has passed the credentials check.
@@ -292,9 +294,9 @@ pub struct Context {
     /// The peer's address, for logs that a fail2ban rule can act on.
     pub remote: std::net::SocketAddr,
     /// Which destinations this proxy may reach.
-    pub policy: Arc<Policy>,
+    pub policy: Policy,
     /// How many tunnels this connection may hold open at once.
-    pub quota: Arc<Quota>,
+    pub quota: Quota,
     /// The bidirectional stream allowance this connection is granted once it
     /// has authenticated: `[limits] max_streams_bidi`, in full.
     ///
@@ -377,7 +379,7 @@ pub struct Context {
     ///
     /// One line per closed session would be one line per stream a peer opens,
     /// which is the flood [`crate::logfmt::Sampler`] exists to stop.
-    pub unanswered_closures: Arc<crate::logfmt::Sampler>,
+    pub unanswered_closures: crate::logfmt::Sampler,
     /// How many destinations this connection's policy has refused, and when
     /// that is worth saying out loud again.
     ///
@@ -389,14 +391,14 @@ pub struct Context {
     /// warning per request would let a peer decide how much of this host's
     /// journal is left for anybody else. See [`crate::logfmt::Sampler`] for the
     /// schedule and for why silencing the repeats was not the answer.
-    pub policy_refusals: Arc<crate::logfmt::Sampler>,
+    pub policy_refusals: crate::logfmt::Sampler,
     /// The same, for requests refused because this connection is already
     /// holding every tunnel it may.
     ///
     /// Reaching the limit costs a peer `max_targets_per_conn` live tunnels,
     /// which is real; staying there costs it nothing at all, and every further
     /// request was a warning for as long as it cared to keep asking.
-    pub limit_refusals: Arc<crate::logfmt::Sampler>,
+    pub limit_refusals: crate::logfmt::Sampler,
 }
 
 impl Context {
@@ -417,14 +419,14 @@ impl Context {
     ) -> Self {
         Self {
             remote: quic.remote_address(),
-            auth_failures: Arc::new(Mutex::new(AuthFailures::default())),
+            auth_failures: Mutex::new(AuthFailures::default()),
             max_auth_failures: config.security.max_auth_failures,
             authenticated,
             quic,
             peer_datagrams,
-            auth: Arc::new(Authenticator::new(&config.auth)),
-            policy: Arc::new(Policy::new(&config.security)),
-            quota: Arc::new(Quota::new(config.limits.max_targets_per_conn)),
+            auth: Authenticator::new(&config.auth),
+            policy: Policy::new(&config.security),
+            quota: Quota::new(config.limits.max_targets_per_conn),
             max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
             stall_budget: config.limits.udp_session_timeout(),
@@ -438,9 +440,9 @@ impl Context {
                     .unanswered_packet_budget
                     .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER),
             ),
-            policy_refusals: Arc::new(crate::logfmt::Sampler::new()),
-            limit_refusals: Arc::new(crate::logfmt::Sampler::new()),
-            unanswered_closures: Arc::new(crate::logfmt::Sampler::new()),
+            policy_refusals: crate::logfmt::Sampler::new(),
+            limit_refusals: crate::logfmt::Sampler::new(),
+            unanswered_closures: crate::logfmt::Sampler::new(),
         }
     }
 
@@ -568,38 +570,6 @@ impl Context {
     /// Whether any request on this connection has (D76).
     pub(crate) fn is_authenticated(&self) -> bool {
         self.authenticated.is_open()
-    }
-}
-
-/// A name that could not be turned into addresses, and why not.
-///
-/// The two cases are reported differently, so the callers have to be able to
-/// tell them apart: a resolver that answered "no" is a 502, while one that did
-/// not answer at all inside the `[limits] connect_timeout` budget is a 504.
-#[derive(Debug)]
-pub(crate) enum ResolveFailure {
-    /// The resolver answered, unsuccessfully.
-    Failed(std::io::Error),
-    /// The budget expired before the resolver answered.
-    TimedOut(Duration),
-}
-
-impl ResolveFailure {
-    /// The RFC 9209 type this failure is reported as.
-    pub(crate) fn proxy_error(&self) -> ProxyError {
-        match self {
-            Self::Failed(_) => ProxyError::DnsError,
-            Self::TimedOut(_) => ProxyError::DnsTimeout,
-        }
-    }
-}
-
-impl std::fmt::Display for ResolveFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed(error) => write!(f, "{error}"),
-            Self::TimedOut(budget) => write!(f, "no answer within {budget:?}"),
-        }
     }
 }
 
@@ -1217,25 +1187,5 @@ mod tests {
         .await
         .expect_err("a lookup that fails must fail");
         assert_eq!(failure.proxy_error(), ProxyError::DnsError);
-    }
-
-    /// The mapping the two resolution failures are told apart by.
-    #[test]
-    fn a_resolver_timeout_is_a_different_type_from_a_resolver_failure() {
-        use std::io::{Error, ErrorKind};
-
-        let failed = ResolveFailure::Failed(Error::from(ErrorKind::NotFound));
-        assert_eq!(failed.proxy_error(), ProxyError::DnsError);
-        assert_eq!(
-            failed.proxy_error().recommended_status(),
-            Status::BAD_GATEWAY
-        );
-
-        let timed_out = ResolveFailure::TimedOut(Duration::from_secs(10));
-        assert_eq!(timed_out.proxy_error(), ProxyError::DnsTimeout);
-        assert_eq!(
-            timed_out.proxy_error().recommended_status(),
-            Status::GATEWAY_TIMEOUT
-        );
     }
 }

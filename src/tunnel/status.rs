@@ -1,13 +1,17 @@
 //! Refusing a request, and the RFC 9209 vocabulary a refusal is written in.
 //!
 //! Everything about *answering* a request this server will not tunnel: the
-//! `Proxy-Status` error types, the failure a connect attempt carries out of its
-//! address walk, and the handful of helpers that put a status on the wire under
-//! the bound [`h3api::Stream::respond_within`] sets.
+//! `Proxy-Status` error types, the two failures that end in one of them (the
+//! failure a connect attempt carries out of its address walk, and the failure a
+//! name resolution carries out of its budget), and the handful of helpers that
+//! put a status on the wire under the bound
+//! [`h3api::Stream::respond_within`] sets.
 //!
 //! The choice of which answer to send is not here. It is made where the fact
 //! is known -- in [`super::admit_target`], in each tunnel's connect step, in
 //! [`crate::conn`] -- and this module is what those choices are said in.
+
+use std::time::Duration;
 
 use tracing::debug;
 
@@ -72,6 +76,38 @@ impl Unreachable {
         Self {
             next_hop: None,
             error: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no addresses to try"),
+        }
+    }
+}
+
+/// A name that could not be turned into addresses, and why not.
+///
+/// The two cases are reported differently, so the callers have to be able to
+/// tell them apart: a resolver that answered "no" is a 502, while one that did
+/// not answer at all inside the `[limits] connect_timeout` budget is a 504.
+#[derive(Debug)]
+pub(crate) enum ResolveFailure {
+    /// The resolver answered, unsuccessfully.
+    Failed(std::io::Error),
+    /// The budget expired before the resolver answered.
+    TimedOut(Duration),
+}
+
+impl ResolveFailure {
+    /// The RFC 9209 type this failure is reported as.
+    pub(crate) fn proxy_error(&self) -> ProxyError {
+        match self {
+            Self::Failed(_) => ProxyError::DnsError,
+            Self::TimedOut(_) => ProxyError::DnsTimeout,
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Failed(error) => write!(f, "{error}"),
+            Self::TimedOut(budget) => write!(f, "no answer within {budget:?}"),
         }
     }
 }
@@ -731,5 +767,25 @@ mod tests {
         assert_eq!(sf_string(r#"a"b"#), r#""a\"b""#);
         assert_eq!(sf_string(r"a\b"), r#""a\\b""#);
         assert_eq!(sf_string(""), "\"\"");
+    }
+
+    /// The mapping the two resolution failures are told apart by.
+    #[test]
+    fn a_resolver_timeout_is_a_different_type_from_a_resolver_failure() {
+        use std::io::{Error, ErrorKind};
+
+        let failed = ResolveFailure::Failed(Error::from(ErrorKind::NotFound));
+        assert_eq!(failed.proxy_error(), ProxyError::DnsError);
+        assert_eq!(
+            failed.proxy_error().recommended_status(),
+            Status::BAD_GATEWAY
+        );
+
+        let timed_out = ResolveFailure::TimedOut(Duration::from_secs(10));
+        assert_eq!(timed_out.proxy_error(), ProxyError::DnsTimeout);
+        assert_eq!(
+            timed_out.proxy_error().recommended_status(),
+            Status::GATEWAY_TIMEOUT
+        );
     }
 }
