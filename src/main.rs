@@ -35,6 +35,15 @@ struct Cli {
     /// rollback turns on: nothing is bound, started or written.
     #[arg(long)]
     check_config: bool,
+
+    /// Print a support bundle to stdout, then exit without serving.
+    ///
+    /// `conflicts_with` rather than a precedence rule: the two flags answer
+    /// different questions and neither is the obvious winner, so a command line
+    /// naming both is refused by clap with a message naming them, rather than
+    /// one of them being silently ignored.
+    #[arg(long, conflicts_with = "check_config")]
+    diagnostics: bool,
 }
 
 fn main() -> Result<()> {
@@ -53,6 +62,13 @@ fn main() -> Result<()> {
     // the flag promises is that nothing happens except reading the file.
     if cli.check_config {
         report_config_check(&cli.config, &config);
+        return Ok(());
+    }
+
+    // The same place and the same promise. The two cannot both be set -- clap
+    // refuses that command line -- so the order between them decides nothing.
+    if cli.diagnostics {
+        report_diagnostics(&cli.config, &config);
         return Ok(());
     }
 
@@ -118,6 +134,117 @@ fn report_config_check(path: &Path, config: &Config) {
         path.display(),
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Prints the support bundle `--diagnostics` promises.
+///
+/// One question: what would an operator have to be asked for, one message at a
+/// time, before an issue about this host could be read at all. The answer is
+/// the version, the file as this binary parsed it, the two host limits that
+/// decide whether the configured quotas are reachable, and what kernel this is.
+/// Printing it in one go turns that exchange into a paste.
+///
+/// What it deliberately does not do bounds the trust it needs. Nothing is bound,
+/// connected or resolved, no journal is read, and nothing goes through
+/// `tracing` -- the subscriber is not installed at this point in `main` and this
+/// output is not a log line, so D100's accounted set is untouched. Everything
+/// here is either this process's own memory, a `getrlimit` on itself, four files
+/// under `/proc/sys`, or one `uname`.
+///
+/// Secrets are redacted because `Config` is printed through the `Debug` that
+/// already does it: `impl Debug for config::User` renders the password as
+/// `<redacted>`, which is the same guard that keeps a password out of the error
+/// a malformed file produces. `conn::redact_credentials` is the other half of
+/// that rule and is not reachable here -- it is for a header value, and no
+/// header exists in this process.
+fn report_diagnostics(path: &Path, config: &Config) {
+    println!("volto {} diagnostics", env!("CARGO_PKG_VERSION"));
+    println!();
+    println!("[configuration]");
+    println!("path = {}", path.display());
+    println!();
+    println!("[server]\n{:#?}", config.server);
+    println!();
+    // The passwords are `<redacted>` here, by `Debug for config::User`.
+    println!("[auth]\n{:#?}", config.auth);
+    println!();
+    // After serde's defaults, so these are the values the server would run on
+    // and not the subset the file happens to name.
+    println!("[limits]\n{:#?}", config.limits);
+    println!();
+    println!("[security]\n{:#?}", config.security);
+    println!();
+    println!("[log]\n{:#?}", config.log);
+    println!();
+
+    println!("[warnings]");
+    let warnings = config.warnings();
+    if warnings.is_empty() {
+        println!("none");
+    }
+    for warning in &warnings {
+        println!("{warning}");
+    }
+    println!();
+
+    println!("[file descriptors]");
+    let (soft, hard) = volto::net::fd_limits();
+    println!("RLIMIT_NOFILE soft = {}", or_unlimited(soft));
+    println!("RLIMIT_NOFILE hard = {}", or_unlimited(hard));
+    println!();
+
+    println!("[udp socket buffers]");
+    print_udp_buffer_sysctls();
+    println!();
+
+    println!("[operating system]");
+    println!("{}", uname());
+}
+
+/// A `getrlimit` value, where absent means `RLIM_INFINITY`.
+fn or_unlimited(limit: Option<u64>) -> String {
+    limit.map_or_else(|| "unlimited".to_string(), |value| value.to_string())
+}
+
+/// The four `net.core` values `docs/deployment.md` tells an operator to look at.
+///
+/// Read as files rather than by shelling out to `sysctl`, so the bundle does not
+/// depend on a binary being installed, and only on Linux: these keys do not
+/// exist on the macOS development host, where the equivalent ceiling is
+/// `kern.ipc.maxsockbuf` and the two are not comparable enough to print side by
+/// side.
+#[cfg(target_os = "linux")]
+fn print_udp_buffer_sysctls() {
+    for key in ["rmem_default", "rmem_max", "wmem_default", "wmem_max"] {
+        let path = format!("/proc/sys/net/core/{key}");
+        match std::fs::read_to_string(&path) {
+            Ok(value) => println!("net.core.{key} = {}", value.trim()),
+            Err(error) => println!("net.core.{key} = unreadable ({error})"),
+        }
+    }
+}
+
+/// The same section where `/proc/sys/net/core` does not exist.
+#[cfg(not(target_os = "linux"))]
+fn print_udp_buffer_sysctls() {
+    println!("not available on this platform (net.core.* is Linux only)");
+}
+
+/// `uname -srm`, or a line saying why there is none.
+///
+/// A process rather than a crate, because a dependency for three words is not
+/// worth the supply chain, and this runs once in a command an operator typed.
+fn uname() -> String {
+    match std::process::Command::new("uname")
+        .args(["-s", "-r", "-m"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        Ok(output) => format!("uname exited with {}", output.status),
+        Err(error) => format!("uname could not be run ({error})"),
+    }
 }
 
 /// Everything that needs a runtime, which is everything after the configuration.

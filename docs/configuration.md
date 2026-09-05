@@ -498,6 +498,36 @@ The reason the flag exists is the section below: it is how
 about to install whether it can read the file this host already has, before it
 swaps the binary.
 
+## Collecting a support bundle
+
+```sh
+volto --diagnostics --config /etc/volto/config.toml
+```
+
+prints, to stdout, everything an issue about a host would otherwise be a series
+of questions about, and exits 0. In order: the version of the binary that
+printed it; the configuration file's path and every table of it as this binary
+parsed it, after defaults, so `[limits]` and `[security]` are the values the
+server would actually run on rather than the subset the file happens to name;
+the warnings `--check-config` prints; the process's `RLIMIT_NOFILE`, soft and
+hard, since the hard limit is what says whether a soft one that is too low can
+be raised here at all or needs the unit changed; the four `net.core` UDP buffer
+sysctls named under [UDP socket
+buffers](deployment.md#udp-socket-buffers), read from `/proc/sys` on Linux and
+reported as unavailable on any other platform; and `uname -srm`.
+
+**Passwords are redacted.** Every `[auth].users` entry prints its password as
+`<redacted>`, by the same guard that keeps one out of the error a malformed file
+produces, so the output is safe to paste into an issue. Read it before pasting
+anyway: the rest of the configuration is there in full, host names and listen
+address included.
+
+Nothing is bound, connected or resolved, nothing is written, and no journal is
+read, so this asks for no more privilege than reading the configuration file
+does. The two flags refuse to be combined: `--check-config` and `--diagnostics`
+answer different questions and neither is the obvious winner, so a command line
+naming both is rejected rather than one of them ignored.
+
 ## Version compatibility
 
 An unknown key is refused, and the file is refused *whole* rather than the one

@@ -304,6 +304,107 @@ fn a_warning_is_reported_without_failing_the_check() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The support bundle prints what an issue needs and not what it must not carry.
+///
+/// The password is the assertion that matters. `--diagnostics` prints the whole
+/// parsed configuration, which is exactly the shape that leaks a secret if the
+/// redaction is not reached, and the operator this flag is written for is being
+/// asked to paste the output somewhere public. [`SECRET`] is distinctive enough
+/// that finding it anywhere in either stream is proof, and the run is over a
+/// port this test already holds, so a bundle that bound the listener would fail
+/// with the address in use rather than pass quietly.
+#[test]
+fn the_support_bundle_names_the_version_and_redacts_the_password() {
+    let dir = config_dir("diagnostics");
+
+    // Held for the duration of the run: nothing here may bind anything.
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("an ephemeral port must be free");
+    let listen = taken
+        .local_addr()
+        .expect("the bound address must be readable");
+
+    let path = write_config(&dir, &listen.to_string(), "");
+    let output = run(&["--diagnostics", "--config", path.to_str().unwrap()]);
+
+    assert!(
+        output.status.success(),
+        "a support bundle over a loadable file must exit 0: {}",
+        stderr_of(&output)
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(
+        !stdout.contains(SECRET),
+        "the password must not reach the bundle an operator pastes into an \
+         issue: {stdout}"
+    );
+    assert!(
+        !stderr_of(&output).contains(SECRET),
+        "nor the other stream: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout.contains("<redacted>"),
+        "and the field has to still be there, so a reader can see there was one: \
+         {stdout}"
+    );
+
+    assert!(
+        stdout.contains(env!("CARGO_PKG_VERSION")),
+        "a bundle that does not say which binary produced it answers nothing: \
+         {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("{}", path.display())),
+        "nor one that does not name the file it read: {stdout}"
+    );
+    for section in [
+        "[limits]",
+        "[security]",
+        "[warnings]",
+        "[file descriptors]",
+        "[udp socket buffers]",
+        "[operating system]",
+    ] {
+        assert!(
+            stdout.contains(section),
+            "the bundle must carry the {section} section: {stdout}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// The two flags answer different questions, so a command line naming both is
+/// refused rather than resolved by a precedence nobody would remember.
+#[test]
+fn the_two_reporting_flags_refuse_to_be_combined() {
+    let dir = config_dir("both-flags");
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+
+    let output = run(&[
+        "--check-config",
+        "--diagnostics",
+        "--config",
+        path.to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "clap reports a usage error with its own status: {}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("--check-config") && stderr.contains("--diagnostics"),
+        "and it has to name both flags, so the operator knows which to drop: \
+         {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The distinction `script/deploy.sh` must never blur.
 ///
 /// An argument the binary does not know is clap's failure, reported in clap's

@@ -79,7 +79,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Open-proxy defences** | Private, loopback and multicast ranges refused by default (IPv4-mapped bypasses included), port 25 denied, tunnels capped per connection, unanswered UDP sessions bounded, name-lookup budget per connection. |
 | **QUIC transport** | Stream limits, idle timeout, keep-alive, initial MTU, PMTU probing, congestion controller (BBR by default) and initial RTT are configuration, not constants. |
 | **Operations** | `SIGHUP` reload that rejects a bad configuration whole and keeps serving; graceful shutdown with GOAWAY and a grace period; systemd unit, installer and self-updating deploy script included. |
-| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, and `--check-config`, which validates a file with the exact code path startup uses. |
+| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which validates a file with the exact code path startup uses, and `--diagnostics`, which prints a support bundle with the passwords redacted. |
 
 **Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel.
 

@@ -389,7 +389,18 @@ pub fn holds_address(ip: std::net::IpAddr) -> bool {
 /// compare a budget against. See [`crate::quic`]'s `warn_if_fd_budget_is_tight`,
 /// which treats that as room to spare.
 pub fn fd_soft_limit() -> Option<u64> {
-    rustix::process::getrlimit(rustix::process::Resource::Nofile).current
+    fd_limits().0
+}
+
+/// The process's `RLIMIT_NOFILE`, soft limit first and hard limit second.
+///
+/// `None` in either place is `RLIM_INFINITY`, exactly as [`fd_soft_limit`]
+/// describes for the soft one. The pair is what `volto --diagnostics` prints,
+/// because the hard limit is what says whether a soft limit that is too low can
+/// be raised on this host at all or needs the service manager changed.
+pub fn fd_limits() -> (Option<u64>, Option<u64>) {
+    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    (nofile.current, nofile.maximum)
 }
 
 /// Binds a UDP socket and connects it to `target`.
