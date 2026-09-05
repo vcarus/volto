@@ -241,6 +241,20 @@ debug = "line-tables-only"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+# The same setting `[profile.dev]` above carries, and for the narrower of the
+# two reasons: a panic in production should name a file and a line rather than
+# an address nobody can resolve after the fact. `panic = "abort"` is
+# deliberately not here.
+#
+# What it reaches is worth stating, because it is not the released artifact.
+# `release.yml` and `cross.yml` both build with `strip: true`, which removes
+# these sections again, and `script/deploy.sh` installs exactly those assets --
+# so a host deployed from a release has the binary it always had, to the byte of
+# behaviour and close to the byte of size. What gains the line numbers is a
+# binary built here: `cargo build --release` as `docs/deployment.md#building`
+# describes it, which is how a reproduction is built and where a backtrace is
+# actually read.
+debug = "line-tables-only"
 
 # TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion
 # loss burst during a bulk transfer as the path having stopped carrying the
