@@ -1197,6 +1197,81 @@ async fn a_session_200_the_peer_will_not_take_is_reset() {
     );
 }
 
+/// And no packet is forwarded for a session that 200 was going to open.
+///
+/// The reset above is what the peer sees. This is what the *target* sees, and
+/// it is the other half of the same rule: `tunnel::respond` answers whether the
+/// 200 reached the stream, `Responded::landed` reports the lapse and returns
+/// `false`, and the whole meaning of that `false` is that `udp::run` stops
+/// before the session loop. A caller that read the lapse and carried on would
+/// open the session anyway, and the only place that shows is a target receiving
+/// traffic on behalf of a client that was never told it had a tunnel.
+///
+/// The datagrams go out after the reset, on the Quarter Stream ID the client
+/// computes for itself: a peer sends them whether or not it heard the 200, and
+/// with a session running they are relayed (`it_settings` pins that a raw
+/// connection which never sent SETTINGS still has its payloads forwarded).
+///
+/// The control at the end is what makes "nothing arrived" a measurement rather
+/// than a broken target: a second, ordinary connection opens a session to the
+/// same target and one payload must be counted. The four above were sent, and
+/// processed, before that connection's handshake began.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_whose_200_never_landed_forwards_nothing() {
+    let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
+    let (target, received) = spawn_silent_udp_target().await;
+
+    let endpoint =
+        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = common::finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    let quarter_stream_id = datagram::quarter_stream_id(u64::from(send.id()));
+    send.write_all(&common::rawstream::connect_udp_headers_frame(
+        &server.addr.to_string(),
+        "127.0.0.1",
+        target.port(),
+    ))
+    .await
+    .expect("send a connect-udp request that will be accepted");
+
+    // Waited for rather than slept past: the reset is what says the response
+    // deadline (this connection's idle timeout) has lapsed, so the request task
+    // has decided by the time the datagrams below go out.
+    tokio::time::timeout(TIMEOUT, recv.received_reset())
+        .await
+        .expect("the server must not wait for a window that is not coming")
+        .expect("a 200 the peer would not take must end in a reset");
+
+    // Well inside the unanswered-packet budget, so nothing here could be
+    // dropped by the amplification cap instead of by the absent session.
+    for round in 0u8..4 {
+        send_udp_payload(&connection, quarter_stream_id, &[b'x', round]);
+    }
+
+    let mut client = H3Client::connect(&server).await;
+    let (control, _stream) = open_udp_session(&mut client, &server, target).await;
+    send_udp_payload(&client.quic, control, b"the control packet");
+
+    tokio::time::timeout(TIMEOUT, async {
+        while received.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the control session's payload must reach the target");
+
+    assert_eq!(
+        received.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "only the control session's packet may reach the target: a 200 that never \
+         landed must stop `udp::run` before the session loop, so the four payloads \
+         sent on the abandoned session are relayed by nobody"
+    );
+}
+
 /// An unreachable target must close the session, not leave it hanging.
 ///
 /// Sending to a port with nothing bound draws an ICMP port-unreachable, which the
