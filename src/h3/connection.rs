@@ -1848,6 +1848,61 @@ mod tests {
         });
     }
 
+    /// The limit itself, which the property above cannot pin.
+    ///
+    /// That property compares one run of the bytes against a cut-up run of the
+    /// same bytes, and the state step is per byte, so the two agree by
+    /// construction however long the integer is: it pins determinism and
+    /// nothing else. These two cases are what say where the limit falls.
+    ///
+    /// RFC 9204 §4.1.1 requires integers "up to and including 62 bits long",
+    /// which a 6-bit prefix reaches in nine continuation bytes of seven bits
+    /// each. A tenth is a value no conformant encoder produces.
+    #[test]
+    fn a_qpack_integer_past_the_continuation_limit_ends_the_connection() {
+        // Stream Cancellation whose 6-bit prefix is all ones, so its stream id
+        // continues, and then one continuation byte more than the limit allows,
+        // none of them ending the integer.
+        let mut stream = vec![0x7f];
+        stream.extend_from_slice(&[0xff; MAX_INTEGER_CONTINUATION + 1]);
+
+        let error = judge_qpack(QpackStream::Decoder, &[&stream])
+            .expect_err("an integer past 62 bits is a connection error");
+
+        assert_eq!(
+            error.code(),
+            Code::QPACK_DECODER_STREAM_ERROR,
+            "the fault is on the peer's decoder stream, so it carries that stream's code"
+        );
+        assert!(
+            format!("{error}").contains("an integer past 62 bits"),
+            "the refusal must say what it refused: {error}"
+        );
+    }
+
+    /// The other side of the same boundary: an integer that ends exactly at the
+    /// limit is accepted, and leaves a stream ready for the next instruction.
+    #[test]
+    fn a_qpack_integer_that_ends_at_the_limit_is_accepted() {
+        // The same instruction, carried on by eight continuation bytes and
+        // ended by a ninth, which is `MAX_INTEGER_CONTINUATION` exactly.
+        let mut stream = vec![0x7f];
+        stream.extend_from_slice(&[0xff; MAX_INTEGER_CONTINUATION - 1]);
+        stream.push(0x00);
+
+        let progress = judge_qpack(QpackStream::Decoder, &[&stream])
+            .expect("an integer of nine continuation bytes is inside the limit");
+
+        assert_eq!(
+            progress.continuation, MAX_INTEGER_CONTINUATION,
+            "the ninth continuation byte is counted and allowed"
+        );
+        assert!(
+            !progress.continuing,
+            "a continuation byte with its top bit clear ends the integer"
+        );
+    }
+
     #[test]
     fn a_goaway_identifier_may_shrink_but_not_grow() {
         let shared = Shared::default();
