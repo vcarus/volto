@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::{
-    ClientStream, H3Client, TIMEOUT, TestServer, connect_request, open_tcp_tunnel,
+    ClientStream, H3Client, TIMEOUT, TestServer, close_and_drain, connect_request, open_tcp_tunnel,
     open_udp_session, send_and_respond, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 use volto::datagram::put_varint;
@@ -400,19 +400,14 @@ const KEPT_PER_CLOSED_SESSION: i64 = 8 * 1024;
 /// session, and the session ending finishes the server's. So the FIN that comes
 /// back is the signal that the session loop has returned -- which is where
 /// everything it held goes.
+///
+/// `close_and_drain` is that pair, and bounding it here is strictly stronger
+/// than the loop this replaced: `read_to_end` bounds each individual read at
+/// `TIMEOUT` as well, where the hand-written loop bounded only the whole drain.
 async fn close_session(session: &mut ClientStream) {
-    session.finish().expect("finish the request stream");
-
-    let ended = tokio::time::timeout(TIMEOUT, async {
-        while session
-            .recv_data()
-            .await
-            .expect("read the capsule stream")
-            .is_some()
-        {}
-    })
-    .await;
-    ended.expect("the server must close its half of a session the client ended");
+    tokio::time::timeout(TIMEOUT, close_and_drain(session))
+        .await
+        .expect("the server must close its half of a session the client ended");
 }
 
 /// A connection that has opened and closed sessions holds nothing for them.
