@@ -668,7 +668,7 @@ async fn a_reload_cannot_move_the_listening_socket() {
     );
     assert!(
         warning.contains("bound=127.0.0.1:0"),
-        "the warning must name the address the endpoint was bound with: {warning}"
+        "the warning must name the address it was configured with at startup: {warning}"
     );
 
     // Still answering where it was bound, and the reloadable key from the same
