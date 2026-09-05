@@ -164,6 +164,22 @@ const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 /// unauthenticated connection hold.
 const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
+// D77's boundary, written as arithmetic rather than only as prose: the
+// connection budget is a whole number of largest-allowed buffered frames, and
+// at least sixteen of them, so sixteen concurrent full-size field sections fill
+// it and the seventeenth is refused. The count is against this constant, the
+// encoded-octet cap the budget is measured in, and deliberately not against
+// `quic::INITIAL_BIDI_STREAMS`, which is also sixteen by coincidence and which
+// D98 says must not be tied to it.
+//
+// A `usize` byte count against a `u64` one; both are literals of this crate and
+// far inside either type.
+#[allow(clippy::as_conversions)]
+const _: () = assert!(
+    (super::HEADERS_BUFFER_BUDGET as u64).is_multiple_of(MAX_BUFFERED_FRAME)
+        && super::HEADERS_BUFFER_BUDGET as u64 / MAX_BUFFERED_FRAME >= 16
+);
+
 /// Longest frame header there can be: a type and a length, both varints.
 const MAX_FRAME_HEADER: usize = 2 * super::VARINT_MAX_LEN;
 

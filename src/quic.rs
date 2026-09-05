@@ -1674,6 +1674,19 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// default) in exchange for throughput we cannot measure a need for.
 pub const SEND_WINDOW: u64 = 10_000_000;
 
+// D47's invariants and its validation rules, as arithmetic. Those rules were
+// written for the day these three might become configuration keys, and they are
+// the relationships between the values whether or not that day comes: the
+// stream window is at least 64 KiB, at most an eighth of the connection window,
+// and below 4 MiB, where the fairness crossover falls to four saturated
+// tunnels and which that ADR says is not to be tried; the send window is never
+// below the stream window it feeds.
+const _: () = assert!(STREAM_RECEIVE_WINDOW.into_inner() >= 64 * 1024);
+const _: () =
+    assert!(STREAM_RECEIVE_WINDOW.into_inner() <= CONNECTION_RECEIVE_WINDOW.into_inner() / 8);
+const _: () = assert!(STREAM_RECEIVE_WINDOW.into_inner() < 4 * 1024 * 1024);
+const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
+
 /// Inbound QUIC DATAGRAM bytes the transport buffers per connection.
 ///
 /// Exactly what quinn already defaults to, and stated here for the reason D47
@@ -1794,6 +1807,12 @@ pub const INITIAL_BIDI_STREAMS: u32 = 16;
 /// shutdown may spend, and the wait for the blocking pool is measured against
 /// the same total.
 pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+// `shutdown::blocking_grace` adds this to a grace period an operator may set to
+// zero, and the drain that precedes it may equally have nothing to wait for. At
+// zero here a shutdown would leave the endpoint no time at all to put the
+// CONNECTION_CLOSE it just wrote on the wire.
+const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
 
 #[cfg(test)]
 mod tests {

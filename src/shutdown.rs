@@ -32,6 +32,12 @@ use tokio::sync::watch;
 /// anyway.
 pub const EXIT_SLACK: Duration = Duration::from_secs(1);
 
+// D90's 2026-09-04 addendum gives the blocking pool the whole allowance the
+// connections got and then a margin on top, so the margin has to be one: at
+// zero the pool would be told to stop at the instant the drain ended, with
+// nothing left for the scheduling between the two.
+const _: () = assert!(!EXIT_SLACK.is_zero());
+
 /// How long the blocking pool gets once the runtime's own work is over.
 ///
 /// `server.shutdown_grace` plus the endpoint's close flush plus [`EXIT_SLACK`],
