@@ -204,11 +204,11 @@ impl ResolverBudget {
     /// One connection's view of it.
     pub fn per_connection(&self) -> ConnectionResolver {
         ConnectionResolver {
-            slots: Arc::new(ConnectionSlots {
+            slots: ConnectionSlots {
                 reserved: Arc::new(Semaphore::new(1)),
                 burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
                 shared: self.shared.clone(),
-            }),
+            },
         }
     }
 }
@@ -238,10 +238,14 @@ impl Default for ResolverBudget {
 /// One of these per connection, made by [`ResolverBudget::per_connection`] and
 /// held for the connection's whole life by its [`crate::tunnel::Context`].
 /// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
-/// counting separately would be no bound at all.
+/// counting separately would be no bound at all. That is also why the slots are
+/// held inline rather than behind an `Arc`: with one owner and no clone, the
+/// allocation bought nothing. The three semaphores inside keep theirs, because
+/// `acquire_owned` needs an `Arc<Semaphore>` and one of them is the server-wide
+/// allowance every connection really does share.
 #[derive(Debug)]
 pub struct ConnectionResolver {
-    slots: Arc<ConnectionSlots>,
+    slots: ConnectionSlots,
 }
 
 /// What one connection's lookups draw on.
