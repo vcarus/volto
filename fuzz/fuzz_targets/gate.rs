@@ -153,7 +153,13 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
             );
             match refusal {
                 Refusal::OtherName(name) => {
-                    assert!(name.len() < MAX_BOUNDED, "an unbounded name reached a log");
+                    // The refusal carries the peer's bytes raw, so the bound is
+                    // asked of the rendering the log line builds from them,
+                    // which is where `escaped_bytes` is now applied.
+                    assert!(
+                        volto::logfmt::escaped_bytes(name).len() < MAX_BOUNDED,
+                        "an unbounded name reached a log"
+                    );
                 }
                 // The one refusal decided on the header behind the protection:
                 // the length it names is the length byte the datagram carries,

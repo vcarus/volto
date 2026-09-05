@@ -334,7 +334,7 @@ fn a_first_initial_is_opened_under_its_own_keys() {
     );
     assert_eq!(
         judgement(&stranger, &names),
-        Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned()))
+        Verdict::Refuse(Refusal::OtherName(b"other.example".to_vec()))
     );
 
     let ours = initial(
@@ -427,6 +427,92 @@ fn a_first_initial_with_a_full_connection_id_is_not_refused_for_its_length() {
         judgement(&initial(&*crypto, &CLIENT_CID, &[]), &names),
         Verdict::Pass,
         "an eight-byte connection ID is the shortest one a client may choose"
+    );
+}
+
+/// A refused name is carried raw and escaped where it is logged.
+///
+/// `Refusal::OtherName` holds the bytes the extension spelled, so a build that
+/// is not logging at DEBUG formats nothing for a flood of refused handshakes.
+/// The escaping did not leave the path, it moved later into it: `Gate::screen`
+/// applies `logfmt::escaped_bytes` inside the `debug!` that prints the name.
+/// This drives both steps in that order on a name carrying the two characters
+/// escaping exists for, a quote and a newline, either of which would otherwise
+/// let an unauthenticated peer forge a journal entry.
+#[test]
+fn a_refused_name_is_carried_raw_and_escaped_where_it_is_logged() {
+    let crypto = nameless_crypto();
+    let names = Names::new(&[LISTED.to_owned()]);
+
+    let hostile = "a\"b\nc.example";
+    let datagram = initial(
+        &*crypto,
+        &CLIENT_CID,
+        &crypto_frame_at(0, &named_hello(hostile)),
+    );
+
+    let Verdict::Refuse(Refusal::OtherName(name)) = judgement(&datagram, &names) else {
+        panic!("a name that is not on the list must be refused for its name");
+    };
+    assert_eq!(
+        name,
+        hostile.as_bytes(),
+        "the refusal must carry the bytes the peer sent, unrendered"
+    );
+
+    let logged = volto::logfmt::escaped_bytes(&name);
+    assert_eq!(logged, r#""a\"b\nc.example""#);
+    assert!(
+        !logged.contains('\n'),
+        "a newline must not survive into a log line"
+    );
+}
+
+/// An Initial whose Length field leaves no room for a packet number is passed
+/// through, and is answered before any key is derived.
+///
+/// RFC 9001 §5.4.2 samples header protection from four bytes past the packet
+/// number offset, so a packet declaring fewer bytes than that after the offset
+/// cannot be opened under any cipher. `Judge::decrypt` asks that half of the
+/// length test above `initial_keys`, which is nearly the whole cost of judging
+/// an Initial, and the verdict is the same on both sides of the move: a packet
+/// that does not open is one quinn tells apart with state this gate does not
+/// have, so it reaches quinn.
+#[test]
+fn an_initial_too_short_for_a_packet_number_is_passed_through() {
+    let crypto = nameless_crypto();
+    let names = Names::new(&[LISTED.to_owned()]);
+
+    let mut datagram = initial(
+        &*crypto,
+        &CLIENT_CID,
+        &crypto_frame_at(0, &named_hello(UNLISTED)),
+    );
+    assert_eq!(
+        judgement(&datagram, &names),
+        Verdict::Refuse(Refusal::OtherName(UNLISTED.as_bytes().to_vec())),
+        "the packet must be refused for its name before it is shortened"
+    );
+
+    // Where `shaped_initial` writes the Length: the first byte, the version,
+    // each connection ID behind its own length byte, then a one-byte token
+    // length of zero. The packet number follows the two bytes of it.
+    let shape = Shape::default();
+    assert!(shape.token.is_empty(), "the default shape carries no token");
+    let length_offset = 1 + 4 + 1 + shape.dcid.len() + 1 + shape.scid.len() + 1;
+    let declared = u16::from_be_bytes([datagram[length_offset], datagram[length_offset + 1]]);
+    assert_eq!(
+        declared & 0xc000,
+        0x4000,
+        "the Length field is a two-byte varint at {length_offset}"
+    );
+
+    // Three bytes of packet, where the sample alone needs four past the offset.
+    datagram[length_offset..length_offset + 2].copy_from_slice(&(0x4000u16 | 3).to_be_bytes());
+    assert_eq!(
+        judgement(&datagram, &names),
+        Verdict::Pass,
+        "a packet that cannot be opened is quinn's to tell apart"
     );
 }
 
@@ -785,7 +871,7 @@ async fn a_real_quinn_first_flight_is_judged_by_the_name_it_carries() {
     let refusal = judgement(&datagram, &Names::new(&["other.example".to_owned()]));
     assert_eq!(
         refusal,
-        Verdict::Refuse(Refusal::OtherName(format!("{REAL_NAME:?}"))),
+        Verdict::Refuse(Refusal::OtherName(REAL_NAME.as_bytes().to_vec())),
         "the same datagram must be refused for the name it carries"
     );
 }
@@ -876,7 +962,7 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
     );
     assert_eq!(
         judgement(&datagram, &Names::new(&["other.example".to_owned()])),
-        Verdict::Refuse(Refusal::OtherName(format!("{REAL_NAME:?}"))),
+        Verdict::Refuse(Refusal::OtherName(REAL_NAME.as_bytes().to_vec())),
         "the same datagram must be refused for the name it carries"
     );
 }
@@ -938,7 +1024,7 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
         (
             "a-name-we-do-not",
             initial(&*crypto, &CLIENT_CID, &crypto_frame_at(0, &stranger)),
-            Verdict::Refuse(Refusal::OtherName("\"other.example\"".to_owned())),
+            Verdict::Refuse(Refusal::OtherName(b"other.example".to_vec())),
         ),
         (
             "no-server-name",

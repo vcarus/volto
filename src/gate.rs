@@ -202,7 +202,7 @@ const FRAME_CONNECTION_CLOSE: u64 = 0x1c;
 /// — so that the normalisation happens once at load rather than once per
 /// Initial packet, and so that both gates ([`Names::accepts`] here and the
 /// certificate resolver in [`crate::tls`]) can only ever agree.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Names {
     names: Vec<String>,
 }
@@ -267,7 +267,7 @@ fn normalise(name: &str) -> String {
 ///
 /// Read once per receive batch rather than once per datagram, and written once
 /// per reload, so a plain `RwLock` around an `Arc` is all the sharing this needs.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Expected(Arc<RwLock<Arc<Names>>>);
 
 impl Expected {
@@ -353,7 +353,7 @@ impl Gate {
             ),
             Refusal::OtherName(name) => debug!(
                 %remote,
-                server_name = %name,
+                server_name = %escaped_bytes(&name),
                 "dropping a handshake: its server_name is not one this server answers to"
             ),
         }
@@ -486,7 +486,7 @@ impl Judge {
             FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
             FirstFlight::Named(name) => match std::str::from_utf8(&name) {
                 Ok(text) if expected.accepts(text) => Verdict::Pass,
-                _ => Verdict::Refuse(Refusal::OtherName(escaped_bytes(&name))),
+                _ => Verdict::Refuse(Refusal::OtherName(name)),
             },
         }
     }
@@ -502,6 +502,20 @@ impl Judge {
     /// passes both through, because quinn tells them apart with the state this
     /// gate lacks and drops the second kind without a reply.
     fn decrypt(&self, datagram: &[u8], header: &InitialHeader) -> Option<BytesMut> {
+        // quinn's header key takes the whole packet and reads its sample from
+        // four bytes past the packet number, so a packet too short for that
+        // would panic rather than fail. RFC 9001 §5.4.2 puts the sample there.
+        //
+        // The half of that test which does not need a cipher is asked first,
+        // above the key derivation, because deriving Initial secrets is nearly
+        // the whole cost of judging a packet and a packet with no room for the
+        // four bytes is refused under every cipher there is. No packet changes
+        // verdict: a sample end past the packet end follows from this one.
+        let number_end_limit = header.packet_number_offset.checked_add(4)?;
+        if number_end_limit > header.packet_end {
+            return None;
+        }
+
         // The keys are a function of the Destination Connection ID and the
         // version alone, which is what makes this possible at all without any
         // connection state.
@@ -515,13 +529,8 @@ impl Judge {
             .initial_keys(QUIC_V1, &ConnectionId::new(&datagram[header.dcid.clone()]))
             .ok()?;
 
-        // quinn's header key takes the whole packet and reads its sample from
-        // four bytes past the packet number, so a packet too short for that
-        // would panic rather than fail. RFC 9001 §5.4.2 puts the sample there.
-        let sample_end = header
-            .packet_number_offset
-            .checked_add(4)?
-            .checked_add(keys.header.remote.sample_size())?;
+        // The other half, which the cipher's sample size decides.
+        let sample_end = number_end_limit.checked_add(keys.header.remote.sample_size())?;
         if sample_end > header.packet_end {
             return None;
         }
@@ -650,7 +659,12 @@ pub enum Verdict {
     Refuse(Refusal),
 }
 
-/// Why a datagram was refused, in the words its log line uses.
+/// Why a datagram was refused, and what the refusal was about.
+///
+/// The values are the parser's own, not the logger's: a peer-chosen name is
+/// carried raw and is bounded and escaped in [`Gate::screen`], inside the
+/// `debug!` that prints it. Nothing is rendered for a build that is not logging
+/// at DEBUG, which a flood of refused handshakes is the reason to care about.
 ///
 /// Hidden, and public for the same reason [`Verdict`] is.
 #[doc(hidden)]
@@ -665,8 +679,11 @@ pub enum Refusal {
     NotClientHello,
     /// A complete ClientHello with no `server_name` extension.
     Anonymous,
-    /// A ClientHello naming somebody else. Already bounded and escaped.
-    OtherName(String),
+    /// A ClientHello naming somebody else, carrying the name it gave.
+    ///
+    /// Peer-chosen bytes, exactly as the extension spelled them: whatever reads
+    /// them owes them [`crate::logfmt::escaped_bytes`] before they reach a log.
+    OtherName(Vec<u8>),
 }
 
 /// Makes quinn's packet decoder reject a datagram before it can answer it.
