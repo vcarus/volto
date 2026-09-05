@@ -268,7 +268,7 @@ fn read_a_first_flight(crypto: &[u8]) {
 /// end of the message must read as [`FirstFlight::Truncated`], and no cut at or
 /// after it may. This reads the 24-bit length itself so that the oracle is not
 /// the code under test.
-fn fail_open_before_the_message_is_whole(crypto: &[u8], read: &FirstFlight) {
+fn fail_open_before_the_message_is_whole(crypto: &[u8], read: &FirstFlight<'_>) {
     if crypto.first() != Some(&CLIENT_HELLO) {
         return;
     }

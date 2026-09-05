@@ -102,10 +102,12 @@
 //! here from somebody who does not know the name to ask for; it does nothing
 //! about what a connection looks like once one is open.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::task::{Context, Poll};
 
@@ -267,18 +269,55 @@ fn normalise(name: &str) -> String {
 ///
 /// Read once per receive batch rather than once per datagram, and written once
 /// per reload, so a plain `RwLock` around an `Arc` is all the sharing this needs.
+///
+/// The flag beside it answers "is there a list at all" without taking the lock,
+/// because an empty list is the shipped default and every release before v0.9.0
+/// behaved that way. A gate that is off then costs a receive batch one atomic
+/// load rather than a read guard, an `Arc` clone and its drop.
 #[derive(Clone, Debug)]
-pub struct Expected(Arc<RwLock<Arc<Names>>>);
+pub struct Expected(Arc<Held>);
+
+/// The list and the flag that says whether it holds anything.
+#[derive(Debug)]
+struct Held {
+    names: RwLock<Arc<Names>>,
+    /// Whether `names` is non-empty. Written after `names`, read before it.
+    any: AtomicBool,
+}
 
 impl Expected {
     /// A handle starting on `names`.
     pub fn new(names: Names) -> Self {
-        Self(Arc::new(RwLock::new(Arc::new(names))))
+        let any = AtomicBool::new(!names.is_empty());
+        Self(Arc::new(Held {
+            names: RwLock::new(Arc::new(names)),
+            any,
+        }))
     }
 
     /// Replaces the list, for every datagram received from now on.
+    ///
+    /// The list is written first and the flag second, with a `Release` store
+    /// against the `Acquire` load in [`Expected::any`], so a reader that sees
+    /// the flag set also sees the list the flag is about.
+    ///
+    /// The order matters in one direction only. A reader that has already
+    /// loaded the flag while it still said "empty" judges its batch against the
+    /// list that was in force a moment earlier, which is what a reload means
+    /// for every datagram that arrived just before it and is why the gate can
+    /// be reloaded at all. Storing the flag first would allow the opposite: a
+    /// reader seeing "there is a list" and then reading a list that is not yet
+    /// the new one, which is a judgement made against a list no configuration
+    /// ever asked for.
     pub fn set(&self, names: Names) {
-        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(names);
+        let any = !names.is_empty();
+        *self.0.names.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(names);
+        self.0.any.store(any, Ordering::Release);
+    }
+
+    /// Whether the list in force holds any name, without taking the lock.
+    pub fn any(&self) -> bool {
+        self.0.any.load(Ordering::Acquire)
     }
 
     /// The list in force.
@@ -287,6 +326,7 @@ impl Expected {
     /// immutable, so there is nothing to observe half-written.
     pub fn current(&self) -> Arc<Names> {
         self.0
+            .names
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -484,9 +524,11 @@ impl Judge {
             FirstFlight::Truncated => Verdict::Pass,
             FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
             FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
-            FirstFlight::Named(name) => match std::str::from_utf8(&name) {
+            FirstFlight::Named(name) => match std::str::from_utf8(name) {
                 Ok(text) if expected.accepts(text) => Verdict::Pass,
-                _ => Verdict::Refuse(Refusal::OtherName(name)),
+                // The verdict outlives the datagram it was judged from, so the
+                // refusal takes the copy the pass path does not need.
+                _ => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
             },
         }
     }
@@ -535,13 +577,19 @@ impl Judge {
             return None;
         }
 
-        let mut packet = datagram[..header.packet_end].to_vec();
+        // Only the header and the sample it is unmasked with are copied. Header
+        // protection reads up to `sample_end` and writes five bytes inside it,
+        // the first byte and the packet number, so the rest of the packet has
+        // no reason to be moved: the payload below is taken from the datagram
+        // where it already is, and the associated data the AEAD needs is inside
+        // this copy.
+        let mut head = datagram[..sample_end].to_vec();
         keys.header
             .remote
-            .decrypt(header.packet_number_offset, &mut packet);
+            .decrypt(header.packet_number_offset, &mut head);
 
         // The two bits the header protection was hiding.
-        let number_length = usize::from(packet[0] & 0x03) + 1;
+        let number_length = usize::from(head[0] & 0x03) + 1;
         let number_end = header.packet_number_offset.checked_add(number_length)?;
         if number_end > header.packet_end {
             return None;
@@ -554,7 +602,7 @@ impl Judge {
         // that has acknowledged nothing to reconstruct it, and there is nothing
         // to acknowledge yet.
         let mut number = 0u64;
-        for byte in &packet[header.packet_number_offset..number_end] {
+        for byte in &head[header.packet_number_offset..number_end] {
             number = (number << 8) | u64::from(*byte);
         }
 
@@ -565,10 +613,10 @@ impl Judge {
             return None;
         }
 
-        let mut frames = BytesMut::from(&packet[number_end..]);
+        let mut frames = BytesMut::from(&datagram[number_end..header.packet_end]);
         keys.packet
             .remote
-            .decrypt(number, &packet[..number_end], &mut frames)
+            .decrypt(number, &head[..number_end], &mut frames)
             .ok()?;
         Some(frames)
     }
@@ -605,6 +653,12 @@ impl AsyncUdpSocket for Gate {
             Poll::Ready(Ok(count)) => count,
             other => return other,
         };
+
+        // The flag first, so a gate that is off pays one atomic load per batch
+        // and takes neither the lock nor a clone of the list.
+        if !self.expected.any() {
+            return Poll::Ready(Ok(count));
+        }
 
         let expected = self.expected.current();
         if expected.is_empty() {
@@ -772,7 +826,7 @@ impl InitialHeader {
 /// implied by its type and skipping one wrongly would find CRYPTO data that is
 /// not there. Only the frame types RFC 9000 §17.2.2 allows in an Initial packet
 /// are understood; anything else ends the walk with whatever was found so far.
-fn crypto_stream_prefix(payload: &[u8]) -> Option<Vec<u8>> {
+fn crypto_stream_prefix(payload: &[u8]) -> Option<Cow<'_, [u8]>> {
     let mut fragments: Vec<(u64, &[u8])> = Vec::new();
     let mut at = 0usize;
 
@@ -822,9 +876,16 @@ fn crypto_stream_prefix(payload: &[u8]) -> Option<Vec<u8>> {
     }
 
     // Sorted and appended while contiguous, so a first flight split across
-    // several CRYPTO frames in one packet reads as one stream. In practice there
-    // is exactly one frame and this is a copy.
+    // several CRYPTO frames in one packet reads as one stream.
     fragments.sort_by_key(|(offset, _)| *offset);
+
+    // In practice there is exactly one frame and it starts at offset 0, which
+    // is a first flight that fits in one packet, so that case is borrowed out
+    // of the decrypted frames rather than copied into a second buffer.
+    if let [(0, data)] = fragments.as_slice() {
+        return (!data.is_empty()).then_some(Cow::Borrowed(*data));
+    }
+
     let mut stream: Vec<u8> = Vec::new();
     for (offset, data) in fragments {
         let offset = usize::try_from(offset).ok()?;
@@ -838,7 +899,7 @@ fn crypto_stream_prefix(payload: &[u8]) -> Option<Vec<u8>> {
         }
     }
 
-    (!stream.is_empty()).then_some(stream)
+    (!stream.is_empty()).then_some(Cow::Owned(stream))
 }
 
 /// Advances past `count` varints, or `None` if they do not all fit.
@@ -856,15 +917,18 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 /// it to a fuzz target.
 #[doc(hidden)]
 #[derive(Debug, PartialEq, Eq)]
-pub enum FirstFlight {
+pub enum FirstFlight<'a> {
     /// The ClientHello is not all here yet.
     Truncated,
     /// The first handshake message is something other than a ClientHello.
     NotAClientHello,
     /// A whole ClientHello with no `server_name` extension.
     Anonymous,
-    /// The host name it asked for, as it arrived.
-    Named(Vec<u8>),
+    /// The host name it asked for, as it arrived, borrowed out of the CRYPTO
+    /// bytes it was read from. A name only reaches an allocation when the
+    /// verdict is a refusal, which is where [`Refusal::OtherName`] takes a copy
+    /// that outlives the datagram.
+    Named(&'a [u8]),
 }
 
 /// Reads the `server_name` a ClientHello carries.
@@ -882,7 +946,7 @@ pub enum FirstFlight {
 /// — which a fuzzer cannot do by luck. So the CRYPTO bytes can be handed over
 /// directly.
 #[doc(hidden)]
-pub fn first_flight(crypto: &[u8]) -> FirstFlight {
+pub fn first_flight(crypto: &[u8]) -> FirstFlight<'_> {
     let mut reader = Reader::new(crypto);
 
     let Some(kind) = reader.byte() else {
@@ -902,7 +966,7 @@ pub fn first_flight(crypto: &[u8]) -> FirstFlight {
     // a malformed ClientHello rather than an unfinished one, and a malformed one
     // names nobody.
     match server_name(body) {
-        Some(name) => FirstFlight::Named(name.to_vec()),
+        Some(name) => FirstFlight::Named(name),
         None => FirstFlight::Anonymous,
     }
 }
@@ -1164,13 +1228,30 @@ mod tests {
         assert!(expected.current().accepts("new.example"));
     }
 
+    /// The flag is what `poll_recv` reads before it takes the lock, so it has
+    /// to follow `set` in both directions or a reload would either be ignored
+    /// or turn the gate off.
+    #[test]
+    fn the_flag_beside_the_list_follows_every_replacement() {
+        let expected = Expected::new(Names::new(&[]));
+        assert!(!expected.any(), "an empty list is the gate being off");
+
+        expected.set(Names::new(&["proxy.example".to_owned()]));
+        assert!(expected.any(), "a name was added, so the gate is on");
+
+        expected.set(Names::new(&[]));
+        assert!(!expected.any(), "the list was emptied, so the gate is off");
+
+        assert!(
+            Expected::new(Names::new(&["proxy.example".to_owned()])).any(),
+            "a handle built on a non-empty list starts open"
+        );
+    }
+
     #[test]
     fn a_client_hello_naming_a_host_is_read_back() {
         let hello = client_hello(&sni_extension("proxy.example"));
-        assert_eq!(
-            first_flight(&hello),
-            FirstFlight::Named(b"proxy.example".to_vec())
-        );
+        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
     }
 
     /// The extension is found even when it is not the first one.
@@ -1180,10 +1261,7 @@ mod tests {
         extensions.extend_from_slice(&sni_extension("proxy.example"));
         let hello = client_hello(&extensions);
 
-        assert_eq!(
-            first_flight(&hello),
-            FirstFlight::Named(b"proxy.example".to_vec())
-        );
+        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
     }
 
     #[test]
@@ -1210,10 +1288,7 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            first_flight(&hello),
-            FirstFlight::Named(b"proxy.example".to_vec())
-        );
+        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
     }
 
     /// A cut inside the *extensions* is the case the design argument is about,
@@ -1252,7 +1327,13 @@ mod tests {
     fn a_crypto_frame_at_offset_zero_is_the_one_that_is_read() {
         // CRYPTO, offset 0, length 3.
         let payload = [0x06, 0x00, 0x03, b'a', b'b', b'c'];
-        assert_eq!(crypto_stream_prefix(&payload), Some(b"abc".to_vec()));
+        // One fragment at offset 0, which is every first flight that fits in one
+        // packet, is borrowed out of the frames rather than copied.
+        assert!(matches!(
+            crypto_stream_prefix(&payload),
+            Some(Cow::Borrowed(b"abc"))
+        ));
+        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"abc"[..]));
 
         // The same frame at offset 1 carries no beginning to judge.
         let payload = [0x06, 0x01, 0x03, b'a', b'b', b'c'];
@@ -1266,7 +1347,7 @@ mod tests {
         payload.extend_from_slice(&[0x06, 0x00, 0x02, b'h', b'i']);
         payload.extend_from_slice(&[0x00; 8]); // trailing PADDING
 
-        assert_eq!(crypto_stream_prefix(&payload), Some(b"hi".to_vec()));
+        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"hi"[..]));
     }
 
     #[test]
@@ -1276,7 +1357,7 @@ mod tests {
         let mut payload = vec![0x02, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00];
         payload.extend_from_slice(&[0x06, 0x00, 0x01, b'x']);
 
-        assert_eq!(crypto_stream_prefix(&payload), Some(b"x".to_vec()));
+        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"x"[..]));
     }
 
     #[test]
@@ -1284,7 +1365,10 @@ mod tests {
         let mut payload = vec![0x06, 0x02, 0x02, b'c', b'd']; // offset 2
         payload.extend_from_slice(&[0x06, 0x00, 0x02, b'a', b'b']); // offset 0
 
-        assert_eq!(crypto_stream_prefix(&payload), Some(b"abcd".to_vec()));
+        assert_eq!(
+            crypto_stream_prefix(&payload).as_deref(),
+            Some(&b"abcd"[..])
+        );
     }
 
     /// A gap is not filled in: what is returned is the contiguous prefix, and a
@@ -1294,7 +1378,7 @@ mod tests {
         let mut payload = vec![0x06, 0x00, 0x02, b'a', b'b']; // offset 0
         payload.extend_from_slice(&[0x06, 0x09, 0x02, b'y', b'z']); // offset 9
 
-        assert_eq!(crypto_stream_prefix(&payload), Some(b"ab".to_vec()));
+        assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"ab"[..]));
     }
 
     #[test]

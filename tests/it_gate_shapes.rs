@@ -316,7 +316,7 @@ fn certified_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
 fn the_hand_written_client_hello_reads_back_as_its_name() {
     assert_eq!(
         first_flight(&named_hello("localhost")),
-        FirstFlight::Named(b"localhost".to_vec())
+        FirstFlight::Named(b"localhost")
     );
 }
 
@@ -1047,7 +1047,7 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
         (
             "crypto-a-whole-client-hello",
             ours,
-            FirstFlight::Named(b"localhost".to_vec()),
+            FirstFlight::Named(b"localhost"),
         ),
         (
             "crypto-a-client-hello-cut-short",
