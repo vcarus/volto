@@ -29,7 +29,7 @@ use std::process::Command;
 
 use scripts::{
     plant_binary_without_the_flag, plant_placeholder_certificates, real_binary, repo_root,
-    scratch_dir,
+    scratch_dir, stderr_of, stdout_of,
 };
 use volto::config::Config;
 
@@ -102,8 +102,8 @@ fn run_check_config(root: &Path, script: &Path, binary: &Path) -> (bool, String,
 
     (
         output.status.success(),
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout_of(&output),
+        stderr_of(&output),
     )
 }
 
@@ -120,11 +120,16 @@ fn print_config(args: &[&str]) -> (bool, String, String) {
         .output()
         .expect("the installer script must be runnable");
 
-    (
-        output.status.success(),
-        String::from_utf8(output.stdout).expect("the generated config must be UTF-8"),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    )
+    let ok = output.status.success();
+    let stderr = stderr_of(&output);
+
+    // Strict here, unlike `run_check_config`'s `stdout_of`: a generated
+    // configuration that is not UTF-8 is the failure, and reading it lossily
+    // would hide it behind whatever assertion looked at the text next. That
+    // choice is why these two runners are two.
+    let config = String::from_utf8(output.stdout).expect("the generated config must be UTF-8");
+
+    (ok, config, stderr)
 }
 
 /// Runs the installer's config generator with the given arguments.
