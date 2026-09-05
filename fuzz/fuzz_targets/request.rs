@@ -21,6 +21,12 @@
 //! are what the rest of the crate is entitled to assume of a [`Request`]:
 //! `tunnel::tcp` splits `authority` without re-checking it is not empty, and
 //! `tunnel::udp` reads `path` as a URI path.
+//!
+//! Two of the judgements that read an accepted request are then called for
+//! their own sake. Neither may panic on anything `build_request` let through,
+//! which is the only promise a caller of either makes: both answer with a
+//! reason string rather than by failing, and both are reached on the request
+//! path before any tunnel exists.
 
 #![no_main]
 
@@ -138,6 +144,13 @@ fn cut_token<'a>(
 
 /// What every accepted request promises, whichever shape it has.
 fn check(request: &Request) {
+    // The two judgements a request passes on its way to a tunnel, called here
+    // because neither may panic on anything `build_request` accepted. Both are
+    // `#[doc(hidden)] pub` seams over the functions the request path itself
+    // calls (D83), so a finding is a finding in what the server runs.
+    let _ = volto::tunnel::connection_specific_field(request);
+    let _ = volto::tunnel::udp::validate(request);
+
     // A method survives a round trip through its own parser: the token is kept
     // as it arrived, which is what a 501 has to name.
     assert_eq!(

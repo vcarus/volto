@@ -77,7 +77,13 @@ pub fn route(req: &Request) -> Route<'_> {
 /// is told more by a status than by `H3_MESSAGE_ERROR`.
 ///
 /// Named one at a time so the log says which field was the problem.
-pub(crate) fn connection_specific_field(req: &Request) -> Option<&'static str> {
+///
+/// Hidden, and public for the reason `gate::judgement` is (D83): the `request`
+/// fuzz target is outside this crate and has to be able to hand every request
+/// `build_request` accepts to the judgement a real one gets. It is not an entry
+/// point of its own; the request path calls this same function.
+#[doc(hidden)]
+pub fn connection_specific_field(req: &Request) -> Option<&'static str> {
     CONNECTION_SPECIFIC_FIELDS
         .iter()
         .copied()

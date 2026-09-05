@@ -1018,7 +1018,13 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unrea
 /// RESET_STREAM. RFC 9114 §4.1.2 allows a server to send a response before
 /// closing the stream, and resetting instead would discard the buffered
 /// response, leaving the client to guess why its tunnel was refused.
-fn validate(req: &Request) -> Result<(), &'static str> {
+///
+/// Hidden, and public for the reason `gate::judgement` is (D83): the `request`
+/// fuzz target is outside this crate and has to be able to hand every request
+/// `build_request` accepts to the judgement a real CONNECT-UDP gets. It is not
+/// an entry point of its own; the socket path calls this same function.
+#[doc(hidden)]
+pub fn validate(req: &Request) -> Result<(), &'static str> {
     if req.scheme.as_deref().is_none_or(str::is_empty) {
         return Err("connect-udp requires a non-empty :scheme");
     }
