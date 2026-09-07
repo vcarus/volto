@@ -384,13 +384,20 @@ pub struct Context {
     /// the counter an attacker cannot recreate: it is created with the
     /// connection and it is only ever spent.
     ///
-    /// **Nothing credits it back.** A target that answers lifts its own
-    /// session's cap, as it always has, and pays nothing back here. Crediting on
-    /// an answer would let a client keep one consenting target on the side and
-    /// buy back, packet for packet, the allowance it is spending on a silent
-    /// one, which is the churn this exists to stop. The allowance is therefore
-    /// a total for the life of the connection, and a client that wants another
-    /// one pays for another handshake.
+    /// **A session whose target answers repays what that session spent**, and
+    /// nothing else does (D84, the 2026-09-05 addendum). The repayment is that
+    /// session's own `charged_unanswered` count and it is capped at the total
+    /// the connection was created with, so no sequence of sessions can lift the
+    /// counter above where it started. The objection this rule had to answer,
+    /// a client keeping one consenting target on the side and buying back
+    /// packet for packet the allowance it is spending on a silent one, does not
+    /// apply to an own-session refund: a silent session's spend stays spent,
+    /// and the bound is unchanged for what it was written for, packets to
+    /// targets that never answer.
+    ///
+    /// A connection that spends the total with nothing outstanding to repay it
+    /// keeps it spent for its own life, and a client that wants another
+    /// allowance pays for another handshake (D84, the 2026-09-07 addendum).
     ///
     /// Zero means uncapped, the same way `unanswered_packet_budget = 0` does:
     /// the operator switched the mitigation off.
@@ -671,6 +678,44 @@ where
     resolved.map_err(ResolveFailure::Failed)
 }
 
+/// Whether a resolved address is one of this proxy's own.
+///
+/// RFC 9298 §7, on the software that trusts a request for having come from the
+/// host it runs on: "This could lead to unauthorized access by UDP proxying
+/// clients unless the UDP proxy disallows UDP proxying requests to vulnerable
+/// targets, such as the UDP proxy's own addresses and localhost, link-local,
+/// multicast, and broadcast addresses. UDP proxies can use the
+/// destination_ip_prohibited Proxy Error Type from Section 2.3.5 of
+/// [PROXY-STATUS] when rejecting such requests." Four of those five classes are
+/// [`Policy`]'s two buckets. This is the fifth, and it is the one no address
+/// range describes: which addresses are the proxy's own is a fact about the host
+/// rather than about the address, so it is asked of the kernel
+/// ([`crate::net::holds_address`]) rather than matched against a list.
+///
+/// The class is not lifted by `allow_private_networks`, because the reason is a
+/// different one. That switch is the operator saying which *address space* this
+/// proxy may reach; this rule is about the proxy itself, and a target that is
+/// this host is the escalation the section describes whatever the address space
+/// says.
+///
+/// **Loopback is deliberately not here.** The sentence above names "localhost"
+/// as a class beside "the proxy's own addresses", and this crate implements that
+/// class in the private bucket, where `allow_private_networks` decides it: off
+/// by default, and reachable only where an operator has said in the
+/// configuration file that local address space is a legitimate destination.
+/// Folding loopback in here would overrule that decision, and it would do it for
+/// every service on the host rather than for this proxy.
+///
+/// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
+/// request and never per packet, and it is paid only by addresses the policy has
+/// already let through, and the loopback test above it is free.
+fn is_the_proxys_own(ip: std::net::IpAddr) -> bool {
+    // Canonical first: `::ffff:127.0.0.1` is loopback wearing an IPv6 hat, and
+    // the kernel would bind it happily.
+    let ip = policy::canonical(ip);
+    !ip.is_loopback() && crate::net::holds_address(ip)
+}
+
 /// Turns a request's target into the addresses it may be dialled on, answering
 /// the request itself when there are none it may use.
 ///
@@ -721,44 +766,6 @@ where
 /// type has to carry — nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
 /// field for CONNECT-UDP. Deferred, so only the one path that sends a 200 pays
 /// for building it.
-/// Whether a resolved address is one of this proxy's own.
-///
-/// RFC 9298 §7, on the software that trusts a request for having come from the
-/// host it runs on: "This could lead to unauthorized access by UDP proxying
-/// clients unless the UDP proxy disallows UDP proxying requests to vulnerable
-/// targets, such as the UDP proxy's own addresses and localhost, link-local,
-/// multicast, and broadcast addresses. UDP proxies can use the
-/// destination_ip_prohibited Proxy Error Type from Section 2.3.5 of
-/// [PROXY-STATUS] when rejecting such requests." Four of those five classes are
-/// [`Policy`]'s two buckets. This is the fifth, and it is the one no address
-/// range describes: which addresses are the proxy's own is a fact about the host
-/// rather than about the address, so it is asked of the kernel
-/// ([`crate::net::holds_address`]) rather than matched against a list.
-///
-/// The class is not lifted by `allow_private_networks`, because the reason is a
-/// different one. That switch is the operator saying which *address space* this
-/// proxy may reach; this rule is about the proxy itself, and a target that is
-/// this host is the escalation the section describes whatever the address space
-/// says.
-///
-/// **Loopback is deliberately not here.** The sentence above names "localhost"
-/// as a class beside "the proxy's own addresses", and this crate implements that
-/// class in the private bucket, where `allow_private_networks` decides it: off
-/// by default, and reachable only where an operator has said in the
-/// configuration file that local address space is a legitimate destination.
-/// Folding loopback in here would overrule that decision, and it would do it for
-/// every service on the host rather than for this proxy.
-///
-/// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
-/// request and never per packet, and it is paid only by addresses the policy has
-/// already let through, and the loopback test above it is free.
-fn is_the_proxys_own(ip: std::net::IpAddr) -> bool {
-    // Canonical first: `::ffff:127.0.0.1` is loopback wearing an IPv6 hat, and
-    // the kernel would bind it happily.
-    let ip = policy::canonical(ip);
-    !ip.is_loopback() && crate::net::holds_address(ip)
-}
-
 pub(crate) async fn admit_target(
     host: &str,
     port: u16,
@@ -1062,14 +1069,14 @@ mod tests {
         )
     }
 
-    /// The connection's allowance is spent once and never given back, and the
-    /// operator's off switch turns it off too.
-    ///
-    /// Charged one packet at a time because that is how a session spends it, and
-    /// the number that has to be exact is the last one: the packet after the
-    /// total is the one whose session is closed.
     /// A refund returns exactly what one session charged, and never lifts the
     /// counter past the total the connection was created with.
+    ///
+    /// The three things D84's 2026-09-05 addendum promises, in order: a spent
+    /// total buys nothing, a refund of two buys two and no third, and a refund
+    /// of everything an attacker could ask for stops at the total. The last one
+    /// is the cap `refund_unanswered` applies; without it a connection could
+    /// end up with more allowance than it was created with.
     #[tokio::test]
     async fn a_refund_returns_a_sessions_own_charge_and_no_more() {
         const BUDGET: u32 = 3;
@@ -1111,6 +1118,13 @@ mod tests {
         assert!(uncapped.charge_unanswered());
     }
 
+    /// The connection's allowance is spent once and, with nothing outstanding
+    /// to repay it, never given back; and the operator's off switch turns it
+    /// off too.
+    ///
+    /// Charged one packet at a time because that is how a session spends it, and
+    /// the number that has to be exact is the last one: the packet after the
+    /// total is the one whose session is closed.
     #[tokio::test]
     async fn the_connections_unanswered_total_is_spent_exactly_once() {
         const BUDGET: u32 = 3;
