@@ -9,7 +9,7 @@
 //! sentence, never that the sentence is true. This binary asks the three
 //! questions about prose that a machine can actually answer.
 //!
-//! # The three gates
+//! # The four gates
 //!
 //! 1. **Configuration keys are one set, counted from both ends.** Every key
 //!    `script/config.example.toml` assigns -- live or commented as
@@ -24,8 +24,12 @@
 //! 3. **Anchors resolve.** Every `docs/<page>.md#<anchor>` named in `src/` or
 //!    `tests/`, and every `](...#anchor)` link inside `docs/` and `README.md`,
 //!    has to name a heading that exists, judged by GitHub's own slug rules.
+//! 4. **A procedure written twice is written once.** The manual installation
+//!    appears in `docs/deployment.md`'s `## systemd` section and again in
+//!    `script/masque.service`'s header comment, and the two command sequences
+//!    have to be the same one.
 //!
-//! The set those three read is itself accounted for. Every `*.md` under `docs/`
+//! The set those four read is itself accounted for. Every `*.md` under `docs/`
 //! is either in `DOC_PAGES` or exempt by name in `EXEMPT`, so a page added
 //! without a decision fails here rather than going unread, the way a new file
 //! under `src/` fails `it_log_lines` by default.
@@ -818,6 +822,162 @@ fn every_documentation_anchor_resolves() {
             reference.source,
             reference.page,
             reference.anchor
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gate 4: the manual installation block
+// ---------------------------------------------------------------------------
+
+/// Commands the manual installation must be written with, at the very least.
+///
+/// Today both sides carry eight. The floor is what stops a heading renamed or a
+/// fence reflowed from comparing two empty lists and calling them equal.
+const INSTALL_COMMAND_FLOOR: usize = 6;
+
+/// The `## systemd` section of `docs/deployment.md`.
+///
+/// Bounded by that heading and the next second-level one, both asserted, so a
+/// renamed heading fails here rather than leaving this gate reading a section
+/// that is not the one it is about.
+fn systemd_section(text: &str) -> &str {
+    let start = text.find("\n## systemd\n").unwrap_or_else(|| {
+        panic!(
+            "docs/deployment.md carries no `## systemd` section, which is where \
+             the manual installation this gate compares is written"
+        )
+    });
+    let rest = &text[start + 1..];
+    let end = rest.find("\n## ").unwrap_or_else(|| {
+        panic!("the `## systemd` section of docs/deployment.md is the last one; this gate reads it by its bounds and needs the next heading")
+    });
+    &rest[..end]
+}
+
+/// The installation part of `script/masque.service`'s header comment.
+///
+/// Bounded by `# Install:` and the paragraph that begins `# Reload after`, both
+/// asserted. The reload paragraph carries a `sudo` line of its own, which is not
+/// part of the installation and must stay outside the comparison.
+fn install_comment(text: &str) -> &str {
+    let start = text
+        .find("# Install:")
+        .unwrap_or_else(|| panic!("script/masque.service carries no `# Install:` header comment"));
+    let rest = &text[start..];
+    let end = rest.find("\n# Reload after").unwrap_or_else(|| {
+        panic!(
+            "script/masque.service's header no longer carries the `# Reload after` \
+             paragraph, which is what bounds the installation comment; without it \
+             this gate would read the reload command as an installation step"
+        )
+    });
+    &rest[..end]
+}
+
+/// Every `sudo` line inside a fenced block of `section`, in order.
+fn fenced_commands(section: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut fenced = false;
+
+    for line in section.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced && line.starts_with("sudo ") {
+            commands.push(line.to_owned());
+        }
+    }
+
+    commands
+}
+
+/// Every `sudo` line of `comment`, in order, with the comment marker taken off.
+fn commented_commands(comment: &str) -> Vec<String> {
+    comment
+        .lines()
+        .filter_map(|line| line.strip_prefix('#'))
+        .map(str::trim)
+        .filter(|line| line.starts_with("sudo "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The manual installation is written twice and the two copies must agree.
+///
+/// `docs/deployment.md`'s `## systemd` section and `script/masque.service`'s
+/// header comment carry the same sequence of commands. The copy in the unit
+/// exists so the file that lands on the host explains itself without a browser,
+/// and it is worth exactly as much as the two agree, the way
+/// `it_release_assets::cross_yml_runs_the_release_build_step_verbatim` holds the
+/// mirrored build step of two workflow files to the same rule.
+///
+/// The order of these commands is the finding this gate was written for: the
+/// block used to end on `systemctl enable --now volto`, which starts the server
+/// on the placeholder password `script/config.example.toml` ships, before the
+/// step that tells the operator to replace it. Splitting `enable` from `start`
+/// is only a fix while both copies say so.
+#[test]
+fn the_manual_installation_is_written_the_same_way_in_both_places() {
+    let page = repo_root().join("docs/deployment.md");
+    let unit = repo_root().join("script/masque.service");
+
+    let documented = fenced_commands(systemd_section(&read_text(&page)));
+    let shipped = commented_commands(install_comment(&read_text(&unit)));
+
+    for (source, commands) in [(&page, &documented), (&unit, &shipped)] {
+        assert!(
+            commands.len() >= INSTALL_COMMAND_FLOOR,
+            "only {} installation commands were read out of {}; the reader is \
+             broken, not the tree",
+            commands.len(),
+            source.display()
+        );
+    }
+
+    assert_eq!(
+        documented, shipped,
+        "the manual installation in docs/deployment.md has drifted from the copy \
+         in script/masque.service's header comment. Both describe the same \
+         procedure to the same operator, and the unit is the copy that reaches \
+         the host inside the release tarball, so a step present in one and not \
+         the other is a host installed a way nobody documented.\n\n\
+         docs/deployment.md:\n{documented:#?}\n\nscript/masque.service:\n{shipped:#?}"
+    );
+
+    // The finding itself, stated as its own claim rather than left implicit in
+    // the sequence above: `--now` would start the server on the shipped
+    // placeholder password, and `start` has to come after the edit step, which
+    // sits between the two fences on the page and between the two comment
+    // paragraphs in the unit.
+    for (source, commands) in [(&page, &documented), (&unit, &shipped)] {
+        assert!(
+            commands
+                .iter()
+                .any(|line| line == "sudo systemctl enable volto"),
+            "{} no longer enables the unit without --now. `enable --now` starts \
+             the server on the placeholder password script/config.example.toml \
+             ships, before the operator has been told to replace it",
+            source.display()
+        );
+        let start = commands
+            .iter()
+            .position(|line| line == "sudo systemctl start volto")
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} never starts the service; the installation it describes \
+                     leaves the operator with a unit that is enabled and not running",
+                    source.display()
+                )
+            });
+        assert_eq!(
+            start,
+            commands.len() - 1,
+            "{} starts the service before the end of the installation. The start \
+             is last because everything before it has to have happened, the edit \
+             of /etc/volto/config.toml above all",
+            source.display()
         );
     }
 }

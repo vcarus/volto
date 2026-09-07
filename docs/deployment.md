@@ -341,11 +341,22 @@ sudo install -d -o volto -g volto -m 0750 /etc/volto
 sudo install -o volto -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
 sudo install -m 0644 script/masque.service /etc/systemd/system/volto.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now volto
+sudo systemctl enable volto
 ```
 
-Then edit `/etc/volto/config.toml`: set the `cert`/`key` paths and **set
-`[auth].users`**. An empty user list means no authentication at all.
+`enable` without `--now` on purpose: the service is not started yet. Then edit
+`/etc/volto/config.toml`: set the `cert`/`key` paths and **set `[auth].users`**.
+An empty user list means no authentication at all, and the password the example
+ships is a placeholder published in this repository and in every release
+tarball, so a server started before this edit accepts a credential anybody can
+read. The server warns about both at startup and refuses neither, so the order
+of these two steps is what keeps the port shut until the file is right.
+
+Start it once that edit is made:
+
+```sh
+sudo systemctl start volto
+```
 
 The unit runs as a fixed system user rather than with `DynamicUser=yes` on
 purpose: the private key must be readable by this service and nothing else,
