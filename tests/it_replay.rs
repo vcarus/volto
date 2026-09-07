@@ -210,19 +210,19 @@ mod shape;
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
 use common::h3client::NoClient;
 use common::{
-    CONNECT_UDP, ClientStream, H3Client, SharedBuffer, TestServer, basic_credentials,
-    spawn_echo_target, spawn_udp_echo_target,
+    ClientStream, H3Client, SharedBuffer, TestServer, basic_credentials, spawn_echo_target,
+    spawn_udp_echo_target,
 };
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
 use volto::datagram;
-use volto::h3api::{Method, Request, Status};
+use volto::h3api::{Request, Status};
 
 use shape::{Ending, Json, TunnelKind};
 
@@ -629,31 +629,25 @@ impl Targets {
 // Driving one tunnel
 // --------------------------------------------------------------------------
 
-fn credentials() -> String {
-    basic_credentials(USER, PASSWORD)
-}
+/// The credentials every request carries, encoded once for the whole run.
+///
+/// `basic_credentials` base64-encodes the pair, and the replay sends thousands
+/// of requests: this is harness cost competing with the server it measures, so
+/// it is paid once. The CONNECT-UDP requests take it from here; the classic
+/// CONNECT ones go through `common::authorized_connect`, which encodes the pair
+/// itself, and having one shared constructor is worth more than that encode.
+static CREDENTIALS: LazyLock<String> = LazyLock::new(|| basic_credentials(USER, PASSWORD));
 
-fn connect_request(authority: &str) -> Request {
-    let mut request = Request::new(Method::Connect);
-    request.authority = Some(authority.into());
-    request.fields.append(
-        "proxy-authorization",
-        volto::h3api::FieldValue::parse(credentials().as_bytes()).expect("a valid field value"),
-    );
-    request
-}
-
+/// A CONNECT-UDP request for `target`, carrying this run's credentials.
+///
+/// `common::connect_udp_request` percent-encodes the host per RFC 9298 §3,
+/// which the copy this replaced did not. Both replay profiles name an IPv4
+/// loopback target, whose textual form has nothing to escape, so the two agree
+/// byte for byte here; an IPv6 target would arrive with escaped colons, which
+/// is what the template asks for.
 fn connect_udp_request(proxy: SocketAddr, target: SocketAddr) -> Request {
-    let mut request = Request::new(Method::Connect);
-    request.scheme = Some("https".into());
-    request.authority = Some(proxy.to_string().into());
-    request.path =
-        Some(format!("/.well-known/masque/udp/{}/{}/", target.ip(), target.port()).into());
-    request.protocol = Some(CONNECT_UDP.into());
-    request.fields.append(
-        "proxy-authorization",
-        volto::h3api::FieldValue::parse(credentials().as_bytes()).expect("a valid field value"),
-    );
+    let mut request = common::connect_udp_request(proxy, &target.ip().to_string(), target.port());
+    common::authorize(&mut request, &CREDENTIALS);
     request
 }
 
@@ -682,23 +676,26 @@ enum Transferred {
 async fn run_transfer(stream: &mut ClientStream, bytes: u32, tag: u64) -> Transferred {
     use bytes::Buf;
 
-    let payload: Vec<u8> = {
+    // One allocation for the whole transfer: `Bytes::slice` hands each chunk out
+    // as a view of it, where copying every 4096-byte chunk out of a buffer this
+    // function already owns is harness cost competing with the server it
+    // measures.
+    let payload: Bytes = {
         let mut buffer = vec![0u8; bytes as usize];
         let tag = tag.to_be_bytes();
         for (slot, byte) in buffer.iter_mut().zip(tag.iter().cycle()) {
             *slot = *byte;
         }
-        buffer
+        Bytes::from(buffer)
     };
 
-    for chunk in payload.chunks(CHUNK) {
-        if stream
-            .send_data(Bytes::copy_from_slice(chunk))
-            .await
-            .is_err()
-        {
+    let mut at = 0;
+    while at < payload.len() {
+        let end = (at + CHUNK).min(payload.len());
+        if stream.send_data(payload.slice(at..end)).await.is_err() {
             return Transferred::Aborted;
         }
+        at = end;
     }
     if stream.finish().is_err() {
         return Transferred::Aborted;
@@ -987,7 +984,7 @@ async fn run_connection(
             TunnelKind::Udp => {
                 connect_udp_request(server.addr, targets.udp[slot % targets.udp.len()])
             }
-            other => connect_request(&targets.authority(other, slot)),
+            other => common::authorized_connect(&targets.authority(other, slot), USER, PASSWORD),
         };
 
         tally.bump(&tally.tunnels_requested);
