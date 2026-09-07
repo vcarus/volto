@@ -614,6 +614,17 @@ impl Server {
         self.trigger.clone()
     }
 
+    /// The `server.shutdown_grace` in force now, which a reload may have moved.
+    ///
+    /// Read from the live configuration rather than from a copy taken at bind,
+    /// because `server.shutdown_grace` is a reloadable key and both readers have
+    /// to see the same value: [`Server::drain`] bounds the drain with it, and
+    /// `main` bounds the blocking pool with it after the runtime has stopped.
+    /// [`crate::shutdown::blocking_grace`] states that as an invariant.
+    pub fn shutdown_grace(&self) -> Duration {
+        self.config().server.shutdown_grace()
+    }
+
     /// A handle that replaces the running configuration.
     ///
     /// The binary hands this to its `SIGHUP` handler; tests call it directly.
@@ -1164,7 +1175,7 @@ impl Server {
         self.endpoint.set_server_config(None);
         drop(swapping);
 
-        let grace = self.config().server.shutdown_grace();
+        let grace = self.shutdown_grace();
         info!(
             log_id = "7x7xt92f",
             open_connections = self.endpoint.open_connections(),
@@ -1909,6 +1920,41 @@ mod tests {
         has_started.recv().expect("the reload thread started");
         std::thread::sleep(SETTLE);
         reloading
+    }
+
+    /// The grace a reload raises is the grace the exit bound gets.
+    ///
+    /// `Server::drain` and `main` both ask for it, and `shutdown::blocking_grace`
+    /// states that the blocking pool gets the whole allowance the connections
+    /// got. That is only true while both read the live configuration: `main`
+    /// read the startup value until 2026-09-07, so a `SIGHUP` that raised the
+    /// key raised the drain and not the exit bound.
+    #[tokio::test]
+    async fn a_reload_moves_the_grace_the_exit_is_bounded_by() {
+        let bound = bound_server("");
+        assert_eq!(
+            bound.server.shutdown_grace(),
+            Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_GRACE),
+            "the grace the process started on"
+        );
+
+        write_config(
+            &bound.config_path,
+            &bound.cert,
+            &bound.key,
+            "shutdown_grace = 300\n",
+        );
+        bound
+            .server
+            .reload_handle()
+            .reload(&bound.config_path)
+            .expect("the raised grace reloads");
+
+        assert_eq!(
+            bound.server.shutdown_grace(),
+            Duration::from_secs(300),
+            "the grace in force after the reload"
+        );
     }
 
     /// A reload that has not got the swap yet has applied none of its writes.

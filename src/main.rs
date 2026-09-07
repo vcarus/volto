@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -80,12 +81,14 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build the async runtime")?;
 
-    // Read before the configuration moves into `run`: it is what bounds the
-    // wait below, and a `SIGHUP` cannot change it, since the runtime it applies
-    // to was built from the file this process started on.
-    let grace = config.server.shutdown_grace();
+    // Only the fallback. `run` returns the grace that was in force when the
+    // server stopped, which a `SIGHUP` may have raised since startup, and it
+    // fails only before the server exists, where the file this process started
+    // on is the right answer.
+    let startup_grace = config.server.shutdown_grace();
 
     let served = runtime.block_on(run(cli, config));
+    let grace = served.as_ref().copied().unwrap_or(startup_grace);
 
     // Deliberately not the implicit drop this used to end on. tokio's
     // `Runtime::drop` waits without limit for blocking tasks that have started,
@@ -98,7 +101,7 @@ fn main() -> Result<()> {
     // is about to end anyway.
     volto::shutdown::stop_runtime(runtime, grace);
 
-    served
+    served.map(|_| ())
 }
 
 /// Says that the file loaded, and repeats what starting on it would warn about.
@@ -248,7 +251,12 @@ fn uname() -> String {
 }
 
 /// Everything that needs a runtime, which is everything after the configuration.
-async fn run(cli: Cli, config: Config) -> Result<()> {
+///
+/// Returns `server.shutdown_grace` as it stood when the server stopped, which is
+/// what bounds the blocking pool once the runtime's own work is over. A reload
+/// can move that key, and `Server::drain` reads the same live value, which is
+/// the invariant [`volto::shutdown::blocking_grace`] states.
+async fn run(cli: Cli, config: Config) -> Result<Duration> {
     init_tracing(&config.log.level)?;
 
     // Only now that a subscriber exists: settings that are legal but risky —
@@ -268,8 +276,12 @@ async fn run(cli: Cli, config: Config) -> Result<()> {
 
     server.run().await;
 
+    // After the drain, so a reload that arrived during the process's life is in
+    // it.
+    let grace = server.shutdown_grace();
+
     info!(log_id = "fle471bm", "volto stopped");
-    Ok(())
+    Ok(grace)
 }
 
 /// Reloads the configuration on every `SIGHUP`, for as long as the process runs.
