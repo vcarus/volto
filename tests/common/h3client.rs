@@ -961,17 +961,11 @@ fn control_preface(datagrams: bool) -> BytesMut {
 }
 
 /// Opens a unidirectional stream and writes its type (RFC 9114 §6.2).
-async fn open_typed(connection: &quinn::Connection, stream_type: u64) -> quinn::SendStream {
-    try_open_typed(connection, stream_type)
-        .await
-        .expect("open a unidirectional stream")
-}
-
-/// [`open_typed`] for a connection that may go away underneath it.
 ///
-/// A connection evicted between its QUIC handshake and its HTTP/3 one takes
-/// these streams with it, which is a result on a path that stretches the gap
-/// between the two and not a fault of the client. See
+/// Fallible rather than asserting, because the connection may go away
+/// underneath it: one evicted between its QUIC handshake and its HTTP/3 one
+/// takes these streams with it, which is a result on a path that stretches the
+/// gap between the two and not a fault of the client. See
 /// [`H3Client::try_connect_within`].
 async fn try_open_typed(
     connection: &quinn::Connection,

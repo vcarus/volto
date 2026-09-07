@@ -92,14 +92,15 @@ use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
     FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
-    STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, application_close,
-    assert_closed_with, authenticate, authenticated_connect_headers_frame, connect_headers_frame,
-    frame, grease_type, headers_frame, open_uni_stream, read_frame, status_of, still_serving,
+    STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    announce_full_sized_headers, application_close, assert_closed_with, authenticate,
+    authenticated_connect_headers_frame, connect_headers_frame, frame, grease_type, headers_frame,
+    open_uni_stream, read_frame, status_of, status_of_response, still_serving, varint_frame,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
     client_endpoint, client_endpoint_with_transport, connect_quic, echoes, finish_connect,
-    open_tcp_tunnel, send_udp_payload, spawn_echo_target, windowless_transport,
+    open_tcp_tunnel, send_udp_payload, silent_peer, spawn_echo_target, windowless_transport,
 };
 use volto::datagram;
 
@@ -158,35 +159,6 @@ fn settings_frame() -> Vec<u8> {
     frame(FRAME_SETTINGS, &payload)
 }
 
-/// A frame whose whole payload is one varint: GOAWAY or MAX_PUSH_ID.
-fn varint_frame(kind: u64, value: u64) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    datagram::put_varint(&mut payload, value);
-    frame(kind, &payload)
-}
-
-/// Opens a request stream, announces a full-sized HEADERS frame and sends one
-/// byte of it.
-///
-/// One byte rather than none so the stream is genuinely mid-frame, and both
-/// halves are handed back rather than dropped: dropping a [`quinn::SendStream`]
-/// finishes it, which would tell the server the frame will never be completed.
-async fn announce_full_sized_headers(
-    connection: &quinn::Connection,
-) -> (quinn::SendStream, quinn::RecvStream) {
-    let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
-
-    let mut announcement = BytesMut::new();
-    datagram::put_varint(&mut announcement, FRAME_HEADERS);
-    datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
-    announcement.extend_from_slice(b"\x00");
-    send.write_all(&announcement)
-        .await
-        .expect("announce a full-sized field section");
-
-    (send, recv)
-}
-
 /// Opens a request stream and writes a frame header for `kind` declaring
 /// `length` bytes, without a byte of the payload behind it.
 ///
@@ -222,24 +194,6 @@ fn stays_open(connection: &quinn::Connection, within: Duration) -> impl Future<O
             panic!("the connection at {caller} was closed within {within:?}: {error}");
         }
     }
-}
-
-/// A QUIC connection that keeps itself alive and has said nothing.
-///
-/// Same shape as `it_handshake`'s peer, and for the same reason: with the
-/// keep-alive, every ACK restarts the server's idle timer, so the transport can
-/// never be the thing that closes the connection and only an application bound
-/// can be.
-async fn silent_peer(server: &TestServer) -> (quinn::Endpoint, quinn::Connection) {
-    let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(Duration::from_millis(100)));
-
-    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
-    let connection = finish_connect(&endpoint, server.addr)
-        .await
-        .expect("the QUIC handshake must succeed");
-
-    (endpoint, connection)
 }
 
 // ---------------------------------------------------------------------------
@@ -827,7 +781,8 @@ async fn the_control_stream_does_not_share_the_request_buffering_budget() {
     let mut held = Vec::new();
     let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
     for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-        let (send, mut recv) = announce_full_sized_headers(&connection).await;
+        let (send, mut recv) =
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
         // Parked rather than dropped: dropping the sending half finishes the
         // stream, which would tell the server the frame will never be completed
         // and give its share of the budget back.
@@ -860,21 +815,6 @@ async fn the_control_stream_does_not_share_the_request_buffering_budget() {
     let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
     stays_open(&connection, Duration::from_millis(500)).await;
-}
-
-/// The `:status` of a response read whole from a raw request stream.
-fn status_of_response(response: &[u8]) -> String {
-    let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
-    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
-    let (length, more) = datagram::peek_varint(&response[used..]).expect("a frame length");
-
-    let payload = &response[used + more..];
-    assert_eq!(
-        payload.len() as u64,
-        length,
-        "the response is the whole of what the stream carried"
-    );
-    status_of(payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,7 +959,8 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
         let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
         let mut senders = Vec::new();
         for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-            let (send, mut recv) = announce_full_sized_headers(&connection).await;
+            let (send, mut recv) =
+                announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
             senders.push(send);
 
             let refusals = refusals.clone();
@@ -1053,7 +994,8 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
     let mut held = Vec::new();
     let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT);
     for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
-        let (send, mut recv) = announce_full_sized_headers(&connection).await;
+        let (send, mut recv) =
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
         held.push(send);
 
         let refusals = refusals.clone();

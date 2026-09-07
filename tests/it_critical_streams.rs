@@ -15,23 +15,13 @@
 
 mod common;
 
-use bytes::BytesMut;
 use common::rawstream::{
-    DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_HEADERS, FRAME_MAX_PUSH_ID, FRAME_SETTINGS,
-    H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR, H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR,
-    QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
-    application_close, connect_headers_frame, frame, open_uni_stream, read_frame, read_varint,
-    status_of,
+    FRAME_CANCEL_PUSH, FRAME_MAX_PUSH_ID, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_ID_ERROR,
+    H3_REQUEST_CANCELLED, QPACK_DECODER_STREAM_ERROR, QPACK_ENCODER_STREAM_ERROR, STREAM_CONTROL,
+    STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, application_close, frame, open_uni_stream,
+    read_varint, still_serving, varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic};
-use volto::datagram;
-
-/// A frame whose whole payload is one varint: CANCEL_PUSH or MAX_PUSH_ID.
-fn push_id_frame(kind: u64, push_id: u64) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    datagram::put_varint(&mut payload, push_id);
-    frame(kind, &payload)
-}
 
 /// Opens a unidirectional stream of `stream_type`, sends `bytes` on it, and
 /// asserts the server ends the connection with `code` and a reason phrase that
@@ -70,25 +60,6 @@ async fn server_control_stream(connection: &quinn::Connection) -> quinn::RecvStr
     panic!("the server never opened a control stream");
 }
 
-/// Sends one request the server answers without touching the network.
-///
-/// Used as a round trip rather than for its answer: a server that has replied to
-/// these bytes has read past everything queued before them.
-async fn round_trip(connection: &quinn::Connection) {
-    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
-    send.write_all(&connect_headers_frame(DENIED_TARGET))
-        .await
-        .expect("send a CONNECT request");
-
-    let (frame_type, payload) = read_frame(&mut recv).await;
-    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
-    assert_eq!(
-        status_of(&payload),
-        "403",
-        "the server must still be serving"
-    );
-}
-
 /// A control stream the peer refuses to read is H3_CLOSED_CRITICAL_STREAM on
 /// the wire, not merely in this server's own head.
 ///
@@ -121,7 +92,7 @@ async fn a_stopped_control_stream_ends_the_connection() {
     // So the STOP_SENDING is not merely queued here but processed there: it was
     // written before these bytes were, and a server that has answered them has
     // read past it.
-    round_trip(&connection).await;
+    still_serving(&connection).await;
 
     server.shutdown();
 
@@ -166,7 +137,7 @@ async fn a_reset_control_stream_ends_the_connection() {
 
     let mut control =
         open_uni_stream(&connection, STREAM_CONTROL, &frame(FRAME_SETTINGS, &[])).await;
-    round_trip(&connection).await;
+    still_serving(&connection).await;
 
     // Any code: what the server owes is its own verdict on being reset at all.
     control
@@ -189,7 +160,7 @@ async fn a_reset_control_stream_ends_the_connection() {
 #[tokio::test]
 async fn a_cancel_push_is_an_id_error() {
     let mut control = frame(FRAME_SETTINGS, &[]);
-    control.extend(push_id_frame(FRAME_CANCEL_PUSH, 7));
+    control.extend(varint_frame(FRAME_CANCEL_PUSH, 7));
 
     expect_close(
         "CANCEL_PUSH",
@@ -208,7 +179,7 @@ async fn a_cancel_push_is_an_id_error() {
 async fn a_shrinking_max_push_id_is_an_id_error() {
     let mut control = frame(FRAME_SETTINGS, &[]);
     for push_id in [10, 10, 12, 5] {
-        control.extend(push_id_frame(FRAME_MAX_PUSH_ID, push_id));
+        control.extend(varint_frame(FRAME_MAX_PUSH_ID, push_id));
     }
 
     expect_close(

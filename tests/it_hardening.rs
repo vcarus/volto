@@ -16,8 +16,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use common::rawstream::{
     DENIED_TARGET, FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
-    H3_STREAM_CREATION_ERROR, assert_closed_with, authenticate, connect_headers_frame, read_frame,
-    status_of, stopped_code,
+    H3_STREAM_CREATION_ERROR, announce_full_sized_headers, assert_closed_with, authenticate,
+    connect_headers_frame, read_frame, status_of, status_of_response, stopped_code,
 };
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, auth_section, authorized_connect,
@@ -940,29 +940,6 @@ fn streams_past_the_budget() -> usize {
     FULL_SIZED_FRAMES_THAT_FIT + 4
 }
 
-/// Opens a request stream, announces a full-sized HEADERS frame on it and sends
-/// a single byte of it.
-///
-/// One byte rather than none so that the stream is genuinely mid-frame rather
-/// than merely announced, and both halves are handed back rather than dropped:
-/// dropping a [`quinn::SendStream`] finishes it, which would tell the server the
-/// frame it is holding will never be completed.
-async fn announce_oversized_headers(
-    connection: &quinn::Connection,
-) -> (quinn::SendStream, quinn::RecvStream) {
-    let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
-
-    let mut frame = BytesMut::new();
-    datagram::put_varint(&mut frame, FRAME_HEADERS);
-    datagram::put_varint(&mut frame, volto::h3::MAX_FIELD_SECTION_SIZE);
-    frame.extend_from_slice(b"\x00");
-    send.write_all(&frame)
-        .await
-        .expect("announce a HEADERS frame");
-
-    (send, recv)
-}
-
 /// Every frame here is within what the server will buffer for one frame, and no
 /// stream breaks a rule of its own — so the bound that has to catch this is the
 /// one on their sum, and what it catches is the request rather than the
@@ -1000,7 +977,8 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     // asserted.
     let (refusals, mut refused) = tokio::sync::mpsc::channel(streams_past_the_budget());
     for _ in 0..streams_past_the_budget() {
-        let (send, mut recv) = announce_oversized_headers(&connection).await;
+        let (send, mut recv) =
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
         let refusals = refusals.clone();
         tokio::spawn(async move {
             // The sending half is parked here rather than dropped: dropping it
@@ -1297,19 +1275,4 @@ async fn a_field_section_decoding_past_the_advertised_size_costs_only_that_reque
     );
     // And it is still a working connection, not merely an unclosed one.
     let _tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
-}
-
-/// The `:status` of a response read whole from a raw request stream.
-fn status_of_response(response: &[u8]) -> String {
-    let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
-    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
-    let (length, more) = datagram::peek_varint(&response[used..]).expect("a frame length");
-
-    let payload = &response[used + more..];
-    assert_eq!(
-        payload.len() as u64,
-        length,
-        "the response is the whole of what the stream carried"
-    );
-    status_of(payload)
 }

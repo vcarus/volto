@@ -540,6 +540,36 @@ pub fn finish_connect_as<'a>(
     }
 }
 
+/// Opens a QUIC connection that keeps itself alive and never says anything.
+///
+/// The keep-alive is what makes a test using this about an *application* bound
+/// rather than about the transport's: with it, every ACK restarts the server's
+/// idle timer, so the transport can never be the thing that closes the
+/// connection and only an application bound can be.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66).
+#[track_caller]
+pub fn silent_peer(
+    server: &TestServer,
+) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> + use<> {
+    let caller = Location::caller();
+    let ca = server.ca.clone();
+    let addr = server.addr;
+
+    async move {
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(Duration::from_millis(100)));
+
+        let endpoint = client_endpoint_with_transport(&ca, &["h3"], transport);
+        let connection = finish_connect(&endpoint, addr)
+            .await
+            .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
+
+        (endpoint, connection)
+    }
+}
+
 /// Asserts that `error` is the peer resetting the stream, with `code`.
 ///
 /// The failure worth describing is the one where a stream ended the wrong way

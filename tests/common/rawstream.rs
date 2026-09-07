@@ -8,14 +8,16 @@
 //! stream and naming its type, building a frame, reading one back, waiting for
 //! the connection to end.
 //!
-//! What is *not* here is any assertion about what the server chose. The five
+//! What is *not* here is any assertion about what the server chose. The six
 //! this module does make are the ones that were written identically at every
-//! call site: a response carries `:status` ([`status_of`]), a stream the server
-//! refuses to read is stopped ([`stopped_code`]), a connection the server ends
-//! is ended with a code the caller names ([`assert_closed_with`]), a connection
-//! that needs more than the pre-authentication stream allowance gets itself
-//! through the door first ([`authenticate`]), and a connection that survived
-//! whatever was done to it is still answering ([`still_serving`]).
+//! call site: a response carries `:status` ([`status_of`]), a response read
+//! whole off a stream is one HEADERS frame and nothing after it
+//! ([`status_of_response`]), a stream the server refuses to read is stopped
+//! ([`stopped_code`]), a connection the server ends is ended with a code the
+//! caller names ([`assert_closed_with`]), a connection that needs more than the
+//! pre-authentication stream allowance gets itself through the door first
+//! ([`authenticate`]), and a connection that survived whatever was done to it is
+//! still answering ([`still_serving`]).
 //!
 //! D66 shape: helpers that assert are synchronous functions returning a future,
 //! so `#[track_caller]` survives to the poll that panics.
@@ -186,6 +188,16 @@ pub fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
     datagram::put_varint(&mut out, payload.len() as u64);
     out.extend_from_slice(payload);
     out.to_vec()
+}
+
+/// A frame whose whole payload is one varint: GOAWAY, CANCEL_PUSH, MAX_PUSH_ID.
+///
+/// The three frames RFC 9114 §7.2.6, §7.2.3 and §7.2.7 define that way, so the
+/// caller names which one it is sending and what identifier it carries.
+pub fn varint_frame(kind: u64, value: u64) -> Vec<u8> {
+    let mut payload = BytesMut::new();
+    datagram::put_varint(&mut payload, value);
+    frame(kind, &payload)
 }
 
 /// Encodes `fields` as a QPACK field section and wraps it in a HEADERS frame.
@@ -361,6 +373,42 @@ pub async fn open_uni_stream(
     stream
 }
 
+/// Opens a request stream, announces a HEADERS frame of `declared` bytes and
+/// sends one byte of it.
+///
+/// One byte rather than none so the stream is genuinely mid-frame rather than
+/// merely announced, and both halves are handed back rather than dropped:
+/// dropping a [`quinn::SendStream`] finishes it, which would tell the server the
+/// frame it is holding will never be completed. Callers that hold a batch of
+/// these open depend on both of those, because a finished stream gives its share
+/// of the buffering budget back.
+///
+/// `declared` is a parameter rather than `volto::h3::MAX_FIELD_SECTION_SIZE`
+/// written in here, so the number a test drives the server to remains at the
+/// test, which is where the arithmetic around it is argued. Both callers pass
+/// exactly the maximum today.
+///
+/// The write is expected to succeed, which is what tells this apart from
+/// `it_hostile::announce_frame`: that one sends a frame header alone, of any
+/// type, and tolerates a write failing because the connection going away is one
+/// of the answers it waits for.
+pub async fn announce_full_sized_headers(
+    connection: &quinn::Connection,
+    declared: u64,
+) -> (quinn::SendStream, quinn::RecvStream) {
+    let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
+
+    let mut announcement = BytesMut::new();
+    datagram::put_varint(&mut announcement, FRAME_HEADERS);
+    datagram::put_varint(&mut announcement, declared);
+    announcement.extend_from_slice(b"\x00");
+    send.write_all(&announcement)
+        .await
+        .expect("announce a full-sized field section");
+
+    (send, recv)
+}
+
 /// Reads one HTTP/3 frame from a raw stream: type, length, payload.
 pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
     let frame_type = read_varint(recv).await;
@@ -414,6 +462,30 @@ pub fn status_of(block: &[u8]) -> String {
         .find(|field| field.name.as_ref() == b":status")
         .expect("a response carries :status");
     String::from_utf8(status.value.to_vec()).expect("a numeric status")
+}
+
+/// The `:status` of a response read whole off a raw request stream.
+///
+/// [`status_of`] for the callers that read the stream to its end rather than one
+/// frame at a time: the bytes must be one HEADERS frame and nothing after it,
+/// which is asserted here rather than assumed, and the field section behind that
+/// frame header is what carries the status.
+///
+/// `#[track_caller]` because those three assertions belong to the call site;
+/// [`status_of`] needs none, its own failures being `expect`s on the decoder.
+#[track_caller]
+pub fn status_of_response(response: &[u8]) -> String {
+    let (frame_type, used) = datagram::peek_varint(response).expect("a frame type");
+    assert_eq!(frame_type, FRAME_HEADERS, "a response begins with HEADERS");
+    let (length, more) = datagram::peek_varint(&response[used..]).expect("a frame length");
+
+    let payload = &response[used + more..];
+    assert_eq!(
+        payload.len() as u64,
+        length,
+        "the response is the whole of what the stream carried"
+    );
+    status_of(payload)
 }
 
 /// Writes until the peer stops the stream, and reports the code it used.

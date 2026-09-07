@@ -34,7 +34,7 @@ use common::rawstream::{
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, authorized_connect,
     basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, finish_connect,
-    open_tcp_tunnel, send_and_respond, spawn_echo_target,
+    open_tcp_tunnel, send_and_respond, silent_peer, spawn_echo_target,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::NamedGroup;
@@ -1120,32 +1120,6 @@ async fn retry_counting_relay(server: SocketAddr) -> (SocketAddr, Arc<AtomicUsiz
 fn is_retry(datagram: &[u8]) -> bool {
     matches!(datagram.first(), Some(first) if first & 0xf0 == 0xf0)
         && matches!(datagram.get(1..5), Some([0x00, 0x00, 0x00, 0x01]))
-}
-
-/// Opens a QUIC connection that keeps itself alive and never says anything.
-///
-/// The keep-alive is what makes these tests about the application bound rather
-/// than about the transport's: with it, every ACK restarts the server's idle
-/// timer, so the transport can never be the thing that closes the connection.
-#[track_caller]
-fn silent_peer(
-    server: &TestServer,
-) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> + use<> {
-    let caller = Location::caller();
-    let ca = server.ca.clone();
-    let addr = server.addr;
-
-    async move {
-        let mut transport = quinn::TransportConfig::default();
-        transport.keep_alive_interval(Some(Duration::from_millis(100)));
-
-        let endpoint = client_endpoint_with_transport(&ca, &["h3"], transport);
-        let connection = finish_connect(&endpoint, addr)
-            .await
-            .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
-
-        (endpoint, connection)
-    }
 }
 
 /// Opens a CONNECT tunnel carrying credentials, and asserts it was accepted.
