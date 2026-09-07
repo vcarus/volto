@@ -50,13 +50,20 @@ jobs:
       # is preinstalled on the ubuntu runner image, so it costs the checkout it
       # was already paying for.
       #
-      # Default severity, which is `style`: the two scripts are clean at it
+      # Default severity, which is `style`: all five scripts are clean at it
       # today, including the info-level checks, and a finding that is wrong for
       # a particular line is turned off in place with a
       # `# shellcheck disable=SCxxxx` carrying its reason (there is one, on the
       # `trap` in install-selfsigned.sh).
+      #
+      # Every tracked script, not `script/*.sh`, which was two of the five. The
+      # three it used to miss are tests/interop/run-local.sh, the fixture
+      # tests/interop/serve.sh and tests/replay/lossy-lab.sh; a quoting bug in
+      # serve.sh breaks the only independent judge of src/h3 and no gate would
+      # say why. Listed by `git ls-files` so a new script is covered when it
+      # arrives rather than when somebody remembers.
       - name: shellcheck
-        run: shellcheck script/*.sh
+        run: shellcheck $(git ls-files '*.sh')
 
   clippy:
     name: clippy
@@ -112,7 +119,12 @@ jobs:
       # job's question, on the toolchain deployments actually build with. The
       # MSRV question is only whether every target still compiles, dev-deps
       # included -- which is also why this is `--all-targets`.
-      - run: cargo check --all-targets --locked
+      #
+      # `--all-features` because `--all-targets` alone skips the two targets
+      # declared `required-features = ["operator-runs"]` (it_bench,
+      # it_resolver_pool), and the comment above claims every target. The crate
+      # has one feature, so the cost is two more test binaries to check.
+      - run: cargo check --all-targets --all-features --locked
 
   fuzz:
     # `fuzz/` is its own cargo workspace (the cargo-fuzz convention), so no

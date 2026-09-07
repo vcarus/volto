@@ -37,7 +37,12 @@ proptest-regressions/
 *.proptest-regressions
 
 # Scratch files the interop job writes into the workspace (certificate, key,
-# config, server log), in case the same steps are run by hand.
+# config, server log), in case the same steps are run by hand. The job writes
+# them into interop/ (ci.yml, "$PWD/interop"); the flat /interop-* names are
+# what it wrote before a50ccf5 moved it to a directory, and are kept so a tree
+# that still has them stays clean. ./run-local.sh writes under
+# target/interop-local/ instead, which /target already covers.
+/interop/
 /interop-*
 
 # Python bytecode from the interop and diff-oracle helpers
