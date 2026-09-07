@@ -949,7 +949,11 @@ impl RequestFatal {
     }
 }
 
-/// A held-open tunnel: both halves, plus the id its payloads are tagged with.
+/// A held-open tunnel: the two halves of its request stream, and nothing else.
+///
+/// The tag its payloads carry is not in here. It is a parameter of [`run_plan`],
+/// which writes it into each payload as it goes, so a tunnel handed back to the
+/// schedule carries no identity of its own.
 struct LiveTunnel {
     send: quinn::SendStream,
     recv: quinn::RecvStream,

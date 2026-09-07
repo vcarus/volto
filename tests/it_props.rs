@@ -875,7 +875,7 @@ proptest! {
 /// policy are what refuse a host, and they see the decoded string either way.
 ///
 /// A leading `+` used to be on this list, because `u16::from_str` takes a sign.
-/// It is refused now, and `a_signed_port_is_refused` below is where that lives.
+/// It is refused now, and `a_signed_port_is_refused` above is where that lives.
 #[test]
 fn the_template_accepts_more_spellings_than_it_advertises() {
     assert_eq!(

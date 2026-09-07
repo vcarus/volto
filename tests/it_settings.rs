@@ -431,6 +431,18 @@ fn settings_frame() -> Vec<u8> {
 /// has no datagram path. The exchange is repeated so that it spans the moment
 /// the server reads the client's SETTINGS: before that moment the fallback was
 /// already correct, and it is the packets after it that used to disappear.
+///
+/// What the repetition costs is nothing but the round trips. The client's
+/// control stream is opened and written before the request, `serve_peer` has
+/// been reading it since before the CONNECT arrived, and the flag it writes is
+/// the very one each reply reads (`crate::h3::connection`'s module
+/// documentation), so round 0's answer -- which comes back only after a full
+/// round trip out to the target and home -- is already on the far side of that
+/// moment. The rounds stay five because nothing on the wire tells the two
+/// states apart: both send the payload back as a DATAGRAM capsule, so no single
+/// round can be shown to be the one that matters and the exchange is repeated
+/// instead. There was a 100 ms sleep at the end of each round with no comment
+/// on it; it held no window open that the round trip does not.
 #[tokio::test]
 async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     let server = TestServer::start().await;
@@ -488,7 +500,5 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
             }
             other => panic!("round {round}: expected a DATAGRAM capsule, got {other:?}"),
         }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
