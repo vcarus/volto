@@ -151,6 +151,13 @@
 //!   phenomenon; the replay could not reproduce them until it had a path.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
 //!
+//! The first two are read off the server's own log, and both are satisfied by a
+//! log the reader made nothing of, so a floor comes before them: the scan must
+//! have found connections established and connections closed. Without it a
+//! reworded message or a changed field syntax turns the whole set green while
+//! the run measures nothing, and nothing else would notice, `it_log_lines`
+//! being keyed by `log_id` rather than by the message.
+//!
 //! What is deliberately *not* asserted is the transport ending a client's own
 //! churn produces: this replay opens an endpoint per connection and lets it go,
 //! so an ephemeral port comes back round to a fresh endpoint that answers a
@@ -1616,6 +1623,26 @@ async fn production_shapes_are_replayed() {
     // offence. A close the *peer* decided on with a code the plan never sends
     // would be the harness lying about what it drove. A transport ending is
     // neither: see `LabLog::transport_endings`.
+    //
+    // The floor under all three comes first, and it is here for the reason
+    // `it_log_lines` and `it_clock` keep theirs: everything below is satisfied
+    // by a `LabLog::default()`, so a log scan that has gone blind reports that
+    // the server did nothing wrong while measuring nothing at all. `read_log`
+    // recognises a line by three free-text substrings and `number` answers zero
+    // for a field it cannot find, so a reworded message or a changed field
+    // syntax is enough to empty it -- and `it_log_lines` does not notice,
+    // because since batch 7 that gate is keyed by `log_id` rather than by the
+    // message.
+    assert!(
+        summary.established > 0 && summary.closed > 0,
+        "the scan of {} found {} established and {} closed connections, which \
+         cannot be true of a run whose clients started {} handshakes: the \
+         reader is broken, not the run clean",
+        settings.log_path.display(),
+        summary.established,
+        summary.closed,
+        tally.connections_started.load(Ordering::Relaxed),
+    );
     assert_eq!(
         summary.server_decided,
         Vec::<String>::new(),
