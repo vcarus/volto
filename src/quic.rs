@@ -618,7 +618,7 @@ impl Server {
     ///
     /// Read from the live configuration rather than from a copy taken at bind,
     /// because `server.shutdown_grace` is a reloadable key and both readers have
-    /// to see the same value: [`Server::drain`] bounds the drain with it, and
+    /// to see the same value: `Server::drain` bounds the drain with it, and
     /// `main` bounds the blocking pool with it after the runtime has stopped.
     /// [`crate::shutdown::blocking_grace`] states that as an invariant.
     pub fn shutdown_grace(&self) -> Duration {

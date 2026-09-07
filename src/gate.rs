@@ -24,8 +24,15 @@
 //! * **Short header** — passes. It belongs to a connection this endpoint may
 //!   already hold, and the gate keeps no connection state to judge it with; see
 //!   *What is left uncovered* below.
-//! * **Long header, version not 1** — refused. quinn would answer it with a
-//!   Version Negotiation packet.
+//! * **Long header, version not 1** — refused, whatever the version is. What
+//!   that removes depends on the version. quinn's default `EndpointConfig`,
+//!   which [`crate::quic::Server::bind`] takes unchanged, supports seven:
+//!   version 1 and the six draft numbers `0xff00001d` to `0xff000022`
+//!   (quinn-proto's `DEFAULT_SUPPORTED_VERSIONS`). For a version outside that
+//!   list quinn would send a Version Negotiation packet, and refusing removes
+//!   the reply. For one of the six drafts quinn would open a connection, and
+//!   refusing removes the service. Nothing this server interoperates with is
+//!   affected, because Surge speaks version 1.
 //! * **Long header, not an Initial** — passes. quinn drops a Handshake or 0-RTT
 //!   packet for an unknown connection without a word.
 //! * **An Initial in a datagram below 1200 bytes** — passes, because RFC 9000
@@ -457,7 +464,9 @@ impl Judge {
         //
         // A deliberate departure from that SHOULD, and the reason the gate
         // exists: a Version Negotiation packet is a reply, and a reply is what a
-        // scan is looking for. D106.
+        // scan is looking for. D106. For the six draft versions quinn's default
+        // `EndpointConfig` also supports, refusing removes the connection rather
+        // than the reply; the module documentation says so in full.
         if version != QUIC_V1 {
             return Verdict::Refuse(Refusal::Version(version));
         }
