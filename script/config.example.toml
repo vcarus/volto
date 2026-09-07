@@ -311,8 +311,9 @@ initial_rtt_ms = 150
 # this key and the client together.
 #
 # Matching is name for name, ASCII case-insensitive, with a trailing dot
-# ignored. No wildcards: list each host. Names are checked at startup and a
-# reload, and the new list applies to handshakes from then on.
+# ignored. No wildcards: list each host. No IP address literals either, which
+# RFC 6066 section 3 does not permit in a server_name. Names are checked at
+# startup and a reload, and the new list applies to handshakes from then on.
 # Default: []
 #expected_sni = []
 

@@ -1456,6 +1456,24 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
         );
     }
 
+    // The character set above already turns away every IPv6 literal, since none
+    // of them can be written without a colon, but the rule is stated as the rule
+    // rather than left as a side effect of the character class. It is exactly
+    // the class this function exists for: an operator who typed the address the
+    // relay is reached on has a name no conforming client will ever send, and
+    // the gate then refuses every handshake in silence.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc6066#section-3
+    //# Literal IPv4 and IPv6 addresses are not permitted in "HostName".
+    if bare.parse::<std::net::Ipv4Addr>().is_ok() || bare.parse::<std::net::Ipv6Addr>().is_ok() {
+        bail!(
+            "security.expected_sni[{index}] = {name:?} is an IP address literal, which \
+             RFC 6066 §3 does not permit in a server_name, so no conforming client can \
+             send it and the gate would refuse every handshake without a reply. Name the \
+             host the certificate is issued for instead"
+        );
+    }
+
     Ok(())
 }
 
@@ -2561,6 +2579,14 @@ pub(crate) mod tests {
             ("\"*.example\"", "wildcard"),
             ("\"proxy example\"", "contains"),
             ("\"[2001:db8::1]\"", "contains"),
+            // RFC 6066 §3: "Literal IPv4 and IPv6 addresses are not permitted
+            // in "HostName"." The dotted-quad passes the character class, so it
+            // needs the rule of its own; the IPv6 forms are refused by the class
+            // and are here to say that the rule covers them too.
+            ("\"192.0.2.1\"", "IP address literal"),
+            ("\"192.0.2.1.\"", "IP address literal"),
+            ("\"2001:db8::1\"", "contains"),
+            ("\"::1\"", "contains"),
         ] {
             let err = parse(&format!("[security]\nexpected_sni = [{entry}]"))
                 .validate()
