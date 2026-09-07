@@ -889,15 +889,7 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
             if host.is_empty() {
                 return Err("empty host");
             }
-            if host.contains(['[', ']']) {
-                // The same rule as the unbracketed arm below, and refused here
-                // for the same reason: RFC 3986 §3.2.2 gives "[" and "]" to the
-                // IP-literal form alone, so a bracket *inside* one is not part
-                // of the address it delimits. `[a[b]:443` must not be dialled
-                // as `a[b`. Written as the same two-character predicate rather
-                // than as a check for "[" only, so the two arms cannot drift:
-                // `]` cannot appear here, since the split above takes the first
-                // one, and asking about it costs nothing.
+            if tunnel::stray_bracket(host) {
                 return Err("stray bracket in host");
             }
             let port = rest
@@ -914,12 +906,7 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
                 // Ambiguous with host:port; brackets are mandatory.
                 return Err("unbracketed IPv6 literal");
             }
-            if host.contains(['[', ']']) {
-                // A bracket that did not open the authority is not part of any
-                // host: RFC 3986 §3.2.2 gives them to the IP-literal form alone,
-                // which the arm above is. Refused rather than tolerated because
-                // the host is what gets dialled and what gets logged, and
-                // `example.com]` must not quietly become `example.com`.
+            if tunnel::stray_bracket(host) {
                 return Err("stray bracket in host");
             }
             (host.to_owned(), port)

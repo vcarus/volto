@@ -136,6 +136,39 @@ pub(crate) fn is_port(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+/// Whether a host component carries a bracket that is not part of an IP literal.
+///
+/// RFC 3986 §3.2.2 gives "[" and "]" to the IP-literal form alone, in as many
+/// words: "This is the only place where square bracket characters are allowed
+/// in the URI syntax." The grammar it says that of is
+///
+/// ```text
+/// host        = IP-literal / IPv4address / reg-name
+///
+/// IP-literal = "[" ( IPv6address / IPvFuture  ) "]"
+/// ```
+///
+/// so a bracket left inside a host, once the pair that delimits an IP literal
+/// has been taken off, is not part of the address or the name it sits in.
+/// Refused rather than tolerated because the host is what gets dialled and what
+/// gets logged, and `example.com]` must not quietly become `example.com`, nor
+/// `[a[b]:443` be dialled as `a[b`.
+///
+/// Both characters are asked about at all three call sites, rather than only
+/// the one each of them can actually see, so the three cannot drift: on the two
+/// bracketed routes a "]" cannot survive, because the split that found the
+/// literal takes the first one, and asking costs nothing.
+///
+/// Written once beside [`is_port`] and for the same reason: two copies of a
+/// spelling rule is how the trailing-dot defect happened. This one was three
+/// copies with three separate comments arguing the same point, on the two
+/// routes a client can name a host by. The refusal each call site answers with
+/// stays at the call site, because a CONNECT authority and a URI template are
+/// refused in different words.
+pub(crate) fn stray_bracket(host: &str) -> bool {
+    host.contains(['[', ']'])
+}
+
 /// How many times over a connection may spend `unanswered_packet_budget` before
 /// its sessions are closed instead of muted.
 ///
@@ -402,6 +435,13 @@ pub struct Context {
     /// Zero means uncapped, the same way `unanswered_packet_budget = 0` does:
     /// the operator switched the mitigation off.
     pub unanswered_connection_budget: AtomicU32,
+    /// What the counter above was created with, which is the ceiling every
+    /// refund is capped at.
+    ///
+    /// Stored rather than recomputed from `unanswered_packet_budget` on each
+    /// refund: the seed and the cap are one number and must not be two
+    /// expressions that can drift apart.
+    unanswered_connection_total: u32,
     /// How many sessions this connection has lost to that total, and when that
     /// is worth saying out loud again.
     ///
@@ -445,6 +485,15 @@ impl Context {
         tunnels: Arc<AtomicU64>,
         authenticated: AuthGate,
     ) -> Self {
+        // The connection's whole unanswered allowance, computed once: the
+        // counter below is seeded with it and `refund_unanswered` caps every
+        // repayment at it, and two spellings of one number are two things that
+        // have to agree.
+        let total = config
+            .security
+            .unanswered_packet_budget
+            .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER);
+
         Self {
             remote: quic.remote_address(),
             auth_failures: Mutex::new(AuthFailures::default()),
@@ -462,12 +511,8 @@ impl Context {
             resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,
             unanswered_packet_budget: config.security.unanswered_packet_budget,
-            unanswered_connection_budget: AtomicU32::new(
-                config
-                    .security
-                    .unanswered_packet_budget
-                    .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER),
-            ),
+            unanswered_connection_total: total,
+            unanswered_connection_budget: AtomicU32::new(total),
             policy_refusals: crate::logfmt::Sampler::new(),
             limit_refusals: crate::logfmt::Sampler::new(),
             unanswered_closures: crate::logfmt::Sampler::new(),
@@ -485,8 +530,12 @@ impl Context {
     ///
     /// Charged only where the per-session budget is charged, so a session whose
     /// target has answered spends nothing here, and neither does a session whose
-    /// own budget is already spent: a muted session sends no packet, and this
-    /// counts packets that were sent.
+    /// own budget is already spent: a muted session attempts no packet, and
+    /// this counts packets a session attempted towards a target that had not
+    /// answered. Attempted rather than sent, deliberately: the charge is taken
+    /// before `sendto`, so a payload the socket refuses per packet (EMSGSIZE,
+    /// EPERM, EACCES, ENOBUFS) is counted without leaving the host. The
+    /// direction is the safe one for a counter that bounds reflection.
     ///
     /// `Relaxed` throughout: the counter is ordered against nothing but itself,
     /// and `fetch_update`'s compare-and-swap is what makes two sessions racing
@@ -522,9 +571,7 @@ impl Context {
             return;
         }
 
-        let total = self
-            .unanswered_packet_budget
-            .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER);
+        let total = self.unanswered_connection_total;
         let _ = self.unanswered_connection_budget.fetch_update(
             Ordering::Relaxed,
             Ordering::Relaxed,

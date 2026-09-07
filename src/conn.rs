@@ -585,7 +585,13 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
                 tunnel::tcp::run(authority, stream, &context).await;
             }
             None => {
-                // RFC 9114 §4.4: a CONNECT request must carry :authority.
+                // Unreachable: RFC 9114 §4.4 is enforced in the codec, which
+                // rejects "a CONNECT request without :authority" as malformed
+                // before `handle_request` is reached, and `Route::Tcp` is the
+                // same predicate the codec takes that branch on. Answered
+                // rather than asserted, for the reason `udp::run` gives its own
+                // unreachable arm: a panic would take the connection down over
+                // a request nobody can send.
                 debug!(stream_id, "CONNECT request without :authority");
                 tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
             }

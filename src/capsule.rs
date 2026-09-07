@@ -33,8 +33,18 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// Largest DATAGRAM capsule value accepted.
 ///
 /// A DATAGRAM capsule value is a Context ID varint followed by the payload
-/// (RFC 9297 §3.5). Beyond this the payload could not be a UDP datagram, so
-/// RFC 9298 §5 requires the stream to be aborted rather than the value buffered.
+/// (RFC 9297 §3.5), and beyond this the payload could not be a UDP datagram.
+///
+/// The refusal is this crate's own, not the RFC's. RFC 9298 §5 says: "An
+/// endpoint that receives an HTTP Datagram using Context ID zero whose UDP
+/// Proxying Payload field is longer than 65527 MUST abort the corresponding
+/// stream." That MUST is about Context ID zero, and the Context ID is the first
+/// varint *inside* the value, so it is not known yet: this bound is read off
+/// the declared capsule length, before any of the value. The payload check at
+/// `tunnel::udp::forward_to_target` is where §5's own rule is applied, on a
+/// payload whose Context ID has been read. Aborting here anyway is the memory
+/// bound below: learning the Context ID would mean buffering the whole value
+/// first, and a non-zero one names an extension this server has not negotiated.
 ///
 /// It is also this decoder's memory bound, and therefore one of the three
 /// buffers a CONNECT-UDP session holds
