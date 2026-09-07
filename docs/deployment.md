@@ -214,10 +214,13 @@ host needs:
 - **Older version installed**: it asks the release it is about to install
   whether it can load this host's `/etc/volto/config.toml` and stops if it
   cannot (see [before the swap](#before-the-swap)); otherwise it keeps the
-  current binary at `/usr/local/bin/volto.prev`, swaps in the new one, refreshes
-  the systemd unit and restarts. If the service is not running a few seconds
-  later, the previous binary is restored and restarted, and the script fails
-  loudly.
+  current binary at `/usr/local/bin/volto.prev` and the current unit at
+  `/etc/systemd/system/volto.service.prev`, swaps in the new one, refreshes the
+  systemd unit and restarts. If the service is not running a few seconds later,
+  both are restored, systemd is reloaded, the service is restarted, and the
+  script fails loudly. The unit is covered because it is refreshed on every
+  update and carries the hardening directives an older host is most likely to
+  reject.
 - **Already on that version**, with the config and the unit in place: it exits
   without touching anything. The presence checks are part of the deal —
   deleting `/etc/volto/config.toml` and re-running is the supported way to
@@ -313,8 +316,8 @@ release is new enough to be asked.
 
 The script's own guardrail does not help here, and reads backwards if you are
 not expecting it: when the newly installed binary is not running a few seconds
-later, the previous one is restored — which on a rollback is the release you
-were trying to leave.
+later, the previous binary and the previous unit are both restored — which on a
+rollback is the release you were trying to leave.
 
 **`--tag` is not a pin.** The script carries no version pin of its own; it
 converges on whatever the newest *published* release is, in either direction. So

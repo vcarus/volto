@@ -358,6 +358,16 @@ else
             install -m 0755 "$BIN" "$BIN.prev"
             note "previous binary kept at $BIN.prev"
         fi
+        # The unit is refreshed on every update and carries the version-dependent
+        # hardening directives (ProtectProc, RestrictAddressFamilies,
+        # SystemCallFilter, LimitNOFILE), which makes it the half most likely to
+        # be what stops an older host from coming up. Keep it beside the binary,
+        # or the rollback below puts the old binary under the new unit and
+        # reports a rollback that did not happen.
+        if [ -f "$UNIT" ]; then
+            install -m 0644 "$UNIT" "$UNIT.prev"
+            note "previous unit kept at $UNIT.prev"
+        fi
         install -m 0755 "$SRC/volto" "$BIN"
         install -m 0644 "$SRC/script/masque.service" "$UNIT"
         systemctl daemon-reload
@@ -370,8 +380,17 @@ else
             note "volto $VERSION is running"
         elif [ -x "$BIN.prev" ]; then
             install -m 0755 "$BIN.prev" "$BIN"
+            RESTORED="binary"
+            if [ -f "$UNIT.prev" ]; then
+                install -m 0644 "$UNIT.prev" "$UNIT"
+                RESTORED="binary and unit"
+            fi
+            # daemon-reload before the restart, not after: without it systemd
+            # starts the service from the unit it has already parsed, which is
+            # the one being rolled back.
+            systemctl daemon-reload || true
             systemctl restart "$SERVICE_NAME" || true
-            die "volto $VERSION failed to start; rolled back to ${INSTALLED:-the previous binary} -- see: journalctl -u $SERVICE_NAME -e"
+            die "volto $VERSION failed to start; rolled the $RESTORED back to ${INSTALLED:-the previous release} -- see: journalctl -u $SERVICE_NAME -e"
         else
             die "volto $VERSION failed to start and there is no previous binary to roll back to -- see: journalctl -u $SERVICE_NAME -e"
         fi
