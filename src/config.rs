@@ -1356,7 +1356,12 @@ fn line_and_column(text: &str, offset: usize) -> Option<(usize, usize)> {
     let before = text.get(..offset)?;
 
     let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    let column = before
+        .rsplit_once('\n')
+        .map_or(before, |(_, tail)| tail)
+        .chars()
+        .count()
+        + 1;
 
     Some((line, column))
 }
@@ -1581,19 +1586,34 @@ pub(crate) mod tests {
         .expect("parses")
     }
 
+    /// Asserts that `body` is refused by [`Config::validate`], that the refusal
+    /// names `key`, and returns the whole message.
+    ///
+    /// About twenty tests here are the same four lines: build a body, expect the
+    /// error, render it, assert it names the key. The key stays a literal at the
+    /// call site so nothing becomes less greppable, and a test that checks a
+    /// second phrase checks it against the returned string.
+    fn rejected(body: &str, key: &str) -> String {
+        let message = parse(body)
+            .validate()
+            .expect_err("must be rejected")
+            .to_string();
+        assert!(message.contains(key), "{key} must be named: {message}");
+        message
+    }
+
     /// Asserts that everything about `cfg` is valid *except* its certificate paths,
     /// which `parse` deliberately points at files that do not exist.
     ///
     /// The certificate check is the last thing `validate` does, so any other
     /// complaint surfaces first and fails this.
     fn assert_valid_apart_from_certs(cfg: &Config, context: &str) {
-        if let Err(error) = cfg.validate() {
-            let msg = error.to_string();
-            assert!(
-                msg.contains("server.cert") || msg.contains("server.key"),
-                "{context} should be valid, but: {msg}"
-            );
-        }
+        assert!(
+            valid_apart_from_certs(cfg),
+            "{context} should be valid, but: {}",
+            cfg.validate()
+                .expect_err("only a complaint can make the predicate false")
+        );
     }
 
     /// A file that removes itself however the test ends.
@@ -1941,23 +1961,19 @@ pub(crate) mod tests {
         ];
 
         for (body, expected) in cases {
-            let err = parse(body).validate().expect_err("must be rejected");
-            assert!(err.to_string().contains(expected), "{err}");
+            rejected(body, expected);
         }
 
         // The duplicate branch names both entries and echoes neither name, the
         // same rule the over-long branch beside it follows.
-        let duplicate = parse(
+        let duplicate = rejected(
             r#"[auth]
                users = [
                  { username = "greppable", password = "p" },
                  { username = "greppable", password = "q" },
                ]"#,
-        )
-        .validate()
-        .expect_err("must be rejected")
-        .to_string();
-        assert!(duplicate.contains("auth.users[0].username"), "{duplicate}");
+            "auth.users[0].username",
+        );
         assert!(duplicate.contains("auth.users[1].username"), "{duplicate}");
         assert!(
             !duplicate.contains("greppable"),
@@ -1982,17 +1998,12 @@ pub(crate) mod tests {
     #[test]
     fn an_over_long_username_is_rejected_without_echoing_it() {
         let username = "u".repeat(crate::logfmt::MAX_TOKEN + 1);
-        let err = parse(&format!(
-            "[auth]\nusers = [{{ username = \"{username}\", password = \"p\" }}]"
-        ))
-        .validate()
-        .expect_err("a user-id past the log bound must be rejected");
-        let rendered = err.to_string();
-
-        assert!(
-            rendered.contains("auth.users[0].username"),
-            "the operator has to be told which entry it is: {rendered}"
+        // The entry it is, which the operator has to be told.
+        let rendered = rejected(
+            &format!("[auth]\nusers = [{{ username = \"{username}\", password = \"p\" }}]"),
+            "auth.users[0].username",
         );
+
         assert!(
             rendered.contains(&crate::logfmt::MAX_TOKEN.to_string()),
             "the message has to name the limit: {rendered}"
@@ -2014,10 +2025,10 @@ pub(crate) mod tests {
     #[test]
     fn a_zero_or_oversized_target_quota_is_rejected() {
         for value in ["0", "70000"] {
-            let err = parse(&format!("[limits]\nmax_targets_per_conn = {value}"))
-                .validate()
-                .expect_err("must be rejected");
-            assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
+            rejected(
+                &format!("[limits]\nmax_targets_per_conn = {value}"),
+                "max_targets_per_conn",
+            );
         }
 
         // The ceiling is a sanity limit rather than a protocol one, so the value
@@ -2028,13 +2039,13 @@ pub(crate) mod tests {
         ));
         assert_valid_apart_from_certs(&cfg, "a quota of exactly the ceiling");
 
-        let err = parse(&format!(
-            "[limits]\nmax_targets_per_conn = {}",
-            MAX_TARGETS_PER_CONN_CEILING + 1
-        ))
-        .validate()
-        .expect_err("one target past the ceiling must be rejected");
-        assert!(err.to_string().contains("max_targets_per_conn"), "{err}");
+        rejected(
+            &format!(
+                "[limits]\nmax_targets_per_conn = {}",
+                MAX_TARGETS_PER_CONN_CEILING + 1
+            ),
+            "max_targets_per_conn",
+        );
     }
 
     /// Zero disables the connect budget rather than meaning "give up at once",
@@ -2081,13 +2092,10 @@ pub(crate) mod tests {
     fn a_keep_alive_at_or_above_half_the_idle_timeout_is_rejected() {
         // Exactly half, and above it.
         for (idle, keepalive) in [(40, 20), (60, 30), (60, 45), (10, 5)] {
-            let err = parse(&format!(
-                "[limits]\nmax_idle_timeout = {idle}\nkeep_alive_interval = {keepalive}"
-            ))
-            .validate()
-            .expect_err("must be rejected");
-            let msg = err.to_string();
-            assert!(msg.contains("keep_alive_interval"), "{msg}");
+            let msg = rejected(
+                &format!("[limits]\nmax_idle_timeout = {idle}\nkeep_alive_interval = {keepalive}"),
+                "keep_alive_interval",
+            );
             // The message has to say what to compare against, not just complain.
             assert!(msg.contains("max_idle_timeout"), "{msg}");
         }
@@ -2115,10 +2123,10 @@ pub(crate) mod tests {
     #[test]
     fn an_overflowing_keep_alive_interval_is_rejected_rather_than_panicking() {
         for keepalive in [u64::MAX, u64::MAX - 1, u64::MAX / 2 + 1, 1u64 << 63] {
-            let err = parse(&format!("[limits]\nkeep_alive_interval = {keepalive}"))
-                .validate()
-                .expect_err("an interval past half the idle timeout must be rejected");
-            assert!(err.to_string().contains("keep_alive_interval"), "{err}");
+            rejected(
+                &format!("[limits]\nkeep_alive_interval = {keepalive}"),
+                "keep_alive_interval",
+            );
         }
     }
 
@@ -2141,11 +2149,7 @@ pub(crate) mod tests {
     #[test]
     fn an_initial_mtu_below_the_quic_floor_is_rejected() {
         for value in [0, 1, 576, 1199] {
-            let err = parse(&format!("[limits]\ninitial_mtu = {value}"))
-                .validate()
-                .expect_err("must be rejected");
-            let msg = err.to_string();
-            assert!(msg.contains("initial_mtu"), "{msg}");
+            let msg = rejected(&format!("[limits]\ninitial_mtu = {value}"), "initial_mtu");
             assert!(msg.contains("1200"), "the floor must be named: {msg}");
         }
 
@@ -2171,11 +2175,7 @@ pub(crate) mod tests {
     #[test]
     fn an_initial_mtu_above_the_ethernet_ceiling_is_rejected() {
         for value in [MAX_INITIAL_MTU + 1, 1500, 9000, u16::MAX] {
-            let err = parse(&format!("[limits]\ninitial_mtu = {value}"))
-                .validate()
-                .expect_err("must be rejected");
-            let msg = err.to_string();
-            assert!(msg.contains("initial_mtu"), "{msg}");
+            let msg = rejected(&format!("[limits]\ninitial_mtu = {value}"), "initial_mtu");
             assert!(
                 msg.contains(&MAX_INITIAL_MTU.to_string()),
                 "the ceiling must be named: {msg}"
@@ -2189,11 +2189,10 @@ pub(crate) mod tests {
     /// destination to its start, which is a coherent (if pointless) request.
     #[test]
     fn an_mtu_upper_bound_below_the_initial_mtu_is_rejected() {
-        let err = parse("[limits]\ninitial_mtu = 1350\nmtu_upper_bound = 1300")
-            .validate()
-            .expect_err("must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("mtu_upper_bound"), "{msg}");
+        let msg = rejected(
+            "[limits]\ninitial_mtu = 1350\nmtu_upper_bound = 1300",
+            "mtu_upper_bound",
+        );
         assert!(msg.contains("initial_mtu"), "{msg}");
 
         for body in [
@@ -2214,11 +2213,10 @@ pub(crate) mod tests {
     #[test]
     fn an_mtu_upper_bound_above_the_ipv4_ethernet_ceiling_is_rejected() {
         for value in [MAX_MTU_UPPER_BOUND + 1, 1500, 9000, u16::MAX] {
-            let err = parse(&format!("[limits]\nmtu_upper_bound = {value}"))
-                .validate()
-                .expect_err("must be rejected");
-            let msg = err.to_string();
-            assert!(msg.contains("mtu_upper_bound"), "{msg}");
+            let msg = rejected(
+                &format!("[limits]\nmtu_upper_bound = {value}"),
+                "mtu_upper_bound",
+            );
             assert!(
                 msg.contains(&MAX_MTU_UPPER_BOUND.to_string()),
                 "the ceiling must be named: {msg}"
@@ -2252,11 +2250,10 @@ pub(crate) mod tests {
     #[test]
     fn an_initial_rtt_outside_the_sane_range_is_rejected() {
         for value in [0, 9, 10_001] {
-            let err = parse(&format!("[limits]\ninitial_rtt_ms = {value}"))
-                .validate()
-                .expect_err("must be rejected");
-            let msg = err.to_string();
-            assert!(msg.contains("initial_rtt_ms"), "{msg}");
+            rejected(
+                &format!("[limits]\ninitial_rtt_ms = {value}"),
+                "initial_rtt_ms",
+            );
         }
 
         // Both ends of the range, the default, and a tuned long-haul value.
@@ -2273,8 +2270,7 @@ pub(crate) mod tests {
             ("[limits]\nmax_idle_timeout = 0", "max_idle_timeout"),
             ("[limits]\nmax_idle_timeout = 4000", "max_idle_timeout"),
         ] {
-            let err = parse(body).validate().expect_err("must be rejected");
-            assert!(err.to_string().contains(field), "{err}");
+            rejected(body, field);
         }
 
         // The ceiling is a legal idle timeout, and the default keep-alive stays
@@ -2284,13 +2280,13 @@ pub(crate) mod tests {
         ));
         assert_valid_apart_from_certs(&cfg, "an idle timeout of exactly the ceiling");
 
-        let err = parse(&format!(
-            "[limits]\nmax_idle_timeout = {}",
-            MAX_IDLE_TIMEOUT_CEILING + 1
-        ))
-        .validate()
-        .expect_err("one second past the ceiling must be rejected");
-        assert!(err.to_string().contains("max_idle_timeout"), "{err}");
+        rejected(
+            &format!(
+                "[limits]\nmax_idle_timeout = {}",
+                MAX_IDLE_TIMEOUT_CEILING + 1
+            ),
+            "max_idle_timeout",
+        );
     }
 
     /// The stream credit is work per handshake, so it has a ceiling (D86).
@@ -2305,10 +2301,10 @@ pub(crate) mod tests {
     #[test]
     fn a_stream_limit_past_the_ceiling_is_rejected() {
         for streams in [u32::MAX, MAX_STREAMS_BIDI_CEILING + 1] {
-            let err = parse(&format!("[limits]\nmax_streams_bidi = {streams}"))
-                .validate()
-                .expect_err("a stream limit past the ceiling must be rejected");
-            assert!(err.to_string().contains("max_streams_bidi"), "{err}");
+            rejected(
+                &format!("[limits]\nmax_streams_bidi = {streams}"),
+                "max_streams_bidi",
+            );
         }
 
         let cfg = parse(&format!(
@@ -2343,8 +2339,7 @@ pub(crate) mod tests {
                 "udp_session_timeout",
             ),
         ] {
-            let err = parse(&body).validate().expect_err("must be rejected");
-            assert!(err.to_string().contains(field), "{err}");
+            rejected(&body, field);
         }
 
         // The ceiling itself is legal for both.
@@ -2541,12 +2536,9 @@ pub(crate) mod tests {
 
     #[test]
     fn port_zero_cannot_be_denied() {
-        let err = parse("[security]\ndenied_ports = [25, 0]")
-            .validate()
-            .expect_err("must be rejected");
-        assert!(
-            err.to_string().contains("security.denied_ports[1]"),
-            "{err}"
+        rejected(
+            "[security]\ndenied_ports = [25, 0]",
+            "security.denied_ports[1]",
         );
     }
 
@@ -2588,23 +2580,17 @@ pub(crate) mod tests {
             ("\"2001:db8::1\"", "contains"),
             ("\"::1\"", "contains"),
         ] {
-            let err = parse(&format!("[security]\nexpected_sni = [{entry}]"))
-                .validate()
-                .expect_err("must be rejected");
-            let message = err.to_string();
-            assert!(
-                message.contains("security.expected_sni[0]") && message.contains(wanted),
-                "{entry}: {message}"
+            let message = rejected(
+                &format!("[security]\nexpected_sni = [{entry}]"),
+                "security.expected_sni[0]",
             );
+            assert!(message.contains(wanted), "{entry}: {message}");
         }
 
         let long = "a".repeat(MAX_EXPECTED_SNI + 1);
-        let err = parse(&format!("[security]\nexpected_sni = [\"{long}\"]"))
-            .validate()
-            .expect_err("must be rejected");
-        assert!(
-            err.to_string().contains("security.expected_sni[0]"),
-            "{err}"
+        rejected(
+            &format!("[security]\nexpected_sni = [\"{long}\"]"),
+            "security.expected_sni[0]",
         );
     }
 
@@ -2624,10 +2610,10 @@ pub(crate) mod tests {
         assert_valid_apart_from_certs(&cfg, "a name of exactly the maximum length");
 
         let over = "a".repeat(MAX_EXPECTED_SNI + 1);
-        let err = parse(&format!("[security]\nexpected_sni = [\"{over}\"]"))
-            .validate()
-            .expect_err("one byte past the maximum must be refused");
-        let message = err.to_string();
+        let message = rejected(
+            &format!("[security]\nexpected_sni = [\"{over}\"]"),
+            "security.expected_sni[0]",
+        );
         assert!(
             message.contains(&format!("is {} bytes", MAX_EXPECTED_SNI + 1)),
             "the refusal must print the length it was given: {message}"
@@ -3405,11 +3391,10 @@ pub(crate) mod tests {
         let cfg = parse(&format!("alpn = [\"{}\"]", "h".repeat(255)));
         assert_valid_apart_from_certs(&cfg, "an ALPN identifier of exactly 255 bytes");
 
-        let err = parse(&format!("alpn = [\"{}\"]", "h".repeat(256)))
-            .validate()
-            .expect_err("an identifier past the length prefix must be rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("server.alpn[0]"), "{msg}");
+        let msg = rejected(
+            &format!("alpn = [\"{}\"]", "h".repeat(256)),
+            "server.alpn[0]",
+        );
         assert!(msg.contains("255"), "the limit must be named: {msg}");
     }
 

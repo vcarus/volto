@@ -298,7 +298,8 @@ pub fn addresses(list: &[std::net::SocketAddr]) -> impl fmt::Display + '_ {
             }
             write!(f, "{address}")?;
         }
-        if let Some(rest) = list.len().checked_sub(MAX_ADDRESSES).filter(|n| *n > 0) {
+        let rest = list.len().saturating_sub(MAX_ADDRESSES);
+        if rest > 0 {
             write!(f, ", and {rest} more")?;
         }
         f.write_str("]")
