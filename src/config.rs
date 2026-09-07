@@ -309,6 +309,19 @@ pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
 /// reply (QUIC retransmits, some game protocols) must not break.
 pub const DEFAULT_UNANSWERED_PACKET_BUDGET: u32 = 64;
 
+/// The password `script/config.example.toml` ships, which no running server may
+/// keep.
+///
+/// The example is what `script/install-selfsigned.sh` copies into place and what
+/// the manual install in `docs/deployment.md` starts from, and the ACME section
+/// of that page leaves the certificate at the paths the example already names.
+/// So an unedited copy is a configuration a server starts on, and this password
+/// is published in the repository. [`Config::warnings`] reports it, the
+/// installer refuses to install a file that still carries it, and
+/// `config::tests::the_shipped_example_configuration_is_valid` pins that this is
+/// the string the example holds, so the two cannot drift apart.
+pub const EXAMPLE_PLACEHOLDER_PASSWORD: &str = "replace-me-with-something-long";
+
 /// The complete server configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -987,6 +1000,30 @@ impl Config {
                  anyone who can reach the port can use it. Add users before exposing it."
                     .to_owned(),
             );
+        }
+
+        // The sibling of the warning above, for a table that is not empty and
+        // admits everybody anyway. The example is meant to be edited and is
+        // startable unedited, so this is the one mistake that leaves a server
+        // authenticating against a secret published in the repository. The
+        // entries are named by index and the password is not printed, for the
+        // reason `parse_error` gives: nothing out of `[auth]` goes to stderr.
+        let placeholders: Vec<String> = self
+            .auth
+            .users
+            .iter()
+            .enumerate()
+            .filter(|(_, user)| user.password == EXAMPLE_PLACEHOLDER_PASSWORD)
+            .map(|(i, _)| format!("auth.users[{i}]"))
+            .collect();
+        if !placeholders.is_empty() {
+            warnings.push(format!(
+                "{} still carries the placeholder password shipped in \
+                 script/config.example.toml, which is published with the source: anyone who \
+                 can reach the port can authenticate. Replace it with a long random secret \
+                 and reload.",
+                placeholders.join(", ")
+            ));
         }
 
         // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
@@ -2581,6 +2618,59 @@ pub(crate) mod tests {
         );
     }
 
+    /// The example's password is startable, published, and warned about.
+    ///
+    /// The install paths copy `script/config.example.toml` into place and the
+    /// ACME instructions leave the certificate where it already points, so an
+    /// operator who follows them and stops before the edit has a running server
+    /// that anybody can authenticate against. The warning is what tells them.
+    #[test]
+    fn the_example_placeholder_password_warns() {
+        let warnings = parse(&format!(
+            r#"
+            [auth]
+            users = [
+                {{ username = "u", password = "a long secret nobody published" }},
+                {{ username = "v", password = "{EXAMPLE_PLACEHOLDER_PASSWORD}" }},
+            ]
+            "#
+        ))
+        .warnings();
+
+        let found = warnings
+            .iter()
+            .find(|w| w.contains("placeholder password"))
+            .unwrap_or_else(|| panic!("no placeholder warning in {warnings:?}"));
+        assert!(
+            found.contains("auth.users[1]"),
+            "the warning names the entry that carries it: {found}"
+        );
+        assert!(
+            !found.contains("auth.users[0]"),
+            "and only that one: {found}"
+        );
+        assert!(
+            !found.contains(EXAMPLE_PLACEHOLDER_PASSWORD),
+            "a password is never echoed, not even this one: {found}"
+        );
+    }
+
+    /// The other half: a table with no placeholder in it draws nothing.
+    #[test]
+    fn a_replaced_password_draws_no_placeholder_warning() {
+        let warnings = parse(
+            r#"
+            [auth]
+            users = [{ username = "u", password = "a long secret nobody published" }]
+            "#,
+        )
+        .warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("placeholder password")),
+            "{warnings:?}"
+        );
+    }
+
     /// A certificate for `names`, written to a fresh directory; returns the
     /// paths a `[server]` section can point at.
     fn minted_certificate(names: &[&str]) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -2767,6 +2857,11 @@ pub(crate) mod tests {
         let cfg: Config = toml::from_str(&text).expect("the example config must parse");
         assert_eq!(cfg.server.listen.port(), 443);
         assert_eq!(cfg.auth.users.len(), 1, "the example must show a user");
+        assert_eq!(
+            cfg.auth.users[0].password, EXAMPLE_PLACEHOLDER_PASSWORD,
+            "the example's password is the string `Config::warnings` looks for and the \
+             installer refuses; changing one without the other leaves both silent"
+        );
         assert_eq!(cfg.log.level, "info");
 
         // Everything except the certificate paths, which do not exist in a checkout,

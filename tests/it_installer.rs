@@ -31,7 +31,7 @@ use scripts::{
     plant_binary_without_the_flag, plant_placeholder_certificates, real_binary, repo_root,
     scratch_dir, stderr_of, stdout_of,
 };
-use volto::config::Config;
+use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
 /// A stand-in for the host filesystem the installer writes into, carrying the
 /// certificate and key the generated config names.
@@ -174,7 +174,7 @@ fn the_placeholder_password_never_survives() {
     let text = generated_config(&[]);
 
     assert!(
-        !text.contains("replace-me-with-something-long"),
+        !text.contains(EXAMPLE_PLACEHOLDER_PASSWORD),
         "the example placeholder password reached the generated config:\n{text}"
     );
 
