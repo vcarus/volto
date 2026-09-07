@@ -409,6 +409,75 @@ pub async fn announce_full_sized_headers(
     (send, recv)
 }
 
+/// A batch of announced streams being read at once, and the answers they draw.
+///
+/// What [`collect_refusals`] hands back. A struct rather than a pair, because a
+/// pair invites `let (_, mut answers) = ...`, which drops every sending half on
+/// the spot and takes the first of that function's two invariants with it.
+pub struct Refusals {
+    /// The sending halves, held for as long as this value lives.
+    ///
+    /// Reachable so a caller can reset one, or ask which code stopped it. A
+    /// caller that only reads answers still has to keep the whole value alive.
+    pub held: Vec<quinn::SendStream>,
+    /// One entry per stream the server answered, with the index of the stream
+    /// it came from, in the order the answers arrived.
+    pub answers: tokio::sync::mpsc::Receiver<(usize, Vec<u8>)>,
+}
+
+/// Reads every stream in `streams` to its end at once, collecting the answers.
+///
+/// The shape six tests of the connection-wide HEADERS budget (D77) share: a
+/// batch of request streams that have each announced a frame, all of them read
+/// at the same time, because which of them the server refuses is up to the order
+/// its tasks reach them in and only the count and the status are the subject.
+/// What is announced stays with the caller, since it differs (a full-sized
+/// HEADERS at five of the six sites, a PUSH_PROMISE header at the sixth), as
+/// does `capacity`, which each caller sizes to the batch it is judging.
+///
+/// # Two invariants, both of which turn a test green for the wrong reason
+///
+/// The sending halves must be held and not dropped. A dropped
+/// `quinn::SendStream` finishes the stream, which tells the server the frame it
+/// is holding will never be completed and gives that frame's share of the budget
+/// back, so a test that dropped them would be measuring a budget that empties
+/// itself. They are held in [`Refusals::held`] for as long as the returned value
+/// lives, which is why that value has to be bound and kept.
+///
+/// The collecting side sees the end of the answers only once every sender is
+/// dropped. This function clones one sender per reader and drops its own before
+/// returning, so `answers.recv()` yields `None` once the last reader has
+/// finished, and a caller that drains to the end terminates. A seventh copy that
+/// kept a sender alive would hang there instead.
+pub fn collect_refusals(
+    streams: Vec<(quinn::SendStream, quinn::RecvStream)>,
+    capacity: usize,
+) -> Refusals {
+    /// Enough for a response header block, and far less than any body.
+    ///
+    /// A refused request is answered with one HEADERS frame and its stream is
+    /// finished; a request the budget holds says nothing at all and its reader
+    /// parks here for the rest of the test.
+    const ANSWER_LIMIT: usize = 4096;
+
+    let (sender, answers) = tokio::sync::mpsc::channel(capacity);
+    let mut held = Vec::with_capacity(streams.len());
+
+    for (index, (send, mut recv)) in streams.into_iter().enumerate() {
+        held.push(send);
+
+        let sender = sender.clone();
+        tokio::spawn(async move {
+            if let Ok(response) = recv.read_to_end(ANSWER_LIMIT).await {
+                let _ = sender.send((index, response)).await;
+            }
+        });
+    }
+    drop(sender);
+
+    Refusals { held, answers }
+}
+
 /// Reads one HTTP/3 frame from a raw stream: type, length, payload.
 pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
     let frame_type = read_varint(recv).await;

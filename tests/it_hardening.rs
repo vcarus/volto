@@ -17,7 +17,8 @@ use bytes::BytesMut;
 use common::rawstream::{
     DENIED_TARGET, FRAME_HEADERS, H3_EXCESSIVE_LOAD, H3_REQUEST_CANCELLED,
     H3_STREAM_CREATION_ERROR, announce_full_sized_headers, assert_closed_with, authenticate,
-    connect_headers_frame, read_frame, status_of, status_of_response, stopped_code,
+    collect_refusals, connect_headers_frame, read_frame, status_of, status_of_response,
+    stopped_code,
 };
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, auth_section, authorized_connect,
@@ -948,25 +949,16 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     // not rely on. Which of them is refused is up to the order the server's
     // tasks reach them in, so all of them are read at once and only the count is
     // asserted.
-    let (refusals, mut refused) = tokio::sync::mpsc::channel(streams_past_the_budget());
+    let mut streams = Vec::new();
     for _ in 0..streams_past_the_budget() {
-        let (send, mut recv) =
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
-        let refusals = refusals.clone();
-        tokio::spawn(async move {
-            // The sending half is parked here rather than dropped: dropping it
-            // finishes the stream, which would tell the server the frame it is
-            // holding will never be completed.
-            let _send = send;
-            if let Ok(response) = recv.read_to_end(4096).await {
-                let _ = refusals.send(response).await;
-            }
-        });
+        streams.push(
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
+        );
     }
-    drop(refusals);
+    let mut batch = collect_refusals(streams, streams_past_the_budget());
 
     for _ in FULL_SIZED_FRAMES_THAT_FIT..streams_past_the_budget() {
-        let response = tokio::time::timeout(TIMEOUT, refused.recv())
+        let (_, response) = tokio::time::timeout(TIMEOUT, batch.answers.recv())
             .await
             .expect("a stream past the buffering budget must be refused")
             .expect("the refusals arrive on live streams");
@@ -978,7 +970,7 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     }
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), refused.recv())
+        tokio::time::timeout(Duration::from_millis(200), batch.answers.recv())
             .await
             .is_err(),
         "only the streams the budget could not hold may be refused"
@@ -1105,28 +1097,17 @@ async fn a_request_past_the_buffering_budget_costs_only_that_request() {
     // exactly one charge has to fail -- whichever stream the server reaches
     // last, which is why the refusal is looked for rather than expected on a
     // particular one.
-    let mut sends = Vec::new();
-    let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
-    for index in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    let mut announced_streams = Vec::new();
+    for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
+        let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
         send.write_all(&frame[..announced])
             .await
             .expect("announce a full-sized request");
-        sends.push(send);
-
-        let refusals = refusals.clone();
-        tokio::spawn(async move {
-            // A refused request is answered and its stream finished; one the
-            // budget holds says nothing at all, and this parks for the rest of
-            // the test.
-            if let Ok(response) = recv.read_to_end(4096).await {
-                let _ = refusals.send((index, response)).await;
-            }
-        });
+        announced_streams.push((send, recv));
     }
-    drop(refusals);
+    let mut batch = collect_refusals(announced_streams, FULL_SIZED_FRAMES_THAT_FIT + 1);
 
-    let (index, response) = tokio::time::timeout(TIMEOUT, refused.recv())
+    let (index, response) = tokio::time::timeout(TIMEOUT, batch.answers.recv())
         .await
         .expect("one of seventeen full-sized requests must be refused")
         .expect("the refusal arrives on a live stream");
@@ -1136,13 +1117,13 @@ async fn a_request_past_the_buffering_budget_costs_only_that_request() {
         "the request the budget could not hold is refused as a request"
     );
     assert_eq!(
-        stopped_code(&mut sends[index]).await,
+        stopped_code(&mut batch.held[index]).await,
         H3_EXCESSIVE_LOAD,
         "the peer must be told which rule the request it lost broke"
     );
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), refused.recv())
+        tokio::time::timeout(Duration::from_millis(200), batch.answers.recv())
             .await
             .is_err(),
         "only the one request the budget could not hold may be refused"

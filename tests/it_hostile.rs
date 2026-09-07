@@ -94,8 +94,9 @@ use common::rawstream::{
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
     STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
     announce_full_sized_headers, application_close, assert_closed_with, authenticate,
-    authenticated_connect_headers_frame, connect_headers_frame, frame, grease_type, headers_frame,
-    open_uni_stream, read_frame, status_of, status_of_response, still_serving, varint_frame,
+    authenticated_connect_headers_frame, collect_refusals, connect_headers_frame, frame,
+    grease_type, headers_frame, open_uni_stream, read_frame, status_of, status_of_response,
+    still_serving, varint_frame,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
@@ -633,22 +634,14 @@ async fn a_frame_refused_for_its_type_is_never_charged_for() {
     datagram::put_varint(&mut announcement, FRAME_PUSH_PROMISE);
     datagram::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
 
-    let (answers, mut answered) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
-    let mut held = Vec::new();
-    for (mut send, mut recv) in streams {
+    let mut announced = Vec::new();
+    for (mut send, recv) in streams {
         // A write that fails is the connection already ended, which is the
         // answer this test is waiting for.
         let _ = send.write_all(&announcement).await;
-        held.push(send);
-
-        let answers = answers.clone();
-        tokio::spawn(async move {
-            if let Ok(response) = recv.read_to_end(4096).await {
-                let _ = answers.send(response).await;
-            }
-        });
+        announced.push((send, recv));
     }
-    drop(answers);
+    let mut batch = collect_refusals(announced, FULL_SIZED_FRAMES_THAT_FIT + 1);
 
     let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
     assert_eq!(
@@ -656,7 +649,7 @@ async fn a_frame_refused_for_its_type_is_never_charged_for() {
         "a PUSH_PROMISE on a request stream; the reason was {reason:?}"
     );
 
-    while let Some(response) = answered.recv().await {
+    while let Some((_, response)) = batch.answers.recv().await {
         assert!(
             response.is_empty(),
             "a frame refused for its type must not be charged for: one announcement was \
@@ -778,26 +771,17 @@ async fn the_control_stream_does_not_share_the_request_buffering_budget() {
 
     authenticate(&connection, None).await;
 
-    let mut held = Vec::new();
-    let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
+    let mut streams = Vec::new();
     for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-        let (send, mut recv) =
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
-        // Parked rather than dropped: dropping the sending half finishes the
-        // stream, which would tell the server the frame will never be completed
-        // and give its share of the budget back.
-        held.push(send);
-
-        let refusals = refusals.clone();
-        tokio::spawn(async move {
-            if let Ok(response) = recv.read_to_end(4096).await {
-                let _ = refusals.send(response).await;
-            }
-        });
+        streams.push(
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
+        );
     }
-    drop(refusals);
+    // The batch holds the sending halves for the rest of the test, which is what
+    // keeps the budget full while the control stream is judged.
+    let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT + 1);
 
-    let response = tokio::time::timeout(TIMEOUT, refused.recv())
+    let (_, response) = tokio::time::timeout(TIMEOUT, batch.answers.recv())
         .await
         .expect("one request past the budget must be refused")
         .expect("the refusal arrives on a live stream");
@@ -956,23 +940,15 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
     authenticate(&connection, None).await;
 
     for _ in 0..ROUNDS {
-        let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT + 1);
-        let mut senders = Vec::new();
+        let mut streams = Vec::new();
         for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-            let (send, mut recv) =
-                announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
-            senders.push(send);
-
-            let refusals = refusals.clone();
-            tokio::spawn(async move {
-                if let Ok(response) = recv.read_to_end(4096).await {
-                    let _ = refusals.send(response).await;
-                }
-            });
+            streams.push(
+                announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
+            );
         }
-        drop(refusals);
+        let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT + 1);
 
-        let response = tokio::time::timeout(TIMEOUT, refused.recv())
+        let (_, response) = tokio::time::timeout(TIMEOUT, batch.answers.recv())
             .await
             .expect("one announcement past the budget must be refused")
             .expect("the refusal arrives on a live stream");
@@ -982,7 +958,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
             "the budget is full, so every other announcement of this round is charged"
         );
 
-        for mut send in senders {
+        for mut send in batch.held {
             let _ = send.reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32));
         }
     }
@@ -991,23 +967,17 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
 
     // Exactly the budget, announced all at once: not one of these may be
     // refused, and a leaked charge is what would refuse one.
-    let mut held = Vec::new();
-    let (refusals, mut refused) = tokio::sync::mpsc::channel(FULL_SIZED_FRAMES_THAT_FIT);
+    let mut streams = Vec::new();
     for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
-        let (send, mut recv) =
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await;
-        held.push(send);
-
-        let refusals = refusals.clone();
-        tokio::spawn(async move {
-            if let Ok(response) = recv.read_to_end(4096).await {
-                let _ = refusals.send(response).await;
-            }
-        });
+        streams.push(
+            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
+        );
     }
-    drop(refusals);
+    let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT);
 
-    if let Ok(Some(response)) = tokio::time::timeout(Duration::from_secs(1), refused.recv()).await {
+    if let Ok(Some((_, response))) =
+        tokio::time::timeout(Duration::from_secs(1), batch.answers.recv()).await
+    {
         panic!(
             "the budget did not survive the storm: a full-sized request was answered {}",
             status_of_response(&response)
