@@ -139,10 +139,36 @@ pub fn stderr_of(output: &Output) -> String {
 /// rather than trusted, so a run that crashed before its cleanup cannot leave a
 /// file behind that makes the next one pass. The directory itself is not
 /// created: some callers want it empty and some want a tree inside it.
+///
+/// That clearing is why no caller deletes its tree on the way out. A trailing
+/// `remove_dir_all` is skipped exactly when a test panics, which is the one run
+/// whose leftovers anybody wants to open, and it buys nothing on a green run
+/// that this does not already buy on the next one. A `Drop` guard would run on
+/// the panic and take that evidence away, which is why there is not one.
 pub fn scratch_dir(tag: &str, name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("volto-{tag}-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir
+}
+
+/// [`scratch_dir`] with `dirs` created inside it, all of them.
+///
+/// The three binaries that drive a shipped script each stand a directory tree up
+/// for it: a stand-in `/etc/volto` for `it_cli`, the four directories a Linux
+/// host already has for `it_deploy`, one configuration directory for
+/// `it_installer`. Which directories differ, and so does whether a certificate
+/// pair is planted afterwards, which each caller still does itself; creating
+/// them is the shared half.
+///
+/// An empty `dirs` creates the scratch directory and nothing under it, which
+/// [`scratch_dir`] on its own deliberately does not do.
+pub fn scratch_tree(tag: &str, name: &str, dirs: &[&str]) -> PathBuf {
+    let root = scratch_dir(tag, name);
+    fs::create_dir_all(&root).expect("the temporary root must be creatable");
+    for dir in dirs {
+        fs::create_dir_all(root.join(dir)).expect("the temporary root must be creatable");
+    }
+    root
 }
 
 /// Writes the certificate pair a loadable configuration has to point at.

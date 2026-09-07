@@ -29,7 +29,7 @@ use std::process::Command;
 
 use scripts::{
     plant_binary_without_the_flag, plant_placeholder_certificates, real_binary, repo_root,
-    scratch_dir, stderr_of, stdout_of,
+    scratch_tree, stderr_of, stdout_of,
 };
 use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
@@ -40,10 +40,8 @@ use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 /// exactly the rule that makes `--check-config` unusable from a bare checkout and
 /// the reason this seam exists at all.
 fn install_root(name: &str) -> PathBuf {
-    let root = scratch_dir("install", name);
-    let conf_dir = root.join("etc/volto");
-    fs::create_dir_all(&conf_dir).expect("the temporary install root must be creatable");
-    plant_placeholder_certificates(&conf_dir);
+    let root = scratch_tree("install", name, &["etc/volto"]);
+    plant_placeholder_certificates(&root.join("etc/volto"));
     root
 }
 
@@ -300,8 +298,6 @@ fn the_generated_configuration_is_one_the_binary_can_load() {
         stdout.contains("loads on this volto"),
         "the run must say the config was checked: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The drift this closes: the generated config is the shipped example with four
@@ -343,8 +339,6 @@ fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
         !root.join("etc/volto/config.toml").exists(),
         "a refused run must not leave a config behind"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// A binary that is not there must be refused with the flag that gets you out of
@@ -375,8 +369,6 @@ fn a_missing_binary_is_refused_with_the_flag_that_points_at_another_one() {
         stderr.contains("--binary"),
         "and the flag that points it somewhere else: {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The branch that decides whether the check may exist at all: a binary from
@@ -411,8 +403,6 @@ fn a_binary_that_predates_the_flag_leaves_the_config_unchecked() {
         stdout.contains("predates --check-config"),
         "the run must say why the config went unchecked: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// Whether a user-id is short enough is volto's rule, not the installer's, and
@@ -489,7 +479,7 @@ fn the_script_documents_itself() {
         .expect("the script must run");
 
     assert!(output.status.success());
-    let usage = String::from_utf8_lossy(&output.stdout);
+    let usage = stdout_of(&output);
     for expected in [
         "--force",
         "--sni",

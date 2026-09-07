@@ -29,18 +29,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use scripts::{
-    loadable_config_text, plant_placeholder_certificates, scratch_dir, stderr_of, stdout_of,
+    loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree, stderr_of,
+    stdout_of,
 };
-
-/// The binary under test, built by cargo for this integration test.
-fn volto() -> &'static str {
-    env!("CARGO_BIN_EXE_volto")
-}
 
 /// A directory of this test's own, standing in for `/etc/volto`.
 fn config_dir(name: &str) -> PathBuf {
-    let dir = scratch_dir("cli", name);
-    fs::create_dir_all(&dir).expect("the temporary config directory must be creatable");
+    let dir = scratch_tree("cli", name, &[]);
     plant_placeholder_certificates(&dir);
     dir
 }
@@ -66,7 +61,7 @@ fn write_config(dir: &Path, listen: &str, body: &str) -> PathBuf {
 const SECRET: &str = "hunter2-TAILSECRET";
 
 fn run(args: &[&str]) -> Output {
-    Command::new(volto())
+    Command::new(real_binary())
         .args(args)
         .output()
         .expect("the volto binary must be runnable")
@@ -142,8 +137,6 @@ fn a_configuration_that_loads_is_reported_without_binding_anything() {
         ["cert.pem", "config.toml", "key.pem"],
         "the check must not write anything"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The rollback case, which is the reason the flag exists.
@@ -191,8 +184,6 @@ fn a_key_from_the_future_is_refused_with_its_position_and_no_secret() {
         !stderr.contains(SECRET) && !stdout_of(&output).contains(SECRET),
         "a configuration error must never echo a credential: {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The check has to be the same judgement the service makes, or it is worth
@@ -226,8 +217,6 @@ fn the_check_refuses_exactly_what_the_server_refuses_to_start_on() {
         stderr_of(&started),
         "and on the reason, word for word"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// Validation, not only parsing: a key this binary knows can still hold a value
@@ -245,8 +234,6 @@ fn a_value_out_of_range_is_refused_by_the_name_of_its_key() {
         stderr.contains("limits.max_streams_bidi"),
         "a range failure must name the key: {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A file that is not there is a failure of the same kind, not a panic.
@@ -263,8 +250,6 @@ fn a_missing_file_is_refused_by_name() {
         "{}",
         stderr_of(&output)
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A legal configuration that deserves a word still passes.
@@ -300,8 +285,6 @@ fn a_warning_is_reported_without_failing_the_check() {
         stderr.contains("authentication is DISABLED"),
         "an empty user list must still be said out loud: {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The support bundle prints what an issue needs and not what it must not carry.
@@ -371,8 +354,6 @@ fn the_support_bundle_names_the_version_and_redacts_the_password() {
             "the bundle must carry the {section} section: {stdout}"
         );
     }
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The two flags answer different questions, so a command line naming both is
@@ -401,8 +382,6 @@ fn the_two_reporting_flags_refuse_to_be_combined() {
         "and it has to name both flags, so the operator knows which to drop: \
          {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The distinction `script/deploy.sh` must never blur.
@@ -439,6 +418,4 @@ fn an_unknown_argument_fails_differently_from_an_unknown_key() {
         !stderr.contains("config file"),
         "which must not read like a configuration failure: {stderr}"
     );
-
-    let _ = fs::remove_dir_all(&dir);
 }

@@ -25,7 +25,7 @@ use std::process::{Command, Output, Stdio};
 
 use scripts::{
     loadable_config_text, plant_binary_without_the_flag, plant_placeholder_certificates,
-    real_binary, repo_root, scratch_dir, stderr_of, stdout_of,
+    real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
 };
 
 fn deploy_script() -> PathBuf {
@@ -88,16 +88,16 @@ fn run_deploy_piped(root: &Path, args: &[&str]) -> Output {
 /// A stand-in for a host's filesystem: the directories a Linux host already has,
 /// under a directory of this test's own.
 fn install_root(name: &str) -> PathBuf {
-    let root = scratch_dir("deploy", name);
-    for dir in [
-        "usr/local/bin",
-        "usr/local/sbin",
-        "etc/volto",
-        "etc/systemd/system",
-    ] {
-        fs::create_dir_all(root.join(dir)).expect("the temporary install root must be creatable");
-    }
-    root
+    scratch_tree(
+        "deploy",
+        name,
+        &[
+            "usr/local/bin",
+            "usr/local/sbin",
+            "etc/volto",
+            "etc/systemd/system",
+        ],
+    )
 }
 
 /// Plants an installed binary that answers `--version` like the real one.
@@ -223,8 +223,6 @@ fn an_intact_install_of_the_release_version_is_left_alone() {
         stdout_of(&output),
         "dry-run: already deployed and intact (v0.2.4)\n"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The regression the v0.2.1 fix was about: a deleted config must pull the run
@@ -242,8 +240,6 @@ fn a_missing_config_reinstalls_at_the_matching_version() {
         stdout_of(&output),
         "dry-run: would install v0.2.4 (missing: config)\n"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// A deleted unit, on the other hand, is the update path: the config is what
@@ -261,8 +257,6 @@ fn a_missing_unit_at_the_matching_version_is_an_update() {
         stdout_of(&output),
         "dry-run: would update 0.2.4 -> v0.2.4 (missing: unit)\n"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The everyday path of a timered host: a newer release exists.
@@ -280,8 +274,6 @@ fn an_older_installed_version_becomes_an_update() {
         stdout_of(&output),
         "dry-run: would update 0.2.3 -> v0.2.4\n"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// A downgrade is the incident path, and two of its hazards are invisible from
@@ -326,8 +318,6 @@ fn a_downgrade_says_what_bites_on_the_way_back() {
         stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
         "the decision must still be the last thing printed: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The everyday direction must stay quiet: an upgrade has neither hazard, and a
@@ -361,8 +351,6 @@ fn an_upgrade_and_a_reinstall_say_nothing_about_downgrades() {
             decision,
             "{name} must print only its decision"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 }
 
@@ -404,8 +392,6 @@ fn a_candidate_that_cannot_load_this_hosts_config_is_refused_before_anything_mov
         !stdout.contains("would update"),
         "the run must stop before the decision it would have acted on: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The other verdict: a configuration the candidate loads is not in the way, and
@@ -430,8 +416,6 @@ fn a_candidate_that_loads_the_config_lets_the_run_continue() {
         stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
         "the decision must still be the last thing printed: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The branch that decides whether any of this can be trusted: a candidate from
@@ -479,8 +463,6 @@ fn a_candidate_that_predates_the_flag_falls_back_to_the_advisory() {
         stdout.ends_with("dry-run: would update 0.5.1 -> v0.4.4\n"),
         "the decision must still be the last thing printed: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// There is nothing to check before a first install: the file the check would
@@ -497,8 +479,6 @@ fn there_is_nothing_to_check_before_a_first_install() {
         "dry-run: would install v0.4.4 (missing: config unit)\n",
         "a first install has no configuration to check"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// `refresh_self` keeps the copy the timer executes in step with the release,
@@ -556,8 +536,6 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
             .join("etc/systemd/system/volto-deploy.service")
             .exists()
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
 
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
@@ -582,6 +560,4 @@ fn a_piped_bootstrap_has_nothing_to_copy_and_says_so_by_succeeding() {
         stdout.ends_with("dry-run: would enable timer\n"),
         "the run must reach the timer decision: {stdout}"
     );
-
-    let _ = fs::remove_dir_all(&root);
 }
