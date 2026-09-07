@@ -712,6 +712,41 @@ async fn a_reload_cannot_move_the_listening_socket() {
         "the warning must name the address it was configured with at startup: {warning}"
     );
 
+    // The socket buffers are the same class and the same no-op, so they draw
+    // the same warning, one per direction the file moved. The configured number
+    // is what is compared, not the granted one: Linux reports back double what
+    // it granted, so a reload that changed nothing would otherwise warn twice on
+    // every host.
+    for (key, bound) in [
+        (
+            "limits.socket_recv_buffer",
+            volto::config::DEFAULT_SOCKET_RECV_BUFFER,
+        ),
+        (
+            "limits.socket_send_buffer",
+            volto::config::DEFAULT_SOCKET_SEND_BUFFER,
+        ),
+    ] {
+        let line = logs
+            .lines()
+            .find(|line| {
+                line.contains("a startup-only socket buffer changed") && line.contains(key)
+            })
+            .unwrap_or_else(|| panic!("{key} must be reported; log was:\n{logs}"));
+        assert!(
+            line.contains("WARN"),
+            "a key that silently did not apply is a warning, not an aside: {line}"
+        );
+        assert!(
+            line.contains("configured=1048576"),
+            "the warning must name the size the file asked for: {line}"
+        );
+        assert!(
+            line.contains(&format!("bound={bound}")),
+            "and the size the socket was bound with: {line}"
+        );
+    }
+
     // Still answering where it was bound, and the reloadable key from the same
     // file did take effect.
     let mut client = H3Client::connect(&server).await;

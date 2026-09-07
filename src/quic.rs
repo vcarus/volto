@@ -505,6 +505,9 @@ pub struct Server {
     /// What the kernel granted for the endpoint socket's buffers, for the
     /// startup line. Fixed at bind time: nothing reloadable can change it.
     socket_buffers: SocketBuffers,
+    /// The socket buffer sizes `[limits]` asked for at bind, for the one thing
+    /// a reload has to say about them; see [`RequestedBuffers`].
+    requested_buffers: RequestedBuffers,
     config: LiveConfig,
     /// The connections being served, in accept order, and what the accept loop
     /// decides `max_connections` against; see [`Roster`].
@@ -596,6 +599,10 @@ impl Server {
         Ok(Self {
             endpoint,
             socket_buffers,
+            requested_buffers: RequestedBuffers {
+                recv: config.limits.socket_recv_buffer,
+                send: config.limits.socket_send_buffer,
+            },
             listen: config.server.listen,
             config: Arc::new(RwLock::new(config)),
             roster: Roster::new(),
@@ -635,6 +642,7 @@ impl Server {
             shutdown: self.shutdown.clone(),
             expected: self.expected.clone(),
             swap: self.swap.clone(),
+            requested_buffers: self.requested_buffers,
             listen: self.listen,
         }
     }
@@ -1303,9 +1311,12 @@ pub struct ReloadHandle {
     /// The server's own, so a reload and the drain cannot interleave their
     /// writes; see [`ConfigSwap`].
     swap: ConfigSwap,
-    /// The `[server] listen` the endpoint was bound with, for the one key a
-    /// reload has to say it is ignoring.
+    /// The `[server] listen` the endpoint was bound with, for one of the three
+    /// keys a reload has to say it is ignoring.
     listen: SocketAddr,
+    /// The other two, which are startup-only for the same reason; see
+    /// [`RequestedBuffers`].
+    requested_buffers: RequestedBuffers,
 }
 
 impl ReloadHandle {
@@ -1394,6 +1405,36 @@ impl ReloadHandle {
 
         for warning in warnings {
             warn!(log_id = "bg9ux69o", "{warning}");
+        }
+
+        // The same no-op as `listen` above, for the same reason and with the
+        // same remedy: the sizes are asked of the socket when it is created and
+        // a reload does not rebind it, so a changed value applies nothing. The
+        // configured number is compared rather than the granted one, because
+        // Linux reports back double what it granted.
+        for (which, bound, configured) in [
+            (
+                SocketBuffer::Recv,
+                self.requested_buffers.recv,
+                config.limits.socket_recv_buffer,
+            ),
+            (
+                SocketBuffer::Send,
+                self.requested_buffers.send,
+                config.limits.socket_send_buffer,
+            ),
+        ] {
+            if configured != bound {
+                warn!(
+                    log_id = "om0np2q6",
+                    key = which.key(),
+                    bound,
+                    configured,
+                    "a startup-only socket buffer changed, but a reload cannot resize the \
+                     socket the endpoint is bound to; it keeps the size it started with. \
+                     Restart to apply it."
+                );
+            }
         }
 
         // Both halves of the product are reloadable, and `docs/deployment.md`
@@ -1493,6 +1534,24 @@ impl SocketBuffer {
             Self::Send => "net.core.wmem_max",
         }
     }
+}
+
+/// The socket buffer sizes `[limits]` asked for, as configured rather than as
+/// granted.
+///
+/// Kept from [`Server::bind`] to [`ReloadHandle`] for the same reason `listen`
+/// is: all three keys are applied to the socket when it is created, a reload
+/// never rebinds, and a reload carrying new values for them therefore applies
+/// nothing. The operator being told is the whole point, so the reload compares a
+/// reloaded file against these and warns per direction that differs. The granted
+/// sizes in [`SocketBuffers`] cannot serve here, because Linux reports back
+/// double what it granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestedBuffers {
+    /// `limits.socket_recv_buffer` as the file that bound the socket spelled it.
+    recv: usize,
+    /// `limits.socket_send_buffer`, likewise.
+    send: usize,
 }
 
 /// What the kernel reports the endpoint socket's buffers are, after being asked.

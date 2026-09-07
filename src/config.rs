@@ -527,7 +527,8 @@ pub struct Limits {
     /// Applied to the socket when it is created, which makes this a startup-only
     /// setting: a `SIGHUP` reload does not rebind the socket, so a change here
     /// needs a restart — the same class as [`Server::listen`], and unlike every
-    /// key above it.
+    /// key above it. A reload carrying a different value is accepted, applies
+    /// nothing, and says so, exactly as one carrying a different `listen` does.
     ///
     /// Two things the kernel does with the request are worth knowing before
     /// reading a log line about it. It is capped at a host ceiling —

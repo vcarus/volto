@@ -308,6 +308,17 @@ const ACCOUNTED: &[Accounted] = &[
                  with; a reload starts with SIGHUP.",
     },
     Accounted {
+        id: "om0np2q6",
+        file: "quic.rs",
+        message: "a startup-only socket buffer changed, but a reload cannot resize the \
+                  socket the endpoint is bound to; it keeps the size it started with. \
+                  Restart to apply it.",
+        bound: Bound::Lifecycle,
+        reason: "At most two per reload, one per direction, and only when the \
+                 operator's own file asks for a size the socket was not bound \
+                 with; a reload starts with SIGHUP.",
+    },
+    Accounted {
         id: "bg9ux69o",
         file: "quic.rs",
         message: "{warning}",
