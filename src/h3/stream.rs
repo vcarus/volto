@@ -999,9 +999,9 @@ impl Writer {
                 Err(quinn::StoppedError::ConnectionLost(error)) => {
                     StreamError::Connection(error.into())
                 }
-                // 0-RTT, which this server never accepts (`quic::Server`
-                // answers every `Incoming` with `accept`, never `retry` into a
-                // 0-RTT acceptance), so there is no rejection to report.
+                // 0-RTT, which this server never accepts (`tls::server_crypto`
+                // sets `max_early_data_size` to 0, with RFC 9001 §9.2 quoted
+                // beside it), so there is no rejection to report.
                 Err(other) => StreamError::Local(Violation::stream(
                     Code::H3_INTERNAL_ERROR,
                     other.to_string(),

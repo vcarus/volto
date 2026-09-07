@@ -338,9 +338,9 @@ impl From<Violation> for StreamError {
 ///   having already finished with the stream.
 /// * `IllegalOrderedRead`, on `ReadError`, cannot occur: this stack only ever
 ///   reads in order.
-/// * `ZeroRttRejected`, on both, is 0-RTT, which this server never accepts
-///   ([`crate::quic::Server`] answers every `Incoming` with `accept`, never
-///   `retry` into a 0-RTT acceptance), so there is no rejection to report.
+/// * `ZeroRttRejected`, on both, is 0-RTT, which this server never accepts:
+///   `tls::server_crypto` sets `max_early_data_size` to 0, with RFC 9001 §9.2
+///   quoted beside it, so there is no rejection to report.
 ///   [`super::stream::Writer::stopped`] says the same of its own arm.
 fn internal(error: &impl fmt::Display) -> StreamError {
     StreamError::Local(Violation::stream(
