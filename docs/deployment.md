@@ -316,7 +316,7 @@ release is new enough to be asked.
 
 The script's own guardrail does not help here, and reads backwards if you are
 not expecting it: when the newly installed binary is not running a few seconds
-later, the previous binary and the previous unit are both restored — which on a
+later, the previous binary and the previous unit are both restored, which on a
 rollback is the release you were trying to leave.
 
 **`--tag` is not a pin.** The script carries no version pin of its own; it
