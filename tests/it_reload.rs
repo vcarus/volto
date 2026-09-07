@@ -626,6 +626,43 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
     );
 }
 
+/// A reload that raises the tunnel quota past `RLIMIT_NOFILE` says so.
+///
+/// `warn_if_fd_budget_is_tight` ran at bind only, while both halves of the
+/// product it checks are reloadable and `docs/deployment.md` promises a reload
+/// applies a raised `limits.max_connections`. So the file that warned at startup
+/// was silent when the same numbers arrived by `SIGHUP`, which is the case D19
+/// wrote the check for: descriptor exhaustion is not a graceful failure mode,
+/// and an operator raising a quota during an incident is who meets it.
+///
+/// The numbers overshoot any host's limit by orders of magnitude, so the test
+/// does not depend on what `RLIMIT_NOFILE` happens to be here.
+#[tokio::test]
+async fn a_reload_that_outgrows_the_fd_budget_says_so() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+
+    server.rewrite_config("[limits]\nmax_connections = 4000000\nmax_targets_per_conn = 65536\n");
+    let (reloaded, logs) = reload_capturing_logs(&server);
+    reloaded.expect("raising a quota is a valid configuration, not a refusal");
+
+    let warning = logs
+        .lines()
+        .find(|line| line.contains("RLIMIT_NOFILE leaves no room"))
+        .unwrap_or_else(|| panic!("the fd budget must be re-checked; log was:\n{logs}"));
+    assert!(
+        warning.contains("WARN"),
+        "a quota the process cannot meet is a warning, not an aside: {warning}"
+    );
+    assert!(
+        warning.contains("max_connections=4000000"),
+        "the warning must name the quota that was asked for: {warning}"
+    );
+    assert!(
+        warning.contains("max_targets_per_conn=65536"),
+        "and the other half of the product: {warning}"
+    );
+}
+
 /// `[server] listen` and the socket buffers are startup keys: a reload carrying
 /// new values for them is accepted and moves nothing -- and says so.
 ///

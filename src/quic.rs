@@ -1396,6 +1396,12 @@ impl ReloadHandle {
             warn!(log_id = "bg9ux69o", "{warning}");
         }
 
+        // Both halves of the product are reloadable, and `docs/deployment.md`
+        // says a reload applies a raised `limits.max_connections`, so the check
+        // `Server::bind` runs belongs here too. An operator raising a quota
+        // during an incident is the case D19 wrote it for.
+        warn_if_fd_budget_is_tight(&config.limits);
+
         Ok(config)
     }
 }
