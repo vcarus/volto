@@ -221,8 +221,28 @@ async fn connect_udp_binds_a_socket_to_the_preferred_family() {
     );
 }
 
-/// A sanity check on the premise rather than on the proxy: if this fails, the
-/// two tests above are skipping for a reason that is no longer true.
+/// The premise of the two tests above, latched on the platform that has to
+/// hold it.
+///
+/// The two wire tests return early with an `eprintln!` when the host cannot
+/// host the experiment, and an `eprintln!` from a passing test is invisible
+/// under `cargo test` without `--nocapture`. They are the only wire-level
+/// coverage `ip_family_preference` has, so a premise that quietly stops holding
+/// everywhere would leave the knob shipping untested with every run still
+/// green. `it_scrub` answers the same shape with the canonical-repository latch
+/// in `no_tracked_file_contains_a_private_literal`; this is that latch.
+///
+/// It is a latch and not a proof of the preference: it fails when macOS, the
+/// platform CLAUDE.md requires to stay green, stops resolving `localhost` to
+/// both families, and says nothing about any other host. Linux CI images that
+/// ship one family are the reason it is not asserted everywhere.
+///
+/// The equality below is the weaker half and is kept for what it does check.
+/// `localhost_is_dual_stack` and the expression it is compared against are the
+/// same predicate — a `SocketAddr` is either V4 or V6, so "two distinct
+/// `is_ipv6` answers" and "one of each" cannot disagree over one list — but the
+/// two run over separate `lookup_host` calls, so what it catches is a resolver
+/// that answers differently twice in a row.
 #[tokio::test]
 async fn the_environment_probe_agrees_with_the_resolver() {
     let addresses: Vec<SocketAddr> = match tokio::net::lookup_host(("localhost", 443)).await {
@@ -233,6 +253,17 @@ async fn the_environment_probe_agrees_with_the_resolver() {
     assert_eq!(
         dual_stack,
         addresses.iter().any(SocketAddr::is_ipv4) && addresses.iter().any(SocketAddr::is_ipv6),
-        "the probe and the resolver must agree: {addresses:?}"
+        "two consecutive lookups of `localhost` disagreed about its address \
+         families: {addresses:?}"
+    );
+
+    #[cfg(target_os = "macos")]
+    assert!(
+        dual_stack,
+        "`localhost` no longer resolves to both address families on macOS, so \
+         `connect_dials_the_preferred_family_first` and \
+         `connect_udp_binds_a_socket_to_the_preferred_family` are now skipping \
+         silently on the platform that must stay green, and \
+         `ip_family_preference` has no wire coverage left anywhere: {addresses:?}"
     );
 }
