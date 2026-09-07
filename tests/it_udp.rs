@@ -503,7 +503,7 @@ async fn empty_payloads_are_forwarded() {
 /// capsules.
 #[tokio::test]
 async fn capsules_carry_payloads_when_datagrams_are_unavailable() {
-    use volto::capsule::{self, Capsule, CapsuleDecoder};
+    use volto::capsule::{self, CapsuleDecoder};
 
     let server = TestServer::start().await;
     let target = spawn_udp_echo_target().await;
@@ -527,12 +527,7 @@ async fn capsules_carry_payloads_when_datagrams_are_unavailable() {
     // The reply comes back as a capsule too, since datagrams are unavailable.
     let mut decoder = CapsuleDecoder::new();
     let payload = loop {
-        if let Some(Capsule::Datagram {
-            context_id,
-            payload,
-        }) = decoder.next_capsule().expect("well-formed capsules")
-        {
-            assert_eq!(context_id, 0);
+        if let Some(payload) = common::next_udp_payload(&mut decoder) {
             break payload;
         }
 

@@ -22,7 +22,7 @@ use common::{
     TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, finish_connect,
     send_udp_payload, spawn_udp_echo_target,
 };
-use volto::capsule::{Capsule, CapsuleDecoder};
+use volto::capsule::CapsuleDecoder;
 use volto::datagram;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
@@ -363,16 +363,8 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
     );
     let mut decoder = CapsuleDecoder::new();
     decoder.push(&Bytes::from(payload));
-    match decoder.next_capsule().expect("well-formed capsules") {
-        Some(Capsule::Datagram {
-            context_id,
-            payload,
-        }) => {
-            assert_eq!(context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
-            assert_eq!(&payload[..], b"before settings");
-        }
-        other => panic!("expected a DATAGRAM capsule, got {other:?}"),
-    }
+    let capsule = common::next_udp_payload(&mut decoder).expect("a whole DATAGRAM capsule");
+    assert_eq!(&capsule[..], b"before settings");
 
     // Only now does the peer say datagrams are allowed. The control stream is
     // kept open for the rest of the test: closing it is H3_CLOSED_CRITICAL_STREAM.
@@ -490,15 +482,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(&Bytes::from(payload));
-        match decoder.next_capsule().expect("well-formed capsules") {
-            Some(Capsule::Datagram {
-                context_id,
-                payload,
-            }) => {
-                assert_eq!(context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
-                assert_eq!(&payload[..], b"no frame size", "round {round}");
-            }
-            other => panic!("round {round}: expected a DATAGRAM capsule, got {other:?}"),
-        }
+        let capsule = common::next_udp_payload(&mut decoder).expect("a whole DATAGRAM capsule");
+        assert_eq!(&capsule[..], b"no frame size", "round {round}");
     }
 }

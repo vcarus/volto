@@ -17,7 +17,7 @@ use bytes::BytesMut;
 use common::rawstream::{H3_MESSAGE_ERROR, QPACK_DECOMPRESSION_FAILED, close_reason};
 use common::{
     ALLOW_PRIVATE, H3Client, TIMEOUT, TestServer, assert_peer_reset, auth_section, authorize,
-    basic_credentials, connect_request, echoes, respond_to, spawn_echo_target,
+    basic_credentials, echoes, respond_to, spawn_echo_target,
 };
 use volto::h3::frame;
 use volto::h3api::{Method, Request, Status};
@@ -52,7 +52,8 @@ async fn an_unimplemented_connect_protocol_is_answered_501() {
 
     // One request this server will not serve is not a reason to drop the rest:
     // the same connection must still open an ordinary tunnel.
-    let mut tunnel = open_tcp_tunnel_as_user(&mut client, &target.to_string()).await;
+    let mut tunnel =
+        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
     echoes(&mut tunnel, b"after 501").await;
 }
 
@@ -100,7 +101,8 @@ async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
     assert_peer_reset(&error, H3_MESSAGE_ERROR);
 
     // A malformed request is a stream error, so the connection carries on.
-    let mut tunnel = open_tcp_tunnel_as_user(&mut client, &target.to_string()).await;
+    let mut tunnel =
+        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
     echoes(&mut tunnel, b"after the malformed :protocol").await;
 }
 
@@ -158,21 +160,6 @@ fn connect_ip_request(proxy: &str) -> Request {
     request.protocol = Some("connect-ip".into());
     authorize_as_user(&mut request);
     request
-}
-
-/// `common::open_tcp_tunnel` for a server that requires credentials.
-async fn open_tcp_tunnel_as_user(client: &mut H3Client, authority: &str) -> common::ClientStream {
-    let mut request = connect_request(authority);
-    authorize_as_user(&mut request);
-
-    let (response, stream) = common::send_and_respond(client, request).await;
-    assert_eq!(
-        response.status,
-        Status::OK,
-        "the tunnel to {authority} was refused: proxy-status={:?}",
-        response.fields.get("proxy-status")
-    );
-    stream
 }
 
 /// Adds this suite's credentials to a request.

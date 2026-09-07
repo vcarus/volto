@@ -99,16 +99,7 @@ fn any_varint() -> impl Strategy<Value = u64> {
 
 /// Splits `bytes` at the offsets in `cuts`, clamped into range and deduplicated.
 fn split_at(bytes: &[u8], cuts: &[u16]) -> Vec<Vec<u8>> {
-    let mut offsets: Vec<usize> = cuts
-        .iter()
-        .map(|cut| usize::from(*cut) % (bytes.len() + 1))
-        .collect();
-    offsets.push(0);
-    offsets.push(bytes.len());
-    offsets.sort_unstable();
-    offsets.dedup();
-
-    offsets
+    props::cut_offsets(bytes.len(), cuts)
         .windows(2)
         .map(|pair| bytes[pair[0]..pair[1]].to_vec())
         .filter(|chunk| !chunk.is_empty())

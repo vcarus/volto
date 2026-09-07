@@ -58,6 +58,28 @@ pub fn payload(max: usize) -> impl Strategy<Value = Vec<u8>> {
     (0usize..=max, any::<u8>()).prop_map(|(length, seed)| pattern(length, seed))
 }
 
+/// The boundaries a run of `cuts` divides `len` bytes into, in order.
+///
+/// Each cut is folded into `0..=len`, both ends are added, and the result is
+/// sorted and deduplicated, so consecutive offsets are a chunking of the whole
+/// input with no empty piece between two equal cuts. Always at least `[0, len]`,
+/// or `[0]` for an empty input.
+///
+/// The slicing is left with the caller on purpose: `it_fuzz` copies out of a
+/// `&[u8]` into `Vec<u8>` and `it_props` takes `Bytes::slice` of a `Bytes`,
+/// which is a zero-copy view, and neither wants the other's.
+pub fn cut_offsets(len: usize, cuts: &[u16]) -> Vec<usize> {
+    let mut offsets: Vec<usize> = cuts
+        .iter()
+        .map(|cut| usize::from(*cut) % (len + 1))
+        .collect();
+    offsets.push(0);
+    offsets.push(len);
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
 /// Writes `value` as a varint of exactly `length` bytes (RFC 9000 §16).
 ///
 /// `length` must be able to hold `value`; the caller chooses it, which is the

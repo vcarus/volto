@@ -33,7 +33,7 @@ use common::{
     ClientStream, H3Client, TIMEOUT, TestServer, echoes, open_tcp_tunnel, open_udp_session,
     send_udp_payload, spawn_echo_target, spawn_flooding_udp_target, spawn_udp_echo_target,
 };
-use volto::capsule::{self, Capsule, CapsuleDecoder};
+use volto::capsule::{self, CapsuleDecoder};
 
 /// A per-stream receive window too small for a flooding target's replies, so
 /// the server is parked in its write to the client rather than racing it.
@@ -66,12 +66,7 @@ async fn capsule_reply_is(stream: &mut ClientStream, payload: &[u8]) {
 
     let found = tokio::time::timeout(TIMEOUT, async {
         loop {
-            while let Some(capsule) = decoder.next_capsule().expect("well-formed capsules") {
-                let Capsule::Datagram {
-                    context_id,
-                    payload: got,
-                } = capsule;
-                assert_eq!(context_id, 0, "a UDP payload travels under context 0");
+            while let Some(got) = common::next_udp_payload(&mut decoder) {
                 if got == payload {
                     return;
                 }

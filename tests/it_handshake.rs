@@ -21,7 +21,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -32,9 +31,9 @@ use common::rawstream::{
     still_serving,
 };
 use common::{
-    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, authorized_connect,
-    basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, finish_connect,
-    open_tcp_tunnel, send_and_respond, silent_peer, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
+    client_endpoint, client_endpoint_with_transport, echoes, finish_connect, open_tcp_tunnel,
+    open_tcp_tunnel_as, silent_peer, spawn_echo_target,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::NamedGroup;
@@ -43,7 +42,6 @@ use rustls::client::{
     Tls13ClientSessionValue,
 };
 use rustls::pki_types::{CertificateDer, ServerName};
-use volto::h3api::Status;
 
 /// APPLICATION_ERROR (RFC 9000 §20.1), the transport code a server sends when it
 /// closes for an application reason before the handshake has completed
@@ -206,7 +204,7 @@ async fn an_authenticated_connection_is_not_bounded() {
     let echo = spawn_echo_target().await;
 
     let mut client = H3Client::connect(&server).await;
-    let mut tunnel = authenticated_tunnel(&mut client, &echo.to_string()).await;
+    let mut tunnel = open_tcp_tunnel_as(&mut client, &echo.to_string(), USER.0, USER.1).await;
     echoes(&mut tunnel, b"payload").await;
 
     // Longer than the bound (two 3s idle timeouts), with not a byte of HTTP/3
@@ -214,7 +212,7 @@ async fn an_authenticated_connection_is_not_bounded() {
     tokio::time::sleep(Duration::from_millis(6_500)).await;
 
     // Still usable, which it would not be if the bound had applied.
-    let mut second = authenticated_tunnel(&mut client, &echo.to_string()).await;
+    let mut second = open_tcp_tunnel_as(&mut client, &echo.to_string(), USER.0, USER.1).await;
     echoes(&mut second, b"still here").await;
 }
 
@@ -1120,23 +1118,4 @@ async fn retry_counting_relay(server: SocketAddr) -> (SocketAddr, Arc<AtomicUsiz
 fn is_retry(datagram: &[u8]) -> bool {
     matches!(datagram.first(), Some(first) if first & 0xf0 == 0xf0)
         && matches!(datagram.get(1..5), Some([0x00, 0x00, 0x00, 0x01]))
-}
-
-/// Opens a CONNECT tunnel carrying credentials, and asserts it was accepted.
-#[track_caller]
-fn authenticated_tunnel<'a>(
-    client: &'a mut H3Client,
-    authority: &'a str,
-) -> impl Future<Output = common::ClientStream> + 'a {
-    let caller = Location::caller();
-    async move {
-        let request = authorized_connect(authority, USER.0, USER.1);
-        let (response, stream) = send_and_respond(client, request).await;
-        assert_eq!(
-            response.status,
-            Status::OK,
-            "the tunnel opened at {caller} was refused"
-        );
-        stream
-    }
 }

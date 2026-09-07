@@ -706,6 +706,38 @@ pub fn open_tcp_tunnel<'a>(
     }
 }
 
+/// [`open_tcp_tunnel`] against a server that requires credentials.
+///
+/// The same judgement, on a request built by [`authorized_connect`]: a server
+/// with `[auth]` users answers an anonymous CONNECT with a 407, so a test that
+/// wants a tunnel there has to present the pair it configured. Kept apart from
+/// [`open_tcp_tunnel`] rather than folded into it with an `Option`, because the
+/// tests that open a tunnel without credentials are about being let through
+/// without them.
+///
+/// Same shape as [`open_tcp_tunnel`], and for the same reason (D66).
+#[track_caller]
+pub fn open_tcp_tunnel_as<'a>(
+    client: &'a mut H3Client,
+    authority: &'a str,
+    username: &'a str,
+    password: &'a str,
+) -> impl Future<Output = ClientStream> + 'a {
+    let caller = Location::caller();
+    async move {
+        let request = authorized_connect(authority, username, password);
+        let (response, stream) = send_and_respond(client, request).await;
+        assert_eq!(
+            response.status,
+            Status::OK,
+            "the tunnel to {authority} opened at {caller} as {username} was refused: \
+             proxy-status={:?}",
+            proxy_status(&response)
+        );
+        stream
+    }
+}
+
 /// Opens a CONNECT-UDP session to `target` and returns its Quarter Stream ID.
 ///
 /// Same shape as [`open_tcp_tunnel`], and for the same reason.
@@ -864,6 +896,37 @@ async fn read_datagram(
         "a UDP payload must use context 0; read at {caller}"
     );
     decoded
+}
+
+/// The payload of the next DATAGRAM capsule `decoder` can produce, if it has
+/// one.
+///
+/// The capsule fallback's counterpart to [`recv_datagram`], and it checks the
+/// same thing for the same reason: RFC 9297 §2.1 carries an HTTP Datagram under
+/// a Context ID, and RFC 9298 §5 gives a UDP payload exactly one, so a capsule
+/// under any other context is not a packet from the target whatever else it may
+/// be. That assertion is a protocol requirement rather than scaffolding, which
+/// is the class D66 says travels up with the helper.
+///
+/// `None` means the decoder needs more bytes, not that the stream ended, so a
+/// caller reads more and asks again. The reading itself is deliberately left
+/// with the caller: the four tests reaching for this do not share a stream, two
+/// holding a [`ClientStream`] and two having already taken the DATA frame off a
+/// raw `quinn::RecvStream`, and the decoder is what they do share.
+#[track_caller]
+pub fn next_udp_payload(decoder: &mut volto::capsule::CapsuleDecoder) -> Option<Bytes> {
+    let capsule = decoder.next_capsule().expect("well-formed capsules")?;
+    let volto::capsule::Capsule::Datagram {
+        context_id,
+        payload,
+    } = capsule;
+
+    assert_eq!(
+        context_id,
+        datagram::CONTEXT_ID_UDP_PAYLOAD,
+        "a UDP payload must travel under context 0"
+    );
+    Some(payload)
 }
 
 /// A UDP target on an ephemeral loopback port that answers with `reply`.

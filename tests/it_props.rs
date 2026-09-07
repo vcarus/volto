@@ -409,16 +409,7 @@ fn drive(chunks: &[Bytes]) -> Outcome {
 
 /// Splits `bytes` at the offsets in `cuts` (clamped into range, deduplicated).
 fn chunks(bytes: &Bytes, cuts: &[u16]) -> Vec<Bytes> {
-    let mut offsets: Vec<usize> = cuts
-        .iter()
-        .map(|cut| usize::from(*cut) % (bytes.len() + 1))
-        .collect();
-    offsets.push(0);
-    offsets.push(bytes.len());
-    offsets.sort_unstable();
-    offsets.dedup();
-
-    offsets
+    props::cut_offsets(bytes.len(), cuts)
         .windows(2)
         .map(|pair| bytes.slice(pair[0]..pair[1]))
         .filter(|chunk| !chunk.is_empty())
