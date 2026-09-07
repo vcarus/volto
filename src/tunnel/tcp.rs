@@ -90,7 +90,7 @@ use tracing::{debug, info};
 
 use crate::h3api::{self, Fields, Reader, Status, Stream, StreamError, Writer};
 use crate::tunnel;
-use crate::tunnel::{Context, Responded, Unreachable};
+use crate::tunnel::{Context, Unreachable};
 
 /// Smallest window `read_buf` is ever offered on the target → client relay.
 ///
@@ -306,27 +306,26 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     )
     .await;
 
-    match sent {
-        Responded::Sent => {}
-        Responded::Failed => return,
-        Responded::Expired => {
-            debug!(
-                stream_id,
-                authority, "gave up on a 200 for CONNECT the peer would not take"
-            );
-            // The stream has already been reset with H3_REQUEST_CANCELLED, which
-            // is the client-abort half of RFC 9114 §4.4: "If the proxy detects
-            // that the client has reset the stream or aborted reading from the
-            // stream, it MUST close the TCP connection", and "In all these
-            // cases, if the underlying TCP implementation permits it, the proxy
-            // SHOULD send a TCP segment with the RST bit set." Returning drops
-            // `tcp` and closes it either way; arming the reset first is what
-            // makes it the abortive close the SHOULD asks for, so a target that
-            // has already accepted the connection is not left believing it was
-            // finished politely.
-            abort_target(&tcp);
-            return;
-        }
+    // A 200 that does not land leaves a target connection that has already been
+    // accepted and will now carry nothing, and RFC 9114 §4.4 covers both ways
+    // of not landing with one sentence: "Correspondingly, if a proxy detects an
+    // error with the stream or the QUIC connection, it MUST close the TCP
+    // connection. If the proxy detects that the client has reset the stream or
+    // aborted reading from the stream, it MUST close the TCP connection. [...]
+    // In all these cases, if the underlying TCP implementation permits it, the
+    // proxy SHOULD send a TCP segment with the RST bit set." A write that
+    // failed outright is the first case and a lapse is the second. Returning
+    // drops `tcp` and closes it either way; arming the reset first is what
+    // makes it the abortive close the SHOULD asks for, so a target is not left
+    // believing it was finished politely. Written once so the two cannot
+    // differ: the `Failed` arm used to return without it (review L8).
+    if !sent.landed(
+        stream_id,
+        Status::OK,
+        "gave up on a 200 for CONNECT the peer would not take",
+    ) {
+        abort_target(&tcp);
+        return;
     }
 
     info!(

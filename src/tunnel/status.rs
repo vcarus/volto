@@ -320,21 +320,21 @@ pub(crate) enum Responded {
     /// The write did not complete within its bound, and the stream has already
     /// been reset with H3_REQUEST_CANCELLED.
     ///
-    /// [`Responded::landed`] is the follow-up three of the four callers share:
-    /// it writes the line and answers that the write did not land. `tcp::run`
-    /// keeps a `match` of its own, because a lapse there also leaves a target
-    /// connection that RFC 9114 section 4.4 asks to be aborted, and an
-    /// authority worth naming beside the line.
+    /// [`Responded::landed`] is the follow-up all four callers share: it writes
+    /// the line and answers that the write did not land. What a caller has left
+    /// to clean up stays with the caller; `tcp::run` aborts the target
+    /// connection RFC 9114 section 4.4 asks it to, for a lapse and for an
+    /// outright failure alike.
     Expired,
 }
 
 impl Responded {
     /// Whether the response reached the stream, reporting a lapse as `gave_up`.
     ///
-    /// The follow-up is the same at every call site that has nothing else to
-    /// clean up: a sent response is what the caller asked for, a failed one has
-    /// already been reported by [`respond`], and a lapsed one owes one line.
-    /// Written here so a fourth caller cannot answer it a fourth way.
+    /// The follow-up is the same at every call site: a sent response is what
+    /// the caller asked for, a failed one has already been reported by
+    /// [`respond`], and a lapsed one owes one line. Written here so a fifth
+    /// caller cannot answer it a fifth way.
     ///
     /// What a lapse leaves behind is still the caller's business. `false` says
     /// to stop; anything past that stays where the thing to undo is.

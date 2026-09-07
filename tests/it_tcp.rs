@@ -1471,6 +1471,51 @@ async fn the_target_of_a_200_the_peer_will_not_take_is_reset_too() {
     );
 }
 
+/// A 200 that fails outright leaves the same target connection a lapsed one
+/// does, and RFC 9114 §4.4 covers both with one sentence.
+///
+/// "Correspondingly, if a proxy detects an error with the stream or the QUIC
+/// connection, it MUST close the TCP connection. If the proxy detects that the
+/// client has reset the stream or aborted reading from the stream, it MUST
+/// close the TCP connection. [...] In all these cases, if the underlying TCP
+/// implementation permits it, the proxy SHOULD send a TCP segment with the RST
+/// bit set." The `Responded::Failed` arm of `tcp::run` returned without the
+/// reset, so a target that had already accepted the connection was told it was
+/// finished politely (review L8). `the_target_of_a_200_the_peer_will_not_take_is_reset_too`
+/// above is the other half, where the write lapses rather than fails.
+///
+/// Driven on a raw QUIC stream: the shared client has no way to abort reading a
+/// response it has not read, and that is what makes the server's write of the
+/// 200 fail rather than lapse. The STOP_SENDING is sent before anything is read,
+/// so it is processed while the server is still connecting to the target, which
+/// is why this is a failure and not a timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_200_that_fails_aborts_the_target_connection() {
+    let server = TestServer::start().await;
+    let (target, mut ended) = spawn_end_reporting_target().await;
+    let client = H3Client::connect(&server).await;
+
+    let (mut send, mut recv) = client.quic.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_headers_frame(&target.to_string()))
+        .await
+        .expect("send the CONNECT request");
+    // The code is the client's own business; what is under test is what the
+    // server does with the target once its 200 has nowhere to go.
+    recv.stop(quinn::VarInt::from_u32(0))
+        .expect("abort reading the response direction");
+
+    let end = tokio::time::timeout(TIMEOUT, ended.recv())
+        .await
+        .expect("the target connection must be closed")
+        .expect("close notification");
+
+    assert_eq!(
+        end,
+        ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset),
+        "a 200 that failed must reach the target as a reset, not as a clean EOF"
+    );
+}
+
 #[tokio::test]
 async fn refuses_a_target_that_is_not_listening() {
     let server = TestServer::start().await;

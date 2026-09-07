@@ -27,8 +27,8 @@ use crate::quic::AuthGate;
 pub use quota::{Pending, Quota, Slot};
 pub use status::ProxyError;
 pub(crate) use status::{
-    ResolveFailure, Responded, Unreachable, accept_then_close, refuse, refuse_because,
-    refuse_unreachable, refuse_with, respond,
+    ResolveFailure, Unreachable, accept_then_close, refuse, refuse_because, refuse_unreachable,
+    refuse_with, respond,
 };
 
 /// How a request should be handled.
