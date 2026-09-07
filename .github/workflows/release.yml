@@ -110,6 +110,14 @@ jobs:
           # would make every timered host reinstall and restart daily, forever.
           grep -q "^version = \"${version}\"\$" Cargo.toml ||
             { echo "tag ${GITHUB_REF_NAME} does not match the version in Cargo.toml" >&2; exit 1; }
+          # The tarball example in docs/deployment.md carries a `version=` line
+          # the release checklist asks to be bumped by hand beside Cargo.toml,
+          # Cargo.lock and fuzz/Cargo.lock. The three manifests are pinned (the
+          # grep above, and it_release_assets for the fuzz lockfile); the page
+          # was the last hand-kept copy with no gate, and a stale one sends the
+          # reader of a fresh release at an archive that is not there.
+          grep -qE "^version=${version}([[:space:]]|\$)" docs/deployment.md ||
+            { echo "docs/deployment.md's tarball example does not name ${version}" >&2; exit 1; }
           name="volto-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}/script"
           cp "target/${{ matrix.target }}/release/volto" "dist/${name}/"
