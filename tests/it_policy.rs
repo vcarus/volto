@@ -725,6 +725,20 @@ async fn a_churn_of_sessions_cannot_restore_the_unanswered_budget() {
         .expect("the session ends inside the timeout")
         .expect_err("a session past the connection total must be ended by the proxy");
     assert_peer_reset(&error, H3_REQUEST_CANCELLED);
+
+    // Both halves of that stream carry one verdict. Left to the `Reader` being
+    // dropped, quinn sends STOP_SENDING with code 0, which RFC 9114 §8.1 makes
+    // equivalent to H3_NO_ERROR, so the client would read a fault on the half
+    // it reads and "no error" on the half it writes (review L9).
+    let stopped = tokio::time::timeout(TIMEOUT, last.stopped())
+        .await
+        .expect("the proxy must stop the client's sending side")
+        .expect("the stream must still be open to be stopped");
+    assert_eq!(
+        stopped.map(quinn::VarInt::into_inner),
+        Some(H3_REQUEST_CANCELLED),
+        "the STOP_SENDING must carry the code the stream was reset with"
+    );
 }
 
 /// A session whose target answers must give the connection back what it spent

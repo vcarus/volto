@@ -276,12 +276,20 @@ enum Step {
     Continue,
     /// The session is over; close the request stream tidily.
     Stop,
-    /// The session is over and the request stream has **already been reset**.
+    /// The session is over and the request stream has **already been reset**,
+    /// with the code carried here.
     ///
     /// Distinct from [`Step::Stop`] because the tidy close would contradict the
     /// reset: telling the peer "no error" on a stream we just aborted leaves it
     /// to guess which signal to believe.
-    Aborted,
+    ///
+    /// The code travels with the verdict so that the STOP_SENDING sent on the
+    /// way out can carry it too. Every one of the five sites that reaches here
+    /// resets the sending half with a code first, and the receiving half has to
+    /// end with the same one (review L9). Four of them send it; the fifth is
+    /// the stream ending mid-capsule, where the peer's FIN has already been
+    /// read, so quinn has nothing left to stop and the call is a no-op.
+    Aborted(h3api::Code),
 }
 
 /// Which of a session's three sources produced work, before it is handled.
@@ -430,10 +438,18 @@ impl Session<'_> {
             match step {
                 Step::Continue => {}
                 Step::Stop => break,
-                // The stream carries its own error signal already; anything
-                // added here would only muddy it. The socket still closes, with
-                // `self`.
-                Step::Aborted => return,
+                // The sending half has already been reset with `code`, and the
+                // receiving half ends with the same one. Returning without
+                // saying so does not leave the peer with nothing: dropping the
+                // `Reader` makes quinn send STOP_SENDING with code 0, which RFC
+                // 9114 §8.1 makes equivalent to H3_NO_ERROR, so the peer would
+                // read a fault on one half and "no error" on the other. One
+                // verdict on both halves instead (review L9). The socket still
+                // closes, with `self`.
+                Step::Aborted(code) => {
+                    self.reader.stop_receiving(code);
+                    return;
+                }
             }
         }
 
@@ -476,7 +492,7 @@ impl Session<'_> {
                 "client sent an oversized UDP payload, aborting the session"
             );
             self.writer.reset(h3api::DATAGRAM_ERROR);
-            return Step::Aborted;
+            return Step::Aborted(h3api::DATAGRAM_ERROR);
         }
 
         // RFC 9298 §7. The packet is dropped rather than the session closed: a
@@ -516,7 +532,7 @@ impl Session<'_> {
                     ),
                 }
                 self.writer.reset(h3api::REQUEST_CANCELLED);
-                return Step::Aborted;
+                return Step::Aborted(h3api::REQUEST_CANCELLED);
             }
 
             *remaining -= 1;
@@ -704,7 +720,7 @@ impl Session<'_> {
                     "client stopped reading the capsule stream, resetting it"
                 );
                 self.writer.reset(h3api::REQUEST_CANCELLED);
-                Step::Aborted
+                Step::Aborted(h3api::REQUEST_CANCELLED)
             }
         }
     }
@@ -750,7 +766,7 @@ impl Session<'_> {
                             // "Datagram or Capsule Protocol parse error".
                             debug!(stream_id, %error, "malformed capsule");
                             self.writer.reset(h3api::DATAGRAM_ERROR);
-                            return Step::Aborted;
+                            return Step::Aborted(h3api::DATAGRAM_ERROR);
                         }
                     }
                 }
@@ -784,7 +800,7 @@ impl Session<'_> {
                         "connect-udp stream ended mid-capsule"
                     );
                     self.writer.reset(h3api::MESSAGE_ERROR);
-                    Step::Aborted
+                    Step::Aborted(h3api::MESSAGE_ERROR)
                 }
             }
             Err(error) => {
