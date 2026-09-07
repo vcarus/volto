@@ -139,10 +139,11 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
             assert_eq!(Some(*refused), version, "the version that was refused");
             assert_ne!(*refused, 1, "version 1 is the one we speak");
         }
-        // The four that are decided behind the packet protection, which is only
-        // reachable by opening the packet: the gate must have had a v1 Initial,
-        // in a datagram large enough for a server to look at, to get here at
-        // all.
+        // The four that need a v1 Initial in a datagram large enough for a
+        // server to look at. Three of them are decided behind the packet
+        // protection, which is only reachable by opening the packet; the
+        // fourth, the connection ID length, is decided on such a packet's
+        // header.
         Verdict::Refuse(refusal) => {
             assert!(
                 long_header
@@ -161,9 +162,9 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
                         "an unbounded name reached a log"
                     );
                 }
-                // The one refusal decided on the header behind the protection:
-                // the length it names is the length byte the datagram carries,
-                // and it is under the floor RFC 9000 §7.2 sets.
+                // Decided on the header, ahead of the decryption: the length
+                // it names is the length byte the datagram carries, and it is
+                // under the floor RFC 9000 §7.2 sets.
                 Refusal::ShortConnectionId(length) => {
                     assert_eq!(
                         Some(*length),
@@ -184,14 +185,17 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
 }
 
 /// The v0.9.1 rule: only a packet the gate could open may be refused for what
-/// was behind its packet protection — the ClientHello, or the connection ID
-/// length that opening the packet turns into a statement about a first flight.
+/// was behind its packet protection, which is the ClientHello.
 ///
 /// The keys are derived from the Destination Connection ID in the datagram
-/// itself, so changing that field must turn any such refusal into a pass — a
+/// itself, so changing that field must turn any such refusal into a pass. A
 /// packet keyed by something the gate cannot see is exactly the shape of every
 /// client Initial after the server has answered (RFC 9000 §7.2, RFC 9001 §5.2),
 /// and refusing those cost every admitted handshake a probe timeout in v0.9.0.
+///
+/// `Refusal::ShortConnectionId` left this set on 2026-09-07. It is read off the
+/// header ahead of the decryption, the way quinn reads its own, so rotating a
+/// byte of the connection ID leaves both the length it names and the refusal.
 fn refusing_needs_the_keys_this_datagram_carries(
     datagram: &[u8],
     names: &Names,
@@ -199,12 +203,7 @@ fn refusing_needs_the_keys_this_datagram_carries(
 ) {
     let refused_by_what_was_opened = matches!(
         verdict,
-        Verdict::Refuse(
-            Refusal::ShortConnectionId(_)
-                | Refusal::NotClientHello
-                | Refusal::Anonymous
-                | Refusal::OtherName(_)
-        )
+        Verdict::Refuse(Refusal::NotClientHello | Refusal::Anonymous | Refusal::OtherName(_))
     );
     if !refused_by_what_was_opened {
         return;

@@ -284,6 +284,32 @@ fn initial(crypto: &dyn quinn::crypto::ServerConfig, dcid: &[u8], frames: &[u8])
     shaped_initial(crypto, &shape, frames)
 }
 
+/// A 1200-byte version-1 Initial addressed to `dcid` whose payload was never
+/// sealed.
+///
+/// Every other builder here encrypts what it makes, so this is the one shape
+/// that reaches the gate without authenticating under any key. The layout is a
+/// long header with the Initial type, an empty Source Connection ID, an empty
+/// token, a two-byte Length field, and filler to 1200 bytes.
+fn unsealed_initial(dcid: &[u8]) -> Vec<u8> {
+    let mut datagram = vec![0xc0];
+    datagram.extend_from_slice(&QUIC_V1.to_be_bytes());
+    datagram.push(u8::try_from(dcid.len()).expect("a legal connection id"));
+    datagram.extend_from_slice(dcid);
+    datagram.push(0); // no Source Connection ID
+    datagram.extend_from_slice(&varint(0)); // no token
+    let length = MIN_INITIAL_DATAGRAM - datagram.len() - 2;
+    let encoded = varint(length);
+    assert_eq!(
+        encoded.len(),
+        2,
+        "a two-byte Length field, as an Initial uses"
+    );
+    datagram.extend_from_slice(&encoded);
+    datagram.resize(MIN_INITIAL_DATAGRAM, 0x5a); // the payload, sealed by nobody
+    datagram
+}
+
 /// A quinn crypto configuration around a throwaway certificate.
 ///
 /// The one builder here that carries a certificate, for the one test whose
@@ -427,6 +453,39 @@ fn a_first_initial_with_a_full_connection_id_is_not_refused_for_its_length() {
         judgement(&initial(&*crypto, &CLIENT_CID, &[]), &names),
         Verdict::Pass,
         "an eight-byte connection ID is the shortest one a client may choose"
+    );
+}
+
+/// A short connection ID is refused whether or not the packet authenticates.
+///
+/// The length is read off the header, ahead of the decryption, because quinn
+/// reads it ahead of its own decryption: `early_validate_first_packet` runs
+/// before `first_decode.finish` and answers a Destination Connection ID under
+/// eight bytes with CONNECTION_CLOSE(PROTOCOL_VIOLATION) without opening the
+/// packet. So an Initial nobody sealed, which costs its sender no cryptography
+/// at all, drew that reply through the gate until 2026-09-07. The two other
+/// witnesses for this rule both seal their payloads, which is why this one is
+/// built by hand.
+#[test]
+fn an_unsealed_initial_with_a_short_connection_id_is_refused() {
+    let names = Names::new(&["localhost".to_owned()]);
+
+    let short = [0x11; 4];
+    let refused = unsealed_initial(&short);
+    assert_eq!(refused.len(), MIN_INITIAL_DATAGRAM);
+    assert_eq!(
+        judgement(&refused, &names),
+        Verdict::Refuse(Refusal::ShortConnectionId(short.len())),
+        "an Initial nobody sealed, behind a four-byte connection ID"
+    );
+
+    // The same shape behind a connection ID a client may choose is passed
+    // through, which is what says this payload authenticates under no key: an
+    // Initial the gate cannot open is one it passes.
+    assert_eq!(
+        judgement(&unsealed_initial(&CLIENT_CID), &names),
+        Verdict::Pass,
+        "an unsealed payload opens under no key, so the length is all there is"
     );
 }
 

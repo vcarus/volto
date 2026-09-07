@@ -30,6 +30,14 @@
 //!   packet for an unknown connection without a word.
 //! * **An Initial in a datagram below 1200 bytes** — passes, because RFC 9000
 //!   §14.1 has the server discard it and quinn does exactly that, silently.
+//! * **An Initial whose Destination Connection ID is shorter than eight
+//!   bytes** — refused, on the header alone and whether or not the packet
+//!   authenticates. RFC 9000 §7.2 gives a client's first Initial a floor of
+//!   eight bytes. Every later Initial of an admitted handshake is addressed by
+//!   the eight bytes this endpoint chose, and so is the one a Retry supplies,
+//!   so nothing legitimate is this shape. quinn's own rule is ahead of its
+//!   decryption as well, in `early_validate_first_packet`, and it answers this
+//!   shape with the CONNECTION_CLOSE named above before it reads a frame.
 //! * **An Initial this server cannot open** — passes. Only a client's *first*
 //!   Initial packets are keyed by their own Destination Connection ID: once the
 //!   server has answered, the client addresses it by the connection ID the
@@ -39,14 +47,6 @@
 //!   its state. They belong to a flight that was judged when it started; a
 //!   forgery that is not one of them fails quinn's own decryption and is
 //!   dropped there without a reply.
-//! * **An Initial this server can open whose Destination Connection ID is
-//!   shorter than eight bytes** — refused. Opening it is what says its keys
-//!   came from the connection ID written in it, and that is a client's first
-//!   Initial, which RFC 9000 §7.2 gives a floor of eight bytes. Every later
-//!   Initial of an admitted handshake is addressed by the eight bytes this
-//!   endpoint chose, and so is the one a Retry supplies, so nothing legitimate
-//!   is this shape — and quinn answers it with the CONNECTION_CLOSE named
-//!   above before it reads a frame.
 //! * **An Initial with no CRYPTO frame at offset 0** — passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started.
@@ -157,9 +157,11 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 
 /// The shortest Destination Connection ID a client's first Initial may carry.
 ///
-/// A packet the gate can open is keyed by the connection ID written in it, and
-/// only a first Initial is (RFC 9001 §5.2, quoted at [`Judge::decrypt`]), so the
-/// sentence below applies to every packet that gets that far.
+/// The floor is applied to every Initial the gate parses rather than only to one
+/// it can open, because quinn applies its own the same way: its
+/// `early_validate_first_packet` refuses a shorter one before any decryption.
+/// Nothing legitimate arrives under it, because every Initial after a client's
+/// first is addressed by the eight bytes this endpoint's own generator chose.
 ///
 //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
 //# When an Initial packet is sent by a client that has not previously
@@ -478,6 +480,29 @@ impl Judge {
             return Verdict::Pass;
         };
 
+        // Judged on the header alone, ahead of the decryption, because quinn
+        // judges it ahead of its own decryption. `Endpoint::early_validate_first_packet`
+        // runs before `first_decode.finish` and answers a Destination
+        // Connection ID under eight bytes with a CONNECTION_CLOSE carrying
+        // PROTOCOL_VIOLATION, without opening the packet. Its one exemption is
+        // a packet carrying a token whose Destination Connection ID is exactly
+        // the length this endpoint's own generator uses, which is eight, so
+        // nothing under eight bytes is exempt. RFC 9000 §7.2 gives a client's
+        // first Initial a floor of eight bytes, quoted at
+        // `MIN_CLIENT_CONNECTION_ID`, and every later Initial of an admitted
+        // handshake is addressed by the eight bytes this endpoint's own
+        // generator chose, as is the one a Retry supplies. So nothing
+        // legitimate is ever this shape, and the reply quinn would send is one
+        // of the three this gate exists to take away.
+        //
+        // Before 2026-09-07 this sat after the decryption, which left the
+        // shape that costs an attacker no cryptography at all, a 1200-byte
+        // Initial with a four-byte connection ID and a payload nobody sealed,
+        // passing through to that reply.
+        if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
+            return Verdict::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
+        }
+
         let Some(frames) = self.decrypt(datagram, &header) else {
             // Authentication failed under the keys this packet's own
             // Destination Connection ID derives. That is every client Initial
@@ -497,20 +522,6 @@ impl Judge {
             //# packets.
             return Verdict::Pass;
         };
-
-        // It opened, so its keys came from the Destination Connection ID
-        // written in it, and only a client's first Initial is keyed that way —
-        // which is a packet RFC 9000 §7.2 gives a floor of eight bytes to
-        // (quoted at `MIN_CLIENT_CONNECTION_ID`). Every later Initial of an
-        // admitted handshake is addressed by the eight bytes this endpoint's
-        // own generator chose, and so is the one a Retry supplies, so nothing
-        // legitimate is ever this shape. quinn answers what is with a
-        // CONNECTION_CLOSE carrying PROTOCOL_VIOLATION before it reads a single
-        // frame, which is one of the three replies this gate exists to take
-        // away.
-        if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
-            return Verdict::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
-        }
 
         let Some(crypto) = crypto_stream_prefix(&frames) else {
             // No CRYPTO frame at offset 0: an acknowledgement, or a later
@@ -726,7 +737,7 @@ pub enum Verdict {
 pub enum Refusal {
     /// A long header naming a QUIC version this server does not speak.
     Version(u32),
-    /// A first Initial whose Destination Connection ID is under
+    /// An Initial whose Destination Connection ID is under
     /// [`MIN_CLIENT_CONNECTION_ID`] bytes, carrying the length it had.
     ShortConnectionId(usize),
     /// A first flight that does not begin with a ClientHello.
