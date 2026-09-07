@@ -60,6 +60,20 @@ users = [{ username = "$VOLTO_USER", password = "$VOLTO_PASSWORD" }]
 # is what the refusal test drives.
 allow_private_networks = true
 
+[limits]
+# Sized to the host this run has, not to a production host. The GitHub runner
+# grants 212992 bytes per UDP socket (net.core.wmem_max) and a 65536-descriptor
+# soft limit, and the defaults, 2 MiB per socket and 256 x 256 tunnels, draw the
+# two warnings the server writes for a host that cannot grant them (log_id
+# einsvqj5 and bt1hbfco). Those are true statements about the runner and say
+# nothing about the two foreign clients, so the fixture asks for what the runner
+# has and the check below keeps its list at the two lines this run earns. Seven
+# tunnels on one loopback need none of the headroom either figure gives up.
+socket_recv_buffer = 212992
+socket_send_buffer = 212992
+max_connections = 16
+max_targets_per_conn = 64
+
 [log]
 # Every inbound request is logged with its headers, so a client-side failure
 # can be read off the server side too.
