@@ -416,9 +416,13 @@ async fn closing_the_request_stream_ends_the_session() {
 
     stream.finish().expect("finish the request stream");
 
-    // Give the server a moment to tear the session down, then confirm nothing
-    // is routed any more.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Waited on rather than slept through: RFC 9298 §3.1 pairs the two ends of
+    // the request stream, so the server finishing its own half is the observable
+    // event that says the session loop returned -- which is what the silence
+    // below depends on. A fixed sleep only guesses at it.
+    ends_cleanly(&mut stream, "the closed session").await;
+
+    // And now nothing is routed any more.
     send_udp_payload(&client.quic, qsid, b"after");
 
     let stray = tokio::time::timeout(Duration::from_millis(500), client.quic.read_datagram()).await;
