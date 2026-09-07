@@ -84,8 +84,15 @@ jobs:
       # cross.yml runs this exact step on the pull requests that can break it,
       # which is only worth anything while the two are identical. The markers
       # below delimit what `tests/it_release_assets.rs` compares between the two
-      # files; the prose stays outside them, since only the step has to match.
+      # files; this prose is outside them and differs per file, and everything
+      # inside them, comments included, has to match byte for byte.
       # >>> mirrored build step (release.yml <-> cross.yml) >>>
+      # `strip: true` is the action's own input and it is a no-op for a target
+      # this action cross-builds, which is how the first v0.10.0 release shipped
+      # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
+      # in `[profile.release]`; this input is kept as a second layer for the
+      # targets where it does something, and it guarantees nothing on its own.
+      # The step after this one is what proves either of them ran.
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build
@@ -118,6 +125,24 @@ jobs:
           # reached it. Copied as a directory rather than by name, so a new page
           # needs no change here.
           cp -R docs "dist/${name}/"
+          # Nothing else proves the published binary is stripped. The first
+          # v0.10.0 release was deleted for an unstripped aarch64 asset, closed
+          # by `strip = true` in `[profile.release]`, and an edit to that profile
+          # (`debug = "line-tables-only"` was tried and reverted once) would
+          # silently reship the fat asset. readelf reads an ELF of any
+          # architecture, so this x86_64 runner judges both targets.
+          command -v readelf >/dev/null ||
+            { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends binutils; }
+          sections="$(readelf -S --wide "dist/${name}/volto")"
+          # Floor first: a reader that found nothing must fail rather than
+          # report a clean binary.
+          printf '%s\n' "$sections" | grep -q '[[:space:]]\.text[[:space:]]' ||
+            { echo "::error::readelf -S found no .text section in dist/${name}/volto; this check is broken, not the binary" >&2; exit 1; }
+          carried="$(printf '%s\n' "$sections" |
+            awk '{ for (i = 1; i <= NF; i++) if ($i == ".symtab" || $i == ".debug_info") print $i }' |
+            sort -u | tr '\n' ' ')"
+          [ -z "$carried" ] ||
+            { echo "::error::dist/${name}/volto still carries ${carried}-- the release binary is not stripped" >&2; exit 1; }
           tar -C dist -czf "${name}.tar.gz" "${name}"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

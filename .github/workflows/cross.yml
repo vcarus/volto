@@ -59,6 +59,12 @@ jobs:
       # the markers below and fails if they differ by a byte, and release.yml is
       # in this workflow's `paths` filter so editing that side runs this side.
       # >>> mirrored build step (release.yml <-> cross.yml) >>>
+      # `strip: true` is the action's own input and it is a no-op for a target
+      # this action cross-builds, which is how the first v0.10.0 release shipped
+      # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
+      # in `[profile.release]`; this input is kept as a second layer for the
+      # targets where it does something, and it guarantees nothing on its own.
+      # The step after this one is what proves either of them ran.
       - uses: houseabsolute/actions-rust-cross@21b0f18dc621b25bfae556ff2791fca4173121e8 # v1.0.8
         with:
           command: build
@@ -66,3 +72,25 @@ jobs:
           args: "--locked --release"
           strip: true
       # <<< mirrored build step (release.yml <-> cross.yml) <<<
+
+      # release.yml makes this assertion on the copy in `dist/`, inside the step
+      # that packages the tarball, so it cannot be part of the mirrored block.
+      # Made here on the binary this workflow just built, it moves the signal to
+      # the pull request that changes `Cargo.toml`, which is what this
+      # workflow's `paths` filter already selects.
+      - name: The built binary is stripped
+        run: |
+          set -euo pipefail
+          command -v readelf >/dev/null ||
+            { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends binutils; }
+          binary="target/${{ matrix.target }}/release/volto"
+          sections="$(readelf -S --wide "$binary")"
+          # Floor first: a reader that found nothing must fail rather than
+          # report a clean binary.
+          printf '%s\n' "$sections" | grep -q '[[:space:]]\.text[[:space:]]' ||
+            { echo "::error::readelf -S found no .text section in ${binary}; this check is broken, not the binary" >&2; exit 1; }
+          carried="$(printf '%s\n' "$sections" |
+            awk '{ for (i = 1; i <= NF; i++) if ($i == ".symtab" || $i == ".debug_info") print $i }' |
+            sort -u | tr '\n' ' ')"
+          [ -z "$carried" ] ||
+            { echo "::error::${binary} still carries ${carried}-- a release built from this branch would not be stripped" >&2; exit 1; }
