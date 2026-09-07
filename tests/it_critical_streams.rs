@@ -133,6 +133,57 @@ async fn a_stopped_control_stream_ends_the_connection() {
     assert!(!reason.is_empty(), "the peer must be told what it did");
 }
 
+/// A peer that resets its own control stream, with the connection still up, is
+/// the other ending RFC 9114 §6.2.1 forbids.
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+//# The sender MUST NOT close the control stream, and the receiver
+//# MUST NOT request that the sender close the control stream.
+///
+/// The verdict is the same as for a clean finish, and since review L1 it is
+/// reached through the same helper (`critical_stream_closed`) rather than
+/// through an arm of its own. This case is the half of that helper's rule the
+/// wire can show: the reset happens on a connection the peer keeps open, so the
+/// exemption does not apply and the CONNECTION_CLOSE is observable.
+///
+/// The other half, a reset that arrives in the same flight as the peer's own
+/// CONNECTION_CLOSE, cannot be arranged from here: `quinn::Connection::close`
+/// moves the connection to `State::Closed`, after which `poll_transmit` writes
+/// only ACKs and the CONNECTION_CLOSE, so a RESET_STREAM queued and not yet
+/// sent never leaves the client. It is pinned as a unit test on the helper
+/// instead.
+///
+/// SETTINGS goes first because a control stream that carries no SETTINGS is a
+/// different violation (H3_MISSING_SETTINGS), and the reason phrase is what
+/// tells the two apart. The round trip in between is not decoration: RFC 9114
+/// §6.2 has the server tolerate a unidirectional stream reset before its type
+/// varint arrives, and a reset queued behind unflushed bytes is exactly that
+/// stream, so without the round trip this test asserts nothing.
+#[tokio::test]
+async fn a_reset_control_stream_ends_the_connection() {
+    let server = TestServer::start().await;
+    let (_endpoint, connection) = connect_quic(&server).await;
+
+    let mut control =
+        open_uni_stream(&connection, STREAM_CONTROL, &frame(FRAME_SETTINGS, &[])).await;
+    round_trip(&connection).await;
+
+    // Any code: what the server owes is its own verdict on being reset at all.
+    control
+        .reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
+        .expect("reset the control stream");
+
+    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+    assert_eq!(
+        closed_with, H3_CLOSED_CRITICAL_STREAM,
+        "a control stream the peer reset; the reason was {reason:?}"
+    );
+    assert!(
+        reason.contains("reset its control stream"),
+        "the reason {reason:?} does not say the control stream was reset"
+    );
+}
+
 /// RFC 9114 §7.2.3: a CANCEL_PUSH for a push ID never mentioned by a
 /// PUSH_PROMISE is H3_ID_ERROR -- and this server mentions none.
 #[tokio::test]
@@ -181,13 +232,15 @@ async fn a_shrinking_max_push_id_is_an_id_error() {
 /// rather than the rule: a peer tearing a connection down finishes its send
 /// streams and sends CONNECTION_CLOSE in the same breath, and answering an
 /// ordinary goodbye with a protocol error puts a fault in the operator's log.
-/// The control stream answers that with an exemption rather than with silence --
-/// `control_stream_finished` reports nothing once `close_reason` is `Some` --
-/// and the QPACK streams now use the same construction (audit N3).
+/// The server answers that with an exemption rather than with silence --
+/// `critical_stream_closed` reports nothing once `close_reason` is `Some` --
+/// and all three critical streams reach it through that one helper (audit N3,
+/// review L1).
 ///
 /// So what is asserted is the case the exemption does not cover: a peer that
-/// closes one of these streams and leaves the connection up. A reset is the same
-/// verdict by the same rule and reaches it through the sibling arm.
+/// closes one of these streams and leaves the connection up. A reset is the
+/// same verdict by the same rule and through the same helper, which
+/// `a_reset_control_stream_ends_the_connection` covers for the control stream.
 ///
 /// The stream carries no instruction at all, so nothing here can be mistaken for
 /// one of the instruction rules the cases below cover.

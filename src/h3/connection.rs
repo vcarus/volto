@@ -48,6 +48,7 @@
 //! *reason*, which quinn overwrites with "closed locally" -- so it is recorded
 //! on the way past and read back by [`Connection::accept`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ops::ControlFlow;
@@ -1009,18 +1010,19 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
     let mut frames = FrameReader::new(recv, BufferBudget::unshared());
     let mut control = Control::default();
 
-    loop {
+    // The two endings RFC 9114 §6.2.1 forbids, as a detail string for
+    // [`critical_stream_closed`]. Both leave the loop rather than reporting on
+    // the spot, so the exemption is asked for once and cannot come to differ
+    // between a clean finish and a reset:
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+    //# The sender MUST NOT close the control stream, and the receiver
+    //# MUST NOT request that the sender close the control stream.
+    let ended: Cow<'static, str> = loop {
         let item = match frames.next().await {
             Ok(Some(item)) => item,
 
-            Ok(None) => {
-                if let Some(violation) =
-                    control_stream_finished(handle.quic.close_reason().as_ref())
-                {
-                    handle.fail(violation);
-                }
-                return;
-            }
+            Ok(None) => break "the peer closed its control stream".into(),
 
             // Every framing rule is fatal here, whatever it would have been on
             // a request stream: the connection cannot go on without the stream
@@ -1036,15 +1038,8 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
             // protocol violation in the operator's log.
             Err(frame::Error::Stream(StreamError::Connection(_))) => return,
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-            //# The sender MUST NOT close the control stream, and the receiver
-            //# MUST NOT request that the sender close the control stream.
             Err(frame::Error::Stream(error)) => {
-                handle.fail(Violation::connection(
-                    Code::H3_CLOSED_CRITICAL_STREAM,
-                    format!("the peer reset its control stream: {error}"),
-                ));
-                return;
+                break format!("the peer reset its control stream: {error}").into();
             }
         };
 
@@ -1052,22 +1047,35 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
             handle.fail(violation);
             return;
         }
+    };
+
+    if let Some(violation) = critical_stream_closed(ended, handle.quic.close_reason().as_ref()) {
+        handle.fail(violation);
     }
 }
 
-/// What a clean end of the peer's control stream means, given `close_reason`.
+/// What an ending of one of the peer's critical streams means, given
+/// `close_reason`.
+///
+/// One helper for the three streams and for both of the endings each of them
+/// has, because the two RFCs state one verdict for all six: neither tells a
+/// clean finish from a reset, and neither tells the control stream from a QPACK
+/// stream. `detail` says which stream ended and how, for the message only.
 ///
 /// `close_reason` is [`quinn::Connection::close_reason`]: `Some` once the
 /// connection is over, whoever ended it.
 ///
 /// The rule below is not negotiable. What is negotiable is whether reaching its
 /// verdict is worth anything on a connection that has already ended: a peer
-/// tearing one down finishes its send streams and sends CONNECTION_CLOSE in the
-/// same breath, and the two can be read here in either order. Answering an
-/// ordinary goodbye with a protocol error would turn that race into a fault in
-/// the operator's log, on behalf of a connection there is nothing left to
-/// protect -- the same reasoning [`serve_qpack`] records for the QPACK streams.
-fn control_stream_finished(close_reason: Option<&quinn::ConnectionError>) -> Option<Violation> {
+/// tearing one down finishes or resets its send streams and sends
+/// CONNECTION_CLOSE in the same breath, and the two can be read here in either
+/// order. Answering an ordinary goodbye with a protocol error would turn that
+/// race into a fault in the operator's log, on behalf of a connection there is
+/// nothing left to protect.
+fn critical_stream_closed(
+    detail: impl Into<Cow<'static, str>>,
+    close_reason: Option<&quinn::ConnectionError>,
+) -> Option<Violation> {
     if close_reason.is_some() {
         return None;
     }
@@ -1075,9 +1083,15 @@ fn control_stream_finished(close_reason: Option<&quinn::ConnectionError>) -> Opt
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
     //# If either control stream is closed at any point, this MUST be treated
     //# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //# The sender MUST NOT close either of these streams, and the receiver
+    //# MUST NOT request that the sender close either of these streams.
+    //# Closure of either unidirectional stream type MUST be treated as a
+    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
     Some(Violation::connection(
         Code::H3_CLOSED_CRITICAL_STREAM,
-        "the peer closed its control stream",
+        detail,
     ))
 }
 
@@ -1266,35 +1280,6 @@ impl QpackStream {
     }
 }
 
-/// What an end of one of the peer's QPACK streams means, given `close_reason`.
-///
-/// `detail` says which ending it was, for the message only: RFC 9204 §4.2 makes
-/// a clean finish and a reset the same verdict.
-///
-/// The same rule and the same exemption as [`control_stream_finished`], which
-/// carries the reasoning: a peer tearing a connection down finishes its send
-/// streams and sends CONNECTION_CLOSE in the same breath, and answering an
-/// ordinary goodbye with a protocol error would put a fault in the operator's
-/// log on behalf of a connection there is nothing left to protect.
-fn qpack_stream_ended(
-    detail: String,
-    close_reason: Option<&quinn::ConnectionError>,
-) -> Option<Violation> {
-    if close_reason.is_some() {
-        return None;
-    }
-
-    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
-    //# The sender MUST NOT close either of these streams, and the receiver
-    //# MUST NOT request that the sender close either of these streams.
-    //# Closure of either unidirectional stream type MUST be treated as a
-    //# connection error of type H3_CLOSED_CRITICAL_STREAM.
-    Some(Violation::connection(
-        Code::H3_CLOSED_CRITICAL_STREAM,
-        detail,
-    ))
-}
-
 /// The most continuation bytes an instruction's prefixed integer may run to.
 ///
 /// RFC 9204 §4.1.1 requires decoding integers "up to and including 62 bits
@@ -1361,8 +1346,8 @@ impl QpackProgress {
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
 /// connection error of type H3_CLOSED_CRITICAL_STREAM, and
-/// [`qpack_stream_ended`] reports it, with the one exemption the control stream
-/// makes for the same race: a connection that has already ended is not
+/// [`critical_stream_closed`] reports it, with the one exemption the control
+/// stream makes for the same race: a connection that has already ended is not
 /// disturbed. Both endings count, a clean finish and a reset alike, which is
 /// what §4.2 says.
 async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
@@ -1373,30 +1358,17 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
 
     let mut progress = QpackProgress::default();
 
-    loop {
+    // The two endings §4.2 forbids, as a detail string for
+    // [`critical_stream_closed`]. A read error that is the connection itself
+    // ending needs no arm of its own: `close_reason` is `Some` by then, which
+    // is exactly the exemption.
+    let ended = loop {
         let chunk = match recv.read_chunk(usize::MAX, true).await {
             Ok(Some(chunk)) => chunk,
 
-            // The two endings §4.2 forbids. A read error that is the connection
-            // itself ending needs no arm of its own: `close_reason` is `Some`
-            // by then, which is exactly the exemption.
-            Ok(None) => {
-                let detail = format!("the peer closed its QPACK {} stream", kind.name());
-                if let Some(violation) =
-                    qpack_stream_ended(detail, handle.quic.close_reason().as_ref())
-                {
-                    handle.fail(violation);
-                }
-                return;
-            }
+            Ok(None) => break format!("the peer closed its QPACK {} stream", kind.name()),
             Err(error) => {
-                let detail = format!("the peer reset its QPACK {} stream: {error}", kind.name());
-                if let Some(violation) =
-                    qpack_stream_ended(detail, handle.quic.close_reason().as_ref())
-                {
-                    handle.fail(violation);
-                }
-                return;
+                break format!("the peer reset its QPACK {} stream: {error}", kind.name());
             }
         };
 
@@ -1406,6 +1378,10 @@ async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackSt
                 return;
             }
         }
+    };
+
+    if let Some(violation) = critical_stream_closed(ended, handle.quic.close_reason().as_ref()) {
+        handle.fail(violation);
     }
 }
 
@@ -2358,13 +2334,31 @@ mod tests {
         assert_eq!(reports, vec![1, 2, 4, 8, 1], "each shape speaks for itself");
     }
 
-    /// RFC 9114 §6.2.1 stands while the connection does; once it is over, the
-    /// same FIN is the peer saying goodbye a packet early.
+    /// RFC 9114 §6.2.1 and RFC 9204 §4.2 stand while the connection does; once
+    /// it is over, the same ending is the peer saying goodbye a packet early.
+    ///
+    /// All four endings are listed rather than one of them, because the
+    /// exemption used to be written per call site and the control stream's
+    /// reset was the site that did not have it.
     #[test]
-    fn a_control_stream_fin_is_a_fault_only_while_the_connection_lives() {
-        let violation = control_stream_finished(None).expect("a live connection must report it");
-        assert_eq!(violation.code(), Code::H3_CLOSED_CRITICAL_STREAM);
-        assert!(violation.is_connection_error());
+    fn a_critical_stream_ending_is_a_fault_only_while_the_connection_lives() {
+        let endings = [
+            "the peer closed its control stream",
+            "the peer reset its control stream: reset by peer: code 0",
+            "the peer closed its QPACK encoder stream",
+            "the peer reset its QPACK decoder stream: reset by peer: code 0",
+        ];
+
+        for ending in endings {
+            let violation = critical_stream_closed(ending, None)
+                .expect("a live connection must report every one of them");
+            assert_eq!(violation.code(), Code::H3_CLOSED_CRITICAL_STREAM);
+            assert!(violation.is_connection_error());
+            assert!(
+                violation.to_string().ends_with(ending),
+                "the detail is carried into the message: {violation}"
+            );
+        }
 
         for closed in [
             quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
@@ -2374,10 +2368,13 @@ mod tests {
             quinn::ConnectionError::TimedOut,
             quinn::ConnectionError::LocallyClosed,
         ] {
-            assert!(
-                control_stream_finished(Some(&closed)).is_none(),
-                "a connection already closed by {closed} needs no fault report"
-            );
+            for ending in endings {
+                assert!(
+                    critical_stream_closed(ending, Some(&closed)).is_none(),
+                    "a connection already closed by {closed} needs no fault report for \
+                     {ending:?}"
+                );
+            }
         }
     }
 }
