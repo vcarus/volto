@@ -1017,9 +1017,10 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
 
 /// Keys whose default is written in both places, at the very least.
 ///
-/// Today 23, which is every key on the page that has a default at all: the
-/// three required `[server]` keys have none, and `users` and `initial_rtt_ms`
-/// are live in the example rather than commented with one.
+/// Today 23 of the 25 page keys that print a default: the three required
+/// `[server]` keys print none, and `users` and `initial_rtt_ms` are live in the
+/// example rather than commented with a `# Default:` line, so the gate never
+/// reaches those two.
 const DEFAULT_FLOOR: usize = 20;
 
 /// The `# Default: …` text the example writes above each key, as `(table, key)`.

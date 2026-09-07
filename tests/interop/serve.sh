@@ -107,7 +107,7 @@ wait_until_ready() {
 # failure, including a wrong password, and only the credential-less one is
 # expected here. The private-networks filter stays on the message text, because
 # that warning reaches the log through the generic configuration-warning
-# statement at src/main.rs:266, whose id f9be058r covers every configuration
+# statement in src/main.rs, whose id f9be058r covers every configuration
 # warning there is; keying on it would suppress the rest of them too.
 check_log() {
     local log="$1"

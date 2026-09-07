@@ -319,7 +319,9 @@ pub const DEFAULT_UNANSWERED_PACKET_BUDGET: u32 = 64;
 /// is published in the repository. [`Config::warnings`] reports it, the
 /// installer refuses to install a file that still carries it, and
 /// `config::tests::the_shipped_example_configuration_is_valid` pins that this is
-/// the string the example holds, so the two cannot drift apart.
+/// the string the example holds, so the two cannot drift apart. The installer's
+/// own copy of the string is pinned to this constant by
+/// `it_installer::the_placeholder_password_never_survives`.
 pub const EXAMPLE_PLACEHOLDER_PASSWORD: &str = "replace-me-with-something-long";
 
 /// The complete server configuration.

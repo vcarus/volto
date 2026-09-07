@@ -8,7 +8,7 @@
 //! the peer has lowered `max_datagram_frame_size` under us (D48 §3).
 //!
 //! None of that is visible to a test that only checks the response: the decision
-//! functions behind these lines (`policy::is_dns_blackhole`, `oversize_verdict`)
+//! functions behind these lines (`policy::is_dns_blackhole`, `tunnel::udp::grade`)
 //! are unit-tested and stay green if the line they feed is renamed, demoted, or
 //! bypassed entirely. That last hop is what this binary drives — mutating the
 //! blackhole `info!` into a `warn!` leaves all 19 `it_policy` tests passing.

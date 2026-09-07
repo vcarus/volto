@@ -176,6 +176,18 @@ fn the_placeholder_password_never_survives() {
         "the example placeholder password reached the generated config:\n{text}"
     );
 
+    // The installer's second layer is its own `grep` for the placeholder, a
+    // literal in the script; it is only a layer while it names the same string
+    // the crate does.
+    let script = fs::read_to_string(repo_root().join("script/install-selfsigned.sh"))
+        .expect("the installer script must be readable");
+    assert!(
+        script.contains(&format!("'{EXAMPLE_PLACEHOLDER_PASSWORD}'")),
+        "script/install-selfsigned.sh no longer greps for the crate's placeholder \
+         password {EXAMPLE_PLACEHOLDER_PASSWORD:?}, so its refusal to install a file \
+         that still carries it has drifted from the string the example ships"
+    );
+
     // With no password given, one is generated -- and it is not empty or trivial.
     let config: Config = toml::from_str(&text).expect("parses");
     assert_eq!(config.auth.users.len(), 1);

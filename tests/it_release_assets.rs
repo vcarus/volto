@@ -174,7 +174,8 @@ const MIRROR_CLOSE: &str = "<<< mirrored build step";
 /// files of different lengths, and an offset is wrong the first time either file
 /// grows a line — silently, since a wrong offset still yields *some* text to
 /// compare. The prose above each block differs on purpose and stays outside the
-/// markers; only the step itself has to match.
+/// markers; everything inside them, comments included, has to match byte for
+/// byte.
 fn mirrored_build_step(name: &str) -> String {
     let path = repo_root().join(".github/workflows").join(name);
     let text = read_text(&path);

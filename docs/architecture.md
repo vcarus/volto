@@ -60,14 +60,16 @@ than 1 is refused. A long header that is not an Initial passes, because quinn
 drops those for an unknown connection without a word. An Initial in a datagram
 below 1200 bytes passes for the same reason: RFC 9000 §14.1 has the server
 discard it, and quinn does, silently. What is left is an Initial that could start
-a connection, and that one is opened: the keys for it are derived from the
-Destination Connection ID in the packet itself (RFC 9001 §5.2), so no connection
-state is needed to read it. That it opens at all says it is a client's *first*
-Initial, because only a first Initial is keyed that way, and RFC 9000 §7.2 gives
-a first Initial a Destination Connection ID of at least eight bytes — every
-later one is addressed by the eight bytes this endpoint chose, and so is the one
-a Retry supplies. A shorter one is refused here, which is the `CONNECTION_CLOSE`
-above never sent. Otherwise its CRYPTO frames are assembled from offset zero,
+a connection. Its Destination Connection ID is judged first, on the header alone
+and before any decryption: RFC 9000 §7.2 gives a client's first Initial a
+Destination Connection ID of at least eight bytes, every later Initial of an
+admitted handshake is addressed by the eight bytes this endpoint chose, and so is
+the one a Retry supplies, so nothing legitimate is shorter. quinn applies the
+same floor ahead of its own decryption, in `early_validate_first_packet`. A
+shorter one is refused here, which is the `CONNECTION_CLOSE` above never sent.
+The packet is then opened: the keys for it are derived from the Destination
+Connection ID in the packet itself (RFC 9001 §5.2), so no connection state is
+needed to read it. Its CRYPTO frames are assembled from offset zero,
 the ClientHello is parsed, and the `server_name` extension (RFC 6066 §3) is
 compared with the configured list — ASCII case-insensitively, with a trailing
 root dot ignored, name for name and no wildcards.

@@ -1055,7 +1055,7 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
 /// How much of a `remaining`-byte frame the chunk in hand settles, and what is
 /// left of the frame after it.
 ///
-/// One function for the DATA arm and the Skipping arm of [`FrameDecoder::next`],
+/// One function for the DATA arm and the Skipping arm of [`FrameDecoder::next_item`],
 /// which compute the same thing: DATA hands the bytes out and Skipping throws
 /// them away, and neither may run past the frame it is in. Written here so the
 /// conversion and the argument for it are in one place rather than two.

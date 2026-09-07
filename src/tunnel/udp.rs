@@ -242,13 +242,13 @@ struct Session<'a> {
     ///
     /// The drops themselves are per packet and can arrive at line rate, so a
     /// line each would be the flood [`crate::logfmt::Sampler`] exists to stop;
-    /// see [`oversize_verdict`]. One sampler per session, so a session cannot
+    /// see [`grade`]. One sampler per session, so a session cannot
     /// spend a quiet neighbour's allowance.
     oversize_drops: crate::logfmt::Sampler,
     /// How many send-buffer evictions this session has had, likewise.
     ///
     /// The same shape and the same reason as `oversize_drops`: see
-    /// [`send_buffer_verdict`].
+    /// [`grade`].
     evictions: crate::logfmt::Sampler,
     /// When this session becomes idle enough to close.
     ///

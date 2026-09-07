@@ -394,8 +394,9 @@ Some details worth knowing before relying on it:
   Naming several hosts means volto answers to all of them with the same
   certificate, so they all have to be on it.
 - **A packet that names nobody can still draw an acknowledgement.** The check
-  refuses a first Initial whose Destination Connection ID is under the eight
-  bytes RFC 9000 §7.2 requires, since no client's first packet is that shape;
+  refuses an Initial whose Destination Connection ID is under the eight bytes
+  RFC 9000 §7.2 requires of a client's first packet, since no later one is that
+  shape either and quinn applies the same floor before decrypting;
   what it passes, it passes to quinn, which acknowledges an Initial carrying an
   ack-eliciting frame whether or not a name is in it. Sending one means building
   a QUIC Initial packet on purpose, which is a probe aimed at this server rather

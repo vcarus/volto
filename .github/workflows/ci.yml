@@ -61,9 +61,18 @@ jobs:
       # tests/interop/serve.sh and tests/replay/lossy-lab.sh; a quoting bug in
       # serve.sh breaks the only independent judge of src/h3 and no gate would
       # say why. Listed by `git ls-files` so a new script is covered when it
-      # arrives rather than when somebody remembers.
+      # arrives rather than when somebody remembers. Floor first, the way the
+      # other readers in this file judge: five scripts today, and a listing that
+      # comes back short says so instead of linting whatever it found.
       - name: shellcheck
-        run: shellcheck $(git ls-files '*.sh')
+        run: |
+          set -euo pipefail
+          scripts="$(git ls-files '*.sh')"
+          count="$(printf '%s\n' "$scripts" | grep -c .)"
+          [ "$count" -ge 4 ] ||
+            { echo "::error::git ls-files '*.sh' listed ${count} scripts where the tree carries five; this step is broken, not the scripts" >&2; exit 1; }
+          # shellcheck disable=SC2086
+          shellcheck $scripts
 
   clippy:
     name: clippy

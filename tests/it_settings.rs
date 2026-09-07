@@ -427,7 +427,7 @@ fn settings_frame() -> Vec<u8> {
 /// What the repetition costs is nothing but the round trips. The client's
 /// control stream is opened and written before the request, `serve_peer` has
 /// been reading it since before the CONNECT arrived, and the flag it writes is
-/// the very one each reply reads (`crate::h3::connection`'s module
+/// the very one each reply reads (`volto::h3::connection`'s module
 /// documentation), so round 0's answer -- which comes back only after a full
 /// round trip out to the target and home -- is already on the far side of that
 /// moment. The rounds stay five because nothing on the wire tells the two
