@@ -20,6 +20,7 @@ credentials arrive in the environment. Nothing here starts a server.
 
 import asyncio
 import base64
+import inspect
 import os
 import sys
 
@@ -415,6 +416,10 @@ async def test_denied_target_is_refused_with_proxy_status():
             raise AssertionError(f"CONNECT-UDP to port {DENIED_PORT} succeeded")
 
 
+# Written out rather than derived, because the order is the reading order: the
+# two tunnel kinds first, then the two isolation checks, then the three edge
+# cases. `check_tests_are_accounted_for` is what makes the hand-written list
+# safe.
 TESTS = [
     test_tcp_tunnel_round_trips,
     test_tcp_tunnels_do_not_cross_talk,
@@ -426,7 +431,49 @@ TESTS = [
 ]
 
 
+def check_tests_are_accounted_for():
+    """TESTS names every test in this file, and nothing that is not one.
+
+    This suite is its own runner rather than a discovery-based one: the Go half
+    is driven by `go test`, which finds every `TestXxx` by itself, and nothing
+    here does that. A `test_*` added to the file and not added to `TESTS` would
+    simply never run, silently, on the half that carries the whole independent
+    coverage of the plain CONNECT path.
+
+    Both directions, because either one alone passes over an empty scan: a
+    coroutine defined here that the list does not name, and a name on the list
+    that this module does not define, which is what a rename leaves behind. Same
+    latch as `it_docs.every_page_under_docs_is_read_or_exempt_by_name` in the
+    Rust suite, for the same reason.
+    """
+    defined = {
+        name
+        for name, value in globals().items()
+        if name.startswith("test_") and inspect.iscoroutinefunction(value)
+    }
+    listed = [test.__name__ for test in TESTS]
+
+    if not TESTS:
+        sys.exit("TESTS is empty, so this suite would pass having run nothing")
+
+    unlisted = sorted(defined - set(listed))
+    if unlisted:
+        sys.exit(
+            f"these tests are defined in {os.path.basename(__file__)} and are not "
+            f"in TESTS, so they never run: {unlisted}"
+        )
+
+    missing = sorted(set(listed) - defined)
+    if missing:
+        sys.exit(f"TESTS names tests this module does not define: {missing}")
+
+    duplicated = sorted({name for name in listed if listed.count(name) > 1})
+    if duplicated:
+        sys.exit(f"TESTS names the same test more than once: {duplicated}")
+
+
 async def main():
+    check_tests_are_accounted_for()
     failures = 0
     for test in TESTS:
         print(f"=== {test.__name__}")

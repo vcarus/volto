@@ -355,6 +355,18 @@ jobs:
           pip install -r tests/interop/aioquic/requirements.txt
           python tests/interop/aioquic/interop_test.py
 
+      # Both suites green is not the whole claim. This job is the only
+      # independent judge of src/h3, because the in-tree test client is built on
+      # volto::h3, and until now it only printed the server log for a human who
+      # was not going to read it, under an `if: always()` step whose output
+      # nothing judges. A regression that both foreign clients tolerate while
+      # the server logs an error went green here. The filter is the one
+      # ./run-local.sh has always applied, moved into the shared fixture so both
+      # callers use the same list. Before the teardown, so a failure here still
+      # gets the log printed by the step below.
+      - name: The server log is clean
+        run: tests/interop/serve.sh check interop/server.log
+
       # Runs even when an earlier step failed, including before the server was
       # started, so neither file is assumed to exist. The log is the half of a
       # failure the Go client cannot see: it says which request was refused and

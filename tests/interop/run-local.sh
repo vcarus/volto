@@ -12,9 +12,11 @@
 # only when requirements.txt changes.
 #
 # Needs: go (version per ../go.mod), python3, openssl. Exits non-zero on the
-# first failing suite, and finishes by holding the server log to the same two
-# permitted warnings the ops runbook allows (the private-networks notice from
-# this config, and the 407 the missing-credentials test draws on purpose).
+# first failing suite, and finishes by handing the server log to
+# `./serve.sh check`, which holds it to the two permitted warnings the ops
+# runbook allows (the private-networks notice from this config, and the 407 the
+# missing-credentials test draws on purpose). That check is in the fixture
+# rather than here so the CI job runs the same one.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -57,17 +59,9 @@ if [ ! -x "$VENV/bin/python" ] \
 fi
 "$VENV/bin/python" "$ROOT/tests/interop/aioquic/interop_test.py"
 
-# The ops runbook's final step, automated: the only WARN the server may have
-# written are the private-networks notice this config asks for and the
-# missing-credentials 407 one test draws on purpose. Anything else -- or any
-# ERROR -- is a finding, even with both suites green.
-UNEXPECTED=$(grep -E ' (WARN|ERROR) ' "$WORK/server.log" \
-    | grep -v "allow_private_networks is on" \
-    | grep -v 'authentication failed.*reason="no credentials"' || true)
-if [ -n "$UNEXPECTED" ]; then
-    echo "unexpected WARN/ERROR in the server log:" >&2
-    echo "$UNEXPECTED" >&2
-    exit 1
-fi
+# The ops runbook's final step, automated, from the fixture the CI job calls
+# too. It used to live here, which is why the `interop` job never made it: the
+# job is the only independent judge of src/h3, and it was the weaker of the two.
+"$ROOT/tests/interop/serve.sh" check "$WORK/server.log"
 
-echo "interop: both suites green, server log clean ($WORK/server.log)"
+echo "interop: both suites green"
