@@ -59,6 +59,8 @@ users = [
 # Each costs one file descriptor, so this and systemd's LimitNOFILE are two halves
 # of the same budget: volto warns at startup if RLIMIT_NOFILE leaves no margin.
 # Requests beyond it get 503 with `Proxy-Status: volto; error=connection_limit_reached`.
+# Range 1..65536, the same ceiling max_streams_bidi has: one tunnel is one
+# bidirectional stream. A value outside it is refused at startup.
 # Default: 256
 #max_targets_per_conn = 256
 
@@ -250,10 +252,13 @@ initial_rtt_ms = 150
 [security]
 # Allow tunnels to the address space RFC 6890 marks special-purpose.
 #
-# That is loopback, RFC 1918, link-local, shared address space (100.64.0.0/10,
-# the inside of a carrier-grade NAT), IETF protocol assignments (192.0.0.0/24),
-# benchmarking (198.18.0.0/15), reserved space (240.0.0.0/4), the documentation
-# ranges, ULA, the deprecated site-local fec0::/10, 2001:db8::/32 and 100::/64.
+# That is "this host on this network" (0.0.0.0/8), loopback, RFC 1918,
+# link-local, shared address space (100.64.0.0/10, the inside of a carrier-grade
+# NAT), IETF protocol assignments (192.0.0.0/24), benchmarking (198.18.0.0/15 and
+# 2001:2::/48), 6to4 relay anycast (192.88.99.0/24), reserved space (240.0.0.0/4),
+# the documentation ranges, ULA, ORCHID (2001:10::/28), the deprecated site-local
+# fec0::/10, the deprecated IPv4-compatible ::/96 (stacks that still honour it
+# route ::127.0.0.1 to loopback), 2001:db8::/32 and 100::/64.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust
@@ -281,6 +286,12 @@ initial_rtt_ms = 150
 # Stops a client using the proxy as a reflector or a port scanner. The first reply
 # from the target lifts the limit for the rest of the session, so this only ever
 # bites on one-way floods. 0 disables the mitigation entirely (warned about).
+#
+# The CONNECTION carries a total of its own, `CONNECTION_UNANSWERED_MULTIPLIER` = 8
+# times this value (512 packets at the default), spent by every session on it that
+# sends into silence and given back only by a session whose target answers; a
+# session that finds the total spent is closed rather than left running and muted.
+# 0 switches both halves off.
 # Default: 64
 #unanswered_packet_budget = 64
 

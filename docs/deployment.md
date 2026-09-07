@@ -398,8 +398,11 @@ See [`[log]`](configuration.md#log) for the rest of the line format.
 
 When a problem needs reporting rather than reading, `volto --diagnostics
 --config /etc/volto/config.toml` prints the version, the parsed configuration
-with passwords redacted, this process's descriptor limits, the UDP buffer
-sysctls and the kernel, in one paste. See [collecting a support
+with passwords redacted, descriptor limits, the UDP buffer sysctls and the
+kernel, in one paste. The descriptor limits are those of the process that ran
+the command, so from an SSH shell they are the shell's and not the service's;
+read `/proc/<MainPID>/limits` for the service, with the pid from `systemctl show
+-p MainPID volto`. See [collecting a support
 bundle](configuration.md#collecting-a-support-bundle).
 
 ## Firewall

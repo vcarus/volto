@@ -515,18 +515,41 @@ fn quoted_value(rest: &str) -> Option<u64> {
 
 /// One `` `IDENT` = value `` quote, and where it was found.
 struct Quote {
-    page: &'static str,
+    /// The source's path relative to the repository root.
+    source: String,
     line: usize,
     name: String,
     value: Option<u64>,
 }
 
-/// Every constant quote on the doc pages.
+/// Every constant quote on the doc pages and in the example configuration.
+///
+/// The example is read too, and not only the pages: it is the file that lands on
+/// the host and the one most operators read, so a number it quotes from the crate
+/// has to be the crate's number for the same reason a page's does. Nothing in it
+/// used the notation until `CONNECTION_UNANSWERED_MULTIPLIER` arrived in the
+/// `unanswered_packet_budget` comment, and this is what makes that quote a claim
+/// rather than a copy. `prose_lines` drops fenced blocks, of which a TOML file has
+/// none, so every line of it is read.
 fn quotes() -> Vec<Quote> {
     let mut found = Vec::new();
 
-    for page in DOC_PAGES {
-        let text = read_text(&doc_path(page));
+    let sources = DOC_PAGES
+        .map(doc_path)
+        .into_iter()
+        .chain([repo_root().join("script/config.example.toml")]);
+
+    for source in sources {
+        let named = if source.extension().is_some_and(|kind| kind == "toml") {
+            "script/config.example.toml".to_owned()
+        } else {
+            let name = DOC_PAGES
+                .into_iter()
+                .find(|name| source.ends_with(name))
+                .expect("every markdown source is one of DOC_PAGES");
+            format!("docs/{name}")
+        };
+        let text = read_text(&source);
         for (line, content) in prose_lines(&text) {
             let mut rest = content;
             while let Some(open) = rest.find('`') {
@@ -546,7 +569,7 @@ fn quotes() -> Vec<Quote> {
                     let parsed = quoted_value(value);
                     if parsed.is_some() {
                         found.push(Quote {
-                            page,
+                            source: named.clone(),
                             line,
                             name: name.to_owned(),
                             value: parsed,
@@ -577,28 +600,29 @@ fn every_constant_quoted_in_the_docs_matches_the_crate() {
     let quoted: BTreeSet<&str> = quotes.iter().map(|quote| quote.name.as_str()).collect();
     assert!(
         quoted.len() >= CONSTANT_FLOOR,
-        "only {} distinct constants are quoted in docs/ ({quoted:?}); the reader \
-         is broken, or the notation `IDENT` = value has been edited away",
+        "only {} distinct constants are quoted in docs/ and the example \
+         ({quoted:?}); the reader is broken, or the notation `IDENT` = value has \
+         been edited away",
         quoted.len()
     );
 
     for quote in &quotes {
         let Quote {
-            page,
+            source,
             line,
             name,
             value,
         } = quote;
         let actual = constants.get(name.as_str()).unwrap_or_else(|| {
             panic!(
-                "docs/{page}:{line} quotes `{name}`, which is not a constant this \
+                "{source}:{line} quotes `{name}`, which is not a constant this \
                  gate knows; add it to `crate_constants` or fix the name"
             )
         });
         let value = value.expect("only parsed quotes are collected");
         assert_eq!(
             value, *actual,
-            "docs/{page}:{line} says `{name}` = {value}, the crate says {actual}"
+            "{source}:{line} says `{name}` = {value}, the crate says {actual}"
         );
     }
 }

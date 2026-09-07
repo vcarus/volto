@@ -51,7 +51,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `udp_session_timeout` | seconds | `180` | Idle timeout for a UDP session, where idle means no packet crossed the proxy in either direction: a payload reaching the target or the target answering re-arms it, while bytes that complete nothing — a capsule still being assembled or skipped, packets a budget or a full queue dropped — do not, so a peer cannot hold a session's socket and buffers open by dripping. RFC 9298 §3.1 says a proxy SHOULD NOT go below 120 (volto warns if you do), and the ceiling is 3600. Also bounds each write in a half-closed TCP tunnel's surviving direction: one that does not complete within it cuts the tunnel, while a half-closed tunnel parked in a read is left alone (see the architecture doc) |
-| `max_targets_per_conn` | integer | `256` | Concurrent tunnels on one QUIC connection, TCP and UDP sharing the budget. Beyond it, requests get 503 with `Proxy-Status: volto; error=connection_limit_reached` |
+| `max_targets_per_conn` | integer | `256` | Concurrent tunnels on one QUIC connection, TCP and UDP sharing the budget. Beyond it, requests get 503 with `Proxy-Status: volto; error=connection_limit_reached`. Range 1..65536, the same ceiling `max_streams_bidi` has and for the same reason: one tunnel is one bidirectional stream, and every tunnel also costs a file descriptor |
 | `max_connections` | integer | `256` | Simultaneously open QUIC connections; `0` removes the limit and never evicts. At the cap a new connection takes the slot of the oldest connection that has never had a request pass the credentials check — closed with `H3_NO_ERROR` and logged with `reason=evicted` — so a peer that keeps handshaking without ever authenticating cannot hold the server shut. Only a newcomer whose address QUIC has validated may evict: at the cap an unvalidated one is answered with a Retry (RFC 9000 §8.1) and takes no slot, which costs a spoofed Initial the flood it was for. A client that has connected before pays nothing — it returns a NEW_TOKEN token (RFC 9000 §8.1.3) and is already validated — so the extra round trip falls on first contact, on a token older than two weeks, and on the first reconnection after a restart or `SIGHUP`, and only while the server is full. Only when every live connection has authenticated is the newcomer refused during the handshake, before any per-connection state exists here |
 | `connect_timeout` | seconds | `10` | Budget for reaching a target; `0` disables it, and the ceiling is 3600. Spent twice per request and separately — once on name resolution, once on the whole list of addresses it resolved to — so a request holds its tunnel slot for at most twice this before any byte flows. A lookup that runs out answers 504 with `Proxy-Status: volto; error=dns_timeout`, a connect that runs out answers 504 with `error=connection_timeout` |
 | `ip_family_preference` | string | `"ipv4"` | Which address family a resolved target name is tried on first: `ipv4`, `ipv6` or `system` (the resolver's own RFC 6724 order). Applies to both tunnel kinds |
@@ -287,7 +287,7 @@ family, an IP literal above all, is unaffected by any of the three.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: "this host on this network" (`0.0.0.0/8`), loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15` and `2001:2::/48`), 6to4 relay anycast (`192.88.99.0/24`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, ORCHID (`2001:10::/28`), the deprecated site-local `fec0::/10`, `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
+| `allow_private_networks` | bool | `false` | Allow tunnels to address space RFC 6890 marks special-purpose: "this host on this network" (`0.0.0.0/8`), loopback, RFC 1918, link-local, shared address space (`100.64.0.0/10`), IETF protocol assignments (`192.0.0.0/24`), benchmarking (`198.18.0.0/15` and `2001:2::/48`), 6to4 relay anycast (`192.88.99.0/24`), reserved (`240.0.0.0/4`), the documentation ranges, ULA, ORCHID (`2001:10::/28`), the deprecated site-local `fec0::/10`, the deprecated IPv4-compatible `::/96` (stacks that still honour it route `::127.0.0.1` to loopback, which would otherwise be a second way around the IPv4 rules), `2001:db8::/32` and `100::/64`. Keep it off on a public deployment |
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
@@ -428,6 +428,25 @@ the log usable for confirming which authorization header a client actually sends
 A keylog file decrypts **every** session through the proxy, including sessions
 already recorded. Turn it off and delete the file when you are done.
 
+Under the shipped unit it writes nowhere. `ProtectSystem=strict` with
+`ReadOnlyPaths=/etc/volto` and no `ReadWritePaths=` leaves the service no
+writable path but its own `PrivateTmp=yes` directory, and rustls reports the
+failure to open once and carries on, so the operator gets a server that started,
+a startup warning saying the keylog is on, and no file. Give it a directory and
+a path with a drop-in:
+
+```ini
+# /etc/systemd/system/volto.service.d/keylog.conf
+[Service]
+Environment=SSLKEYLOGFILE=/var/lib/volto/keylog
+ReadWritePaths=/var/lib/volto
+```
+
+after `sudo install -d -o volto -g volto -m 0700 /var/lib/volto`, then
+`systemctl daemon-reload` and restart. Remove the drop-in and the directory
+together with `keylog = false` when the session is over: the file is every
+secret the proxy has negotiated since it was created.
+
 Under systemd, volto prefixes each line with a syslog priority (`<3>` for ERROR,
 `<4>` for WARN, `<6>` for INFO, `<7>` for DEBUG and TRACE). journald parses that
 prefix, strips it, and files the record with the matching `PRIORITY`, so
@@ -511,10 +530,10 @@ of questions about, and exits 0. In order: the version of the binary that
 printed it; the configuration file's path and every table of it as this binary
 parsed it, after defaults, so `[limits]` and `[security]` are the values the
 server would actually run on rather than the subset the file happens to name;
-the warnings `--check-config` prints; the process's `RLIMIT_NOFILE`, soft and
-hard, since the hard limit is what says whether a soft one that is too low can
-be raised here at all or needs the unit changed; the four `net.core` UDP buffer
-sysctls named under [UDP socket
+the warnings `--check-config` prints; the descriptor limits of **the process
+that ran the command**, soft and hard, since the hard limit is what says whether
+a soft one that is too low can be raised here at all or needs the unit changed;
+the four `net.core` UDP buffer sysctls named under [UDP socket
 buffers](deployment.md#udp-socket-buffers), read from `/proc/sys` on Linux and
 reported as unavailable on any other platform; and `uname -srm`.
 
@@ -523,6 +542,12 @@ reported as unavailable on any other platform; and `uname -srm`.
 produces, so the output is safe to paste into an issue. Read it before pasting
 anyway: the rest of the configuration is there in full, host names and listen
 address included.
+
+**The descriptor limits are this command's, not the service's.** Run from an SSH
+shell the figures are that shell's, which is how 1024 and 1048576 came to be
+recorded for two hosts running the service at 131072. For the running service,
+read `/proc/<MainPID>/limits`, with the pid from `systemctl show -p MainPID
+volto`.
 
 Nothing is bound, connected or resolved, nothing is written, and no journal is
 read, so this asks for no more privilege than reading the configuration file
