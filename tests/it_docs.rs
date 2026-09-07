@@ -9,7 +9,7 @@
 //! sentence, never that the sentence is true. This binary asks the three
 //! questions about prose that a machine can actually answer.
 //!
-//! # The four gates
+//! # The five gates
 //!
 //! 1. **Configuration keys are one set, counted from both ends.** Every key
 //!    `script/config.example.toml` assigns -- live or commented as
@@ -28,8 +28,11 @@
 //!    appears in `docs/deployment.md`'s `## systemd` section and again in
 //!    `script/masque.service`'s header comment, and the two command sequences
 //!    have to be the same one.
+//! 5. **A default written twice is written once.** The `# Default: X` line the
+//!    example writes above each optional key and the Default column of the
+//!    page's reference table are the same value.
 //!
-//! The set those four read is itself accounted for. Every `*.md` under `docs/`
+//! The set those five read is itself accounted for. Every `*.md` under `docs/`
 //! is either in `DOC_PAGES` or exempt by name in `EXEMPT`, so a page added
 //! without a decision fails here rather than going unread, the way a new file
 //! under `src/` fails `it_log_lines` by default.
@@ -75,7 +78,9 @@
 //! already owns the other two corners of the same triangle: the example against
 //! `Config`'s fields, and every `# Default: N` in it against the compiled
 //! default. This binary adds `docs/` as the third corner and does not repeat
-//! either of those. `tests/it_bounds.rs` weighs the memory figures
+//! either of those; gate 5 is the edge that closes it, since a Default column
+//! is a table cell rather than the `` `IDENT` = value `` notation gate 2 reads
+//! and was pinned by nothing before. `tests/it_bounds.rs` weighs the memory figures
 //! `docs/configuration.md` quotes; gate 2 here is what makes its claim that
 //! "`docs/configuration.md` quotes the same numbers" mechanical.
 
@@ -1004,4 +1009,183 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
             source.display()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gate 5: the defaults the example promises and the page prints
+// ---------------------------------------------------------------------------
+
+/// Keys whose default is written in both places, at the very least.
+///
+/// Today 23, which is every key on the page that has a default at all: the
+/// three required `[server]` keys have none, and `users` and `initial_rtt_ms`
+/// are live in the example rather than commented with one.
+const DEFAULT_FLOOR: usize = 20;
+
+/// The `# Default: …` text the example writes above each key, as `(table, key)`.
+///
+/// The convention is the one the file keeps everywhere: the line immediately
+/// above the assignment, live or commented. Anything further up is prose about
+/// the key, which is why only the line directly above counts.
+///
+/// The text is taken whole rather than cut at the first word: `alpn` writes
+/// `["h3"], which is what Surge speaks`, and cutting it would need a rule about
+/// where a value ends that this file would then have to keep.
+fn example_defaults() -> BTreeMap<(String, String), String> {
+    let path = repo_root().join("script/config.example.toml");
+    let text = read_text(&path);
+
+    let mut defaults = BTreeMap::new();
+    let mut table = String::new();
+    let mut previous = "";
+
+    for line in text.lines() {
+        // The same reading `example_keys` uses: `#key = value` is a commented
+        // key, `# sentence` is prose.
+        let code = match line.strip_prefix('#') {
+            Some(rest) if rest.starts_with(' ') || rest.is_empty() => line,
+            Some(rest) => rest,
+            None => line,
+        };
+
+        if let Some(name) = code
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            table = name.to_owned();
+        } else if let Some(key) = assigned_key(code)
+            && let Some(stated) = previous.strip_prefix("# Default: ")
+        {
+            defaults.insert((table.clone(), key.to_owned()), stated.trim().to_owned());
+        }
+
+        previous = line;
+    }
+
+    defaults
+}
+
+/// The Default column of `docs/configuration.md`, as `(table, key)`.
+///
+/// `None` for a row whose Default cell is not a backticked value, which is how
+/// the three required `[server]` keys, whose cell reads `required`, stay out of
+/// the comparison rather than being compared against nothing.
+fn documented_defaults() -> BTreeMap<(String, String), Option<String>> {
+    let text = read_text(&doc_path("configuration.md"));
+    let mut defaults = BTreeMap::new();
+    let mut table: Option<String> = None;
+
+    for (_, line) in prose_lines(&text) {
+        if let Some(heading) = line.strip_prefix("## ") {
+            table = heading
+                .trim()
+                .strip_prefix("`[")
+                .and_then(|rest| rest.strip_suffix("]`"))
+                .map(str::to_owned);
+            continue;
+        }
+
+        let (Some(table), true) = (table.as_ref(), line.starts_with("| `")) else {
+            continue;
+        };
+
+        // Only the first four fields are read, so whatever the Meaning cell
+        // holds -- a table pipe of its own included -- cannot move the columns
+        // this gate looks at.
+        let cells: Vec<&str> = line.splitn(5, '|').collect();
+        let [_, key, _, default, ..] = cells.as_slice() else {
+            continue;
+        };
+        let Some((key, _)) = key.trim().strip_prefix('`').and_then(|r| r.split_once('`')) else {
+            continue;
+        };
+        if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+            continue;
+        }
+
+        let default = default
+            .trim()
+            .strip_prefix('`')
+            .and_then(|rest| rest.strip_suffix('`'))
+            .map(str::to_owned);
+        defaults.insert((table.clone(), key.to_owned()), default);
+    }
+
+    defaults
+}
+
+/// The default the example promises is the default the page prints.
+///
+/// This is the numeric half of the duplication between the two files made
+/// self-checking. Every key is described twice at length, and until now
+/// `it_docs` pinned only that the two key *sets* are equal, so a default
+/// changed in one file and not the other was invisible; that is the drift the
+/// 2026-09-07 review found in the `allow_private_networks` and
+/// `unanswered_packet_budget` comments.
+///
+/// It closes the last edge of a triangle. `src/config.rs`'s
+/// `the_example_documents_every_key_and_pins_every_default` holds the example's
+/// own values to the compiled defaults, and gate 2 above holds the constants the
+/// pages quote to the crate; the page's Default column was pinned by nothing,
+/// because a table cell is not the `` `IDENT` = value `` notation gate 2 reads.
+/// With this edge the column is the example's promise, which is the crate's
+/// value.
+///
+/// What it does not reach: the `# Default:` comment text is compared against the
+/// page and not against the value beside it, which is the one thing
+/// `src/config.rs` holds. The three keys the example deliberately sets away from
+/// their defaults (`initial_mtu`, `mtu_upper_bound`, `initial_rtt_ms`) are why
+/// that comparison cannot be made unconditionally.
+#[test]
+fn every_default_the_example_promises_is_the_default_the_page_prints() {
+    let promised = example_defaults();
+    let printed = documented_defaults();
+
+    assert!(
+        promised.len() >= DEFAULT_FLOOR,
+        "only {} `# Default:` lines were read out of script/config.example.toml; \
+         the reader is broken, not the file",
+        promised.len()
+    );
+
+    let mut compared = 0;
+    for ((table, key), stated) in &promised {
+        let cell = printed
+            .get(&(table.clone(), key.clone()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "script/config.example.toml gives [{table}].{key} a default and \
+                 docs/configuration.md has no row for it. The key sets are one \
+                 set, so this is a row that moved out from under its heading"
+                )
+            });
+        let cell = cell.as_ref().unwrap_or_else(|| {
+            panic!(
+                "script/config.example.toml says [{table}].{key} defaults to \
+                 {stated:?}, and docs/configuration.md's Default column for it \
+                 carries no value. One of the two is wrong about whether this key \
+                 has a default"
+            )
+        });
+
+        // Either the whole line is the value, or the value followed by a comma
+        // and a sentence about it, which is how `alpn` writes its own. A bare
+        // prefix test would let `2560` pass for `256`; the comma is the boundary.
+        let agrees = stated == cell || stated.starts_with(&format!("{cell},"));
+        assert!(
+            agrees,
+            "docs/configuration.md prints `{cell}` as the default of \
+             [{table}].{key}, and script/config.example.toml promises \
+             {stated:?}. The example is the file that lands on the host and the \
+             page is the one an operator reads first; they cannot say different \
+             numbers"
+        );
+        compared += 1;
+    }
+
+    assert!(
+        compared >= DEFAULT_FLOOR,
+        "only {compared} defaults were actually compared; the reader is broken, \
+         not the tree"
+    );
 }
