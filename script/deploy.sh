@@ -346,9 +346,10 @@ else
         # VOLTO_DEPLOY_ROOT prefixes every path this script decides; the
         # installer has the same seam under its own name, and without this the
         # first-install branch of a run with the deploy root set would write to
-        # the real /etc and /usr/local. Exported around the call rather than for
-        # the whole script, so the two seams compose and nothing else inherits
-        # it. Empty in every real run, which is what the two variables mean.
+        # the real /etc and /usr/local. Set on the call itself rather than
+        # exported for the whole script, so the two seams compose and nothing
+        # else inherits it. Empty in every real run, which is what the two
+        # variables mean.
         VOLTO_INSTALL_ROOT="$ROOT" \
             bash "$SRC/script/install-selfsigned.sh" --binary "$SRC/volto" \
             ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}

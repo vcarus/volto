@@ -101,7 +101,8 @@ wait_until_ready() {
 # purpose. Anything else at WARN, and any ERROR at all, is a finding.
 #
 # The authentication filter is keyed by log_id, which D100's 2026-09-05 addendum
-# makes the stable half of a line. 3gmzhaq7 is the statement at src/conn.rs:503.
+# makes the stable half of a line. 3gmzhaq7 is the "authentication failed"
+# statement in src/conn.rs.
 # The `reason=` field stays in the pattern: the id covers every authentication
 # failure, including a wrong password, and only the credential-less one is
 # expected here. The private-networks filter stays on the message text, because

@@ -6,8 +6,8 @@
 //! every production log statement, `it_clock` over the wall clock -- and prose
 //! was the one part of the tree with no such reader. `cargo doc` covers the
 //! rustdoc, but that is a *structural* gate: it proves every public item has a
-//! sentence, never that the sentence is true. This binary asks the three
-//! questions about prose that a machine can actually answer.
+//! sentence, never that the sentence is true. This binary asks the questions
+//! about prose that a machine can actually answer.
 //!
 //! # The five gates
 //!
