@@ -239,10 +239,10 @@ async fn connect_udp_binds_a_socket_to_the_preferred_family() {
 ///
 /// The equality below is the weaker half and is kept for what it does check.
 /// `localhost_is_dual_stack` and the expression it is compared against are the
-/// same predicate — a `SocketAddr` is either V4 or V6, so "two distinct
-/// `is_ipv6` answers" and "one of each" cannot disagree over one list — but the
-/// two run over separate `lookup_host` calls, so what it catches is a resolver
-/// that answers differently twice in a row.
+/// same predicate, since a `SocketAddr` is either V4 or V6 and so "two distinct
+/// `is_ipv6` answers" and "one of each" cannot disagree over one list. What is
+/// left for it to catch is that the two run over separate `lookup_host` calls,
+/// so a resolver that answers differently twice in a row fails it.
 #[tokio::test]
 async fn the_environment_probe_agrees_with_the_resolver() {
     let addresses: Vec<SocketAddr> = match tokio::net::lookup_host(("localhost", 443)).await {

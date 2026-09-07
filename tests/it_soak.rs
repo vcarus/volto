@@ -78,10 +78,10 @@
 //! `common::udp_round_trip` to reach every site, which is where it must not go:
 //! `it_close_log`, `it_os_faults` and `it_policy` all assert exact drop counts
 //! through that helper, and a resend moves them. A payload-matched round trip
-//! private to this file would work — it would have to match on the payload
-//! rather than take the first datagram, or a late arrival would be consumed by
-//! the following exchange — and it is not worth the second implementation of
-//! the same helper for one unreproduced loss. This paragraph is the mitigation
+//! private to this file would work. It would have to match on the payload rather
+//! than take the first datagram, or a late arrival would be consumed by the
+//! following exchange, and it is not worth the second implementation of the same
+//! helper for one unreproduced loss. This paragraph is the mitigation
 //! (review L15).
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
