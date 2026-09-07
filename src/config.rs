@@ -973,6 +973,11 @@ impl Config {
     /// tracing subscriber exists — a warning logged during `load()` would be
     /// written to a subscriber that has not been installed yet, i.e. nowhere —
     /// and so they can be asserted on in tests.
+    ///
+    /// This opens and parses `server.cert` when `security.expected_sni` is not
+    /// empty, so it is a blocking file read and not only a walk over the parsed
+    /// configuration. `ReloadHandle::reload` calls it before it takes the
+    /// `ConfigSwap` guard for that reason.
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -1007,10 +1012,14 @@ impl Config {
         // threaded through because this runs before the TLS configuration
         // exists at startup and again on every reload; one that cannot be read
         // is left for the bind to refuse, loudly.
+        //
+        // `load_certs` refuses an empty chain, so the leaf is always there;
+        // asking for it rather than indexing at zero keeps that reliance local.
         if !self.security.expected_sni.is_empty()
             && let Ok(certs) = crate::tls::load_certs(&self.server.cert)
+            && let Some(leaf) = certs.first()
         {
-            for name in crate::tls::names_not_covered(&certs[0], &self.security.expected_sni) {
+            for name in crate::tls::names_not_covered(leaf, &self.security.expected_sni) {
                 warnings.push(format!(
                     "security.expected_sni names \"{name}\", which server.cert = {} does not \
                      cover: a client that verifies the certificate by that name fails its \

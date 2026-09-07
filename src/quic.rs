@@ -1312,11 +1312,17 @@ impl ReloadHandle {
         let quic_config = server_config(&config)
             .context("the new configuration's certificate and key are not usable")?;
 
+        // Rendered before the guard is taken, because it opens and parses
+        // `server.cert` a second time (see `Config::warnings`), and the guard
+        // is the one `Server::accept_under_the_swap` takes for every connection
+        // it accepts. The strings are logged after the swap, where they were.
+        let warnings = config.warnings();
+
         // Everything from the latch read to the last write is one step, and the
         // drain takes the same lock around its own `set_server_config`. Held
         // here rather than only around the writes because the latch is a
         // check-then-act: reading it and then re-opening the listener is
-        // precisely the race D22 forbids. The parsing above is deliberately
+        // precisely the race D22 forbids. Every parse above is deliberately
         // outside it, so a `SIGHUP` with a large certificate cannot delay a
         // drain that is waiting for this.
         let _swapping = self.swap.hold();
@@ -1375,7 +1381,7 @@ impl ReloadHandle {
             );
         }
 
-        for warning in config.warnings() {
+        for warning in warnings {
             warn!(log_id = "bg9ux69o", "{warning}");
         }
 
