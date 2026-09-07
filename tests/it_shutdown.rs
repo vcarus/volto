@@ -458,11 +458,26 @@ async fn the_grace_period_bounds_the_wait() {
         .await
         .expect("send");
 
+    let started = std::time::Instant::now();
     server.shutdown();
 
     // The server stops on its own, one second later, without the tunnel ever
     // being closed by the client.
     server.wait_until_stopped(STOP_TIMEOUT).await;
+
+    // Timed, because `STOP_TIMEOUT` is twenty seconds and any stop under it
+    // would otherwise pass -- including one that ignored `shutdown_grace`
+    // altogether. Four seconds is comfortably over the configured one plus the
+    // endpoint's close flush, and comfortably under the five-second default
+    // this guards against creeping back in, which is the regression its
+    // neighbour `a_zero_grace_period_closes_everything_at_once` names on the
+    // other side of the same rule.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "a grace period of one second must bound the wait for a tunnel the \
+         client never closes; stopping took {elapsed:?}"
+    );
 
     // And the client is told, rather than left to time out: the endpoint sends
     // CONNECTION_CLOSE on the way out.
