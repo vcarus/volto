@@ -13,7 +13,7 @@ use common::{
     closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
     send_udp_payload, spawn_flooding_udp_target, spawn_large_reply_udp_target,
     spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, windowless_transport,
+    spawn_udp_echo_target, udp_round_trip, windowless_transport,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -30,7 +30,10 @@ async fn close_code(quic: &quinn::Connection) -> u64 {
 /// payload.
 ///
 /// Datagrams for other sessions are put aside rather than discarded so a caller
-/// interleaving several sessions does not lose data.
+/// interleaving several sessions does not lose data. That putting-aside is the
+/// whole reason this exists: a test with one session in flight uses
+/// `common::udp_round_trip`, which reads one datagram and asserts it came back
+/// on the session it was sent on.
 async fn recv_payload_for(
     quic: &quinn::Connection,
     quarter_stream_id: u64,
@@ -64,10 +67,7 @@ async fn forwards_udp_payloads_to_a_target_and_back() {
 
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    send_udp_payload(&client.quic, qsid, b"hello udp");
-
-    let mut pending = HashMap::new();
-    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    let echoed = udp_round_trip(&client, qsid, b"hello udp").await;
     assert_eq!(&echoed[..], b"hello udp");
 }
 
@@ -145,10 +145,7 @@ async fn unknown_context_ids_are_dropped_without_ending_the_session() {
         .expect("send datagram");
 
     // The session still works.
-    send_udp_payload(&client.quic, qsid, b"still here");
-
-    let mut pending = HashMap::new();
-    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    let echoed = udp_round_trip(&client, qsid, b"still here").await;
     assert_eq!(&echoed[..], b"still here");
 }
 
@@ -164,10 +161,7 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
 
     send_udp_payload(&client.quic, qsid + 4242, b"nowhere");
 
-    send_udp_payload(&client.quic, qsid, b"somewhere");
-
-    let mut pending = HashMap::new();
-    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    let echoed = udp_round_trip(&client, qsid, b"somewhere").await;
     assert_eq!(&echoed[..], b"somewhere");
 }
 
@@ -329,10 +323,7 @@ async fn a_truncated_context_id_is_dropped_without_closing_the_connection() {
         .expect("send datagram");
 
     // The connection is still usable and so is the session.
-    send_udp_payload(&client.quic, qsid, b"still routed");
-
-    let mut pending = HashMap::new();
-    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    let echoed = udp_round_trip(&client, qsid, b"still routed").await;
     assert_eq!(&echoed[..], b"still routed");
 }
 
@@ -407,10 +398,8 @@ async fn closing_the_request_stream_ends_the_session() {
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // Confirm it works before closing it.
-    send_udp_payload(&client.quic, qsid, b"before");
-    let mut pending = HashMap::new();
     assert_eq!(
-        &recv_payload_for(&client.quic, qsid, &mut pending).await[..],
+        &udp_round_trip(&client, qsid, b"before").await[..],
         b"before"
     );
 
@@ -502,10 +491,7 @@ async fn empty_payloads_are_forwarded() {
 
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
 
-    send_udp_payload(&client.quic, qsid, b"");
-
-    let mut pending = HashMap::new();
-    let echoed = recv_payload_for(&client.quic, qsid, &mut pending).await;
+    let echoed = udp_round_trip(&client, qsid, b"").await;
     assert!(echoed.is_empty(), "expected an empty payload back");
 }
 
@@ -814,11 +800,8 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
     // The session is still alive: a small reply still gets through.
     let small_target = spawn_udp_echo_target().await;
     let (small_qsid, _small_stream) = open_udp_session(&mut client, &server, small_target).await;
-    send_udp_payload(&client.quic, small_qsid, b"small");
-
-    let mut pending = HashMap::new();
     assert_eq!(
-        &recv_payload_for(&client.quic, small_qsid, &mut pending).await[..],
+        &udp_round_trip(&client, small_qsid, b"small").await[..],
         b"small"
     );
 }
@@ -837,12 +820,7 @@ async fn an_idle_session_closes_the_request_stream() {
     let (qsid, mut stream) = open_udp_session(&mut client, &server, target).await;
 
     // The session works to begin with.
-    send_udp_payload(&client.quic, qsid, b"alive");
-    let mut pending = HashMap::new();
-    assert_eq!(
-        &recv_payload_for(&client.quic, qsid, &mut pending).await[..],
-        b"alive"
-    );
+    assert_eq!(&udp_round_trip(&client, qsid, b"alive").await[..], b"alive");
 
     // Now go idle. The server must end the request stream on its own.
     ends_cleanly(&mut stream, "the idle session").await;

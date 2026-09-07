@@ -27,6 +27,23 @@ use common::{
 use volto::datagram;
 use volto::h3api::{Request, Status};
 
+/// A server with `users` configured, private targets allowed and a failure
+/// budget of `failures`.
+///
+/// The configuration eleven of the tests below share, written out eleven times
+/// before this. The only thing any of them varied was the user list and the
+/// number, and both are parameters, so a test now says what it is about on one
+/// line. `a_peer_that_never_reads_its_407_still_spends_its_budget` is the
+/// twelfth and keeps its own `format!`: it prepends [`UNHURRIED`] and does not
+/// allow private networks, which are the two things this does not take.
+async fn server_with_budget(users: &[(&str, &str)], failures: u32) -> TestServer {
+    TestServer::start_with(&format!(
+        "{}[security]\nallow_private_networks = true\nmax_auth_failures = {failures}\n",
+        auth_section(users)
+    ))
+    .await
+}
+
 /// A CONNECT attempt as `user1` with the given password, returning the status.
 async fn attempt(client: &mut H3Client, authority: &str, password: &str) -> Option<Status> {
     attempt_as(client, authority, "user1", password).await
@@ -169,11 +186,7 @@ async fn a_zero_connection_cap_admits_everyone_and_evicts_nobody() {
 /// budget is spent, instead of allowing unlimited guesses down one connection.
 #[tokio::test]
 async fn repeated_authentication_failures_close_the_connection() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 3).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -206,11 +219,7 @@ async fn repeated_authentication_failures_close_the_connection() {
 /// suite still green.
 #[tokio::test]
 async fn credential_less_failures_alone_close_the_connection() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 3).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -267,11 +276,7 @@ fn guesses(authority: &str, passwords: &[&str]) -> Request {
 /// request is one failure and the connection lives.
 #[tokio::test]
 async fn a_request_of_two_guesses_spends_two_failures() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 2).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -297,11 +302,7 @@ async fn a_request_of_two_guesses_spends_two_failures() {
 /// leave the connection where it was, and the credentials that work still work.
 #[tokio::test]
 async fn a_third_credential_value_is_refused_before_any_is_tried() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 2).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -552,11 +553,7 @@ fn deaf_transport() -> quinn::TransportConfig {
 /// used — the counter must only move on failure.
 #[tokio::test]
 async fn successful_authentication_does_not_consume_the_budget() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 2).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -586,11 +583,7 @@ async fn successful_authentication_does_not_consume_the_budget() {
 /// with a success between them are exactly that shape at `max_auth_failures = 2`.
 #[tokio::test]
 async fn a_success_clears_the_failures_before_it() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 2).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -634,11 +627,7 @@ async fn a_success_clears_the_failures_before_it() {
 /// the success is not for — and the opposite outcome.
 #[tokio::test]
 async fn a_success_does_not_clear_another_users_failures() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 2\n",
-        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret"), ("user2", "hunter2")], 2).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -679,11 +668,7 @@ async fn a_success_does_not_clear_another_users_failures() {
 /// so the guesses stand and the *total* reaches the cap in the second round.
 #[tokio::test]
 async fn an_interleaved_cycle_of_guesses_still_reaches_the_cap() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 5\n",
-        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret"), ("user2", "hunter2")], 5).await;
     let target = spawn_echo_target().await;
     let authority = target.to_string();
     let mut client = H3Client::connect(&server).await;
@@ -738,11 +723,7 @@ async fn an_interleaved_cycle_of_guesses_still_reaches_the_cap() {
 /// fifth guess is the fifth failure whatever the success did.
 #[tokio::test]
 async fn a_success_never_clears_a_guess_at_a_user_that_does_not_exist() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 5\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 5).await;
     let target = spawn_echo_target().await;
     let authority = target.to_string();
     let mut client = H3Client::connect(&server).await;
@@ -797,11 +778,7 @@ async fn a_success_never_clears_a_guess_at_a_user_that_does_not_exist() {
 /// guesses too, the fifth would be the second and it would never go at all.
 #[tokio::test]
 async fn a_success_clears_credential_less_failures_and_nothing_else() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 3\n",
-        auth_section(&[("user1", "s3cret"), ("user2", "hunter2")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret"), ("user2", "hunter2")], 3).await;
     let target = spawn_echo_target().await;
     let authority = target.to_string();
     let mut client = H3Client::connect(&server).await;
@@ -839,11 +816,7 @@ async fn a_success_clears_credential_less_failures_and_nothing_else() {
 /// Zero disables the cap, for the operator who would rather fail2ban handle it.
 #[tokio::test]
 async fn a_zero_budget_disables_the_cap() {
-    let server = TestServer::start_with(&format!(
-        "{}[security]\nallow_private_networks = true\nmax_auth_failures = 0\n",
-        auth_section(&[("user1", "s3cret")])
-    ))
-    .await;
+    let server = server_with_budget(&[("user1", "s3cret")], 0).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
