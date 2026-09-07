@@ -7,6 +7,7 @@ use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
+use common::h3client::ends_with_no_body;
 use common::rawstream::{
     FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
     H3_REQUEST_CANCELLED, assert_closed_with, connect_headers_frame, frame, headers_frame,
@@ -1668,14 +1669,7 @@ async fn refuses_an_authority_without_a_port() {
 
     assert_eq!(response.status, Status::BAD_REQUEST);
 
-    let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
-        .await
-        .expect("the stream ended promptly")
-        .expect("a refusal must end cleanly, not with a stream error");
-    assert!(
-        end.is_none(),
-        "a 400 carries no body: the next read is the end of the stream"
-    );
+    ends_with_no_body(&mut stream, "the 400 for an authority without a port").await;
 }
 
 /// A bracket that did not open the authority is not part of a host (review M3).
@@ -1702,11 +1696,7 @@ async fn refuses_an_authority_with_a_stray_bracket() {
         "a host with a stray bracket is not the host without it"
     );
 
-    let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
-        .await
-        .expect("the stream ended promptly")
-        .expect("a refusal must end cleanly, not with a stream error");
-    assert!(end.is_none(), "a 400 carries no body");
+    ends_with_no_body(&mut stream, "the 400 for a stray bracket").await;
 }
 
 /// RFC 9114 §4.2: "any message containing connection-specific fields MUST be
@@ -1759,11 +1749,7 @@ async fn refuses_connection_specific_fields() {
                 Status::BAD_REQUEST,
                 "{route}: {name}: {value} must be refused"
             );
-            let end = tokio::time::timeout(TIMEOUT, stream.recv_data())
-                .await
-                .expect("the stream ended promptly")
-                .expect("a refusal must end cleanly, not with a stream error");
-            assert!(end.is_none(), "{route}: {name}: a 400 carries no body");
+            ends_with_no_body(&mut stream, &format!("{route}: {name}: the 400")).await;
         }
 
         // `TE` is the fifth field of RFC 9110 §7.6.1 and the one RFC 9114 §4.2

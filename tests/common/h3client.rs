@@ -765,6 +765,49 @@ pub fn ends_cleanly<'a>(
     }
 }
 
+/// Asserts that the very first read on `stream` is the end of it.
+///
+/// The judgement D40 asks a refusal to pass, and the reason the second half of
+/// each of these tests exists: a status immediately followed by a RESET_STREAM
+/// is worse than useless, because the client is entitled to read the reset as
+/// "the proxy broke" and retry or fail over instead of surfacing the status,
+/// and `recv_response` succeeds either way. A refusal that then sends a body is
+/// wrong for the other reason, that it is not a refusal. Reading once and
+/// requiring the end of the stream catches both.
+///
+/// Not [`ends_cleanly`]: that one reads past whatever is in flight before it
+/// judges, which is right for a tunnel the server is closing and wrong here,
+/// since a body would be drained rather than reported. `what` names the request
+/// being judged, so a table-driven caller can say which row failed.
+///
+/// Written as a synchronous function returning a future so `#[track_caller]`
+/// survives to the poll that panics (D66).
+#[track_caller]
+pub fn ends_with_no_body<'a>(
+    stream: &'a mut ClientStream,
+    what: &'a str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let end = tokio::time::timeout(super::TIMEOUT, stream.recv_data())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "{what}, awaited at {caller}, was still open after {:?}",
+                    super::TIMEOUT
+                )
+            })
+            .unwrap_or_else(|error| {
+                panic!("{what}, awaited at {caller}, must end cleanly, not with {error:?}")
+            });
+
+        assert!(
+            end.is_none(),
+            "{what}, awaited at {caller}, carries no body: the next read is the end of the stream"
+        );
+    }
+}
+
 /// Turns a request into the field lines that carry it (RFC 9114 §4.3).
 ///
 /// Pseudo-headers first and in the order RFC 9114 §4.3.1 lists them, then the
