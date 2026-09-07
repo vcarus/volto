@@ -592,6 +592,21 @@ pub fn connect_request(authority: &str) -> Request {
     request
 }
 
+/// A hostname no resolver anywhere can answer for.
+///
+/// Five sixty-octet labels and a `.invalid` suffix, which is longer than the 255
+/// octets DNS permits, so the stub resolver refuses it before a query leaves the
+/// host. That is D16: a merely nonexistent name would not do, because a resolver
+/// that hijacks NXDOMAIN resolves it, and this development host runs one (Surge,
+/// from a fake-IP range). A test built on such a name would assert on the
+/// environment rather than on the server, which is what D16 replaced. It is also
+/// the trick `crate::net`'s own unit test uses, and the only way to get a
+/// deterministic resolution failure without a network.
+pub fn unresolvable_host() -> String {
+    let label = "a".repeat(60);
+    vec![label; 5].join(".") + ".invalid"
+}
+
 /// A field value from text a test authored.
 #[track_caller]
 pub fn field_value(value: &str) -> FieldValue {

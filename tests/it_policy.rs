@@ -509,17 +509,15 @@ async fn udp_port_53_is_reachable_by_default() {
 /// A name that cannot be resolved is the proxy's problem to report, not the
 /// client's fault: 502 with `dns_error`, not 400 (decision D9).
 ///
-/// The name is longer than the 255 octets DNS permits, so the stub resolver
-/// rejects it locally. A merely nonexistent name would not do: resolvers that
-/// hijack NXDOMAIN — Surge does, from a fake-IP range — would resolve it and this
-/// test would assert on the environment instead of on the server.
+/// The name `common::unresolvable_host` builds, which is longer than the 255
+/// octets DNS permits, so the stub resolver rejects it locally. Why a merely
+/// nonexistent name would not do is written on that helper (D16).
 #[tokio::test]
 async fn an_unresolvable_target_is_a_bad_gateway() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
-    let label = "a".repeat(60);
-    let host = vec![label; 5].join(".") + ".invalid";
+    let host = common::unresolvable_host();
 
     let tcp = respond_to(&mut client, connect_request(&format!("{host}:443"))).await;
     assert_refused(&tcp, Status::BAD_GATEWAY, "dns_error");

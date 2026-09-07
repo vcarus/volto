@@ -224,17 +224,6 @@ fn assert_local_failure(response: &Response, what: &str) {
     );
 }
 
-/// A hostname no resolver anywhere can answer for.
-///
-/// Longer than the 255 octets DNS allows, so the stub resolver refuses it
-/// before a query leaves the host — the trick `crate::net`'s own unit test
-/// uses, and the only way to get a deterministic resolution failure without a
-/// network.
-fn unresolvable() -> String {
-    let label = "a".repeat(60);
-    vec![label; 5].join(".") + ".invalid"
-}
-
 /// Sends `count` CONNECT requests before reading any of their answers.
 ///
 /// The concurrent shape of the quota: `count` request tasks are live on the
@@ -419,7 +408,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     );
 
     // --- A storm of unresolvable targets, beside a healthy tunnel. ---
-    let host = unresolvable();
+    let host = common::unresolvable_host();
     for attempt in 0..DNS_STORM {
         let response = respond_to(&mut client, connect_request(&format!("{host}:443"))).await;
         assert_eq!(
