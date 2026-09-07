@@ -443,16 +443,33 @@ status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
 
 fingerprint="$(openssl x509 -in "$CERT" -noout -fingerprint -sha256)"
 expiry="$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)"
+# Every substitution below ends in `|| true`, and each has a fallback value.
+# Under `set -euo pipefail` the exit status of a plain assignment is the command
+# substitution's, and pipefail makes a pipeline fail when any stage does, so a
+# failing `hostname` or a `grep` with no match would end the script here. By this
+# point the certificate has been regenerated and the service restarted, so that
+# exit is silent, prints no fingerprint, and lands exactly when every client's
+# pinned fingerprint has just gone stale. The report is the point of a re-run.
+
 # Only for the pasteable policy line; the operator substitutes the real address if
 # this box is behind a relay.
-address="$(hostname -I 2>/dev/null | awk '{print $1}')"
+address="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "$address" ] || address="<server-ip>"
 
 # The password is read back out of the config so a re-run prints the one actually
-# in force rather than a freshly generated one that was never installed.
-configured_user="$(grep -o '{ username = "[^"]*", password = "[^"]*" }' "$CONF" | head -n1)"
-conf_username="$(echo "$configured_user" | sed -n 's/.*username = "\([^"]*\)".*/\1/p')"
-conf_password="$(echo "$configured_user" | sed -n 's/.*password = "\([^"]*\)".*/\1/p')"
+# in force rather than a freshly generated one that was never installed. The grep
+# has no match on a config whose user line was hand-edited into another spelling,
+# or on one with `users = []`, and the documentation invites both; an unreadable
+# line prints as <unknown> and says so rather than ending the run.
+configured_user="$(grep -o '{ username = "[^"]*", password = "[^"]*" }' "$CONF" | head -n1 || true)"
+conf_username="$(echo "$configured_user" | sed -n 's/.*username = "\([^"]*\)".*/\1/p' || true)"
+conf_password="$(echo "$configured_user" | sed -n 's/.*password = "\([^"]*\)".*/\1/p' || true)"
+if [ -z "$conf_username" ] || [ -z "$conf_password" ]; then
+    note "no '{ username = ..., password = ... }' entry could be read out of $CONF;"
+    note "the policy line below names the credential as <unknown>"
+    [ -n "$conf_username" ] || conf_username="<unknown>"
+    [ -n "$conf_password" ] || conf_password="<unknown>"
+fi
 
 echo
 echo "==> done"
