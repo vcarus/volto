@@ -80,6 +80,14 @@ async fn a_socket_the_os_reported_broken_is_not_logged_as_a_dropped_packet() {
     // The other half, and the one that says the two verdicts have not collapsed
     // into one: a socket the operating system has given up on is not a packet
     // that did not fit.
+    //
+    // The needle is a negative, so unlike the positive above it does not turn
+    // red when the message moves: a reworded line is a needle that can never
+    // match, and the assertion is then permanently satisfied. `it_log_lines`
+    // does not catch that either, being keyed by `log_id` rather than by the
+    // message. `Session::forward_to_target` in `src/tunnel/udp.rs` is the one
+    // site in the tree that writes this string, on the `is_per_packet_error`
+    // arm, so this is the reason a rename there has to reach here (review L11).
     let dropped = buffer.lines_since(mark, &["target socket refused this packet, dropping it"]);
     assert!(
         dropped.is_empty(),
