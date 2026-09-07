@@ -942,10 +942,10 @@ impl Config {
                 .iter()
                 .position(|other| other.username == user.username)
             {
-                bail!(
-                    "auth.users[{i}].username duplicates auth.users[{first}].username = {:?}",
-                    user.username
-                );
+                // Not echoed either, for the reason given above: the two
+                // indices name both entries, which is what it takes to find
+                // and fix them.
+                bail!("auth.users[{i}].username duplicates auth.users[{first}].username");
             }
         }
 
@@ -1925,6 +1925,25 @@ pub(crate) mod tests {
             let err = parse(body).validate().expect_err("must be rejected");
             assert!(err.to_string().contains(expected), "{err}");
         }
+
+        // The duplicate branch names both entries and echoes neither name, the
+        // same rule the over-long branch beside it follows.
+        let duplicate = parse(
+            r#"[auth]
+               users = [
+                 { username = "greppable", password = "p" },
+                 { username = "greppable", password = "q" },
+               ]"#,
+        )
+        .validate()
+        .expect_err("must be rejected")
+        .to_string();
+        assert!(duplicate.contains("auth.users[0].username"), "{duplicate}");
+        assert!(duplicate.contains("auth.users[1].username"), "{duplicate}");
+        assert!(
+            !duplicate.contains("greppable"),
+            "nothing out of [auth] goes to stderr: {duplicate}"
+        );
     }
 
     /// A user-id longer than a log line carries whole is refused at load.
