@@ -60,6 +60,29 @@
 //! One `#[tokio::test]`, because the assertions on the closing line need a
 //! capturing subscriber and `tracing_subscriber::fmt().init()` may run once per
 //! process — the same reason `it_close_log` is one function.
+//!
+//! # A lost datagram on a runner, and why there is no retry
+//!
+//! Every UDP exchange here goes through `common::udp_round_trip`, which sends
+//! one datagram and panics if nothing decodable arrives within `TIMEOUT`. There
+//! is no retry anywhere, and one run has been lost to that: on 2026-09-05 the
+//! first v0.10.0 release run failed macOS `it_soak` with one UDP echo lost on
+//! the GitHub runner, was green on the rerun, green locally three times out of
+//! three, and green on the previous commit on the same job. Recorded in
+//! `full-audit-2026-09-04.md`'s 2026-09-05 addendum. That is one observation and
+//! it was never diagnosed, so no rate is claimed for it; what it means for a
+//! reader is that a single lost echo here is more likely to be the runner than a
+//! defect, and the way to tell is a rerun plus a local run.
+//!
+//! No retry was added, and the reason is that the resend would have to live in
+//! `common::udp_round_trip` to reach every site, which is where it must not go:
+//! `it_close_log`, `it_os_faults` and `it_policy` all assert exact drop counts
+//! through that helper, and a resend moves them. A payload-matched round trip
+//! private to this file would work — it would have to match on the payload
+//! rather than take the first datagram, or a late arrival would be consumed by
+//! the following exchange — and it is not worth the second implementation of
+//! the same helper for one unreproduced loss. This paragraph is the mitigation
+//! (review L15).
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the loop counts are ones this file writes out itself.
