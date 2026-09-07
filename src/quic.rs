@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::IntoFuture;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -43,7 +44,10 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
             data.protocol
                 .as_deref()
                 .map(|p| String::from_utf8_lossy(p).into_owned()),
-            data.server_name.clone(),
+            // Moved rather than cloned: the first element has finished
+            // borrowing `data` by the time this one is evaluated, and this is
+            // one `String` per accepted connection.
+            data.server_name,
         ),
         None => (None, None),
     };
@@ -767,6 +771,13 @@ impl Server {
         // connection.
         let max_connections = self.config().limits.max_connections;
 
+        // Zero is no cap at all, so nothing below is measured and the roster is
+        // not even asked for its length.
+        if max_connections == 0 {
+            return Some(incoming);
+        }
+        let ceiling = live_ceiling(max_connections);
+
         // The roster rather than the `JoinSet`: a slot is entered before the
         // QUIC handshake starts and given up by a guard, so the roster counts
         // exactly the connections that hold one. The set is kept for draining,
@@ -775,14 +786,18 @@ impl Server {
         // registration, and an evicted one leaves the roster before its task
         // ends, so the set holds everything the roster does and sometimes
         // more.
-        if max_connections == 0 || self.roster.len() < live_ceiling(max_connections) {
+        //
+        // Read once and reused by the two log lines below, which takes one
+        // mutex acquisition off every arrival at the cap, the path a flood
+        // takes.
+        let live = self.roster.len();
+        if live < ceiling {
             return Some(incoming);
         }
 
         // Read before `retry()` or `refuse()` consumes the `Incoming`, so
         // either branch can still name the peer.
         let remote = incoming.remote_address();
-        let live = self.roster.len();
 
         // Taking somebody else's slot is a privilege, and a source address
         // that has proved nothing does not have it: one spoofed Initial per
@@ -866,7 +881,7 @@ impl Server {
         // second and never authenticates would otherwise hold every slot there
         // is for as long as it cared to -- each one bounded, all of them
         // replaced (audit 2026-08-23).
-        for victim in self.roster.evict_until_below(live_ceiling(max_connections)) {
+        for victim in self.roster.evict_until_below(ceiling) {
             // DEBUG, not INFO: this fires once per arrival for as long as a
             // flood lasts, which is exactly the shape the refusal beside it is
             // DEBUG for. The victim's own closing line stays at INFO -- that
@@ -886,7 +901,7 @@ impl Server {
         // told immediately instead of timing out, and nothing per-connection
         // is built on our side. Logged at DEBUG because a flood is exactly
         // when this fires.
-        if self.roster.len() >= live_ceiling(max_connections) {
+        if self.roster.len() >= ceiling {
             debug!(
                 %remote,
                 live = self.roster.len(),
@@ -1064,52 +1079,6 @@ impl Server {
             // differing from `remote` is the only externally visible trace of a
             // migration or NAT rebind during the connection's life — and the
             // MTU.
-            //
-            // `mtu` is the packet size DPLPMTUD settled on in this direction —
-            // a report, not a knob: it is here so an operator can see whether
-            // discovery ever got past `initial_mtu` on their path. On a
-            // connection that lived long enough to probe, a value still at the
-            // floor means the probes went unanswered (the shape a path that
-            // black-holes large packets has) or a black hole was detected later
-            // and discovery fell back; anything above it is discovery having
-            // done its job.
-            //
-            // `mtu_black_holes` counts how often quinn's black-hole detector
-            // fired and pushed the packet size back to the floor for its
-            // cooldown. It is what tells those two apart when `mtu` alone
-            // cannot: discovery may have climbed back by the time the
-            // connection ends, hiding a fall-back that a bulk transfer in the
-            // middle paid for. quinn's detector is a heuristic over loss
-            // bursts, and a burst of full-size packets lost to ordinary
-            // congestion looks the same to it as a path that stopped carrying
-            // them, so a non-zero count on a path that other connections probe
-            // fine is the signature of a false positive rather than of the
-            // path.
-            //
-            // `tunnels` is how many requests on this connection were granted a
-            // tunnel slot — TCP CONNECT and CONNECT-UDP alike — so a connection
-            // that only ever failed authentication reports zero.
-            //
-            // `dropped_datagrams` is how many inbound HTTP Datagrams the
-            // connection's router dropped instead of delivering — an unknown
-            // Context ID, a Quarter Stream ID no session claims, a session
-            // whose inbound queue was full, or a datagram cut short of its
-            // Context ID. Each drop is silent where it happens, because the
-            // RFCs ask for exactly that, so this total is the only trace a
-            // misdirected or over-fast sender leaves in production. Distinct
-            // from `lost_packets`, which is the QUIC path losing what was
-            // sent; these arrived fine and were dropped on purpose.
-            //
-            // `tx_bytes` and
-            // `rx_bytes` are UDP-level byte counts: everything this endpoint put
-            // on or took off the wire for this connection, QUIC and HTTP/3
-            // framing, retransmissions, ACKs and padding included. They are
-            // neither tunnel payload — always smaller — nor bytes the peer
-            // acknowledged, since a packet is counted when it is sent whether or
-            // not it arrived, so they answer "how much did this connection move
-            // through this host" and nothing finer. `sent_packets` and
-            // `lost_packets` are reported together because a loss rate needs
-            // both: either number alone says nothing about the path (D72).
             let rtt_probe = quic.clone();
 
             // Created here rather than inside the connection so they survive
@@ -1227,15 +1196,57 @@ impl Server {
 /// the error that stopped it.
 ///
 /// Written here rather than at the end of [`Server::serve`] so the two field
-/// lists cannot drift apart. They carry the same twelve fields and differ only
-/// in `reason` against `error`, which is what makes an operator able to grep
-/// one journal for both -- and what a second copy of a twelve-field list
-/// invites losing, as D72's traffic counters would have been had they landed on
-/// only one of them.
+/// lists cannot drift apart. They carry the same eleven fields and differ in
+/// two, `log_id` and `reason` against `error`, which is what makes an operator
+/// able to grep one journal for both -- and what a second copy of a list this
+/// long invites losing, as D72's traffic counters would have been had they
+/// landed on only one of them.
 ///
 /// `closed` is graded from the error *value* rather than from
 /// `Connection::close_reason()`, for the reason [`Server::serve`] gives where it
 /// is decided.
+///
+/// # What the fields report
+///
+/// `mtu` is the packet size DPLPMTUD settled on in this direction — a report,
+/// not a knob: it is here so an operator can see whether discovery ever got
+/// past `initial_mtu` on their path. On a connection that lived long enough to
+/// probe, a value still at the floor means the probes went unanswered (the
+/// shape a path that black-holes large packets has) or a black hole was
+/// detected later and discovery fell back; anything above it is discovery
+/// having done its job.
+///
+/// `mtu_black_holes` counts how often quinn's black-hole detector fired and
+/// pushed the packet size back to the floor for its cooldown. It is what tells
+/// those two apart when `mtu` alone cannot: discovery may have climbed back by
+/// the time the connection ends, hiding a fall-back that a bulk transfer in the
+/// middle paid for. quinn's detector is a heuristic over loss bursts, and a
+/// burst of full-size packets lost to ordinary congestion looks the same to it
+/// as a path that stopped carrying them, so a non-zero count on a path that
+/// other connections probe fine is the signature of a false positive rather
+/// than of the path.
+///
+/// `tunnels` is how many requests on this connection were granted a tunnel slot
+/// — TCP CONNECT and CONNECT-UDP alike — so a connection that only ever failed
+/// authentication reports zero.
+///
+/// `dropped_datagrams` is how many inbound HTTP Datagrams the connection's
+/// router dropped instead of delivering — an unknown Context ID, a Quarter
+/// Stream ID no session claims, a session whose inbound queue was full, or a
+/// datagram cut short of its Context ID. Each drop is silent where it happens,
+/// because the RFCs ask for exactly that, so this total is the only trace a
+/// misdirected or over-fast sender leaves in production. Distinct from
+/// `lost_packets`, which is the QUIC path losing what was sent; these arrived
+/// fine and were dropped on purpose.
+///
+/// `tx_bytes` and `rx_bytes` are UDP-level byte counts: everything this
+/// endpoint put on or took off the wire for this connection, QUIC and HTTP/3
+/// framing, retransmissions, ACKs and padding included. They are neither tunnel
+/// payload — always smaller — nor bytes the peer acknowledged, since a packet
+/// is counted when it is sent whether or not it arrived, so they answer "how
+/// much did this connection move through this host" and nothing finer.
+/// `sent_packets` and `lost_packets` are reported together because a loss rate
+/// needs both: either number alone says nothing about the path (D72).
 fn log_connection_closed(
     remote: SocketAddr,
     quic: &quinn::Connection,
@@ -1534,6 +1545,22 @@ impl SocketBuffer {
             Self::Send => "net.core.wmem_max",
         }
     }
+
+    /// Asks the kernel for `size` bytes in this direction.
+    fn set(self, socket: &SockRef<'_>, size: usize) -> io::Result<()> {
+        match self {
+            Self::Recv => socket.set_recv_buffer_size(size),
+            Self::Send => socket.set_send_buffer_size(size),
+        }
+    }
+
+    /// Reads back what the kernel holds in this direction.
+    fn get(self, socket: &SockRef<'_>) -> io::Result<usize> {
+        match self {
+            Self::Recv => socket.recv_buffer_size(),
+            Self::Send => socket.send_buffer_size(),
+        }
+    }
 }
 
 /// The socket buffer sizes `[limits]` asked for, as configured rather than as
@@ -1582,7 +1609,9 @@ impl SocketBuffers {
 /// Asks the kernel for `requested` bytes of buffer and reports what it granted.
 ///
 /// The socket half of the pair; [`socket_buffer_was_capped`] is the judgement,
-/// kept separate so both of its answers can be tested without a socket.
+/// kept separate so both of its answers can be tested without a socket. Every
+/// fact that depends on the direction lives on [`SocketBuffer`], so this
+/// function does not branch on the variant at all.
 ///
 /// Nothing here is fatal, and that is deliberate. A refused `setsockopt` leaves
 /// the socket exactly where it was — on the operating system's default, which is
@@ -1604,12 +1633,7 @@ fn request_socket_buffer(
     let refused = if requested == 0 {
         false
     } else {
-        let asked = match which {
-            SocketBuffer::Recv => socket.set_recv_buffer_size(requested),
-            SocketBuffer::Send => socket.set_send_buffer_size(requested),
-        };
-
-        match asked {
+        match which.set(socket, requested) {
             Ok(()) => false,
             Err(error) => {
                 warn!(
@@ -1628,11 +1652,7 @@ fn request_socket_buffer(
         }
     };
 
-    let granted = match which {
-        SocketBuffer::Recv => socket.recv_buffer_size(),
-        SocketBuffer::Send => socket.send_buffer_size(),
-    };
-    let granted = match granted {
+    let granted = match which.get(socket) {
         Ok(granted) => granted,
         Err(error) => {
             debug!(
@@ -2635,7 +2655,7 @@ mod tests {
     ///
     /// One eviction per arrival is all a server sitting at a steady cap needs.
     /// A `SIGHUP` that lowers `max_connections` below the number of connections
-    /// already live is the case that is not steady: `serve_forever` reads the cap
+    /// already live is the case that is not steady: [`Server::admit`] reads the cap
     /// per accepted connection, so the newcomer is judged against the new value
     /// while everybody already in was admitted under the old one, and without
     /// the loop inside `evict_until_below` -- the accept path's own, called here
@@ -2680,7 +2700,7 @@ mod tests {
 
     /// Why the accept loop asks whether there is a cap before applying one.
     ///
-    /// `max_connections = 0` means "no limit", and the guard in `serve_forever`
+    /// `max_connections = 0` means "no limit", and the guard in [`Server::admit`]
     /// is the whole of that meaning. Handed to this arithmetic as a number, zero
     /// is the harshest cap there could be -- every roster is at or above it -- so
     /// each arrival would empty the roster and then be refused for finding it

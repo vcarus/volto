@@ -207,11 +207,9 @@ impl ResolverBudget {
     /// One connection's view of it.
     pub fn per_connection(&self) -> ConnectionResolver {
         ConnectionResolver {
-            slots: ConnectionSlots {
-                reserved: Arc::new(Semaphore::new(1)),
-                burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
-                shared: self.shared.clone(),
-            },
+            reserved: Arc::new(Semaphore::new(1)),
+            burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
+            shared: self.shared.clone(),
         }
     }
 }
@@ -241,19 +239,13 @@ impl Default for ResolverBudget {
 /// One of these per connection, made by [`ResolverBudget::per_connection`] and
 /// held for the connection's whole life by its [`crate::tunnel::Context`].
 /// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
-/// counting separately would be no bound at all. That is also why the slots are
-/// held inline rather than behind an `Arc`: with one owner and no clone, the
-/// allocation bought nothing. The three semaphores inside keep theirs, because
+/// counting separately would be no bound at all. That is also why the three
+/// semaphores are held inline rather than behind an `Arc`: with one owner and no
+/// clone, the allocation bought nothing. Each semaphore keeps its own, because
 /// `acquire_owned` needs an `Arc<Semaphore>` and one of them is the server-wide
 /// allowance every connection really does share.
 #[derive(Debug)]
 pub struct ConnectionResolver {
-    slots: ConnectionSlots,
-}
-
-/// What one connection's lookups draw on.
-#[derive(Debug)]
-struct ConnectionSlots {
     /// This connection's own slot. One permit, never shared.
     reserved: Arc<Semaphore>,
     /// How much of the shared allowance this connection may hold at once.
@@ -300,14 +292,12 @@ impl ConnectionResolver {
     async fn acquire(&self) -> LookupSlot {
         let from_shared = async {
             let burst = self
-                .slots
                 .burst
                 .clone()
                 .acquire_owned()
                 .await
                 .expect("the budget is never closed");
             let shared = self
-                .slots
                 .shared
                 .clone()
                 .acquire_owned()
@@ -322,7 +312,7 @@ impl ConnectionResolver {
 
         tokio::select! {
             biased;
-            reserved = self.slots.reserved.clone().acquire_owned() => LookupSlot::Reserved {
+            reserved = self.reserved.clone().acquire_owned() => LookupSlot::Reserved {
                 _slot: reserved.expect("the budget is never closed"),
             },
             slot = from_shared => slot,
@@ -678,7 +668,7 @@ mod tests {
             let victim = budget.per_connection();
             // The reserved slot is taken, so everything below has to queue.
             let reserved = ready(victim.acquire()).expect("the reserved slot starts free");
-            assert_eq!(victim.slots.burst.available_permits(), BURST_LOOKUPS);
+            assert_eq!(victim.burst.available_permits(), BURST_LOOKUPS);
 
             let mut cx = TaskContext::from_waker(std::task::Waker::noop());
             let mut parked: Vec<_> = (0..BURST_LOOKUPS)
@@ -691,7 +681,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                victim.slots.burst.available_permits(),
+                victim.burst.available_permits(),
                 0,
                 "a parked lookup is meant to be holding its burst permit while it queues"
             );
@@ -700,7 +690,7 @@ mod tests {
             drop(parked);
 
             assert_eq!(
-                victim.slots.burst.available_permits(),
+                victim.burst.available_permits(),
                 BURST_LOOKUPS,
                 "burst permits were left behind by lookups that gave up"
             );
