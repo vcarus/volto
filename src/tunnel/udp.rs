@@ -687,11 +687,10 @@ impl Session<'_> {
         // on the write finishing, not on progress inside it, the same reading
         // the TCP half-close bound gives the same knob.
         //
-        // It cannot simply be abandoned. A cancelled send leaves a partial DATA
-        // frame on the stream, and the tidy `finish()` the session otherwise
-        // ends with would then FIN a truncated capsule — malformed by RFC 9297
-        // §3.3. So the stream is reset instead, which says the same thing
-        // without leaving a half-written frame behind.
+        // It cannot simply be abandoned: `send_data` is not cancel-safe, and
+        // its rustdoc carries the rule. The tidy `finish()` this session
+        // otherwise ends with would FIN a truncated capsule, malformed by RFC
+        // 9297 §3.3 as well. So the stream is reset instead.
         match tokio::time::timeout(self.ctx.stall_budget, self.writer.send_data(encoded)).await {
             Ok(Ok(())) => Step::Continue,
             Ok(Err(error)) => {

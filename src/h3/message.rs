@@ -382,22 +382,14 @@ pub fn token(bytes: &[u8]) -> Option<&str> {
 
 /// The name of one field line, if it is one this server will accept.
 ///
-/// Lowercase `tchar` and at least one of them: RFC 9110 §5.6.2's `token`
-/// restricted by RFC 9114 §4.2's rule that a field name arriving with an
-/// uppercase character makes the message malformed. Shared with the suite's
-/// client, which holds the server to the same rule in the other direction.
+/// Lowercase `tchar` and at least one of them: [`token`] restricted by RFC 9114
+/// §4.2's rule that a field name arriving with an uppercase character makes the
+/// message malformed. Written as that restriction rather than as its own loop,
+/// so the two cannot come to disagree about what a `tchar` is. Shared with the
+/// suite's client, which holds the server to the same rule in the other
+/// direction.
 pub fn field_name(bytes: &[u8]) -> Option<&str> {
-    if bytes.is_empty()
-        || !bytes
-            .iter()
-            .all(|byte| is_tchar(*byte) && !byte.is_ascii_uppercase())
-    {
-        return None;
-    }
-
-    // `tchar` is a subset of ASCII, so this cannot fail; written fallibly for
-    // the reason `Method::parse` gives.
-    std::str::from_utf8(bytes).ok()
+    token(bytes).filter(|name| !name.bytes().any(|byte| byte.is_ascii_uppercase()))
 }
 
 /// Whether `byte` is an RFC 9110 §5.6.2 `tchar`.

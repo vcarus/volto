@@ -653,12 +653,8 @@ impl FrameDecoder {
                     return Ok(Some(Item::Data(Bytes::new())));
                 }
 
-                // Both directions of the `take` conversion are exact: the
-                // minimum is at most the chunk's own length, so it is a `usize`
-                // value, and it goes back to `u64` as the same number.
-                #[allow(clippy::as_conversions)]
                 State::Data { remaining } => {
-                    let take = remaining.min(self.chunk.len() as u64) as usize;
+                    let (take, left) = take_from(remaining, self.chunk.len());
                     if take == 0 {
                         return Ok(None);
                     }
@@ -667,7 +663,7 @@ impl FrameDecoder {
                     // Back to `Header` as soon as the frame is spent, so the end
                     // of a frame and the end of a stream agree about where a
                     // boundary is.
-                    self.state = match remaining - take as u64 {
+                    self.state = match left {
                         0 => State::Header,
                         left => State::Data { remaining: left },
                     };
@@ -706,13 +702,11 @@ impl FrameDecoder {
                     return Ok(Some(Item::Frame(parse(kind, payload)?)));
                 }
 
-                // Exact for the reason the DATA arm above states.
-                #[allow(clippy::as_conversions)]
                 State::Skipping { kind, remaining } => {
-                    let take = remaining.min(self.chunk.len() as u64) as usize;
+                    let (take, left) = take_from(remaining, self.chunk.len());
                     self.chunk.advance(take);
 
-                    match remaining - take as u64 {
+                    match left {
                         0 => {
                             self.state = State::Header;
                             self.count_skip()?;
@@ -1056,6 +1050,23 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
             _ => None,
         },
     }
+}
+
+/// How much of a `remaining`-byte frame the chunk in hand settles, and what is
+/// left of the frame after it.
+///
+/// One function for the DATA arm and the Skipping arm of [`FrameDecoder::next`],
+/// which compute the same thing: DATA hands the bytes out and Skipping throws
+/// them away, and neither may run past the frame it is in. Written here so the
+/// conversion and the argument for it are in one place rather than two.
+///
+/// Both directions of the conversion are exact: the minimum is at most the
+/// chunk's own length, so it is a `usize` value, and it goes back to `u64` as
+/// the same number. The subtraction cannot underflow for the same reason.
+#[allow(clippy::as_conversions)]
+fn take_from(remaining: u64, chunk_len: usize) -> (usize, u64) {
+    let take = remaining.min(chunk_len as u64);
+    (take as usize, remaining - take)
 }
 
 /// Parses a buffered frame payload.

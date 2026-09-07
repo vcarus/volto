@@ -202,6 +202,11 @@ impl Resolver {
 /// is a parameter: a request that was never understood will never be answered,
 /// while a [`Reader`] is only half a stream and the tunnels decide the other
 /// half differently for a client abort than for a target failure.
+///
+/// The parameter governs the two protocol arms only. A `frame::Error::Stream`
+/// is the transport already having decided, so it is returned as it stands and
+/// the sending half is left to its drop: `quinn::SendStream::drop` finishes it
+/// cleanly, or resets it if the peer has also sent STOP_SENDING.
 fn answer(
     handle: &Handle,
     frames: &mut FrameReader,
@@ -474,9 +479,7 @@ fn uri_scheme(scheme: &[u8]) -> Result<&str, Violation> {
         return Err(invalid());
     }
 
-    // ASCII by the check above, so the conversion cannot fail; it is written
-    // fallibly rather than as an `expect` because these are a peer's bytes.
-    std::str::from_utf8(scheme).map_err(|_| invalid())
+    ascii(scheme, invalid)
 }
 
 /// Checks an authority (RFC 3986 §3.2).
@@ -507,8 +510,7 @@ fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
         return Err(invalid());
     }
 
-    // ASCII by the check above; fallible for the reason `uri_scheme` gives.
-    std::str::from_utf8(authority).map_err(|_| invalid())
+    ascii(authority, invalid)
 }
 
 /// Splits a `:path` into its path and its query, checking both.
@@ -549,15 +551,23 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
         return Err(malformed("a :path with a character no query may contain"));
     }
 
-    // ASCII by the checks above, so neither conversion can fail; written
-    // fallibly for the reason `uri_scheme` gives.
     let invalid = || malformed("a :path that is not valid UTF-8");
     Ok((
-        std::str::from_utf8(path).map_err(|_| invalid())?,
-        query
-            .map(|query| std::str::from_utf8(query).map_err(|_| invalid()))
-            .transpose()?,
+        ascii(path, invalid)?,
+        query.map(|query| ascii(query, invalid)).transpose()?,
     ))
+}
+
+/// The last step of each of the three target parsers above: bytes an ASCII
+/// check has already accepted, as a `&str`.
+///
+/// None of the four conversions can fail, because every byte was matched
+/// against an ASCII set on the way in. It is written fallibly rather than as an
+/// `expect` because these are a peer's bytes: an `expect` here would be a panic
+/// waiting for one of the checks above to be widened. `invalid` is what each
+/// caller wants said in its place.
+fn ascii(bytes: &[u8], invalid: impl Fn() -> Violation) -> Result<&str, Violation> {
+    std::str::from_utf8(bytes).map_err(|_| invalid())
 }
 
 /// The punctuation an authority may contain, beside letters and digits.
@@ -769,11 +779,10 @@ impl Stream {
     /// no backstop while the peer's stack answers our keep-alive PINGs.
     ///
     /// The lapsed answer is abandoned with a reset rather than left to a FIN
-    /// that cannot be sent either: the request will not be answered, and RFC
-    /// 9114 §8.1 gives H3_REQUEST_CANCELLED for "the request or its response
-    /// (including pushed response) is cancelled", which is exactly what has
-    /// happened. Only the stream ends; the connection carries on serving
-    /// everything else on it.
+    /// that cannot be sent either: the request will not be answered, which is
+    /// exactly what RFC 9114 §8.1 gives H3_REQUEST_CANCELLED for. "The request
+    /// or its response (including pushed response) is cancelled." Only the
+    /// stream ends; the connection carries on serving everything else on it.
     pub async fn respond_within(
         &mut self,
         status: Status,
@@ -904,6 +913,19 @@ impl Writer {
     /// The frame header and the payload go out as two chunks of one write, so
     /// the payload is never copied: what arrives here as a `Bytes` is what
     /// quinn queues.
+    ///
+    /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
+    /// flow-control credit parks this for as long as it likes, so both tunnels
+    /// do abandon it, under a teardown signal or a timeout; what they may not
+    /// do afterwards is finish the stream. Abandoning the write part-way leaves
+    /// the header written and the payload not, which is a truncated DATA frame,
+    /// and RFC 9114 §7.1 says what that costs: "When a stream terminates
+    /// cleanly, if the last frame on the stream was truncated, this MUST be
+    /// treated as a connection error of type H3_FRAME_ERROR. Streams that
+    /// terminate abruptly may be reset at any point in a frame." So a reset
+    /// behind an abandoned send is not tidying up after the fact; it is what
+    /// makes the truncation legal, and a FIN in its place is the connection
+    /// error that sentence names.
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
         // The same widening the HEADERS length above states.
         #[allow(clippy::as_conversions)]

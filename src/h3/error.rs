@@ -328,6 +328,27 @@ impl From<Violation> for StreamError {
     }
 }
 
+/// A quinn failure that is a fault in this stack rather than in the peer.
+///
+/// The three conversions below all end here, so the code and the shape of the
+/// detail are written once. Which variants reach it, and why none of them is
+/// the peer doing anything:
+///
+/// * `ClosedStream`, on both `ReadError` and `WriteError`, is this endpoint
+///   having already finished with the stream.
+/// * `IllegalOrderedRead`, on `ReadError`, cannot occur: this stack only ever
+///   reads in order.
+/// * `ZeroRttRejected`, on both, is 0-RTT, which this server never accepts
+///   ([`crate::quic::Server`] answers every `Incoming` with `accept`, never
+///   `retry` into a 0-RTT acceptance), so there is no rejection to report.
+///   [`super::stream::Writer::stopped`] says the same of its own arm.
+fn internal(error: &impl fmt::Display) -> StreamError {
+    StreamError::Local(Violation::stream(
+        Code::H3_INTERNAL_ERROR,
+        error.to_string(),
+    ))
+}
+
 impl From<quinn::ReadError> for StreamError {
     fn from(error: quinn::ReadError) -> Self {
         match error {
@@ -335,13 +356,9 @@ impl From<quinn::ReadError> for StreamError {
                 code: Code::new(code.into_inner()),
             },
             quinn::ReadError::ConnectionLost(error) => Self::Connection(error.into()),
-            // `IllegalOrderedRead` cannot occur: this stack only ever reads in
-            // order. The other two are this endpoint having already finished
-            // with the stream, which is a fault in this stack, not in the peer.
-            other => Self::Local(Violation::stream(
-                Code::H3_INTERNAL_ERROR,
-                other.to_string(),
-            )),
+            // `ClosedStream`, `IllegalOrderedRead` and `ZeroRttRejected`, all
+            // three accounted for on [`internal`].
+            other => internal(&other),
         }
     }
 }
@@ -353,20 +370,16 @@ impl From<quinn::WriteError> for StreamError {
                 code: Code::new(code.into_inner()),
             },
             quinn::WriteError::ConnectionLost(error) => Self::Connection(error.into()),
-            other => Self::Local(Violation::stream(
-                Code::H3_INTERNAL_ERROR,
-                other.to_string(),
-            )),
+            // `ClosedStream` and `ZeroRttRejected`, both accounted for on
+            // [`internal`].
+            other => internal(&other),
         }
     }
 }
 
 impl From<quinn::ClosedStream> for StreamError {
     fn from(error: quinn::ClosedStream) -> Self {
-        Self::Local(Violation::stream(
-            Code::H3_INTERNAL_ERROR,
-            error.to_string(),
-        ))
+        internal(&error)
     }
 }
 
