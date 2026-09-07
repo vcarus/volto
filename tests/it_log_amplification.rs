@@ -199,6 +199,10 @@ async fn an_authentication_storm_is_bounded_by_the_failure_budget(buffer: &Share
 
     let failures = buffer.lines_since(mark, &[" WARN ", "authentication failed"]);
     assert!(
+        !failures.is_empty(),
+        "the line a fail2ban rule reads must still be audible at WARN"
+    );
+    assert!(
         failures.len() <= BUDGET,
         "the failure budget is {BUDGET}, so a connection may not write more than \
          {BUDGET} warnings about it; got {}:\n{}",
