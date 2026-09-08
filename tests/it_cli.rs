@@ -354,6 +354,19 @@ fn the_support_bundle_names_the_version_and_redacts_the_password() {
             "the bundle must carry the {section} section: {stdout}"
         );
     }
+
+    // The descriptor limits are read with `getrlimit` on the process running
+    // the command, which from an SSH shell is that shell and not the service.
+    // Two hosts were reported with the shell's figures because the bundle did
+    // not say so, so the line that says so is part of the bundle.
+    assert!(
+        stdout.contains("not the service's"),
+        "the bundle must say whose descriptor limits those two lines are: {stdout}"
+    );
+    assert!(
+        stdout.contains("/proc/<MainPID>/limits"),
+        "and name where the service's own figures are: {stdout}"
+    );
 }
 
 /// The two flags answer different questions, so a command line naming both is

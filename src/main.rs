@@ -152,7 +152,10 @@ fn report_config_check(path: &Path, config: &Config) {
 /// `tracing` -- the subscriber is not installed at this point in `main` and this
 /// output is not a log line, so D100's accounted set is untouched. Everything
 /// here is either this process's own memory, a `getrlimit` on itself, four files
-/// under `/proc/sys`, or one `uname`.
+/// under `/proc/sys`, the `exe` link, `comm` and `limits` of the processes
+/// listed under `/proc`, or one `uname`. The `/proc/<pid>` reads are Linux only
+/// and every one of them is allowed to fail: a refused or missing file becomes
+/// a line saying so, never a non-zero exit.
 ///
 /// Secrets are redacted because `Config` is printed through the `Debug` that
 /// already does it: `impl Debug for config::User` renders the password as
@@ -194,6 +197,11 @@ fn report_diagnostics(path: &Path, config: &Config) {
     let (soft, hard) = volto::net::fd_limits();
     println!("RLIMIT_NOFILE soft = {}", or_unlimited(soft));
     println!("RLIMIT_NOFILE hard = {}", or_unlimited(hard));
+    println!(
+        "these two are this process's own limits, not the service's \
+         (the service's are in /proc/<MainPID>/limits)"
+    );
+    print_service_fd_limits();
     println!();
 
     println!("[udp socket buffers]");
@@ -231,6 +239,102 @@ fn print_udp_buffer_sysctls() {
 #[cfg(not(target_os = "linux"))]
 fn print_udp_buffer_sysctls() {
     println!("not available on this platform (net.core.* is Linux only)");
+}
+
+/// The descriptor limits of the running volto service, if one is running.
+///
+/// The two `getrlimit` lines above are this process's own, and this command is
+/// typed into an SSH shell far more often than it is run by the service. That
+/// shell is where 1024 and 1048576 came from in two deploy reports about hosts
+/// whose unit sets `LimitNOFILE=131072`. The figure an operator wants is in
+/// `/proc/<pid>/limits` of the service process, so it is read here rather than
+/// left to a second command nobody runs.
+///
+/// The pid is found by walking `/proc` rather than by asking `systemctl`, which
+/// keeps the bundle free of a process and of any assumption about the unit's
+/// name. A process counts as this service when its `exe` link resolves to the
+/// same binary this process was started from. That link is readable only by a
+/// process that could ptrace the target, so an unprivileged operator gets
+/// `Permission denied` for the service running as root, and the name in `comm`
+/// is the fallback for exactly that case. Both are as much as `/proc` can be
+/// asked without privilege, and neither is proof: a second volto started by
+/// hand matches the same way, which is why every match is printed with its pid
+/// rather than reduced to one answer.
+///
+/// Nothing here can fail the run. Every read is reported as a line of its own,
+/// because a bundle that exits non-zero over a file it could not read is worse
+/// than one that says it could not read it.
+#[cfg(target_os = "linux")]
+fn print_service_fd_limits() {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!("the service's limits could not be looked up (/proc: {error})");
+            return;
+        }
+    };
+
+    let own_pid = std::process::id();
+    // `None` when this binary's own path cannot be read, which leaves `comm` as
+    // the only test rather than matching every process against nothing.
+    let own_exe = std::env::current_exe().ok();
+
+    let mut pids: Vec<u32> = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            // Everything under /proc that is not a pid, such as `sys` itself.
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+
+        let directory = Path::new("/proc").join(pid.to_string());
+        let matched = match std::fs::read_link(directory.join("exe")) {
+            Ok(exe) => own_exe.as_deref() == Some(exe.as_path()),
+            Err(_) => std::fs::read_to_string(directory.join("comm"))
+                .is_ok_and(|comm| comm.trim() == "volto"),
+        };
+        if matched {
+            pids.push(pid);
+        }
+    }
+    pids.sort_unstable();
+
+    if pids.is_empty() {
+        println!("no running volto process was found under /proc");
+        return;
+    }
+
+    for pid in pids {
+        let path = format!("/proc/{pid}/limits");
+        match std::fs::read_to_string(&path) {
+            Ok(limits) => match volto::net::max_open_files(&limits) {
+                Some((soft, hard)) => {
+                    println!(
+                        "service pid {pid} Max open files soft = {}",
+                        or_unlimited(soft)
+                    );
+                    println!(
+                        "service pid {pid} Max open files hard = {}",
+                        or_unlimited(hard)
+                    );
+                }
+                None => println!("service pid {pid} has no readable Max open files row in {path}"),
+            },
+            Err(error) => println!("service pid {pid} limits unreadable ({path}: {error})"),
+        }
+    }
+}
+
+/// The same lines where there is no `/proc` to walk.
+#[cfg(not(target_os = "linux"))]
+fn print_service_fd_limits() {
+    println!("the service's own limits are not available on this platform (/proc is Linux only)");
 }
 
 /// `uname -srm`, or a line saying why there is none.

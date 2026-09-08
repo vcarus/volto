@@ -393,6 +393,55 @@ pub fn fd_limits() -> (Option<u64>, Option<u64>) {
     (nofile.current, nofile.maximum)
 }
 
+/// The `Max open files` row of a `/proc/<pid>/limits` file, soft limit first.
+///
+/// `None` in either position is the file's literal `unlimited`, the same thing
+/// [`fd_limits`] reports as `None` for `RLIM_INFINITY`. `None` for the pair
+/// means the text carries no `Max open files` row, or carries one that does not
+/// have two readable value columns. Those two are not told apart, because the
+/// caller has the same thing to say about either: there is no number to print.
+///
+/// This takes the file's text rather than a pid, which is what makes it
+/// testable on the macOS development host where no such file exists. Reading
+/// the file, and finding the pid to read it for, belong to the one caller:
+/// `volto --diagnostics`, whose `[file descriptors]` section prints the running
+/// service's limits beside the ones `getrlimit` reports for itself. The two
+/// differ whenever the command is typed into an SSH shell, because the service
+/// runs under the unit's `LimitNOFILE` and the shell does not.
+///
+/// The kernel writes the row in fixed-width columns, and each value column is
+/// either a decimal number or the word `unlimited`:
+///
+/// ```text
+/// Limit                     Soft Limit           Hard Limit           Units
+/// Max open files            131072               131072               files
+/// ```
+pub fn max_open_files(limits: &str) -> Option<(Option<u64>, Option<u64>)> {
+    // The row name is followed by its padding, so a line that only begins with
+    // those words and then continues into a longer name is not this row.
+    let row = limits
+        .lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .filter(|row| row.starts_with(char::is_whitespace))?;
+
+    let mut columns = row.split_whitespace();
+    let soft = limit_column(columns.next()?)?;
+    let hard = limit_column(columns.next()?)?;
+    Some((soft, hard))
+}
+
+/// One value column of a `/proc/<pid>/limits` row.
+///
+/// `Some(None)` is `unlimited` and the outer `None` is a column that is neither
+/// that word nor a number, which is the case [`max_open_files`] reports as
+/// having no readable row.
+fn limit_column(column: &str) -> Option<Option<u64>> {
+    if column == "unlimited" {
+        return Some(None);
+    }
+    column.parse::<u64>().ok().map(Some)
+}
+
 /// Binds a UDP socket and connects it to `target`.
 ///
 /// Connecting the socket makes the kernel drop any packet that does not come
@@ -780,6 +829,87 @@ mod tests {
         // Whatever the platform calls it, it must be an error rather than an
         // empty success.
         assert!(!error.to_string().is_empty());
+    }
+
+    /// A `/proc/<pid>/limits` file as Linux writes it, with `soft` and `hard`
+    /// substituted into the `Max open files` row.
+    ///
+    /// The other rows are kept because they are what the parser has to walk
+    /// past, including `Max locked memory`, whose name also starts with the
+    /// word `Max`, and the two priority rows, which have no unit column.
+    fn limits_file(row: &str) -> String {
+        format!(
+            "Limit                     Soft Limit           Hard Limit           Units\n\
+             Max cpu time              unlimited            unlimited            seconds\n\
+             Max file size             unlimited            unlimited            bytes\n\
+             Max stack size            8388608              unlimited            bytes\n\
+             Max core file size        0                    unlimited            bytes\n\
+             Max processes             15155                15155                processes\n\
+             {row}\
+             Max locked memory         8388608              8388608              bytes\n\
+             Max address space         unlimited            unlimited            bytes\n\
+             Max nice priority         0                    0                    \n\
+             Max realtime timeout      unlimited            unlimited            us\n"
+        )
+    }
+
+    /// The row as it reads on a host running the shipped unit, whose
+    /// `LimitNOFILE` is 131072.
+    #[test]
+    fn the_max_open_files_row_gives_both_of_its_numbers() {
+        let text = limits_file(
+            "Max open files            131072               131072               files\n",
+        );
+
+        assert_eq!(max_open_files(&text), Some((Some(131_072), Some(131_072))));
+    }
+
+    /// `unlimited` is a value the file really carries, and it means the same
+    /// thing `None` means everywhere else here: no ceiling at all.
+    #[test]
+    fn unlimited_is_read_as_no_ceiling_rather_than_as_a_failure() {
+        let text = limits_file(
+            "Max open files            1024                 unlimited            files\n",
+        );
+
+        assert_eq!(max_open_files(&text), Some((Some(1024), None)));
+
+        let both = limits_file(
+            "Max open files            unlimited            unlimited            files\n",
+        );
+
+        assert_eq!(max_open_files(&both), Some((None, None)));
+    }
+
+    /// A file without the row answers nothing, which is what a kernel that
+    /// renamed the row or a file read from the wrong place would look like.
+    #[test]
+    fn a_file_without_the_row_has_no_answer() {
+        assert_eq!(max_open_files(&limits_file("")), None);
+        assert_eq!(max_open_files(""), None);
+    }
+
+    /// A row whose columns are not what they should be is reported as no
+    /// answer, never as a number nobody wrote down.
+    #[test]
+    fn a_malformed_row_is_not_guessed_at() {
+        for row in [
+            // A value column that is neither a number nor `unlimited`.
+            "Max open files            many                 131072               files\n",
+            "Max open files            131072               many                 files\n",
+            // A negative number is not a limit either.
+            "Max open files            -1                   131072               files\n",
+            // Only one value column.
+            "Max open files            131072\n",
+            // The name with nothing after it at all.
+            "Max open files\n",
+        ] {
+            assert_eq!(
+                max_open_files(&limits_file(row)),
+                None,
+                "this row has no readable pair of values: {row:?}"
+            );
+        }
     }
 
     /// The startup fd check is only useful if the probe works on both hosts.

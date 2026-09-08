@@ -399,10 +399,12 @@ See [`[log]`](configuration.md#log) for the rest of the line format.
 When a problem needs reporting rather than reading, `volto --diagnostics
 --config /etc/volto/config.toml` prints the version, the parsed configuration
 with passwords redacted, descriptor limits, the UDP buffer sysctls and the
-kernel, in one paste. The descriptor limits are those of the process that ran
-the command, so from an SSH shell they are the shell's and not the service's;
-read `/proc/<MainPID>/limits` for the service, with the pid from `systemctl show
--p MainPID volto`. See [collecting a support
+kernel, in one paste. The two `RLIMIT_NOFILE` lines are those of the process
+that ran the command, so from an SSH shell they are the shell's and not the
+service's. The bundle says so on the line under them, and on Linux it prints the
+service's own `Max open files` values as well, read from `/proc/<pid>/limits` of
+every running volto process it finds. To read that by hand, `systemctl show -p
+MainPID volto` gives the pid. See [collecting a support
 bundle](configuration.md#collecting-a-support-bundle).
 
 ## Firewall

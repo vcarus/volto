@@ -533,8 +533,9 @@ parsed it, after defaults, so `[limits]` and `[security]` are the values the
 server would actually run on rather than the subset the file happens to name;
 the warnings `--check-config` prints; the descriptor limits of **the process
 that ran the command**, soft and hard, since the hard limit is what says whether
-a soft one that is too low can be raised here at all or needs the unit changed;
-the four `net.core` UDP buffer sysctls named under [UDP socket
+a soft one that is too low can be raised here at all or needs the unit changed,
+and on Linux the same pair for the running service, read from `/proc`; the four
+`net.core` UDP buffer sysctls named under [UDP socket
 buffers](deployment.md#udp-socket-buffers), read from `/proc/sys` on Linux and
 reported as unavailable on any other platform; and `uname -srm`.
 
@@ -545,10 +546,29 @@ anyway: the rest of the configuration is there in full, host names and listen
 address included.
 
 **The descriptor limits are this command's, not the service's.** Run from an SSH
-shell the figures are that shell's, which is how 1024 and 1048576 came to be
-recorded for two hosts running the service at 131072. For the running service,
-read `/proc/<MainPID>/limits`, with the pid from `systemctl show -p MainPID
-volto`.
+shell the two `RLIMIT_NOFILE` lines are that shell's, which is how 1024 and
+1048576 came to be recorded for two hosts running the service at 131072. The
+line under them says so, and on Linux the section then prints the running
+service's own figures, read from `/proc/<pid>/limits`:
+
+```text
+[file descriptors]
+RLIMIT_NOFILE soft = 1024
+RLIMIT_NOFILE hard = 1048576
+these two are this process's own limits, not the service's (the service's are in /proc/<MainPID>/limits)
+service pid 5312 Max open files soft = 131072
+service pid 5312 Max open files hard = 131072
+```
+
+The service is found by walking `/proc`, so no unit name is assumed and nothing
+is asked of `systemctl`: a process matches when its `exe` link resolves to the
+binary this command is running, or, where that link cannot be read without
+privilege, when its `comm` is `volto`. Every match is printed with its own pid,
+so a second volto started by hand is visible rather than folded into one answer.
+A host with no such process prints one line saying so, and a file that cannot be
+read prints one line saying that; neither changes the exit status. On any other
+platform the section says these figures are Linux only. To read them by hand,
+`systemctl show -p MainPID volto` gives the pid for `/proc/<MainPID>/limits`.
 
 Nothing is bound, connected or resolved, nothing is written, and no journal is
 read, so this asks for no more privilege than reading the configuration file
