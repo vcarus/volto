@@ -252,14 +252,17 @@ fn print_udp_buffer_sysctls() {
 ///
 /// The pid is found by walking `/proc` rather than by asking `systemctl`, which
 /// keeps the bundle free of a process and of any assumption about the unit's
-/// name. A process counts as this service when its `exe` link resolves to the
-/// same binary this process was started from. That link is readable only by a
-/// process that could ptrace the target, so an unprivileged operator gets
-/// `Permission denied` for the service running as root, and the name in `comm`
-/// is the fallback for exactly that case. Both are as much as `/proc` can be
-/// asked without privilege, and neither is proof: a second volto started by
-/// hand matches the same way, which is why every match is printed with its pid
-/// rather than reduced to one answer.
+/// name. A process counts as this service when its `comm` is `volto`, or when
+/// its `exe` link resolves to the same binary this process was started from.
+/// Both tests are needed. `comm` is readable without privilege but is only a
+/// name. The `exe` link is exact but is readable only by a process that could
+/// ptrace the target, so an unprivileged operator gets `Permission denied` for
+/// a service running as root; and it reads `/usr/local/bin/volto (deleted)`
+/// once the deploy script has replaced the file under the running service, and
+/// a different path when this command is run from a freshly unpacked tarball.
+/// Neither test is proof: a second volto started by hand matches the same way,
+/// which is why every match is printed with its pid rather than reduced to one
+/// answer.
 ///
 /// Nothing here can fail the run. Every read is reported as a line of its own,
 /// because a bundle that exits non-zero over a file it could not read is worse
@@ -277,6 +280,8 @@ fn print_service_fd_limits() {
     let own_pid = std::process::id();
     // `None` when this binary's own path cannot be read, which leaves `comm` as
     // the only test rather than matching every process against nothing.
+    // `/proc/self/exe` is what `current_exe` reads on Linux, so the comparison
+    // is link target against link target.
     let own_exe = std::env::current_exe().ok();
 
     let mut pids: Vec<u32> = Vec::new();
@@ -294,12 +299,13 @@ fn print_service_fd_limits() {
         }
 
         let directory = Path::new("/proc").join(pid.to_string());
-        let matched = match std::fs::read_link(directory.join("exe")) {
-            Ok(exe) => own_exe.as_deref() == Some(exe.as_path()),
-            Err(_) => std::fs::read_to_string(directory.join("comm"))
-                .is_ok_and(|comm| comm.trim() == "volto"),
+        let by_name = std::fs::read_to_string(directory.join("comm"))
+            .is_ok_and(|comm| comm.trim() == "volto");
+        let by_path = || {
+            std::fs::read_link(directory.join("exe"))
+                .is_ok_and(|exe| own_exe.as_deref() == Some(exe.as_path()))
         };
-        if matched {
+        if by_name || by_path() {
             pids.push(pid);
         }
     }

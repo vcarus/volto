@@ -561,9 +561,12 @@ service pid 5312 Max open files hard = 131072
 ```
 
 The service is found by walking `/proc`, so no unit name is assumed and nothing
-is asked of `systemctl`: a process matches when its `exe` link resolves to the
-binary this command is running, or, where that link cannot be read without
-privilege, when its `comm` is `volto`. Every match is printed with its own pid,
+is asked of `systemctl`: a process matches when its `comm` is `volto`, or when
+its `exe` link resolves to the binary this command is running. The name alone
+is enough because the link is readable only with privilege, reads `(deleted)`
+once the deploy script has replaced the file under the running service, and is
+a different path when this command is run from a freshly unpacked tarball.
+Every match is printed with its own pid,
 so a second volto started by hand is visible rather than folded into one answer.
 A host with no such process prints one line saying so, and a file that cannot be
 read prints one line saying that; neither changes the exit status. On any other
