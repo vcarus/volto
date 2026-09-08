@@ -1,6 +1,6 @@
 [package]
 name = "volto"
-version = "0.10.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
