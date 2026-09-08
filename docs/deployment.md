@@ -225,12 +225,24 @@ host needs:
   without touching anything. The presence checks are part of the deal —
   deleting `/etc/volto/config.toml` and re-running is the supported way to
   regenerate it (the certificate and the system user survive, so the
-  fingerprint does not change).
+  fingerprint does not change). What decides this is the version string and
+  nothing else, so a binary that reports the wanted version is left in place
+  whatever its bytes are; `--force` below is how it gets replaced.
 
 `--dry-run` prints which of the three a run would pick and stops before doing
 anything about it. It needs an explicit `--tag`, since resolving "latest" is a
 network call, and it is how `tests/it_deploy.rs` exercises the decision without
 root, systemd or a download.
+
+`--force` takes the download, verify, install and restart path even when the
+installed version already matches and the config and unit are both in place. It
+needs `--tag` for the same reason `--dry-run` does: a reinstall is about the
+bytes of one named release. Nothing else about the path changes, the rollback
+guard included, and neither `/etc/volto/config.toml` nor the certificate is
+rewritten. A dry run reports the same decision as `dry-run: would reinstall
+v0.4.7`. The case it is for is a release deleted and published again under the
+same tag: the convergence check compares version strings, so a host that already
+reports that version keeps the bytes of the first upload until a run is forced.
 
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of
@@ -292,6 +304,10 @@ Rolling back is the same flow pinned to an older release:
 ```sh
 sudo volto-deploy --tag v0.1.0
 ```
+
+Add `--force` when the host already reports the version being pinned to. The
+convergence check compares version strings, so without it that run is a no-op
+and the binary on the host stays where it is.
 
 Before pinning anything older than v0.4.5, comment `mtu_upper_bound` out of
 `/etc/volto/config.toml`: every install carries that key, no earlier release

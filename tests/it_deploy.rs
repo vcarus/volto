@@ -144,6 +144,7 @@ fn the_script_documents_itself() {
         "--tag",
         "--enable-timer",
         "--dry-run",
+        "--force",
         "--sni",
         "Re-running is safe",
     ] {
@@ -204,6 +205,48 @@ fn a_dry_run_without_a_tag_refuses_rather_than_resolving_one() {
     assert!(
         stderr.contains("--dry-run needs --tag"),
         "the error must say a tag is required: {stderr}"
+    );
+}
+
+/// `--force` puts a named release's bytes on the host, so it has to be told
+/// which release. The same reason `--dry-run` needs a tag, refused in the same
+/// words.
+#[test]
+fn forcing_a_reinstall_without_a_tag_is_rejected() {
+    let output = run_deploy(&["--force"]);
+
+    assert!(
+        !output.status.success(),
+        "--force without a tag must not run"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("--force needs --tag"),
+        "the error must say a tag is required: {stderr}"
+    );
+}
+
+/// The gap `--force` closes: the version string is the whole convergence test,
+/// so a host reporting the release's version keeps whatever binary it has.
+///
+/// A release deleted and published again under the same tag leaves exactly
+/// that, and on 2026-09-05 it left a host running the bytes of the first
+/// upload. Without `--force` the run is the no-op below; with it the same
+/// intact install is downloaded, verified and installed again.
+#[test]
+fn an_intact_install_is_reinstalled_when_the_run_is_forced() {
+    let root = install_root("forced-reinstall");
+    plant_binary(&root, "0.2.4");
+    plant_config(&root);
+    plant_unit(&root);
+
+    let output = run_deploy_under(Some(&root), &["--dry-run", "--tag", "v0.2.4", "--force"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        stdout_of(&output),
+        "dry-run: would reinstall v0.2.4
+"
     );
 }
 

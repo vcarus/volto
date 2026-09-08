@@ -14,6 +14,14 @@
 # That no-op path is what makes the script safe to run on a schedule:
 # --enable-timer installs a systemd timer that re-runs it daily.
 #
+# The version string is the whole of that test, which is why --force exists. A
+# release deleted and published again under the same tag leaves a host whose
+# volto --version matches the tag and whose binary is not the release's, and
+# nothing here can tell the two apart. --force takes the download, verify,
+# install and restart path anyway, rollback guard included, and needs --tag for
+# the same reason --dry-run does: the point is to put one named release's bytes
+# on this host.
+#
 # Rolling back by hand is the same flow pinned to an older release:
 #   sudo volto-deploy --tag v0.1.0
 #
@@ -66,6 +74,7 @@ TIMER_SERVICE="$ROOT/etc/systemd/system/$TIMER_NAME.service"
 TIMER_UNIT="$ROOT/etc/systemd/system/$TIMER_NAME.timer"
 ENABLE_TIMER=0
 DRY_RUN=0
+FORCE=0
 INSTALL_ARGS=()
 
 usage() {
@@ -78,7 +87,9 @@ a host without an existing install this runs the bundled self-signed installer
 runs volto only the binary and the systemd unit are refreshed and the service
 is restarted, keeping the previous binary for automatic rollback. When the
 installed version already matches the release and the config and unit are in
-place, nothing is touched.
+place, nothing is touched. That check is the version string and nothing else,
+so a binary that reports the wanted version is left alone even when its bytes
+are not the release's; --force (with --tag) is how such a binary is replaced.
 
 Before the binary is swapped the new one is asked whether it can load
 /etc/volto/config.toml (volto --check-config); if it cannot, nothing is
@@ -92,6 +103,10 @@ Options:
                        script daily, keeping the host on the newest release
       --dry-run        print the decision this run would act on and stop;
                        needs --tag, downloads nothing, changes nothing
+      --force          install the release even when the installed version
+                       already matches it; needs --tag, keeps the rollback
+                       guard, and rewrites neither the config nor the
+                       certificate
   -s, --sni NAME       first install only: passed to install-selfsigned.sh
   -p, --port PORT      first install only: passed to install-selfsigned.sh
   -u, --username NAME  first install only: passed to install-selfsigned.sh
@@ -106,7 +121,8 @@ the config check runs; both exist for --dry-run tests.
 
 Re-running is safe: the version check turns a run with nothing new into a
 no-op, and the first-install path inherits install-selfsigned.sh's guarantees
-(an existing config file, certificate or user is kept as it is).
+(an existing config file, certificate or user is kept as it is). --force is the
+one way to get past that no-op.
 USAGE
 }
 
@@ -210,6 +226,7 @@ while [ $# -gt 0 ]; do
         -t|--tag)       [ $# -ge 2 ] || die "$1 needs a value"; TAG="$2"; shift 2 ;;
         --enable-timer) ENABLE_TIMER=1; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
+        --force)        FORCE=1; shift ;;
         -s|--sni|-p|--port|-u|--username|-w|--password)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
@@ -217,6 +234,13 @@ while [ $# -gt 0 ]; do
         *)              usage >&2; die "unknown option: $1" ;;
     esac
 done
+
+# Asked here rather than beside the --dry-run check below, so the answer does
+# not depend on the host: a forced run on a dev machine is refused for the
+# reason it is actually wrong, and not by the root check in front of it.
+if [ "$FORCE" -eq 1 ] && [ -z "$TAG" ]; then
+    die "--force needs --tag: reinstalling means putting one named release's bytes on this host"
+fi
 
 # --- preflight ---------------------------------------------------------------
 
@@ -289,7 +313,7 @@ SELF_SOURCE="$0"
 # Converging means the whole install, not just the binary: a deleted config or
 # unit must be regenerated even when the version already matches, and doing so
 # needs the tarball (it carries the installer and the example config).
-if [ "$INSTALLED" = "$VERSION" ] && [ -f "$CONF" ] && [ -f "$UNIT" ]; then
+if [ "$INSTALLED" = "$VERSION" ] && [ -f "$CONF" ] && [ -f "$UNIT" ] && [ "$FORCE" -eq 0 ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "dry-run: already deployed and intact ($TAG)"
     else
@@ -312,6 +336,10 @@ elif [ "$DRY_RUN" -eq 1 ]; then
 
     if [ ! -f "$CONF" ]; then
         echo "dry-run: would install $TAG$MISSING"
+    elif [ "$FORCE" -eq 1 ] && [ "$INSTALLED" = "$VERSION" ] && [ -z "$MISSING" ]; then
+        # The only decision --force adds: everything else it reaches is already
+        # an install or an update, and is reported as one.
+        echo "dry-run: would reinstall $TAG"
     else
         echo "dry-run: would update ${INSTALLED:-(unknown)} -> $TAG$MISSING"
     fi
@@ -360,7 +388,11 @@ else
         # ends the run with the service still up.
         check_config_with "$SRC/volto"
 
-        echo "==> updating volto ${INSTALLED:-(unknown)} -> $VERSION"
+        if [ "$FORCE" -eq 1 ] && [ "$INSTALLED" = "$VERSION" ]; then
+            echo "==> reinstalling volto $VERSION over the same version"
+        else
+            echo "==> updating volto ${INSTALLED:-(unknown)} -> $VERSION"
+        fi
 
         if [ -x "$BIN" ]; then
             install -m 0755 "$BIN" "$BIN.prev"
