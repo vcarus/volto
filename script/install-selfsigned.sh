@@ -358,28 +358,50 @@ install -d -o volto -g volto -m 0750 "$CONF_DIR"
 if [ -f "$CERT" ] && [ -f "$KEY" ] && [ "$FORCE" -eq 0 ]; then
     note "certificate already exists, keeping it (use --force to regenerate)"
 else
+    # The new pair is written beside the old one and moved into place only after
+    # openssl has succeeded. A renewal that fails -- a full filesystem, a
+    # provider that will not initialize, an extension this openssl does not know
+    # -- therefore leaves the configured paths holding the pair that already
+    # worked, which is the pair the next restart has to load.
+    #
+    # EC P-256: smaller handshake than RSA, and universally supported by TLS 1.3.
+    # The SAN is what actually gets matched -- a bare CN has not been accepted for
+    # years -- so it must be present even though the name is fictional.
+    #
+    # `umask 077` in a subshell around the generation: openssl creates -keyout
+    # with the process umask, so without it the new key is world-readable from
+    # its creation until the chmod below. The subshell keeps the umask off the
+    # rest of the script.
+    (
+        umask 077
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+            -keyout "$KEY.new" -out "$CERT.new" \
+            -days "$CERT_DAYS" -nodes \
+            -subj "/CN=$SNI" \
+            -addext "subjectAltName=DNS:$SNI" \
+            -addext "basicConstraints=critical,CA:FALSE" \
+            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "extendedKeyUsage=serverAuth" \
+            >/dev/null 2>&1
+    ) || {
+        rm -f "$CERT.new" "$KEY.new"
+        die "openssl failed to generate the certificate; the previous certificate and key are untouched at $CERT and $KEY"
+    }
+
+    # One timestamp for both backups, so the pair keeps a name that says it is a
+    # pair even when the generation above straddles a second boundary.
     if [ -f "$CERT" ]; then
-        backup="$CERT.$(date +%Y%m%d%H%M%S).bak"
+        stamp="$(date +%Y%m%d%H%M%S)"
+        backup="$CERT.$stamp.bak"
         mv "$CERT" "$backup"
         if [ -f "$KEY" ]; then
-            mv "$KEY" "$KEY.$(date +%Y%m%d%H%M%S).bak"
+            mv "$KEY" "$KEY.$stamp.bak"
         fi
         note "backed up the previous certificate to $backup"
     fi
 
-    # EC P-256: smaller handshake than RSA, and universally supported by TLS 1.3.
-    # The SAN is what actually gets matched -- a bare CN has not been accepted for
-    # years -- so it must be present even though the name is fictional.
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$KEY" -out "$CERT" \
-        -days "$CERT_DAYS" -nodes \
-        -subj "/CN=$SNI" \
-        -addext "subjectAltName=DNS:$SNI" \
-        -addext "basicConstraints=critical,CA:FALSE" \
-        -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-        -addext "extendedKeyUsage=serverAuth" \
-        >/dev/null 2>&1 ||
-        die "openssl failed to generate the certificate"
+    mv "$CERT.new" "$CERT"
+    mv "$KEY.new" "$KEY"
 
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi
