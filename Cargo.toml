@@ -313,4 +313,4 @@ unsafe_code = "deny"
 as_conversions = "deny"
 
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "48455d33be98128882d900dfcd7014b9a7beff6f" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "a708a979c291f6b2baf0141d3096f265353cbce1" }

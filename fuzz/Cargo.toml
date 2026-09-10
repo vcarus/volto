@@ -44,7 +44,7 @@ unsafe_code = "deny"
 # stanza has to be repeated; keep the rev in lockstep with `../Cargo.toml`,
 # where the reasoning and the exit condition live.
 [patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "48455d33be98128882d900dfcd7014b9a7beff6f" }
+quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "a708a979c291f6b2baf0141d3096f265353cbce1" }
 
 [workspace]
 members = ["."]
