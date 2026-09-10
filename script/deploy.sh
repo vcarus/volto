@@ -47,7 +47,9 @@
 # under a piped bootstrap, and the config check above -- inside reach of
 # tests/it_deploy.rs, with no root, no systemd and no network.
 
-set -euo pipefail
+# `-E` so the ERR trap the update block arms is inherited by functions;
+# nothing else in this script installs one.
+set -eEuo pipefail
 
 # --- defaults ----------------------------------------------------------------
 
@@ -133,6 +135,36 @@ die() {
 
 note() {
     echo "  $*"
+}
+
+# Puts the previous binary and unit back, then ends the run.
+#
+# Armed as an ERR trap over the window between the `.prev` copies and the health
+# check, and disarmed once the service is up. Without it `set -e` ends the run
+# with whatever the failure left behind: an `install` that truncated its target
+# before failing leaves no usable binary, and a failure between the binary copy
+# and the unit copy leaves the new binary under the old unit. The rollback
+# branch further down answers neither, because it runs only after `systemctl
+# is-active` has been asked, which is past this window.
+#
+# The service is not restarted here. Before the health check it is still running
+# the release it was already running, or systemd is bringing it back under
+# Restart=on-failure, and the journal is where the operator looks either way.
+restore_previous() {
+    trap - ERR
+    local restored=""
+
+    if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN"; then
+        restored="binary"
+    fi
+    if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+        restored="${restored:+$restored and }unit"
+    fi
+    systemctl daemon-reload || true
+
+    [ -n "$restored" ] ||
+        die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
+    die "installing volto $VERSION failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
 }
 
 # True when version $1 is strictly older than version $2, comparing the dotted
@@ -408,6 +440,12 @@ else
             install -m 0644 "$UNIT" "$UNIT.prev"
             note "previous unit kept at $UNIT.prev"
         fi
+        # Both `.prev` copies exist from here on, so every failure until the
+        # service answers is a failure this can undo. A command inside the `if`
+        # below is a tested command and does not fire the trap, which is what
+        # leaves the rollback branch reachable for a service that comes up and
+        # then dies.
+        trap restore_previous ERR
         install -m 0755 "$SRC/volto" "$BIN"
         install -m 0644 "$SRC/script/masque.service" "$UNIT"
         systemctl daemon-reload
@@ -417,6 +455,7 @@ else
         # under Restart=on-failure the service is not "active" again by now.
         sleep 3
         if systemctl is-active --quiet "$SERVICE_NAME"; then
+            trap - ERR
             note "volto $VERSION is running"
         elif [ -x "$BIN.prev" ]; then
             install -m 0755 "$BIN.prev" "$BIN"
