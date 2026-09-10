@@ -26,17 +26,23 @@
 //! * **Private** — everything RFC 6890 calls special-purpose and this proxy
 //!   might actually reach: `0.0.0.0/8`, loopback, RFC 1918, link-local, shared
 //!   address space, the benchmarking and documentation ranges, reserved space,
-//!   6to4 relay anycast, ULA, ORCHID and the deprecated IPv4-compatible and
-//!   IPv6 site-local spaces. Denied by default, unlocked by
-//!   `allow_private_networks`.
+//!   6to4 relay anycast, ULA, ORCHID, the local-use NAT64 prefix and the
+//!   deprecated IPv4-compatible and IPv6 site-local spaces. Denied by default,
+//!   unlocked by `allow_private_networks`.
 //!
 //! # Transition addresses are judged as IPv4
 //!
-//! NAT64, 6to4 and Teredo addresses embed an IPv4 address, and a host that
-//! routes them reaches exactly that address. `64:ff9b::7f00:1` is therefore
-//! 127.0.0.1 with three extra steps, and letting it past because it is
-//! syntactically a global IPv6 address would undo the whole IPv4 half of this
-//! module. `embedded_ipv4` unwraps them before any rule is applied.
+//! The well-known NAT64 prefix, 6to4 and Teredo addresses embed an IPv4 address
+//! at a fixed place, and a host that routes them reaches exactly that address.
+//! `64:ff9b::7f00:1` is therefore 127.0.0.1 with three extra steps, and letting
+//! it past because it is syntactically a global IPv6 address would undo the
+//! whole IPv4 half of this module. `embedded_ipv4` unwraps them before any rule
+//! is applied.
+//!
+//! The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) is the one transition
+//! form that is not unwrapped. Its operator chooses the layout, RFC 8215 §5
+//! forbids a reader assuming one, and a guess can read a private target as
+//! public. The whole prefix sits in the private bucket instead.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -184,6 +190,12 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// interior with it before 2004 still routes it, and nothing on the public
 /// internet answers there, so a request for it is either a mistake or a way in.
 ///
+/// One entry is here because its contents cannot be read: `64:ff9b:1::/48`, the
+/// local-use NAT64 prefix (RFC 8215). It carries an IPv4 address, but the
+/// operator picks the layout and RFC 8215 §5 forbids assuming one, so the whole
+/// prefix follows the switch rather than the address it might contain
+/// ([`is_local_use_nat64`], and [`embedded_ipv4`] for the reasoning).
+///
 /// One entry is deliberately absent: `2001::/23`, RFC 6890 Table 22's IETF
 /// Protocol Assignments (from RFC 2928) — the IPv6 counterpart of the
 /// `192.0.0.0/24` this list does claim. Every one of its Source, Destination,
@@ -236,6 +248,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_ipv6_benchmarking(v6)
                 || is_orchid(v6)
                 || is_discard_only(v6)
+                || is_local_use_nat64(v6)
         }
     }
 }
@@ -290,23 +303,29 @@ fn is_discard_only(v6: Ipv6Addr) -> bool {
     segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0)
 }
 
+/// `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215).
+///
+/// An address here is a translation of some IPv4 address, and the operator
+/// chooses where in the address that IPv4 address sits. RFC 8215 §5 says a
+/// reader must not guess: "they must not make any assumptions regarding the
+/// syntax or properties of those addresses (e.g., the existence and location of
+/// embedded IPv4 addresses)". So the whole prefix is private, and it is
+/// `allow_private_networks` that decides whether it may be dialled. See
+/// [`embedded_ipv4`] for what reading a layout would cost.
+fn is_local_use_nat64(v6: Ipv6Addr) -> bool {
+    v6.octets()[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
+}
+
 /// The IPv4 address an IPv6 transition address carries, if it carries one.
 ///
 /// A host that routes any of these reaches the embedded IPv4 address, so this is
 /// what the IPv4 rules must be applied to — otherwise `2002:0a00:0001::` is a
 /// route to 10.0.0.1 that `allow_private_networks = false` never sees.
 ///
-/// The four forms that matter here:
+/// The three forms that matter here:
 ///
 /// * `64:ff9b::/96` — the well-known NAT64 prefix (RFC 6052 §2.1), with the
 ///   address in the last 32 bits;
-/// * `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215), **decoded at the
-///   /48 layout and at no other**; see below.
-///   At a /48 prefix RFC 6052 §2.2 splits the address around the reserved octet
-///   at bits 64-71, which is why this is not simply the last four octets. The
-///   reserved octet is not checked: a host translating the address ignores it
-///   too, and refusing to look would let a single non-zero byte hide a private
-///   target.
 /// * `2002::/16` — 6to4 (RFC 3056), with the address at bits 16-47;
 /// * `2001::/32` — Teredo (RFC 4380 §4). The client's own IPv4 address is the
 ///   last 32 bits with every bit inverted, which is the one this proxy would
@@ -316,48 +335,29 @@ fn is_discard_only(v6: Ipv6Addr) -> bool {
 /// unwrapping it would turn `::1` into 0.0.0.1 and lose the loopback meaning, so
 /// [`is_ipv4_compatible`] keeps claiming it wholesale instead.
 ///
-/// # The local-use prefix has more than one layout, and this reads one of them
+/// # The local-use prefix is refused whole rather than read
 ///
 /// The well-known prefix is fixed at /96 by RFC 6052 §3.1, so there is one
 /// answer for it. `64:ff9b:1::/48` is not like that. RFC 8215 §5: "64:ff9b:1::/48
 /// is intended as a technology-agnostic and generic reservation. A network
 /// operator may freely use it in combination with any kind of IPv4/IPv6
-/// translation mechanism deployed within their network." The same section says
-/// what that costs a reader of one of these addresses: "By default, IPv6 nodes
-/// and applications must not treat IPv6 addresses within 64:ff9b:1::/48
-/// differently from other globally scoped IPv6 addresses. In particular, they
-/// must not make any assumptions regarding the syntax or properties of those
-/// addresses (e.g., the existence and location of embedded IPv4 addresses)". An
-/// operator may therefore run a translator on a /56, /64 or /96 taken out of
-/// that /48. RFC 6052 §2.2 allows prefix lengths of 32, 40, 48, 56, 64 and 96,
-/// and the four that are /48 or longer fit inside this reservation. The
-/// embedded address sits somewhere else in each of them.
+/// translation mechanism deployed within their network." The same section
+/// forbids reading one of these addresses: "By default, IPv6 nodes and
+/// applications must not treat IPv6 addresses within 64:ff9b:1::/48 differently
+/// from other globally scoped IPv6 addresses. In particular, they must not make
+/// any assumptions regarding the syntax or properties of those addresses (e.g.,
+/// the existence and location of embedded IPv4 addresses)". RFC 6052 §2.2
+/// allows prefix lengths of 32, 40, 48, 56, 64 and 96, and the four that are /48
+/// or longer fit inside this reservation, each with the address in a different
+/// place. Nothing in an address says which of them produced it.
 ///
-/// This function reads the /48 layout, where the address is octets 6 and 7 then
-/// 9 and 10, so an address deployed at another layout is judged by four octets
-/// that are not the address a translator would reach. What that verdict is,
-/// layout by layout:
-///
-/// * **/56**: the address is octet 7 then octets 9, 10 and 11, so the read is
-///   the address shifted by one octet with the operator's octet 6 in front of
-///   it: `prefix.a.b.c` for a real `a.b.c.d`.
-/// * **/64**: the address is octets 9 to 12, and octets 6 and 7 are the
-///   operator's subnet, so the read is `subnet.subnet.a.b`. Zero subnet bits
-///   make that `0.0.a.b`, which `is_never_allowed` or the `0.0.0.0/8` entry of
-///   the private bucket refuses.
-/// * **/96**: the address is the last four octets, and octets 6, 7, 9 and 10
-///   are all inside the operator's prefix. A prefix whose low bits are zero
-///   reads as `0.0.0.0`, which is never allowed.
-///
-/// So the mislayouts land in the refused direction rather than the permissive
-/// one, which is why this is documented rather than changed. The exception is
-/// narrow and worth naming: a /64 deployment whose subnet bits happen to spell a
-/// public IPv4 prefix while the embedded address is private would be allowed on
-/// the strength of an address nothing will be sent to. Closing it means refusing
-/// the whole `64:ff9b:1::/48` rather than guessing better, because nothing in
-/// the address says which layout produced it, and that is the change to make if
-/// a translator on this prefix at another layout ever turns up on a path this
-/// proxy can reach.
+/// Picking one layout judges an address deployed at another by octets no
+/// translator will send to, and the direction of that error is not always the
+/// refusing one: at the /64 layout the operator's subnet octets are read as the
+/// first half of the address, so a subnet that spells a public IPv4 prefix hides
+/// a private target from `allow_private_networks = false`. So this function
+/// reads no layout at all, and [`is_local_use_nat64`] puts the whole /48 in the
+/// private bucket instead.
 fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     let IpAddr::V6(v6) = ip else {
         return None;
@@ -369,11 +369,6 @@ fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
         return Some(Ipv4Addr::new(
             octets[12], octets[13], octets[14], octets[15],
         ));
-    }
-
-    // 64:ff9b:1::/48
-    if octets[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01] {
-        return Some(Ipv4Addr::new(octets[6], octets[7], octets[9], octets[10]));
     }
 
     // 2002::/16
@@ -780,7 +775,6 @@ mod tests {
             "64:ff9b::7f00:1",          // NAT64 well-known prefix, 127.0.0.1
             "64:ff9b::a00:1",           // 10.0.0.1
             "64:ff9b::a9fe:a9fe",       // 169.254.169.254, the metadata address
-            "64:ff9b:1:a9fe:a9:fe00::", // the /48 prefix, same address
             "2002:a00:1::",             // 6to4, 10.0.0.1
             "2002:7f00:1::",            // 6to4, 127.0.0.1
             "2001:0:0:0:0:0:f5ff:fffe", // Teredo, 10.0.0.1 inverted
@@ -799,7 +793,6 @@ mod tests {
         // blanket ban on the transition forms.
         for address in [
             "64:ff9b::808:808",         // NAT64, 8.8.8.8
-            "64:ff9b:1:808:8:800::",    // the /48 prefix, 8.8.8.8
             "2002:808:808::",           // 6to4, 8.8.8.8
             "2001:0:0:0:0:0:f7f7:f7f7", // Teredo, 8.8.8.8 inverted
         ] {
@@ -821,13 +814,40 @@ mod tests {
         }
     }
 
+    /// The local-use NAT64 prefix is private as a whole, at every layout.
+    ///
+    /// RFC 8215 §5 forbids assuming where the IPv4 address sits inside
+    /// `64:ff9b:1::/48`, so this proxy does not look for one. Each address below
+    /// is a translation of 10.0.0.1 at one of the RFC 6052 §2.2 layouts that fit
+    /// inside that /48, and in each of them the four octets a /48 reader takes
+    /// spell a public address instead. Reading the layout would therefore let a
+    /// private target past `allow_private_networks = false`.
+    #[test]
+    fn the_local_use_nat64_prefix_is_private_at_every_layout() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for (address, layout, misread) in [
+            ("64:ff9b:1:80a:0:1::", "/56", "8.10.0.0"),
+            ("64:ff9b:1:808:a:0:100:0", "/64", "8.8.10.0"),
+            ("64:ff9b:1:808:8:800:a00:1", "/96", "8.8.8.8"),
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} translates 10.0.0.1 at the {layout} layout \
+                 and must be denied rather than read as {misread}"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} is private and must follow the switch"
+            );
+        }
+    }
+
     /// The extraction itself, address by address.
     ///
     /// The bucket assertions above would pass on a near-miss — 169.254.0.169 is
     /// as link-local as 169.254.169.254 — so the exact value is asserted here.
-    /// The RFC 6052 §2.2 /48 layout is the one worth stating: the IPv4 address is
-    /// split around the reserved octet at bits 64-71 rather than sitting in one
-    /// piece.
     #[test]
     fn the_embedded_ipv4_is_extracted_exactly() {
         for (address, expected) in [
@@ -835,9 +855,6 @@ mod tests {
             ("64:ff9b::7f00:1", "127.0.0.1"),
             ("64:ff9b::808:808", "8.8.8.8"),
             ("64:ff9b::", "0.0.0.0"),
-            // RFC 8215's /48 prefix, RFC 6052 §2.2's split layout.
-            ("64:ff9b:1:a9fe:a9:fe00::", "169.254.169.254"),
-            ("64:ff9b:1:808:8:800::", "8.8.8.8"),
             // 6to4: bits 16-47.
             ("2002:a00:1::", "10.0.0.1"),
             ("2002:808:808::1", "8.8.8.8"),
@@ -852,13 +869,17 @@ mod tests {
             );
         }
 
-        // Everything else carries nothing, including the ranges that merely look
-        // adjacent and the deprecated `::/96` form that must stay whole.
+        // Everything else carries nothing: the local-use prefix whose layout must
+        // not be guessed, the ranges that merely look adjacent, and the
+        // deprecated `::/96` form that must stay whole.
         for address in [
-            "2001:db8::1",  // documentation, not Teredo
-            "2003::1",      // not 6to4
-            "64:ff9c::1",   // not the NAT64 prefix
-            "64:ff9b:2::1", // not the /48 NAT64 prefix either
+            "64:ff9b:1::1",              // the local-use prefix, read at no layout
+            "64:ff9b:1:a9fe:a9:fe00::",  // the /48 layout, once read as 169.254.169.254
+            "64:ff9b:1:808:8:800:a00:1", // the /96 layout, once read as 8.8.8.8
+            "2001:db8::1",               // documentation, not Teredo
+            "2003::1",                   // not 6to4
+            "64:ff9c::1",                // not the NAT64 prefix
+            "64:ff9b:2::1",              // outside the local-use prefix
             "::1",
             "::127.0.0.1",
             "2606:4700::1111",

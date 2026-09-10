@@ -305,10 +305,13 @@ family, an IP literal above all, is unaffected by any of the three.
 - Addresses are normalized before matching, so neither `::ffff:127.0.0.1` nor
   `::127.0.0.1` gets past `allow_private_networks = false`.
 - IPv6 transition addresses are judged by the IPv4 address they carry, because
-  that is what a host routing them actually reaches: NAT64 (`64:ff9b::/96` and
-  `64:ff9b:1::/48`), 6to4 (`2002::/16`) and Teredo (`2001::/32`). So
+  that is what a host routing them actually reaches: the well-known NAT64 prefix
+  (`64:ff9b::/96`), 6to4 (`2002::/16`) and Teredo (`2001::/32`). So
   `64:ff9b::7f00:1` is refused as the 127.0.0.1 it is, while `64:ff9b::808:808`
-  is reachable as 8.8.8.8.
+  is reachable as 8.8.8.8. The local-use NAT64 prefix `64:ff9b:1::/48` is judged
+  differently: its operator picks where the IPv4 address sits inside it and
+  RFC 8215 §5 forbids a reader assuming a layout, so the whole prefix counts as
+  private and follows `allow_private_networks`.
 - Multicast, broadcast and the unspecified address are never dialled,
   **regardless** of that setting. They are amplification primitives, not
   destinations. What the client is *told* about the unspecified address is a

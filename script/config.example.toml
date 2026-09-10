@@ -258,15 +258,18 @@ initial_rtt_ms = 150
 # 2001:2::/48), 6to4 relay anycast (192.88.99.0/24), reserved space (240.0.0.0/4),
 # the documentation ranges, ULA, ORCHID (2001:10::/28), the deprecated site-local
 # fec0::/10, the deprecated IPv4-compatible ::/96 (stacks that still honour it
-# route ::127.0.0.1 to loopback), 2001:db8::/32 and 100::/64.
+# route ::127.0.0.1 to loopback), 2001:db8::/32, 100::/64 and the local-use NAT64
+# prefix 64:ff9b:1::/48.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust
 # 127.0.0.1 or a private range without further authentication. IPv4-mapped
 # addresses (`::ffff:127.0.0.1`) are normalized before matching, and IPv6
-# transition addresses (NAT64 64:ff9b::/96 and 64:ff9b:1::/48, 6to4 2002::/16,
-# Teredo 2001::/32) are judged by the IPv4 address they carry, so turning this
-# off cannot be worked around either way.
+# transition addresses (the well-known NAT64 prefix 64:ff9b::/96, 6to4
+# 2002::/16, Teredo 2001::/32) are judged by the IPv4 address they carry, so
+# turning this off cannot be worked around either way. The local-use NAT64
+# prefix 64:ff9b:1::/48 is private as a whole instead, because its operator
+# chooses where the IPv4 address sits inside it.
 #
 # Multicast, broadcast and the unspecified address are refused regardless of this
 # setting — they are amplification primitives, not destinations.
