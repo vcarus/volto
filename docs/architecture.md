@@ -575,13 +575,12 @@ than after it, unlike the routing it precedes: a message carrying one is
 malformed whoever sent it, and judging it afterwards answered that MUST with a
 407 to an unauthenticated peer and a 400 to an authenticated one.
 
-One deviation is taken knowingly:
-
-- A peer that closes its QPACK encoder or decoder stream is **not** treated as
-  `H3_CLOSED_CRITICAL_STREAM`, which RFC 9204 §4.2 requires. With a zero table
-  capacity those streams carry nothing, so nothing is lost when they end — and a
-  client that tidily finishes its streams a moment before CONNECTION_CLOSE would
-  otherwise be logged as a fault it did not commit.
+A peer that closes its QPACK encoder or decoder stream is treated as
+`H3_CLOSED_CRITICAL_STREAM`, the connection error RFC 9204 §4.2 requires, and
+both endings count: a clean finish and a reset alike. The one exemption is a
+connection that has already ended, where the closure is the connection going
+away rather than a fault the peer committed. That is the exemption the control
+stream makes for the same race.
 
 HTTP Datagrams are hand-rolled in `src/datagram.rs`. That started as a way around
 `h3-datagram` 0.0.2, which tagged every datagram with Quarter Stream ID 0 and so
