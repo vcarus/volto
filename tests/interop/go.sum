@@ -2,8 +2,8 @@ github.com/dunglas/httpsfv v1.1.0 h1:Jw76nAyKWKZKFrpMMcL76y35tOpYHqQPzHQiwDvpe54
 github.com/dunglas/httpsfv v1.1.0/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0 h1:APacT+iIaNF6fd8AGEiN3bT/Jtkd2jz4v4TzM7MFjy0=
 github.com/quic-go/go-ossfuzz-seeds v0.1.0/go.mod h1:3IOHRbJIc+L6YKMwfDtJAM9Vj9k0YY4muhuyUYk5tbk=
-github.com/quic-go/masque-go v0.4.1-0.20260724165511-ef3cba4ab1b9 h1:I2aVerufEc9BNEglEZt4xcaeD1GUpIBZU9TsgiTnSnE=
-github.com/quic-go/masque-go v0.4.1-0.20260724165511-ef3cba4ab1b9/go.mod h1:YoD8LebUF1Qt46WSrKxA7zEr/cXtI+6cLy0WPPjRDmE=
+github.com/quic-go/masque-go v0.5.0 h1:Ii6HUr/oRIROG9+xnGCMTKo7N8fb/J3hZOh1AMPH36M=
+github.com/quic-go/masque-go v0.5.0/go.mod h1:1o0Hj5Myu9wysEqY7oTyEgPEQjl2rQ2CKYkO5WrtZ7E=
 github.com/quic-go/qpack v0.6.0 h1:g7W+BMYynC1LbYLSqRt8PBg5Tgwxn214ZZR34VIOjz8=
 github.com/quic-go/qpack v0.6.0/go.mod h1:lUpLKChi8njB4ty2bFLX2x4gzDqXwUpaO1DP9qMDZII=
 github.com/quic-go/quic-go v0.62.0 h1:ZHDjCk5OacATwGvs8PWE97CTvX7AqZiVoW7++ZOXTf8=
