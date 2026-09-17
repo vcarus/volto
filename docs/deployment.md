@@ -11,11 +11,8 @@ what adds requirements, and they are named under [building](#building).
 
 ## Building
 
-Rust 1.95 or newer. `Cargo.lock` is committed, and `quinn-proto` is redirected
-by a `[patch.crates-io]` stanza to a commit carrying an MTU fix no release has
-yet (see
-[architecture.md](architecture.md#why-quinn-proto-is-patched-temporary)), so
-build with the lockfile and do **not** run `cargo update`:
+Rust 1.95 or newer. `Cargo.lock` is committed, so build with the lockfile to
+get the dependency graph the releases are built from:
 
 ```sh
 cargo build --release --locked      # target/release/volto

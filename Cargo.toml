@@ -7,8 +7,8 @@ description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
 documentation = "https://vcarus.github.io/volto/"
 license = "MIT"
-# The `[patch.crates-io]` stanza below cannot be expressed on crates.io, and this
-# is a server rather than a library anyone would depend on.
+# A server rather than a library anyone would depend on, so there is nothing
+# here for crates.io to carry.
 publish = false
 
 [dependencies]
@@ -252,48 +252,6 @@ codegen-units = 1
 # `DEBUG=true` for build scripts, which made `cc` compile aws-lc with `-g`.
 strip = true
 
-# TEMPORARY. quinn-proto's MTU black-hole detector reads an ordinary congestion
-# loss burst during a bulk transfer as the path having stopped carrying the
-# current MTU: the connection drops back to the 1200-byte floor, and on the
-# 0.11.x branch every further loss burst at the floor re-triggers the detector
-# and pushes the re-probe out again, so the MTU stays there for the whole
-# download. That branch is also missing two comparison fixes that upstream
-# landed on `main` only. Until a quinn-proto 0.11.x release carries all of
-# these, we pin the `0.11.x` branch commit that carries them: `48455d3` is the
-# `quinn-proto-0.11.17` tag plus the fixes below (and two unrelated backports
-# the branch picked up in between, an ACK-bundling change and a min-RTT stat).
-# Three are in `quinn-proto/src/connection/mtud.rs` (brought over by
-# quinn-rs/quinn#2799):
-#
-#   Fix some comparisons in the black hole detector               (upstream #2400)
-#   Relax MTU discovery state assertion                           (upstream #2400)
-#   proto: treat an equal-size delivery as evidence against a
-#          preceding loss burst                                   (#2792, ours)
-#
-# the fourth is in `quinn-proto/src/connection/datagrams.rs` (#2806, ours):
-# the outgoing-datagram eviction loop double-subtracted an evicted datagram's
-# size from `payload_bytes`, so sustained eviction underflows the counter and
-# panics inside `send_datagram` while the connection lock is held (#2805);
-# and the fifth is in `quinn-proto/src/endpoint.rs` (#2823, ours): a datagram
-# with an unsupported version elicited a Version Negotiation packet at any
-# size, where RFC 9000 Section 5.2.2 says servers MUST drop the small ones --
-# an amplification vector against the port scanner the SNI gate is built for.
-#
-# Upstream refs: the MTU bug is quinn-rs/quinn#2791, the fix quinn-rs/quinn#2792
-# (merged to `main`), and #2799 brought all three to `0.11.x` on 2026-08-20;
-# the datagram bug is #2805, fixed on `0.11.x` by #2806 on 2026-08-29; the
-# Version Negotiation fix is #2822 on `main`, backported by #2823 on 2026-09-04.
-# Until 2026-08-20 the three MTU commits were served from a personal fork.
-#
-# EXIT CONDITION: delete this stanza as soon as a quinn-proto 0.11.x release
-# includes the fix, then `cargo update -p quinn-proto` and drop the CI audit
-# workaround (see `.github/workflows/ci.yml`). Two blind spots until then, both
-# spelled out in docs/architecture.md: Dependabot cannot bump a git patch, so
-# the rev is moved by hand; and cargo-audit ignores lockfile entries whose
-# source is not the default registry, which the `audit` job works around by
-# rewriting that one source line back to the registry before it scans -- the
-# pinned commit's version *is* the upstream tag, so advisories filed against
-# quinn-proto 0.11.17 apply to us unchanged.
 [lints.rust]
 # The default for every target in the package, tests and examples included: a
 # new file that wants `unsafe` must argue for a file-level `allow` (today there
@@ -311,6 +269,3 @@ unsafe_code = "deny"
 # stated fallback where the narrowing is real, and a per-site allow only where
 # the value is already proven in range by the code above it.
 as_conversions = "deny"
-
-[patch.crates-io]
-quinn-proto = { git = "https://github.com/quinn-rs/quinn", rev = "a708a979c291f6b2baf0141d3096f265353cbce1" }

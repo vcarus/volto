@@ -8,15 +8,10 @@
 # project is checked against, so an unwatched copy of either would quietly age
 # into agreeing with us by being too old to disagree.
 #
-# Two things stay outside its reach. The `[patch.crates-io]` entry redirecting
-# `quinn-proto` at a git commit (in both Cargo manifests): Dependabot ignores
-# git dependencies. It is meant to be temporary -- the commit is moved by hand
-# until an upstream 0.11.x release carries the MTU black-hole detector fix, at
-# which point the whole stanza goes away. Both the patch and its exit condition
-# are documented in docs/architecture.md. And transitive-only crates: Dependabot
-# proposes bumps for the dependencies a manifest names, never for the ones
-# they pull in, so the lockfiles are refreshed by hand (`cargo update`, root
-# and fuzz/) before a release.
+# One thing stays outside its reach: transitive-only crates. Dependabot proposes
+# bumps for the dependencies a manifest names, never for the ones they pull in,
+# so the lockfiles are refreshed by hand (`cargo update`, root and fuzz/) before
+# a release.
 #
 # Every dependency PR must pass the full CI suite, on Linux and macOS, before it
 # is merged.

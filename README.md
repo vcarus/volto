@@ -60,7 +60,7 @@ sudo script/deploy.sh --enable-timer       # or: install + keep it updated
 
 ### 3. From source
 
-Rust 1.95 or newer. `Cargo.lock` is committed and redirects `quinn-proto` to a patched commit, so always build `--locked` and never run a bare `cargo update` (why: [docs/architecture.md](docs/architecture.md#why-quinn-proto-is-patched-temporary)).
+Rust 1.95 or newer. `Cargo.lock` is committed, so build `--locked` to get the dependency graph the releases are built from.
 
 ```sh
 cargo build --release --locked             # target/release/volto
@@ -101,7 +101,7 @@ From v1.0.0 on, configuration keys, their defaults and the command-line argument
 | [The manual](https://vcarus.github.io/volto/) | The three pages below as one searchable book, rebuilt from `main` on every push. |
 | [docs/configuration.md](docs/configuration.md) | Every key, its default, and what it costs to change. |
 | [docs/deployment.md](docs/deployment.md) | Building, certificates (ACME DNS-01 or self-signed + pinning), releases and rollback, systemd, firewall, fd budget, reloads, relays, fail2ban. |
-| [docs/architecture.md](docs/architecture.md) | How a request becomes a tunnel, the in-tree HTTP/3 layer, why quinn-proto is patched, what the tests assert. |
+| [docs/architecture.md](docs/architecture.md) | How a request becomes a tunnel, the in-tree HTTP/3 layer, what the tests assert. |
 | [API docs](https://vcarus.github.io/volto/api/) | The crate's rustdoc, rebuilt from `main` on every push. |
 | [SECURITY.md](SECURITY.md) | How to report a vulnerability privately. |
 

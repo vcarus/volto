@@ -66,8 +66,12 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
 /// miserable bug to find, since everything would work until the connection went
 /// idle behind a relay. It is also what makes every value below reloadable: a
 /// `SIGHUP` rebuilds this and hands it to `Endpoint::set_server_config`, so the new
-/// numbers apply to connections accepted from then on. Connections already open
-/// keep the transport parameters they negotiated at handshake time — QUIC has no
+/// numbers apply to every connection whose first Initial packet arrives from then
+/// on. That packet is where quinn-proto 0.11.18 copies the endpoint's server
+/// configuration into the buffer it keeps for a pending `Incoming`, so a handshake
+/// already queued for acceptance finishes on the numbers it started under.
+/// Connections already open keep the transport parameters they negotiated at
+/// handshake time — QUIC has no
 /// way to renegotiate them mid-connection, so this is a property of the protocol
 /// rather than a shortcut.
 fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
@@ -289,9 +293,14 @@ type LiveConfig = Arc<RwLock<Arc<Config>>>;
 /// Three callers take it. `reload` holds it across the latch read and all three
 /// writes, `drain` across its own `set_server_config(None)`, and
 /// [`Server::accept_under_the_swap`] across the pair of reads that decide what
-/// one new connection runs on. The third is what closes the second race rather
-/// than narrowing it: both halves of a connection's configuration are now taken
-/// on one side of a reload.
+/// one new connection runs on. The third narrows the second race. It does not
+/// close it under quinn-proto 0.11.18, which pins a connection's transport
+/// parameters when its first Initial arrives rather than when this process
+/// accepts it, and that read happens in the endpoint driver, where no lock here
+/// reaches. What the guard still buys is that the live `Config` and the accept
+/// are taken on one side of a reload. Closing the race outright would mean
+/// `Incoming::accept_with` and a server configuration this process snapshots
+/// itself; D18's 2026-09-17 addendum records why that is not done here.
 ///
 /// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
 /// the values themselves each have their own lock. It is never held across an
@@ -923,11 +932,20 @@ impl Server {
     /// and the timeouts. The second is quinn's endpoint server configuration,
     /// which carries the transport parameters: `IntoFuture` for
     /// `quinn::Incoming` is `Incoming::accept()` (quinn `incoming.rs`), and
-    /// `proto::Endpoint::accept` reads `self.server_config` there and fixes the
-    /// parameters for the life of the connection. Left to the first poll of the
-    /// spawned task, that second read could land on the far side of a `SIGHUP`
-    /// from the first, which is the half-applied state D22 says there is none
-    /// of: one generation's transport parameters beside another's users.
+    /// `proto::Endpoint::accept` fixes the parameters for the life of the
+    /// connection there. Left to the first poll of the spawned task, that second
+    /// read could land on the far side of a `SIGHUP` from the first, which is
+    /// the half-applied state D22 says there is none of: one generation's
+    /// transport parameters beside another's users.
+    ///
+    /// Since quinn-proto 0.11.18 that accept reads the configuration the
+    /// endpoint held when the connection's first Initial arrived, copied into
+    /// the incoming buffer at that moment, rather than whatever the endpoint
+    /// holds now. So the read this guard covers no longer decides the transport
+    /// parameters, and the window it cannot cover runs from that first Initial
+    /// to this accept. Taking the pair whole again would mean
+    /// `Incoming::accept_with` and a server configuration snapshotted here; see
+    /// D18's 2026-09-17 addendum.
     ///
     /// Both under [`ConfigSwap`], which `reload` holds across all three of its
     /// writes, so a connection accepted while a reload is applying waits for it
@@ -1141,6 +1159,13 @@ impl Server {
         // Stop new handshakes at the source. Packets for existing connections are
         // unaffected; a client that arrives now sees the port as closed and can
         // fail over immediately rather than after a timeout.
+        //
+        // "New" counts from the first Initial. A handshake quinn had already
+        // queued as an `Incoming` keeps the server configuration it arrived
+        // under (quinn-proto 0.11.18), so this call neither completes nor
+        // refuses it. Nothing here ever accepts one: the accept loop has left by
+        // the time this runs, and a queued `Incoming` goes away with the
+        // endpoint.
         //
         // Under the swap, because the latch this drain runs on is read by
         // `ReloadHandle::reload` as a plain predicate: without it a reload that
@@ -1753,12 +1778,19 @@ pub const STREAM_RECEIVE_WINDOW: VarInt = VarInt::from_u32(2 * 1024 * 1024);
 #[cfg(test)]
 const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 
-/// Aggregate unacknowledged outbound stream data per connection, in bytes.
+/// Aggregate outbound stream data retained per connection, in bytes.
 ///
 /// The mirror image of [`CONNECTION_RECEIVE_WINDOW`], and the only bound on what
-/// this process buffers for a client that has stopped reading. 10 MB over the
-/// ~90 ms path RTT is about 889 Mbps against a measured peak of 177 Mbps, so it
-/// is nowhere near a throughput constraint.
+/// this process buffers for a client that has stopped reading. quinn-proto
+/// 0.11.18 counts bytes retained from application writes rather than bytes still
+/// unacknowledged: acknowledged data goes on counting until the storage holding
+/// it is released, which is what makes this a bound on memory rather than only on
+/// data in flight. What it counts is bytes accepted from the buffers this process
+/// hands over, so a slice of a larger allocation can retain more than the limit
+/// accounts for. That is the amplification the 64 KiB relay block in
+/// `tunnel/tcp.rs` is shaped to hold at 1.33x; see D47's 2026-08-23 addendum.
+/// 10 MB over the ~90 ms path RTT is about 889 Mbps against a measured peak of
+/// 177 Mbps, so it is nowhere near a throughput constraint.
 ///
 /// Set to exactly what quinn already defaults to, so it changes not a byte on the
 /// wire today. It is pinned rather than inherited because upstream derives that

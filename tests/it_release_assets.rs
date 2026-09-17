@@ -22,10 +22,13 @@
 //!   workflow exists so a dependency bump that breaks the musl cross-build
 //!   fails on the pull request rather than at tag time, and it is worth exactly
 //!   as much as the two steps are identical.
-//! * **`fuzz/Cargo.toml` pins the quinn-proto revision `Cargo.toml` pins.** The
-//!   fuzz crate is its own workspace, so the root `[patch.crates-io]` does not
-//!   reach it and the stanza is duplicated; a bump applied to one and not the
-//!   other fuzzes a QUIC stack the server does not use.
+//! * **Neither manifest patches `quinn-proto`, and both lockfiles take it from
+//!   the registry.** D60 redirected that crate to a git revision until 0.11.18
+//!   shipped the fixes it carried, and a `[patch.crates-io]` stanza costs two
+//!   things that report nothing when they stop working: Dependabot proposes no
+//!   bump for a git revision, and cargo-audit skips a lockfile entry whose
+//!   source is not the default registry. A patch reintroduced in either
+//!   workspace would take quinn-proto back out of both.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -278,67 +281,74 @@ fn editing_release_yml_triggers_the_cross_workflow() {
 }
 
 // ---------------------------------------------------------------------------
-// The two quinn-proto pins
+// quinn-proto comes from the registry
 // ---------------------------------------------------------------------------
 
-/// The `rev` of the `quinn-proto` `[patch.crates-io]` entry in `manifest`.
-fn quinn_proto_rev(manifest: &Path) -> String {
-    let text = read_text(manifest);
-
-    let entry = text
-        .split_once("quinn-proto = {")
-        .unwrap_or_else(|| {
-            panic!(
-                "{} carries no `quinn-proto = {{ … }}` patch entry — has the \
-                 stanza been removed? If a quinn-proto 0.11.x release now ships \
-                 the fixes, both manifests lose it together and this test goes \
-                 with them.",
-                manifest.display()
-            )
-        })
-        .1;
-    let entry = entry
-        .split_once('}')
-        .unwrap_or_else(|| panic!("{}: unterminated quinn-proto entry", manifest.display()))
-        .0;
-
-    let rev = entry
-        .split_once("rev = \"")
-        .unwrap_or_else(|| {
-            panic!(
-                "{}: the quinn-proto patch carries no `rev`: {entry}",
-                manifest.display()
-            )
-        })
-        .1;
-
-    rev.split_once('"')
-        .unwrap_or_else(|| panic!("{}: unterminated rev string", manifest.display()))
-        .0
-        .to_string()
+/// The `[[package]]` block a lockfile records for `package`, its header line
+/// excluded.
+fn locked_package(lockfile: &Path, package: &str) -> String {
+    let text = read_text(lockfile);
+    let needle = format!("name = \"{package}\"\n");
+    let start = text
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{} records no package named {package}", lockfile.display()));
+    text[start..]
+        .lines()
+        .take_while(|line| !line.starts_with("[[package]]"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-/// The fuzz crate must fuzz the QUIC stack the server runs.
+/// quinn-proto is an ordinary registry dependency in both workspaces.
 ///
-/// `fuzz/` is its own cargo workspace, which is how cargo-fuzz wants it, and a
-/// `[patch.crates-io]` does not reach across that boundary — so the pin is
-/// written twice and kept equal by a comment in each file asking for it. Moving
-/// the rev in one place and not the other leaves the fuzz targets exercising a
-/// quinn-proto nothing deploys: a finding nobody can reproduce, or one nobody
-/// ever sees.
+/// Asserted: neither `Cargo.toml` nor `fuzz/Cargo.toml` carries a
+/// `[patch.crates-io]` table, and the `quinn-proto` entry in each lockfile names
+/// the crates.io registry as its source and carries a `checksum`. D60 pointed
+/// that crate at a git revision from 2026-08-18 until 0.11.18 shipped every fix
+/// it carried, and `fuzz/` held a second copy of the stanza because a patch does
+/// not cross a workspace boundary.
+///
+/// Without this, a patch put back in either manifest costs two things and
+/// announces neither. Dependabot proposes no bump for a git revision, so
+/// quinn-proto stops being watched; and cargo-audit skips a lockfile entry whose
+/// source is not the default registry, so an advisory filed against the version
+/// that entry records is never reported. Both are absences, and a green CI run
+/// looks exactly the same either way.
 #[test]
-fn the_fuzz_crate_pins_the_same_quinn_proto_revision() {
-    let root = repo_root();
-    let crate_rev = quinn_proto_rev(&root.join("Cargo.toml"));
-    let fuzz_rev = quinn_proto_rev(&root.join("fuzz/Cargo.toml"));
+fn quinn_proto_is_an_unpatched_registry_dependency() {
+    const REGISTRY: &str = "source = \"registry+https://github.com/rust-lang/crates.io-index\"";
 
-    assert_eq!(
-        crate_rev, fuzz_rev,
-        "Cargo.toml pins quinn-proto at {crate_rev} and fuzz/Cargo.toml at \
-         {fuzz_rev}. The two are separate workspaces, so the root's \
-         [patch.crates-io] does not reach the fuzz crate and both revisions have \
-         to move together; the reasoning and the exit condition live in Cargo.toml."
-    );
+    let root = repo_root();
+
+    for manifest in ["Cargo.toml", "fuzz/Cargo.toml"] {
+        let path = root.join(manifest);
+        assert!(
+            !read_text(&path).contains("[patch.crates-io]"),
+            "{} carries a [patch.crates-io] table. D60 removed the quinn-proto \
+             patch when 0.11.18 shipped its fixes; a patch here puts the crate \
+             back outside Dependabot and outside cargo-audit, and nothing else \
+             in this tree says so.",
+            path.display()
+        );
+    }
+
+    for lockfile in ["Cargo.lock", "fuzz/Cargo.lock"] {
+        let path = root.join(lockfile);
+        let entry = locked_package(&path, "quinn-proto");
+
+        assert!(
+            entry.contains(REGISTRY),
+            "{}: quinn-proto does not come from the crates.io registry, so \
+             cargo-audit skips it:\n{entry}",
+            path.display()
+        );
+        assert!(
+            entry.lines().any(|line| line.starts_with("checksum = \"")),
+            "{}: the quinn-proto entry has no checksum line, which a registry \
+             entry always has:\n{entry}",
+            path.display()
+        );
+    }
 }
 
 /// The `version` a `[[package]]` block records in a lockfile, by package name.

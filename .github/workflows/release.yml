@@ -78,8 +78,8 @@ jobs:
       # Static musl binaries, so a release runs on any glibc vintage. aws-lc-rs
       # needs a working cross C toolchain for aarch64, which is what `cross`
       # provides; the non-FIPS build ships pre-generated bindings, so it wants a
-      # C compiler but neither cmake nor bindgen nor Go. --locked keeps the
-      # committed lockfile, quinn-proto patch included.
+      # C compiler but neither cmake nor bindgen nor Go. --locked builds the
+      # committed lockfile and nothing else.
       #
       # cross.yml runs this exact step on the pull requests that can break it,
       # which is only worth anything while the two are identical. The markers

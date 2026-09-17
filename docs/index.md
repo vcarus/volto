@@ -26,7 +26,7 @@ It finishes by printing a ready-to-paste client policy line. Every flag, the cer
 
 - [Configuration](configuration.md) — every key, its default, and what it costs to change.
 - [Deployment](deployment.md) — building, certificates (ACME DNS-01 or self-signed plus pinning), releases and rollback, systemd, firewall, fd budget, reloads, relays, fail2ban.
-- [Architecture](architecture.md) — how a request becomes a tunnel, the in-tree HTTP/3 layer, why quinn-proto is patched, and what the tests assert.
+- [Architecture](architecture.md) — how a request becomes a tunnel, the in-tree HTTP/3 layer, and what the tests assert.
 
 ## Reference
 

@@ -1290,7 +1290,7 @@ async fn draws_no_reply(what: &str, dcid: &[u8], frames: &[u8]) {
 /// and therefore that it is a client's first Initial, and a first Initial's
 /// Destination Connection ID is at least eight bytes (RFC 9000 §7.2). quinn
 /// answers a shorter one with a CONNECTION_CLOSE before it looks at a single
-/// frame (`early_validate_first_packet`, quinn-proto `48455d3`), which is what
+/// frame (`early_validate_first_packet`, quinn-proto 0.11.18), which is what
 /// the gate-off half of this probe records.
 #[tokio::test]
 async fn a_padding_only_initial_with_a_short_connection_id_is_silent() {

@@ -168,9 +168,9 @@ jobs:
     # and a `src` change that broke them read identically in the log.
     #
     # Refreshing it is `cargo generate-lockfile --manifest-path fuzz/Cargo.toml`
-    # -- inside `fuzz/` only. A bare `cargo update` at the root is never the
-    # move (see the `[patch.crates-io]` note in `Cargo.toml`), and these are two
-    # workspaces with two lockfiles: touching one does not touch the other.
+    # -- inside `fuzz/` only. These are two workspaces with two lockfiles, so
+    # touching one does not touch the other, and a refresh at the root leaves
+    # this one exactly where it was.
     name: fuzz targets compile
     runs-on: ubuntu-latest
     steps:
@@ -197,14 +197,12 @@ jobs:
     # slow it down.
     #
     # cargo-audit skips every lockfile entry whose source is not the default
-    # registry -- it does not fall back to the version a git dependency declares.
-    # Exactly one entry in this lockfile is in that position, the `[patch.crates-io]`
-    # pin of `quinn-proto`, and it does not have to stay there: the pinned commit is
-    # the upstream `quinn-proto-0.11.17` tag plus three fixes, so advisories against
-    # 0.11.17 apply to it verbatim. The second step below recovers it by auditing a
-    # copy of the lockfile with that one `source` line pointed back at the registry,
-    # which leaves the audit with no blind spot at all. Delete the step together
-    # with the patch.
+    # registry, and it does not fall back to the version a git dependency
+    # declares. No entry is in that position today: the h3 and h3-quinn git pins
+    # went with D75's in-tree HTTP/3 layer, and the `[patch.crates-io]` pin of
+    # `quinn-proto` went when 0.11.18 shipped the fixes it carried. A git
+    # dependency added later would fall out of RustSec coverage without saying
+    # so, and would need a step here to recover it.
     name: audit (RustSec)
     runs-on: ubuntu-latest
     permissions:
@@ -228,41 +226,6 @@ jobs:
       - uses: rustsec/audit-check@858dc40f52ca2b8570b7a997c1c4e35c6fc9a432 # main 2026-03-20 (Node 24, unreleased)
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      # TEMPORARY, and paired with the `[patch.crates-io]` stanza in Cargo.toml:
-      # delete both together once quinn-proto ships the fix upstream.
-      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2.87.8
-        with:
-          tool: cargo-audit
-      - name: Audit the patched quinn-proto as its upstream release
-        run: |
-          set -euo pipefail
-          LOCK="$RUNNER_TEMP/Cargo.audit.lock"
-
-          # Only inside the quinn-proto entry -- from its `name =` line to the
-          # next `[[package]]` header -- so no other git source is touched. A
-          # `checksum` line is simply absent for a git entry, which cargo-audit
-          # accepts: it reads name, version and source and nothing else.
-          sed -e '/^name = "quinn-proto"$/,/^\[\[package\]\]$/ s|^source = "git+.*"$|source = "registry+https://github.com/rust-lang/crates.io-index"|' \
-            Cargo.lock > "$LOCK"
-
-          # Assert the rewrite landed. Without this the step would keep passing
-          # if the entry ever changed shape, having quietly audited nothing.
-          entry="$(grep -A 2 '^name = "quinn-proto"$' "$LOCK")"
-          printf '%s\n' "$entry"
-          case "$entry" in
-            *'source = "registry+https://github.com/rust-lang/crates.io-index"'*) ;;
-            *)
-              echo "::error::the quinn-proto source rewrite did not apply"
-              exit 1
-              ;;
-          esac
-
-          # Vulnerabilities fail the step; informational advisories are reported
-          # without failing, matching the action above. Note that this scan does
-          # not read that action's `ignore:` list -- an accepted RUSTSEC id has to
-          # be written in both places.
-          cargo audit -f "$LOCK"
 
   test:
     # macOS is the development host and Linux the deployment target; both have to
