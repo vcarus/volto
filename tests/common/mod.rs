@@ -140,7 +140,14 @@ pub struct TestServer {
     trigger: Trigger,
     /// Replaces the running configuration, exactly as the SIGHUP handler does.
     reload: ReloadHandle,
-    /// `None` once the accept loop has been awaited by `wait_until_stopped`.
+    /// The bound server, until its accept loop is started.
+    ///
+    /// `Some` only between [`TestServer::bind_with`] and [`TestServer::serve`].
+    /// Every other constructor starts the loop before it returns, so for every
+    /// other test this is `None` from the first line.
+    unserved: Option<Server>,
+    /// `None` until the accept loop is started, and again once it has been
+    /// awaited by `wait_until_stopped`.
     task: Option<JoinHandle<()>>,
 }
 
@@ -189,8 +196,36 @@ impl TestServer {
         Self::start_named(extra, "", names).await
     }
 
+    /// Binds the server and leaves its accept loop unstarted.
+    ///
+    /// The endpoint is live from here: quinn spawns its driver task when the
+    /// endpoint is built, so a client's first Initial is received and queued as
+    /// an `Incoming` with nothing to accept it. That is the only way a test can
+    /// put a reload between a handshake's arrival and its acceptance, which is
+    /// the window `Incoming::accept_with` exists to cover. Call [`Self::serve`]
+    /// to start the loop.
+    pub async fn bind_with(extra: &str) -> Self {
+        Self::bind_named(extra, "", &[])
+    }
+
+    /// Starts the accept loop of a server bound by [`Self::bind_with`].
+    pub fn serve(&mut self) {
+        let server = self
+            .unserved
+            .take()
+            .expect("the accept loop is only started once");
+        self.task = Some(tokio::spawn(async move { server.run().await }));
+    }
+
     /// The body behind all of the constructors above.
     async fn start_named(extra: &str, log_extra: &str, extra_names: &[&str]) -> Self {
+        let mut server = Self::bind_named(extra, log_extra, extra_names);
+        server.serve();
+        server
+    }
+
+    /// Everything [`Self::start_named`] does except starting the accept loop.
+    fn bind_named(extra: &str, log_extra: &str, extra_names: &[&str]) -> Self {
         let dir = TempDir::new("server");
         let mut subject = vec!["localhost".to_owned()];
         subject.extend(extra_names.iter().map(|name| (*name).to_owned()));
@@ -219,7 +254,6 @@ impl TestServer {
         // Taken before the server moves into its task.
         let trigger = server.shutdown_trigger();
         let reload = server.reload_handle();
-        let task = tokio::spawn(async move { server.run().await });
 
         Self {
             addr,
@@ -230,7 +264,8 @@ impl TestServer {
             key,
             trigger,
             reload,
-            task: Some(task),
+            unserved: Some(server),
+            task: None,
         }
     }
 

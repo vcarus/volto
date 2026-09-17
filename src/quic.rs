@@ -1,12 +1,13 @@
 //! The QUIC endpoint: transport parameters, the accept loop and peer metadata.
 
 use std::collections::BTreeMap;
-use std::future::IntoFuture;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -65,11 +66,18 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
 /// — a reload that quietly dropped the stream limit or the keep-alive would be a
 /// miserable bug to find, since everything would work until the connection went
 /// idle behind a relay. It is also what makes every value below reloadable: a
-/// `SIGHUP` rebuilds this and hands it to `Endpoint::set_server_config`, so the new
-/// numbers apply to every connection whose first Initial packet arrives from then
-/// on. That packet is where quinn-proto 0.11.18 copies the endpoint's server
-/// configuration into the buffer it keeps for a pending `Incoming`, so a handshake
-/// already queued for acceptance finishes on the numbers it started under.
+/// `SIGHUP` rebuilds this, writes it to the slot [`Server::accept_under_the_swap`]
+/// reads and hands a copy to `Endpoint::set_server_config`, so the new numbers
+/// apply to every connection this process accepts from then on.
+///
+/// The endpoint's copy governs a different thing. quinn-proto 0.11.18 reads it as
+/// a connection's first Initial arrives, to derive the Initial keys and to
+/// validate an address-validation token, and copies it into the buffer it keeps
+/// for that pending `Incoming`, where it is what seals a Retry. It is not what
+/// the handshake runs on: `Incoming::accept_with` replaces it with the one the
+/// slot holds, which is what keeps the transport parameters and the live
+/// [`Config`] on one side of a reload (D22).
+///
 /// Connections already open keep the transport parameters they negotiated at
 /// handshake time — QUIC has no
 /// way to renegotiate them mid-connection, so this is a property of the protocol
@@ -273,12 +281,29 @@ fn congestion_factory(
 /// await — only long enough to clone the `Arc`.
 type LiveConfig = Arc<RwLock<Arc<Config>>>;
 
+/// The `quinn::ServerConfig` a new connection is accepted with.
+///
+/// The transport parameters and the TLS identity, kept beside the endpoint's own
+/// copy rather than read back out of it, because quinn exposes no getter and
+/// because the endpoint's copy is not what an accept has to use: since
+/// quinn-proto 0.11.18 a pending `Incoming` carries the configuration the
+/// endpoint held when its first Initial arrived, which is one generation too old
+/// whenever a `SIGHUP` lands in between. [`Server::accept_under_the_swap`] reads
+/// this slot and hands what it finds to `Incoming::accept_with`, so the accepted
+/// connection runs on the same generation as the live [`Config`] beside it.
+///
+/// The same `RwLock` shape as [`LiveConfig`], for the same reasons: one read per
+/// accepted connection, one write per `SIGHUP`, and the guard held only long
+/// enough to clone the `Arc`. `quinn::ServerConfig` is a set of `Arc`s, so both
+/// the clone into this slot and the clone out of it are a few reference counts.
+type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
+
 /// Serialises everything that decides what a new connection is accepted with.
 ///
-/// Three writes make a reload, the SNI gate's list, the live [`Config`] and the
-/// endpoint's `quinn::ServerConfig`, and a fourth closes the listener at the
-/// start of the drain. Held apart, they are two check-then-act races on the
-/// same state.
+/// Four writes make a reload, the SNI gate's list, the live [`Config`], the
+/// `quinn::ServerConfig` an accept runs on and the endpoint's own copy of it, and
+/// a fifth closes the listener at the start of the drain. Held apart, they are
+/// two check-then-act races on the same state.
 ///
 /// The first is [`ReloadHandle::reload`] against [`Server::drain`]: the reload
 /// reads the shutdown latch and then re-opens the listener, so a `SIGTERM`
@@ -286,28 +311,27 @@ type LiveConfig = Arc<RwLock<Arc<Config>>>;
 /// drain has just refused, and quinn's unaccepted `Incoming` queue grows for the
 /// whole grace period. D22 states that this must not happen. The second is the
 /// reload against an accept: a connection taken off `endpoint.accept()` between
-/// two of the three writes runs on one generation's transport parameters and
+/// two of the four writes runs on one generation's transport parameters and
 /// another's `Authenticator`, `Policy` and quotas for its whole life, which is
 /// the half-applied state the same ADR says there is none of.
 ///
-/// Three callers take it. `reload` holds it across the latch read and all three
+/// Three callers take it. `reload` holds it across the latch read and all four
 /// writes, `drain` across its own `set_server_config(None)`, and
 /// [`Server::accept_under_the_swap`] across the pair of reads that decide what
-/// one new connection runs on. The third narrows the second race. It does not
-/// close it under quinn-proto 0.11.18, which pins a connection's transport
-/// parameters when its first Initial arrives rather than when this process
-/// accepts it, and that read happens in the endpoint driver, where no lock here
-/// reaches. What the guard still buys is that the live `Config` and the accept
-/// are taken on one side of a reload. Closing the race outright would mean
-/// `Incoming::accept_with` and a server configuration this process snapshots
-/// itself; D18's 2026-09-17 addendum records why that is not done here.
+/// one new connection runs on. The third closes the second race rather than
+/// narrowing it, because both of those reads are now reads this process makes.
+/// The first is the live [`Config`]. The second is [`LiveQuicConfig`], which
+/// `Incoming::accept_with` then uses in place of the copy quinn-proto 0.11.18
+/// pinned to the connection when its first Initial arrived. Nothing about the
+/// accepted connection is decided by a read the endpoint driver makes on its own
+/// (D22, addendum of 2026-09-17).
 ///
 /// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
 /// the values themselves each have their own lock. It is never held across an
 /// await, since `reload` is synchronous throughout, `drain` holds it for one
 /// `set_server_config` call, and `accept_under_the_swap` for two synchronous
-/// reads. The slow half of a reload, parsing the file and the certificate,
-/// happens before it is taken.
+/// reads and the synchronous `Incoming::accept_with` they feed. The slow half of
+/// a reload, parsing the file and the certificate, happens before it is taken.
 #[derive(Clone)]
 struct ConfigSwap(Arc<Mutex<()>>);
 
@@ -512,6 +536,58 @@ impl Drop for Registration {
     }
 }
 
+/// Starting one arriving connection's handshake on a stated configuration.
+///
+/// One method, so that [`Server::accept_under_the_swap`] can be exercised with
+/// no peer on the other end. It was `IntoFuture` until the server configuration
+/// became something this process chooses rather than something quinn reads for
+/// itself. What the regression test has to observe now is the argument, and
+/// `IntoFuture::into_future` takes none.
+trait AcceptWith {
+    /// The handshake, once started.
+    type Accepted;
+
+    /// Answers the peer's Initial and starts the handshake on `server_config`.
+    fn accept_with(self, server_config: Arc<quinn::ServerConfig>) -> Self::Accepted;
+}
+
+impl AcceptWith for quinn::Incoming {
+    type Accepted = Handshake;
+
+    fn accept_with(self, server_config: Arc<quinn::ServerConfig>) -> Handshake {
+        // quinn's own inherent method of the same name, which a path call
+        // reaches ahead of this trait's.
+        Handshake(quinn::Incoming::accept_with(self, server_config))
+    }
+}
+
+/// A handshake `quinn::Incoming::accept_with` has started, awaited like a
+/// `Connecting`.
+///
+/// quinn's `IncomingFuture` is exactly this and cannot be built from outside:
+/// its field is private and `IntoFuture for Incoming` is the only way to reach
+/// it, which is the call this replaces. The `Result` is resolved before the
+/// future exists, and that is what keeps the accept eager: by the time anything
+/// polls this, quinn has answered the client's Initial and the TLS server flight
+/// is on its way. [`Server::serve`] depends on that and says so.
+struct Handshake(Result<quinn::Connecting, quinn::ConnectionError>);
+
+impl std::future::Future for Handshake {
+    type Output = Result<quinn::Connection, quinn::ConnectionError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        match &mut self.0 {
+            // `Connecting` is `Unpin`, which is how quinn polls it inside
+            // `IncomingFuture` as well.
+            Ok(connecting) => Pin::new(connecting).poll(cx),
+            // Cloned rather than taken, so that a second poll answers the same
+            // error instead of panicking. Nothing here polls twice; this is the
+            // shape quinn's own adapter has.
+            Err(error) => Poll::Ready(Err(error.clone())),
+        }
+    }
+}
+
 /// A bound QUIC endpoint ready to accept connections.
 pub struct Server {
     endpoint: quinn::Endpoint,
@@ -522,6 +598,12 @@ pub struct Server {
     /// a reload has to say about them; see [`RequestedBuffers`].
     requested_buffers: RequestedBuffers,
     config: LiveConfig,
+    /// The `quinn::ServerConfig` an accept runs a connection on; see
+    /// [`LiveQuicConfig`].
+    ///
+    /// Written beside `config` and under the same guard, so the two halves of
+    /// what one connection gets cannot come from two generations.
+    quic_config: LiveQuicConfig,
     /// The connections being served, in accept order, and what the accept loop
     /// decides `max_connections` against; see [`Roster`].
     roster: Roster,
@@ -582,6 +664,12 @@ impl Server {
         // Connection ID rather than of the certificate (RFC 9001 §5.2), so this
         // handle stays good across every reload.
         let crypto = quic_config.crypto.clone();
+        // The other copy, the one every accept runs a connection on. Taken here
+        // so the slot and the endpoint start on the same generation, which is
+        // the invariant `reload` then maintains. `quinn::ServerConfig` is a set
+        // of `Arc`s, so this is a few reference counts and the two copies share
+        // the transport parameters, the certificate and the token key.
+        let accepted_with = Arc::new(quic_config.clone());
 
         let socket = std::net::UdpSocket::bind(config.server.listen)
             .with_context(|| format!("failed to bind UDP socket {}", config.server.listen))?;
@@ -618,6 +706,7 @@ impl Server {
             },
             listen: config.server.listen,
             config: Arc::new(RwLock::new(config)),
+            quic_config: Arc::new(RwLock::new(accepted_with)),
             roster: Roster::new(),
             resolver: crate::net::ResolverBudget::new(),
             expected,
@@ -652,6 +741,7 @@ impl Server {
         ReloadHandle {
             endpoint: self.endpoint.clone(),
             config: self.config.clone(),
+            quic_config: self.quic_config.clone(),
             shutdown: self.shutdown.clone(),
             expected: self.expected.clone(),
             swap: self.swap.clone(),
@@ -665,6 +755,18 @@ impl Server {
         // Poisoning would mean a panic while swapping the config; the value itself
         // is an immutable `Arc`, so it cannot be observed half-written.
         self.config
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// A snapshot of the `quinn::ServerConfig` currently in force.
+    ///
+    /// The other half of [`Self::config`], and read in the same breath as it by
+    /// [`Self::accept_under_the_swap`]; poisoning is treated the same way and
+    /// for the same reason.
+    fn quic_config(&self) -> Arc<quinn::ServerConfig> {
+        self.quic_config
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -841,6 +943,17 @@ impl Server {
         // `SIGHUP`. And it is paid only while the server is full: below the
         // cap this branch is not entered at all, so an ordinary Surge
         // handshake is untouched.
+        //
+        // Deliberately not given the slot `accept_under_the_swap` reads. quinn
+        // has no `retry_with`, and the two halves of a Retry are the endpoint's
+        // business either way: quinn-proto seals the token with the `token_key`
+        // of the configuration it pinned to this `Incoming` when the Initial
+        // arrived, and validates the returning one against whatever the
+        // endpoint holds by then. Neither read is reachable from here, and
+        // overriding them would buy nothing, because a token that crosses a
+        // `SIGHUP` is already refused by the paragraph above: the key is redrawn
+        // with the configuration, so the client pays one more round trip and
+        // handshakes afresh.
         if !incoming.remote_address_validated() {
             if incoming.may_retry() {
                 match incoming.retry() {
@@ -929,35 +1042,36 @@ impl Server {
     /// Two reads decide what a connection gets, and they read two different
     /// generations unless something orders them. The first is the live
     /// `Config`, which carries the `Authenticator`, the `Policy`, the quotas
-    /// and the timeouts. The second is quinn's endpoint server configuration,
-    /// which carries the transport parameters: `IntoFuture` for
-    /// `quinn::Incoming` is `Incoming::accept()` (quinn `incoming.rs`), and
-    /// `proto::Endpoint::accept` fixes the parameters for the life of the
-    /// connection there. Left to the first poll of the spawned task, that second
-    /// read could land on the far side of a `SIGHUP` from the first, which is
-    /// the half-applied state D22 says there is none of: one generation's
-    /// transport parameters beside another's users.
+    /// and the timeouts. The second is [`LiveQuicConfig`], which carries the
+    /// transport parameters and the certificate. Both are read here, under
+    /// [`ConfigSwap`], and the second is handed straight to
+    /// `Incoming::accept_with`, so the pair cannot straddle a `SIGHUP`. A
+    /// connection accepted while a reload is applying waits for it and then runs
+    /// wholly on one generation.
     ///
-    /// Since quinn-proto 0.11.18 that accept reads the configuration the
-    /// endpoint held when the connection's first Initial arrived, copied into
-    /// the incoming buffer at that moment, rather than whatever the endpoint
-    /// holds now. So the read this guard covers no longer decides the transport
-    /// parameters, and the window it cannot cover runs from that first Initial
-    /// to this accept. Taking the pair whole again would mean
-    /// `Incoming::accept_with` and a server configuration snapshotted here; see
-    /// D18's 2026-09-17 addendum.
+    /// Reading the second one here is the whole point of the slot. What quinn
+    /// would otherwise use is the copy quinn-proto 0.11.18 took from the
+    /// endpoint when this connection's first Initial arrived, which a `SIGHUP`
+    /// in between makes a generation old: `Incoming::accept()`, which
+    /// `IntoFuture for Incoming` calls, passes no configuration, and
+    /// `proto::Endpoint::accept` then falls back to
+    /// `incoming_buffer.server_config` (quinn-proto `endpoint.rs`,
+    /// `server_config.unwrap_or_else(..)`). That window opens in the endpoint
+    /// driver, where no lock in this file reaches, so it is closed by stating
+    /// the value rather than by ordering the read (D22, addendum of
+    /// 2026-09-17).
     ///
-    /// Both under [`ConfigSwap`], which `reload` holds across all three of its
-    /// writes, so a connection accepted while a reload is applying waits for it
-    /// and then runs wholly on one generation. The guard covers two synchronous
-    /// reads and no await.
+    /// The guard covers two synchronous reads and the synchronous half of the
+    /// accept, and no await. `Incoming::accept_with` answers the client's
+    /// Initial before it returns, which [`Self::serve`] depends on.
     ///
-    /// Generic over what is being accepted so the regression test can attempt
-    /// the snapshot with no peer on the other end; `serve` is the only caller
-    /// that passes a `quinn::Incoming`.
-    fn accept_under_the_swap<I: IntoFuture>(&self, incoming: I) -> (Arc<Config>, I::IntoFuture) {
+    /// Generic over [`AcceptWith`] rather than over `quinn::Incoming` so the
+    /// regression test can attempt the pair with no peer on the other end and
+    /// read back what the accept was handed; `serve` is the only caller that
+    /// passes a `quinn::Incoming`.
+    fn accept_under_the_swap<I: AcceptWith>(&self, incoming: I) -> (Arc<Config>, I::Accepted) {
         let _swapping = self.swap.hold();
-        (self.config(), incoming.into_future())
+        (self.config(), incoming.accept_with(self.quic_config()))
     }
 
     /// Runs one accepted connection to completion.
@@ -983,12 +1097,13 @@ impl Server {
     /// allowed to say nothing at all is not going to finish it. Dropping the
     /// future ends the connection and frees the slot with it.
     ///
-    /// What that drop is *not* is a refusal. The `Incoming` was turned into a
-    /// future by [`Self::accept_under_the_swap`] before this task existed, and
-    /// `IntoFuture` for `Incoming` is `Incoming::accept()`, so by the time
-    /// either arm of the select below can run there is a `Connecting` rather
-    /// than an `Incoming`: quinn has answered the client's Initial and the TLS
-    /// server flight is already on its way.
+    /// What that drop is *not* is a refusal. The `Incoming` was accepted by
+    /// [`Self::accept_under_the_swap`] before this task existed, and
+    /// `Incoming::accept_with` returns a `Connecting`, so by the time either arm
+    /// of the select below can run there is a `Connecting` rather than an
+    /// `Incoming`: quinn has answered the client's Initial and the TLS server
+    /// flight is already on its way. [`Handshake`] is the wrapper that carries
+    /// it here, and it starts nothing of its own.
     /// Dropping a `Connecting` closes the connection the way an application
     /// close does, and RFC 9000 §10.2.3 has an application close sent before the
     /// handshake completes go out as a transport one, so what the peer receives
@@ -1167,6 +1282,12 @@ impl Server {
         // the time this runs, and a queued `Incoming` goes away with the
         // endpoint.
         //
+        // Deliberately not paired with a write to `self.quic_config`. That slot
+        // exists for `accept_under_the_swap`, which is the only thing that reads
+        // it, and by the time this runs the accept loop it belongs to has
+        // returned. Emptying it would mean making it an `Option` and giving that
+        // method a branch nothing can take.
+        //
         // Under the swap, because the latch this drain runs on is read by
         // `ReloadHandle::reload` as a plain predicate: without it a reload that
         // had already passed that read would install a server configuration
@@ -1341,6 +1462,9 @@ fn log_connection_closed(
 pub struct ReloadHandle {
     endpoint: quinn::Endpoint,
     config: LiveConfig,
+    /// The server's own slot, written in the same guarded block as `config` and
+    /// as the endpoint's copy; see [`LiveQuicConfig`].
+    quic_config: LiveQuicConfig,
     shutdown: Shutdown,
     /// The SNI gate's list, which is swapped with the rest (D106).
     expected: Expected,
@@ -1376,6 +1500,14 @@ impl ReloadHandle {
         // it accepts. The strings are logged after the swap, where they were.
         let warnings = config.warnings();
 
+        // One value, two homes. `Server::accept_under_the_swap` reads the slot
+        // and `Incoming::accept_with` uses what it finds, while the endpoint's
+        // own copy governs the pending path: as a first Initial arrives it
+        // derives the Initial keys and validates an address-validation token,
+        // and quinn-proto 0.11.18 pins it to that connection, where it seals a
+        // Retry. Built here so the two cannot be two different configurations.
+        let accepted_with = Arc::new(quic_config);
+
         // Everything from the latch read to the last write is one step, and the
         // drain takes the same lock around its own `set_server_config`. Held
         // here rather than only around the writes because the latch is a
@@ -1402,17 +1534,27 @@ impl ReloadHandle {
         // removed -- and the gate's whole point is that a name it does not know
         // gets no reply at all.
         //
-        // The live `Config` goes before `set_server_config` for a second
-        // reason, now that `Server::accept_under_the_swap` takes this lock
-        // across both of the reads a new connection makes: an accept can no
-        // longer land between the two at all, so the order inside the guard is
-        // what a reader of this function should be able to follow rather than
-        // what a connection depends on. New users before new transport
-        // parameters is the order the sentence above describes for the gate,
-        // read the same way: the half that decides who gets in goes first.
+        // The live `Config` goes before the slot for a second reason, now that
+        // `Server::accept_under_the_swap` takes this lock across both of the
+        // reads a new connection makes: an accept can no longer land between the
+        // two at all, so the order inside the guard is what a reader of this
+        // function should be able to follow rather than what a connection
+        // depends on. New users before new transport parameters is the order the
+        // sentence above describes for the gate, read the same way: the half
+        // that decides who gets in goes first.
+        //
+        // `set_server_config` goes last of the four because it is the one write
+        // with a reader outside this guard. The endpoint driver reads it when an
+        // Initial arrives, and nothing there takes the swap; the other three are
+        // read only by holders of it.
         self.expected.set(Names::new(&config.security.expected_sni));
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
-        self.endpoint.set_server_config(Some(quic_config));
+        *self
+            .quic_config
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = accepted_with.clone();
+        self.endpoint
+            .set_server_config(Some((*accepted_with).clone()));
 
         info!(
             log_id = "aie853ib",
@@ -2123,20 +2265,53 @@ mod tests {
         assert!(bound.server.expected.current().accepts("other.example"));
     }
 
-    /// A connection is not accepted between two of a reload's writes.
+    /// A `quinn::Incoming` stand-in that needs no peer on the other end.
     ///
-    /// The mirror of the test above, from the accept side. `Server::serve`
-    /// takes two reads that decide what one connection runs on, the live
-    /// `Config` and, through `IntoFuture for quinn::Incoming`, the endpoint's
-    /// server configuration, and until this batch it took neither under the
-    /// swap. A reload landing between them gave that connection one
+    /// Records the `quinn::ServerConfig` it was accepted with, which is the
+    /// half of `accept_under_the_swap` that `std::future::ready(())` could not
+    /// observe: until the accept took a configuration of its own there was no
+    /// argument to look at.
+    struct Arriving(Arc<Mutex<Option<Arc<quinn::ServerConfig>>>>);
+
+    impl Arriving {
+        /// A stand-in, and the slot it writes what it was handed into.
+        fn new() -> (Self, Arc<Mutex<Option<Arc<quinn::ServerConfig>>>>) {
+            let recorded = Arc::new(Mutex::new(None));
+            (Self(recorded.clone()), recorded)
+        }
+    }
+
+    impl AcceptWith for Arriving {
+        type Accepted = std::future::Ready<()>;
+
+        fn accept_with(self, server_config: Arc<quinn::ServerConfig>) -> Self::Accepted {
+            *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(server_config);
+            std::future::ready(())
+        }
+    }
+
+    /// A connection is not accepted between two of a reload's writes, and it is
+    /// accepted with the server configuration the reload installed.
+    ///
+    /// The mirror of the test above, from the accept side. `Server::serve` takes
+    /// two reads that decide what one connection runs on, the live `Config` and
+    /// the `quinn::ServerConfig`, and until the 2026-09-05 batch it took neither
+    /// under the swap. A reload landing between them gave that connection one
     /// generation's users beside another's transport parameters for its whole
     /// life, which is the tear D22's 2026-09-04 addendum recorded as narrowed
     /// rather than closed.
     ///
+    /// The second assertion is the 2026-09-17 half. The swap orders the two
+    /// reads, and that alone stopped deciding the transport parameters when
+    /// quinn-proto 0.11.18 began pinning a pending `Incoming` to the
+    /// configuration the endpoint held as its first Initial arrived. So the
+    /// accept states the configuration rather than letting quinn pick one, and
+    /// what this pins is that the value stated is the one the reload wrote and
+    /// not the one it replaced.
+    ///
     /// Deterministic because the test holds the swap the reload holds, in place
-    /// of racing one. The accept is stood in for by a future that needs no
-    /// peer: what is under test is that the pair waits.
+    /// of racing one. The accept is stood in for by [`Arriving`]: what is under
+    /// test is that the pair waits, and what it is handed when it stops waiting.
     #[tokio::test]
     async fn a_connection_is_not_accepted_between_two_of_a_reloads_writes() {
         let bound = bound_server("[limits]\nmax_streams_bidi = 64\n");
@@ -2147,13 +2322,17 @@ mod tests {
             "[limits]\nmax_streams_bidi = 32\n",
         );
 
+        // What `bind` put in the slot, so the last assertion can say the accept
+        // did not take it.
+        let before = bound.server.quic_config();
+
         let swapping = bound.server.swap.hold();
         let (snapshotted, has_snapshotted) = std::sync::mpsc::channel();
+        let (arriving, accepted_with) = Arriving::new();
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                let (config, _accepted) =
-                    bound.server.accept_under_the_swap(std::future::ready(()));
+                let (config, _accepted) = bound.server.accept_under_the_swap(arriving);
                 snapshotted
                     .send(config.limits.max_streams_bidi)
                     .expect("report what the connection was accepted on");
@@ -2164,14 +2343,21 @@ mod tests {
                 "a connection accepted while a reload holds the swap must wait for it"
             );
 
-            // The write the reload makes to the live configuration, while the
+            // The two writes the reload makes to what an accept reads, while the
             // accept waits for the rest of them.
+            let reloaded = Config::load(&bound.config_path).expect("the new configuration loads");
+            let reloaded_quic =
+                Arc::new(server_config(&reloaded).expect("the new certificate is usable"));
             *bound
                 .server
                 .config
                 .write()
-                .unwrap_or_else(PoisonError::into_inner) =
-                Arc::new(Config::load(&bound.config_path).expect("the new configuration loads"));
+                .unwrap_or_else(PoisonError::into_inner) = Arc::new(reloaded);
+            *bound
+                .server
+                .quic_config
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = reloaded_quic.clone();
             drop(swapping);
 
             assert_eq!(
@@ -2180,6 +2366,21 @@ mod tests {
                     .expect("the accept completes once the swap is free"),
                 32,
                 "a connection accepted after the reload runs on the new configuration"
+            );
+
+            let handed = accepted_with
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+                .expect("the accept states a server configuration");
+            assert!(
+                Arc::ptr_eq(&handed, &reloaded_quic),
+                "a connection accepted after the reload must be accepted with the \
+                 server configuration the reload installed"
+            );
+            assert!(
+                !Arc::ptr_eq(&handed, &before),
+                "and not with the one that was in force before it"
             );
         });
     }

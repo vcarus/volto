@@ -213,6 +213,104 @@ async fn reloading_replaces_the_connection_cap() {
     );
 }
 
+/// How long a client's first Initial is given to reach the endpoint below.
+///
+/// There is nothing to wait *for*. quinn publishes no count of the `Incoming`s
+/// it has queued and answers a queued one with nothing, so the arrival has no
+/// signal on either side of the socket, and this is loopback with a live
+/// endpoint driver on the other end of it. The wait is one-sided: too short
+/// makes that test vacuous, because an Initial that lands after the reload is
+/// pinned to the new configuration whether or not the accept states one, and it
+/// cannot make the test fail, because nothing can make a queued Initial arrive
+/// late. The red run of 2026-09-17 failed at this value, which is what says it
+/// is long enough.
+const QUEUED: Duration = Duration::from_millis(500);
+
+/// A handshake that arrived before a reload is accepted on the reloaded
+/// transport parameters.
+///
+/// quinn-proto 0.11.18 copies the endpoint's server configuration into the
+/// buffer it keeps for a pending `Incoming` when that connection's first Initial
+/// arrives, so a `SIGHUP` between the arrival and this server's accept used to
+/// leave the connection on the old transport parameters beside the new
+/// `Config`. `Server::accept_under_the_swap` states the configuration instead,
+/// through `Incoming::accept_with`, and this is that from the client's side.
+///
+/// `max_streams_bidi` is the observable: below `INITIAL_BIDI_STREAMS` it is what
+/// the handshake advertises as `max_concurrent_bidi_streams` verbatim, so
+/// counting the request streams that open without blocking reads the transport
+/// parameter back. Both edges are asserted, so a count that happened to match
+/// some other allowance would not pass.
+///
+/// The accept loop is started after the reload rather than before it. That is
+/// the only way to hold a handshake between its arrival and its acceptance: with
+/// the loop running, `Server::run` takes each `Incoming` off `endpoint.accept()`
+/// and accepts it in the same synchronous step.
+#[tokio::test]
+async fn a_handshake_queued_before_a_reload_is_accepted_on_the_reloaded_parameters() {
+    /// The allowance the endpoint is bound with, and the one a broken accept
+    /// would leave this connection on.
+    const BEFORE: usize = 2;
+    /// The allowance the reload installs. Neither a multiple of `BEFORE` nor a
+    /// number anything else in this server defaults to.
+    const AFTER: usize = 5;
+
+    let mut server = TestServer::bind_with(&format!(
+        "[limits]\nmax_streams_bidi = {BEFORE}\n{ALLOW_PRIVATE}"
+    ))
+    .await;
+
+    // Started, not awaited: quinn sends the Initial from the connection driver
+    // it spawns here, so the handshake is queued as an `Incoming` while this
+    // test goes on to reload. Nothing accepts it until `serve` below.
+    let endpoint = common::client_endpoint(&server.ca, &["h3"]);
+    let connecting = endpoint
+        .connect(server.addr, "localhost")
+        .expect("start a handshake");
+    tokio::time::sleep(QUEUED).await;
+
+    server.rewrite_config(&format!(
+        "[limits]\nmax_streams_bidi = {AFTER}\n{ALLOW_PRIVATE}"
+    ));
+    server.reload().expect("a valid configuration must apply");
+
+    server.serve();
+
+    let connection = tokio::time::timeout(TIMEOUT, connecting)
+        .await
+        .expect("the queued handshake completes once the accept loop starts")
+        .expect("the queued handshake completes once the accept loop starts");
+
+    // Held rather than dropped, because the transport parameter bounds streams
+    // open at once rather than streams opened in total.
+    let mut streams = Vec::new();
+    for n in 0..AFTER {
+        let stream = tokio::time::timeout(TIMEOUT, connection.open_bi())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "request stream {n} was refused: a handshake queued before the reload must \
+                     run on the {AFTER} streams the reload installed, not the {BEFORE} it replaced"
+                )
+            })
+            .expect("open a request stream");
+        streams.push(stream);
+    }
+
+    // The upper edge, and not an error: there is no credit for one more, so it
+    // never leaves this client (STREAMS_BLOCKED, RFC 9000 §4.6).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), connection.open_bi())
+            .await
+            .is_err(),
+        "a request stream past the reloaded allowance must not be granted"
+    );
+    assert!(
+        connection.close_reason().is_none(),
+        "asking for one stream too many is not a protocol violation"
+    );
+}
+
 /// A reload can also tighten the destination policy.
 #[tokio::test]
 async fn reloading_replaces_the_destination_policy() {
