@@ -416,6 +416,36 @@ pub async fn udp_answer(addr: SocketAddr, bytes: &[u8], patience: Duration) -> O
     }
 }
 
+/// A 1200-byte long-header packet naming a QUIC version nobody speaks.
+///
+/// The version is one RFC 9000 §15 sets aside for this: "Versions that follow
+/// the pattern 0x?a?a?a?a are reserved for use in forcing version negotiation
+/// to be exercised -- that is, any version number where the low four bits of
+/// all bytes is 1010 (in binary)." The size is the 1200 bytes below which
+/// quinn-proto drops an unsupported version without an answer, and RFC 9000
+/// §5.2.2 says of a packet that size: "If a server receives a packet that
+/// indicates an unsupported version and if the packet is large enough to
+/// initiate a new connection for any supported version, the server SHOULD send
+/// a Version Negotiation packet as described in Section 6.1." Everything before
+/// the version field is well formed, because quinn reads the connection IDs
+/// out before it looks at the version.
+pub fn version_probe() -> Vec<u8> {
+    let mut packet = vec![0xc0]; // long header, fixed bit, Initial type
+    packet.extend_from_slice(&0x1a2a_3a4au32.to_be_bytes());
+    packet.push(8); // Destination Connection ID length
+    packet.extend_from_slice(&[0xab; 8]);
+    packet.push(0); // Source Connection ID length
+    packet.resize(1200, 0);
+    packet
+}
+
+/// Whether `datagram` is a Version Negotiation packet: RFC 9000 §17.2.1 gives
+/// it a long header and a Version field of zero.
+pub fn is_version_negotiation(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(first) if first & 0x80 != 0)
+        && matches!(datagram.get(1..5), Some([0, 0, 0, 0]))
+}
+
 /// Sends `bytes` once from a fresh socket and collects every datagram that
 /// arrives within `patience`.
 ///

@@ -26,9 +26,10 @@ use common::Response;
 use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
-    auth_section, authorized_connect, close_and_drain, connect_request, echoes, open_tcp_tunnel,
-    open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
-    spawn_end_reporting_target, spawn_udp_echo_target, udp_round_trip,
+    auth_section, authorized_connect, close_and_drain, connect_request, echoes,
+    is_version_negotiation, open_tcp_tunnel, open_udp_session, read_at_least, respond_to,
+    send_and_respond, spawn_echo_target, spawn_end_reporting_target, spawn_udp_echo_target,
+    udp_round_trip, version_probe,
 };
 use tokio::sync::oneshot;
 use volto::h3api::{FieldValue, Status};
@@ -231,7 +232,8 @@ struct ArrivalRelay {
 /// quinn answers a queued `Incoming` with nothing, so its arrival has no
 /// signal of its own. The relay sends the endpoint a datagram it does answer
 /// instead. Right behind the client's first datagram it sends a
-/// [`version_probe`], from the same socket to the same address. quinn's
+/// [`version_probe`], from the same socket to the same address. The SNI gate
+/// would refuse that probe, and this file's servers run with the gate off. quinn's
 /// endpoint driver handles the datagrams of a socket in the order it reads
 /// them, and loopback delivers two datagrams one socket sends to one address in
 /// the order they were sent. So the Version Negotiation packet that comes back
@@ -280,35 +282,6 @@ async fn arrival_reporting_relay(server: SocketAddr) -> ArrivalRelay {
     });
 
     ArrivalRelay { addr, handled }
-}
-
-/// A 1200-byte long-header packet naming a QUIC version nobody speaks.
-///
-/// The version is one RFC 9000 §15 sets aside for this: "Versions that follow
-/// the pattern 0x?a?a?a?a are reserved for use in forcing version negotiation
-/// to be exercised -- that is, any version number where the low four bits of
-/// all bytes is 1010 (in binary)." The size is the 1200 bytes below which
-/// quinn-proto drops an unsupported version without an answer, and RFC 9000
-/// §5.2.2 says of a packet that size: "If a server receives a packet that
-/// indicates an unsupported version and if the packet is large enough to
-/// initiate a new connection for any supported version, the server SHOULD send
-/// a Version Negotiation packet as described in Section 6.1." The SNI gate
-/// would refuse it, and this file's servers run with the gate off.
-fn version_probe() -> Vec<u8> {
-    let mut packet = vec![0xc0]; // long header, fixed bit, Initial type
-    packet.extend_from_slice(&0x1a2a_3a4au32.to_be_bytes());
-    packet.push(8); // Destination Connection ID length
-    packet.extend_from_slice(&[0xab; 8]);
-    packet.push(0); // Source Connection ID length
-    packet.resize(1200, 0);
-    packet
-}
-
-/// Whether `datagram` is a Version Negotiation packet: RFC 9000 §17.2.1 gives
-/// it a long header and a Version field of zero.
-fn is_version_negotiation(datagram: &[u8]) -> bool {
-    matches!(datagram.first(), Some(first) if first & 0x80 != 0)
-        && matches!(datagram.get(1..5), Some([0, 0, 0, 0]))
 }
 
 /// A handshake that arrived before a reload is accepted on the reloaded

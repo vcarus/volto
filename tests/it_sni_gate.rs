@@ -29,8 +29,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint_with_transport,
-    finish_connect_as, open_tcp_tunnel, open_udp_session, read_at_least, spawn_echo_target,
-    spawn_udp_echo_target, udp_answer, udp_round_trip,
+    finish_connect_as, is_version_negotiation, open_tcp_tunnel, open_udp_session, read_at_least,
+    spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_round_trip, version_probe,
 };
 use rustls::pki_types::CertificateDer;
 
@@ -174,22 +174,6 @@ async fn the_name_on_the_list_reaches_both_kinds_of_tunnel() {
 // (c) A version-negotiation probe: answered with the gate off, silent with it on
 // ---------------------------------------------------------------------------
 
-/// A 1200-byte long-header packet naming a QUIC version nobody speaks.
-///
-/// Large enough that RFC 9000 §5.2.2's "if the packet is large enough to
-/// initiate a new connection" holds, so a server that follows that SHOULD
-/// answers it. Everything before the version field is well formed, because
-/// quinn reads the connection IDs out before it looks at the version.
-fn unknown_version_probe() -> Vec<u8> {
-    let mut packet = vec![0xc0]; // long header, fixed bit, Initial type
-    packet.extend_from_slice(&0xdead_beefu32.to_be_bytes());
-    packet.push(8); // Destination Connection ID length
-    packet.extend_from_slice(&[0xab; 8]);
-    packet.push(0); // Source Connection ID length
-    packet.resize(1200, 0);
-    packet
-}
-
 /// Sends `probe` from a fresh socket and returns whatever comes back.
 async fn probe(addr: SocketAddr, probe: &[u8]) -> Option<Vec<u8>> {
     udp_answer(addr, probe, CLIENT_IDLE).await
@@ -199,21 +183,13 @@ async fn probe(addr: SocketAddr, probe: &[u8]) -> Option<Vec<u8>> {
 async fn an_unknown_version_draws_a_version_negotiation_packet_with_the_gate_off() {
     let server = TestServer::start_with(GATE_OFF).await;
 
-    let answer = probe(server.addr, &unknown_version_probe())
+    let answer = probe(server.addr, &version_probe())
         .await
         .expect("with the gate off, quinn answers an unsupported version");
 
-    // RFC 9000 §17.2.1: a Version Negotiation packet is a long header whose
-    // Version field is zero.
     assert!(
-        answer.len() >= 5,
-        "a Version Negotiation packet is longer than this: {answer:?}"
-    );
-    assert_ne!(answer[0] & 0x80, 0, "a long header was expected");
-    assert_eq!(
-        u32::from_be_bytes([answer[1], answer[2], answer[3], answer[4]]),
-        0,
-        "a Version Negotiation packet carries version 0"
+        is_version_negotiation(&answer),
+        "a Version Negotiation packet was expected: {answer:?}"
     );
 }
 
@@ -222,7 +198,7 @@ async fn an_unknown_version_draws_nothing_at_all_with_the_gate_on() {
     let server = TestServer::start_with(GATE_LOCALHOST).await;
 
     assert!(
-        probe(server.addr, &unknown_version_probe()).await.is_none(),
+        probe(server.addr, &version_probe()).await.is_none(),
         "with the gate on, an unsupported version must draw no reply"
     );
 }
