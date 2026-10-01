@@ -18,6 +18,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -29,6 +30,7 @@ use common::{
     open_udp_session, read_at_least, respond_to, send_and_respond, spawn_echo_target,
     spawn_end_reporting_target, spawn_udp_echo_target, udp_round_trip,
 };
+use tokio::sync::oneshot;
 use volto::h3api::{FieldValue, Status};
 
 /// Reloads the server with a subscriber of this test's own, and returns
@@ -213,18 +215,101 @@ async fn reloading_replaces_the_connection_cap() {
     );
 }
 
-/// How long a client's first Initial is given to reach the endpoint below.
+/// A relay between one client and a server, with a report of when the server
+/// endpoint has handled the client's first datagram.
+struct ArrivalRelay {
+    /// Where the client connects to.
+    addr: SocketAddr,
+    /// Completes once the server endpoint has handled the client's first
+    /// datagram. Dropped unsent if the relay's socket fails first.
+    handled: oneshot::Receiver<()>,
+}
+
+/// Carries datagrams both ways between one client and `server`, and reports
+/// when the server endpoint has handled the client's first datagram.
 ///
-/// There is nothing to wait *for*. quinn publishes no count of the `Incoming`s
-/// it has queued and answers a queued one with nothing, so the arrival has no
-/// signal on either side of the socket, and this is loopback with a live
-/// endpoint driver on the other end of it. The wait is one-sided: too short
-/// makes that test vacuous, because an Initial that lands after the reload is
-/// pinned to the new configuration whether or not the accept states one, and it
-/// cannot make the test fail, because nothing can make a queued Initial arrive
-/// late. The red run of 2026-09-17 failed at this value, which is what says it
-/// is long enough.
-const QUEUED: Duration = Duration::from_millis(500);
+/// quinn answers a queued `Incoming` with nothing, so its arrival has no
+/// signal of its own. The relay sends the endpoint a datagram it does answer
+/// instead. Right behind the client's first datagram it sends a
+/// [`version_probe`], from the same socket to the same address. quinn's
+/// endpoint driver handles the datagrams of a socket in the order it reads
+/// them, and loopback delivers two datagrams one socket sends to one address in
+/// the order they were sent. So the Version Negotiation packet that comes back
+/// was sent after the endpoint handled the client's Initial. Handling that
+/// Initial is what queues the `Incoming`, and what copies the endpoint's server
+/// configuration into the buffer quinn-proto keeps for it.
+///
+/// The Version Negotiation packet is not passed on to the client, which has no
+/// use for an answer to a probe it did not send.
+async fn arrival_reporting_relay(server: SocketAddr) -> ArrivalRelay {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind the relay socket");
+    let addr = socket.local_addr().expect("the relay's address");
+    let (report, handled) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let probe = version_probe();
+        let mut report = Some(report);
+        let mut buf = vec![0u8; usize::from(u16::MAX)];
+        // Learned from the first datagram that is not the server's, so the
+        // answers have somewhere to go.
+        let mut client: Option<SocketAddr> = None;
+
+        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
+            let datagram = &buf[..read];
+
+            if from == server {
+                if is_version_negotiation(datagram) {
+                    if let Some(report) = report.take() {
+                        let _ = report.send(());
+                    }
+                } else if let Some(client) = client {
+                    let _ = socket.send_to(datagram, client).await;
+                }
+                continue;
+            }
+
+            let first = client.is_none();
+            client = Some(from);
+            let _ = socket.send_to(datagram, server).await;
+            if first {
+                let _ = socket.send_to(&probe, server).await;
+            }
+        }
+    });
+
+    ArrivalRelay { addr, handled }
+}
+
+/// A 1200-byte long-header packet naming a QUIC version nobody speaks.
+///
+/// The version is one RFC 9000 §15 sets aside for this: "Versions that follow
+/// the pattern 0x?a?a?a?a are reserved for use in forcing version negotiation
+/// to be exercised -- that is, any version number where the low four bits of
+/// all bytes is 1010 (in binary)." The size is the 1200 bytes below which
+/// quinn-proto drops an unsupported version without an answer, and RFC 9000
+/// §5.2.2 says of a packet that size: "If a server receives a packet that
+/// indicates an unsupported version and if the packet is large enough to
+/// initiate a new connection for any supported version, the server SHOULD send
+/// a Version Negotiation packet as described in Section 6.1." The SNI gate
+/// would refuse it, and this file's servers run with the gate off.
+fn version_probe() -> Vec<u8> {
+    let mut packet = vec![0xc0]; // long header, fixed bit, Initial type
+    packet.extend_from_slice(&0x1a2a_3a4au32.to_be_bytes());
+    packet.push(8); // Destination Connection ID length
+    packet.extend_from_slice(&[0xab; 8]);
+    packet.push(0); // Source Connection ID length
+    packet.resize(1200, 0);
+    packet
+}
+
+/// Whether `datagram` is a Version Negotiation packet: RFC 9000 §17.2.1 gives
+/// it a long header and a Version field of zero.
+fn is_version_negotiation(datagram: &[u8]) -> bool {
+    matches!(datagram.first(), Some(first) if first & 0x80 != 0)
+        && matches!(datagram.get(1..5), Some([0, 0, 0, 0]))
+}
 
 /// A handshake that arrived before a reload is accepted on the reloaded
 /// transport parameters.
@@ -245,7 +330,9 @@ const QUEUED: Duration = Duration::from_millis(500);
 /// The accept loop is started after the reload rather than before it. That is
 /// the only way to hold a handshake between its arrival and its acceptance: with
 /// the loop running, `Server::run` takes each `Incoming` off `endpoint.accept()`
-/// and accepts it in the same synchronous step.
+/// and accepts it in the same synchronous step. The client connects through
+/// [`arrival_reporting_relay`], and the reload waits for its report that the
+/// endpoint has handled the client's first Initial.
 #[tokio::test]
 async fn a_handshake_queued_before_a_reload_is_accepted_on_the_reloaded_parameters() {
     /// The allowance the endpoint is bound with, and the one a broken accept
@@ -261,13 +348,25 @@ async fn a_handshake_queued_before_a_reload_is_accepted_on_the_reloaded_paramete
     .await;
 
     // Started, not awaited: quinn sends the Initial from the connection driver
-    // it spawns here, so the handshake is queued as an `Incoming` while this
-    // test goes on to reload. Nothing accepts it until `serve` below.
+    // it spawns here, and nothing accepts it until `serve` below.
+    let relay = arrival_reporting_relay(server.addr).await;
     let endpoint = common::client_endpoint(&server.ca, &["h3"]);
     let connecting = endpoint
-        .connect(server.addr, "localhost")
+        .connect(relay.addr, "localhost")
         .expect("start a handshake");
-    tokio::time::sleep(QUEUED).await;
+
+    // The reload has to run after the endpoint has queued the handshake.
+    // Otherwise the handshake gets the new configuration whatever the accept
+    // passes, and this test passes without testing anything.
+    tokio::time::timeout(TIMEOUT, relay.handled)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the server endpoint did not handle the client's first Initial within \
+                 {TIMEOUT:?}, so no handshake is queued before the reload"
+            )
+        })
+        .expect("the relay's socket failed before the server endpoint answered its probe");
 
     server.rewrite_config(&format!(
         "[limits]\nmax_streams_bidi = {AFTER}\n{ALLOW_PRIVATE}"
