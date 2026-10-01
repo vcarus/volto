@@ -1382,6 +1382,7 @@ dependencies = [
  "percent-encoding",
  "proptest",
  "quinn",
+ "quinn-proto",
  "rcgen",
  "rustix",
  "rustls",

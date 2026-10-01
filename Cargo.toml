@@ -34,6 +34,12 @@ quinn = { version = "0.11", default-features = false, features = [
     "bloom",
     "log",
 ] }
+# Named for one type: `quinn_proto::RttEstimator`, which `Controller::on_ack`
+# takes (src/congestion.rs) and quinn does not re-export. quinn-proto is already
+# in the tree as quinn's own dependency, so `Cargo.lock` gains this edge and no
+# crate. Same requirement style as quinn, and no features of its own: quinn
+# selects them.
+quinn-proto = { version = "0.11", default-features = false }
 # The crypto backend is aws-lc-rs rather than ring (D102). It is what rustls
 # enables by default upstream and the only provider that carries ML-KEM, so a
 # hybrid key exchange becomes a client-side question rather than a server

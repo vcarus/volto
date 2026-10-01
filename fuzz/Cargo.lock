@@ -1006,6 +1006,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "quinn",
+ "quinn-proto",
  "rustix",
  "rustls",
  "serde",

@@ -61,7 +61,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
 | `mtu_upper_bound` | bytes | `1452` | Ceiling for the MTU discovery search — a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. The default is the value safe over both IPv4 and IPv6 on Ethernet; an operator who has measured their path (`ping -M do`, `tracepath`) can claim what IPv4 leaves above that, at most 1472. Safe to overshoot, unlike `initial_mtu`: a size is only adopted after a probe of that size is acknowledged, and a lost probe is retried then abandoned without counting as congestion, so a bound above what the path carries costs a few PINGs and nothing else. No effect (and a startup warning) when `mtu_discovery` is off |
-| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `cubic` or `newreno` |
+| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-capped`, `cubic` or `newreno` |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
 | `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max` |
@@ -198,6 +198,34 @@ loss-based controller (cubic, newreno) reads every dropped packet as congestion
 and collapses the window — downloads stall to near zero while a co-located TCP
 proxy, which the kernel runs on BBR, is unaffected. BBR models bandwidth and RTT
 instead. Switch to cubic only on a clean path, or as a fallback.
+
+**`bbr-capped` is BBR with its window held to 1.25 times the bandwidth-delay
+product it measures.** quinn's BBR estimates the bottleneck bandwidth several
+times too high, so during a bulk download it sends faster than the path carries
+and the path drops the difference. `bbr-capped` measures the delivery rate once
+per round trip and caps the window, and with it the pacing rate, at 1.25 times
+that rate times the minimum RTT. The cap is never below the 240 kB window a new
+connection starts with, so on a path whose bandwidth-delay product is under 192
+kB the window can be 240 kB. A new connection uses 2.89 times instead, BBR's
+startup gain, until its measured rate stops growing, or until a loss arrives in
+a round trip in which it did not grow; behind a 150 Mbit/s bottleneck in the lab
+it reached 90 percent of that rate 1.4 s after the handshake at a 60 ms RTT and
+2.9 s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. Apart from
+ending that startup, it responds to loss exactly as BBR does, so it keeps what
+makes BBR the choice for a lossy path. It keeps its own minimum RTT, which lasts
+10 s unless a lower or equal sample renews it. When it runs out, and once the
+sender is not app-limited, the window is held at half the bandwidth-delay
+product for at least 200 ms so that the bottleneck queue empties, and the lowest
+RTT seen then becomes the new minimum. In a lab with a 150 Mbit/s bottleneck and
+a 60 ms RTT, behind a queue of one bandwidth-delay product, BBR lost 28 percent
+of the packets it sent and `bbr-capped` none, at 8 percent higher throughput;
+behind a 50 kB queue the loss went from 54 to 18 percent, and under 0.2 and 2
+percent random loss its throughput was 15 and 26 percent higher than BBR's. The
+re-measurement costs about 1.4 percent of the throughput. A lasting rise in the
+path's RTT lowers throughput until the next re-measurement, 10 s after the last
+one or later while the sender is app-limited; after a rise from 60 to 150 ms the
+throughput was back at the bottleneck rate 3.5 to 3.7 s after that. It is not
+the default until it has been measured on real paths.
 
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines
