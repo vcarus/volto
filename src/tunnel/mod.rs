@@ -909,6 +909,7 @@ pub(crate) async fn admit_target(
 mod tests {
     use super::*;
     use crate::h3api::{FieldValue, Status};
+    use crate::quic::tests::loopback_pair;
 
     fn connect_with_protocol(protocol: Option<&str>) -> Request {
         let mut req = Request::new(Method::Connect);
@@ -997,64 +998,6 @@ mod tests {
         }
     }
 
-    /// One QUIC connection over the loopback.
-    ///
-    /// [`Context`] holds one and there is no way to make one without a
-    /// handshake; nothing the failure counters do looks at it. The certificate
-    /// is generated here rather than taken from `tests/common`, which the lib
-    /// target cannot reach.
-    async fn loopback_connection() -> quinn::Connection {
-        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate a self-signed certificate");
-        let certificate = issued.cert.der().clone();
-        let key =
-            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
-
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3")
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], key)
-            .expect("certificate and key");
-        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).expect("quic tls"),
-        ));
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(certificate).expect("trust the certificate");
-        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
-
-        let bind = "127.0.0.1:0".parse().expect("bind address");
-        let server = quinn::Endpoint::server(server_config, bind).expect("server endpoint");
-        let addr = server.local_addr().expect("local address");
-        let mut client = quinn::Endpoint::client(bind).expect("client endpoint");
-        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("quic tls"),
-        )));
-
-        // Both sides have to be driven for either handshake to finish.
-        let (connection, _accepted) = tokio::join!(
-            client.connect(addr, "localhost").expect("start connecting"),
-            async {
-                server
-                    .accept()
-                    .await
-                    .expect("an incoming connection")
-                    .await
-                    .expect("the server side of the handshake")
-            }
-        );
-
-        connection.expect("the client side of the handshake")
-    }
-
     /// A context whose authenticator knows exactly one user.
     ///
     /// Parsed rather than assembled so the `[auth]` section is the one the
@@ -1082,7 +1025,7 @@ mod tests {
 
         Context::new(
             &config,
-            loopback_connection().await,
+            loopback_pair(quinn::TransportConfig::default()).await.0,
             Arc::new(AtomicBool::new(false)),
             &crate::net::ResolverBudget::new(),
             Arc::new(AtomicU64::new(0)),
@@ -1108,7 +1051,7 @@ mod tests {
 
         Context::new(
             &config,
-            loopback_connection().await,
+            loopback_pair(quinn::TransportConfig::default()).await.0,
             Arc::new(AtomicBool::new(false)),
             &crate::net::ResolverBudget::new(),
             Arc::new(AtomicU64::new(0)),

@@ -193,7 +193,7 @@ initial_mtu = 1242
 # Default: 1452
 mtu_upper_bound = 1464
 
-# QUIC congestion controller: "bbr", "cubic" or "newreno".
+# QUIC congestion controller: "bbr", "bbr-capped", "cubic" or "newreno".
 #
 # BBR by default, and it should usually stay that way. Over a long, lossy
 # international path a loss-based controller (cubic/newreno) treats every dropped
@@ -201,6 +201,17 @@ mtu_upper_bound = 1464
 # while a co-located TCP proxy (which the kernel runs on BBR) is unaffected. BBR
 # models bandwidth and RTT instead, so it holds throughput on exactly these
 # paths. Switch to cubic only on a clean path, or as a fallback.
+#
+# "bbr-capped" is the same BBR with its window held to 1.25 times the
+# bandwidth-delay product it measures, and never below the 240 kB a new
+# connection starts with. quinn's BBR overestimates the bottleneck, so a bulk
+# download sends faster than the path carries and loses the difference; the
+# cap removes most of that loss and keeps BBR's response to random loss. A new
+# connection uses a higher cap until its measured rate stops growing. It
+# measures the minimum RTT again 10 s after the last measurement, or later
+# while the sender is app-limited, so a lasting RTT rise costs throughput for
+# about that long plus a few seconds. Not the default yet; see
+# docs/configuration.md for the measurements.
 # Default: "bbr"
 #congestion_control = "bbr"
 

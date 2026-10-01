@@ -249,13 +249,13 @@ impl AuthGate {
 
 /// The quinn congestion controller factory named by `[limits] congestion_control`.
 ///
-/// Split out from [`transport_config`] purely so it can be tested: `TransportConfig`
-/// has no getter for the factory and its `Debug` skips it, so the mapping is
-/// invisible to the assertions above — a `Bbr => CubicConfig` slip passes every one
-/// of them. The failure it would cause is not subtle in production (the download
-/// direction of a long international path collapsed to near-zero on 2026-08-13, and
-/// it took a day to localise) but it is entirely silent here, so the unit test
-/// builds the controller and downcasts it.
+/// `TransportConfig` has no getter for the factory and its `Debug` skips it, so
+/// the mapping is invisible to the assertions on [`transport_config`]: a
+/// `Bbr => CubicConfig` slip passes every one of them. The failure it would
+/// cause is not subtle in production (the download direction of a long
+/// international path collapsed to near-zero on 2026-08-13, and it took a day to
+/// localise) but it is silent there, so the unit tests open a connection with
+/// the transport parameters and downcast the controller it runs.
 ///
 /// BBR by default. A loss-based controller (CUBIC, NewReno) reads the
 /// non-congestive packet loss of a long international path as congestion and
@@ -269,6 +269,7 @@ fn congestion_factory(
 ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match cc {
         CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+        CongestionControl::BbrCapped => Arc::new(crate::congestion::BbrCappedConfig::default()),
         CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
         CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
     }
@@ -2116,7 +2117,7 @@ pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::path::PathBuf;
@@ -2835,19 +2836,86 @@ mod tests {
         );
     }
 
-    /// Builds the controller a `[limits] congestion_control` value selects and
-    /// names its concrete type.
+    /// A QUIC connection over the loopback whose server side uses `transport`,
+    /// returned as the client's side and the server's.
     ///
-    /// `TransportConfig` keeps the factory behind a private field that its `Debug`
-    /// does not print, so [`transport_debug`] — which pins every other transport
-    /// parameter — cannot see this one at all. `Controller::into_any` exists for
-    /// exactly this downcast.
-    fn controller_type_of(cc: crate::config::CongestionControl) -> &'static str {
-        let built = congestion_factory(cc).build(std::time::Instant::now(), 1200);
-        let any = built.into_any();
+    /// For the tests here and in `congestion` and `tunnel` that need a real
+    /// connection. The certificate is generated here rather than taken from
+    /// `tests/common`, which the lib target cannot reach.
+    pub(crate) async fn loopback_pair(
+        transport: quinn::TransportConfig,
+    ) -> (quinn::Connection, quinn::Connection) {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate a self-signed certificate");
+        let certificate = issued.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .expect("certificate and key");
+        server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            QuicServerConfig::try_from(server_crypto).expect("quic tls"),
+        ));
+        server_config.transport_config(Arc::new(transport));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).expect("trust the certificate");
+        let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+        let bind = "127.0.0.1:0".parse().expect("bind address");
+        let server = quinn::Endpoint::server(server_config, bind).expect("server endpoint");
+        let addr = server.local_addr().expect("local address");
+        let mut client = quinn::Endpoint::client(bind).expect("client endpoint");
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).expect("quic tls"),
+        )));
+
+        // Both sides have to be driven for either handshake to finish.
+        let (connection, accepted) = tokio::join!(
+            client.connect(addr, "localhost").expect("start connecting"),
+            async {
+                server
+                    .accept()
+                    .await
+                    .expect("an incoming connection")
+                    .await
+                    .expect("the server side of the handshake")
+            }
+        );
+        (
+            connection.expect("the client side of the handshake"),
+            accepted,
+        )
+    }
+
+    /// The controller a connection accepted with `transport_config(limits)`
+    /// runs, named by its concrete type.
+    ///
+    /// `TransportConfig` keeps the factory in a private field that its `Debug`
+    /// does not print, so [`transport_debug`], which pins every other transport
+    /// parameter, cannot see it. The controller is read back from the server
+    /// side of a real connection instead, through `Connection::congestion_state`,
+    /// and `Controller::into_any` exists for this downcast.
+    async fn controller_type_of(limits: &crate::config::Limits) -> &'static str {
+        let transport = transport_config(limits).expect("the limits build a transport config");
+        let (_client, server) = loopback_pair(transport).await;
+        let any = server.congestion_state().into_any();
 
         if any.is::<quinn::congestion::Bbr>() {
             "bbr"
+        } else if any.is::<crate::congestion::BbrCapped>() {
+            "bbr-capped"
         } else if any.is::<quinn::congestion::Cubic>() {
             "cubic"
         } else if any.is::<quinn::congestion::NewReno>() {
@@ -2857,32 +2925,39 @@ mod tests {
         }
     }
 
-    /// Every `congestion_control` value selects the controller it names.
-    #[test]
-    fn each_congestion_control_value_selects_its_controller() {
+    /// Every `congestion_control` value selects the controller it names, on a
+    /// connection accepted with the transport parameters `transport_config`
+    /// builds.
+    #[tokio::test]
+    async fn each_congestion_control_value_selects_its_controller() {
         use crate::config::CongestionControl;
 
         for (value, expected) in [
             (CongestionControl::Bbr, "bbr"),
+            (CongestionControl::BbrCapped, "bbr-capped"),
             (CongestionControl::Cubic, "cubic"),
             (CongestionControl::NewReno, "newreno"),
         ] {
-            assert_eq!(controller_type_of(value), expected, "{value:?}");
+            let limits = crate::config::Limits {
+                congestion_control: value,
+                ..crate::config::Limits::default()
+            };
+            assert_eq!(controller_type_of(&limits).await, expected, "{value:?}");
         }
     }
 
-    /// The default really is BBR, all the way to the built controller.
+    /// The default really is BBR, all the way to the controller a connection
+    /// runs.
     ///
-    /// The one assertion in this module with a production incident behind it. quinn
-    /// defaults to CUBIC, so losing this mapping — a mis-edited match arm, a
-    /// default that stops being BBR — lands on a loss-based controller, and a
+    /// The one assertion in this module with a production incident behind it.
+    /// quinn defaults to CUBIC, so losing this mapping (a mis-edited match arm,
+    /// a default that stops being BBR, or `transport_config` no longer
+    /// installing the factory) lands on a loss-based controller, and a
     /// loss-based controller collapses the download direction of the production
     /// path to near-zero while leaving upload, CPU and every log line looking
-    /// normal. Nothing else in the suite can tell the two apart. (What this cannot
-    /// see is `transport_config` ceasing to call `congestion_factory` at all; that
-    /// call is one line away and reviewed with it.)
-    #[test]
-    fn the_default_congestion_controller_is_bbr() {
+    /// normal. Nothing else in the suite can tell the two apart.
+    #[tokio::test]
+    async fn the_default_congestion_controller_is_bbr() {
         let limits = crate::config::Limits::default();
 
         assert_eq!(
@@ -2891,7 +2966,7 @@ mod tests {
             "the default must stay BBR"
         );
         assert_eq!(
-            controller_type_of(limits.congestion_control),
+            controller_type_of(&limits).await,
             "bbr",
             "the default limits must build a BBR controller, not quinn's CUBIC"
         );

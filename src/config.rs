@@ -26,7 +26,7 @@
 //! initial_mtu          = 1200  # bytes, 1200..1452
 //! mtu_discovery        = true
 //! mtu_upper_bound      = 1452  # bytes, initial_mtu..1472
-//! congestion_control   = "bbr" # bbr | cubic | newreno
+//! congestion_control   = "bbr" # bbr | bbr-capped | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
 //! socket_recv_buffer   = 2097152 # bytes, 0 keeps the OS default
 //! socket_send_buffer   = 2097152 # bytes, 0 keeps the OS default
@@ -398,6 +398,10 @@ pub enum CongestionControl {
     /// BBR (quinn's experimental port of BBRv1). The default; best on lossy
     /// long-haul paths.
     Bbr,
+    /// The same BBR with its window capped at 1.25 times the measured
+    /// bandwidth-delay product; see [`crate::congestion`].
+    #[serde(rename = "bbr-capped")]
+    BbrCapped,
     /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
     Cubic,
     /// NewReno. Loss-based and the most conservative; mainly of interest for
@@ -2475,6 +2479,7 @@ pub(crate) mod tests {
         );
         for (value, expected) in [
             ("bbr", CongestionControl::Bbr),
+            ("bbr-capped", CongestionControl::BbrCapped),
             ("cubic", CongestionControl::Cubic),
             ("newreno", CongestionControl::NewReno),
         ] {
@@ -3549,6 +3554,7 @@ pub(crate) mod tests {
                 any::<bool>(),
                 prop::sample::select(vec![
                     CongestionControl::Bbr,
+                    CongestionControl::BbrCapped,
                     CongestionControl::Cubic,
                     CongestionControl::NewReno,
                 ]),
