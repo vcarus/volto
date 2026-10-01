@@ -944,16 +944,32 @@ impl Server {
         // cap this branch is not entered at all, so an ordinary Surge
         // handshake is untouched.
         //
-        // Deliberately not given the slot `accept_under_the_swap` reads. quinn
-        // has no `retry_with`, and the two halves of a Retry are the endpoint's
-        // business either way: quinn-proto seals the token with the `token_key`
-        // of the configuration it pinned to this `Incoming` when the Initial
-        // arrived, and validates the returning one against whatever the
-        // endpoint holds by then. Neither read is reachable from here, and
-        // overriding them would buy nothing, because a token that crosses a
-        // `SIGHUP` is already refused by the paragraph above: the key is redrawn
-        // with the configuration, so the client pays one more round trip and
-        // handshakes afresh.
+        // Deliberately not given the slot `accept_under_the_swap` reads, because
+        // quinn has no `retry_with`. quinn-proto seals the Retry token with the
+        // `token_key` of the configuration it pinned to this `Incoming` when the
+        // Initial arrived, and validates the returning token against the
+        // configuration the endpoint holds when that token arrives. Neither read
+        // can be reached from here.
+        //
+        // So a Retry token that crosses a `SIGHUP` fails to decode under the new
+        // key, and quinn-proto treats the returning Initial as carrying no token.
+        // That connection attempt fails; it does not cost one more round trip
+        // the way a NEW_TOKEN token does in the paragraph above. If the server is
+        // still full, `admit` sends a second Retry, and the client discards it:
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
+        //# A client MUST accept and process at most one Retry packet for each
+        //# connection attempt.
+        //
+        // The client keeps resending its Initial, each one draws another
+        // Retry, and the attempt ends at the client's idle timeout. If the
+        // server is no longer full, the connection is accepted with the Retry's
+        // source connection ID as its original destination connection ID and
+        // with no retry source connection ID, and the client closes it with
+        // TRANSPORT_PARAMETER_ERROR. Either way the client has to start a new
+        // attempt. This needs the server to be full and a reload to land inside
+        // one round trip, and without a `retry_with` nothing here can narrow
+        // it.
         if !incoming.remote_address_validated() {
             if incoming.may_retry() {
                 match incoming.retry() {
@@ -1537,16 +1553,25 @@ impl ReloadHandle {
         // The live `Config` goes before the slot for a second reason, now that
         // `Server::accept_under_the_swap` takes this lock across both of the
         // reads a new connection makes: an accept can no longer land between the
-        // two at all, so the order inside the guard is what a reader of this
+        // two at all, so the order of these two is what a reader of this
         // function should be able to follow rather than what a connection
         // depends on. New users before new transport parameters is the order the
         // sentence above describes for the gate, read the same way: the half
         // that decides who gets in goes first.
         //
-        // `set_server_config` goes last of the four because it is the one write
-        // with a reader outside this guard. The endpoint driver reads it when an
-        // Initial arrives, and nothing there takes the swap; the other three are
-        // read only by holders of it.
+        // Two of the four writes are read in the endpoint driver, which never
+        // takes the swap: `Gate::poll_recv` reads the gate's list on every
+        // receive batch, and quinn-proto reads the endpoint's configuration
+        // when a first Initial arrives. Their order is the one a connection can
+        // see, and it is the order the first paragraph gives: the list before
+        // the endpoint's configuration. The slot is read only under the swap, so
+        // its place between them changes nothing a connection sees.
+        // `set_server_config` goes after it so that the endpoint never holds a
+        // configuration the slot does not hold yet. The live `Config` is also
+        // read outside the swap, by `admit` for the connection cap and by
+        // `Server::shutdown_grace`, but each of those reads one key and does
+        // not compare it with any of the other three values, so the order of
+        // the writes does not change what they see.
         self.expected.set(Names::new(&config.security.expected_sni));
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         *self
@@ -2218,11 +2243,13 @@ mod tests {
 
     /// A reload that has not got the swap yet has applied none of its writes.
     ///
-    /// The three are the SNI gate's list, the live `Config` and the endpoint's
-    /// server configuration, and a connection accepted between any two of them
-    /// runs on one generation's transport parameters beside another's
-    /// credentials and policy for its whole life. Under the swap they are one
-    /// step, which is what D22 means by no half-applied state.
+    /// The four are the SNI gate's list, the live `Config`, the
+    /// `quinn::ServerConfig` slot an accept reads and the endpoint's own copy,
+    /// and a connection accepted between any two of them runs on one
+    /// generation's transport parameters beside another's credentials and
+    /// policy for its whole life. Under the swap they are one step, which is
+    /// what D22 means by no half-applied state. The endpoint's copy has no
+    /// getter, so the test reads the other three.
     #[tokio::test]
     async fn a_reload_applies_none_of_its_writes_before_it_has_the_swap() {
         let bound = bound_server(
@@ -2236,6 +2263,7 @@ mod tests {
             "[limits]\nmax_streams_bidi = 32\n\
              [security]\nexpected_sni = [\"other.example\"]\n",
         );
+        let before = bound.server.quic_config();
 
         let swapping = bound.server.swap.hold();
         let reloading =
@@ -2245,6 +2273,10 @@ mod tests {
             bound.server.config().limits.max_streams_bidi,
             64,
             "a reload waiting for the swap must not have replaced the live configuration"
+        );
+        assert!(
+            Arc::ptr_eq(&bound.server.quic_config(), &before),
+            "nor the server configuration an accept reads"
         );
         assert!(
             bound.server.expected.current().accepts("localhost"),
@@ -2263,6 +2295,10 @@ mod tests {
 
         assert_eq!(bound.server.config().limits.max_streams_bidi, 32);
         assert!(bound.server.expected.current().accepts("other.example"));
+        assert!(
+            !Arc::ptr_eq(&bound.server.quic_config(), &before),
+            "the reload replaces the server configuration an accept reads"
+        );
     }
 
     /// A `quinn::Incoming` stand-in that needs no peer on the other end.
@@ -2301,13 +2337,13 @@ mod tests {
     /// life, which is the tear D22's 2026-09-04 addendum recorded as narrowed
     /// rather than closed.
     ///
-    /// The second assertion is the 2026-09-17 half. The swap orders the two
-    /// reads, and that alone stopped deciding the transport parameters when
-    /// quinn-proto 0.11.18 began pinning a pending `Incoming` to the
-    /// configuration the endpoint held as its first Initial arrived. So the
-    /// accept states the configuration rather than letting quinn pick one, and
-    /// what this pins is that the value stated is the one the reload wrote and
-    /// not the one it replaced.
+    /// The `Arc::ptr_eq` pair at the end is the 2026-09-17 half. The swap
+    /// orders the two reads, and that alone stopped deciding the transport
+    /// parameters when quinn-proto 0.11.18 began pinning a pending `Incoming`
+    /// to the configuration the endpoint held as its first Initial arrived. So
+    /// the accept states the configuration rather than letting quinn pick one,
+    /// and what this pins is that the value stated is the one the reload wrote
+    /// and not the one it replaced.
     ///
     /// Deterministic because the test holds the swap the reload holds, in place
     /// of racing one. The accept is stood in for by [`Arriving`]: what is under
@@ -2403,6 +2439,7 @@ mod tests {
             &bound.key,
             "[limits]\nmax_streams_bidi = 32\n",
         );
+        let before = bound.server.quic_config();
 
         let swapping = bound.server.swap.hold();
         let reloading =
@@ -2425,6 +2462,10 @@ mod tests {
             bound.server.config().limits.max_streams_bidi,
             64,
             "a refused reload changes nothing"
+        );
+        assert!(
+            Arc::ptr_eq(&bound.server.quic_config(), &before),
+            "nor the server configuration an accept reads"
         );
     }
 
