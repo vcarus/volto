@@ -952,7 +952,11 @@ impl Server {
         // configuration the endpoint holds when that token arrives. Neither read
         // can be reached from here.
         //
-        // So a Retry token that crosses a `SIGHUP` fails to decode under the new
+        // The two keys differ when a `SIGHUP` lands between the Retry and the
+        // returning Initial, because `server_config` builds every configuration
+        // with `ServerConfig::with_crypto`, which draws a fresh `token_key` each
+        // time (quinn-proto 0.11.18 `src/config/mod.rs` lines 396 to 408). A
+        // Retry token that crosses a `SIGHUP` then fails to decode under the new
         // key, and quinn-proto treats the returning Initial as carrying no token.
         // That connection attempt fails; it does not cost one more round trip
         // the way a NEW_TOKEN token does in the paragraph above. If the server is
@@ -969,8 +973,12 @@ impl Server {
         // with no retry source connection ID, and the client closes it with
         // TRANSPORT_PARAMETER_ERROR. Either way the client has to start a new
         // attempt. This needs the server to be full and a reload to land inside
-        // one round trip, and without a `retry_with` nothing here can narrow
-        // it.
+        // one round trip. Keeping one key across reloads would remove it: a key
+        // drawn once and set with `ServerConfig::token_key` (`src/config/mod.rs`
+        // line 275) on every build, with one `ValidationTokenConfig` shared
+        // across builds so that its log of used NEW_TOKEN tokens survives too.
+        // That is not done, because D31 records key rotation on reload as the
+        // current behaviour.
         if !incoming.remote_address_validated() {
             if incoming.may_retry() {
                 match incoming.retry() {
