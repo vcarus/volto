@@ -45,7 +45,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, TestServer, bulk_alpn, client_endpoint, udp_answer, udp_answers,
+    ALLOW_PRIVATE, GATE_LOCALHOST, TestServer, bulk_alpn, client_endpoint, is_version_negotiation,
+    udp_answer, udp_answers,
 };
 use quinn::ConnectionId;
 use volto::datagram::{peek_varint, put_varint};
@@ -1157,11 +1158,10 @@ fn describe(crypto: &dyn quinn::crypto::ServerConfig, reply: &[u8], dcid: &[u8])
     if first & LONG_HEADER_FORM == 0 {
         return format!("a short-header packet of {} bytes", reply.len());
     }
-    let Some(version) = reply.get(1..5) else {
+    if reply.len() < 5 {
         return format!("a long header of {} bytes, cut short", reply.len());
-    };
-    let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
-    if version == 0 {
+    }
+    if is_version_negotiation(reply) {
         return format!("a Version Negotiation packet of {} bytes", reply.len());
     }
     let kind = match first & 0x30 {
