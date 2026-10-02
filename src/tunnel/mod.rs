@@ -538,7 +538,7 @@ impl Context {
     /// direction is the safe one for a counter that bounds reflection.
     ///
     /// `Relaxed` throughout: the counter is ordered against nothing but itself,
-    /// and `fetch_update`'s compare-and-swap is what makes two sessions racing
+    /// and `try_update`'s compare-and-swap is what makes two sessions racing
     /// for the last packet give it to exactly one of them.
     pub(crate) fn charge_unanswered(&self) -> bool {
         if self.unanswered_packet_budget == 0 {
@@ -546,7 +546,7 @@ impl Context {
         }
 
         self.unanswered_connection_budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -572,7 +572,7 @@ impl Context {
         }
 
         let total = self.unanswered_connection_total;
-        let _ = self.unanswered_connection_budget.fetch_update(
+        let _ = self.unanswered_connection_budget.try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |remaining| Some(remaining.saturating_add(charged).min(total)),
