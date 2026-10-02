@@ -29,10 +29,10 @@
 //! [`Controller::window`]. It measures the delivery rate once per round trip:
 //! the bytes acknowledged, over the time their ACKs took to arrive or the time
 //! the packets they belong to took to send, whichever is longer. It keeps the
-//! largest of the last ten measurements and caps the window at 1.25 times that
-//! rate times its own minimum RTT. The cap is never below the window a new
-//! connection starts with, 240 kB with quinn's default (200 packets of 1200
-//! bytes), so on a path whose bandwidth-delay product is under 192 kB the
+//! largest measurement of the last ten round trips and caps the window at 1.25
+//! times that rate times its own minimum RTT. The cap is never below the window
+//! a new connection starts with, 240 kB with quinn's default (200 packets of
+//! 1200 bytes), so on a path whose bandwidth-delay product is under 192 kB the
 //! window can be 240 kB. Because quinn paces from the window, the cap also sets
 //! the pacing rate, in-flight data sits at the cap, and a quarter of a
 //! bandwidth-delay product stands in the bottleneck queue. 1.25 is the highest
@@ -64,7 +64,7 @@
 //! without the congestion exit the startup gain would stay.
 //!
 //! The startup gain returns when the estimate climbs back after a fall. The
-//! estimate keeps ten samples, so a loss episode longer than ten round trips
+//! estimate keeps ten round trips, so a loss episode longer than that
 //! leaves only samples from the episode in it, and the cap starts again from
 //! its floor. At 1.25 the estimate then grows by about 12 percent per sample,
 //! not 25, because a raised window shows in the sample about two round trips
@@ -118,8 +118,7 @@
 //! alone, ACKs that arrive together, as they do after a fall in RTT, give a
 //! sample far above what the path carries. quinn reports a sender blocked by
 //! the peer's flow control as app-limited, so the lower samples that follow do
-//! not replace it, and it stays in the estimate until ten newer samples have
-//! pushed it out.
+//! not replace it, and it stays in the estimate for ten round trips.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -130,11 +129,11 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Bbr, BbrConfig, Controller, ControllerFactory, ControllerMetrics};
 use quinn_proto::RttEstimator;
 
-/// How many delivery-rate samples the bandwidth estimate is the largest of:
-/// the length of BBR's own bandwidth filter in round trips. A sample is taken
-/// about once per round trip, but a sample from an app-limited interval that is
-/// below the estimate is not stored, so the oldest one can be older than ten
-/// round trips.
+/// How many sample intervals a delivery-rate sample stays in the bandwidth
+/// estimate: the length of BBR's own bandwidth filter in round trips. A sample
+/// interval lasts about one round trip. Every closed interval counts, including
+/// one whose sample is not stored, so a sample leaves the estimate after ten
+/// round trips also while the sender is app-limited.
 const SAMPLES: usize = 10;
 
 /// The window cap as a multiple of the estimated bandwidth-delay product, in
@@ -473,8 +472,8 @@ impl Controller for BbrCapped {
     }
 }
 
-/// The delivery rate, measured once per round trip, and the largest of the
-/// last [`SAMPLES`] measurements.
+/// The delivery rate, measured once per round trip, and the largest
+/// measurement of the last [`SAMPLES`] intervals.
 ///
 /// An interval starts at the end of one ACK batch and ends at the end of the
 /// first batch at least one smoothed RTT later. One smoothed RTT rather than
@@ -507,7 +506,11 @@ struct DeliveryRate {
     sent_at_start: Option<Instant>,
     /// The last [`SAMPLES`] samples in bytes per second, oldest overwritten first.
     samples: [u64; SAMPLES],
+    /// The interval count when each sample was stored.
+    stored_at: [usize; SAMPLES],
     next: usize,
+    /// How many intervals have closed.
+    intervals: usize,
 }
 
 impl DeliveryRate {
@@ -548,9 +551,24 @@ impl DeliveryRate {
         // equal to the estimate. quinn's BBR never takes an app-limited sample.
         let stored = !self.app_limited || sample > self.max().unwrap_or(0);
         if stored {
+            // A sample at least SAMPLES intervals old leaves the filter when a
+            // newer one is stored, so the estimate holds while nothing is
+            // stored. Linux's windowed max filter also expires samples only when
+            // it is given a new one (`minmax_running_max` in
+            // `lib/win_minmax.c`). A zero sample expires nothing, so the
+            // estimate never becomes empty.
+            if sample > 0 {
+                for (slot, &at) in self.samples.iter_mut().zip(&self.stored_at) {
+                    if self.intervals.wrapping_sub(at) >= SAMPLES {
+                        *slot = 0;
+                    }
+                }
+            }
             self.samples[self.next] = sample;
+            self.stored_at[self.next] = self.intervals;
             self.next = (self.next + 1) % SAMPLES;
         }
+        self.intervals = self.intervals.wrapping_add(1);
         let sample = Sample {
             rate: sample,
             app_limited: self.app_limited,
@@ -849,6 +867,32 @@ mod tests {
         interval(&mut c, t, 10_000_000, false);
         assert_eq!(c.rate.max(), Some(10_000_000));
         assert_eq!(c.cap(), Some(750_000), "1.25 x 10 MB/s x 60 ms");
+    }
+
+    #[test]
+    fn a_sample_expires_ten_intervals_later_even_when_they_stored_nothing() {
+        let mut c = capped();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        t = interval(&mut c, t, 30_000_000, false);
+        t = interval(&mut c, t, 12_000_000, false);
+        for _ in 2..SAMPLES {
+            t = interval(&mut c, t, 1_000_000, true);
+        }
+        assert_eq!(
+            c.rate.max(),
+            Some(30_000_000),
+            "nothing was stored, so the estimate holds"
+        );
+
+        t = interval(&mut c, t, 10_000_000, false);
+        assert_eq!(
+            c.rate.max(),
+            Some(12_000_000),
+            "the next stored sample expires the one ten intervals old"
+        );
+        interval(&mut c, t, 10_000_000, false);
+        assert_eq!(c.rate.max(), Some(10_000_000));
     }
 
     #[test]
