@@ -1134,9 +1134,9 @@ fn documented_defaults() -> BTreeMap<(String, String), Option<String>> {
 ///
 /// What it does not reach: the `# Default:` comment text is compared against the
 /// page and not against the value beside it, which is the one thing
-/// `src/config.rs` holds. The three keys the example deliberately sets away from
-/// their defaults (`initial_mtu`, `mtu_upper_bound`, `initial_rtt_ms`) are why
-/// that comparison cannot be made unconditionally.
+/// `src/config.rs` holds. The two keys the example deliberately sets away from
+/// their defaults (`initial_mtu`, `initial_rtt_ms`) are why that comparison
+/// cannot be made unconditionally.
 #[test]
 fn every_default_the_example_promises_is_the_default_the_page_prints() {
     let promised = example_defaults();

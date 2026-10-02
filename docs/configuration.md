@@ -60,7 +60,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
-| `mtu_upper_bound` | bytes | `1452` | Ceiling for the MTU discovery search — a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. The default is the value safe over both IPv4 and IPv6 on Ethernet; an operator who has measured their path (`ping -M do`, `tracepath`) can claim what IPv4 leaves above that, at most 1472. Safe to overshoot, unlike `initial_mtu`: a size is only adopted after a probe of that size is acknowledged, and a lost probe is retried then abandoned without counting as congestion, so a bound above what the path carries costs a few PINGs and nothing else. No effect (and a startup warning) when `mtu_discovery` is off |
+| `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. The default is below quinn's 1452, the value safe over both IPv4 and IPv6 on Ethernet, because a size is adopted after one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load. 1436 is what a measured relay path carries; the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) give the measurement. An operator who has measured their own path at bulk rate can raise it, at most to 1472. A bound above what the path carries costs failed probes on a path that drops oversize packets, and lost traffic until the black-hole detector fires on a path that delivers single probes but not bulk traffic at that size. No effect (and a startup warning) when `mtu_discovery` is off |
 | `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-capped`, `cubic` or `newreno` |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
@@ -250,7 +250,9 @@ lost to ordinary congestion during a bulk transfer look the same to it as a
 path that stopped carrying them, after which the connection sends packets at
 the 1200-byte floor for a one-minute cooldown before probing again. A
 non-zero count on a path where other connections settle above the floor is
-therefore that heuristic firing, not the path changing.
+therefore either that heuristic firing on congestion or a ceiling above the
+size the path carries under load. The paragraphs on the two MTU keys below
+describe the second case.
 
 **Those lines also report what the connection carried.** Alongside `rtt_ms=`
 and `mtu=` they carry `tunnels=`, how many requests on that connection were
@@ -287,23 +289,44 @@ fallback used when the key is absent stays at 333. Keep the margin: a value
 below the real RTT makes the timer fire early and retransmit packets that were
 never lost.
 
-**The two MTU keys are shipped tuned as well.** The example configuration in
-`script/` ships `initial_mtu = 1242` and `mtu_upper_bound = 1464` as live keys,
-and the installer substitutes only the listen address, the certificate paths
-and the user — so every install derived from it runs above the compiled-in 1200
-and 1452 that apply when the keys are absent. 1242 keeps the handshake inside a
-1270-byte IPv4 packet: under the 1280 bytes any practical path carries, and
-below what Chromium (1250) and quic-go (1280) send everywhere. Over IPv6 the
-same packets are 1290 bytes, past that guarantee, so put it back to 1200 if
-clients reach the server over IPv6 — this is the key that is sent blind, and a
-size the path cannot carry kills the connection with nothing to fall back to.
-1464 is what an IPv4 uplink behind a 1492-byte first-hop IP MTU (one
-PPPoE-sized deduction) leaves, and it is a ceiling for a search rather than a
-size that gets sent, so overshooting costs a probe and nothing else; 1472,
-clean Ethernet over IPv4, is the most volto accepts. Neither value is a
-measurement of *your* path: measure with `ping -M do` before raising either,
-and lower `initial_mtu` on the first sign that a handshake is not getting
-through.
+**The two MTU keys are shipped as live keys too.** The example configuration
+in `script/` ships `initial_mtu = 1242` and `mtu_upper_bound = 1436`, and the
+installer substitutes only the listen address, the certificate paths and the
+user. The compiled-in defaults that apply when the keys are absent are 1200 and
+1436, so an install derived from the example differs from them only in
+`initial_mtu`. 1242 keeps the handshake inside a 1270-byte IPv4 packet: under
+the 1280 bytes any practical path carries, and below what Chromium (1250) and
+quic-go (1280) send everywhere. Over IPv6 the same packets are 1290 bytes, past
+that guarantee, so put it back to 1200 if clients reach the server over IPv6.
+This is the key that is sent blind, and a size the path cannot carry kills the
+connection with nothing to fall back to.
+
+**A probe that gets through is not the same as a path that carries the size.**
+Discovery adopts a size once one probe of it is acknowledged. On a measured
+relay path, IPv4 packets above 1464 bytes (UDP payload above 1436) arrived with
+the DF bit cleared. Single probes of those sizes got through, so discovery
+adopted 1452 or 1464, and at bulk rate 62 to 89 percent of the packets at that
+size were lost. The black-hole detector then dropped the size to 1200, and
+after its one-minute cooldown the same probe succeeded again. Packets of up to
+1464 IP bytes kept DF set and lost about what 1200-byte packets lost. 1436 is
+the largest UDP payload whose IPv4 packet crosses that path with DF set, which
+is why it is both the default and the shipped value. quinn's 1452 is a 1480-byte
+IPv4 packet, above that boundary, and in one of two runs with that ceiling 85
+percent of the 1452-byte packets were lost. The example shipped 1464 before:
+what an IPv4 uplink behind a 1492-byte first-hop IP MTU leaves. That uplink was
+measured correctly, but it is not the segment that limits the relay path. Over
+IPv6, 1452 is what an Ethernet frame leaves and 1436 is below it, so the default
+holds on either family.
+
+**The counter to watch is `mtu_black_holes=` in the connection close line.** A
+ceiling above what the path carries under load shows up as connections that
+carried bulk traffic and close with it non-zero. On the measured path, a ceiling
+of 1400 ran with no black-hole event. 1472, clean Ethernet over IPv4, is the
+most volto accepts, and `ping -M do` alone does not justify raising the ceiling
+toward it, because a path that clears DF delivers that probe too. Raise it only
+after a bulk transfer at the new size has run with `mtu_black_holes=0`. Neither
+value is a measurement of *your* path: lower `initial_mtu` on the first sign
+that a handshake is not getting through.
 
 **`ip_family_preference` decides which half of a dual-stack target is tried
 first, and it is an operator's call rather than the resolver's.** `getaddrinfo`
@@ -681,9 +704,13 @@ instead.
 Configuration keys, their defaults and the command-line arguments are stable
 within 1.x. A key that exists keeps its name and its meaning, a documented
 default is not changed under a running deployment, and a key is removed only
-after at least one minor release has warned about it at startup. A new key keeps
-taking its documented default when the file does not mention it, which is what
-makes the upgrade half of this section a no-op.
+after at least one minor release has warned about it at startup. The release
+after v1.1.1 lowers the documented default of `mtu_upper_bound` from 1452 to
+1436 on measured evidence (the MTU paragraphs under [Notes that matter in
+practice](#notes-that-matter-in-practice) give it); a host that relied on 1452
+can set it explicitly, and a file from any earlier release still loads. A new
+key keeps taking its documented default when the file does not mention it, which
+is what makes the upgrade half of this section a no-op.
 
 Two things are deliberately outside that promise. Log line shapes are not an
 interface: fields are added, reworded and moved between levels as the

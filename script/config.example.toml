@@ -182,16 +182,20 @@ initial_mtu = 1242
 # Default: true
 #mtu_discovery = true
 
-# Ceiling for path MTU discovery, in bytes — a UDP payload size like
-# initial_mtu. The program default 1452 is safe over both IPv4 and IPv6 on
-# Ethernet; this file ships 1464, what an IPv4 uplink behind a 1492-byte
-# first-hop IP MTU (a single PPPoE-sized deduction) leaves, and the most a
-# measured path commonly yields. Overshooting is harmless — a size is only
-# adopted after a probe of that size is acknowledged — so unlike initial_mtu
-# this key is safe to raise on a hunch; 1472 (clean Ethernet over IPv4) is the
-# most volto accepts. No effect when mtu_discovery is off.
-# Default: 1452
-mtu_upper_bound = 1464
+# Ceiling for path MTU discovery, in bytes. It is a UDP payload size like
+# initial_mtu. 1436 is the largest payload whose IPv4 packet (1464 bytes)
+# crossed a measured relay path with DF set. Above that size the path cleared
+# DF and still delivered single probes, so discovery adopted the larger size,
+# and at bulk rate 62 to 89 percent of those packets were lost until the
+# black-hole detector fired. A probe that gets through does not show that the
+# path carries the size under load. Over IPv6, 1452 is the value safe on
+# Ethernet, and 1436 is below it. Raise this only after measuring your own path
+# at bulk rate; 1472 (clean Ethernet over IPv4) is the most volto accepts. Bulk
+# connections that close with a non-zero mtu_black_holes on the connection
+# close line are the sign of a ceiling above what the path carries under load.
+# No effect when mtu_discovery is off.
+# Default: 1436
+mtu_upper_bound = 1436
 
 # QUIC congestion controller: "bbr", "bbr-capped", "cubic" or "newreno".
 #

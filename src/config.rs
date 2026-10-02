@@ -25,7 +25,7 @@
 //! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
 //! initial_mtu          = 1200  # bytes, 1200..1452
 //! mtu_discovery        = true
-//! mtu_upper_bound      = 1452  # bytes, initial_mtu..1472
+//! mtu_upper_bound      = 1436  # bytes, initial_mtu..1472
 //! congestion_control   = "bbr" # bbr | bbr-capped | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
 //! socket_recv_buffer   = 2097152 # bytes, 0 keeps the OS default
@@ -172,9 +172,10 @@ pub const MIN_INITIAL_MTU: u16 = 1200;
 /// discovery", and Ethernet's 1500-byte MTU leaves 1472 bytes of payload over
 /// IPv4 (20-byte header + 8-byte UDP) and 1452 over IPv6 (40 + 8). The ceiling
 /// stays at the both-families value even though `mtu_upper_bound` may claim
-/// IPv4's extra 20 bytes: discovery earns a size by probing it and loses only
-/// the probe when wrong, while this value is sent blind in the handshake —
-/// see the next paragraph for what wrong costs here.
+/// IPv4's extra 20 bytes. Discovery reaches a size only after a probe of it is
+/// acknowledged, and the black-hole detector takes the size back down when
+/// traffic at it is lost. This value is sent blind in the handshake, and the
+/// next paragraph says what a wrong value costs here.
 ///
 /// There is no floor to fall back to if this is wrong: quinn applies the value
 /// with a `max()` against the 1200-byte minimum and no `min()` above it, so the
@@ -189,22 +190,39 @@ pub const MAX_INITIAL_MTU: u16 = 1452;
 
 /// Default ceiling for path MTU discovery, in bytes.
 ///
-/// quinn's own default, which "stays within Ethernet's MTU when using IPv4 and
-/// IPv6" (quinn-proto `config/transport.rs`): 1500 minus IPv6's 40-byte header
-/// and UDP's 8. Safe whichever family the path runs.
-pub const DEFAULT_MTU_UPPER_BOUND: u16 = 1452;
+/// Below quinn's own default of 1452, which quinn-proto `config/transport.rs`
+/// chooses "to stay within Ethernet's MTU when using IPv4 and IPv6": 1500 minus
+/// IPv6's 40-byte header and UDP's 8. The same file says "It is safe to use an
+/// arbitrarily high upper bound, regardless of the network path's MTU". That
+/// holds only on a path that drops a packet it cannot carry.
+///
+/// A probe that is acknowledged does not show that the path carries that size
+/// under load. On a measured relay path, IPv4 packets above 1464 bytes (UDP
+/// payload above 1436) arrived with DF cleared. Single probes of those sizes got
+/// through, so discovery adopted them, and at bulk rate those packets were lost
+/// at 62 to 89 percent until the black-hole detector dropped the size to 1200.
+/// After the detector's cooldown the same probe succeeded again. 1436 is the
+/// largest UDP payload whose IPv4 packet (1464 bytes) crossed that path with DF
+/// set (D81).
+///
+/// Over IPv6 the 1452 reasoning still holds, and 1436 is below 1452, so the
+/// default is safe on either family.
+pub const DEFAULT_MTU_UPPER_BOUND: u16 = 1436;
 
 /// The largest `mtu_upper_bound` this server accepts, in bytes.
 ///
 /// Ethernet's 1500 minus IPv4's 20-byte header and UDP's 8. Nothing on a
 /// standard internet path carries more than that, so a higher bound could only
 /// spend probes on sizes that cannot exist. The ceiling being *above*
-/// [`MAX_INITIAL_MTU`] is deliberate, not an inconsistency: discovery only ever
-/// reaches a size by probing it — a lost probe is retried, then abandoned, and
-/// is never treated as congestion — whereas `initial_mtu` is sent blind in the
-/// handshake with no recovery path (see [`MAX_INITIAL_MTU`]). An upper bound
-/// the path cannot carry costs a few PINGs; an initial the path cannot carry
-/// costs the server.
+/// [`MAX_INITIAL_MTU`] is deliberate, not an inconsistency. Discovery only ever
+/// reaches a size by probing it. A lost probe is retried, then abandoned, and is
+/// never treated as congestion, and the black-hole detector takes an adopted
+/// size back down when traffic at it is lost. `initial_mtu` is sent blind in the
+/// handshake with no recovery path (see [`MAX_INITIAL_MTU`]). An upper bound the
+/// path cannot carry costs failed probes, or, on a path that delivers single
+/// probes at a size it cannot carry under load, lost traffic until the detector
+/// fires (see [`DEFAULT_MTU_UPPER_BOUND`]). An initial the path cannot carry
+/// makes the server unreachable.
 pub const MAX_MTU_UPPER_BOUND: u16 = 1472;
 
 /// Default round-trip time assumed before the first measurement, in milliseconds.
@@ -513,14 +531,17 @@ pub struct Limits {
     pub mtu_discovery: bool,
     /// Ceiling for path MTU discovery, in bytes. Between `initial_mtu` and 1472.
     ///
-    /// A UDP payload size like `initial_mtu`. quinn's default of 1452 is the
-    /// value safe over both IPv4 and IPv6 on Ethernet; an operator who has
-    /// measured their path (`ping -M do`, `tracepath`) can claim what IPv4
-    /// leaves above that — at most 1472 — and overshooting is harmless, because
-    /// a size is only ever reached by probing it. Moot when `mtu_discovery` is
-    /// off, which is warned about rather than rejected. See
-    /// [`MAX_MTU_UPPER_BOUND`].
-    pub mtu_upper_bound: u16,
+    /// A UDP payload size like `initial_mtu`. The default of 1436 is below
+    /// quinn's 1452 because an acknowledged probe does not show that the path
+    /// carries that size under load; [`DEFAULT_MTU_UPPER_BOUND`] gives the
+    /// measurement. An operator who has measured their own path at bulk rate
+    /// can raise it, at most to 1472. Moot when `mtu_discovery` is off, which is
+    /// warned about rather than rejected. See [`MAX_MTU_UPPER_BOUND`].
+    ///
+    /// `None` when the key is absent, which is what lets an absent ceiling
+    /// follow `initial_mtu` up while a written one is checked exactly. Read the
+    /// ceiling in effect through [`Limits::mtu_upper_bound`].
+    pub mtu_upper_bound: Option<u16>,
     /// QUIC congestion controller. Defaults to BBR; see [`CongestionControl`].
     pub congestion_control: CongestionControl,
     /// Milliseconds of round-trip time assumed before the first measurement.
@@ -652,7 +673,7 @@ impl Default for Limits {
             keep_alive_interval: DEFAULT_KEEP_ALIVE_INTERVAL,
             initial_mtu: DEFAULT_INITIAL_MTU,
             mtu_discovery: true,
-            mtu_upper_bound: DEFAULT_MTU_UPPER_BOUND,
+            mtu_upper_bound: None,
             congestion_control: CongestionControl::Bbr,
             initial_rtt_ms: DEFAULT_INITIAL_RTT_MS,
             socket_recv_buffer: DEFAULT_SOCKET_RECV_BUFFER,
@@ -682,6 +703,22 @@ impl Limits {
     /// The QUIC idle timeout as a duration.
     pub fn max_idle_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.max_idle_timeout)
+    }
+
+    /// The path MTU discovery ceiling in effect, in bytes.
+    ///
+    /// A ceiling the file sets is used as written; `validate` has already held
+    /// it to `initial_mtu..=`[`MAX_MTU_UPPER_BOUND`]. An absent one is
+    /// [`DEFAULT_MTU_UPPER_BOUND`], raised to `initial_mtu` when that is larger.
+    /// The raise exists because the default (1436) is below
+    /// [`MAX_INITIAL_MTU`] (1452): a file from a release whose default ceiling
+    /// was 1452 may set `initial_mtu` anywhere up to 1452 and no ceiling, and it
+    /// has to keep loading. quinn would raise a ceiling below the starting size
+    /// to that size on its own; this makes the same value explicit, so the
+    /// transport and the logs see the ceiling that is actually used.
+    pub fn mtu_upper_bound(&self) -> u16 {
+        self.mtu_upper_bound
+            .unwrap_or_else(|| DEFAULT_MTU_UPPER_BOUND.max(self.initial_mtu))
     }
 
     /// `initial_rtt_ms` as a [`Duration`](std::time::Duration).
@@ -876,24 +913,28 @@ impl Config {
             );
         }
 
-        if self.limits.mtu_upper_bound < self.limits.initial_mtu {
-            bail!(
-                "limits.mtu_upper_bound = {} is below limits.initial_mtu = {}; \
-                 discovery searches upward from the initial size, so a ceiling \
-                 under the start describes a search that cannot happen",
-                self.limits.mtu_upper_bound,
-                self.limits.initial_mtu
-            );
-        }
+        // Only a ceiling the file writes is checked. An absent one resolves to
+        // a value that is in range by construction (`Limits::mtu_upper_bound`).
+        if let Some(upper_bound) = self.limits.mtu_upper_bound {
+            if upper_bound < self.limits.initial_mtu {
+                bail!(
+                    "limits.mtu_upper_bound = {} is below limits.initial_mtu = {}; \
+                     discovery searches upward from the initial size, so a ceiling \
+                     under the start describes a search that cannot happen",
+                    upper_bound,
+                    self.limits.initial_mtu
+                );
+            }
 
-        if self.limits.mtu_upper_bound > MAX_MTU_UPPER_BOUND {
-            bail!(
-                "limits.mtu_upper_bound = {} is above the {MAX_MTU_UPPER_BOUND} bytes this \
-                 server allows; the value is a UDP payload size, and an Ethernet \
-                 frame leaves at most that much of one over IPv4, so a larger \
-                 bound could only probe sizes no standard path carries",
-                self.limits.mtu_upper_bound
-            );
+            if upper_bound > MAX_MTU_UPPER_BOUND {
+                bail!(
+                    "limits.mtu_upper_bound = {} is above the {MAX_MTU_UPPER_BOUND} bytes this \
+                     server allows; the value is a UDP payload size, and an Ethernet \
+                     frame leaves at most that much of one over IPv4, so a larger \
+                     bound could only probe sizes no standard path carries",
+                    upper_bound
+                );
+            }
         }
 
         if !INITIAL_RTT_RANGE_MS.contains(&self.limits.initial_rtt_ms) {
@@ -1140,12 +1181,13 @@ impl Config {
             ));
         }
 
-        if !self.limits.mtu_discovery && self.limits.mtu_upper_bound != DEFAULT_MTU_UPPER_BOUND {
+        if let (false, Some(upper_bound)) = (self.limits.mtu_discovery, self.limits.mtu_upper_bound)
+        {
             warnings.push(format!(
                 "limits.mtu_upper_bound = {} has no effect while limits.mtu_discovery \
                  is off: the value is a ceiling for the upward search, and there is no \
                  search to bound",
-                self.limits.mtu_upper_bound
+                upper_bound
             ));
         }
 
@@ -1542,8 +1584,11 @@ pub(crate) mod tests {
         assert_eq!(cfg.limits.keep_alive_interval, 20);
         assert_eq!(cfg.limits.initial_mtu, 1200);
         assert!(cfg.limits.mtu_discovery);
-        // quinn's own ceiling: raising it is a per-path measurement, not a default.
-        assert_eq!(cfg.limits.mtu_upper_bound, 1452);
+        // Below quinn's 1452: the largest size a measured relay path carried
+        // with DF set (D81). Raising it is a per-path measurement, not a default.
+        // Absent from the file, so the field is `None` and the accessor answers.
+        assert_eq!(cfg.limits.mtu_upper_bound, None);
+        assert_eq!(cfg.limits.mtu_upper_bound(), 1436);
         // The socket buffers are asked for, not inherited: quinn never calls
         // setsockopt, so an absent key would leave `net.core.rmem_default`.
         assert_eq!(cfg.limits.socket_recv_buffer, DEFAULT_SOCKET_RECV_BUFFER);
@@ -2204,13 +2249,40 @@ pub(crate) mod tests {
         for body in [
             "[limits]\ninitial_mtu = 1350\nmtu_upper_bound = 1350",
             "[limits]\nmtu_upper_bound = 1452",
-            // A measured path: 1464 is what an IPv4 uplink capped at 1492 bytes
-            // of IP packet leaves, and the ceiling is the IPv4 Ethernet limit.
+            // The example shipped 1464 from v0.4.5 to v1.1.1, so a host installed
+            // from it carries that value, and an upgrade must still load it. The
+            // ceiling is the IPv4 Ethernet limit.
             "[limits]\nmtu_upper_bound = 1464",
             "[limits]\nmtu_upper_bound = 1472",
         ] {
             assert_valid_apart_from_certs(&parse(body), body);
         }
+    }
+
+    /// A file that sets only `initial_mtu`, at any value it was allowed before
+    /// the default ceiling fell to 1436, still loads.
+    ///
+    /// Before that change the default ceiling was 1452, equal to
+    /// [`MAX_INITIAL_MTU`], so no legal `initial_mtu` could sit above it. An
+    /// absent ceiling now resolves to the larger of the default and the
+    /// starting size, so such a file probes nothing below where it starts.
+    #[test]
+    fn an_initial_mtu_above_the_default_ceiling_loads_without_a_ceiling() {
+        let cfg = parse("[limits]\ninitial_mtu = 1452");
+        assert_valid_apart_from_certs(&cfg, "initial_mtu = 1452 alone");
+        assert_eq!(cfg.limits.mtu_upper_bound, None);
+        assert_eq!(cfg.limits.mtu_upper_bound(), 1452);
+    }
+
+    /// The same pair with the ceiling written out is still the operator's
+    /// mistake, and is still reported: the exemption is for an absent key only.
+    #[test]
+    fn an_explicit_default_ceiling_below_the_initial_mtu_is_rejected() {
+        let msg = rejected(
+            "[limits]\ninitial_mtu = 1440\nmtu_upper_bound = 1436",
+            "mtu_upper_bound",
+        );
+        assert!(msg.contains("initial_mtu"), "{msg}");
     }
 
     /// 1500 is in the list for the same reason as in the `initial_mtu` test:
@@ -2231,7 +2303,8 @@ pub(crate) mod tests {
     }
 
     /// With discovery off there is no search to bound, and a key the operator
-    /// set to a non-default value deserves a word about why nothing changed.
+    /// wrote deserves a word about why nothing changed. That holds for a
+    /// written value equal to the default too: the operator still set it.
     #[test]
     fn an_mtu_upper_bound_without_discovery_is_allowed_but_warned_about() {
         let cfg = parse("[limits]\nmtu_discovery = false\nmtu_upper_bound = 1464");
@@ -2244,7 +2317,16 @@ pub(crate) mod tests {
             cfg.warnings()
         );
 
-        // The default value draws no warning: nothing was configured away.
+        let cfg = parse("[limits]\nmtu_discovery = false\nmtu_upper_bound = 1436");
+        assert!(
+            cfg.warnings()
+                .iter()
+                .any(|w| w.contains("mtu_upper_bound") && w.contains("1436")),
+            "{:?}",
+            cfg.warnings()
+        );
+
+        // An absent key draws no warning: nothing was configured away.
         let cfg = parse("[limits]\nmtu_discovery = false");
         assert!(
             !cfg.warnings().iter().any(|w| w.contains("mtu_upper_bound")),
@@ -3028,7 +3110,7 @@ pub(crate) mod tests {
         (uncommented, documented)
     }
 
-    /// Uncommented, the example is the defaults key for key -- apart from three
+    /// Uncommented, the example is the defaults key for key -- apart from two
     /// values it deliberately raises.
     ///
     /// [`the_shipped_example_configuration_is_valid`] proves the file parses,
@@ -3039,24 +3121,29 @@ pub(crate) mod tests {
     /// file is a promise to the operator reading it, and the value beside the key
     /// is what that operator uncomments and gets.
     ///
-    /// The three values the file ships uncommented are its own deviations, for
-    /// the reasons it gives beside them:
+    /// The file ships three keys uncommented. Two are its own deviations, for the
+    /// reasons it gives beside them:
     ///
     /// * `initial_mtu = 1242`, which "keeps the handshake inside a 1270-byte IPv4
     ///   packet -- under the 1280 bytes any practical path carries", against a
     ///   program default of 1200 the file calls "the conservative" one.
-    /// * `mtu_upper_bound = 1464`, "what an IPv4 uplink behind a 1492-byte
-    ///   first-hop IP MTU (a single PPPoE-sized deduction) leaves, and the most a
-    ///   measured path commonly yields", against quinn's 1452.
     /// * `initial_rtt_ms = 150`, "sized with margin for the ~60-100 ms long-haul
     ///   paths a fronted deployment typically serves", cutting "the worst-case
     ///   handshake stall from ~1 s to a few hundred ms", against RFC 9002's
     ///   conservative 333.
     ///
-    /// Listing them is what stops a fourth arriving quietly: every other field is
-    /// asserted equal to its default, and each of these three is asserted to
-    /// still *be* a deviation, so a default moved onto one of them fails here
-    /// rather than silently making the paragraph above untrue.
+    /// The third, `mtu_upper_bound = 1436`, is live and equal to the default. From
+    /// v0.4.5 to v1.1.1 the file shipped 1464 against a program default of 1452.
+    /// On a measured relay path, packets above 1436 bytes of UDP payload were
+    /// delivered with DF cleared and lost at bulk rate, so the example and the
+    /// default moved to 1436 together (D81). It stays a live key so that the
+    /// installed file states the ceiling.
+    ///
+    /// Listing them is what stops a fourth arriving quietly. Every other field is
+    /// asserted equal to its default, each deviation is asserted to still *be* a
+    /// deviation, and the live key at its default is asserted to stay equal to
+    /// it. A default moved onto a deviation, or away from the live key, fails
+    /// here rather than silently making the paragraphs above untrue.
     #[test]
     fn the_example_documents_every_key_and_pins_every_default() {
         let (text, documented) = example_with_every_key_uncommented();
@@ -3111,13 +3198,15 @@ pub(crate) mod tests {
         assert_eq!(socket_recv_buffer, limits.socket_recv_buffer);
         assert_eq!(socket_send_buffer, limits.socket_send_buffer);
 
-        // The three deviations, each still a deviation.
+        // The two deviations, each still a deviation.
         assert_eq!(initial_mtu, 1242);
         assert_ne!(initial_mtu, DEFAULT_INITIAL_MTU);
-        assert_eq!(mtu_upper_bound, 1464);
-        assert_ne!(mtu_upper_bound, DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(initial_rtt_ms, 150);
         assert_ne!(initial_rtt_ms, DEFAULT_INITIAL_RTT_MS);
+
+        // The live key at its default, still at its default.
+        assert_eq!(mtu_upper_bound, Some(1436));
+        assert_eq!(mtu_upper_bound, Some(DEFAULT_MTU_UPPER_BOUND));
 
         let Security {
             allow_private_networks,
@@ -3351,12 +3440,13 @@ pub(crate) mod tests {
 
         // The key added since is absent, so it takes its compiled-in default
         // rather than leaving the file half-applied.
-        assert_eq!(cfg.limits.mtu_upper_bound, DEFAULT_MTU_UPPER_BOUND);
-        assert_eq!(cfg.limits.mtu_upper_bound, 1452);
+        assert_eq!(cfg.limits.mtu_upper_bound, None);
+        assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
+        assert_eq!(cfg.limits.mtu_upper_bound(), 1436);
 
         // And the default has to be consistent with what the old file *does*
         // say, or an upgrade would fail validation on a file that was fine.
-        assert!(cfg.limits.mtu_upper_bound >= cfg.limits.initial_mtu);
+        assert!(cfg.limits.mtu_upper_bound() >= cfg.limits.initial_mtu);
         assert_valid_apart_from_certs(&cfg, "a v0.4.3-era configuration file");
     }
 
@@ -3547,7 +3637,9 @@ pub(crate) mod tests {
             ),
             (
                 around(u64::from(MAX_INITIAL_MTU)),
-                around(u64::from(MAX_MTU_UPPER_BOUND)),
+                // `None` too: an absent ceiling is the case every file that
+                // leaves the key out takes.
+                proptest::option::of(around(u64::from(MAX_MTU_UPPER_BOUND))),
                 around(*INITIAL_RTT_RANGE_MS.end()),
                 around(recv_buffer),
                 around(send_buffer),
@@ -3597,7 +3689,7 @@ pub(crate) mod tests {
                     keep_alive_interval,
                     initial_mtu: narrow_u16(initial_mtu),
                     mtu_discovery,
-                    mtu_upper_bound: narrow_u16(mtu_upper_bound),
+                    mtu_upper_bound: mtu_upper_bound.map(narrow_u16),
                     congestion_control,
                     initial_rtt_ms,
                     socket_recv_buffer: usize::try_from(socket_recv_buffer).unwrap_or(usize::MAX),
@@ -3642,7 +3734,7 @@ pub(crate) mod tests {
                 initial_mtu,
                 mtu_upper_bound: limits
                     .mtu_upper_bound
-                    .clamp(initial_mtu, MAX_MTU_UPPER_BOUND),
+                    .map(|upper_bound| upper_bound.clamp(initial_mtu, MAX_MTU_UPPER_BOUND)),
                 initial_rtt_ms: limits
                     .initial_rtt_ms
                     .clamp(*INITIAL_RTT_RANGE_MS.start(), *INITIAL_RTT_RANGE_MS.end()),

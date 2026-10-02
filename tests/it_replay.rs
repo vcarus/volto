@@ -327,9 +327,12 @@ impl Settings {
 
     /// The lab server's configuration.
     ///
-    /// The MTU and initial-RTT keys are the values the shipped
-    /// `script/config.example.toml` recommends and the captured hosts run with,
-    /// so the server's own timers and packet sizes start where production's do.
+    /// The MTU and initial-RTT keys are the values the captured hosts ran with
+    /// when the profiles were taken, so the server's own timers and packet sizes
+    /// start where production's did. `mtu_upper_bound = 1464` is what
+    /// `script/config.example.toml` shipped up to v1.1.1; the example and the
+    /// hosts have since moved to 1436 (D81), and the profiles were not
+    /// recaptured, so the harness keeps the value they were taken under.
     /// Everything else is the program default, which is what those hosts use --
     /// including `max_connections`, spelled out here rather than left implicit
     /// only because [`CONNECTION_CEILING_SHARE`] is a share of it and a default
