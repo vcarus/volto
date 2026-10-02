@@ -207,11 +207,13 @@ mtu_upper_bound = 1464
 # connection starts with. quinn's BBR overestimates the bottleneck, so a bulk
 # download sends faster than the path carries and loses the difference; the
 # cap removes most of that loss and keeps BBR's response to random loss. A new
-# connection uses a higher cap until its measured rate stops growing. It
-# measures the minimum RTT again 10 s after the last measurement, or later
-# while the sender is app-limited, so a lasting RTT rise costs throughput for
-# about that long plus a few seconds. Not the default yet; see
-# docs/configuration.md for the measurements.
+# connection uses a higher cap until its measured rate stops growing, and so
+# does a connection whose rate climbs back after falling below half of its
+# highest value, as it does after a burst of loss. It measures the minimum RTT
+# again 10 s after the last measurement, or later while the sender is
+# app-limited, so a lasting RTT rise costs throughput for about that long plus
+# a few seconds. Not the default yet; see docs/configuration.md for the
+# measurements.
 # Default: "bbr"
 #congestion_control = "bbr"
 

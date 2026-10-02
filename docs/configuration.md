@@ -210,22 +210,30 @@ kB the window can be 240 kB. A new connection uses 2.89 times instead, BBR's
 startup gain, until its measured rate stops growing, or until a loss arrives in
 a round trip in which it did not grow; behind a 150 Mbit/s bottleneck in the lab
 it reached 90 percent of that rate 1.4 s after the handshake at a 60 ms RTT and
-2.9 s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. Apart from
-ending that startup, it responds to loss exactly as BBR does, so it keeps what
-makes BBR the choice for a lossy path. It keeps its own minimum RTT, which lasts
-10 s unless a lower or equal sample renews it. When it runs out, and once the
-sender is not app-limited, the window is held at half the bandwidth-delay
-product for at least 200 ms so that the bottleneck queue empties, and the lowest
-RTT seen then becomes the new minimum. In a lab with a 150 Mbit/s bottleneck and
-a 60 ms RTT, behind a queue of one bandwidth-delay product, BBR lost 28 percent
-of the packets it sent and `bbr-capped` none, at 8 percent higher throughput;
-behind a 50 kB queue the loss went from 54 to 18 percent, and under 0.2 and 2
-percent random loss its throughput was 15 and 26 percent higher than BBR's. The
-re-measurement costs about 1.4 percent of the throughput. A lasting rise in the
-path's RTT lowers throughput until the next re-measurement, 10 s after the last
-one or later while the sender is app-limited; after a rise from 60 to 150 ms the
-throughput was back at the bottleneck rate 3.5 to 3.7 s after that. It is not
-the default until it has been measured on real paths.
+2.9 s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. The higher gain
+returns when the measured rate, after falling below half of its highest value,
+rises in three round trips in a row. After a 3 s burst of 90 percent loss in the
+lab, the climb back to 90 percent of the bottleneck rate, once sending resumed,
+took 0.2 s at a 60 ms RTT and 2.0 to 2.2 s at 150 ms, against 0.8 to 0.9 s and
+3.2 to 3.5 s before this rule; BBR came back at once. Apart from ending that
+startup and bringing it back, it responds to loss exactly as BBR does, so it
+keeps what makes BBR the choice for a lossy path. It keeps its own minimum RTT,
+which lasts 10 s unless a lower or equal sample renews it. When it runs out, and
+once the sender is not app-limited, the window is held at half the
+bandwidth-delay product for at least 200 ms so that the bottleneck queue
+empties, and the lowest RTT seen then becomes the new minimum. In a lab with a
+150 Mbit/s bottleneck and a 60 ms RTT, behind a queue of one bandwidth-delay
+product, BBR lost 28 percent of the packets it sent and `bbr-capped` none, at 8
+percent higher throughput; behind a 50 kB queue the loss went from 54 to 18
+percent, and under 0.2 and 2 percent random loss its throughput was 15 and 26
+percent higher than BBR's. The re-measurement costs about 1.4 percent of the
+throughput. A lasting rise in the path's RTT lowers throughput until the next
+re-measurement, 10 s after the last one or later while the sender is
+app-limited; after a rise from 60 to 150 ms the throughput was back at the
+bottleneck rate 1.6 to 2.9 s after that, against 3.2 to 3.6 s before the startup
+gain could return, at a cost of 0.05 to 0.21 percent of the packets sent in the
+45 s after the rise. It is not the default until it has been measured on real
+paths.
 
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines

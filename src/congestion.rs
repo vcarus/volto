@@ -57,8 +57,20 @@
 //! but only in a round trip that is not app-limited. quinn reports a sender
 //! blocked by the peer's flow control as app-limited, so behind a flow-control
 //! window smaller than the startup cap the full-bandwidth test never runs, and
-//! without the congestion exit the startup gain would stay. The startup gain
-//! does not return once it has ended.
+//! without the congestion exit the startup gain would stay.
+//!
+//! The startup gain returns when the estimate climbs back after a fall. The
+//! estimate keeps ten samples, so a loss episode longer than ten round trips
+//! leaves only samples from the episode in it, and the cap starts again from
+//! its floor. At 1.25 the estimate then grows by about 12 percent per sample,
+//! not 25, because a raised window shows in the sample about two round trips
+//! later. So three samples in a row from intervals that were not app-limited,
+//! each raising the estimate from below half of the highest estimate the
+//! connection has had, bring the startup gain back, and the two rules above end
+//! it again. Any rise counts, so a climb at 1.25 meets the rule within a few
+//! samples. The rule is ours. The highest estimate does not expire, so on a
+//! path whose rate has fallen for good, a later climb from below half of the
+//! old rate also uses the startup gain, until the same two rules end it.
 //!
 //! The minimum RTT is the wrapper's own, and it expires. quinn's
 //! `RttEstimator::min` never does within a path, so with it a lasting RTT rise
@@ -91,8 +103,9 @@
 //!
 //! A lasting RTT rise therefore lowers throughput until the next probe, which
 //! starts 10 s after the minimum was last taken, or later while the sender is
-//! app-limited. After it the cap grows with each delivery-rate sample until
-//! the window reaches the new bandwidth-delay product. A fall in RTT takes
+//! app-limited. By then the estimate has fallen to what the floor carries, so
+//! once the probe has taken the new minimum, the climb back to the new
+//! bandwidth-delay product brings the startup gain back. A fall in RTT takes
 //! effect with the first lower sample. Each probe holds the window low for
 //! about a quarter of a second.
 //!
@@ -141,6 +154,19 @@ const GROWTH_PERCENT: u128 = 125;
 /// How many samples in a row without growth end the startup
 /// (`K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP` = 3, line 645).
 const SAMPLES_WITHOUT_GROWTH: u8 = 3;
+
+/// How far the estimate has to be below its highest value, in percent of it,
+/// for a rise to count towards bringing the startup back. Our own value.
+const FALLEN_PERCENT: u128 = 50;
+
+/// How many samples in a row, each raising the estimate from below
+/// [`FALLEN_PERCENT`] of its highest value, bring the startup back. The same
+/// count as [`SAMPLES_WITHOUT_GROWTH`]; the rule is ours. Any rise counts, not
+/// only one of [`GROWTH_PERCENT`]: with the window at 1.25 times the estimate,
+/// a raised window shows in the sample about two round trips later, so the
+/// estimate grows by about 12 percent per sample, and in the lab by 3 to 25
+/// percent.
+const RISES_TO_RESTART: u8 = 3;
 
 /// How long a minimum RTT holds without a sample at or below it before a probe
 /// measures it again: BBR's MinRTTFilterLen.
@@ -191,10 +217,11 @@ pub struct BbrCapped {
     mtu: u64,
 }
 
-/// The state of BBR's full-bandwidth test, which ends the startup gain.
+/// The state of BBR's full-bandwidth test, which ends the startup gain, and
+/// of the rule that brings it back after the estimate has fallen.
 #[derive(Debug, Clone, Copy, Default)]
 struct Startup {
-    /// Whether the startup has ended. Once set, never cleared.
+    /// Whether the startup has ended. Cleared when the startup comes back.
     ended: bool,
     /// The estimate when it last grew by [`GROWTH_PERCENT`].
     grown_to: u64,
@@ -202,6 +229,14 @@ struct Startup {
     flat: u8,
     /// Whether a congestion event came in the current sample interval.
     congested: bool,
+    /// The highest estimate so far.
+    peak: u64,
+    /// The estimate after the last sample interval that was not app-limited.
+    last: u64,
+    /// Samples in a row, not counting app-limited ones, that raised the
+    /// estimate from below [`FALLEN_PERCENT`] of `peak` after the startup had
+    /// ended.
+    rises: u8,
 }
 
 impl Startup {
@@ -209,7 +244,17 @@ impl Startup {
     /// estimate after it.
     fn on_interval(&mut self, estimate: u64, app_limited: bool) {
         let congested = std::mem::take(&mut self.congested);
-        if self.ended || (app_limited && !congested) {
+        self.peak = self.peak.max(estimate);
+        if self.ended {
+            if !app_limited {
+                self.count_rise(estimate);
+            }
+            return;
+        }
+        if !app_limited {
+            self.last = estimate;
+        }
+        if app_limited && !congested {
             return;
         }
         if u128::from(estimate) * 100 >= u128::from(self.grown_to) * GROWTH_PERCENT {
@@ -222,6 +267,25 @@ impl Startup {
         } else {
             self.flat += 1;
             self.ended = self.flat >= SAMPLES_WITHOUT_GROWTH;
+        }
+    }
+
+    /// Brings the startup back once [`RISES_TO_RESTART`] samples in a row,
+    /// each from an estimate below [`FALLEN_PERCENT`] of the highest one, have
+    /// raised it. The test that ends it then starts again from the current
+    /// estimate.
+    fn count_rise(&mut self, estimate: u64) {
+        let last = std::mem::replace(&mut self.last, estimate);
+        let fallen = u128::from(last) * 100 < u128::from(self.peak) * FALLEN_PERCENT;
+        let rose = estimate > last;
+        self.rises = if fallen && rose { self.rises + 1 } else { 0 };
+        if self.rises >= RISES_TO_RESTART {
+            *self = Self {
+                grown_to: estimate,
+                peak: self.peak,
+                last: estimate,
+                ..Self::default()
+            };
         }
     }
 }
@@ -997,6 +1061,112 @@ mod tests {
         interval(&mut c, t, 20_000_000, true);
         assert!(c.startup.ended);
         assert_eq!(c.cap(), Some(1_500_000), "1.25 x 20 MB/s x 60 ms");
+    }
+
+    /// A controller whose startup ended at 15 MB/s by three samples without
+    /// growth, and whose estimate has since fallen to `rate` through ten
+    /// intervals at that rate. Returns it and when its last interval ended.
+    fn fallen_to(rate: u64) -> (BbrCapped, Instant) {
+        let mut c = starting();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        for _ in 0..4 {
+            t = interval(&mut c, t, BANDWIDTH, false);
+        }
+        assert!(c.startup.ended, "three samples without growth");
+        for _ in 0..SAMPLES {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert_eq!(c.rate.max(), Some(rate));
+        (c, t)
+    }
+
+    #[test]
+    fn the_startup_gain_returns_after_three_rises_from_below_half_the_peak() {
+        let (mut c, mut t) = fallen_to(2_000_000);
+        t = interval(&mut c, t, 2_200_000, false);
+        // An app-limited sample in the run neither counts nor breaks it.
+        t = interval(&mut c, t, 1_000_000, true);
+        t = interval(&mut c, t, 2_400_000, false);
+        assert!(c.startup.ended, "two rises");
+        assert_eq!(
+            c.cap(),
+            Some(240_000),
+            "1.25 x 2.4 MB/s x 60 ms is below the floor"
+        );
+
+        t = interval(&mut c, t, 4_000_000, false);
+        assert!(!c.startup.ended, "the third rise");
+        assert_eq!(c.cap(), Some(692_400), "2.885 x 4 MB/s x 60 ms");
+
+        // It ends by the rules of the first startup: three samples in a row
+        // without a rise of a quarter since the estimate last grew.
+        t = interval(&mut c, t, 10_000_000, false);
+        for _ in 0..2 {
+            t = interval(&mut c, t, 12_000_000, false);
+        }
+        assert!(!c.startup.ended, "10 MB/s grew, 12 MB/s twice did not");
+        t = interval(&mut c, t, 12_000_000, false);
+        assert!(c.startup.ended);
+        assert_eq!(c.cap(), Some(900_000), "1.25 x 12 MB/s x 60 ms");
+
+        // And it can return again after the next fall.
+        for _ in 0..SAMPLES {
+            t = interval(&mut c, t, 1_000_000, false);
+        }
+        for rate in [1_100_000, 1_200_000, 1_300_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(!c.startup.ended, "15 MB/s is still the peak");
+    }
+
+    #[test]
+    fn the_startup_gain_does_not_return_without_a_fall_below_half_or_three_rises_in_a_row() {
+        // From 8 MB/s, above half of the 15 MB/s peak, three rises.
+        let (mut c, mut t) = fallen_to(8_000_000);
+        for rate in [10_000_000, 12_500_000, 16_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(c.startup.ended, "the estimate had not fallen to half");
+
+        // From 2 MB/s, a run of rises broken by a sample that does not raise
+        // the estimate.
+        let (mut c, mut t) = fallen_to(2_000_000);
+        for rate in [3_000_000, 4_000_000, 3_900_000, 5_000_000, 6_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(c.startup.ended, "3.9 MB/s leaves the estimate at 4 MB/s");
+        interval(&mut c, t, 7_000_000, false);
+        assert!(
+            !c.startup.ended,
+            "5, 6 and 7 MB/s are three rises from below 7.5 MB/s"
+        );
+
+        // The rise has to start below half the peak, not at it.
+        let (mut c, mut t) = fallen_to(6_000_000);
+        for rate in [7_000_000, 7_500_000, 8_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(c.startup.ended, "the third rise starts at 7.5 MB/s");
+
+        // App-limited samples alone never bring it back.
+        let (mut c, mut t) = fallen_to(2_000_000);
+        for rate in [3_000_000, 4_000_000, 5_000_000, 7_000_000] {
+            t = interval(&mut c, t, rate, true);
+        }
+        assert!(c.startup.ended);
+    }
+
+    #[test]
+    fn a_congestion_event_without_growth_ends_a_returned_startup() {
+        let (mut c, mut t) = fallen_to(2_000_000);
+        for rate in [3_000_000, 4_000_000, 5_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(!c.startup.ended);
+        c.on_congestion_event(t, t - MIN_RTT, false, 1200);
+        interval(&mut c, t, 5_500_000, true);
+        assert!(c.startup.ended);
     }
 
     /// What a [`Shadowed`] controller saw on a real connection.
