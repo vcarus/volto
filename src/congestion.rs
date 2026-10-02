@@ -287,6 +287,28 @@ impl BbrCapped {
         }
     }
 
+    /// One debug line per delivery-rate sample, with the terms that can limit
+    /// the window after it. Off under the shipped `volto=info` filter.
+    fn trace(&self, sample: &Sample, in_flight: u64) {
+        tracing::debug!(
+            sample_bytes_per_sec = sample.rate,
+            estimate_bytes_per_sec = self.rate.max().unwrap_or(0),
+            cap_bytes = self.cap().unwrap_or(0),
+            bbr_window_bytes = self.inner.window(),
+            window_bytes = self.window(),
+            in_flight_bytes = in_flight,
+            min_rtt_us = self.min_rtt.map_or(0, |(min, _)| min.as_micros()),
+            srtt_us = self.srtt.as_micros(),
+            ack_interval_us = sample.ack_elapsed.as_micros(),
+            send_interval_us = sample.send_elapsed.as_micros(),
+            startup = !self.startup.ended,
+            app_limited = sample.app_limited,
+            stored = sample.stored,
+            probing = self.probe.is_some(),
+            "bbr-capped sample"
+        );
+    }
+
     /// The window limit, once there is a delivery-rate sample to compute it
     /// from: 1.25 times the bandwidth-delay product, the startup gain times it
     /// until the startup has ended, or half of it during a probe.
@@ -334,9 +356,10 @@ impl Controller for BbrCapped {
     ) {
         self.inner
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
-        if let Some(app_limited) = self.rate.on_end_acks(now, app_limited, self.srtt) {
+        if let Some(sample) = self.rate.on_end_acks(now, app_limited, self.srtt) {
             self.startup
-                .on_interval(self.rate.max().unwrap_or(0), app_limited);
+                .on_interval(self.rate.max().unwrap_or(0), sample.app_limited);
+            self.trace(&sample, in_flight);
         }
         self.update_probe(now, in_flight);
     }
@@ -429,8 +452,8 @@ impl DeliveryRate {
     }
 
     /// Ends the current interval if it has lasted `round`, and then returns
-    /// whether it was app-limited.
-    fn on_end_acks(&mut self, now: Instant, app_limited: bool, round: Duration) -> Option<bool> {
+    /// its sample.
+    fn on_end_acks(&mut self, now: Instant, app_limited: bool, round: Duration) -> Option<Sample> {
         self.app_limited |= app_limited;
         let Some(started) = self.started else {
             self.restart(now);
@@ -446,6 +469,7 @@ impl DeliveryRate {
             (Some(first), Some(last)) => last.saturating_duration_since(first),
             _ => Duration::ZERO,
         };
+        let ack_elapsed = elapsed;
         let elapsed = elapsed.max(send_elapsed);
         let rate = u128::from(self.bytes) * 1_000_000 / elapsed.as_micros().max(1);
         let sample = u64::try_from(rate).unwrap_or(u64::MAX);
@@ -454,13 +478,20 @@ impl DeliveryRate {
         // BBR draft (draft-cardwell-iccrg-bbr-congestion-control) and in Linux
         // (`bbr_update_bw` in `net/ipv4/tcp_bbr.c`), which also take a sample
         // equal to the estimate. quinn's BBR never takes an app-limited sample.
-        if !self.app_limited || sample > self.max().unwrap_or(0) {
+        let stored = !self.app_limited || sample > self.max().unwrap_or(0);
+        if stored {
             self.samples[self.next] = sample;
             self.next = (self.next + 1) % SAMPLES;
         }
-        let app_limited = self.app_limited;
+        let sample = Sample {
+            rate: sample,
+            app_limited: self.app_limited,
+            stored,
+            ack_elapsed,
+            send_elapsed,
+        };
         self.restart(now);
-        Some(app_limited)
+        Some(sample)
     }
 
     fn restart(&mut self, now: Instant) {
@@ -475,6 +506,22 @@ impl DeliveryRate {
     fn max(&self) -> Option<u64> {
         self.samples.iter().copied().max().filter(|&max| max > 0)
     }
+}
+
+/// One closed sample interval of [`DeliveryRate`].
+#[derive(Debug, Clone, Copy)]
+struct Sample {
+    /// The delivery rate in bytes per second.
+    rate: u64,
+    /// Whether any ACK in the interval found the sender app-limited.
+    app_limited: bool,
+    /// Whether the sample went into the filter; an app-limited one below the
+    /// estimate does not.
+    stored: bool,
+    /// The ACK interval.
+    ack_elapsed: Duration,
+    /// The send interval of the acknowledged packets; zero when unknown.
+    send_elapsed: Duration,
 }
 
 #[cfg(test)]
