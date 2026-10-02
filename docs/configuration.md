@@ -61,7 +61,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
 | `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. The default is below quinn's 1452, the value safe over both IPv4 and IPv6 on Ethernet, because a size is adopted after one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load. 1436 is what a measured relay path carries; the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) give the measurement. An operator who has measured their own path at bulk rate can raise it, at most to 1472. A bound above what the path carries costs failed probes on a path that drops oversize packets, and lost traffic until the black-hole detector fires on a path that delivers single probes but not bulk traffic at that size. No effect (and a startup warning) when `mtu_discovery` is off |
-| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-capped`, `cubic` or `newreno` |
+| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-uncapped`, `cubic` or `newreno`. `bbr` is quinn's BBR with its window capped, the default since 1.2.0; `bbr-capped`, its name in v1.1.0 and v1.1.1, still selects it. `bbr-uncapped` is quinn's BBR as it ships, which `bbr` selected before 1.2.0 |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
 | `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max` |
@@ -199,41 +199,44 @@ and collapses the window — downloads stall to near zero while a co-located TCP
 proxy, which the kernel runs on BBR, is unaffected. BBR models bandwidth and RTT
 instead. Switch to cubic only on a clean path, or as a fallback.
 
-**`bbr-capped` is BBR with its window held to 1.25 times the bandwidth-delay
-product it measures.** quinn's BBR estimates the bottleneck bandwidth several
-times too high, so during a bulk download it sends faster than the path carries
-and the path drops the difference. `bbr-capped` measures the delivery rate once
-per round trip and caps the window, and with it the pacing rate, at 1.25 times
-that rate times the minimum RTT. The cap is never below the 240 kB window a new
-connection starts with, so on a path whose bandwidth-delay product is under 192
-kB the window can be 240 kB. A new connection uses 2.89 times instead, BBR's
-startup gain, until its measured rate stops growing, or until a loss arrives in
-a round trip in which it did not grow; behind a 150 Mbit/s bottleneck in the lab
-it reached 90 percent of that rate 1.4 s after the handshake at a 60 ms RTT and
-2.9 s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. The higher gain
+**`bbr` is BBR with its window held to 1.25 times the bandwidth-delay product it
+measures.** quinn's BBR estimates the bottleneck bandwidth several times too
+high, so during a bulk download it sends faster than the path carries and the
+path drops the difference. `bbr` measures the delivery rate once per round trip
+and caps the window, and with it the pacing rate, at 1.25 times that rate times
+the minimum RTT. The cap is never below the 240 kB window a new connection
+starts with, so on a path whose bandwidth-delay product is under 192 kB the
+window can be 240 kB. A new connection uses 2.89 times instead, BBR's startup
+gain, until its measured rate stops growing, or until a loss arrives in a round
+trip in which it did not grow; behind a 150 Mbit/s bottleneck in the lab it
+reached 90 percent of that rate 1.4 s after the handshake at a 60 ms RTT and 2.9
+s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. The higher gain
 returns when the measured rate, after falling below half of its highest value,
 rises in three round trips in a row. After a 3 s burst of 90 percent loss in the
 lab, the climb back to 90 percent of the bottleneck rate, once sending resumed,
 took 0.2 s at a 60 ms RTT and 2.0 to 2.2 s at 150 ms, against 0.8 to 0.9 s and
-3.2 to 3.5 s before this rule; BBR came back at once. Apart from ending that
-startup and bringing it back, it responds to loss exactly as BBR does, so it
-keeps what makes BBR the choice for a lossy path. It keeps its own minimum RTT,
-which lasts 10 s unless a lower or equal sample renews it. When it runs out, and
-once the sender is not app-limited, the window is held at half the
+3.2 to 3.5 s before this rule; `bbr-uncapped` came back at once. Apart from
+ending that startup and bringing it back, it responds to loss exactly as BBR
+does, so it keeps what makes BBR the choice for a lossy path. It keeps its own
+minimum RTT, which lasts 10 s unless a lower or equal sample renews it. When it
+runs out, and once the sender is not app-limited, the window is held at half the
 bandwidth-delay product for at least 200 ms so that the bottleneck queue
 empties, and the lowest RTT seen then becomes the new minimum. In a lab with a
 150 Mbit/s bottleneck and a 60 ms RTT, behind a queue of one bandwidth-delay
-product, BBR lost 28 percent of the packets it sent and `bbr-capped` none, at 8
-percent higher throughput; behind a 50 kB queue the loss went from 54 to 18
+product, `bbr-uncapped` lost 28 percent of the packets it sent and `bbr` none,
+at 8 percent higher throughput; behind a 50 kB queue the loss went from 54 to 18
 percent, and under 0.2 and 2 percent random loss its throughput was 15 and 26
-percent higher than BBR's. The re-measurement costs about 1.4 percent of the
-throughput. A lasting rise in the path's RTT lowers throughput until the next
-re-measurement, 10 s after the last one or later while the sender is
-app-limited; after a rise from 60 to 150 ms the throughput was back at the
+percent higher than that of `bbr-uncapped`. The re-measurement costs about 1.4
+percent of the throughput. A lasting rise in the path's RTT lowers throughput
+until the next re-measurement, 10 s after the last one or later while the sender
+is app-limited; after a rise from 60 to 150 ms the throughput was back at the
 bottleneck rate 1.6 to 2.9 s after that, against 3.2 to 3.6 s before the startup
 gain could return, at a cost of 0.05 to 0.21 percent of the packets sent in the
-45 s after the rise. It is not the default until it has been measured on real
-paths.
+45 s after the rise. It is the default since 1.2.0, after download A/B runs on a
+production relay path in which it lost fewer packets and carried more data than
+`bbr-uncapped` in every run. In v1.1.0 and v1.1.1 it was opt-in under the name
+`bbr-capped`, which still selects it. `bbr-uncapped` selects quinn's BBR as it
+ships, the controller `bbr` selected before 1.2.0.
 
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines
@@ -704,13 +707,19 @@ instead.
 Configuration keys, their defaults and the command-line arguments are stable
 within 1.x. A key that exists keeps its name and its meaning, a documented
 default is not changed under a running deployment, and a key is removed only
-after at least one minor release has warned about it at startup. The release
-after v1.1.1 lowers the documented default of `mtu_upper_bound` from 1452 to
-1436 on measured evidence (the MTU paragraphs under [Notes that matter in
+after at least one minor release has warned about it at startup. v1.2.0 lowers
+the documented default of `mtu_upper_bound` from 1452 to 1436 on measured
+evidence (the MTU paragraphs under [Notes that matter in
 practice](#notes-that-matter-in-practice) give it); a host that relied on 1452
-can set it explicitly, and a file from any earlier release still loads. A new
-key keeps taking its documented default when the file does not mention it, which
-is what makes the upgrade half of this section a no-op.
+can set it explicitly, and a file from any earlier release still loads. v1.2.0
+also changes what `bbr`, the default value of `congestion_control`, selects:
+since 1.2.0 it is quinn's BBR with its window capped, the controller v1.1.0 and
+v1.1.1 called `bbr-capped`. A file that writes `bbr` or leaves the key out gets
+it without an edit, and `bbr-capped` still loads as the same controller.
+`bbr-uncapped` selects quinn's BBR as `bbr` selected it before, and a file that
+writes it does not load on a release before 1.2.0. A new key keeps taking its
+documented default when the file does not mention it, which is what makes the
+upgrade half of this section a no-op.
 
 Two things are deliberately outside that promise. Log line shapes are not an
 interface: fields are added, reworded and moved between levels as the

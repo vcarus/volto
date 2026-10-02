@@ -265,12 +265,15 @@ impl AuthGate {
 /// kernel runs BBR for TCP. BBR models bandwidth and RTT instead, holding
 /// throughput on exactly these paths. See `config::CongestionControl` for why this
 /// is the default and stays configurable.
+///
+/// Since 1.2.0 `bbr` builds the capped controller of [`crate::congestion`]
+/// (D108), and `bbr-uncapped` builds quinn's BBR as it ships.
 fn congestion_factory(
     cc: CongestionControl,
 ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match cc {
-        CongestionControl::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
-        CongestionControl::BbrCapped => Arc::new(crate::congestion::BbrCappedConfig::default()),
+        CongestionControl::Bbr => Arc::new(crate::congestion::BbrCappedConfig::default()),
+        CongestionControl::BbrUncapped => Arc::new(quinn::congestion::BbrConfig::default()),
         CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
         CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
     }
@@ -2909,7 +2912,8 @@ pub(crate) mod tests {
     }
 
     /// The controller a connection accepted with `transport_config(limits)`
-    /// runs, named by its concrete type.
+    /// runs, named by its concrete type with the `congestion_control` value
+    /// that selects it.
     ///
     /// `TransportConfig` keeps the factory in a private field that its `Debug`
     /// does not print, so [`transport_debug`], which pins every other transport
@@ -2921,10 +2925,10 @@ pub(crate) mod tests {
         let (_client, server) = loopback_pair(transport).await;
         let any = server.congestion_state().into_any();
 
-        if any.is::<quinn::congestion::Bbr>() {
+        if any.is::<crate::congestion::BbrCapped>() {
             "bbr"
-        } else if any.is::<crate::congestion::BbrCapped>() {
-            "bbr-capped"
+        } else if any.is::<quinn::congestion::Bbr>() {
+            "bbr-uncapped"
         } else if any.is::<quinn::congestion::Cubic>() {
             "cubic"
         } else if any.is::<quinn::congestion::NewReno>() {
@@ -2943,7 +2947,7 @@ pub(crate) mod tests {
 
         for (value, expected) in [
             (CongestionControl::Bbr, "bbr"),
-            (CongestionControl::BbrCapped, "bbr-capped"),
+            (CongestionControl::BbrUncapped, "bbr-uncapped"),
             (CongestionControl::Cubic, "cubic"),
             (CongestionControl::NewReno, "newreno"),
         ] {
@@ -2955,8 +2959,30 @@ pub(crate) mod tests {
         }
     }
 
+    /// `bbr-uncapped` selects quinn's own BBR, the controller
+    /// `quinn::congestion::BbrConfig` builds, with no cap around it (D108).
+    /// It is the comparison against the default and the way back to quinn's
+    /// controller without a rebuild.
+    #[tokio::test]
+    async fn bbr_uncapped_selects_quinns_own_bbr() {
+        use serde::Deserialize as _;
+        use serde::de::IntoDeserializer as _;
+
+        let value =
+            crate::config::CongestionControl::deserialize("bbr-uncapped".into_deserializer())
+                .map_err(|e: serde::de::value::Error| e.to_string())
+                .expect("bbr-uncapped is a congestion_control value");
+        let limits = crate::config::Limits {
+            congestion_control: value,
+            ..crate::config::Limits::default()
+        };
+
+        assert_eq!(controller_type_of(&limits).await, "bbr-uncapped");
+    }
+
     /// The default really is BBR, all the way to the controller a connection
-    /// runs.
+    /// runs. Since 1.2.0 that is the capped controller (D108), the type
+    /// [`controller_type_of`] names `bbr`.
     ///
     /// The one assertion in this module with a production incident behind it.
     /// quinn defaults to CUBIC, so losing this mapping (a mis-edited match arm,
@@ -2977,7 +3003,7 @@ pub(crate) mod tests {
         assert_eq!(
             controller_type_of(&limits).await,
             "bbr",
-            "the default limits must build a BBR controller, not quinn's CUBIC"
+            "the default limits must build the capped BBR controller, not quinn's CUBIC"
         );
     }
 

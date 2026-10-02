@@ -26,7 +26,7 @@
 //! initial_mtu          = 1200  # bytes, 1200..1452
 //! mtu_discovery        = true
 //! mtu_upper_bound      = 1436  # bytes, initial_mtu..1472
-//! congestion_control   = "bbr" # bbr | bbr-capped | cubic | newreno
+//! congestion_control   = "bbr" # bbr | bbr-uncapped | cubic | newreno
 //! initial_rtt_ms       = 333   # milliseconds, 10..10000
 //! socket_recv_buffer   = 2097152 # bytes, 0 keeps the OS default
 //! socket_send_buffer   = 2097152 # bytes, 0 keeps the OS default
@@ -400,26 +400,35 @@ impl std::fmt::Debug for User {
 /// QUIC congestion controller, selected by `[limits].congestion_control`.
 ///
 /// The default is BBR, deliberately. This proxy exists to carry traffic over
-/// long, often lossy international paths, and a loss-based controller reads the
+/// long, often lossy international paths. A loss-based controller reads the
 /// non-congestive packet loss of those paths as congestion and keeps the window
-/// from ever opening — the download direction collapses to near-zero. BBR models
+/// from opening, and the download direction falls to near zero. BBR models
 /// bottleneck bandwidth and RTT instead of reacting to loss, so it holds
 /// throughput where CUBIC and NewReno stall, matching what the Linux kernel does
 /// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
 ///
-/// The loss-based controllers are kept as an escape hatch: quinn's BBR is a
-/// port marked "experimental", so an operator who hits trouble after a
-/// dependency bump can fall back without recompiling.
+/// Since 1.2.0 the value `bbr` selects quinn's BBR with its window capped
+/// ([`crate::congestion`], D108), because quinn's BBR overestimates the
+/// bottleneck and loses the difference on a bulk download. The capped
+/// controller took over the name so that an existing file, whether it writes
+/// `bbr` or leaves the key out, gets it without an edit. quinn's controller as
+/// it ships stays selectable as `bbr-uncapped`.
+///
+/// The other controllers are kept as a fallback: quinn's BBR is a port marked
+/// "experimental", so an operator who hits trouble after a dependency bump can
+/// switch without recompiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CongestionControl {
-    /// BBR (quinn's experimental port of BBRv1). The default; best on lossy
-    /// long-haul paths.
+    /// quinn's BBR with its window capped at 1.25 times the measured
+    /// bandwidth-delay product; see [`crate::congestion`]. The default since
+    /// 1.2.0. `bbr-capped`, its name in v1.1.0 and v1.1.1, still selects it.
+    #[serde(alias = "bbr-capped")]
     Bbr,
-    /// The same BBR with its window capped at 1.25 times the measured
-    /// bandwidth-delay product; see [`crate::congestion`].
-    #[serde(rename = "bbr-capped")]
-    BbrCapped,
+    /// quinn's BBR as it ships (its experimental port of BBRv1), without the
+    /// cap. The controller `bbr` selected before 1.2.0.
+    #[serde(rename = "bbr-uncapped")]
+    BbrUncapped,
     /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
     Cubic,
     /// NewReno. Loss-based and the most conservative; mainly of interest for
@@ -542,7 +551,8 @@ pub struct Limits {
     /// follow `initial_mtu` up while a written one is checked exactly. Read the
     /// ceiling in effect through [`Limits::mtu_upper_bound`].
     pub mtu_upper_bound: Option<u16>,
-    /// QUIC congestion controller. Defaults to BBR; see [`CongestionControl`].
+    /// QUIC congestion controller. Defaults to `bbr`, which since 1.2.0 is
+    /// quinn's BBR with its window capped; see [`CongestionControl`].
     pub congestion_control: CongestionControl,
     /// Milliseconds of round-trip time assumed before the first measurement.
     ///
@@ -2561,7 +2571,8 @@ pub(crate) mod tests {
         );
         for (value, expected) in [
             ("bbr", CongestionControl::Bbr),
-            ("bbr-capped", CongestionControl::BbrCapped),
+            ("bbr-capped", CongestionControl::Bbr),
+            ("bbr-uncapped", CongestionControl::BbrUncapped),
             ("cubic", CongestionControl::Cubic),
             ("newreno", CongestionControl::NewReno),
         ] {
@@ -2569,6 +2580,21 @@ pub(crate) mod tests {
             assert_eq!(cfg.limits.congestion_control, expected, "{value}");
             assert_valid_apart_from_certs(&cfg, value);
         }
+    }
+
+    /// `bbr-capped`, the name the capped controller had in v1.1.0 and v1.1.1,
+    /// still loads, and as the controller `bbr` names (D108). A file written
+    /// for those releases keeps the controller it chose.
+    #[test]
+    fn bbr_capped_loads_as_the_controller_bbr_names() {
+        let named = |value: &str| {
+            parse(&format!("[limits]\ncongestion_control = \"{value}\""))
+                .limits
+                .congestion_control
+        };
+
+        assert_eq!(named("bbr-capped"), named("bbr"));
+        assert_eq!(named("bbr-capped"), parse("").limits.congestion_control);
     }
 
     #[test]
@@ -3444,6 +3470,14 @@ pub(crate) mod tests {
         assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(cfg.limits.mtu_upper_bound(), 1436);
 
+        // `bbr` written in an old file selects what `bbr` selects today, the
+        // capped controller since 1.2.0 (D108), with no edit to the file.
+        assert_eq!(cfg.limits.congestion_control, CongestionControl::Bbr);
+        assert_eq!(
+            cfg.limits.congestion_control,
+            Limits::default().congestion_control
+        );
+
         // And the default has to be consistent with what the old file *does*
         // say, or an upgrade would fail validation on a file that was fine.
         assert!(cfg.limits.mtu_upper_bound() >= cfg.limits.initial_mtu);
@@ -3646,7 +3680,7 @@ pub(crate) mod tests {
                 any::<bool>(),
                 prop::sample::select(vec![
                     CongestionControl::Bbr,
-                    CongestionControl::BbrCapped,
+                    CongestionControl::BbrUncapped,
                     CongestionControl::Cubic,
                     CongestionControl::NewReno,
                 ]),
