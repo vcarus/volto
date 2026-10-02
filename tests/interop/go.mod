@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/quic-go/masque-go v0.5.0
-	github.com/quic-go/quic-go v0.62.0
+	github.com/quic-go/quic-go v0.63.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 )
 
