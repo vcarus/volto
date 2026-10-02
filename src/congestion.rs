@@ -2,8 +2,9 @@
 //! to 1.25 times the measured bandwidth-delay product.
 //!
 //! It is the default since 1.2.0 (D108). In v1.1.0 and v1.1.1 it was opt-in
-//! under the value `bbr-capped`, which still selects it. quinn's BBR as it
-//! ships is the value `bbr-uncapped`. The type keeps the name [`BbrCapped`].
+//! under the value `bbr-capped`, an alias 1.2.0 still accepted and 1.3.0
+//! removed. quinn's BBR as it ships is the value `bbr-uncapped`. The type keeps
+//! the name [`BbrCapped`].
 //!
 //! quinn-proto 0.11.18's BBR overestimates the bottleneck bandwidth, so its
 //! congestion window never limits what is in flight. Paths below are in that

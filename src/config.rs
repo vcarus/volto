@@ -422,8 +422,8 @@ impl std::fmt::Debug for User {
 pub enum CongestionControl {
     /// quinn's BBR with its window capped at 1.25 times the measured
     /// bandwidth-delay product; see [`crate::congestion`]. The default since
-    /// 1.2.0. `bbr-capped`, its name in v1.1.0 and v1.1.1, still selects it.
-    #[serde(alias = "bbr-capped")]
+    /// 1.2.0. Its v1.1.x name `bbr-capped` was an alias in 1.2.0 and is not
+    /// accepted since 1.3.0.
     Bbr,
     /// quinn's BBR as it ships (its experimental port of BBRv1), without the
     /// cap. The controller `bbr` selected before 1.2.0.
@@ -2571,7 +2571,6 @@ pub(crate) mod tests {
         );
         for (value, expected) in [
             ("bbr", CongestionControl::Bbr),
-            ("bbr-capped", CongestionControl::Bbr),
             ("bbr-uncapped", CongestionControl::BbrUncapped),
             ("cubic", CongestionControl::Cubic),
             ("newreno", CongestionControl::NewReno),
@@ -2582,19 +2581,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// `bbr-capped`, the name the capped controller had in v1.1.0 and v1.1.1,
-    /// still loads, and as the controller `bbr` names (D108). A file written
-    /// for those releases keeps the controller it chose.
+    /// `bbr-capped`, the name the capped controller had in v1.1.0 and v1.1.1
+    /// and an alias of `bbr` in 1.2.0, is not accepted since 1.3.0 (D108, user
+    /// ruling 2026-10-03). The refusal names the accepted values, so the fix
+    /// for a 1.1.x file is in the message.
     #[test]
-    fn bbr_capped_loads_as_the_controller_bbr_names() {
-        let named = |value: &str| {
-            parse(&format!("[limits]\ncongestion_control = \"{value}\""))
-                .limits
-                .congestion_control
-        };
-
-        assert_eq!(named("bbr-capped"), named("bbr"));
-        assert_eq!(named("bbr-capped"), parse("").limits.congestion_control);
+    fn bbr_capped_is_no_longer_accepted() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [server]
+            listen = "127.0.0.1:4433"
+            cert = "/tmp/c.pem"
+            key = "/tmp/k.pem"
+            [limits]
+            congestion_control = "bbr-capped"
+            "#,
+        )
+        .expect_err("the 1.1.x alias must be refused")
+        .to_string();
+        assert!(err.contains("bbr-capped"), "{err}");
+        assert!(err.contains("`bbr`"), "{err}");
+        assert!(err.contains("bbr-uncapped"), "{err}");
     }
 
     #[test]

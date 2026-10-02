@@ -61,7 +61,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
 | `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. The default is below quinn's 1452, the value safe over both IPv4 and IPv6 on Ethernet, because a size is adopted after one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load. 1436 is what a measured relay path carries; the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) give the measurement. An operator who has measured their own path at bulk rate can raise it, at most to 1472. A bound above what the path carries costs failed probes on a path that drops oversize packets, and lost traffic until the black-hole detector fires on a path that delivers single probes but not bulk traffic at that size. No effect (and a startup warning) when `mtu_discovery` is off |
-| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-uncapped`, `cubic` or `newreno`. `bbr` is quinn's BBR with its window capped, the default since 1.2.0; `bbr-capped`, its name in v1.1.0 and v1.1.1, still selects it. `bbr-uncapped` is quinn's BBR as it ships, which `bbr` selected before 1.2.0 |
+| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-uncapped`, `cubic` or `newreno`. `bbr` is quinn's BBR with its window capped, the default since 1.2.0. `bbr-uncapped` is quinn's BBR as it ships, which `bbr` selected before 1.2.0 |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
 | `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max` |
@@ -235,8 +235,9 @@ gain could return, at a cost of 0.05 to 0.21 percent of the packets sent in the
 45 s after the rise. It is the default since 1.2.0, after download A/B runs on a
 production relay path in which it lost fewer packets and carried more data than
 `bbr-uncapped` in every run. In v1.1.0 and v1.1.1 it was opt-in under the name
-`bbr-capped`, which still selects it. `bbr-uncapped` selects quinn's BBR as it
-ships, the controller `bbr` selected before 1.2.0.
+`bbr-capped`; 1.2.0 accepted that name as an alias, and from 1.3.0 a file that
+writes it does not load, so write `bbr` or leave the key out. `bbr-uncapped`
+selects quinn's BBR as it ships, the controller `bbr` selected before 1.2.0.
 
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines
@@ -715,9 +716,13 @@ can set it explicitly, and a file from any earlier release still loads. v1.2.0
 also changes what `bbr`, the default value of `congestion_control`, selects:
 since 1.2.0 it is quinn's BBR with its window capped, the controller v1.1.0 and
 v1.1.1 called `bbr-capped`. A file that writes `bbr` or leaves the key out gets
-it without an edit, and `bbr-capped` still loads as the same controller.
-`bbr-uncapped` selects quinn's BBR as `bbr` selected it before, and a file that
-writes it does not load on a release before 1.2.0. A new key keeps taking its
+it without an edit. 1.2.0 also accepted `bbr-capped` as an alias; v1.3.0 removes
+the alias without a warning release first, because the value existed for two
+patch releases only and the stability rule above is about keys, so a file that
+still writes `bbr-capped` is refused at startup with a message that lists the
+accepted values, and the fix is to write `bbr`. `bbr-uncapped` selects quinn's
+BBR as `bbr` selected it before, and a file that writes it does not load on a
+release before 1.2.0. A new key keeps taking its
 documented default when the file does not mention it, which is what makes the
 upgrade half of this section a no-op.
 

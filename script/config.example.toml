@@ -216,7 +216,7 @@ mtu_upper_bound = 1436
 # burst of loss. It measures the minimum RTT again 10 s after the last
 # measurement, or later while the sender is app-limited, so a lasting RTT rise
 # costs throughput for about that long plus a few seconds. It is the default
-# since 1.2.0. "bbr-capped", its name in 1.1.0 and 1.1.1, still selects it.
+# since 1.2.0; its 1.1.x name "bbr-capped" is not accepted since 1.3.0.
 # "bbr-uncapped" is quinn's BBR as it ships, which "bbr" selected before 1.2.0.
 # See docs/configuration.md for the measurements.
 # Default: "bbr"
