@@ -355,6 +355,40 @@ install -d -o volto -g volto -m 0750 "$CONF_DIR"
 
 # --- certificate ------------------------------------------------------------
 
+# Puts back whatever the certificate swap had moved, removes the new pair, then
+# ends the run.
+#
+# Armed as an ERR trap over the four renames of the swap, and disarmed after the
+# last one. Without it `set -e` ends the run with the configured pair split. A
+# failure at the key backup leaves the old key with no certificate. A failure at
+# either move into place leaves the new certificate, or no certificate, beside
+# the old key's backup. The running service keeps the pair it loaded, so the
+# next restart is what fails.
+#
+# The moves are undone in reverse order. The old certificate replaces the new
+# one in a single rename, so the certificate path is not left empty while there
+# is an old certificate to restore.
+restore_previous_pair() {
+    trap - ERR
+    local restored=""
+
+    if [ -n "$key_backup" ] && mv -f "$key_backup" "$KEY"; then
+        restored="$KEY"
+    fi
+    if [ -n "$cert_backup" ]; then
+        if mv -f "$cert_backup" "$CERT"; then
+            restored="$CERT${restored:+ and $restored}"
+        fi
+    elif [ "$cert_placed" -eq 1 ]; then
+        rm -f "$CERT"
+    fi
+    rm -f "$CERT.new" "$KEY.new"
+
+    [ -n "$restored" ] ||
+        die "installing the new certificate failed; there was nothing to restore, and the new pair was removed"
+    die "installing the new certificate failed; restored the previous $restored, and the new pair was removed"
+}
+
 if [ -f "$CERT" ] && [ -f "$KEY" ] && [ "$FORCE" -eq 0 ]; then
     note "certificate already exists, keeping it (use --force to regenerate)"
 else
@@ -388,20 +422,29 @@ else
         die "openssl failed to generate the certificate; the previous certificate and key are untouched at $CERT and $KEY"
     }
 
+    # What restore_previous_pair needs to know about how far the swap got.
+    cert_backup=""
+    key_backup=""
+    cert_placed=0
+    trap restore_previous_pair ERR
+
     # One timestamp for both backups, so the pair keeps a name that says it is a
     # pair even when the generation above straddles a second boundary.
     if [ -f "$CERT" ]; then
         stamp="$(date +%Y%m%d%H%M%S)"
-        backup="$CERT.$stamp.bak"
-        mv "$CERT" "$backup"
+        mv "$CERT" "$CERT.$stamp.bak"
+        cert_backup="$CERT.$stamp.bak"
         if [ -f "$KEY" ]; then
             mv "$KEY" "$KEY.$stamp.bak"
+            key_backup="$KEY.$stamp.bak"
         fi
-        note "backed up the previous certificate to $backup"
+        note "backed up the previous certificate to $cert_backup"
     fi
 
     mv "$CERT.new" "$CERT"
+    cert_placed=1
     mv "$KEY.new" "$KEY"
+    trap - ERR
 
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi

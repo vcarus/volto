@@ -8,7 +8,8 @@
 //!
 //! The script's `--print-config` flag exists for this test: it runs the real
 //! generation path, touches nothing, and needs no root. The rest of the script
-//! (users, certificates, systemd) cannot be exercised on the dev host and is
+//! needs root, a Debian host and systemd. One test reaches the certificate swap
+//! by putting stand-ins for those commands in front of `PATH`. The rest is
 //! covered by shellcheck plus review.
 //!
 //! `--check-config` is the second seam, and it closes the other half of the same
@@ -24,6 +25,7 @@
 mod scripts;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -477,6 +479,181 @@ fn server_accepts_username(name: &str) -> bool {
     match config.validate() {
         Ok(()) => true,
         Err(error) => !error.to_string().contains("byte limit"),
+    }
+}
+
+/// The first executable called `name` on the inherited `PATH`.
+///
+/// Resolved before the stubs below go in front of it, so a wrapper can hand its
+/// arguments to the real tool by absolute path.
+fn real_tool(name: &str) -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no {name} on PATH"))
+}
+
+/// Writes `text` to `path` with mode 0755.
+fn write_executable(path: &Path, text: &str) {
+    fs::write(path, text).expect("the stub must be writable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("the stub must be executable");
+}
+
+/// Writes stand-ins for the commands the install path needs root or a Debian
+/// host for, and an `mv` that fails on its `fail_at`-th call. Returns the
+/// directory to put in front of `PATH`.
+///
+/// `id -u` prints 0 and `id -u volto` succeeds, so the root check passes and no
+/// user is created. `apt-get` and `systemctl` are only looked up before the
+/// certificate step. `chown` does nothing. `install` drops its `-o` and `-g`
+/// arguments, which name a user this host does not have, and runs the real
+/// `install`. `mv` counts its calls in `mv-calls` beside it.
+fn plant_root_stubs(root: &Path, fail_at: usize) -> PathBuf {
+    let dir = root.join("stubs");
+    fs::create_dir_all(&dir).expect("the stub directory must be creatable");
+
+    write_executable(
+        &dir.join("id"),
+        "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
+    );
+    for name in ["apt-get", "systemctl", "chown"] {
+        write_executable(&dir.join(name), "#!/bin/sh\nexit 0\n");
+    }
+    write_executable(
+        &dir.join("install"),
+        &format!(
+            "#!/bin/sh\n\
+             skip=\n\
+             for arg do\n\
+             \x20 shift\n\
+             \x20 if [ -n \"$skip\" ]; then skip=; continue; fi\n\
+             \x20 case \"$arg\" in -o|-g) skip=1; continue ;; esac\n\
+             \x20 set -- \"$@\" \"$arg\"\n\
+             done\n\
+             exec '{}' \"$@\"\n",
+            real_tool("install").display()
+        ),
+    );
+    write_executable(
+        &dir.join("mv"),
+        &format!(
+            "#!/bin/sh\n\
+             count_file='{count}'\n\
+             n=$(( $(cat \"$count_file\" 2>/dev/null || echo 0) + 1 ))\n\
+             echo \"$n\" >\"$count_file\"\n\
+             if [ \"$n\" -eq {fail_at} ]; then\n\
+             \x20 echo \"mv stub: forced failure on call $n\" >&2\n\
+             \x20 exit 1\n\
+             fi\n\
+             exec '{real}' \"$@\"\n",
+            count = dir.join("mv-calls").display(),
+            real = real_tool("mv").display(),
+        ),
+    );
+    dir
+}
+
+/// A failed rename in the certificate swap must leave the configured paths
+/// holding the pair they held before the run.
+///
+/// The swap is four renames: the old certificate and the old key to their
+/// backups, then the new certificate and the new key into place. Each call of
+/// the loop forces one of them to fail. Without the rollback, a failure at the
+/// second leaves the old key with no certificate, and a failure at the third or
+/// fourth leaves the new certificate or no certificate beside the old key's
+/// backup. The service keeps the pair it loaded, so the next restart is the one
+/// that fails.
+///
+/// The counter is asserted because a run that stopped before the swap would
+/// leave the old pair in place too, and would pass for the wrong reason.
+#[test]
+fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
+    let script = repo_root().join("script/install-selfsigned.sh");
+
+    for fail_at in 1..=4 {
+        let root = scratch_tree(
+            "install",
+            &format!("swap-fails-at-{fail_at}"),
+            &["etc/volto", "usr/local/bin"],
+        );
+        let conf_dir = root.join("etc/volto");
+        let (cert, key) = plant_placeholder_certificates(&conf_dir);
+        let old_cert = fs::read(&cert).expect("the old certificate must be readable");
+        let old_key = fs::read(&key).expect("the old key must be readable");
+
+        let binary = plant_binary_without_the_flag(&root, "volto-stub");
+        let stubs = plant_root_stubs(&root, fail_at);
+        let path = std::env::var_os("PATH").expect("PATH must be set");
+        let path = std::env::join_paths(
+            std::iter::once(stubs.clone()).chain(std::env::split_paths(&path)),
+        )
+        .expect("the stub directory must fit in PATH");
+
+        let output = Command::new("bash")
+            .arg(&script)
+            .args([
+                "--force",
+                "--sni",
+                "volto.test",
+                "--binary",
+                binary.to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+                "-w",
+                "correct-horse-battery",
+            ])
+            .current_dir(repo_root())
+            .env("VOLTO_INSTALL_ROOT", &root)
+            .env("PATH", path)
+            .output()
+            .expect("the installer script must be runnable");
+        let stderr = stderr_of(&output);
+
+        assert!(
+            !output.status.success(),
+            "rename {fail_at} failed, so the run must fail: {stderr}"
+        );
+        let calls: usize = fs::read_to_string(stubs.join("mv-calls"))
+            .unwrap_or_else(|error| panic!("the run never reached the swap: {error}\n{stderr}"))
+            .trim()
+            .parse()
+            .expect("the call count must be a number");
+        assert!(
+            calls >= fail_at
+                && stderr.contains(&format!("mv stub: forced failure on call {fail_at}")),
+            "the forced failure must be the one at rename {fail_at}: {stderr}"
+        );
+
+        assert_eq!(
+            fs::read(&cert).ok(),
+            Some(old_cert),
+            "after a failure at rename {fail_at} the old certificate must be back at {}: {stderr}",
+            cert.display()
+        );
+        assert_eq!(
+            fs::read(&key).ok(),
+            Some(old_key),
+            "after a failure at rename {fail_at} the old key must be back at {}: {stderr}",
+            key.display()
+        );
+
+        let mut leftovers: Vec<String> = fs::read_dir(&conf_dir)
+            .expect("the configuration directory must be readable")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
+            .collect();
+        leftovers.sort();
+        assert!(
+            leftovers.is_empty(),
+            "after a failure at rename {fail_at} no new or backup file may stay behind, found {leftovers:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("installing the new certificate failed"),
+            "the run must say the swap failed: {stderr}"
+        );
     }
 }
 
