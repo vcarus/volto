@@ -52,3 +52,11 @@ updates:
     directory: "/tests/interop/aioquic"
     schedule:
       interval: weekly
+    # aioquic pins pylsqpack to one major, so the two cannot move in separate
+    # PRs: on 2026-10-16 Dependabot opened one per package and pip could not
+    # resolve either (#31, #32). One PR for the whole client keeps the pins
+    # resolvable together.
+    groups:
+      interop-client:
+        patterns:
+          - "*"
