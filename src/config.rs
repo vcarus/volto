@@ -190,9 +190,10 @@ pub const MAX_INITIAL_MTU: u16 = 1452;
 
 /// Default ceiling for path MTU discovery, in bytes.
 ///
-/// Below quinn's own default of 1452, which quinn-proto `config/transport.rs`
-/// chooses "to stay within Ethernet's MTU when using IPv4 and IPv6": 1500 minus
-/// IPv6's 40-byte header and UDP's 8. The same file says "It is safe to use an
+/// Below quinn's own default of 1452, which quinn-proto 0.11.x
+/// `src/config/transport.rs`, `MtuDiscoveryConfig::upper_bound`, chooses "to
+/// stay within Ethernet's MTU when using IPv4 and IPv6": 1500 minus IPv6's
+/// 40-byte header and UDP's 8. The same doc comment says "It is safe to use an
 /// arbitrarily high upper bound, regardless of the network path's MTU". That
 /// holds only on a path that drops a packet it cannot carry.
 ///

@@ -6,25 +6,31 @@
 //! removed. quinn's BBR as it ships is the value `bbr-uncapped`. The type keeps
 //! the name [`BbrCapped`].
 //!
-//! quinn-proto 0.11.18's BBR overestimates the bottleneck bandwidth, so its
+//! quinn-proto 0.11.x's BBR overestimates the bottleneck bandwidth, so its
 //! congestion window never limits what is in flight. Paths below are in that
-//! crate. quinn calls `Controller::on_ack` once per acknowledged packet
-//! (`src/connection/mod.rs` line 1621). For each call BBR takes that packet's
-//! bytes over the time since the previous call
-//! (`src/congestion/bbr/bw_estimation.rs`, lines 55 to 62). For the first
-//! packet of an ACK frame that time is the gap since the previous ACK frame.
-//! For the other packets of the frame it is zero, and the rate is zero. The
-//! sample is the lower of that rate and a send rate taken from the last two
-//! `on_sent` calls (lines 46 to 53 and 64), and it reads several times too
-//! high. The max filter is only updated with a new maximum (line 65), so its
-//! ten-round window (`src/congestion/bbr/min_max.rs`, line 114) never expires
-//! an old one. The window BBR computes from that estimate (`get_target_cwnd`,
-//! `src/congestion/bbr/mod.rs` lines 264 to 274) runs to tens of megabytes, and
-//! in-flight data is limited only by the recovery window and the peer's flow
-//! control. quinn paces from the window (`src/connection/pacing.rs` line 92,
-//! 1.25 windows per smoothed RTT), so nothing slows the sender to the
-//! bottleneck. On one production path a bulk download lost 17 to 21 percent of
-//! the packets sent this way.
+//! crate. The quinn-proto citations in volto were verified against quinn-proto
+//! 0.11.19 on 2026-10-16, and the dependency update checklist in
+//! `dev_docs/workflows.md` asks for the same check on every quinn-proto bump.
+//! quinn calls `Controller::on_ack` once per acknowledged packet
+//! (`src/connection/mod.rs`, `Connection::on_packet_acked`). For each call BBR
+//! takes that packet's bytes over the time since the previous call
+//! (`src/congestion/bbr/bw_estimation.rs`, `BandwidthEstimation::on_ack`, the
+//! `ack_rate` binding). For the first packet of an ACK frame that time is the
+//! gap since the previous ACK frame. For the other packets of the frame it is
+//! zero, and the rate is zero. The sample is the lower of that rate and a send
+//! rate taken from the last two `on_sent` calls (the `send_rate` binding, and
+//! `send_rate.min(ack_rate)` after it), and it reads several times too high.
+//! The max filter is only updated with a new maximum (the
+//! `self.max_filter.get() < bandwidth` condition in front of `update_max`), so
+//! its ten-round window (`src/congestion/bbr/min_max.rs`, `MinMax::default`,
+//! the field `window`) never expires an old one. The window BBR computes from
+//! that estimate (`src/congestion/bbr/mod.rs`, `Bbr::get_target_cwnd`) runs to
+//! tens of megabytes, and in-flight data is limited only by the recovery window
+//! and the peer's flow control. quinn paces from the window
+//! (`src/connection/pacing.rs`, `Pacer::delay`, which adds 1.25 windows of
+//! tokens per smoothed RTT), so nothing slows the sender to the bottleneck. On
+//! one production path a bulk download lost 17 to 21 percent of the packets
+//! sent this way.
 //!
 //! [`BbrCapped`] forwards every callback to quinn's BBR and only lowers
 //! [`Controller::window`]. It measures the delivery rate once per round trip:
@@ -38,32 +44,32 @@
 //! window can be 240 kB. Because quinn paces from the window, the cap also sets
 //! the pacing rate, in-flight data sits at the cap, and a quarter of a
 //! bandwidth-delay product stands in the bottleneck queue. 1.25 is the highest
-//! pacing gain of BBR's ProbeBW cycle (`K_PACING_GAIN`,
-//! `src/congestion/bbr/mod.rs` line 642). BBR's window gain of two (line 640)
-//! is a ceiling above a sender that paces at the estimated rate. In quinn the
-//! window is what the sender sends, so a gain of two keeps a whole
-//! bandwidth-delay product queued and loses packets wherever the queue is
-//! shorter than that. BBR's response to loss is unchanged: it has none beyond
-//! its recovery window, which is the property D33 chose BBR for. The wrapper's
-//! only response to loss is to end its startup gain, described next.
+//! pacing gain of BBR's ProbeBW cycle (`src/congestion/bbr/mod.rs`,
+//! `K_PACING_GAIN`). BBR's window gain of two (`K_DERIVED_HIGH_CWNDGAIN`) is a
+//! ceiling above a sender that paces at the estimated rate. In quinn the window
+//! is what the sender sends, so a gain of two keeps a whole bandwidth-delay
+//! product queued and loses packets wherever the queue is shorter than that.
+//! BBR's response to loss is unchanged: it has none beyond its recovery window,
+//! which is the property D33 chose BBR for. The wrapper's only response to loss
+//! is to end its startup gain, described next.
 //!
 //! A new connection uses a higher gain until its estimate stops growing. With
 //! the window at the cap, each sample can only show the rate the cap allows, so
 //! at 1.25 the estimate grows by at most 1.25 times per sample. The startup
-//! gain is BBR's Startup gain, 2/ln 2, about 2.89 (`K_DEFAULT_HIGH_GAIN`,
-//! `src/congestion/bbr/mod.rs` line 638). The estimate has stopped growing when
-//! three samples in a row from intervals that were not app-limited have not
-//! raised it by 25 percent since it last did. This is BBR's full-bandwidth test,
-//! with quinn's constants (`K_STARTUP_GROWTH_TARGET` and
-//! `K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP`, lines 644 and 645). A
-//! congestion event also ends the startup when the sample interval it falls in
-//! does not raise the estimate by 25 percent, whether or not that interval was
-//! app-limited. quinn's own Startup ends the same way when it is in recovery at
-//! a round trip without growth (`check_if_full_bw_reached`, lines 372 to 391),
-//! but only in a round trip that is not app-limited. quinn reports a sender
-//! blocked by the peer's flow control as app-limited, so behind a flow-control
-//! window smaller than the startup cap the full-bandwidth test never runs, and
-//! without the congestion exit the startup gain would stay.
+//! gain is BBR's Startup gain, 2/ln 2, about 2.89 (`src/congestion/bbr/mod.rs`,
+//! `K_DEFAULT_HIGH_GAIN`). The estimate has stopped growing when three samples
+//! in a row from intervals that were not app-limited have not raised it by 25
+//! percent since it last did. This is BBR's full-bandwidth test, with quinn's
+//! constants (`K_STARTUP_GROWTH_TARGET` and
+//! `K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP`). A congestion event
+//! also ends the startup when the sample interval it falls in does not raise
+//! the estimate by 25 percent, whether or not that interval was app-limited.
+//! quinn's own Startup ends the same way when it is in recovery at a round trip
+//! without growth (`Bbr::check_if_full_bw_reached`), but only in a round trip
+//! that is not app-limited. quinn reports a sender blocked by the peer's flow
+//! control as app-limited, so behind a flow-control window smaller than the
+//! startup cap the full-bandwidth test never runs, and without the congestion
+//! exit the startup gain would stay.
 //!
 //! The startup gain returns when the estimate climbs back after a fall. The
 //! estimate keeps a sample for ten intervals, so a loss episode longer than that
@@ -86,11 +92,11 @@
 //! queue in it would raise the cap, and with it the queue, each time. So the
 //! wrapper empties the queue before it measures, the way BBR's ProbeRTT does.
 //! quinn's BBR does not do that for it. It enters ProbeRTT every 10 s
-//! (`is_min_rtt_expired`, `src/congestion/bbr/mod.rs` lines 213 to 219), but
-//! its ProbeRTT window is 0.75 times its own inflated target window
-//! (`get_probe_rtt_cwnd`, lines 276 to 280, with `PROBE_RTT_BASED_ON_BDP` true
-//! at line 650), so in-flight data does not fall. Its minimum RTT is
-//! `RttEstimator::min` as well (line 412).
+//! (`src/congestion/bbr/mod.rs`, `Bbr::is_min_rtt_expired`), but its ProbeRTT
+//! window is 0.75 times its own inflated target window
+//! (`Bbr::get_probe_rtt_cwnd`, with the constant `PROBE_RTT_BASED_ON_BDP`
+//! true), so in-flight data does not fall. Its minimum RTT is
+//! `RttEstimator::min` as well (`on_ack` in `impl Controller for Bbr`).
 //!
 //! The minimum is the lowest `now - sent` of any acknowledged packet. The
 //! peer's ACK delay is part of it, which can only make it larger. A sample at
@@ -154,17 +160,17 @@ const CWND_GAIN_PERMILLE: u128 = 1_250;
 const PROBE_GAIN_PERMILLE: u128 = 500;
 
 /// The window cap until the estimate stops growing, in per mille: BBR's Startup
-/// gain, 2/ln 2 (quinn-proto 0.11.18, `K_DEFAULT_HIGH_GAIN` = 2.885,
-/// `src/congestion/bbr/mod.rs` line 638).
+/// gain, 2/ln 2 (quinn-proto 0.11.x, `src/congestion/bbr/mod.rs`,
+/// `K_DEFAULT_HIGH_GAIN` = 2.885).
 const STARTUP_GAIN_PERMILLE: u128 = 2_885;
 
 /// How much the estimate has to rise, in percent of its value when it last
 /// rose, to count as growth: BBR's full-bandwidth test
-/// (`K_STARTUP_GROWTH_TARGET` = 1.25, line 644).
+/// (`K_STARTUP_GROWTH_TARGET` = 1.25).
 const GROWTH_PERCENT: u128 = 125;
 
 /// How many samples in a row without growth end the startup
-/// (`K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP` = 3, line 645).
+/// (`K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP` = 3).
 const SAMPLES_WITHOUT_GROWTH: u8 = 3;
 
 /// How far the estimate has to be below its highest value, in percent of it,
@@ -761,8 +767,9 @@ mod tests {
             );
             c.startup.ended = true;
             // An MTU update raises quinn's BBR window to at least four packets,
-            // but not the initial window it reports (quinn-proto 0.11.18
-            // `src/congestion/bbr/mod.rs` lines 478 to 483 and 506 to 508).
+            // but not the initial window it reports (quinn-proto 0.11.x
+            // `src/congestion/bbr/mod.rs`, `on_mtu_update` and `initial_window`
+            // in `impl Controller for Bbr`).
             c.on_mtu_update(1200);
 
             let t0 = Instant::now();

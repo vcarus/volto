@@ -29,6 +29,9 @@
 //!   bump for a git revision, and cargo-audit skips a lockfile entry whose
 //!   source is not the default registry. A patch reintroduced in either
 //!   workspace would take quinn-proto back out of both.
+//! * **`src/` cites quinn-proto by symbol, not by line number.** A line number
+//!   goes stale on every quinn-proto bump, and a stale one still points at
+//!   some line.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -37,7 +40,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use scripts::{read_text, repo_root};
+use scripts::{read_text, repo_root, rust_files, source_root};
 
 /// Every `script/…` path the release workflow copies into the tarball.
 fn packaged_paths() -> BTreeSet<String> {
@@ -349,6 +352,78 @@ fn quinn_proto_is_an_unpatched_registry_dependency() {
             path.display()
         );
     }
+}
+
+/// Paths and names that mark a line of `src/` as a citation of quinn-proto.
+///
+/// The crate name, and the quinn-proto source paths this crate's comments
+/// cite. A path alone is enough, because a citation often names the crate on
+/// the line before. `src/config.rs` has no entry here: it is a file of this
+/// crate, and its comments speak of "line 7" in a TOML document.
+const QUINN_PROTO_MARKERS: [&str; 5] = [
+    "quinn-proto",
+    "src/congestion/",
+    "src/connection/",
+    "src/config/mod.rs",
+    "src/endpoint.rs",
+];
+
+/// Whether `line` carries a line number: `line N` or `lines N to M`, where the
+/// word starts at a word boundary and is followed by a digit.
+fn carries_a_line_number(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    line.match_indices("line").any(|(at, _)| {
+        let starts_a_word = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
+        let rest = &line[at + "line".len()..];
+        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        starts_a_word
+            && rest
+                .strip_prefix(' ')
+                .is_some_and(|after| after.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+/// No comment in `src/` cites quinn-proto by line number.
+///
+/// Asserted: no line of any `.rs` file under `src/` both names quinn-proto or
+/// one of the source paths in [`QUINN_PROTO_MARKERS`] and carries `line N` or
+/// `lines N to M`. A citation names the file and the symbol instead: the
+/// function, method, constant or field.
+///
+/// A line number goes stale on every quinn-proto bump and a symbol does not.
+/// The lock file moved from 0.11.18 to 0.11.19 with every line-number citation
+/// in `src/congestion.rs` and `src/quic.rs` left unchecked, and one of them,
+/// the call to `Controller::on_ack` in `src/connection/mod.rs`, had already
+/// moved by three lines. A stale line number still points at some line, so
+/// nothing reports it. A renamed symbol is not found at all, which the reader
+/// sees at once.
+#[test]
+fn no_source_comment_cites_quinn_proto_by_line_number() {
+    let root = source_root();
+    let mut offenders = Vec::new();
+
+    for path in rust_files(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .expect("under src/")
+            .display()
+            .to_string();
+        for (index, line) in read_text(&path).lines().enumerate() {
+            let cites_quinn_proto = QUINN_PROTO_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker));
+            if cites_quinn_proto && carries_a_line_number(line) {
+                offenders.push(format!("src/{relative}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these lines cite quinn-proto by line number; name the file and the symbol \
+         instead, because a line number goes stale on every quinn-proto bump:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// The `version` a `[[package]]` block records in a lockfile, by package name.

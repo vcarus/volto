@@ -70,7 +70,7 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
 /// reads and hands a copy to `Endpoint::set_server_config`, so the new numbers
 /// apply to every connection this process accepts from then on.
 ///
-/// The endpoint's copy governs a different thing. quinn-proto 0.11.18 reads it as
+/// The endpoint's copy governs a different thing. quinn-proto 0.11.x reads it as
 /// a connection's first Initial arrives, to derive the Initial keys and to
 /// validate an address-validation token, and copies it into the buffer it keeps
 /// for that pending `Incoming`, where it is what seals a Retry. It is not what
@@ -326,7 +326,7 @@ type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
 /// one new connection runs on. The third closes the second race rather than
 /// narrowing it, because both of those reads are now reads this process makes.
 /// The first is the live [`Config`]. The second is [`LiveQuicConfig`], which
-/// `Incoming::accept_with` then uses in place of the copy quinn-proto 0.11.18
+/// `Incoming::accept_with` then uses in place of the copy quinn-proto 0.11.x
 /// pinned to the connection when its first Initial arrived. Nothing about the
 /// accepted connection is decided by a read the endpoint driver makes on its own
 /// (D22, addendum of 2026-09-17).
@@ -958,13 +958,14 @@ impl Server {
         //
         // The two keys differ when a `SIGHUP` lands between the Retry and the
         // returning Initial, because `server_config` builds every configuration
-        // with `ServerConfig::with_crypto`, which draws a fresh `token_key` each
-        // time (quinn-proto 0.11.18 `src/config/mod.rs` lines 396 to 408). A
-        // Retry token that crosses a `SIGHUP` then fails to decode under the new
-        // key, and quinn-proto treats the returning Initial as carrying no token.
-        // That connection attempt fails; it does not cost one more round trip
-        // the way a NEW_TOKEN token does in the paragraph above. If the server is
-        // still full, `admit` sends a second Retry, and the client discards it:
+        // with `ServerConfig::with_crypto`, which draws a fresh `token_key`
+        // each time (quinn-proto 0.11.x `src/config/mod.rs`,
+        // `ServerConfig::with_crypto`). A Retry token that crosses a `SIGHUP`
+        // then fails to decode under the new key, and quinn-proto treats the
+        // returning Initial as carrying no token. That connection attempt
+        // fails; it does not cost one more round trip the way a NEW_TOKEN token
+        // does in the paragraph above. If the server is still full, `admit`
+        // sends a second Retry, and the client discards it:
         //
         //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
         //# A client MUST accept and process at most one Retry packet for each
@@ -978,11 +979,11 @@ impl Server {
         // TRANSPORT_PARAMETER_ERROR. Either way the client has to start a new
         // attempt. This needs the server to be full and a reload to land inside
         // one round trip. Keeping one key across reloads would remove it: a key
-        // drawn once and set with `ServerConfig::token_key` (`src/config/mod.rs`
-        // line 275) on every build, with one `ValidationTokenConfig` shared
-        // across builds so that its log of used NEW_TOKEN tokens survives too.
-        // That is not done, because D31 records key rotation on reload as the
-        // current behaviour.
+        // drawn once and set with `ServerConfig::token_key` (quinn-proto 0.11.x
+        // `src/config/mod.rs`) on every build, with one `ValidationTokenConfig`
+        // shared across builds so that its log of used NEW_TOKEN tokens
+        // survives too. That is not done, because D31 records key rotation on
+        // reload as the current behaviour.
         if !incoming.remote_address_validated() {
             if incoming.may_retry() {
                 match incoming.retry() {
@@ -1079,16 +1080,16 @@ impl Server {
     /// wholly on one generation.
     ///
     /// Reading the second one here is the whole point of the slot. What quinn
-    /// would otherwise use is the copy quinn-proto 0.11.18 took from the
+    /// would otherwise use is the copy quinn-proto 0.11.x took from the
     /// endpoint when this connection's first Initial arrived, which a `SIGHUP`
     /// in between makes a generation old: `Incoming::accept()`, which
     /// `IntoFuture for Incoming` calls, passes no configuration, and
     /// `proto::Endpoint::accept` then falls back to
-    /// `incoming_buffer.server_config` (quinn-proto `endpoint.rs`,
-    /// `server_config.unwrap_or_else(..)`). That window opens in the endpoint
-    /// driver, where no lock in this file reaches, so it is closed by stating
-    /// the value rather than by ordering the read (D22, addendum of
-    /// 2026-09-17).
+    /// `incoming_buffer.server_config` (quinn-proto 0.11.x `src/endpoint.rs`,
+    /// `Endpoint::accept`, `server_config.unwrap_or_else(..)`). That window
+    /// opens in the endpoint driver, where no lock in this file reaches, so it
+    /// is closed by stating the value rather than by ordering the read (D22,
+    /// addendum of 2026-09-17).
     ///
     /// The guard covers two synchronous reads and the synchronous half of the
     /// accept, and no await. `Incoming::accept_with` answers the client's
@@ -1306,7 +1307,7 @@ impl Server {
         //
         // "New" counts from the first Initial. A handshake quinn had already
         // queued as an `Incoming` keeps the server configuration it arrived
-        // under (quinn-proto 0.11.18), so this call neither completes nor
+        // under (quinn-proto 0.11.x), so this call neither completes nor
         // refuses it. Nothing here ever accepts one: the accept loop has left by
         // the time this runs, and a queued `Incoming` goes away with the
         // endpoint.
@@ -1533,7 +1534,7 @@ impl ReloadHandle {
         // and `Incoming::accept_with` uses what it finds, while the endpoint's
         // own copy governs the pending path: as a first Initial arrives it
         // derives the Initial keys and validates an address-validation token,
-        // and quinn-proto 0.11.18 pins it to that connection, where it seals a
+        // and quinn-proto 0.11.x pins it to that connection, where it seals a
         // Retry. Built here so the two cannot be two different configurations.
         let accepted_with = Arc::new(quic_config);
 
@@ -1962,7 +1963,7 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 ///
 /// The mirror image of [`CONNECTION_RECEIVE_WINDOW`], and the only bound on what
 /// this process buffers for a client that has stopped reading. quinn-proto
-/// 0.11.18 counts bytes retained from application writes rather than bytes still
+/// 0.11.x counts bytes retained from application writes rather than bytes still
 /// unacknowledged: acknowledged data goes on counting until the storage holding
 /// it is released, which is what makes this a bound on memory rather than only on
 /// data in flight. What it counts is bytes accepted from the buffers this process

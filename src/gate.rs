@@ -28,11 +28,11 @@
 //!   that removes depends on the version. quinn's default `EndpointConfig`,
 //!   which [`crate::quic::Server::bind`] takes unchanged, supports seven:
 //!   version 1 and the six draft numbers `0xff00001d` to `0xff000022`
-//!   (quinn-proto's `DEFAULT_SUPPORTED_VERSIONS`). For a version outside that
-//!   list quinn would send a Version Negotiation packet, and refusing removes
-//!   the reply. For one of the six drafts quinn would open a connection, and
-//!   refusing removes the service. Nothing this server interoperates with is
-//!   affected, because Surge speaks version 1.
+//!   (quinn-proto 0.11.x `src/lib.rs`, `DEFAULT_SUPPORTED_VERSIONS`). For a
+//!   version outside that list quinn would send a Version Negotiation packet,
+//!   and refusing removes the reply. For one of the six drafts quinn would
+//!   open a connection, and refusing removes the service. Nothing this server
+//!   interoperates with is affected, because Surge speaks version 1.
 //! * **Long header, not an Initial** — passes. quinn drops a Handshake or 0-RTT
 //!   packet for an unknown connection without a word.
 //! * **An Initial in a datagram below 1200 bytes** — passes, because RFC 9000
