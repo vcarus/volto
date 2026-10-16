@@ -20,7 +20,7 @@ them — only RFC 9114 itself.
 
 ## The path of a request
 
-`quic.rs` owns the quinn endpoint. Transport parameters come from `[limits]`, so
+`quic/` owns the quinn endpoint. Transport parameters come from `[limits]`, so
 the stream cap, idle timeout, keep-alive, MTU settings, congestion controller and
 initial RTT are configuration rather than constants; they apply to connections
 accepted from then on, including across a SIGHUP reload. The stream cap is the
@@ -147,7 +147,7 @@ RFC 9209 `Proxy-Status` vocabulary refusals are written in, and
 Every wait that stands between a packet arriving and a tunnel opening is
 bounded, whatever the connection's authentication state, and two limits share
 the job. All but two of those waits are bounded by `limits.max_idle_timeout`:
-the QUIC/TLS handshake in `quic.rs`, the HTTP/3 handshake and the read of each
+the QUIC/TLS handshake in `quic/`, the HTTP/3 handshake and the read of each
 peer unidirectional stream's type in `h3/connection.rs`, the read of a request
 stream's HEADERS in `Resolver::resolve`, and every response this server writes
 before a tunnel starts relaying — 400, 403, 407, 431, 501 and the 5xx family,
