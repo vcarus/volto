@@ -74,9 +74,9 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// one request past the credentials check, after which it is closed with
 /// H3_NO_ERROR. Without a bound of some kind a peer that completes the QUIC
 /// handshake and then says nothing holds a `max_connections` slot for as long
-/// as it keeps its socket open, since the keep-alive PINGs `quic.rs` sends are
-/// answered by its QUIC stack with no application involved and so keep the
-/// transport's idle timeout from ever firing (D76). Once a request
+/// as it keeps its socket open, since the keep-alive PINGs `quic/transport.rs`
+/// configures are answered by its QUIC stack with no application involved and
+/// so keep the transport's idle timeout from ever firing (D76). Once a request
 /// authenticates the bound is gone for the life of the connection.
 ///
 /// The deadline is absolute rather than rearmed on each wait, which is the
@@ -121,8 +121,9 @@ pub async fn handle(
     let for_context = quic.clone();
 
     // One idle timeout for the whole HTTP/3 handshake -- the same value
-    // `quic.rs` puts in this connection's transport parameters. Why a handshake
-    // needs a deadline of its own is on `h3api::Connection::handshake`.
+    // `quic/transport.rs` puts in this connection's transport parameters. Why a
+    // handshake needs a deadline of its own is on
+    // `h3api::Connection::handshake`.
     let mut connection =
         h3api::Connection::handshake(quic, config.limits.max_idle_timeout(), dropped_datagrams)
             .await?;
@@ -198,8 +199,8 @@ pub async fn handle(
                 // Nothing wrong happened here: a peer that has not
                 // authenticated is simply not owed a connection slot it is not
                 // using. So this is a close with no error to signal rather than
-                // a violation, and `quic.rs` logs it as the idle ending it is
-                // (D76).
+                // a violation, and `quic/mod.rs` logs it as the idle ending it
+                // is (D76).
                 NextRequest::Silent => {
                     debug!(
                         remote = %context.remote,

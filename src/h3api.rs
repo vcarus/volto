@@ -135,7 +135,8 @@ mod tests {
         );
     }
 
-    /// The grading `quic.rs` logs by: two endings are routine, the rest warn.
+    /// The grading `quic/mod.rs` logs by: two endings are routine, the rest
+    /// warn.
     #[test]
     fn routine_endings_are_graded_as_such() {
         assert_eq!(

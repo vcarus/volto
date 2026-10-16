@@ -432,8 +432,8 @@ mod tests {
         assert_eq!(Code::QPACK_DECOMPRESSION_FAILED.value(), 0x200);
     }
 
-    /// The grading in `quic.rs` reads the connection close log off this text,
-    /// and `it_close_log` asserts the peer-close line names the variant.
+    /// The grading in `quic/mod.rs` reads the connection close log off this
+    /// text, and `it_close_log` asserts the peer-close line names the variant.
     #[test]
     fn a_peer_application_close_names_itself() {
         let error = ConnectionError::from(quinn::ConnectionError::ApplicationClosed(
@@ -448,11 +448,11 @@ mod tests {
     }
 
     /// A peer's *transport* close carries prose the peer wrote, and this type's
-    /// `Display` is what `quic.rs` records with `%error` on the `WARN` that ends
-    /// a connection. `Display` escapes nothing, and systemd splits a service's
-    /// stdout on `\n`, so a reason phrase reaching that line whole hands any peer
-    /// that can complete a handshake a journal entry of its own -- forged,
-    /// attributed to this server, and free.
+    /// `Display` is what `quic/mod.rs` records with `%error` on the `WARN` that
+    /// ends a connection. `Display` escapes nothing, and systemd splits a
+    /// service's stdout on `\n`, so a reason phrase reaching that line whole
+    /// hands any peer that can complete a handshake a journal entry of its own
+    /// -- forged, attributed to this server, and free.
     ///
     /// The peer's own words are still worth having, so they are kept: bounded and
     /// `Debug`-escaped where they enter this type, which is the same division of

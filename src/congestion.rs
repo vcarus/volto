@@ -9,11 +9,10 @@
 //! quinn-proto 0.11.x's BBR overestimates the bottleneck bandwidth, so its
 //! congestion window never limits what is in flight. Paths below are in that
 //! crate. The quinn-proto citations in volto were verified against quinn-proto
-//! 0.11.19 on 2026-10-16, and the dependency update checklist in
-//! `dev_docs/workflows.md` asks for the same check on every quinn-proto bump.
-//! quinn calls `Controller::on_ack` once per acknowledged packet
-//! (`src/connection/mod.rs`, `Connection::on_packet_acked`). For each call BBR
-//! takes that packet's bytes over the time since the previous call
+//! 0.11.19 on 2026-10-16. quinn calls `Controller::on_ack` once per
+//! acknowledged packet (`src/connection/mod.rs`,
+//! `Connection::on_packet_acked`). For each call BBR takes that packet's bytes
+//! over the time since the previous call
 //! (`src/congestion/bbr/bw_estimation.rs`, `BandwidthEstimation::on_ack`, the
 //! `ack_rate` binding). For the first packet of an ACK frame that time is the
 //! gap since the previous ACK frame. For the other packets of the frame it is

@@ -766,10 +766,10 @@ impl Drop for Connection {
     /// datagrams.
     ///
     /// H3_NO_ERROR is RFC 9114 §8.1's code for when "the connection or stream
-    /// needs to be closed, but there is no error to signal". `quic.rs` depends
-    /// on this happening: it is why `quinn::Connection::close_reason()` cannot be used
-    /// to grade a connection's closing log line, and why the error *value*
-    /// returned by `conn::handle` is graded instead.
+    /// needs to be closed, but there is no error to signal". `quic/mod.rs`
+    /// depends on this happening: it is why `quinn::Connection::close_reason()`
+    /// cannot be used to grade a connection's closing log line, and why the
+    /// error *value* returned by `conn::handle` is graded instead.
     fn drop(&mut self) {
         self.handle.quic.close(
             varint(Code::H3_NO_ERROR),

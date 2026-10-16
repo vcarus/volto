@@ -239,14 +239,14 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "77jqt7xj",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "accepting QUIC connections",
         bound: Bound::Lifecycle,
         reason: "Once, when the endpoint starts its accept loop.",
     },
     Accounted {
         id: "7l4svyo3",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "connection established",
         bound: Bound::PerConnection,
         reason: "One per completed QUIC handshake, which is the price D76 makes \
@@ -254,7 +254,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "8ro19wv6",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "connection closed",
         bound: Bound::PerConnection,
         reason: "The other end of the same pair: one per connection, carrying the \
@@ -262,7 +262,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "9pds6tk6",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "connection closed with error",
         bound: Bound::PerConnection,
         reason: "The same line for a connection that ended badly -- one per \
@@ -271,35 +271,35 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "7x7xt92f",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "shutting down: no new connections, letting existing tunnels finish",
         bound: Bound::Lifecycle,
         reason: "Once, when `drain` closes the door.",
     },
     Accounted {
         id: "85kda9tt",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "every connection finished within the grace period",
         bound: Bound::Lifecycle,
         reason: "One of the two outcomes of the single drain, written once.",
     },
     Accounted {
         id: "89143be4",
-        file: "quic.rs",
+        file: "quic/mod.rs",
         message: "grace period expired, closing the remaining connections",
         bound: Bound::Lifecycle,
         reason: "The other outcome of the same single drain.",
     },
     Accounted {
         id: "aie853ib",
-        file: "quic.rs",
+        file: "quic/reload.rs",
         message: "configuration reloaded; new connections will use it",
         bound: Bound::Lifecycle,
         reason: "One per successful reload, and a reload starts with SIGHUP.",
     },
     Accounted {
         id: "amplq5bv",
-        file: "quic.rs",
+        file: "quic/reload.rs",
         message: "server.listen changed, but a reload cannot move the listening socket; the \
                   server is still bound where it started. Restart to apply it.",
         bound: Bound::Lifecycle,
@@ -309,7 +309,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "om0np2q6",
-        file: "quic.rs",
+        file: "quic/reload.rs",
         message: "a startup-only socket buffer changed, but a reload cannot resize the \
                   socket the endpoint is bound to; it keeps the size it started with. \
                   Restart to apply it.",
@@ -320,7 +320,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "bg9ux69o",
-        file: "quic.rs",
+        file: "quic/reload.rs",
         message: "{warning}",
         bound: Bound::Lifecycle,
         reason: "One per warning the reloaded configuration produced, on the same \
@@ -328,7 +328,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "bt1hbfco",
-        file: "quic.rs",
+        file: "quic/socket.rs",
         message: "RLIMIT_NOFILE leaves no room for limits.max_connections x \
                   limits.max_targets_per_conn: clients at their quotas can exhaust the \
                   process. Raise LimitNOFILE (systemd) or lower either limit.",
@@ -338,7 +338,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "djabk3lf",
-        file: "quic.rs",
+        file: "quic/socket.rs",
         message: "the kernel refused the UDP socket buffer {} asks for, so the socket keeps the \
                   operating system default. Lower the value, or raise this host's ceiling ({} on \
                   Linux, kern.ipc.maxsockbuf on macOS).",
@@ -348,7 +348,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "einsvqj5",
-        file: "quic.rs",
+        file: "quic/socket.rs",
         message: "the kernel granted less UDP socket buffer than {} asks for: a burst that \
                   outruns this socket is dropped there, silently, and has to be sent again. Raise \
                   this host's ceiling (sysctl -w {}=<bytes> on Linux, kern.ipc.maxsockbuf on \
