@@ -3,9 +3,9 @@
 # go.sum pins masque-go's: an interop client that floats is an interop client
 # whose failures start with "which version was that". Dependabot watches this
 # file (pip ecosystem) the way it watches go.mod.
-aioquic==1.6.1
+aioquic==1.7.0
 attrs==26.1.0
-certifi==2026.7.22
+certifi==2026.10.19
 cffi==2.1.1
 cryptography==50.0.2
 pycparser==3.11
