@@ -5,7 +5,7 @@
 # file (pip ecosystem) the way it watches go.mod.
 aioquic==1.7.0
 attrs==26.1.0
-certifi==2026.10.19
+certifi==2026.10.23
 cffi==2.1.1
 cryptography==50.0.2
 pycparser==3.12
