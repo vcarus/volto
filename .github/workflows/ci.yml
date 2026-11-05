@@ -99,10 +99,13 @@ jobs:
       # discovered by whoever next runs a benchmark. This is the only job that
       # sees them.
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      # rustdoc's own lints -- a link to an item that does not exist, or that a
-      # public reader cannot see -- are warnings by default and nothing else
-      # runs rustdoc, so they would accumulate unseen.
-      - run: cargo doc --no-deps --locked
+      # rustdoc's own lints are warnings by default, so they would accumulate
+      # unseen. The two builds split the work. docs.yml builds the public docs
+      # on every pull request and push, which is where a public page linking to
+      # a private item fails. This build includes private items, which is where
+      # a broken link inside a private item's doc comment fails; the public
+      # build never renders those comments.
+      - run: cargo doc --no-deps --document-private-items --locked
         env:
           RUSTDOCFLAGS: -D warnings
 
