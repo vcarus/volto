@@ -29,9 +29,11 @@ on:
       - .github/workflows/cross.yml
       - .github/workflows/release.yml
 
+# As in ci.yml: a new push to a pull request supersedes its running check, and
+# on main every commit keeps its own run.
 concurrency:
   group: cross-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -43,6 +45,7 @@ jobs:
   build:
     name: cross (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

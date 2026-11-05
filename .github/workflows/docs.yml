@@ -8,19 +8,24 @@ name: Docs
 #   * the crate's **rustdoc** under `/api/`, laid out so that `/api/` is the
 #     crate page itself rather than a redirect into `/api/volto/`.
 #
-# It runs only on `main`: a pull request cannot publish, and nothing in it needs
-# more than read access to the repository.
+# A pull request builds and checks the site but does not publish it, so a
+# broken link or anchor is found before it reaches `main`. Only a push to `main`
+# or a manual run uploads the artifact and deploys. The build job needs no more
+# than read access to the repository.
 
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 # Deployments queue rather than cancel: Pages serves whichever finished last,
 # and cancelling one midway would leave a stale site behind a newer commit.
+# A pull request gets a group of its own, so it never waits behind a
+# deployment, and a new push to it supersedes its running check.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ${{ github.event_name == 'pull_request' && format('docs-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -33,6 +38,8 @@ jobs:
   build:
     name: site
     runs-on: ubuntu-latest
+    # The same limit as ci.yml's jobs carry.
+    timeout-minutes: 15
     env:
       # mdBook 0.5.4, the latest release at the time this was pinned
       # (2026-09-02). Pinned by version *and* by digest of the exact asset:
@@ -321,13 +328,16 @@ jobs:
           PY
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
         with:
           path: site
 
   deploy:
     name: deploy
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # The only write this workflow performs, scoped to the job that performs it.
     permissions:
       pages: write

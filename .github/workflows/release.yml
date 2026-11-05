@@ -29,6 +29,9 @@ jobs:
     # this point, since every other job needs this one.
     name: require CI on the tagged commit
     runs-on: ubuntu-latest
+    # Every job here carries the same limit as ci.yml's: about five times the
+    # slowest job, so a hang ends in minutes rather than after six hours.
+    timeout-minutes: 15
     permissions:
       contents: read
       # `gh run list` reads workflow runs, which `contents: read` does not cover.
@@ -66,6 +69,7 @@ jobs:
     name: build (${{ matrix.target }})
     needs: ci-passed
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -163,6 +167,7 @@ jobs:
     name: publish release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:

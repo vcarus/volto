@@ -5,10 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-# A new push to a branch supersedes the run already going on it.
+# A new push to a pull request supersedes its running check. On main every
+# commit keeps its own run, because release.yml requires a green ci.yml run for
+# the exact commit a tag names, and a cancelled run is not one.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # The token every job gets unless it says otherwise. Nothing here writes to the
 # repository, so nothing here can be made to.
@@ -28,10 +30,15 @@ env:
   # why they all pass `--locked`.
   CARGO_INCREMENTAL: 0
 
+# Every job carries `timeout-minutes: 15`. The slowest job takes about three
+# minutes, and without a limit a hung test holds its runner for GitHub's
+# default of six hours while a release waits on the result.
+
 jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -69,7 +76,7 @@ jobs:
           set -euo pipefail
           scripts="$(git ls-files '*.sh')"
           count="$(printf '%s\n' "$scripts" | grep -c .)"
-          [ "$count" -ge 4 ] ||
+          [ "$count" -ge 5 ] ||
             { echo "::error::git ls-files '*.sh' listed ${count} scripts where the tree carries five; this step is broken, not the scripts" >&2; exit 1; }
           # shellcheck disable=SC2086
           shellcheck $scripts
@@ -77,6 +84,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -107,6 +115,7 @@ jobs:
     # exactly that version, so the claim stays true rather than asserted.
     name: msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # The single place this workflow spells the version; the first step
       # asserts it against Cargo.toml, so the two cannot drift apart silently.
@@ -173,6 +182,7 @@ jobs:
     # this one exactly where it was.
     name: fuzz targets compile
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -205,6 +215,7 @@ jobs:
     # so, and would need a step here to recover it.
     name: audit (RustSec)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       # All the action writes: one check run carrying the report. It only opens
@@ -232,6 +243,7 @@ jobs:
     # stay green, so the suite runs on both rather than on one of them.
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -266,6 +278,7 @@ jobs:
     # the platform matrix is already covered by the `test` job above.
     name: interop (masque-go + aioquic)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     env:
       # Loopback, so nothing outside the runner can reach this server for the
       # minute it lives. The port is arbitrary and unprivileged.
@@ -306,6 +319,7 @@ jobs:
       # `if: always()` step at the end through this pid file. run-local.sh is
       # one shell throughout and uses an EXIT trap instead.
       - name: Start the server
+        id: server
         run: |
           nohup ./target/debug/volto --config interop/config.toml \
             > interop/server.log 2>&1 &
@@ -323,13 +337,19 @@ jobs:
         # of failing: `go test` then panics and the job fails.
         run: go test -v -count=1 -timeout 120s ./...
 
+      # This step and the two after it run even when the masque-go half failed.
+      # aioquic is the only independent coverage of the TCP tunnel, so a Go
+      # failure must not hide its result, and the log check judges both halves.
+      # They need only a server that started.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
         with:
           python-version: "3.13"
           cache: pip
           cache-dependency-path: tests/interop/aioquic/requirements.txt
 
       - name: Drive it with aioquic
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
         env:
           VOLTO_CERT: ${{ github.workspace }}/interop/cert.pem
         # The same server instance: every test opens its own QUIC connection, so
@@ -349,6 +369,7 @@ jobs:
       # callers use the same list. Before the teardown, so a failure here still
       # gets the log printed by the step below.
       - name: The server log is clean
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
         run: tests/interop/serve.sh check interop/server.log
 
       # Runs even when an earlier step failed, including before the server was
