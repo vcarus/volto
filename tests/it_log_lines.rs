@@ -317,6 +317,17 @@ const ACCOUNTED: &[Accounted] = &[
                  with; a reload starts with SIGHUP.",
     },
     Accounted {
+        id: "w8t2n5kr",
+        file: "quic/reload.rs",
+        message: "log.level changed, but the tracing subscriber is built once at startup \
+                  and a reload cannot change it; the server keeps the level it started \
+                  with. Restart to apply it. RUST_LOG, if set, overrides log.level.",
+        bound: Bound::Lifecycle,
+        reason: "At most one per reload, and only when the operator's own file \
+                 names a different level than the one the subscriber was built \
+                 with; a reload starts with SIGHUP.",
+    },
+    Accounted {
         id: "om0np2q6",
         file: "quic/reload.rs",
         message: "a startup-only socket buffer changed, but a reload cannot resize the \

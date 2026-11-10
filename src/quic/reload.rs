@@ -161,6 +161,26 @@ pub struct ReloadHandle {
     /// The other two, which are startup-only for the same reason; see
     /// [`RequestedBuffers`].
     pub(super) requested_buffers: RequestedBuffers,
+    /// The `[log].level` the tracing subscriber was built with.
+    ///
+    /// The subscriber is installed once, before the server binds, and nothing
+    /// rebuilds it: a reload can swap the live [`Config`] but not the filter
+    /// every line is judged by. Kept from bind so a reload can compare the file
+    /// against the value actually in force and say that a restart is needed;
+    /// see [`ReloadHandle::reload`].
+    pub(super) startup_log_level: String,
+}
+
+/// Whether a reloaded file asks for a different `[log].level` than the one the
+/// subscriber was built with.
+///
+/// Split out so both answers are testable without a server. The strings are
+/// compared rather than parsed filters because two spellings of the same
+/// directives are not necessarily the same filter (`volto=debug` and
+/// `VOLTO=debug` name different targets), and any textual change is a change
+/// the operator should hear about.
+fn log_level_differs(startup: &str, configured: &str) -> bool {
+    startup != configured
 }
 
 impl ReloadHandle {
@@ -283,6 +303,22 @@ impl ReloadHandle {
             );
         }
 
+        // The subscriber that applies `log.level` is installed once, before the
+        // server binds, and nothing rebuilds it. A reload stores the new value in
+        // the live configuration, where nothing reads it, so without this line a
+        // `SIGHUP` that raised verbosity looks exactly like one that did.
+        if log_level_differs(&self.startup_log_level, &config.log.level) {
+            warn!(
+                log_id = "w8t2n5kr",
+                startup = %self.startup_log_level,
+                configured = %config.log.level,
+                "log.level changed, but the tracing subscriber is built once at \
+                 startup and a reload cannot change it; the server keeps the level \
+                 it started with. Restart to apply it. RUST_LOG, if set, overrides \
+                 log.level."
+            );
+        }
+
         for warning in warnings {
             warn!(log_id = "bg9ux69o", "{warning}");
         }
@@ -324,5 +360,30 @@ impl ReloadHandle {
         warn_if_fd_budget_is_tight(&config.limits);
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reloaded `[log].level` is compared as the configured string.
+    ///
+    /// Equal means the subscriber, built once at startup, already judges every
+    /// line by it and there is nothing to say. Different means the file asks for
+    /// a filter the process cannot install without a restart, which is what the
+    /// warning is for. The strings are compared rather than parsed filters
+    /// because two spellings of the same directives are not necessarily the same
+    /// filter (`volto=debug` and `VOLTO=debug` name different targets), and any
+    /// textual change is a change the operator should hear about.
+    #[test]
+    fn a_changed_log_level_is_told_apart_from_the_startup_one() {
+        assert!(!log_level_differs("info", "info"));
+        assert!(!log_level_differs(
+            "volto=debug,quinn=info",
+            "volto=debug,quinn=info"
+        ));
+        assert!(log_level_differs("info", "debug"));
+        assert!(log_level_differs("volto=debug,quinn=info", "volto=info"));
     }
 }

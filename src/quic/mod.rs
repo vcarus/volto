@@ -173,6 +173,13 @@ pub struct Server {
     /// whole value in, so the second reload naming a new address would find
     /// the first one's already there and say nothing.
     listen: SocketAddr,
+    /// The `[log].level` the tracing subscriber was built with.
+    ///
+    /// Kept from bind for the same reason `listen` is: a reload swaps the whole
+    /// live configuration in, so a comparison against it would find the
+    /// reloaded value already there and say nothing. The subscriber itself is
+    /// installed once, in `main`, before this type exists; see [`ReloadHandle`].
+    startup_log_level: String,
 }
 
 impl Server {
@@ -241,6 +248,7 @@ impl Server {
                 send: config.limits.socket_send_buffer,
             },
             listen: config.server.listen,
+            startup_log_level: config.log.level.clone(),
             config: Arc::new(RwLock::new(config)),
             quic_config: Arc::new(RwLock::new(accepted_with)),
             roster: Roster::new(),
@@ -283,6 +291,7 @@ impl Server {
             swap: self.swap.clone(),
             requested_buffers: self.requested_buffers,
             listen: self.listen,
+            startup_log_level: self.startup_log_level.clone(),
         }
     }
 

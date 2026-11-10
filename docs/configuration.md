@@ -192,6 +192,14 @@ quinn never calls `setsockopt` itself, so a server that does not ask gets
 `net.core.rmem_default` — around 208 KiB — however high `rmem_max` has been
 raised; see [UDP socket buffers](deployment.md#udp-socket-buffers).
 
+**`[log].level` is startup-only.** The tracing subscriber that applies it is
+built once, before the server binds, and nothing rebuilds it. A reload carrying
+a new value is accepted and stored in the live configuration, but every line is
+still filtered by the level the process started with. The reload says so,
+naming both levels, so a `SIGHUP` meant to raise verbosity is not mistaken for
+one that did. Restart to apply it. `RUST_LOG`, when set, overrides `log.level`
+at startup, so a service environment that sets it is unaffected by either.
+
 **`keep_alive_interval` is validated as strictly below half the idle timeout,
 not at most half.** At exactly half, losing a single keep-alive packet is enough
 for the connection to time out. This pairing is what keeps a NAT mapping alive
@@ -491,7 +499,7 @@ Some details worth knowing before relying on it:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `level` | string | `"info"` | A bare level (`trace`/`debug`/`info`/`warn`/`error`) or a directive list such as `"volto=debug,quinn=info"`. `RUST_LOG` overrides it |
+| `level` | string | `"info"` | A bare level (`trace`/`debug`/`info`/`warn`/`error`) or a directive list such as `"volto=debug,quinn=info"`. Startup-only: the subscriber is built once at startup, a reload accepts a new value but cannot apply it, and a restart applies it. `RUST_LOG`, if set, overrides it |
 | `keylog` | bool | `false` | Write TLS secrets to the file named by `SSLKEYLOGFILE`. Debugging only; volto warns while it is on |
 
 At `debug`, every inbound request is logged with its method, path, `:protocol`

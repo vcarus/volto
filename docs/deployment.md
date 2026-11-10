@@ -525,6 +525,13 @@ rather than `reload` when the old credentials must stop working — a restart
 closes those connections after the shutdown grace period (see
 [Graceful shutdown](#graceful-shutdown)) instead of leaving them running.
 
+Some keys are startup-only: `server.listen`, `limits.socket_recv_buffer`,
+`limits.socket_send_buffer` and `log.level`. A reload accepts a new value for
+one of them and applies the rest of the file, but the key itself needs a
+restart, and the reload warns saying so. For `log.level` the tracing subscriber
+is built once at startup, so only a restart applies it; `RUST_LOG`, when set,
+overrides it.
+
 A reload is all-or-nothing. Parsing, validation and certificate loading all
 happen before anything is swapped in, so there is no state where a new
 certificate is paired with an old user list. If the file is broken, volto logs
