@@ -265,8 +265,10 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_ipv6_documentation(v6)
                 || is_ipv6_benchmarking(v6)
                 || is_orchid(v6)
+                || is_det(v6)
                 || is_discard_only(v6)
                 || is_local_use_nat64(v6)
+                || is_srv6_sids(v6)
         }
     }
 }
@@ -284,10 +286,15 @@ fn is_ipv4_documentation(octets: [u8; 4]) -> bool {
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
-/// `2001:db8::/32` — the IPv6 documentation range (RFC 3849).
+/// `2001:db8::/32` and `3fff::/20` — the IPv6 documentation ranges.
+///
+/// Reachable nowhere by definition, and the ranges examples and test fixtures
+/// are written with. RFC 3849's block is the one in long use; the IANA registry
+/// added `3fff::/20` as a second documentation block in July 2024.
 fn is_ipv6_documentation(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0db8
+    (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
 }
 
 /// `2001:2::/48` — the IPv6 benchmarking range (RFC 6890 Table 24, from
@@ -301,15 +308,30 @@ fn is_ipv6_benchmarking(v6: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000
 }
 
-/// `2001:10::/28` — ORCHID (RFC 6890 Table 26, from RFC 4843).
+/// `2001:10::/28` and `2001:20::/28` — ORCHID and ORCHIDv2.
 ///
 /// An ORCHID is a hash of a host identity, not a locator: nothing forwards one,
-/// so a tunnel to it can only ever hold a slot. The registry entry carries a
-/// termination date of March 2014 and its successor prefix `2001:20::/28` is not
-/// in RFC 6890, so only the original block is claimed here.
+/// so a tunnel to it can only ever hold a slot. The original block's registry
+/// entry carries a termination date of March 2014, and its successor is listed
+/// as ORCHIDv2. The IANA registry marks ORCHIDv2 globally reachable, but it is
+/// still an identifier rather than a location, so the second clause of this
+/// module's rule covers it: it is not a destination an internet-facing proxy has
+/// any business dialling.
 fn is_orchid(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
-    segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0010
+    segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020)
+}
+
+/// `2001:30::/28` — the Drone Remote ID Protocol Entity Tags (DETs) prefix.
+///
+/// The IANA registry lists the block as globally reachable, but its name says
+/// what it carries: entity tags, identifiers for a drone's remote identity. An
+/// entity tag is not a service to dial, so the second clause of this module's
+/// rule claims it, and `allow_private_networks` opens it for an operator who
+/// disagrees.
+fn is_det(v6: Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0030
 }
 
 /// `100::/64` — the discard-only prefix (RFC 6666).
@@ -319,6 +341,15 @@ fn is_orchid(v6: Ipv6Addr) -> bool {
 fn is_discard_only(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
     segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0)
+}
+
+/// `5f00::/16` — Segment Routing (SRv6) SIDs.
+///
+/// The IANA registry marks the block not globally reachable. A host with SRv6
+/// routes can still deliver it to an internal SID, which is the class
+/// `allow_private_networks` is meant to gate.
+fn is_srv6_sids(v6: Ipv6Addr) -> bool {
+    v6.segments()[0] == 0x5f00
 }
 
 /// `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215).
@@ -513,6 +544,18 @@ mod tests {
         // RFC 6890 Table 26, ORCHID (RFC 4843).
         "2001:10::1",
         "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
+        // ORCHIDv2, the successor prefix in the same 2001::/23 block.
+        "2001:20::1",
+        "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
+        // The Drone Remote ID Protocol Entity Tags (DETs) prefix.
+        "2001:30::1",
+        "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
+        // The second IPv6 documentation block, 3fff::/20.
+        "3fff::1",
+        "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
+        // Segment Routing (SRv6) SIDs, 5f00::/16.
+        "5f00::1",
+        "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
     ];
 
     const PUBLIC: &[&str] = &[
@@ -550,7 +593,15 @@ mod tests {
         "2001:1:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:2::/48
         "2001:2:1::1",                          // just above it
         "2001:f:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:10::/28
-        "2001:20::1",                           // just above it, ORCHIDv2
+        // Just above the top of the claimed 2001::/23 span, which now runs
+        // through 2001:3f:ffff:... (ORCHID, ORCHIDv2 and the DETs prefix).
+        "2001:40::1",
+        // The neighbours of the second documentation block, 3fff::/20.
+        "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
+        "4000::1",                                // just above it
+        // The neighbours of the SRv6 SID block, 5f00::/16.
+        "5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
+        "5f01::1",                                // just above it
     ];
 
     const NEVER: &[&str] = &[
@@ -746,8 +797,9 @@ mod tests {
 
         // The two IPv6 blocks carved out of 2001::/23. Their neighbours are
         // picked to miss Teredo (2001::/32), which is unwrapped before any of
-        // these rules run, and ORCHIDv2 (2001:20::/28) is deliberately public:
-        // RFC 6890's registry does not carry it.
+        // these rules run. The second span covers ORCHID, ORCHIDv2 and the DETs
+        // prefix: 2001:10::/28 through 2001:30::/28 run together under the
+        // masks, so the first public address above them is 2001:40::.
         for (last_public, first_private, last_private, first_public) in [
             (
                 "2001:1:ffff:ffff:ffff:ffff:ffff:ffff",
@@ -758,8 +810,8 @@ mod tests {
             (
                 "2001:f:ffff:ffff:ffff:ffff:ffff:ffff",
                 "2001:10::",
-                "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
-                "2001:20::",
+                "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
+                "2001:40::",
             ),
         ] {
             for public in [last_public, first_public] {
