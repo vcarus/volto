@@ -1007,7 +1007,7 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
     // Not the connection's budget: one control stream buffering one frame at a
     // time is already bounded, and a refusal here could not be the stream-class
     // one that budget hands out (see [`BufferBudget::unshared`]).
-    let mut frames = FrameReader::new(recv, BufferBudget::unshared());
+    let mut frames = FrameReader::on_server_control(recv, BufferBudget::unshared());
     let mut control = Control::default();
 
     // The two endings RFC 9114 §6.2.1 forbids, as a detail string for
@@ -1019,6 +1019,11 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
     //# The sender MUST NOT close the control stream, and the receiver
     //# MUST NOT request that the sender close the control stream.
     let ended: Cow<'static, str> = loop {
+        // Carried in before every read: the decoder parses one frame at a time,
+        // so the frame header it is about to judge has to be judged against
+        // what the last item left behind. `accept` is what sets it.
+        frames.note_settings_seen(control.settings);
+
         let item = match frames.next().await {
             Ok(Some(item)) => item,
 

@@ -268,15 +268,17 @@ fn every_short_varint_and_every_class_boundary_round_trips() {
 //
 // `frame::FrameDecoder` is the pure state machine: it holds every byte of its
 // own state, so a property can hand it a chunk sequence it chose -- one byte at
-// a time, or cut at generated offsets -- and can build it for any of the three
+// a time, or cut at generated offsets -- and can build it for any of the
 // `StreamKind`s this server reads. Those are the two things a loopback
 // connection cannot give. quinn decides how a write is packetised, so a
 // *write*-splitting property only ever states that the answer survived whatever
 // chunking quinn picked; and `FrameReader::new` is the permissive constructor,
-// the one the peer's control stream gets, so the request-stream and tunnel
-// verdicts -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE and a
-// post-CONNECT HEADERS, each refused from the frame header alone -- are out of
-// its reach entirely.
+// the one this suite's client uses for a response stream, so the request-stream
+// and tunnel verdicts -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID,
+// PUSH_PROMISE and a post-CONNECT HEADERS, each refused from the frame header
+// alone -- are out of its reach entirely. The server reads its peer's control
+// stream through the stricter `FrameReader::on_server_control`, which a test
+// binary cannot reach.
 //
 // The properties that put bytes on a real QUIC stream stay. The decoder is only
 // half of what a peer meets: `FrameReader` is the other half, and it is what
@@ -655,8 +657,17 @@ fn through_connect(narrow: bool, request: &[Vec<u8>], tail: &[Vec<u8>]) -> Vec<S
 /// code whatever the table held.
 fn refused_on(kind: StreamKind) -> &'static [u64] {
     match kind {
-        // RFC 9114 §6.2.1 makes this the stream every one of them belongs on.
+        // The permissive kind: RFC 9114 §6.2.1 makes the control stream the
+        // place every one of them belongs, and this kind applies none of the
+        // timing rules.
         StreamKind::Control => &[],
+        // Nothing that earns H3_FRAME_UNEXPECTED on a fresh decoder: it has not
+        // seen SETTINGS, so every known buffered type but SETTINGS is refused
+        // there as H3_MISSING_SETTINGS (RFC 9114 §6.2.1), and the
+        // second-SETTINGS and post-SETTINGS rules cannot be reached without a
+        // SETTINGS first. The strict kind's ordering is pinned by the unit test
+        // in `src/h3/frame.rs` and by `it_hostile`.
+        StreamKind::ServerControl => &[],
         StreamKind::Request => &[
             frame::SETTINGS,
             frame::GOAWAY,
@@ -738,6 +749,7 @@ fn is_answer_prefix(prefix: &[Step], whole: &[Step]) -> bool {
 fn any_stream_kind() -> impl Strategy<Value = StreamKind> {
     prop::sample::select(vec![
         StreamKind::Control,
+        StreamKind::ServerControl,
         StreamKind::Request,
         StreamKind::Tunnel,
     ])
@@ -1065,10 +1077,10 @@ proptest! {
     //# truncated, this MUST be treated as a connection error of type
     //# H3_FRAME_ERROR.
     ///
-    /// `FrameReader::new` is the control stream's constructor, so
-    /// `StreamKind::Control` is the decoder this compares against; the other two
-    /// kinds have no on-wire spelling a test binary can reach, which is what
-    /// makes this property the whole of the tie between them.
+    /// `FrameReader::new` is the permissive constructor, so `StreamKind::Control`
+    /// is the decoder this compares against; the other kinds have no on-wire
+    /// spelling a test binary can reach, which is what makes this property the
+    /// whole of the tie between them.
     #[test]
     fn a_stream_reader_adds_only_the_end_of_stream_rule_to_the_decoder(
         bytes in frame_ish_bytes(),

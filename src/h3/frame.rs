@@ -454,19 +454,28 @@ pub struct Settings {
 /// RFC 9114 states most of its frame rules as "on any other stream" or "once
 /// the CONNECT method has completed", so the same frame type is ordinary on one
 /// stream and a connection error on the next. This is what a decoder knows about
-/// which of the three it is serving, and the module-private `misplaced` is the
+/// which of the four it is serving, and the module-private `misplaced` is the
 /// whole of the rule.
 ///
 /// Public for the reason [`FrameDecoder`] is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
-    /// The peer's control stream (RFC 9114 §6.2.1).
+    /// A stream on which every frame type this server parses may appear.
     ///
-    /// Every frame type this server parses may legitimately arrive here, so
-    /// nothing is refused by type alone: which of them is allowed *when* --
-    /// a second SETTINGS, a CANCEL_PUSH, a HEADERS -- depends on what has
-    /// already been seen, which is [`super::connection`]'s to track.
+    /// The permissive kind, and the one a *client* wants for a response stream:
+    /// the suite's client (`tests/common/h3client.rs`) is built on this module.
+    /// Nothing is refused by type alone here; which frames are allowed *when* is
+    /// the caller's to track.
     Control,
+    /// The peer's control stream as this server reads it (RFC 9114 §6.2.1).
+    ///
+    /// Strict where [`Self::Control`] is permissive: the rules that turn on the
+    /// frame type alone are applied from the frame header, before the buffered
+    /// length is looked at, so a frame the connection must close on cannot earn
+    /// the stream error an oversized frame gets. Which of the rules applies
+    /// depends on whether SETTINGS has already been accepted, which the caller
+    /// carries in with [`FrameDecoder::note_settings_seen`].
+    ServerControl,
     /// A request stream whose request has not completed.
     Request,
     /// A request stream whose CONNECT has completed (RFC 9114 §4.4).
@@ -556,6 +565,14 @@ pub struct FrameDecoder {
     /// the moment its CONNECT is answered, and RFC 9114 §4.4 narrows what may
     /// follow to DATA alone.
     stream: StreamKind,
+    /// Whether the peer's SETTINGS has already been accepted on this stream.
+    ///
+    /// Only [`StreamKind::ServerControl`] reads it. The decoder parses one item
+    /// at a time and cannot know what the caller did with the last one, so the
+    /// caller carries it in through [`Self::note_settings_seen`]. A fresh
+    /// decoder has not seen SETTINGS, which is the first-frame rule's starting
+    /// point (RFC 9114 §6.2.1).
+    settings_seen: bool,
     /// Reserved or unknown frames skipped so far while this was a request
     /// stream (RFC 9114 §10.5).
     ///
@@ -585,9 +602,19 @@ impl FrameDecoder {
             budget,
             charged: 0,
             stream,
+            settings_seen: false,
             skipped: 0,
             state: State::Header,
         }
+    }
+
+    /// Tells the decoder whether the peer's SETTINGS has been accepted yet.
+    ///
+    /// Called by the reader before asking for the next item, once per item the
+    /// caller has judged. Only [`StreamKind::ServerControl`] reads it: on every
+    /// other kind the timing rules stay with the caller.
+    pub(super) fn note_settings_seen(&mut self, seen: bool) {
+        self.settings_seen = seen;
     }
 
     /// Hands the decoder the next chunk of stream.
@@ -628,7 +655,7 @@ impl FrameDecoder {
                     let Some((kind, length)) = self.take_frame_header() else {
                         return Ok(None);
                     };
-                    let next = begin(self.stream, kind, length)?;
+                    let next = begin(self.stream, self.settings_seen, kind, length)?;
 
                     // Charged on the announcement rather than on arrival: the
                     // announcement is the moment this decoder commits to
@@ -820,20 +847,31 @@ impl FrameReader {
     /// A reader for a stream on which every frame type this server parses may
     /// appear.
     ///
-    /// That is the peer's control stream: RFC 9114 §6.2.1 makes it the stream
-    /// SETTINGS, GOAWAY, CANCEL_PUSH and MAX_PUSH_ID belong on, and which of
-    /// them may arrive *when* is [`super::connection`]'s to judge rather than
-    /// the framing layer's. A request stream is read through the crate-internal
-    /// `on_request_stream` instead, where those four -- and PUSH_PROMISE -- are
-    /// refused from the frame header.
-    ///
-    /// It is also what a *client* wants for a response stream, which is why this
-    /// is the constructor that stayed plain: the suite's client
-    /// (`tests/common/h3client.rs`) is built on this module.
+    /// The permissive constructor, and the one a *client* wants for a response
+    /// stream: the suite's client (`tests/common/h3client.rs`) is built on this
+    /// module. The server reads the peer's control stream through the
+    /// crate-internal [`Self::on_server_control`] instead, where the rules that
+    /// turn on the frame type alone are applied from the frame header. A request
+    /// stream is read through `on_request_stream`, where SETTINGS, GOAWAY,
+    /// CANCEL_PUSH, MAX_PUSH_ID and PUSH_PROMISE are refused from the header.
     ///
     /// `budget` is the connection's, not this stream's: see [`BufferBudget`].
     pub fn new(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
         Self::with_kind(recv, StreamKind::Control, budget)
+    }
+
+    /// A reader for the peer's control stream, with its type rules applied from
+    /// the frame header.
+    ///
+    /// RFC 9114 §6.2.1's first-frame rule, §7.2.2's HEADERS rule, §7.2.4's
+    /// second-SETTINGS rule and §7.2.5's PUSH_PROMISE rule are all decidable
+    /// from the frame header, and they are decided here before the buffered
+    /// length is looked at: the length check hands out a stream error, and a
+    /// stream error is the wrong answer to a frame the connection must close
+    /// on. Which of them applies depends on whether SETTINGS has been accepted,
+    /// so [`Self::note_settings_seen`] carries that in before each read.
+    pub(super) fn on_server_control(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
+        Self::with_kind(recv, StreamKind::ServerControl, budget)
     }
 
     /// A reader for a request stream whose request has not completed.
@@ -841,6 +879,14 @@ impl FrameReader {
     /// Becomes a tunnel's reader once [`Self::connect_completed`] is called.
     pub(super) fn on_request_stream(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
         Self::with_kind(recv, StreamKind::Request, budget)
+    }
+
+    /// Carries the caller's SETTINGS state into the decoder.
+    ///
+    /// Called before each [`Self::next`] once the caller has judged the item
+    /// before it; see [`FrameDecoder::note_settings_seen`].
+    pub(super) fn note_settings_seen(&mut self, seen: bool) {
+        self.decoder.note_settings_seen(seen);
     }
 
     fn with_kind(recv: quinn::RecvStream, stream: StreamKind, budget: Arc<BufferBudget>) -> Self {
@@ -910,13 +956,21 @@ impl FrameReader {
 
 /// Decides what to do with a frame that has just been announced on `stream`.
 ///
-/// The order of the two verdicts below is load-bearing. A frame type that may
-/// not appear on this stream at all is a connection error whatever length it
+/// The order of the verdicts below is load-bearing. A frame type that may not
+/// appear on this stream at all is a connection error whatever length it
 /// declares, so the length check -- which hands out a *stream* error, and whose
 /// answer on a request stream is a 431 -- must not reach it first: a 431 is a
 /// nonsensical reply to a SETTINGS frame, and the connection would carry on
-/// after a MUST-close.
-fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
+/// after a MUST-close. The control stream's rules are the same ordering with a
+/// different code: before SETTINGS the first-frame rule is judged from the
+/// header at every length for every buffered type but SETTINGS; after SETTINGS,
+/// HEADERS, PUSH_PROMISE and a second SETTINGS are judged from the header at
+/// every length, and the other buffered types past `MAX_BUFFERED_FRAME`, so a
+/// frame RFC 9114 forbids there is not first answered with the stream error an
+/// oversized frame gets. Under the cap the remaining types are buffered and
+/// parsed first, and `connection::Control::accept` applies the state rules once
+/// the payload is whole.
+fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Result<State, Error> {
     if RESERVED_HTTP2_TYPES.contains(&kind) {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
         //# These frame types MUST NOT be sent, and their receipt MUST be
@@ -928,8 +982,8 @@ fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
         .into());
     }
 
-    if let Some(detail) = misplaced(stream, kind) {
-        return Err(Violation::connection(Code::H3_FRAME_UNEXPECTED, detail).into());
+    if let Some(violation) = misplaced(stream, settings_seen, kind, length) {
+        return Err(violation.into());
     }
 
     if kind == DATA {
@@ -963,21 +1017,106 @@ fn begin(stream: StreamKind, kind: u64, length: u64) -> Result<State, Error> {
     })
 }
 
+/// A frame that is not allowed where it appeared (RFC 9114 §7.2).
+fn unexpected(detail: &'static str) -> Violation {
+    Violation::connection(Code::H3_FRAME_UNEXPECTED, detail)
+}
+
 /// Why frame type `kind` may not appear on `stream` at all, or `None` if it may.
 ///
 /// Every case is a MUST in RFC 9114 that turns on *where* the frame arrived
 /// rather than on anything inside it, which is what makes the verdict reachable
-/// from the frame header alone. All of them are H3_FRAME_UNEXPECTED, so the code
-/// is the caller's to supply and this returns only the reason phrase.
-fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
+/// from the frame header alone. Most are H3_FRAME_UNEXPECTED, but the control
+/// stream's first-frame rule is H3_MISSING_SETTINGS, so the violation is
+/// returned whole rather than as a reason phrase for the caller to wrap.
+///
+/// `settings_seen` is the caller's answer to whether the peer's SETTINGS has
+/// been accepted and `length` the frame's declared payload length; only
+/// [`StreamKind::ServerControl`] reads either. On that kind, the first-frame
+/// rule is judged from the header at every length for every buffered type but
+/// SETTINGS; after SETTINGS, HEADERS, PUSH_PROMISE and a second SETTINGS are
+/// judged from the header at every length, and the other buffered types only
+/// past `MAX_BUFFERED_FRAME`: under the cap their payload is parsed first and
+/// `connection::Control::accept` applies the state rules, so a payload error
+/// keeps the precedence RFC 9114 does not rank against them -- the ordering
+/// `it_frameseq` models.
+fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Option<Violation> {
     match stream {
-        // Nothing: RFC 9114 §6.2.1 makes this the stream the frames below belong
-        // on, and the rules about which may arrive when need to know what has
-        // already been seen -- `connection::Control` keeps that and this does
-        // not. A HEADERS frame here is refused there (§7.2.2), after buffering,
-        // because the control stream has a budget of its own and nothing on it
-        // can be refused stream by stream.
+        // Nothing: the permissive kind, built for a client's response stream.
+        // The server reads its peer's control stream as
+        // [`StreamKind::ServerControl`] instead.
         StreamKind::Control => None,
+
+        StreamKind::ServerControl => {
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If the first frame of the control stream is any other frame
+            //# type, this MUST be treated as a connection error of type
+            //# H3_MISSING_SETTINGS.
+            //
+            // The first frame's type is in its header, so this is decided
+            // before the length cap and before any payload is parsed. Without
+            // it, an oversized HEADERS or PUSH_PROMISE sent first would earn
+            // the cap's stream error instead -- a 431 where the connection must
+            // close -- and a malformed first GOAWAY or MAX_PUSH_ID would earn
+            // its payload error where §6.2.1 has already decided the frame.
+            // DATA and unknown types carry no cap and are left to the caller,
+            // which judges them when it sees them; the first SETTINGS is the
+            // frame this stream is waiting for, so it is exempt here and its
+            // payload is parsed.
+            if !settings_seen && kind != SETTINGS && BufferedKind::from_type(kind).is_some() {
+                return Some(Violation::connection(
+                    Code::H3_MISSING_SETTINGS,
+                    format!("frame type {kind:#x} before SETTINGS on the control stream"),
+                ));
+            }
+
+            // Once SETTINGS has opened the stream, HEADERS and PUSH_PROMISE are
+            // refused from the header at every length: their payload is never
+            // parsed on this stream -- the type is the offence -- so there is
+            // no payload verdict to preserve, and charging the budget for a
+            // frame this stream may never carry would let a peer hold it with
+            // frames it is not entitled to send. A second SETTINGS is refused
+            // from the header at every length too: RFC 9114 §7.2.4 makes the
+            // type the offence, whatever its payload holds. The remaining
+            // buffered types are parsed before `connection::Control::accept`
+            // sees them, so under the cap their payload verdict keeps its
+            // precedence, which RFC 9114 does not rank against the
+            // control-stream rules; past the cap there is no payload to parse
+            // and the header decides, or the cap would answer a MUST-close with
+            // a stream error.
+            let type_decided =
+                matches!(kind, HEADERS | PUSH_PROMISE) || (settings_seen && kind == SETTINGS);
+            if length <= MAX_BUFFERED_FRAME && !type_decided {
+                return None;
+            }
+
+            match kind {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
+                //# HEADERS frames can only be sent on request streams or push
+                //# streams. If a HEADERS frame is received on a control stream,
+                //# the recipient MUST respond with a connection error of type
+                //# H3_FRAME_UNEXPECTED.
+                HEADERS => Some(unexpected("a HEADERS frame on the control stream")),
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
+                //# A client MUST NOT send a PUSH_PROMISE frame. A server MUST
+                //# treat the receipt of a PUSH_PROMISE frame as a connection
+                //# error of type H3_FRAME_UNEXPECTED.
+                PUSH_PROMISE => Some(unexpected("a PUSH_PROMISE frame")),
+
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
+                //# If an endpoint receives a second SETTINGS frame on the
+                //# control stream, the endpoint MUST respond with a connection
+                //# error of type H3_FRAME_UNEXPECTED.
+                SETTINGS if settings_seen => Some(unexpected("a second SETTINGS frame")),
+
+                // GOAWAY, CANCEL_PUSH and MAX_PUSH_ID belong on this stream once
+                // SETTINGS has opened it, and the cap is their only bound. The
+                // first SETTINGS is allowed here; DATA and unknown types are
+                // the caller's, as above.
+                _ => None,
+            }
+        }
 
         StreamKind::Request => match kind {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
@@ -985,19 +1124,19 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
             //# control stream. If an endpoint receives a SETTINGS frame on a
             //# different stream, the endpoint MUST respond with a connection
             //# error of type H3_FRAME_UNEXPECTED.
-            SETTINGS => Some("a SETTINGS frame on a request stream"),
+            SETTINGS => Some(unexpected("a SETTINGS frame on a request stream")),
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.3
             //# A CANCEL_PUSH frame is sent on the control stream. Receiving a
             //# CANCEL_PUSH frame on a stream other than the control stream MUST
             //# be treated as a connection error of type H3_FRAME_UNEXPECTED.
-            CANCEL_PUSH => Some("a CANCEL_PUSH frame on a request stream"),
+            CANCEL_PUSH => Some(unexpected("a CANCEL_PUSH frame on a request stream")),
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.7
             //# The MAX_PUSH_ID frame is always sent on the control stream.
             //# Receipt of a MAX_PUSH_ID frame on any other stream MUST be
             //# treated as a connection error of type H3_FRAME_UNEXPECTED.
-            MAX_PUSH_ID => Some("a MAX_PUSH_ID frame on a request stream"),
+            MAX_PUSH_ID => Some(unexpected("a MAX_PUSH_ID frame on a request stream")),
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
             //# A client MUST NOT send a PUSH_PROMISE frame. A server MUST treat
@@ -1008,7 +1147,9 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
             // receive this frame anywhere, so §7.2.5's separate sentence about
             // the control stream is addressed to a client and this is the
             // sentence that governs both places for us.
-            PUSH_PROMISE => Some("a PUSH_PROMISE frame, which only a server may send"),
+            PUSH_PROMISE => Some(unexpected(
+                "a PUSH_PROMISE frame, which only a server may send",
+            )),
 
             // GOAWAY is the one of the five whose "not on this stream" rule
             // RFC 9114 §7.2.6 states for a client only -- "A client MUST treat a
@@ -1021,7 +1162,7 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
             //# Receipt of an invalid sequence of frames MUST be treated as a
             //# connection error of type H3_FRAME_UNEXPECTED.
-            GOAWAY => Some("a GOAWAY frame on a request stream"),
+            GOAWAY => Some(unexpected("a GOAWAY frame on a request stream")),
 
             // DATA and HEADERS are what a request stream is made of; §4.1 judges
             // their *order*, which needs the frames themselves and is
@@ -1046,7 +1187,9 @@ fn misplaced(stream: StreamKind, kind: u64) -> Option<&'static str> {
         // same section rather than by reopening it.
         StreamKind::Tunnel => match kind {
             DATA => None,
-            _ if BufferedKind::from_type(kind).is_some() => Some(NON_DATA_FRAME_ON_A_TUNNEL),
+            _ if BufferedKind::from_type(kind).is_some() => {
+                Some(unexpected(NON_DATA_FRAME_ON_A_TUNNEL))
+            }
             _ => None,
         },
     }
@@ -1578,7 +1721,11 @@ mod tests {
     /// neither is counted here however much of it there is.
     #[test]
     fn skipped_frames_are_only_counted_on_a_request_stream() {
-        for stream in [StreamKind::Tunnel, StreamKind::Control] {
+        for stream in [
+            StreamKind::Tunnel,
+            StreamKind::Control,
+            StreamKind::ServerControl,
+        ] {
             let mut wire = BytesMut::new();
             for _ in 0..=MAX_SKIPPED_FRAMES {
                 put_header(&mut wire, 0x21, 0);
@@ -1651,7 +1798,7 @@ mod tests {
     #[test]
     fn reserved_http2_frame_types_end_the_connection() {
         for kind in RESERVED_HTTP2_TYPES {
-            let Err(Error::Protocol(violation)) = begin(StreamKind::Control, kind, 0) else {
+            let Err(Error::Protocol(violation)) = begin(StreamKind::Control, false, kind, 0) else {
                 panic!("frame type {kind:#x} must be refused")
             };
             assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
@@ -1662,7 +1809,7 @@ mod tests {
     #[test]
     fn a_frame_past_the_buffer_limit_is_refused_before_it_is_allocated() {
         let Err(Error::Protocol(violation)) =
-            begin(StreamKind::Request, HEADERS, MAX_BUFFERED_FRAME + 1)
+            begin(StreamKind::Request, false, HEADERS, MAX_BUFFERED_FRAME + 1)
         else {
             panic!("an oversized frame must be refused")
         };
@@ -1672,9 +1819,17 @@ mod tests {
             "one oversized frame is a stream problem, not a connection one"
         );
 
-        assert!(begin(StreamKind::Request, HEADERS, MAX_BUFFERED_FRAME).is_ok());
+        assert!(begin(StreamKind::Request, false, HEADERS, MAX_BUFFERED_FRAME).is_ok());
         // DATA is never buffered, so no declared length can be too large.
-        assert!(begin(StreamKind::Request, DATA, crate::datagram::VARINT_MAX).is_ok());
+        assert!(
+            begin(
+                StreamKind::Request,
+                false,
+                DATA,
+                crate::datagram::VARINT_MAX
+            )
+            .is_ok()
+        );
     }
 
     /// The whole of [`misplaced`], and the ordering it depends on: a frame type
@@ -1720,7 +1875,8 @@ mod tests {
         ] {
             for kind in refused {
                 for length in LENGTHS {
-                    let Err(Error::Protocol(violation)) = begin(stream, *kind, length) else {
+                    let Err(Error::Protocol(violation)) = begin(stream, false, *kind, length)
+                    else {
                         panic!("{stream:?}: frame type {kind:#x} of {length} bytes must be refused")
                     };
                     assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED, "{stream:?}");
@@ -1733,11 +1889,141 @@ mod tests {
 
             for kind in allowed {
                 assert!(
-                    misplaced(stream, *kind).is_none(),
+                    misplaced(stream, false, *kind, MAX_BUFFERED_FRAME + 1).is_none(),
                     "{stream:?}: frame type {kind:#x} belongs here"
                 );
             }
         }
+    }
+
+    /// The control stream's header-decidable rules, and where they stop.
+    ///
+    /// Before SETTINGS, §6.2.1's first-frame rule is decided from the header at
+    /// every length for every buffered type but SETTINGS: HEADERS, PUSH_PROMISE,
+    /// GOAWAY, CANCEL_PUSH and MAX_PUSH_ID are H3_MISSING_SETTINGS whatever
+    /// their payload, and DATA and unknown types are left to `accept`. The first
+    /// SETTINGS is the frame the stream waits for, so it is exempt: under the
+    /// cap it is buffered and parsed and a malformed one keeps its payload
+    /// verdict; over the cap it keeps the load answer. Once SETTINGS has opened
+    /// the stream, HEADERS and PUSH_PROMISE are H3_FRAME_UNEXPECTED from the
+    /// header at every length (RFC 9114 §7.2.2, §7.2.5), and so is a second
+    /// SETTINGS (§7.2.4), before its payload is parsed; GOAWAY, CANCEL_PUSH and
+    /// MAX_PUSH_ID belong there, so under the cap they are buffered and parsed,
+    /// with a payload error able to precede the state rules because RFC 9114
+    /// ranks neither -- the ordering `it_frameseq` models -- and past the cap
+    /// the cap answers. The permissive kind applies none of these rules: the
+    /// suite's client builds it for its own response stream.
+    #[test]
+    fn control_stream_type_rules_are_decided_before_the_cap() {
+        /// Nothing, one byte, and the largest buffered frame.
+        const BUFFERED: [u64; 3] = [0, 1, MAX_BUFFERED_FRAME];
+        /// One past the largest buffered frame.
+        const PAST: u64 = MAX_BUFFERED_FRAME + 1;
+
+        // HEADERS and PUSH_PROMISE before SETTINGS: the first-frame rule, from
+        // the header at every length.
+        for kind in [HEADERS, PUSH_PROMISE] {
+            for length in BUFFERED.iter().copied().chain([PAST]) {
+                let Err(Error::Protocol(violation)) =
+                    begin(StreamKind::ServerControl, false, kind, length)
+                else {
+                    panic!("{kind:#x} of {length} bytes before SETTINGS must be refused")
+                };
+                assert_eq!(violation.code(), Code::H3_MISSING_SETTINGS);
+                assert!(violation.is_connection_error());
+            }
+        }
+
+        // The same two after SETTINGS, at every length.
+        for kind in [HEADERS, PUSH_PROMISE] {
+            for length in BUFFERED.iter().copied().chain([PAST]) {
+                let Err(Error::Protocol(violation)) =
+                    begin(StreamKind::ServerControl, true, kind, length)
+                else {
+                    panic!("{kind:#x} of {length} bytes after SETTINGS must be refused")
+                };
+                assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
+                assert!(violation.is_connection_error());
+            }
+        }
+
+        // A second SETTINGS is refused from the header at every length: the
+        // type is the offence, so its payload is never parsed.
+        for length in BUFFERED.iter().copied().chain([PAST]) {
+            let Err(Error::Protocol(violation)) =
+                begin(StreamKind::ServerControl, true, SETTINGS, length)
+            else {
+                panic!("a second SETTINGS of {length} bytes must be refused")
+            };
+            assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
+            assert!(violation.is_connection_error());
+        }
+
+        // A first GOAWAY, CANCEL_PUSH or MAX_PUSH_ID is the first frame too, so
+        // §6.2.1 decides it from the header at every length: its payload is
+        // never parsed, and a malformed one does not get a payload verdict.
+        for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
+            for length in BUFFERED.iter().copied().chain([PAST]) {
+                let Err(Error::Protocol(violation)) =
+                    begin(StreamKind::ServerControl, false, kind, length)
+                else {
+                    panic!("{kind:#x} of {length} bytes before SETTINGS must be refused")
+                };
+                assert_eq!(violation.code(), Code::H3_MISSING_SETTINGS);
+                assert!(violation.is_connection_error());
+            }
+        }
+
+        // Once SETTINGS has opened the stream, those three belong there: under
+        // the cap they are buffered and parsed, and past it the cap is their
+        // only bound.
+        for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
+            for length in BUFFERED {
+                assert!(
+                    matches!(
+                        begin(StreamKind::ServerControl, true, kind, length),
+                        Ok(State::Buffering { .. })
+                    ),
+                    "{kind:#x} of {length} bytes after SETTINGS is parsed"
+                );
+            }
+            assert!(misplaced(StreamKind::ServerControl, true, kind, PAST).is_none());
+        }
+
+        // The first SETTINGS is the one frame this stream is waiting for, so it
+        // is not type-refused: under the cap it is buffered and parsed, and a
+        // malformed one keeps its payload verdict; over the cap it keeps the
+        // load answer.
+        assert!(matches!(
+            begin(
+                StreamKind::ServerControl,
+                false,
+                SETTINGS,
+                MAX_BUFFERED_FRAME
+            ),
+            Ok(State::Buffering { .. })
+        ));
+        let Err(Error::Protocol(violation)) = begin(
+            StreamKind::ServerControl,
+            false,
+            SETTINGS,
+            MAX_BUFFERED_FRAME + 1,
+        ) else {
+            panic!("a first SETTINGS past the cap keeps the load answer")
+        };
+        assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+        assert!(!violation.is_connection_error());
+
+        // The permissive kind applies no control-stream rule: a HEADERS frame
+        // past the cap is still the stream error a 431 answers, which is what
+        // the suite's client needs for its own response stream.
+        let Err(Error::Protocol(violation)) =
+            begin(StreamKind::Control, true, HEADERS, MAX_BUFFERED_FRAME + 1)
+        else {
+            panic!("the permissive kind still applies the cap")
+        };
+        assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
+        assert!(!violation.is_connection_error());
     }
 
     /// The transition the tunnels make: a stream that accepted a field section
@@ -1746,7 +2032,7 @@ mod tests {
     fn answering_the_connect_narrows_what_the_stream_may_carry() {
         let mut decoder = fresh_decoder();
         assert!(matches!(
-            begin(decoder.stream, HEADERS, 200),
+            begin(decoder.stream, false, HEADERS, 200),
             Ok(State::Buffering { .. })
         ));
 

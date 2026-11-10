@@ -32,11 +32,11 @@
 //! | i2 | Opens a second control stream, a client-initiated push stream, or closes its control stream cleanly | RFC 9114 §6.2.1/§6.2.2 (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR for the first two, H3_CLOSED_CRITICAL_STREAM (0x104) for the third | [`unidirectional_streams_that_break_a_critical_stream_rule_end_the_connection`] |
 //! | i3 | Opens a second QPACK encoder or decoder stream | RFC 9204 §4.2: one of each per endpoint (`serve_qpack`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR (0x103) | [`a_second_qpack_stream_of_either_kind_ends_the_connection`] |
 //! | j | Sends a frame type reserved for HTTP/2 (0x02, 0x06, 0x08, 0x09) | `RESERVED_HTTP2_TYPES` (`src/h3/frame.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), whatever stream it arrives on | [`frame_types_reserved_for_http2_end_the_connection`] |
-//! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream | RFC 9114 §6.2.1 first-frame rule (`Control::accept`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a) | `it_settings::a_frame_before_settings_ends_the_connection` |
+//! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream, or announces an oversized HEADERS/PUSH_PROMISE first | RFC 9114 §6.2.1 first-frame rule: a frame type other than SETTINGS is missing settings at every length (`frame::misplaced` decides every buffered type but SETTINGS from the header at every length; DATA and unknown types carry no cap and are left to `Control::accept`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a), never a 431 | `it_settings::a_frame_before_settings_ends_the_connection`, [`an_oversized_frame_before_settings_is_still_missing_settings`] |
 //! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431, and nothing charged to the buffering budget on the way | [`control_stream_frames_on_a_request_stream_end_the_connection`], [`a_frame_refused_for_its_type_is_never_charged_for`] |
 //! | j6 | Announces a HEADERS frame on a tunnel whose CONNECT has been answered, and never finishes it | RFC 9114 §4.4, decided from the frame header rather than after the payload (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105); the announcement never reaches the budget, so tunnels cannot pin it between them | [`a_field_section_on_an_established_tunnel_ends_the_connection`] |
 //! | j7 | Opens a request stream with a DATA frame, before any HEADERS | RFC 9114 §4.1's rule about the *order* of a request's frames, which `frame::misplaced` leaves to the reader of the request (`Resolver::resolve`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105) | [`a_data_frame_before_any_headers_ends_the_connection`] |
-//! | j3 | Sends a second SETTINGS, or HEADERS/DATA/PUSH_PROMISE, on the control stream after SETTINGS | `Control::accept` (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED | [`frames_the_control_stream_may_not_carry_end_the_connection`] |
+//! | j3 | Sends a second SETTINGS, or HEADERS/PUSH_PROMISE/DATA, on the control stream after SETTINGS, declaring any length | HEADERS, PUSH_PROMISE and a second SETTINGS are refused from the header at every length; `Control::accept` is the only judge of DATA | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431 | [`frames_the_control_stream_may_not_carry_end_the_connection`], [`oversized_control_stream_frames_are_refused_by_type`] |
 //! | j4 | Sends CANCEL_PUSH, or a MAX_PUSH_ID that shrinks | RFC 9114 §7.2.3/§7.2.7 (`Control::accept`) | CONNECTION_CLOSE H3_ID_ERROR (0x108) | `it_critical_streams::a_cancel_push_is_an_id_error`, `it_critical_streams::a_shrinking_max_push_id_is_an_id_error` |
 //! | k | References the QPACK dynamic table in a field section | `QPACK_MAX_TABLE_CAPACITY = 0` is advertised, so there is no entry to name (`src/h3/qpack.rs`) | CONNECTION_CLOSE QPACK_DECOMPRESSION_FAILED (0x200) | `it_extended_connect::a_dynamic_table_reference_closes_the_connection` |
 //! | k2 | Sends encoder or decoder instructions for that table | RFC 9204 §6 (`serve_qpack`) | CONNECTION_CLOSE QPACK_ENCODER_STREAM_ERROR (0x201) / QPACK_DECODER_STREAM_ERROR (0x202) | `it_critical_streams::encoder_instructions_beyond_a_zero_table_are_refused`, `it_critical_streams::decoder_instructions_for_a_table_never_used_are_refused` |
@@ -91,11 +91,11 @@ use bytes::BytesMut;
 use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
     FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
-    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED, H3_STREAM_CREATION_ERROR,
-    STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
-    announce_full_sized_headers, application_close, assert_closed_with, authenticate,
-    authenticated_connect_headers_frame, collect_refusals, connect_headers_frame, frame,
-    grease_type, headers_frame, open_uni_stream, read_frame, status_of, status_of_response,
+    H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED,
+    H3_STREAM_CREATION_ERROR, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
+    STREAM_QPACK_ENCODER, announce_full_sized_headers, application_close, assert_closed_with,
+    authenticate, authenticated_connect_headers_frame, collect_refusals, connect_headers_frame,
+    frame, grease_type, headers_frame, open_uni_stream, read_frame, status_of, status_of_response,
     still_serving, varint_frame,
 };
 use common::{
@@ -545,6 +545,79 @@ async fn frames_the_control_stream_may_not_carry_end_the_connection() {
         assert_eq!(
             closed_with, H3_FRAME_UNEXPECTED,
             "{name} on the control stream; the reason was {reason:?}"
+        );
+    }
+}
+
+/// A frame the control stream may not carry is refused for its type even when
+/// it declares a length past the per-frame cap.
+///
+/// After SETTINGS, HEADERS is H3_FRAME_UNEXPECTED (RFC 9114 §7.2.2),
+/// PUSH_PROMISE is H3_FRAME_UNEXPECTED (§7.2.5) and a second SETTINGS is
+/// H3_FRAME_UNEXPECTED (§7.2.4). Each verdict turns on the frame type alone, so
+/// the 100000-byte announcement never reaches the cap: a decoder that checked
+/// the length first would answer H3_EXCESSIVE_LOAD, which tells the peer it
+/// generated load rather than that it sent a frame the RFC forbids there. Not a
+/// byte of payload is sent, and the sending half is held open so the stream does
+/// not end mid-frame and race H3_FRAME_ERROR.
+#[tokio::test]
+async fn oversized_control_stream_frames_are_refused_by_type() {
+    /// Past the largest frame this server will buffer, so the per-frame cap
+    /// would have something to say about it.
+    const PAST_ONE_FRAME: u64 = 100_000;
+
+    for (name, kind) in [
+        ("a HEADERS frame", FRAME_HEADERS),
+        ("a PUSH_PROMISE frame", FRAME_PUSH_PROMISE),
+        ("a second SETTINGS frame", FRAME_SETTINGS),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        let mut control = BytesMut::new();
+        control.extend_from_slice(&settings_frame());
+        datagram::put_varint(&mut control, kind);
+        datagram::put_varint(&mut control, PAST_ONE_FRAME);
+        let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
+
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_FRAME_UNEXPECTED,
+            "{name} declaring {PAST_ONE_FRAME} bytes on the control stream; the reason was \
+             {reason:?}"
+        );
+    }
+}
+
+/// The first-frame rule outranks the control stream's type rules.
+///
+/// RFC 9114 §6.2.1: "If the first frame of the control stream is any other
+/// frame type, this MUST be treated as a connection error of type
+/// H3_MISSING_SETTINGS." An oversized HEADERS or PUSH_PROMISE that arrives
+/// before SETTINGS is still the first frame, and it is not SETTINGS, so the
+/// verdict is H3_MISSING_SETTINGS rather than the H3_FRAME_UNEXPECTED the same
+/// type earns after SETTINGS.
+#[tokio::test]
+async fn an_oversized_frame_before_settings_is_still_missing_settings() {
+    /// Past the largest frame this server will buffer.
+    const PAST_ONE_FRAME: u64 = 100_000;
+
+    for (name, kind) in [
+        ("a HEADERS frame", FRAME_HEADERS),
+        ("a PUSH_PROMISE frame", FRAME_PUSH_PROMISE),
+    ] {
+        let server = TestServer::start().await;
+        let (_endpoint, connection) = connect_quic(&server).await;
+
+        let mut first = BytesMut::new();
+        datagram::put_varint(&mut first, kind);
+        datagram::put_varint(&mut first, PAST_ONE_FRAME);
+        let _control = open_uni_stream(&connection, STREAM_CONTROL, &first).await;
+
+        let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
+        assert_eq!(
+            closed_with, H3_MISSING_SETTINGS,
+            "{name} before SETTINGS; the reason was {reason:?}"
         );
     }
 }

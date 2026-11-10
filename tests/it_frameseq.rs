@@ -291,13 +291,20 @@ impl ControlEvent {
 /// The close code the first offence in `events` draws, or `None` if every
 /// event is legal.
 ///
-/// Written against the RFC rather than against the server's tables, with one
-/// deliberate exception: where two MUST-close rules apply to one frame, the
-/// model follows the layering the server evaluates them in -- the frame layer
-/// (reserved types, §7.1 payload-shape errors, §7.2.4.1 identifier rules)
-/// before the control-stream state (§6.2.1's first-frame rule, §5.2/§7.2.x's
-/// stateful rules) -- because the RFC ranks neither and the code on the wire
-/// is deterministic. Each arm below says which rule it is applying.
+/// Written against the RFC rather than against the server's tables. Where two
+/// MUST-close rules apply to one frame, the model follows the layering the
+/// server evaluates them in, because the RFC ranks neither and the code on the
+/// wire is deterministic: reserved HTTP/2 types first; then §6.2.1's first-frame
+/// rule, which the frame header decides at every length for every buffered type
+/// but SETTINGS, so a malformed first GOAWAY or MAX_PUSH_ID is
+/// H3_MISSING_SETTINGS and not its payload error; then the control-stream type
+/// rules, which the frame header decides -- HEADERS and PUSH_PROMISE at any
+/// length, and a second SETTINGS (RFC 9114 §7.2.4) at any length, before its
+/// payload is parsed; then, for a frame the stream may carry, the §7.1
+/// payload-shape and §7.2.4/§7.2.4.1 identifier errors a first SETTINGS, or a
+/// GOAWAY, CANCEL_PUSH or MAX_PUSH_ID after SETTINGS, can raise; then the
+/// stateful rules (§5.2, §7.2.3, §7.2.7). Each arm below says which rule it is
+/// applying.
 fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
     let mut settings_seen = false;
     let mut goaway: Option<u64> = None;
@@ -311,19 +318,30 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // whether it was SETTINGS.
             ControlEvent::ReservedH2(_) => return Some(H3_FRAME_UNEXPECTED),
 
-            // RFC 9114 §7.1: a payload that does not hold what its type
-            // promises -- ending early or carrying bytes beyond it -- is
-            // H3_FRAME_ERROR, also judged at the frame layer, before SETTINGS
-            // has or has not been seen can matter.
-            ControlEvent::GoawayMalformed
-            | ControlEvent::MaxPushIdTrailingBytes
-            | ControlEvent::SettingsTruncatedPair => return Some(H3_FRAME_ERROR),
+            // Every SETTINGS payload is a SETTINGS frame on the wire, so once
+            // one has been accepted the type alone is the offence: RFC 9114
+            // §7.2.4 makes a second SETTINGS H3_FRAME_UNEXPECTED, and the
+            // frame layer refuses it from its header before parsing the
+            // payload. The malformed payloads below therefore draw that code
+            // in second position; their own payload verdict stands only when
+            // they are the first frame.
+            ControlEvent::Settings
+            | ControlEvent::SettingsUnknownId
+            | ControlEvent::SettingsConnectProtocolOutOfRange
+            | ControlEvent::SettingsDuplicatePair
+            | ControlEvent::SettingsReservedId
+            | ControlEvent::SettingsBadDatagramValue
+            | ControlEvent::SettingsTruncatedPair
+                if settings_seen =>
+            {
+                return Some(H3_FRAME_UNEXPECTED);
+            }
 
-            // RFC 9114 §7.2.4 (duplicate identifier), §7.2.4.1 (reserved
-            // identifier) and RFC 9297 §2.1.1 (H3_DATAGRAM outside 0/1) are
-            // all H3_SETTINGS_ERROR, and a SETTINGS frame is parsed before the
-            // second-SETTINGS rule is consulted, so the payload's verdict wins
-            // even when the frame is also a second SETTINGS.
+            // A first SETTINGS is the frame the control stream is waiting for,
+            // so it is buffered and parsed: RFC 9114 §7.1's shape rule and
+            // §7.2.4/§7.2.4.1's identifier rules decide before it can be
+            // accepted.
+            ControlEvent::SettingsTruncatedPair => return Some(H3_FRAME_ERROR),
             ControlEvent::SettingsDuplicatePair
             | ControlEvent::SettingsReservedId
             | ControlEvent::SettingsBadDatagramValue => return Some(H3_SETTINGS_ERROR),
@@ -331,16 +349,26 @@ fn control_verdict(events: &[ControlEvent]) -> Option<u64> {
             // The two odd-but-legal payloads are SETTINGS frames like any
             // other: RFC 9114 §7.2.4 ignores an unknown identifier and
             // RFC 8441 §3 gives ENABLE_CONNECT_PROTOCOL no effect at a server,
-            // so all three arms differ only in what a *wrong* server would do.
+            // so all three patterns differ only in what a *wrong* server would
+            // do.
             ControlEvent::Settings
             | ControlEvent::SettingsUnknownId
             | ControlEvent::SettingsConnectProtocolOutOfRange => {
-                if settings_seen {
-                    // RFC 9114 §7.2.4: a second SETTINGS frame is
-                    // H3_FRAME_UNEXPECTED.
-                    return Some(H3_FRAME_UNEXPECTED);
-                }
                 settings_seen = true;
+            }
+
+            // RFC 9114 §7.1: a payload that does not hold what its type
+            // promises -- ending early or carrying bytes beyond it -- is
+            // H3_FRAME_ERROR, judged at the frame layer once the frame is
+            // buffered. After SETTINGS that is the whole verdict; as the first
+            // frame, §6.2.1 has already decided the frame from its type, and
+            // the payload is never parsed.
+            ControlEvent::GoawayMalformed | ControlEvent::MaxPushIdTrailingBytes => {
+                return Some(if settings_seen {
+                    H3_FRAME_ERROR
+                } else {
+                    H3_MISSING_SETTINGS
+                });
             }
 
             // RFC 9114 §9 says to ignore an unknown type, but §6.2.1's rule
@@ -562,6 +590,9 @@ fn every_control_offence_draws_its_modelled_code() {
         ControlEvent::MaxPushId(0x4000),
     ];
 
+    // The legal prefix has carried SETTINGS, so every SETTINGS payload below
+    // is a second SETTINGS: RFC 9114 §7.2.4 makes the type H3_FRAME_UNEXPECTED
+    // whatever the payload holds, and the header is judged before the payload.
     let offences: Vec<(ControlEvent, u64)> = vec![
         (ControlEvent::Settings, H3_FRAME_UNEXPECTED),
         (ControlEvent::SettingsUnknownId, H3_FRAME_UNEXPECTED),
@@ -570,10 +601,10 @@ fn every_control_offence_draws_its_modelled_code() {
             H3_FRAME_UNEXPECTED,
         ),
         (ControlEvent::MaxPushIdTrailingBytes, H3_FRAME_ERROR),
-        (ControlEvent::SettingsDuplicatePair, H3_SETTINGS_ERROR),
-        (ControlEvent::SettingsReservedId, H3_SETTINGS_ERROR),
-        (ControlEvent::SettingsBadDatagramValue, H3_SETTINGS_ERROR),
-        (ControlEvent::SettingsTruncatedPair, H3_FRAME_ERROR),
+        (ControlEvent::SettingsDuplicatePair, H3_FRAME_UNEXPECTED),
+        (ControlEvent::SettingsReservedId, H3_FRAME_UNEXPECTED),
+        (ControlEvent::SettingsBadDatagramValue, H3_FRAME_UNEXPECTED),
+        (ControlEvent::SettingsTruncatedPair, H3_FRAME_UNEXPECTED),
         (ControlEvent::Goaway(9), H3_ID_ERROR),
         (ControlEvent::GoawayMalformed, H3_FRAME_ERROR),
         (ControlEvent::MaxPushId(3), H3_ID_ERROR),
@@ -626,6 +657,54 @@ fn every_control_offence_draws_its_modelled_code() {
             assert_eq!(
                 code, H3_ID_ERROR,
                 "{first:?} must satisfy the first-frame rule; the reason was {reason:?}"
+            );
+        });
+    }
+
+    // The other half of the SETTINGS layering: a malformed payload as the
+    // *first* frame is not a second SETTINGS, so the type rule does not apply
+    // and its payload verdict stands -- the shape error, or the identifier
+    // error the payload names.
+    for (first, expected) in [
+        (ControlEvent::SettingsTruncatedPair, H3_FRAME_ERROR),
+        (ControlEvent::SettingsDuplicatePair, H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsReservedId, H3_SETTINGS_ERROR),
+        (ControlEvent::SettingsBadDatagramValue, H3_SETTINGS_ERROR),
+    ] {
+        let events = vec![first.clone()];
+        assert_eq!(
+            control_verdict(&events),
+            Some(expected),
+            "the model must agree with this table for a first {first:?}"
+        );
+        run_case(async {
+            let (code, reason) = drive_control_script(&events, ControlEnd::Sentinel).await;
+            assert_eq!(
+                code, expected,
+                "a first {first:?}: the reason was {reason:?}"
+            );
+        });
+    }
+
+    // The first-frame rule reaches GOAWAY and MAX_PUSH_ID too: §6.2.1 decides
+    // them from the header at every length, so a malformed payload as the first
+    // frame is H3_MISSING_SETTINGS, not its §7.1 shape error. The offences
+    // table above keeps the after-SETTINGS payload verdict covered.
+    for first in [
+        ControlEvent::GoawayMalformed,
+        ControlEvent::MaxPushIdTrailingBytes,
+    ] {
+        let events = vec![first.clone()];
+        assert_eq!(
+            control_verdict(&events),
+            Some(H3_MISSING_SETTINGS),
+            "the model must agree with this table for a first {first:?}"
+        );
+        run_case(async {
+            let (code, reason) = drive_control_script(&events, ControlEnd::Sentinel).await;
+            assert_eq!(
+                code, H3_MISSING_SETTINGS,
+                "a first {first:?}: the reason was {reason:?}"
             );
         });
     }
