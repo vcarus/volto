@@ -436,9 +436,7 @@ fn interface_addresses() -> Option<Vec<LocalAddress>> {
                     libc::AF_INET => {
                         let sockaddr = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
                         addresses.push(LocalAddress {
-                            ip: IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                                sockaddr.sin_addr.s_addr,
-                            ))),
+                            ip: IpAddr::V4(Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr))),
                             scope_id: 0,
                         });
                     }
@@ -1102,7 +1100,9 @@ mod tests {
     fn the_interface_enumeration_finds_loopback() {
         let interfaces = interface_addresses().expect("getifaddrs must succeed on a running host");
         assert!(
-            interfaces.iter().any(|interface| interface.ip.is_loopback()),
+            interfaces
+                .iter()
+                .any(|interface| interface.ip.is_loopback()),
             "every host has a loopback address: {interfaces:?}"
         );
     }

@@ -199,8 +199,9 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// `allow_private_networks = false` if it is missing: `100.64.0.0/10` is where a
 /// carrier-grade NAT keeps its subscribers, `198.18.0.0/15` is what some
 /// networks number their own infrastructure with, `192.0.0.0/24` holds protocol
-/// assignments including the DS-Lite `192.0.0.0/29` link, and `240.0.0.0/4` is
-/// routed inside more than one large private network in practice.
+/// assignments including the DS-Lite `192.0.0.0/29` link except for its two
+/// globally reachable anycast addresses, and `240.0.0.0/4` is routed inside
+/// more than one large private network in practice.
 ///
 /// One entry is here despite having left the registry: `fec0::/10`, the IPv6
 /// site-local prefix RFC 3879 deprecated. New stacks treat it as global unicast,
@@ -215,15 +216,17 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// ([`is_local_use_nat64`], and [`embedded_ipv4`] for the reasoning).
 ///
 /// One entry is deliberately absent: `2001::/23`, RFC 6890 Table 22's IETF
-/// Protocol Assignments (from RFC 2928) — the IPv6 counterpart of the
-/// `192.0.0.0/24` this list does claim. Every one of its Source, Destination,
-/// Forwardable and Global attributes is "False\[1\]", and footnote \[1\] is "Unless
-/// allowed by a more specific allocation": inside the /23 sit allocations that
-/// are routed services rather than reserved space, `2001:1::1` and `2001:1::2`
-/// (the PCP and STUN anycast addresses) and `2001:4:112::/48` (AS112). Denying
-/// the whole block would take those with it, so it is left public and only the
-/// more-specific allocations worth denying are claimed one at a time — the
-/// benchmarking range, ORCHID and Teredo below.
+/// Protocol Assignments (from RFC 2928), the IPv6 counterpart of
+/// `192.0.0.0/24`. The IPv4 block has two globally reachable addresses, so it
+/// is claimed with them carved out. The IPv6 block is left public instead:
+/// every one of its Source, Destination, Forwardable and Global attributes is
+/// "False\[1\]", and footnote \[1\] is "Unless allowed by a more specific
+/// allocation", so inside the /23 sit allocations that are routed services
+/// rather than reserved space, `2001:1::1` and `2001:1::2` (the PCP and STUN
+/// anycast addresses) and `2001:4:112::/48` (AS112). Denying the whole block
+/// would take those with it, so it is left public and only the more-specific
+/// allocations worth denying are claimed one at a time: the benchmarking
+/// range, ORCHID and Teredo below.
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -242,8 +245,12 @@ fn is_private(ip: IpAddr) -> bool {
                 // 100.64.0.0/10 — shared address space (RFC 6598), i.e. the
                 // inside of a carrier-grade NAT.
                 || (octets[0] == 100 && octets[1] & 0xc0 == 64)
-                // 192.0.0.0/24 — IETF protocol assignments (RFC 6890).
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                // 192.0.0.0/24 — IETF protocol assignments (RFC 6890), minus
+                // the two globally reachable anycast addresses inside it.
+                || (octets[0] == 192
+                    && octets[1] == 0
+                    && octets[2] == 0
+                    && !is_ipv4_protocol_anycast(octets))
                 // 198.18.0.0/15 — benchmarking (RFC 2544).
                 || (octets[0] == 198 && octets[1] & 0xfe == 18)
                 // 192.88.99.0/24 — 6to4 relay anycast (RFC 6890 Table 10, from
@@ -271,6 +278,19 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_srv6_sids(v6)
         }
     }
+}
+
+/// The two globally reachable anycast addresses inside `192.0.0.0/24`.
+///
+/// `192.0.0.9/32` is the Port Control Protocol anycast address and
+/// `192.0.0.10/32` is the Traversal Using Relays around NAT anycast address.
+/// The IANA registry marks both Global "True", so a request for one is a
+/// legitimate destination even while the rest of the block stays private. The
+/// registry marks the other more-specific entries in the block Global "False",
+/// including `192.0.0.8/32` and the NAT64/DNS64 discovery addresses
+/// `192.0.0.170/32` and `192.0.0.171/32`, so they stay inside the refusal.
+fn is_ipv4_protocol_anycast(octets: [u8; 4]) -> bool {
+    octets == [192, 0, 0, 9] || octets == [192, 0, 0, 10]
 }
 
 /// The three IPv4 documentation ranges (RFC 5737).
@@ -509,7 +529,13 @@ mod tests {
         "100.64.0.0",
         "100.127.255.255",
         // RFC 6890 IETF protocol assignments, including the DS-Lite link.
+        // The block's two globally reachable anycast entries are carved out
+        // below; everything else in it is denied.
         "192.0.0.0",
+        "192.0.0.8",
+        "192.0.0.11",
+        "192.0.0.170",
+        "192.0.0.171",
         "192.0.0.255",
         // RFC 2544 benchmarking, which some networks number infrastructure with.
         "198.18.0.0",
@@ -571,6 +597,10 @@ mod tests {
         "100.63.255.255", // just below 100.64/10
         "100.128.0.0",    // just above it
         "192.0.1.1",      // just above 192.0.0/24, and not 192.0.2/24
+        // The two globally reachable anycast entries inside 192.0.0.0/24:
+        // Port Control Protocol and Traversal Using Relays around NAT.
+        "192.0.0.9",
+        "192.0.0.10",
         "198.17.255.255", // just below 198.18/15
         "198.20.0.0",     // just above it
         "1.0.0.0",        // just above 0.0.0.0/8, which has nothing below it
@@ -598,10 +628,10 @@ mod tests {
         "2001:40::1",
         // The neighbours of the second documentation block, 3fff::/20.
         "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
-        "4000::1",                                // just above it
+        "4000::1",                                 // just above it
         // The neighbours of the SRv6 SID block, 5f00::/16.
         "5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
-        "5f01::1",                                // just above it
+        "5f01::1",                                 // just above it
     ];
 
     const NEVER: &[&str] = &[
@@ -830,6 +860,42 @@ mod tests {
                     "{private} must follow the switch"
                 );
             }
+        }
+    }
+
+    /// `192.0.0.0/24` is claimed as a block, with two exceptions: the Port
+    /// Control Protocol and Traversal Using Relays around NAT anycast
+    /// addresses, which the IANA registry marks globally reachable. The
+    /// carve-out is exact, so the addresses around them stay denied, and the
+    /// rest of the block still follows the switch.
+    #[test]
+    fn the_protocol_anycast_addresses_are_carved_out_of_the_ietf_block() {
+        let strict = policy(false, &[]);
+        for address in ["192.0.0.9", "192.0.0.10"] {
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} is globally reachable and must be allowed"
+            );
+        }
+        for address in [
+            "192.0.0.8",   // the dummy address just below PCP anycast
+            "192.0.0.11",  // just above TURN anycast
+            "192.0.0.170", // NAT64/DNS64 discovery, reserved by protocol
+            "192.0.0.171",
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is reserved and must stay denied"
+            );
+        }
+        // The carve-out is a fact about the two addresses, not the switch: the
+        // rest of the block still follows `allow_private_networks`.
+        let permissive = policy(true, &[]);
+        for address in ["192.0.0.8", "192.0.0.11", "192.0.0.170", "192.0.0.171"] {
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow the switch"
+            );
         }
     }
 

@@ -775,9 +775,7 @@ fn is_the_proxys_own(address: std::net::SocketAddr) -> bool {
     // form keeps the same address, so the scope has to survive into the probe.
     // A transition form becomes IPv4 and has no scope to keep.
     let probe = match (routed, address) {
-        (std::net::IpAddr::V6(v6), std::net::SocketAddr::V6(original))
-            if v6 == *original.ip() =>
-        {
+        (std::net::IpAddr::V6(v6), std::net::SocketAddr::V6(original)) if v6 == *original.ip() => {
             std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
                 v6,
                 0,
