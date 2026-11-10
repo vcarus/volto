@@ -9,7 +9,7 @@
 //! * The destination ACL (M4) can only filter what it can see.
 
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -342,35 +342,38 @@ enum LookupSlot {
 /// Whether this host holds `address`, meaning a socket of this process may be
 /// bound to it.
 ///
-/// One `bind(2)` on a UDP socket at an ephemeral port, and the socket is dropped
-/// on the way out. The kernel answers `EADDRNOTAVAIL` for an address no local
-/// interface carries and succeeds for one it does, on both Linux and macOS, so
-/// this asks the kernel the question directly. There is no interface
-/// enumeration in `std` to ask instead.
+/// The host's AF_INET and AF_INET6 addresses are enumerated with `getifaddrs`
+/// and compared against `address`. The `SocketAddr` rather than the `IpAddr` is
+/// what keeps an IPv6 scope ID: a link-local address is matched only by an
+/// interface entry with the same scope, because the same `fe80::` address can
+/// exist on more than one interface.
 ///
-/// The `SocketAddr` rather than the `IpAddr` is what keeps an IPv6 scope ID:
-/// binding a link-local address without the scope that selects its interface
-/// fails even when the host holds the address, so the scope has to survive the
-/// call.
+/// The enumeration rather than a `bind(2)` probe is deliberate. A bind asks the
+/// kernel whether it will accept the address, and `net.ipv4.ip_nonlocal_bind`
+/// or `net.ipv6.ip_nonlocal_bind` makes the kernel skip the local-address check.
+/// On a host with either set, a bind probe answers true for every address, so
+/// every allowed target would look like one of the proxy's own and every tunnel
+/// would be refused. Enumerating the interfaces answers the question this check
+/// actually asks.
 ///
 /// Nothing is cached. The call is on the tunnel-open path, which is per request
 /// and never per packet, an interface can come and go while the server runs, and
 /// a cache would need invalidating by an event this process has no portable way
 /// to see.
 ///
-/// An error that is not "this address is not ours", an empty descriptor table
-/// or an exhausted ephemeral port range, answers `false` as well. That is D89's
-/// rule: local exhaustion is this proxy's own fault and must not turn into a
-/// verdict about the target. The tunnel that follows fails on its own socket a
-/// moment later and reports `proxy_internal_error`, which is the truthful
-/// answer.
+/// A failed enumeration answers `false` as well. That is D89's rule: a local
+/// failure is this proxy's own fault and must not turn into a verdict about the
+/// target. The tunnel that follows fails on its own socket a moment later and
+/// reports `proxy_internal_error`, which is the truthful answer.
 pub fn holds_address(address: SocketAddr) -> bool {
-    std::net::UdpSocket::bind(address).is_ok()
+    let Some(interfaces) = interface_addresses() else {
+        return false;
+    };
+    on_interface(address, &interfaces)
 }
 
 /// One address an interface carries, with the scope that selects the interface
 /// for a link-local IPv6 address.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 struct LocalAddress {
     ip: IpAddr,
@@ -383,10 +386,6 @@ struct LocalAddress {
 /// IPv6 address is matched only by an entry with the same scope ID, because the
 /// same `fe80::` address can exist on more than one interface and the scope is
 /// what selects between them. Every other address is matched by value.
-///
-/// The interface list comes from the enumeration in the next change; until then
-/// the rule is exercised by the test below.
-#[cfg(test)]
 fn on_interface(address: SocketAddr, interfaces: &[LocalAddress]) -> bool {
     let scope = match address {
         SocketAddr::V6(v6) => v6.scope_id(),
@@ -400,9 +399,68 @@ fn on_interface(address: SocketAddr, interfaces: &[LocalAddress]) -> bool {
 }
 
 /// `fe80::/10`, the one IPv6 range whose local binding depends on a scope.
-#[cfg(test)]
 fn is_link_local(ip: IpAddr) -> bool {
     matches!(ip, IpAddr::V6(v6) if crate::policy::is_unicast_link_local(v6))
+}
+
+/// Enumerates the AF_INET and AF_INET6 addresses the host's interfaces carry.
+///
+/// `None` means `getifaddrs` itself failed; the caller turns that into the D89
+/// answer rather than into a verdict about the target. The list is freed with
+/// `freeifaddrs` after every element has been read.
+///
+/// This is the crate's one `unsafe` site: `getifaddrs` has no safe wrapper in
+/// this tree's dependencies, and rustix does not implement it. Each block below
+/// carries its own safety argument.
+#[allow(unsafe_code)]
+fn interface_addresses() -> Option<Vec<LocalAddress>> {
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+
+    // SAFETY: `head` is a valid out-parameter. On success `getifaddrs` writes a
+    // null-terminated list of interface entries that this function owns and
+    // releases with `freeifaddrs` below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+
+    let mut addresses = Vec::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: `cursor` is an element of the list `getifaddrs` returned and
+        // is non-null in this iteration. `ifa_addr` is either null or a valid
+        // `sockaddr` whose concrete type is given by its `sa_family`.
+        unsafe {
+            let entry = &*cursor;
+            if !entry.ifa_addr.is_null() {
+                match i32::from((*entry.ifa_addr).sa_family) {
+                    libc::AF_INET => {
+                        let sockaddr = &*entry.ifa_addr.cast::<libc::sockaddr_in>();
+                        addresses.push(LocalAddress {
+                            ip: IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                                sockaddr.sin_addr.s_addr,
+                            ))),
+                            scope_id: 0,
+                        });
+                    }
+                    libc::AF_INET6 => {
+                        let sockaddr = &*entry.ifa_addr.cast::<libc::sockaddr_in6>();
+                        addresses.push(LocalAddress {
+                            ip: IpAddr::V6(Ipv6Addr::from(sockaddr.sin6_addr.s6_addr)),
+                            scope_id: sockaddr.sin6_scope_id,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            cursor = entry.ifa_next;
+        }
+    }
+
+    // SAFETY: `head` is the list `getifaddrs` allocated and returned, and it is
+    // freed exactly once, after every element has been read.
+    unsafe { libc::freeifaddrs(head) };
+
+    Some(addresses)
 }
 
 /// The process's soft limit on open file descriptors, or `None` if it has none.
@@ -968,15 +1026,15 @@ mod tests {
         );
     }
 
-    /// The two answers the bind probe has to get right, on every host this
+    /// The two answers the enumeration has to get right, on every host this
     /// crate runs on.
     ///
     /// 127.0.0.1 is held by any host that can run this test at all. 192.0.2.1 is
     /// RFC 5737's TEST-NET-1, reserved for documentation, so no interface
-    /// carries it and `bind` has nothing to bind to. A host that did carry it
-    /// would be misconfigured in a way this test is right to report.
+    /// carries it. A host that did carry it would be misconfigured in a way this
+    /// test is right to report.
     #[test]
-    fn the_bind_probe_tells_this_hosts_addresses_from_everything_else() {
+    fn the_enumeration_tells_this_hosts_addresses_from_everything_else() {
         assert!(
             holds_address("127.0.0.1:0".parse().unwrap()),
             "loopback is held by every host"
@@ -1030,6 +1088,23 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    /// The enumeration itself, which is the production path `holds_address`
+    /// uses after this change.
+    ///
+    /// Loopback is the one address every host that can run this test has, so it
+    /// is the one the enumeration must find. `ip_nonlocal_bind` cannot be
+    /// simulated from a test without root and a sysctl, so this is the closest
+    /// direct check the suite can make: the list comes from the interfaces
+    /// rather than from a bind that the sysctl would defeat.
+    #[test]
+    fn the_interface_enumeration_finds_loopback() {
+        let interfaces = interface_addresses().expect("getifaddrs must succeed on a running host");
+        assert!(
+            interfaces.iter().any(|interface| interface.ip.is_loopback()),
+            "every host has a loopback address: {interfaces:?}"
+        );
     }
 
     /// Two of each family, interleaved, so both the partition and its stability
