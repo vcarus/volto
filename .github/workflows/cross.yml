@@ -76,6 +76,21 @@ jobs:
           strip: true
       # <<< mirrored build step (release.yml <-> cross.yml) <<<
 
+      # >>> mirrored smoke step (release.yml <-> cross.yml) >>>
+      - name: The built binary runs
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/volto"
+          work="$(mktemp -d)"
+          : > "$work/cert.pem"
+          : > "$work/key.pem"
+          printf '[server]\nlisten = "127.0.0.1:14443"\ncert = "%s"\nkey = "%s"\n' \
+            "$work/cert.pem" "$work/key.pem" > "$work/config.toml"
+          "$binary" --version
+          "$binary" --check-config --config "$work/config.toml"
+      # <<< mirrored smoke step (release.yml <-> cross.yml) <<<
+
       # release.yml makes this assertion on the copy in `dist/`, inside the step
       # that packages the tarball, so it cannot be part of the mirrored block.
       # Made here on the binary this workflow just built, it moves the signal to

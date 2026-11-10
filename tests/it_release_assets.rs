@@ -174,15 +174,20 @@ const MIRROR_OPEN: &str = ">>> mirrored build step";
 /// And closes it.
 const MIRROR_CLOSE: &str = "<<< mirrored build step";
 
-/// The lines between the mirror markers in `.github/workflows/<name>`.
+/// Opens the smoke block both workflow files must spell identically.
+const SMOKE_OPEN: &str = ">>> mirrored smoke step";
+/// And closes it.
+const SMOKE_CLOSE: &str = "<<< mirrored smoke step";
+
+/// The lines between a pair of mirror markers in `.github/workflows/<name>`.
 ///
-/// Markers rather than line numbers: the two blocks sit at different offsets in
+/// Markers rather than line numbers: the blocks sit at different offsets in
 /// files of different lengths, and an offset is wrong the first time either file
 /// grows a line — silently, since a wrong offset still yields *some* text to
 /// compare. The prose above each block differs on purpose and stays outside the
 /// markers; everything inside them, comments included, has to match byte for
 /// byte.
-fn mirrored_build_step(name: &str) -> String {
+fn mirrored_block(name: &str, open: &str, close: &str) -> String {
     let path = repo_root().join(".github/workflows").join(name);
     let text = read_text(&path);
 
@@ -191,14 +196,14 @@ fn mirrored_build_step(name: &str) -> String {
     let mut closed = false;
 
     for line in text.lines() {
-        if line.contains(MIRROR_OPEN) {
+        if line.contains(open) {
             assert!(
                 !inside && !closed,
                 "{} opens the mirrored block more than once",
                 path.display()
             );
             inside = true;
-        } else if line.contains(MIRROR_CLOSE) {
+        } else if line.contains(close) {
             assert!(
                 inside,
                 "{} closes a mirrored block it never opened",
@@ -213,8 +218,8 @@ fn mirrored_build_step(name: &str) -> String {
 
     assert!(
         closed,
-        "{} carries no `{MIRROR_OPEN}` … `{MIRROR_CLOSE}` block — has the build \
-         step moved, or were the markers dropped?",
+        "{} carries no `{open}` … `{close}` block — has the step moved, or were \
+         the markers dropped?",
         path.display()
     );
     assert!(
@@ -224,6 +229,16 @@ fn mirrored_build_step(name: &str) -> String {
     );
 
     block.join("\n")
+}
+
+/// The build step both workflow files run.
+fn mirrored_build_step(name: &str) -> String {
+    mirrored_block(name, MIRROR_OPEN, MIRROR_CLOSE)
+}
+
+/// The smoke step both workflow files run.
+fn mirrored_smoke_step(name: &str) -> String {
+    mirrored_block(name, SMOKE_OPEN, SMOKE_CLOSE)
 }
 
 /// A green cross build is only evidence about the release build if it *is* the
@@ -241,6 +256,43 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
          step that differs proves something about a build nobody ships.\n\n\
          release.yml:\n{release}\n\ncross.yml:\n{cross}"
     );
+}
+
+/// A green cross build is not evidence that the released binary runs.
+///
+/// Nothing used to execute the musl artifact, so a binary that builds and then
+/// fails at startup, or a config the binary refuses, reached the release page
+/// with every job green. The smoke step runs the built binary with `--version`
+/// and with `--check-config` on a minimal planted configuration.
+///
+/// The step is gated to `x86_64-unknown-linux-musl` because the aarch64 artifact
+/// cannot execute on the x86_64 runner. The aarch64 artifact is still covered by
+/// the strip assertion in cross.yml and by the packaging assertion in
+/// release.yml.
+#[test]
+fn the_released_binary_is_executed_before_publishing() {
+    let release = mirrored_smoke_step("release.yml");
+    let cross = mirrored_smoke_step("cross.yml");
+
+    assert_eq!(
+        release, cross,
+        "the smoke step in .github/workflows/cross.yml has drifted from the one \
+         in release.yml. The two exist so that the same binary is executed on the \
+         pull request that can break it and before it is published; a step that \
+         differs proves something about a binary nobody ships.\n\n\
+         release.yml:\n{release}\n\ncross.yml:\n{cross}"
+    );
+
+    for needle in [
+        "--version",
+        "--check-config",
+        "matrix.target == 'x86_64-unknown-linux-musl'",
+    ] {
+        assert!(
+            release.contains(needle),
+            "the mirrored smoke step no longer contains {needle:?}:\n{release}"
+        );
+    }
 }
 
 /// And it is only evidence at all if editing release.yml runs it.
