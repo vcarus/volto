@@ -674,6 +674,64 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
     }
 }
 
+/// A failure at the ownership change must also put the previous pair back.
+///
+/// The ERR trap covered the four renames and was disarmed before `chown`. A
+/// failure there ended the run with the new pair in place, owned by root with
+/// the key at mode 0640, which the service user cannot read; the next restart
+/// fails. The transaction now covers ownership and mode.
+#[test]
+fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
+    let root = scratch_tree(
+        "install",
+        "chown-fails",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let conf_dir = root.join("etc/volto");
+    let (cert, key) = plant_placeholder_certificates(&conf_dir);
+    let old_cert = fs::read(&cert).expect("the old certificate must be readable");
+    let old_key = fs::read(&key).expect("the old key must be readable");
+
+    let stubs = plant_root_stubs(&root, 0, "active");
+    write_executable(&stubs.join("chown"), "#!/bin/sh\nexit 1\n");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--force"]);
+    let stderr = stderr_of(&output);
+
+    assert!(
+        !output.status.success(),
+        "a failed chown must fail the install: {stderr}"
+    );
+    assert!(
+        stderr.contains("installing the new certificate failed"),
+        "the run must say the certificate install failed: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&cert).ok(),
+        Some(old_cert),
+        "the old certificate must be back at {}: {stderr}",
+        cert.display()
+    );
+    assert_eq!(
+        fs::read(&key).ok(),
+        Some(old_key),
+        "the old key must be back at {}: {stderr}",
+        key.display()
+    );
+
+    let mut leftovers: Vec<String> = fs::read_dir(&conf_dir)
+        .expect("the configuration directory must be readable")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
+        .collect();
+    leftovers.sort();
+    assert!(
+        leftovers.is_empty(),
+        "after a failed chown no new or backup file may stay behind, found {leftovers:?}: {stderr}"
+    );
+}
+
 /// Runs the full install path with the given service status, relocating every
 /// install path under `root`.
 ///
@@ -681,11 +739,23 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
 /// config, so this exercises the generator, the certificate, the unit install
 /// and the service check as one run.
 fn run_full_install(root: &Path, service_status: &str) -> std::process::Output {
-    let script = repo_root().join("script/install-selfsigned.sh");
     let stubs = plant_root_stubs(root, 0, service_status);
+    run_full_install_with_stubs(root, &stubs, &[])
+}
+
+/// Runs the full install path with `stubs` in front of `PATH`, which a test uses
+/// to replace one of the stand-ins the builder wrote.
+fn run_full_install_with_stubs(
+    root: &Path,
+    stubs: &Path,
+    extra_args: &[&str],
+) -> std::process::Output {
+    let script = repo_root().join("script/install-selfsigned.sh");
     let path = std::env::var_os("PATH").expect("PATH must be set");
-    let path = std::env::join_paths(std::iter::once(stubs).chain(std::env::split_paths(&path)))
-        .expect("the stub directory must fit in PATH");
+    let path = std::env::join_paths(
+        std::iter::once(stubs.to_path_buf()).chain(std::env::split_paths(&path)),
+    )
+    .expect("the stub directory must fit in PATH");
 
     Command::new("bash")
         .arg(&script)
@@ -697,6 +767,7 @@ fn run_full_install(root: &Path, service_status: &str) -> std::process::Output {
             "-w",
             "correct-horse-battery",
         ])
+        .args(extra_args)
         .current_dir(repo_root())
         .env("VOLTO_INSTALL_ROOT", root)
         .env("PATH", path)

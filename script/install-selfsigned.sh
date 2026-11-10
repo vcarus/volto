@@ -358,12 +358,14 @@ install -d -o volto -g volto -m 0750 "$CONF_DIR"
 # Puts back whatever the certificate swap had moved, removes the new pair, then
 # ends the run.
 #
-# Armed as an ERR trap over the four renames of the swap, and disarmed after the
-# last one. Without it `set -e` ends the run with the configured pair split. A
-# failure at the key backup leaves the old key with no certificate. A failure at
-# either move into place leaves the new certificate, or no certificate, beside
-# the old key's backup. The running service keeps the pair it loaded, so the
-# next restart is what fails.
+# Armed as an ERR trap over the four renames of the swap and the ownership and
+# mode that follow them, and disarmed after the chmod block. Without it `set -e`
+# ends the run with the configured pair split, or with the new pair in place and
+# the key possibly root-owned and mode 0640, which the next restart cannot read.
+# A failure at the key backup leaves the old key with no certificate. A failure
+# at either move into place leaves the new certificate, or no certificate,
+# beside the old key's backup. The running service keeps the pair it loaded, so
+# the next restart is what fails.
 #
 # The moves are undone in reverse order. The old certificate replaces the new
 # one in a single rename, so the certificate path is not left empty while there
@@ -444,7 +446,6 @@ else
     mv "$CERT.new" "$CERT"
     cert_placed=1
     mv "$KEY.new" "$KEY"
-    trap - ERR
 
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi
@@ -452,6 +453,10 @@ fi
 chown volto:volto "$CERT" "$KEY"
 chmod 0644 "$CERT"
 chmod 0640 "$KEY"
+# The transaction is complete. restore_previous_pair removes the new pair and
+# restores the old one, so a kept-certificate run armed no trap and disarms
+# nothing here.
+trap - ERR
 
 # --- configuration ----------------------------------------------------------
 
