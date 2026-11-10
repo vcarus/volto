@@ -199,7 +199,15 @@ impl ReloadHandle {
         // precisely the race D22 forbids. Every parse above is deliberately
         // outside it, so a `SIGHUP` with a large certificate cannot delay a
         // drain that is waiting for this.
-        let _swapping = self.swap.hold();
+        //
+        // The guard covers the latch read through the fourth write and nothing
+        // after it. It is dropped straight after `set_server_config`, before the
+        // log lines and the fd check: those report what was swapped rather than
+        // decide it, and holding the guard across them would let a blocked log
+        // sink stall the accept path, which takes the same mutex synchronously
+        // on a runtime worker, and the drain, which takes it before closing the
+        // endpoint.
+        let swapping = self.swap.hold();
 
         // A reload during shutdown must not re-open the listener that `drain` just
         // closed. Refusing is safer than racing it.
@@ -248,6 +256,7 @@ impl ReloadHandle {
             .unwrap_or_else(PoisonError::into_inner) = accepted_with.clone();
         self.endpoint
             .set_server_config(Some((*accepted_with).clone()));
+        drop(swapping);
 
         info!(
             log_id = "aie853ib",
