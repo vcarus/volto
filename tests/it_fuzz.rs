@@ -1932,12 +1932,30 @@ proptest! {
         let mut decoder = CapsuleDecoder::new();
         decoder.push(&header);
         prop_assert_eq!(decoder.next_capsule(), Ok(None), "an unknown type is not refused");
+        prop_assert_eq!(
+            decoder.buffered_len(),
+            0,
+            "the header is consumed, so nothing of it is held"
+        );
         prop_assert!(!decoder.at_capsule_boundary(), "it is mid-capsule");
+
+        // The bytes below are a proper prefix of the declared value, however
+        // large the declaration is, so the decoder must discard them rather
+        // than hold them waiting for the rest.
+        prop_assert!(
+            (arriving.len() as u64) < length,
+            "the arriving bytes must stay below the declared length"
+        );
 
         // However much of the value arrives, it is consumed and not held: the
         // decoder still wants more, and still is not at a boundary.
         decoder.push(&arriving);
         prop_assert_eq!(decoder.next_capsule(), Ok(None));
+        prop_assert_eq!(
+            decoder.buffered_len(),
+            0,
+            "a skipped value is discarded as it arrives, so nothing is held"
+        );
         prop_assert!(!decoder.at_capsule_boundary());
     }
 }

@@ -169,6 +169,19 @@ impl CapsuleDecoder {
         }
     }
 
+    /// The number of bytes the decoder is currently holding.
+    ///
+    /// A capsule header is consumed as soon as both varints are present, and
+    /// the value of an unknown capsule type is discarded as it arrives, so
+    /// neither is held. The value of a DATAGRAM capsule is the exception: it is
+    /// held whole until its declared length has arrived, because a Context ID
+    /// has to be read off the front of it. This is what a test needs to tell a
+    /// decoder that skips an unknown capsule from one that buffers its value
+    /// and returns the same `Ok(None)` either way.
+    pub fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Decodes the next capsule of interest.
     ///
     /// `Ok(None)` means more bytes are needed — not an error. Unknown capsule
@@ -427,6 +440,43 @@ mod tests {
         // the next capsule's header, which has not arrived whole.
         decoder.push(&[0x00]);
         assert!(!decoder.at_capsule_boundary());
+    }
+
+    /// What [`CapsuleDecoder::buffered_len`] reports: a DATAGRAM value is held
+    /// whole, while a header and a skipped value are not held at all.
+    #[test]
+    fn buffered_len_reports_the_bytes_still_held() {
+        let mut decoder = CapsuleDecoder::new();
+        let wire = encode_datagram(0, b"held");
+        decoder.push(&wire);
+        assert_eq!(
+            decoder.buffered_len(),
+            wire.len(),
+            "a DATAGRAM value is held"
+        );
+
+        assert_eq!(
+            drain(&mut decoder).unwrap(),
+            vec![datagram_capsule(0, b"held")]
+        );
+        assert_eq!(decoder.buffered_len(), 0, "draining releases the value");
+
+        let mut header = BytesMut::new();
+        datagram::put_varint(&mut header, 0x41);
+        datagram::put_varint(&mut header, 1_000_000);
+        decoder.push(&header);
+        assert_eq!(decoder.buffered_len(), header.len(), "the header is held");
+
+        assert_eq!(decoder.next_capsule().unwrap(), None);
+        assert_eq!(decoder.buffered_len(), 0, "the header is consumed");
+
+        decoder.push(b"a prefix of the value");
+        assert_eq!(decoder.next_capsule().unwrap(), None);
+        assert_eq!(
+            decoder.buffered_len(),
+            0,
+            "a skipped value is discarded as it arrives"
+        );
     }
 
     /// An unknown capsule's value must never be buffered, no matter how large it
