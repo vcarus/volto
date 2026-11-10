@@ -135,10 +135,18 @@ struct Peer {
     ///
     /// Recorded as well as panicked with, because a panic inside a spawned task
     /// is caught by tokio and stored in a `JoinHandle` nobody awaits: the
-    /// message would be printed and the test would still pass. Every request
-    /// and every response checks this, so a server that breaks a rule on its
-    /// control stream fails the next test that talks to it.
+    /// message would be printed and the test would still pass. Every request,
+    /// every response and every data read checks this, and so does
+    /// [`H3Client`] teardown, so a server that breaks a rule on its control
+    /// stream fails the test even when the fault arrives after the last
+    /// exchange.
     fault: Mutex<Option<String>>,
+    /// Whether the server's first control stream has been seen.
+    ///
+    /// RFC 9114 §6.2.1 allows exactly one control stream per connection, so a
+    /// second one is a fault. The first stream sets this; every later one is
+    /// recorded rather than read as if it were the first.
+    control_seen: AtomicBool,
 }
 
 impl Default for Peer {
@@ -148,6 +156,7 @@ impl Default for Peer {
             closing: AtomicBool::new(false),
             goaway: AtomicU64::new(NO_GOAWAY),
             fault: Mutex::new(None),
+            control_seen: AtomicBool::new(false),
         }
     }
 }
@@ -170,8 +179,12 @@ impl Peer {
     }
 
     /// Panics if the server has already broken a control-stream rule.
+    ///
+    /// Called at every request and response boundary, after every data read,
+    /// and at [`H3Client`] teardown, which is the last place a fault recorded
+    /// after the test's final exchange can fail the test.
     #[track_caller]
-    fn check(&self) {
+    pub fn check(&self) {
         if let Some(rule) = self.fault.lock().expect("fault lock").as_deref() {
             panic!("{rule}");
         }
@@ -471,6 +484,13 @@ fn abandon(
 
 impl Drop for H3Client {
     fn drop(&mut self) {
+        // A control-stream fault recorded after the test's last request or
+        // response has nothing left to re-raise it, so teardown is the last
+        // place it can fail the test. Skipped while unwinding: a second panic
+        // there would abort the process instead of reporting the first failure.
+        if !std::thread::panicking() {
+            self.send.peer.check();
+        }
         self.driver.abort();
     }
 }
@@ -627,8 +647,13 @@ impl ClientStream {
     /// accounted for before this returns, so the tests may poll it inside a
     /// `select!` or a timeout and try again.
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, StreamError> {
+        self.peer.check();
         loop {
-            match self.frames.next().await.map_err(convert)? {
+            let next = self.frames.next().await;
+            // A fault recorded while this read waited has no request or
+            // response boundary to catch it, so check here as well.
+            self.peer.check();
+            match next.map_err(convert)? {
                 // RFC 9114 §9's rule that unknown values are ignored, quoted
                 // in full in `volto::h3`.
                 Some(Item::Skipped { .. }) => {}
@@ -1054,17 +1079,38 @@ async fn drive(quic: quinn::Connection, peer: Arc<Peer>) {
 
     while let Ok(recv) = quic.accept_uni().await {
         while streams.try_join_next().is_some() {}
-        streams.spawn(serve_uni(recv, peer.clone()));
+        streams.spawn(serve_uni(recv, peer.clone(), quic.clone()));
     }
 }
 
 /// Dispatches one of the server's unidirectional streams by its type.
-async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
-    match read_varint(&mut recv).await {
-        Some(STREAM_CONTROL) => read_control(recv, peer).await,
+///
+/// A stream that ends before its type, or carries a malformed one, is a fault
+/// unless the connection itself has ended, which ends every stream with it.
+/// RFC 9114 §6.2.1 allows exactly one control stream, so a second one is
+/// recorded rather than read as if it were the first.
+async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
+    let Some(stream_type) = read_varint(&mut recv).await else {
+        if quic.close_reason().is_none() {
+            peer.broke(
+                "the server's unidirectional stream ended before its type or carried a malformed \
+                 type"
+                    .into(),
+            );
+        }
+        return;
+    };
+
+    match stream_type {
+        STREAM_CONTROL => {
+            if peer.control_seen.swap(true, Ordering::Relaxed) {
+                peer.broke("the server opened a second control stream".into());
+            }
+            read_control(recv, peer, quic).await
+        }
         // QPACK streams and anything else: drained rather than stopped, so the
         // server never sees this client refuse a stream it opened.
-        Some(_) | None => drain(recv).await,
+        _ => drain(recv).await,
     }
 }
 
@@ -1077,13 +1123,23 @@ async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
 /// control stream used to be waved through by a `_ => {}` arm and every test
 /// still passed. Unknown and reserved-for-greasing types stay ignored, because
 /// §9 requires exactly that.
-async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
+///
+/// Now also recorded as faults: a unidirectional stream that ends before its
+/// type or carries a malformed one, a second control stream, and a control
+/// stream that ends in the middle of a frame. A stream that ends because the
+/// connection itself has ended is not a fault, since every stream ends with its
+/// connection. [`Peer::check`] re-raises the first fault at the next request or
+/// response, after every data read, and at [`H3Client`] teardown.
+async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
     let mut settings_seen = false;
 
     loop {
         let (Some(kind), Some(length)) =
             (read_varint(&mut recv).await, read_varint(&mut recv).await)
         else {
+            if quic.close_reason().is_none() {
+                peer.broke("the server's control stream ended in the middle of a frame".into());
+            }
             return;
         };
         if length > MAX_CONTROL_FRAME {
@@ -1095,6 +1151,9 @@ async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>) {
 
         let mut payload = vec![0u8; length as usize];
         if recv.read_exact(&mut payload).await.is_err() {
+            if quic.close_reason().is_none() {
+                peer.broke("the server's control stream ended in the middle of a frame".into());
+            }
             return;
         }
 
