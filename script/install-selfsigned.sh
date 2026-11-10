@@ -100,8 +100,9 @@ That bound is volto's, not this script's -- the binary refuses a longer user-id
 at startup, and repeating it here only moves the complaint earlier. Neither the
 username nor the password may contain " \ | or &: the first two cannot be
 written into the generated TOML, and the other two are metacharacters of the
-substitution that writes it. Every other printable character is fine, and a
-generated password is never affected.
+substitution that writes it. Neither may contain a comma or whitespace, because
+the Surge policy line carries the pair as `username=..., password=...`. Every
+other printable character is fine, and a generated password is never affected.
 
 Before the generated config is installed, the volto binary is asked whether it
 can load it (volto --check-config); if it cannot, nothing is written and the
@@ -124,8 +125,9 @@ note() {
     echo "  $*"
 }
 
-# Rejects credentials the generated config could not express, or that the
-# substitution writing it would rewrite into something else.
+# Rejects credentials the generated config could not express, that the
+# substitution writing it would rewrite into something else, or that the Surge
+# policy line cannot carry.
 #
 # Called from the two flags that stop after generating a config as well as from
 # the preflight, because they run the same generator and --print-config used to
@@ -157,6 +159,14 @@ check_credentials() {
         # whole matched line. Rejected rather than escaped so what is installed
         # is always exactly what was asked for.
         *'|'*|*'&'*) die "username and password must not contain a pipe or an ampersand" ;;
+    esac
+    # The Surge policy line carries the pair as `username=..., password=...` on
+    # one line, so a comma or any whitespace cannot be expressed there.
+    case "$USERNAME" in
+        *[[:space:]]*|*,*) die "username must not contain a comma or whitespace" ;;
+    esac
+    case "$PASSWORD" in
+        *[[:space:]]*|*,*) die "password must not contain a comma or whitespace" ;;
     esac
 }
 

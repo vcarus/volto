@@ -295,6 +295,28 @@ fn credentials_with_a_pipe_or_an_ampersand_are_refused() {
     }
 }
 
+/// The Surge policy line carries the pair as `username=..., password=...` on
+/// one line, so a comma or any whitespace in either value cannot be expressed
+/// there. A value the policy line cannot carry would install a proxy Surge
+/// cannot reach with the credentials the installer just printed.
+#[test]
+fn credentials_the_surge_policy_line_cannot_carry_are_refused() {
+    for (argument, value) in [
+        ("-u", "a,b"),
+        ("-u", "a b"),
+        ("-w", "pass,word"),
+        ("-w", " pass"),
+    ] {
+        let (ok, stdout, stderr) = print_config(&[argument, value]);
+
+        assert!(!ok, "{argument} {value} must be refused, got:\n{stdout}");
+        assert!(
+            stderr.contains("must not contain a comma or whitespace"),
+            "the refusal must name the characters, got: {stderr}"
+        );
+    }
+}
+
 /// The question this crate cannot answer for itself: parsing the generated text
 /// here proves *this* build reads it, and the host runs the binary the installer
 /// was handed. So the script asks that binary, and this is the end-to-end shape
