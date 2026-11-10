@@ -354,25 +354,42 @@ fn quinn_proto_is_an_unpatched_registry_dependency() {
     }
 }
 
-/// Paths and names that mark a line of `src/` as a citation of quinn-proto.
+/// The quinn-proto source paths this crate's comments cite.
 ///
-/// The crate name, and the quinn-proto source paths this crate's comments
-/// cite. A path alone is enough, because a citation often names the crate on
-/// the line before. `src/config.rs` has no entry here: it is a file of this
-/// crate, and its comments speak of "line 7" in a TOML document.
-const QUINN_PROTO_MARKERS: [&str; 5] = [
-    "quinn-proto",
+/// A path alone marks a line as a citation, because a citation often names the
+/// crate on the line before. A path can also carry its line number after a
+/// colon, as in `src/connection/mod.rs:42`, so the colon form is checked
+/// against these paths rather than against the crate name.
+const QUINN_PROTO_SOURCE_PATHS: [&str; 4] = [
     "src/congestion/",
     "src/connection/",
     "src/config/mod.rs",
     "src/endpoint.rs",
 ];
 
-/// Whether `line` carries a line number: `line N` or `lines N to M`, where the
-/// word starts at a word boundary and is followed by a digit.
+/// Paths and names that mark a line of `src/` as a citation of quinn-proto.
+///
+/// The crate name, then every source path above. `src/config.rs` is not one of
+/// them: it is a file of this crate, and its comments speak of "line 7" in a
+/// TOML document.
+const QUINN_PROTO_MARKERS: [&str; 5] = [
+    "quinn-proto",
+    QUINN_PROTO_SOURCE_PATHS[0],
+    QUINN_PROTO_SOURCE_PATHS[1],
+    QUINN_PROTO_SOURCE_PATHS[2],
+    QUINN_PROTO_SOURCE_PATHS[3],
+];
+
+/// Whether `line` carries a line number.
+///
+/// Two spellings: `line N` or `lines N to M`, where the word starts at a word
+/// boundary and is followed by a digit; and a source path followed by a colon
+/// and digits, as in `src/connection/mod.rs:42`. For a directory prefix the
+/// text before the colon is the file name and must contain no whitespace; a
+/// full file path may be followed by the colon directly.
 fn carries_a_line_number(line: &str) -> bool {
     let bytes = line.as_bytes();
-    line.match_indices("line").any(|(at, _)| {
+    let word_form = line.match_indices("line").any(|(at, _)| {
         let starts_a_word = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         let rest = &line[at + "line".len()..];
         let rest = rest.strip_prefix('s').unwrap_or(rest);
@@ -380,15 +397,68 @@ fn carries_a_line_number(line: &str) -> bool {
             && rest
                 .strip_prefix(' ')
                 .is_some_and(|after| after.starts_with(|c: char| c.is_ascii_digit()))
-    })
+    });
+
+    let colon_form = QUINN_PROTO_SOURCE_PATHS.iter().any(|path| {
+        line.match_indices(path).any(|(at, _)| {
+            let rest = &line[at + path.len()..];
+            rest.find(':').is_some_and(|colon| {
+                let file_name = &rest[..colon];
+                !file_name.chars().any(|c: char| c.is_whitespace())
+                    && rest[colon + 1..]
+                        .trim_start()
+                        .starts_with(|c: char| c.is_ascii_digit())
+            })
+        })
+    });
+
+    word_form || colon_form
+}
+
+#[test]
+fn carries_a_line_number_recognizes_each_spelling() {
+    // The word form.
+    assert!(carries_a_line_number("see line 42"));
+    assert!(carries_a_line_number("see lines 42 to 44"));
+
+    // The colon form, with a file name after a directory prefix and with a
+    // full file path.
+    assert!(carries_a_line_number(
+        "quinn-proto src/connection/mod.rs:42"
+    ));
+    assert!(carries_a_line_number(
+        "quinn-proto src/congestion/bbr.rs:42"
+    ));
+    assert!(carries_a_line_number("quinn-proto src/config/mod.rs:42"));
+    assert!(carries_a_line_number("quinn-proto src/endpoint.rs:42"));
+    assert!(carries_a_line_number(
+        "quinn-proto src/connection/mod.rs: 42"
+    ));
+
+    // Not a line-number citation.
+    assert!(!carries_a_line_number("quinn-proto src/connection/mod.rs"));
+    assert!(!carries_a_line_number(
+        "quinn-proto src/connection/mod.rs: see the function"
+    ));
+    assert!(!carries_a_line_number(
+        "quinn-proto src/connection/ has no file name"
+    ));
 }
 
 /// No comment in `src/` cites quinn-proto by line number.
 ///
 /// Asserted: no line of any `.rs` file under `src/` both names quinn-proto or
-/// one of the source paths in [`QUINN_PROTO_MARKERS`] and carries `line N` or
-/// `lines N to M`. A citation names the file and the symbol instead: the
-/// function, method, constant or field.
+/// one of the source paths in [`QUINN_PROTO_MARKERS`] and carries a line number,
+/// in any of the spellings [`carries_a_line_number`] recognizes. A citation
+/// names the file and the symbol instead: the function, method, constant or
+/// field.
+///
+/// The check scans a three-line window, because a citation may be split over
+/// two comment lines: for every line that carries a marker it looks ahead for a
+/// line number, and for every line that carries a line number it looks back for
+/// a marker. The window is deliberately small so an unrelated comment within a
+/// few lines does not trip it; if a real source file has such an adjacent pair,
+/// name the symbol instead and do not weaken the lint.
 ///
 /// A line number goes stale on every quinn-proto bump and a symbol does not.
 /// The lock file moved from 0.11.18 to 0.11.19 with every line-number citation
@@ -408,12 +478,60 @@ fn no_source_comment_cites_quinn_proto_by_line_number() {
             .expect("under src/")
             .display()
             .to_string();
-        for (index, line) in read_text(&path).lines().enumerate() {
+        let text = read_text(&path);
+        let lines: Vec<&str> = text.lines().collect();
+        let mut reported = BTreeSet::new();
+
+        for (index, line) in lines.iter().enumerate() {
             let cites_quinn_proto = QUINN_PROTO_MARKERS
                 .iter()
                 .any(|marker| line.contains(marker));
-            if cites_quinn_proto && carries_a_line_number(line) {
-                offenders.push(format!("src/{relative}:{}: {}", index + 1, line.trim()));
+            let carries_number = carries_a_line_number(line);
+
+            // The fast path: both on the same line. The insert guards against a
+            // pair already reported as a split from an earlier marker line.
+            if cites_quinn_proto && carries_number {
+                if reported.insert(index) {
+                    offenders.push(format!("src/{relative}:{}: {}", index + 1, line.trim()));
+                }
+                continue;
+            }
+
+            // A split citation: the marker here, the number within three lines.
+            if cites_quinn_proto {
+                let end = (index + 4).min(lines.len());
+                if let Some(number) = (index + 1..end).find(|at| carries_a_line_number(lines[*at]))
+                {
+                    if reported.insert(number) {
+                        offenders.push(format!(
+                            "src/{relative}:{}: {} (the line number is on line {}: {})",
+                            index + 1,
+                            line.trim(),
+                            number + 1,
+                            lines[number].trim()
+                        ));
+                    }
+                    continue;
+                }
+            }
+
+            // The same split seen from the other end: the number here, the
+            // marker within the previous three lines.
+            if carries_number {
+                let start = index.saturating_sub(3);
+                if let Some(marker) = (start..index)
+                    .rev()
+                    .find(|at| QUINN_PROTO_MARKERS.iter().any(|m| lines[*at].contains(m)))
+                    .filter(|_| reported.insert(index))
+                {
+                    offenders.push(format!(
+                        "src/{relative}:{}: {} (the marker is on line {}: {})",
+                        index + 1,
+                        line.trim(),
+                        marker + 1,
+                        lines[marker].trim()
+                    ));
+                }
             }
         }
     }
