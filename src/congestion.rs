@@ -497,16 +497,20 @@ impl Controller for BbrCapped {
 ///
 /// The sample is the bytes acknowledged in between, over the longer of two
 /// times: the interval itself, and the send interval of the packets those bytes
-/// belong to. The send interval runs from the latest send time of any packet
-/// acknowledged when the interval started to the latest one when it ends. ACKs
-/// that arrive bunched shorten the first time but not the second, so a sample
-/// is not higher than the rate at which its packets were sent. The rule is
-/// ours, a simplified form of the one in the delivery-rate estimation draft
+/// belong to. The send interval runs from the earliest send time among the
+/// packets acknowledged in the interval and the latest send time acknowledged
+/// before it, to the latest send time acknowledged when it ends. The latest
+/// send time only moves forward, so a packet acknowledged out of order does not
+/// shorten the send interval. The earliest one moves back when a packet was
+/// sent before the interval started, as it is when a peer acknowledges the
+/// newest packet first and older ones later, so the send interval always covers
+/// the bytes measured. ACKs that arrive bunched shorten the ACK interval but not
+/// the send interval, so a sample is not higher than the rate at which its
+/// packets were sent. The rule is ours, a simplified form of the one in the
+/// delivery-rate estimation draft
 /// (draft-cheng-iccrg-delivery-rate-estimation), which keeps these times per
-/// packet. The latest send time only moves forward, so a packet acknowledged
-/// out of order does not shorten the send interval. If nothing had been
-/// acknowledged when the interval started, the send interval is unknown and the
-/// interval alone counts.
+/// packet. If nothing had been acknowledged before the interval started, the
+/// send interval starts at the first packet acknowledged in it.
 #[derive(Debug, Clone, Default)]
 struct DeliveryRate {
     /// When the current interval started; `None` until the first ACK batch.
@@ -517,8 +521,10 @@ struct DeliveryRate {
     app_limited: bool,
     /// The latest send time of any packet acknowledged so far.
     sent: Option<Instant>,
-    /// `sent` as it was when the current interval started.
-    sent_at_start: Option<Instant>,
+    /// The earliest send time among the packets acknowledged since the current
+    /// interval started, or the latest send time acknowledged before it,
+    /// whichever is earlier.
+    earliest: Option<Instant>,
     /// Stored samples in bytes per second, oldest overwritten first; a slot
     /// holds zero where expiry cleared it.
     samples: [u64; SAMPLES],
@@ -533,9 +539,12 @@ impl DeliveryRate {
     fn on_ack(&mut self, sent: Instant, bytes: u64, app_limited: bool) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.app_limited |= app_limited;
-        // A packet acknowledged out of order was sent before the latest one, so
-        // it does not move the send time back.
+        // The latest send time only moves forward, so a packet acknowledged out
+        // of order does not shorten the send interval. The earliest one moves
+        // back when the packet was sent before the interval started, as it is
+        // when a peer acknowledges the newest packet first.
         self.sent = self.sent.max(Some(sent));
+        self.earliest = Some(self.earliest.map_or(sent, |earliest| earliest.min(sent)));
     }
 
     /// Ends the current interval if it has lasted `round`, and then returns
@@ -550,9 +559,10 @@ impl DeliveryRate {
         if elapsed.is_zero() || elapsed < round {
             return None;
         }
-        // Unknown when no packet had been acknowledged as the interval started;
-        // the ACK interval alone then counts.
-        let send_elapsed = match (self.sent_at_start, self.sent) {
+        // From the earliest packet acknowledged in the interval, or the latest
+        // one acknowledged before it when that is earlier, to the latest one
+        // acknowledged when the interval ends. Zero when none was acknowledged.
+        let send_elapsed = match (self.earliest, self.sent) {
             (Some(first), Some(last)) => last.saturating_duration_since(first),
             _ => Duration::ZERO,
         };
@@ -599,7 +609,7 @@ impl DeliveryRate {
 
     fn restart(&mut self, now: Instant) {
         self.started = Some(now);
-        self.sent_at_start = self.sent;
+        self.earliest = self.sent;
         self.bytes = 0;
         self.app_limited = false;
     }
@@ -623,7 +633,8 @@ struct Sample {
     stored: bool,
     /// The ACK interval.
     ack_elapsed: Duration,
-    /// The send interval of the acknowledged packets; zero when unknown.
+    /// The send span of the acknowledged packets; zero when none was
+    /// acknowledged or they were all sent at one time.
     send_elapsed: Duration,
 }
 
@@ -869,6 +880,39 @@ mod tests {
         ack(&mut c, t0 + ms(350), ms(110), 2_250_000, false);
         end_acks(&mut c, t0 + ms(350), false);
         assert_eq!(c.rate.max(), Some(15_000_000), "2.25 MB over 150 ms");
+    }
+
+    #[test]
+    fn a_round_that_acknowledges_older_packets_is_measured_over_their_send_span() {
+        let mut rate = DeliveryRate::default();
+        let t0 = Instant::now();
+        // The peer acknowledges only the newest packet, sent at t0 + 90 ms, in
+        // the first interval, which closes at t0 + 100 ms.
+        rate.on_end_acks(t0, false, SRTT);
+        rate.on_ack(t0 + ms(90), 1_000_000, false);
+        let first = rate
+            .on_end_acks(t0 + SRTT, false, SRTT)
+            .expect("the first interval closes");
+        assert_eq!(first.rate, 10_000_000, "1 MB over the 100 ms ACK interval");
+
+        // A smoothed RTT later the peer acknowledges older packets, sent at
+        // t0 - 60 ms and t0 + 60 ms, so before the newest one. Their send span
+        // is longer than the 100 ms ACK interval.
+        rate.on_ack(t0 - ms(60), 1_000_000, false);
+        rate.on_ack(t0 + ms(60), 1_000_000, false);
+        let second = rate
+            .on_end_acks(t0 + 2 * SRTT, false, SRTT)
+            .expect("the second interval closes");
+
+        assert_eq!(
+            second.send_elapsed,
+            ms(150),
+            "from the earliest older packet to the latest send time seen"
+        );
+        assert_eq!(
+            second.rate, 13_333_333,
+            "2 MB over the 150 ms send span, not the 100 ms ACK interval"
+        );
     }
 
     #[test]
