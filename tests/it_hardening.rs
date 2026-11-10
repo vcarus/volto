@@ -97,14 +97,22 @@ async fn the_connection_cap_refuses_further_connections() {
         let _stream = open_tcp_tunnel(client, &target.to_string()).await;
     }
 
-    // The third is refused during the handshake.
+    // The third is refused during the handshake, with the QUIC transport error
+    // the server's `Incoming::refuse` sends. Asserting the kind matters: a TLS
+    // failure, an idle timeout or any other handshake error would otherwise
+    // satisfy a bare `is_err()`.
     let endpoint = common::client_endpoint(&server.ca, &["h3"]);
     let result = common::finish_connect(&endpoint, server.addr).await;
 
-    assert!(
-        result.is_err(),
-        "a connection past the cap must be refused, got {result:?}"
-    );
+    match result {
+        Err(quinn::ConnectionError::ConnectionClosed(close)) => {
+            assert_eq!(
+                close.error_code,
+                quinn::TransportErrorCode::CONNECTION_REFUSED
+            );
+        }
+        other => panic!("expected CONNECTION_REFUSED at the connection cap, got {other:?}"),
+    }
 
     // And the ones already established are untouched by the refusal.
     let mut stream = first
