@@ -212,6 +212,15 @@ const ACCOUNTED: &[Accounted] = &[
                  when the blocking task itself panicked.",
     },
     Accounted {
+        id: "c3n8kq2w",
+        file: "main.rs",
+        message: "RUST_LOG is set but is not a valid filter, so it was ignored; \
+                  log.level is in force instead. Fix or unset RUST_LOG and restart.",
+        bound: Bound::Lifecycle,
+        reason: "Once at startup, before any peer exists, and only when the \
+                 operator's own environment sets a value that does not parse.",
+    },
+    Accounted {
         id: "kuce6ga8",
         file: "main.rs",
         message: "could not install the SIGTERM handler",

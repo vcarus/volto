@@ -529,15 +529,27 @@ const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
 /// Installs the tracing subscriber.
 ///
 /// `RUST_LOG` wins over `log.level` so verbosity can be raised without touching
-/// the config file.
+/// the config file. A `RUST_LOG` value that does not parse is not silently
+/// treated as absent: the subscriber is installed on `log.level` and the parse
+/// error is reported immediately after, so the operator can see that the
+/// variable did not do what they meant.
 ///
 /// Under systemd each line additionally carries a syslog priority prefix; see
 /// [`JournalPriority`]. In a terminal the output is unchanged.
 fn init_tracing(level: &str) -> Result<()> {
-    let filter = match tracing_subscriber::EnvFilter::try_from_default_env() {
-        Ok(filter) => filter,
-        Err(_) => tracing_subscriber::EnvFilter::try_new(level)
+    let rust_log = std::env::var_os("RUST_LOG");
+
+    let mut invalid_rust_log = None;
+    let filter = match filter_source(rust_log.as_deref()) {
+        FilterSource::Config => tracing_subscriber::EnvFilter::try_new(level)
             .with_context(|| format!("log.level = {level:?} is not a valid filter"))?,
+        FilterSource::RustLog => tracing_subscriber::EnvFilter::try_from_default_env()
+            .context("RUST_LOG is set and parses, but could not be read back")?,
+        FilterSource::InvalidRustLog(error) => {
+            invalid_rust_log = Some(error);
+            tracing_subscriber::EnvFilter::try_new(level)
+                .with_context(|| format!("log.level = {level:?} is not a valid filter"))?
+        }
     };
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
@@ -556,7 +568,57 @@ fn init_tracing(level: &str) -> Result<()> {
         builder.init();
     }
 
+    // After `init`, or the line goes nowhere. `log.level` has already been
+    // validated by `Config::validate`, so `level` is the level in force.
+    if let Some(error) = invalid_rust_log {
+        warn!(
+            log_id = "c3n8kq2w",
+            %error,
+            level = %level,
+            "RUST_LOG is set but is not a valid filter, so it was ignored; \
+             log.level is in force instead. Fix or unset RUST_LOG and restart."
+        );
+    }
+
     Ok(())
+}
+
+/// What decides the filter [`init_tracing`] installs.
+///
+/// Three outcomes, because an unset `RUST_LOG` and a set-but-unparseable one
+/// are not the same thing: the first says nothing and `log.level` is the only
+/// instruction, while the second is an operator's mistake worth a line in the
+/// journal. [`EnvFilter::try_from_default_env`] alone cannot tell them apart —
+/// it returns `Err` for both — which is why the variable's presence is read
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FilterSource {
+    /// `RUST_LOG` is absent: `log.level` applies.
+    Config,
+    /// `RUST_LOG` is set and parses: it applies, overriding `log.level`.
+    RustLog,
+    /// `RUST_LOG` is set and does not parse: `log.level` applies, and this is
+    /// the parse error to report once the subscriber exists.
+    InvalidRustLog(String),
+}
+
+/// Reads `RUST_LOG`'s value, as returned by `std::env::var_os`, into the
+/// decision [`init_tracing`] acts on.
+///
+/// Split out so all three outcomes are testable without mutating the process
+/// environment, which this binary's tests share across threads. The value is
+/// taken as an argument rather than read here for the same reason.
+fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
+    match rust_log {
+        None => FilterSource::Config,
+        Some(raw) => match raw.to_str() {
+            Some(text) => match tracing_subscriber::EnvFilter::try_new(text) {
+                Ok(_) => FilterSource::RustLog,
+                Err(error) => FilterSource::InvalidRustLog(error.to_string()),
+            },
+            None => FilterSource::InvalidRustLog("RUST_LOG is not valid UTF-8".to_owned()),
+        },
+    }
 }
 
 /// Whether this process's log output is being read by journald.
@@ -702,6 +764,38 @@ mod tests {
         assert!(!logs_to_journal(None));
         // Set but empty is not a journal either.
         assert!(!logs_to_journal(Some(OsStr::new(""))));
+    }
+
+    /// A `RUST_LOG` that is set but does not parse is not the same as one that
+    /// is absent: the first has an error worth reporting, the second does not.
+    #[test]
+    fn an_invalid_rust_log_is_told_apart_from_an_unset_one() {
+        assert_eq!(filter_source(None), FilterSource::Config);
+        assert_eq!(
+            filter_source(Some(OsStr::new("volto=debug,quinn=info"))),
+            FilterSource::RustLog
+        );
+
+        match filter_source(Some(OsStr::new("volto=notalevel"))) {
+            FilterSource::InvalidRustLog(error) => {
+                assert!(
+                    !error.trim().is_empty(),
+                    "the parse error has to be kept for the warning"
+                );
+            }
+            other => panic!("a set but unparseable RUST_LOG must be invalid: {other:?}"),
+        }
+
+        // Non-UTF-8 is set but unreadable, not unset: the filter parser needs a
+        // string, so there is an error to report and `log.level` to fall back to.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(matches!(
+                filter_source(Some(OsStr::from_bytes(b"volto=\xff"))),
+                FilterSource::InvalidRustLog(_)
+            ));
+        }
     }
 
     /// The prefix has to be the *first* thing on the line, or journald files the

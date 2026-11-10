@@ -499,7 +499,7 @@ Some details worth knowing before relying on it:
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `level` | string | `"info"` | A bare level (`trace`/`debug`/`info`/`warn`/`error`) or a directive list such as `"volto=debug,quinn=info"`. Startup-only: the subscriber is built once at startup, a reload accepts a new value but cannot apply it, and a restart applies it. `RUST_LOG`, if set, overrides it |
+| `level` | string | `"info"` | A bare level (`trace`/`debug`/`info`/`warn`/`error`) or a directive list such as `"volto=debug,quinn=info"`. Startup-only: the subscriber is built once at startup, a reload accepts a new value but cannot apply it, and a restart applies it. `RUST_LOG`, if set, overrides it; a `RUST_LOG` that does not parse is reported at startup and `log.level` is used instead |
 | `keylog` | bool | `false` | Write TLS secrets to the file named by `SSLKEYLOGFILE`. Debugging only; volto warns while it is on |
 
 At `debug`, every inbound request is logged with its method, path, `:protocol`

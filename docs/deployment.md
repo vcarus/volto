@@ -390,6 +390,9 @@ syscall filter, no new privileges.
 Environment=RUST_LOG=volto=debug,quinn=info
 ```
 
+A `RUST_LOG` value that does not parse is reported at startup, and `log.level`
+is used instead.
+
 Log lines carry a syslog priority when systemd is reading them, so journald's own
 severity filter works rather than needing a text search:
 
