@@ -317,6 +317,36 @@ fn credentials_the_surge_policy_line_cannot_carry_are_refused() {
     }
 }
 
+/// A port the install path would refuse must be refused before the print and
+/// check flags return, because those flags print or load the config that names
+/// it. `--print-config --port 99999` used to print a configuration the install
+/// path would then reject.
+#[test]
+fn an_unusable_port_is_refused_before_the_print_and_check_flags() {
+    let (ok, stdout, stderr) = print_config(&["-p", "99999"]);
+    assert!(
+        !ok,
+        "--print-config must refuse a port out of range, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("port out of range: 99999"),
+        "the refusal must name the range: {stderr}"
+    );
+
+    let (ok, stdout, stderr) = print_config(&["-p", "abc"]);
+    assert!(
+        !ok,
+        "--print-config must refuse a port that is not a number, got:\n{stdout}"
+    );
+    assert!(
+        stderr.contains("port must be a number"),
+        "the refusal must say what is wrong: {stderr}"
+    );
+
+    let (ok, _, stderr) = print_config(&["-p", "4433"]);
+    assert!(ok, "a usable port must still print a config: {stderr}");
+}
+
 /// The question this crate cannot answer for itself: parsing the generated text
 /// here proves *this* build reads it, and the host runs the binary the installer
 /// was handed. So the script asks that binary, and this is the end-to-end shape

@@ -283,6 +283,17 @@ check_generated_config() {
     die "refusing to install a config volto cannot load"
 }
 
+# The port is validated here rather than in the preflight below, because both
+# flags that stop after generating a config reach that generation, and a config
+# naming a port the install path would refuse must not be printed or loaded as
+# if it were installable.
+case "$PORT" in
+    ''|*[!0-9]*) die "port must be a number, got: $PORT" ;;
+esac
+if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die "port out of range: $PORT"
+fi
+
 # Both flags below stop after the config has been generated, and both reach it
 # through the same temporary file the install path writes. That is what puts
 # generate_config, verify_config and check_generated_config within reach of the
@@ -320,13 +331,8 @@ command -v apt-get >/dev/null 2>&1 ||
 command -v systemctl >/dev/null 2>&1 || die "systemd is required"
 command -v openssl >/dev/null 2>&1 || die "openssl is required (apt install openssl)"
 
-case "$PORT" in
-    ''|*[!0-9]*) die "port must be a number, got: $PORT" ;;
-esac
-if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
-    die "port out of range: $PORT"
-fi
-
+# PORT was validated above, before the flags branch. Both of those paths stop
+# after generating a config, so the check cannot wait until here.
 check_credentials
 
 [ -f "$BINARY" ] || die "no volto binary at $BINARY — pass --binary PATH (a release tarball unpacks it as ./volto) or build it first: cargo build --release"
