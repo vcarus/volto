@@ -137,6 +137,12 @@ impl Policy {
 ///   The unspecified address is the one entry in the deny list that reaches
 ///   nothing at all.
 ///
+/// The unspecified address is judged in its routed form ([`routed_form`]), so a
+/// NAT64, 6to4 or Teredo address whose embedded IPv4 address is `0.0.0.0` is the
+/// same blackhole as `0.0.0.0` itself. On a DNS64 network that is the ordinary
+/// shape of a blocked name: the resolver answers the A query with `0.0.0.0` and
+/// DNS64 synthesizes `64:ff9b::`.
+///
 /// An empty list is not a blackhole. It cannot arise on the paths that call this
 /// (resolution either fails or yields addresses), and "no addresses at all" is no
 /// reason to quieten a warning.
@@ -144,7 +150,7 @@ pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
     !addresses.is_empty()
         && addresses
             .iter()
-            .all(|address| canonical(address.ip()).is_unspecified())
+            .all(|address| routed_form(address.ip()).is_unspecified())
 }
 
 /// The form the kernel routes for `ip`.
@@ -1002,6 +1008,14 @@ mod tests {
             // IPv4-mapped: unspecified once canonicalized, like everywhere else.
             &["[::ffff:0.0.0.0]:443"][..],
             &["0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"][..],
+            // Transition forms of the unspecified address: the routed form is
+            // 0.0.0.0, so a DNS64 network's blocked answer arrives wearing a
+            // global-looking IPv6 hat.
+            &["[64:ff9b::]:443"][..],
+            &["[2002::]:443"][..],
+            // Teredo: the last 32 bits are the client address with every bit
+            // inverted, so all-ones there decodes to 0.0.0.0.
+            &["[2001::ffff:ffff]:443"][..],
         ] {
             assert!(
                 is_dns_blackhole(&addresses(literals)),
