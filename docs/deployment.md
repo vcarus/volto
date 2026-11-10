@@ -553,11 +553,16 @@ client that keeps using a connection after GOAWAY instead of opening a new one
 — Surge does — has every new request fail until the drain ends, so a long
 grace period trades a longer outage for every new request against finishing the
 transfers already in flight. Raise it if long transfers matter more to you than
-a few seconds of failed requests at each restart. Keep systemd's
-`TimeoutStopSec` comfortably above whatever you choose — the shipped unit uses
-45 — so systemd does not send SIGKILL mid-drain. An hour is the most that can
-be configured: the grace period is the bound the drain is built around, and a
-value past that would only hand the ending back to `SIGKILL`.
+a few seconds of failed requests at each restart. The drain costs twice the
+grace period plus a fixed tail: `2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT +
+EXIT_SLACK`, which is `2 * shutdown_grace + 3` seconds at the shipped
+constants, because each connection gets one grace period to drain its tunnels
+and one more to flush its CLOSE. Set systemd's `TimeoutStopSec` above that
+bound, not above the grace period alone: the shipped unit uses 45, which covers
+the default grace of 5 with 13 seconds of drain. An hour is the most that can
+be configured, and at that ceiling the bound is 7203 seconds, so
+`TimeoutStopSec` has to be raised past 45 as well, or systemd sends SIGKILL
+mid-drain.
 
 The GOAWAY carries an identifier, and it is a promise in both directions.
 Requests below it were already accepted and are still served during the drain,
