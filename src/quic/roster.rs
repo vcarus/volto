@@ -18,7 +18,8 @@ struct Slot {
     ///
     /// The very gate [`crate::tunnel::Context`] opens (D76), created here and
     /// handed down, so that the accept loop can read it without reaching into
-    /// a connection it does not own.
+    /// a connection it does not own. It is also the cell the eviction claims,
+    /// so a slot is removed only if the eviction won that compare-and-swap.
     authenticated: AuthGate,
     /// Ends this connection. `notify_one` leaves a permit behind, so a slot
     /// evicted before its task has run is still ended by it rather than
@@ -162,13 +163,20 @@ impl Roster {
 /// picking the same one over and over while it winds down. `None` means every
 /// entry left has authenticated.
 ///
+/// The candidacy is decided by winning the gate's compare-and-swap, not by
+/// reading it and removing afterwards: a request can authenticate between the
+/// read and the removal, and that race used to end a connection whose request
+/// had just got past the door. A slot whose mark won the swap loses here and
+/// stays on the roster; only a slot this function claimed is removed and
+/// notified.
+///
 /// A free function over the guard rather than a method that takes its own, so
 /// that [`Roster::evict_until_below`] can run it repeatedly under one guard and
 /// the roster's own tests can run exactly what the server runs.
 fn evict_oldest_from(slots: &mut BTreeMap<u64, Slot>) -> Option<SocketAddr> {
     let sequence = *slots
         .iter()
-        .find(|(_, slot)| !slot.authenticated.is_open())
+        .find(|(_, slot)| slot.authenticated.evict())
         .map(|(sequence, _)| sequence)?;
 
     let slot = slots.remove(&sequence)?;
@@ -216,7 +224,11 @@ mod tests {
     /// an authenticated connection is owed.
     fn authenticated_gate() -> AuthGate {
         let gate = AuthGate::closed();
-        assert!(gate.mark(), "the first pass through a gate is the first");
+        assert_eq!(
+            gate.mark(),
+            super::super::transport::MarkOutcome::First,
+            "the first pass through a gate is the first"
+        );
         gate
     }
 
@@ -276,6 +288,43 @@ mod tests {
             "an authenticated connection must never lose its slot"
         );
         assert_eq!(roster.len(), 3, "and must still be on the roster");
+    }
+
+    /// An authenticated slot is skipped even when the scan reaches it first.
+    ///
+    /// The scan starts at the oldest connection, so a roster whose oldest entry
+    /// has authenticated must walk past it rather than stop: the eviction is
+    /// decided by winning the gate's compare-and-swap, not by reading a flag and
+    /// removing afterwards.
+    #[test]
+    fn an_authenticated_slot_is_skipped_and_the_next_candidate_is_taken() {
+        let roster = Roster::new();
+        let mut held = Vec::new();
+
+        let (_evict, registration) = roster.register(peer(0), authenticated_gate());
+        held.push(registration);
+        for n in 1..3 {
+            let (_evict, registration) = roster.register(peer(n), AuthGate::closed());
+            held.push(registration);
+        }
+
+        assert_eq!(
+            evict_oldest_from(&mut roster.slots()),
+            Some(peer(1)),
+            "the oldest never-authenticated connection must be the victim"
+        );
+        assert_eq!(roster.len(), 2, "the authenticated slot must stay");
+        assert_eq!(
+            evict_oldest_from(&mut roster.slots()),
+            Some(peer(2)),
+            "and the next scan must reach the remaining candidate"
+        );
+        assert_eq!(roster.len(), 1, "only the authenticated connection is left");
+        assert_eq!(
+            evict_oldest_from(&mut roster.slots()),
+            None,
+            "with nothing left that may be taken"
+        );
     }
 
     /// Why the accept loop asks whether there is a cap before applying one.

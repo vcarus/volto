@@ -2,7 +2,7 @@
 //! and the gate that records its authentication.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::{Context, Result};
 use quinn::{IdleTimeout, VarInt};
@@ -132,19 +132,46 @@ pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bid
 
 /// Whether a connection has got past the door, shared by everything that asks.
 ///
-/// One flag with three readers in three modules — the accept loop's eviction
-/// candidacy (D80), the bound on how long a connection may say nothing (D76),
-/// and the stream allowance above (D98) — and one of those is not a read at all
-/// but a transition: the raise happens on the false-to-true edge and must
-/// happen exactly once, however many requests authenticate at the same moment.
+/// One cell with three states and two transitions, and every reader in three
+/// modules — the accept loop's eviction candidacy (D80), the bound on how long a
+/// connection may say nothing (D76), and the stream allowance above (D98).
+/// A request opens the gate with [`AuthGate::mark`], and the accept loop claims
+/// it for eviction with [`AuthGate::evict`]; both are a compare-and-swap from
+/// [`UNKNOWN`], so whichever wins is the only transition. That is the whole
+/// point: an eviction cannot take a connection whose request has just
+/// authenticated, and a request cannot proceed on a connection the accept loop
+/// has already taken.
 ///
-/// A newtype rather than the `Arc<AtomicBool>` it wraps, because that invariant
-/// cannot survive as a convention across three modules: a plain `store(true)`
-/// written anywhere in them compiles and silently skips the raise. There is no
-/// way to open this gate without being told whether you were the one who opened
-/// it.
+/// The two transitions are deliberately not one `store`. `mark` reports which of
+/// the three outcomes it got, because the unknown-to-authenticated edge is what
+/// raises the stream allowance and must happen exactly once however many
+/// requests authenticate at the same moment; `evict` reports whether it won,
+/// because only a winning eviction may remove the slot and notify the
+/// connection. A newtype rather than the `Arc<AtomicU8>` it wraps, because that
+/// invariant cannot survive as a convention across three modules: a plain
+/// `store` written anywhere in them compiles and silently skips the raise or
+/// reopens an evicted connection.
 #[derive(Clone, Debug, Default)]
-pub struct AuthGate(Arc<AtomicBool>);
+pub struct AuthGate(Arc<AtomicU8>);
+
+/// Nothing has passed through this gate yet.
+const UNKNOWN: u8 = 0;
+/// A request got past the door; the gate stays open for the connection's life.
+const AUTHENTICATED: u8 = 1;
+/// An eviction took the connection's slot; no request on it may proceed.
+const EVICTED: u8 = 2;
+
+/// What one pass through an [`AuthGate`] found or did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkOutcome {
+    /// This call won the transition from unknown to authenticated, so it must
+    /// raise the connection's stream allowance.
+    First,
+    /// The gate was already open; the request proceeds and grants nothing.
+    Already,
+    /// An eviction won the transition first; the request must not proceed.
+    Evicted,
+}
 
 impl AuthGate {
     /// A gate nothing has passed yet.
@@ -152,18 +179,46 @@ impl AuthGate {
         Self::default()
     }
 
-    /// Records that a request got past the door; `true` if it was the first.
+    /// Records that a request got past the door.
     ///
-    /// `Relaxed` for the same reason the reads are: what is ordered against is
-    /// the flag itself, and a `swap` names exactly one caller the first however
-    /// many race.
-    pub fn mark(&self) -> bool {
-        !self.0.swap(true, Ordering::Relaxed)
+    /// `First` if this call won the transition and so must raise the stream
+    /// allowance, `Already` if it was open, `Evicted` if the accept loop had
+    /// already taken the slot. `Relaxed` for the same reason the reads are: what
+    /// is ordered against is the cell itself, and a compare-and-swap names
+    /// exactly one winner however many race.
+    pub fn mark(&self) -> MarkOutcome {
+        match self
+            .0
+            .compare_exchange(UNKNOWN, AUTHENTICATED, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => MarkOutcome::First,
+            Err(AUTHENTICATED) => MarkOutcome::Already,
+            // The failure value is the cell as it stood, and the two states a
+            // compare-and-swap from `UNKNOWN` can lose to are authenticated and
+            // evicted. Only the latter reaches this arm.
+            Err(_) => MarkOutcome::Evicted,
+        }
     }
 
-    /// Whether anything has.
+    /// Claims the connection for eviction, `true` if this call won.
+    ///
+    /// Only the accept loop's eviction calls this, through
+    /// [`crate::quic::roster`]: a slot whose request authenticated first cannot
+    /// be taken, and the caller must leave it on the roster rather than notify
+    /// a connection that is going to stay.
+    pub(super) fn evict(&self) -> bool {
+        self.0
+            .compare_exchange(UNKNOWN, EVICTED, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// Whether a request has got past the door.
+    ///
+    /// True only for the authenticated state: a gate an eviction took answers
+    /// false, so the connection stays under every pre-authentication bound for
+    /// the moment it has left.
     pub fn is_open(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.load(Ordering::Relaxed) == AUTHENTICATED
     }
 }
 
@@ -525,6 +580,57 @@ mod tests {
             "a quinn bump changed the default CRYPTO reassembly buffer: as above, \
              our pin holds and the reason for the number needs re-checking: {rendered}"
         );
+    }
+
+    /// The gate's three outcomes, and the order they can happen in.
+    ///
+    /// A fresh gate answers `First` to the request that wins the transition and
+    /// `Already` to every later one, which is what makes the stream allowance a
+    /// property of the connection rather than of a request.
+    #[test]
+    fn the_first_pass_is_named_once_and_later_ones_are_already() {
+        let gate = AuthGate::closed();
+
+        assert_eq!(gate.mark(), MarkOutcome::First);
+        assert_eq!(gate.mark(), MarkOutcome::Already);
+        assert!(gate.is_open());
+    }
+
+    /// An eviction is terminal: the request that was racing it must not proceed.
+    ///
+    /// The eviction and the authentication are one compare-and-swap each on the
+    /// same cell, so whichever wins is the only transition. Here the eviction
+    /// won, and `mark` has to report that rather than opening the gate.
+    #[test]
+    fn an_evicted_gate_cannot_authenticate() {
+        let gate = AuthGate::closed();
+
+        assert!(gate.evict(), "the first eviction of a fresh gate wins");
+        assert_eq!(
+            gate.mark(),
+            MarkOutcome::Evicted,
+            "a request that arrives after the eviction must be refused"
+        );
+        assert!(!gate.is_open(), "an evicted gate is not open");
+        assert!(!gate.evict(), "and a second eviction cannot win");
+    }
+
+    /// An authenticated gate cannot be evicted.
+    ///
+    /// The other side of the same swap: once a request has opened the gate, the
+    /// accept loop must not be able to take the connection's slot back, because
+    /// the connection is no longer a candidate for eviction.
+    #[test]
+    fn an_authenticated_gate_cannot_be_evicted() {
+        let gate = AuthGate::closed();
+        assert_eq!(gate.mark(), MarkOutcome::First);
+
+        assert!(
+            !gate.evict(),
+            "an eviction must lose the compare-and-swap against a mark that won"
+        );
+        assert!(gate.is_open(), "an authenticated gate stays open");
+        assert_eq!(gate.mark(), MarkOutcome::Already);
     }
 
     /// What the handshake advertises is the clamp, not `max_streams_bidi`.

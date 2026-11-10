@@ -469,15 +469,23 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             // long as the transport allows -- and, on the first request to get
             // here, raises the connection's request-stream allowance from the
             // handshake's clamp to the configured one. Both are the same door,
-            // so both are opened in one place.
-            context.mark_authenticated(Some(username));
+            // so both are opened in one place. `false` means an eviction claimed
+            // the connection first: the accept loop is already closing it, and
+            // the request must not be routed or answered.
+            if !context.mark_authenticated(Some(username)) {
+                return;
+            }
             debug!(stream_id, username, "request authenticated");
         }
         // No users configured: an open proxy, as warned about at startup. There
         // is no door to get past, so the first request past this point counts as
         // having got past it -- otherwise every connection to an unauthenticated
         // proxy would be living under D76's bound, tunnels and all.
-        Ok(None) => context.mark_authenticated(None),
+        Ok(None) => {
+            if !context.mark_authenticated(None) {
+                return;
+            }
+        }
         Err(denials) => {
             // One line per refused request, not one per refused value: the
             // first refusal comes from the highest-priority header and is the

@@ -22,7 +22,7 @@ use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
 use crate::h3api::{Fields, Method, Request, Stream};
 use crate::policy::{self, Policy};
-use crate::quic::AuthGate;
+use crate::quic::{AuthGate, MarkOutcome};
 
 pub use quota::{Pending, Quota, Slot};
 pub use status::ProxyError;
@@ -326,18 +326,25 @@ pub struct Context {
     pub max_auth_failures: u32,
     /// Whether any request on this connection has passed the credentials check.
     ///
-    /// Set once and never cleared. It is what lifts D76's bound on how long a
-    /// connection may go without sending a request: a client that has proved
-    /// who it is may hold an idle connection for as long as the transport's own
-    /// idle timeout allows, which is what makes a proxy worth reconnecting to.
-    /// A server with no users configured has nothing to check, so its first
-    /// request sets this too -- the flag means "this peer got past the door",
-    /// not "credentials were seen".
+    /// One cell with three states, and never cleared. It is what lifts D76's
+    /// bound on how long a connection may go without sending a request: a
+    /// client that has proved who it is may hold an idle connection for as long
+    /// as the transport's own idle timeout allows, which is what makes a proxy
+    /// worth reconnecting to. A server with no users configured has nothing to
+    /// check, so its first request opens it too -- the state means "this peer
+    /// got past the door", not "credentials were seen".
     ///
-    /// Its transition is load-bearing as well as its value: the false-to-true
-    /// edge is what raises this connection's bidirectional stream allowance to
-    /// the configured one, exactly once — which is why it is an [`AuthGate`]
-    /// and not the bare atomic it wraps. See `Context::mark_authenticated`.
+    /// The third state is the accept loop's: an eviction claims the cell with a
+    /// compare-and-swap, so a request racing an eviction either opens the gate
+    /// first (and the slot stays) or finds it taken and is refused. An evicted
+    /// gate reads closed, so the connection stays under every
+    /// pre-authentication bound for the moment it has left.
+    ///
+    /// Its transition is load-bearing as well as its value: the
+    /// unknown-to-authenticated edge is what raises this connection's
+    /// bidirectional stream allowance to the configured one, exactly once —
+    /// which is why it is an [`AuthGate`] and not the bare atomic it wraps. See
+    /// `Context::mark_authenticated`.
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
     /// from outside the connection as well: the accept loop needs to know which
@@ -626,6 +633,12 @@ impl Context {
     /// Records that a request on this connection got past the credentials check,
     /// and clears the failures that success answers for.
     ///
+    /// Returns whether the request may proceed. `false` means the accept loop
+    /// claimed this connection for eviction first: the caller must return
+    /// without routing the request or opening a target socket, because the
+    /// connection is already being closed. The eviction signal, not a response
+    /// written here, is what ends it.
+    ///
     /// The counters are what make guessing cost a handshake every
     /// `max_auth_failures` attempts, and clearing them is what stops them adding
     /// up over the life of a connection that *is* authenticated: a client whose
@@ -645,19 +658,25 @@ impl Context {
     ///
     /// This is also where a connection stops being worth
     /// `quic::INITIAL_BIDI_STREAMS` request streams and becomes worth
-    /// `[limits] max_streams_bidi` of them. A `swap` rather than a `store`
-    /// because that raise must happen exactly once: every CONNECT on this
-    /// connection carries credentials and so arrives here, and the request
-    /// tasks run concurrently, so the flag going from false to true is the only
+    /// `[limits] max_streams_bidi` of them. A compare-and-swap rather than a
+    /// `store` because that raise must happen exactly once: every CONNECT on
+    /// this connection carries credentials and so arrives here, and the request
+    /// tasks run concurrently, so the transition to authenticated is the only
     /// thing that names one of them the first. Every later success takes the
     /// same path and grants nothing, which is what it means for the allowance
-    /// to be a property of the connection rather than of the request.
+    /// to be a property of the connection rather than of the request. An
+    /// evicted gate grants nothing and clears nothing, because the request it
+    /// belongs to must not proceed.
     ///
     /// Done before the failure counters below rather than after, so this holds
     /// no lock of ours while it takes quinn's.
-    pub(crate) fn mark_authenticated(&self, username: Option<&str>) {
-        if self.authenticated.mark() {
-            crate::quic::admit_configured_streams(&self.quic, self.max_streams_bidi);
+    pub(crate) fn mark_authenticated(&self, username: Option<&str>) -> bool {
+        match self.authenticated.mark() {
+            MarkOutcome::First => {
+                crate::quic::admit_configured_streams(&self.quic, self.max_streams_bidi);
+            }
+            MarkOutcome::Already => {}
+            MarkOutcome::Evicted => return false,
         }
 
         let mut failures = self.auth_failures();
@@ -669,6 +688,8 @@ impl Context {
         if let Some(username) = username {
             failures.configured.remove(username);
         }
+
+        true
     }
 
     /// Whether any request on this connection has (D76).
