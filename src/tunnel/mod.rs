@@ -758,9 +758,9 @@ where
 /// is recognised, and the `SocketAddr` keeps the scope ID that selects the
 /// interface for a link-local address.
 ///
-/// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
-/// request and never per packet, and it is paid only by addresses the policy has
-/// already let through, and the loopback test above it is free.
+/// The cost is one interface enumeration per allowed address per tunnel opened,
+/// which is per request and never per packet, and it is paid only by addresses
+/// the policy has already let through, and the loopback test above it is free.
 fn is_the_proxys_own(address: std::net::SocketAddr) -> bool {
     // The routed form first: `::ffff:127.0.0.1` is loopback wearing an IPv6
     // hat, and a NAT64, 6to4 or Teredo address is a route to the IPv4 address
