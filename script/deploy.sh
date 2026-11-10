@@ -496,10 +496,12 @@ refresh_self() {
 }
 
 if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "$TIMER_UNIT" ]; then
-    # refresh_self runs in a dry run too: copying this script to $SELF_INSTALLED
-    # is the guardrail that broke under `curl ... | bash`, and it is the one step
-    # here that a test can exercise for real under VOLTO_DEPLOY_ROOT.
-    refresh_self
+    # A dry run touches nothing, and the installed copy is a root-owned system
+    # file. The one exception is the test seam: VOLTO_DEPLOY_ROOT relocates every
+    # path, so a dry-run test still exercises refresh_self for real.
+    if [ "$DRY_RUN" -eq 0 ] || [ -n "$ROOT" ]; then
+        refresh_self
+    fi
 
     if [ "$DRY_RUN" -eq 1 ]; then
         echo "dry-run: would enable timer"

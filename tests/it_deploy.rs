@@ -581,6 +581,74 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
     );
 }
 
+/// Writes `text` to `path` with mode 0755.
+fn write_executable(path: &Path, text: &str) {
+    fs::write(path, text).expect("the stub must be writable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("the stub must be executable");
+}
+
+/// A dry run must not rewrite the root-owned installed copy of this script.
+///
+/// The timer branch used to call `refresh_self` before the dry-run exit, and
+/// `refresh_self` installs the running copy over `/usr/local/sbin/volto-deploy`.
+/// The help text and docs/deployment.md promise a dry run changes nothing, and
+/// that path is a root-owned system file.
+///
+/// The stubs make the assertion meaningful on any host. `install` records its
+/// arguments and fails, so a regression cannot reach the real `/usr/local/sbin`.
+/// `cmp` fails, so the "already equal" early return cannot let the run pass for
+/// the wrong reason. `readlink` resolves the script, which is what
+/// `refresh_self` needs to see a file.
+#[test]
+fn a_dry_run_does_not_rewrite_the_installed_script() {
+    let dir = scratch_tree("deploy", "dry-run-timer", &["stubs"]);
+    let stubs = dir.join("stubs");
+    let marker = stubs.join("install-called");
+
+    write_executable(
+        &stubs.join("install"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
+            marker.display()
+        ),
+    );
+    write_executable(&stubs.join("cmp"), "#!/bin/sh\nexit 1\n");
+    write_executable(
+        &stubs.join("readlink"),
+        &format!("#!/bin/sh\necho '{}'\n", deploy_script().display()),
+    );
+
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    let path =
+        std::env::join_paths(std::iter::once(stubs.clone()).chain(std::env::split_paths(&path)))
+            .expect("the stub directory must fit in PATH");
+
+    let output = Command::new("bash")
+        .arg(deploy_script())
+        .args(["--dry-run", "--enable-timer", "--tag", "v0.2.4"])
+        .current_dir(repo_root())
+        .env("PATH", path)
+        .output()
+        .expect("the deploy script must be runnable");
+
+    assert!(
+        output.status.success(),
+        "a dry run must succeed: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.ends_with("dry-run: would enable timer\n"),
+        "the timer decision must be the last thing printed: {stdout}"
+    );
+    assert!(
+        !marker.exists(),
+        "a dry run installed the script over the system path; the stub recorded:\n{}",
+        fs::read_to_string(&marker).unwrap_or_default()
+    );
+}
+
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
 /// not a file. This once aborted the whole run; it must be a quiet no-op.
 #[test]
