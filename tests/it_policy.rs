@@ -298,6 +298,22 @@ async fn connect_udp_to_a_prohibited_address_is_refused() {
 #[tokio::test]
 async fn an_address_this_host_holds_is_refused_on_both_routes() {
     let Some(own) = own_non_loopback_address() else {
+        // A latch, not a silent skip: the test is the only coverage of RFC 9298
+        // §7's own-address class, so a host that must have an address but whose
+        // probe finds none would leave the rule untested with every run green.
+        // macOS is the platform CLAUDE.md requires to stay green, and GitHub's
+        // Linux runners have an address; anywhere else a host with no route may
+        // still skip, but only when the independent probe agrees it has none.
+        let second_probe = a_second_probe_finds_a_non_loopback_address();
+        let must_find_one = cfg!(target_os = "macos")
+            || (cfg!(target_os = "linux") && std::env::var_os("CI").is_some());
+        assert!(
+            !must_find_one && !second_probe,
+            "the own-address probe found no non-loopback address, but this host \
+             must have one (macOS or Linux CI) or a second probe to a different \
+             documentation address found one; the own-address rule would go \
+             untested silently"
+        );
         eprintln!("skipped: this host carries no non-loopback address to test with");
         return;
     };
@@ -337,6 +353,22 @@ fn own_non_loopback_address() -> Option<std::net::IpAddr> {
     socket.connect("192.0.2.1:9").ok()?;
     let address = socket.local_addr().ok()?.ip();
     (!address.is_loopback() && !address.is_unspecified()).then_some(address)
+}
+
+/// A second probe for the same precondition, against a different documentation
+/// address.
+///
+/// Independent of [`own_non_loopback_address`] in the destination it asks the
+/// kernel to route: if this one finds a non-loopback source address while the
+/// first finds none, the host has a route and the first probe is what failed,
+/// so the caller must not skip.
+fn a_second_probe_finds_a_non_loopback_address() -> bool {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("198.51.100.1:9")?;
+            socket.local_addr()
+        })
+        .is_ok_and(|address| !address.ip().is_loopback() && !address.ip().is_unspecified())
 }
 
 /// A name whose every address is the unspecified one was blackholed by the
