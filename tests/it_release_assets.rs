@@ -686,3 +686,35 @@ fn the_fuzz_lockfile_records_the_current_crate_version() {
          `cargo update -p volto --manifest-path fuzz/Cargo.toml` alongside the version bump"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The unit allows the address families libc name resolution needs
+// ---------------------------------------------------------------------------
+
+/// The unit must let libc resolution open every address family it may need.
+///
+/// `RestrictAddressFamilies=AF_INET AF_INET6` covered the sockets volto opens
+/// itself and nothing else. getaddrinfo resolves through NSS modules, and on a
+/// host whose nsswitch.conf names `resolve` or `myhostname` those modules open
+/// AF_UNIX and AF_NETLINK sockets; a denied family fails the lookup and the
+/// tunnel with it. The unit is the only place that restriction is expressed.
+#[test]
+fn the_unit_allows_the_address_families_name_resolution_needs() {
+    let unit = read_text(&repo_root().join("script/masque.service"));
+    let line = unit
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("RestrictAddressFamilies="))
+        .expect("script/masque.service must restrict address families");
+
+    let families: Vec<&str> = line
+        .trim_start_matches("RestrictAddressFamilies=")
+        .split_whitespace()
+        .collect();
+    for family in ["AF_INET", "AF_INET6", "AF_UNIX", "AF_NETLINK"] {
+        assert!(
+            families.contains(&family),
+            "the unit must allow {family}, or libc name resolution can fail; it allows {families:?}"
+        );
+    }
+}

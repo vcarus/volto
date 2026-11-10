@@ -91,8 +91,10 @@ ProtectProc=invisible
 ReadOnlyPaths=/etc/volto
 
 # --- Syscall and network surface -------------------------------------------
-RestrictAddressFamilies=AF_INET AF_INET6
-# AF_NETLINK is not needed: volto resolves through libc and does not read routes.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# AF_UNIX and AF_NETLINK are for libc name resolution: NSS modules such as
+# `resolve` and `myhostname` open sockets in those families, and a denied family
+# fails the lookup. volto does not read routes.
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
