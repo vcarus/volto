@@ -97,7 +97,7 @@ block once the tunnel has relayed anything: reads are cut from one block until
 too little of it is left to offer a full-sized window, and that is also why the
 first 16 KiB is let go after the first read. So the saturation product for TCP
 is `max_connections` × `max_targets_per_conn` × 64 KiB = 4 GiB at the defaults,
-beside the 9.8 GiB of the UDP one. What a tunnel holds beyond that one block is
+beside the 14.7 GiB of the UDP one. What a tunnel holds beyond that one block is
 bounded by quinn's per-connection send window (`SEND_WINDOW` = 10 MB). That
 window counts bytes retained from what this server writes rather than bytes
 still unacknowledged: the pieces cut from a block share it, and each goes on
