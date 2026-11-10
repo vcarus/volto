@@ -238,14 +238,35 @@ fn request_socket_buffer(
 
 /// Whether the kernel granted less buffer than was asked for.
 ///
-/// Split out from the socket I/O so both answers can be asserted on without one,
-/// and written as `<` rather than `!=` deliberately: Linux reports back **twice**
+/// Split out from the socket I/O so both answers can be asserted on without one.
+/// The read-back convention differs by platform: Linux reports back **twice**
 /// the size it granted, because `SO_RCVBUF`'s accounting includes per-packet
-/// overhead, while macOS reports the number unchanged. An equality check would
-/// call every Linux host truncated — including the ones that got exactly what
-/// they asked for.
+/// overhead, while macOS reports the number unchanged. Comparing the two the
+/// same way is wrong in one direction or the other. On Linux the kernel clamps
+/// to the sysctl and reports double the clamped value, so a request above the
+/// ceiling but below twice the ceiling — 300 000 bytes against a 212 992-byte
+/// ceiling, read back as 425 984 — satisfies a plain `<` although the kernel
+/// granted only the ceiling. Halving the read-back before the comparison closes
+/// that band. Elsewhere the number is reported unchanged and compared directly.
+///
+/// [`socket_buffer_was_capped_with`] is the same judgement with the convention
+/// passed in, so both branches are testable on either host.
 fn socket_buffer_was_capped(requested: usize, granted: usize) -> bool {
-    granted < requested
+    socket_buffer_was_capped_with(cfg!(target_os = "linux"), requested, granted)
+}
+
+/// The platform's read-back convention as a parameter: `doubled_read_back` is
+/// `true` on Linux, where the kernel reports twice what it granted.
+fn socket_buffer_was_capped_with(
+    doubled_read_back: bool,
+    requested: usize,
+    granted: usize,
+) -> bool {
+    if doubled_read_back {
+        granted / 2 < requested
+    } else {
+        granted < requested
+    }
 }
 
 /// Descriptors assumed to be needed beyond the tunnel quota: the endpoint
@@ -295,21 +316,53 @@ mod tests {
         assert!(fd_budget_is_tight(256, 0, 256));
     }
 
-    /// The read-back convention differs by platform, so the judgement is written
-    /// as `<` and has to stay that way.
+    /// The read-back convention differs by platform, so the judgement takes it
+    /// as a parameter and both branches are asserted on any host.
     ///
     /// Linux reports twice what it granted; macOS reports it unchanged. The two
-    /// middle cases below are the ones an equality check would get wrong.
+    /// middle cases below are the ones an equality check would get wrong, and
+    /// the band is the case a plain `<` gets wrong on Linux: a request above the
+    /// ceiling but below twice the ceiling reads as satisfied although the
+    /// kernel granted only the ceiling.
     #[test]
     fn a_capped_socket_buffer_is_recognised() {
         // Linux, request satisfied: doubled on the way back.
-        assert!(!socket_buffer_was_capped(2 * 1024 * 1024, 4 * 1024 * 1024));
+        assert!(!socket_buffer_was_capped_with(
+            true,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024
+        ));
         // macOS, request satisfied: reported unchanged.
-        assert!(!socket_buffer_was_capped(2 * 1024 * 1024, 2 * 1024 * 1024));
+        assert!(!socket_buffer_was_capped_with(
+            false,
+            2 * 1024 * 1024,
+            2 * 1024 * 1024
+        ));
         // Linux, clamped at a stock `net.core.rmem_max` of 212992.
-        assert!(socket_buffer_was_capped(2 * 1024 * 1024, 425_984));
-        // The socket left on an untouched default while a size was asked for.
-        assert!(socket_buffer_was_capped(2 * 1024 * 1024, 212_992));
+        assert!(socket_buffer_was_capped_with(
+            true,
+            2 * 1024 * 1024,
+            425_984
+        ));
+        // The socket left on an untouched default while a size was asked for:
+        // capped under either convention.
+        assert!(socket_buffer_was_capped_with(
+            true,
+            2 * 1024 * 1024,
+            212_992
+        ));
+        assert!(socket_buffer_was_capped_with(
+            false,
+            2 * 1024 * 1024,
+            212_992
+        ));
+        // The band: the request is above the Linux ceiling (212992) but below
+        // twice it, and the read-back is double the ceiling. The kernel granted
+        // only the ceiling, so this is capped on Linux; macOS reports the size
+        // unchanged and would have granted the whole request, so it is not
+        // capped there.
+        assert!(socket_buffer_was_capped_with(true, 300_000, 425_984));
+        assert!(!socket_buffer_was_capped_with(false, 300_000, 425_984));
     }
 
     /// A size every host allows is granted, in both directions.
