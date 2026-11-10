@@ -757,9 +757,11 @@ where
 /// request and never per packet, and it is paid only by addresses the policy has
 /// already let through, and the loopback test above it is free.
 fn is_the_proxys_own(ip: std::net::IpAddr) -> bool {
-    // Canonical first: `::ffff:127.0.0.1` is loopback wearing an IPv6 hat, and
-    // the kernel would bind it happily.
-    let ip = policy::canonical(ip);
+    // The routed form first: `::ffff:127.0.0.1` is loopback wearing an IPv6
+    // hat, and a NAT64, 6to4 or Teredo address is a route to the IPv4 address
+    // it carries. Both must be judged as that address, or the check would bind
+    // a literal the host does not hold and miss one it does.
+    let ip = policy::routed_form(ip);
     !ip.is_loopback() && crate::net::holds_address(ip)
 }
 
@@ -995,6 +997,69 @@ mod tests {
                     "{own} is an address this host holds"
                 );
             }
+        }
+    }
+
+    /// A transition address is a route to the IPv4 address it carries, so a
+    /// form of this host's own address must be refused exactly like the bare
+    /// address is.
+    ///
+    /// The probe socket discovers the address the kernel would use towards a
+    /// documentation address without binding it directly. A host with no
+    /// non-loopback IPv4 address has nothing to build the three forms from, so
+    /// the test says so and returns; batch 5 adds the latch that makes such a
+    /// skip visible (TF3).
+    #[test]
+    fn transition_forms_of_this_hosts_own_address_are_refused() {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a probe socket");
+        if socket.connect("192.0.2.1:9").is_err() {
+            eprintln!(
+                "skipping: this host has no route towards 192.0.2.1 to discover its own \
+                 IPv4 address"
+            );
+            return;
+        }
+
+        let own = match socket.local_addr().expect("a local address").ip() {
+            std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => v4,
+            _ => {
+                eprintln!(
+                    "skipping: this host has no non-loopback IPv4 address to build the \
+                     transition forms from"
+                );
+                return;
+            }
+        };
+        let octets = own.octets();
+
+        // 64:ff9b::/96: the address is in the last 32 bits.
+        let mut nat64 = [0u8; 16];
+        nat64[..4].copy_from_slice(&[0x00, 0x64, 0xff, 0x9b]);
+        nat64[12..].copy_from_slice(&octets);
+
+        // 2002::/16: the address is at bits 16-47.
+        let mut six_to_four = [0u8; 16];
+        six_to_four[..2].copy_from_slice(&[0x20, 0x02]);
+        six_to_four[2..6].copy_from_slice(&octets);
+
+        // 2001::/32: the client's address is the last 32 bits, every bit
+        // inverted.
+        let mut teredo = [0u8; 16];
+        teredo[..4].copy_from_slice(&[0x20, 0x01, 0x00, 0x00]);
+        for (byte, own_byte) in teredo[12..].iter_mut().zip(octets) {
+            *byte = own_byte ^ 0xff;
+        }
+
+        for (form, name) in [
+            (std::net::IpAddr::V6(nat64.into()), "NAT64"),
+            (std::net::IpAddr::V6(six_to_four.into()), "6to4"),
+            (std::net::IpAddr::V6(teredo.into()), "Teredo"),
+        ] {
+            assert!(
+                is_the_proxys_own(form),
+                "the {name} form {form} carries this host's own {own} and must be \
+                 recognised as one of the proxy's own"
+            );
         }
     }
 

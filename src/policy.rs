@@ -78,13 +78,12 @@ impl Policy {
 
     /// Whether one resolved address may be dialled.
     pub fn allows_address(&self, ip: IpAddr) -> bool {
-        let ip = canonical(ip);
         // A transition address is judged as the IPv4 address it carries, since
         // that is what a host routing it actually reaches. Done here rather than
         // inside the two rules below because the verdict may be either of them:
         // an embedded multicast or unspecified address is never allowed, an
         // embedded private one is private.
-        let ip = embedded_ipv4(ip).map_or(ip, IpAddr::V4);
+        let ip = routed_form(ip);
 
         if is_never_allowed(ip) {
             return false;
@@ -146,6 +145,19 @@ pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
         && addresses
             .iter()
             .all(|address| canonical(address.ip()).is_unspecified())
+}
+
+/// The form the kernel routes for `ip`.
+///
+/// [`canonical`] first, then [`embedded_ipv4`]: a transition address is a route
+/// to the IPv4 address it carries, so that is the address every rule and the
+/// own-address check must judge. One helper rather than the same two steps
+/// spelled out at each site, because [`Policy::allows_address`],
+/// [`is_dns_blackhole`] and the tunnel's own-address check have to agree on
+/// what "the routed form" means.
+pub(crate) fn routed_form(ip: IpAddr) -> IpAddr {
+    let ip = canonical(ip);
+    embedded_ipv4(ip).map_or(ip, IpAddr::V4)
 }
 
 /// Normalizes an address into the form the kernel will actually route.
