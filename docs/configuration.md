@@ -63,8 +63,8 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. The default is below quinn's 1452, the value safe over both IPv4 and IPv6 on Ethernet, because a size is adopted after one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load. 1436 is what a measured relay path carries; the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) give the measurement. An operator who has measured their own path at bulk rate can raise it, at most to 1472. A bound above what the path carries costs failed probes on a path that drops oversize packets, and lost traffic until the black-hole detector fires on a path that delivers single probes but not bulk traffic at that size. No effect (and a startup warning) when `mtu_discovery` is off |
 | `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-uncapped`, `cubic` or `newreno`. `bbr` is quinn's BBR with its window capped, the default since 1.2.0. `bbr-uncapped` is quinn's BBR as it ships, which `bbr` selected before 1.2.0 |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
-| `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
-| `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max` |
+| `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Range `0`..`2147483647`, the largest value the socket API's signed 32-bit argument can carry; a larger one is refused at load time rather than truncated. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
+| `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max`; the same `0`..`2147483647` range and the same truncation reason |
 
 ### Notes that matter in practice
 
@@ -181,11 +181,16 @@ request is capped by the host: `net.core.rmem_max` / `net.core.wmem_max` on
 Linux, `kern.ipc.maxsockbuf` on macOS, and a host may fail the request outright
 rather than clamping it. volto warns at startup, naming the sysctl, whenever it
 got less than it asked for, and comes up on the operating system's default
-either way. `0` asks for nothing and leaves that default in place. The reason
-these keys exist at all is that quinn never calls `setsockopt` itself, so a
-server that does not ask gets `net.core.rmem_default` — around 208 KiB —
-however high `rmem_max` has been raised; see
-[UDP socket buffers](deployment.md#udp-socket-buffers).
+either way. `0` asks for nothing and leaves that default in place. Both keys are
+range-checked to `0..=2147483647`, the largest value the socket API's signed
+32-bit argument can carry: the value is converted to a `c_int` before
+`setsockopt`, so anything above that limit would reach the kernel truncated to a
+different number — `4294967296` becomes `0`, which is the operating system's
+minimum rather than a request. A larger value is refused at load time, naming
+the key, the value and the limit. The reason these keys exist at all is that
+quinn never calls `setsockopt` itself, so a server that does not ask gets
+`net.core.rmem_default` — around 208 KiB — however high `rmem_max` has been
+raised; see [UDP socket buffers](deployment.md#udp-socket-buffers).
 
 **`keep_alive_interval` is validated as strictly below half the idle timeout,
 not at most half.** At exactly half, losing a single keep-alive packet is enough

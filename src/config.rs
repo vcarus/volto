@@ -308,6 +308,18 @@ pub const DEFAULT_SOCKET_RECV_BUFFER: usize = 2 * 1024 * 1024;
 /// Zero leaves the operating system's own value alone.
 pub const DEFAULT_SOCKET_SEND_BUFFER: usize = 2 * 1024 * 1024;
 
+/// The largest socket buffer size this server accepts, in bytes.
+///
+/// `socket2` passes the value to `setsockopt` as a `c_int`, so a number above
+/// `i32::MAX` is truncated before the kernel sees it: 4294967296 becomes 0 and
+/// leaves the buffer at the operating system's minimum, and 3000000000 becomes
+/// a negative integer the kernel clamps. [`Config::validate`] rejects both
+/// socket buffer keys above this instead, naming the API limit, so a typo cannot
+/// silently become a different number. `0` is still the escape hatch that leaves
+/// the socket alone.
+#[allow(clippy::as_conversions)]
+pub const MAX_SOCKET_BUFFER: usize = i32::MAX as usize;
+
 /// Default number of concurrent tunnels allowed on one QUIC connection.
 ///
 /// Every tunnel costs one file descriptor, so this is also the per-connection
@@ -577,12 +589,20 @@ pub struct Limits {
     /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
     /// warns at startup when it got less than it asked for. See
     /// [`DEFAULT_SOCKET_RECV_BUFFER`].
+    ///
+    /// The socket API takes a signed 32-bit integer, so this key is limited to
+    /// [`MAX_SOCKET_BUFFER`] = `i32::MAX`; a larger value is refused at load
+    /// time rather than truncated to a different number on its way to the
+    /// kernel. `0` is still the escape hatch that leaves the socket on the
+    /// operating system's own value.
     pub socket_recv_buffer: usize,
     /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
     ///
     /// Startup-only, read back and warned about exactly like
     /// [`Limits::socket_recv_buffer`]; the ceiling on this side is
-    /// `net.core.wmem_max`. See [`DEFAULT_SOCKET_SEND_BUFFER`].
+    /// `net.core.wmem_max`. Range-checked to `0..=`[`MAX_SOCKET_BUFFER`] for the
+    /// same reason as the receive side: the socket API's argument is a signed
+    /// 32-bit integer. See [`DEFAULT_SOCKET_SEND_BUFFER`].
     pub socket_send_buffer: usize,
 }
 
@@ -957,6 +977,25 @@ impl Config {
                 INITIAL_RTT_RANGE_MS.start(),
                 INITIAL_RTT_RANGE_MS.end()
             );
+        }
+
+        // `socket2` converts these with `size as c_int`, so a value above
+        // `i32::MAX` reaches the kernel truncated to a different number — 2^32
+        // becomes 0, which is the operating system's minimum rather than the
+        // default the operator asked to leave alone. Refusing at load time is
+        // what makes the number in the file the number the kernel receives.
+        for (key, value) in [
+            ("limits.socket_recv_buffer", self.limits.socket_recv_buffer),
+            ("limits.socket_send_buffer", self.limits.socket_send_buffer),
+        ] {
+            if value > MAX_SOCKET_BUFFER {
+                bail!(
+                    "{key} = {value} is above the {MAX_SOCKET_BUFFER} bytes the socket \
+                     API accepts; the value is passed to setsockopt as a signed 32-bit \
+                     integer, so a larger one is truncated before the kernel sees it. \
+                     Use 0 to keep the operating system default instead"
+                );
+            }
         }
 
         for (i, user) in self.auth.users.iter().enumerate() {
@@ -3297,6 +3336,31 @@ pub(crate) mod tests {
         assert_valid_apart_from_certs(&cfg, "socket buffers left to the OS");
     }
 
+    /// A socket buffer above the socket API's limit is refused, and the
+    /// boundary is accepted.
+    ///
+    /// `socket2` converts the value with `size as c_int`, so `2147483648`
+    /// truncates to a negative number and the kernel receives a different size
+    /// than the file names. `0` stays the escape hatch that leaves the socket
+    /// alone.
+    #[test]
+    fn socket_buffer_sizes_above_the_32_bit_api_limit_are_rejected() {
+        for key in ["socket_recv_buffer", "socket_send_buffer"] {
+            let message = rejected(&format!("[limits]\n{key} = 2147483648"), key);
+            assert!(message.contains("2147483648"), "{message}");
+            assert!(
+                message.contains("2147483647"),
+                "the refusal must name the API limit: {message}"
+            );
+        }
+
+        // The largest value the API accepts is legal.
+        for key in ["socket_recv_buffer", "socket_send_buffer"] {
+            let cfg = parse(&format!("[limits]\n{key} = 2147483647"));
+            assert_valid_apart_from_certs(&cfg, key);
+        }
+    }
+
     #[test]
     fn unknown_key_is_rejected() {
         let err = toml::from_str::<Config>(
@@ -3780,9 +3844,12 @@ pub(crate) mod tests {
                 initial_rtt_ms: limits
                     .initial_rtt_ms
                     .clamp(*INITIAL_RTT_RANGE_MS.start(), *INITIAL_RTT_RANGE_MS.end()),
-                // Unbounded by `validate` and left that way here: the socket
-                // buffers are a request the kernel answers, and `max_connections`
-                // = 0 means no cap at all.
+                // Both are a request the kernel answers, so validation only
+                // bounds them by the socket API's signed 32-bit argument.
+                socket_recv_buffer: limits.socket_recv_buffer.min(MAX_SOCKET_BUFFER),
+                socket_send_buffer: limits.socket_send_buffer.min(MAX_SOCKET_BUFFER),
+                // Unbounded by `validate` and left that way here:
+                // `max_connections` = 0 means no cap at all.
                 ..limits
             }
         })
