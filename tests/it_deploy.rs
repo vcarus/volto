@@ -649,6 +649,42 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
     );
 }
 
+/// The body of the shell function `name` in `script`, from its opening brace to
+/// the closing brace at column zero.
+///
+/// The braces bound the latch: `deploy.sh` carries a `systemctl restart
+/// "$SERVICE_NAME" || true` in the rollback branch as well, so a whole-file
+/// search would pass even while `restore_previous` itself never restarted.
+fn shell_function_body(script: &str, name: &str) -> String {
+    let text = fs::read_to_string(repo_root().join(script)).expect("the script must be readable");
+    let start = text
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{script} carries no `{name}()` function"));
+    let rest = &text[start + 1..];
+    let end = rest
+        .find("\n}")
+        .unwrap_or_else(|| panic!("`{name}()` in {script} is never closed"));
+    rest[..end].to_owned()
+}
+
+/// Restoring the previous files is not enough when the restart itself failed.
+///
+/// If `systemctl restart` returns nonzero after stopping the old unit, for
+/// example because the new unit cannot start at the job level, `restore_previous`
+/// puts the old binary and unit back and reloads systemd, but the unit stays
+/// inactive. The service has to be started here as well.
+#[test]
+fn restoring_the_previous_files_starts_the_service() {
+    let body = shell_function_body("script/deploy.sh", "restore_previous");
+
+    assert!(
+        body.contains("systemctl restart \"$SERVICE_NAME\" || true"),
+        "restore_previous puts the previous binary and unit back but never starts \
+         the service. A systemctl restart that failed after stopping the old unit \
+         leaves the restored files in place and the unit inactive. The body is:\n{body}"
+    );
+}
+
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
 /// not a file. This once aborted the whole run; it must be a quiet no-op.
 #[test]

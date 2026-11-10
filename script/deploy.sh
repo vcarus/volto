@@ -147,9 +147,12 @@ note() {
 # branch further down answers neither, because it runs only after `systemctl
 # is-active` has been asked, which is past this window.
 #
-# The service is not restarted here. Before the health check it is still running
-# the release it was already running, or systemd is bringing it back under
-# Restart=on-failure, and the journal is where the operator looks either way.
+# The service is started here as well. Before the health check it is normally
+# still running the release it was already running, or systemd is bringing it
+# back under Restart=on-failure. That assumption does not hold when the restart
+# itself failed after stopping the unit: the restored files are in place and the
+# unit is inactive, so it is started here. `|| true` because a failed start must
+# not mask the original failure, which `die` reports either way.
 restore_previous() {
     trap - ERR
     local restored=""
@@ -161,6 +164,7 @@ restore_previous() {
         restored="${restored:+$restored and }unit"
     fi
     systemctl daemon-reload || true
+    systemctl restart "$SERVICE_NAME" || true
 
     [ -n "$restored" ] ||
         die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
