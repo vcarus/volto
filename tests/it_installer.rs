@@ -758,6 +758,42 @@ fn an_install_whose_service_is_active_reports_success() {
     );
 }
 
+/// The report must survive a certificate that openssl cannot read.
+///
+/// Under `set -euo pipefail` the plain assignments that read the fingerprint and
+/// the expiry end the script when `openssl x509` fails. By that point the
+/// certificate may have been regenerated and the service restarted, so the exit
+/// is silent, prints no fingerprint, and lands exactly when every client's
+/// pinned fingerprint has just gone stale. The report is the point of a re-run.
+#[test]
+fn an_unreadable_certificate_still_prints_the_report() {
+    let root = scratch_tree(
+        "install",
+        "corrupt-certificate",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let conf_dir = root.join("etc/volto");
+    fs::write(conf_dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
+    fs::write(conf_dir.join("key.pem"), "not a key\n").expect("key must be writable");
+
+    let output = run_full_install(&root, "active");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("certificate: <unknown>"),
+        "an unreadable certificate must print <unknown> rather than end the run: {stdout}"
+    );
+    assert!(
+        stdout.contains("expires:     <unknown>"),
+        "an unreadable expiry must print <unknown>: {stdout}"
+    );
+    assert!(
+        stdout.contains("==> done"),
+        "the report must print: {stdout}"
+    );
+}
+
 /// `-h` must work and describe the safety-relevant flags.
 #[test]
 fn the_script_documents_itself() {

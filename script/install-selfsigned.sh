@@ -506,15 +506,18 @@ fi
 sleep 1
 status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
 
-fingerprint="$(openssl x509 -in "$CERT" -noout -fingerprint -sha256)"
-expiry="$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2)"
-# Every substitution below ends in `|| true`, and each has a fallback value.
-# Under `set -euo pipefail` the exit status of a plain assignment is the command
-# substitution's, and pipefail makes a pipeline fail when any stage does, so a
-# failing `hostname` or a `grep` with no match would end the script here. By this
-# point the certificate has been regenerated and the service restarted, so that
-# exit is silent, prints no fingerprint, and lands exactly when every client's
-# pinned fingerprint has just gone stale. The report is the point of a re-run.
+# Every substitution from here to the end of the report ends in `|| true`, and
+# each has a fallback value. Under `set -euo pipefail` the exit status of a plain
+# assignment is the command substitution's, and pipefail makes a pipeline fail
+# when any stage does, so a failing `openssl x509`, `hostname` or a `grep` with no
+# match would end the script here. By this point the certificate has been
+# regenerated and the service restarted, so that exit is silent, prints no
+# fingerprint, and lands exactly when every client's pinned fingerprint has just
+# gone stale. The report is the point of a re-run.
+fingerprint="$(openssl x509 -in "$CERT" -noout -fingerprint -sha256 || true)"
+expiry="$(openssl x509 -in "$CERT" -noout -enddate | cut -d= -f2 || true)"
+[ -n "$fingerprint" ] || fingerprint="<unknown>"
+[ -n "$expiry" ] || expiry="<unknown>"
 
 # Only for the pasteable policy line; the operator substitutes the real address if
 # this box is behind a relay.
