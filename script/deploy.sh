@@ -417,6 +417,14 @@ else
         VOLTO_INSTALL_ROOT="$ROOT" \
             bash "$SRC/script/install-selfsigned.sh" --binary "$SRC/volto" \
             ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}
+
+        # The update path's health check applied to a first install. The
+        # installer already exits nonzero on a failed start; this catches a
+        # service that dies in the seconds after the installer's one-second
+        # check.
+        sleep 3
+        systemctl is-active --quiet "$SERVICE_NAME" ||
+            die "the first install left $SERVICE_NAME not running -- see: journalctl -u $SERVICE_NAME -e"
     else
         # Before anything on this host moves: the binary about to be installed
         # is asked whether it can read the config that is already here. It

@@ -506,11 +506,14 @@ fn write_executable(path: &Path, text: &str) {
 /// directory to put in front of `PATH`.
 ///
 /// `id -u` prints 0 and `id -u volto` succeeds, so the root check passes and no
-/// user is created. `apt-get` and `systemctl` are only looked up before the
-/// certificate step. `chown` does nothing. `install` drops its `-o` and `-g`
-/// arguments, which name a user this host does not have, and runs the real
-/// `install`. `mv` counts its calls in `mv-calls` beside it.
-fn plant_root_stubs(root: &Path, fail_at: usize) -> PathBuf {
+/// user is created. `apt-get` is only looked up before the certificate step.
+/// `systemctl` reports `service_status` for `is-active`: the `--quiet` form
+/// exits 0 only when the status is `active`, the plain form prints the status
+/// and exits 0, and every other invocation exits 0. `chown` does nothing.
+/// `install` drops its `-o` and `-g` arguments, which name a user this host does
+/// not have, and runs the real `install`. `mv` counts its calls in `mv-calls`
+/// beside it.
+fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBuf {
     let dir = root.join("stubs");
     fs::create_dir_all(&dir).expect("the stub directory must be creatable");
 
@@ -518,9 +521,23 @@ fn plant_root_stubs(root: &Path, fail_at: usize) -> PathBuf {
         &dir.join("id"),
         "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
     );
-    for name in ["apt-get", "systemctl", "chown"] {
-        write_executable(&dir.join(name), "#!/bin/sh\nexit 0\n");
-    }
+    write_executable(
+        &dir.join("systemctl"),
+        &format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = is-active ]; then\n\
+             \x20 if [ \"$2\" = --quiet ]; then\n\
+             \x20   [ \"{service_status}\" = active ] || exit 1\n\
+             \x20   exit 0\n\
+             \x20 fi\n\
+             \x20 echo \"{service_status}\"\n\
+             \x20 exit 0\n\
+             fi\n\
+             exit 0\n"
+        ),
+    );
+    write_executable(&dir.join("apt-get"), "#!/bin/sh\nexit 0\n");
+    write_executable(&dir.join("chown"), "#!/bin/sh\nexit 0\n");
     write_executable(
         &dir.join("install"),
         &format!(
@@ -584,7 +601,7 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
         let old_key = fs::read(&key).expect("the old key must be readable");
 
         let binary = plant_binary_without_the_flag(&root, "volto-stub");
-        let stubs = plant_root_stubs(&root, fail_at);
+        let stubs = plant_root_stubs(&root, fail_at, "active");
         let path = std::env::var_os("PATH").expect("PATH must be set");
         let path = std::env::join_paths(
             std::iter::once(stubs.clone()).chain(std::env::split_paths(&path)),
@@ -655,6 +672,90 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
             "the run must say the swap failed: {stderr}"
         );
     }
+}
+
+/// Runs the full install path with the given service status, relocating every
+/// install path under `root`.
+///
+/// The real binary is installed and asked whether it can load the generated
+/// config, so this exercises the generator, the certificate, the unit install
+/// and the service check as one run.
+fn run_full_install(root: &Path, service_status: &str) -> std::process::Output {
+    let script = repo_root().join("script/install-selfsigned.sh");
+    let stubs = plant_root_stubs(root, 0, service_status);
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    let path = std::env::join_paths(std::iter::once(stubs).chain(std::env::split_paths(&path)))
+        .expect("the stub directory must fit in PATH");
+
+    Command::new("bash")
+        .arg(&script)
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+            "-u",
+            "alice",
+            "-w",
+            "correct-horse-battery",
+        ])
+        .current_dir(repo_root())
+        .env("VOLTO_INSTALL_ROOT", root)
+        .env("PATH", path)
+        .output()
+        .expect("the installer script must be runnable")
+}
+
+/// A service that failed to start must turn the install into a failure.
+///
+/// The installer read `systemctl is-active` with `|| true`, printed the status
+/// and exited 0 even when the service failed to start. A port already bound
+/// leaves the host without a proxy while the installer reports success. The
+/// report and the security notes still print, so the operator has the
+/// fingerprint and the policy line before the refusal.
+#[test]
+fn an_install_whose_service_failed_is_not_reported_as_success() {
+    let root = scratch_tree(
+        "install",
+        "service-failed",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+
+    let output = run_full_install(&root, "failed");
+
+    assert!(
+        !output.status.success(),
+        "an install that leaves the service not running must fail: {}",
+        stdout_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("volto is failed after the install"),
+        "the refusal must name the status: {stderr}"
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("==> done"),
+        "the report must print before the refusal, so the fingerprint and the \
+         policy line reach the operator: {stdout}"
+    );
+}
+
+/// And a service that is active still succeeds, with the report printed.
+#[test]
+fn an_install_whose_service_is_active_reports_success() {
+    let root = scratch_tree(
+        "install",
+        "service-active",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+
+    let output = run_full_install(&root, "active");
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains("==> done"),
+        "the report must print: {}",
+        stdout_of(&output)
+    );
 }
 
 /// `-h` must work and describe the safety-relevant flags.

@@ -552,3 +552,10 @@ echo "    channel you trust and type it in yourself. Never use skip-cert-verify 
 echo "  * $KEY must never leave this machine. There is no revocation: if it leaks,"
 echo "    regenerate with --force and update the fingerprint on every client."
 echo
+
+# After the report, so the fingerprint and the policy line are printed even when
+# the service did not come up. A port already bound is the common cause, and it
+# leaves the host without a proxy while the install would otherwise report
+# success.
+[ "$status" = active ] ||
+    die "$SERVICE_NAME is $status after the install; the proxy is not serving -- see: journalctl -u $SERVICE_NAME -e"
