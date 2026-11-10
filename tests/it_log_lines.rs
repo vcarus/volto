@@ -203,6 +203,15 @@ const ACCOUNTED: &[Accounted] = &[
         reason: "At most one per SIGHUP, on the same operator-driven path.",
     },
     Accounted {
+        id: "r7m2xq4p",
+        file: "main.rs",
+        message: "the configuration reload task panicked; the running configuration \
+                  may have changed",
+        bound: Bound::Lifecycle,
+        reason: "At most one per SIGHUP, on the same operator-driven path, and only \
+                 when the blocking task itself panicked.",
+    },
+    Accounted {
         id: "kuce6ga8",
         file: "main.rs",
         message: "could not install the SIGTERM handler",

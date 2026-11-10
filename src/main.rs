@@ -406,6 +406,14 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 /// they were accepted with. For a certificate that is the only sane reading (the
 /// old one is still valid for the session that negotiated it), and for credentials
 /// it means a revoked user keeps their current tunnels until they reconnect.
+///
+/// The reload itself runs on the blocking pool rather than on the async task.
+/// It reads the configuration file and parses the certificate and key, which is
+/// file I/O and CPU work, and on a host whose runtime has one worker thread — a
+/// one-vCPU VPS — that worker also drives the endpoint and every connection.
+/// Running it inline would stop every packet and timer for the length of the
+/// parse; `spawn_blocking` uses the pool `main` already sizes for this kind of
+/// work.
 #[cfg(unix)]
 async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
     use tokio::signal::unix::{SignalKind, signal};
@@ -429,14 +437,32 @@ async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
             "received SIGHUP, reloading configuration"
         );
 
-        if let Err(error) = handle.reload(&path) {
+        // Both cloned because the blocking task takes ownership. The handle is
+        // a set of `Arc`s and the path one allocation, so the copy costs
+        // nothing next to the parse it feeds.
+        let reload = handle.clone();
+        let reloading = path.clone();
+        let result = tokio::task::spawn_blocking(move || reload.reload(&reloading)).await;
+
+        match result {
+            Ok(Ok(_)) => {}
             // `{error:#}` prints the whole anyhow chain, which is where the
             // specific offending field ends up.
-            error!(
+            Ok(Err(error)) => error!(
                 log_id = "k977pzqe",
                 error = format!("{error:#}"),
                 "configuration reload failed; the running configuration is unchanged"
-            );
+            ),
+            // The blocking task panicked. Unlike a refused reload, a panic can
+            // leave the swap half-applied, so this does not claim the running
+            // configuration is unchanged; its own id lets an operator tell the
+            // two failures apart in the journal.
+            Err(error) => error!(
+                log_id = "r7m2xq4p",
+                %error,
+                "the configuration reload task panicked; the running configuration \
+                 may have changed"
+            ),
         }
     }
 }
