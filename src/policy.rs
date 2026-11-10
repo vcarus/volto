@@ -411,7 +411,9 @@ fn is_unique_local(v6: Ipv6Addr) -> bool {
 /// `fe80::/10` — link-local unicast (RFC 4291 §2.5.6).
 ///
 /// Hand-rolled because `Ipv6Addr::is_unicast_link_local` is still unstable.
-fn is_unicast_link_local(v6: Ipv6Addr) -> bool {
+/// Shared with [`crate::net`], whose address comparison has to know which IPv6
+/// addresses are selected by a scope ID.
+pub(crate) fn is_unicast_link_local(v6: Ipv6Addr) -> bool {
     v6.segments()[0] & 0xffc0 == 0xfe80
 }
 

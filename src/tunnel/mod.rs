@@ -753,16 +753,42 @@ where
 /// Folding loopback in here would overrule that decision, and it would do it for
 /// every service on the host rather than for this proxy.
 ///
+/// The question is asked of the routed form ([`policy::routed_form`]), so a
+/// NAT64, 6to4 or Teredo address carrying one of the proxy's own IPv4 addresses
+/// is recognised, and the `SocketAddr` keeps the scope ID that selects the
+/// interface for a link-local address.
+///
 /// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
 /// request and never per packet, and it is paid only by addresses the policy has
 /// already let through, and the loopback test above it is free.
-fn is_the_proxys_own(ip: std::net::IpAddr) -> bool {
+fn is_the_proxys_own(address: std::net::SocketAddr) -> bool {
     // The routed form first: `::ffff:127.0.0.1` is loopback wearing an IPv6
     // hat, and a NAT64, 6to4 or Teredo address is a route to the IPv4 address
     // it carries. Both must be judged as that address, or the check would bind
     // a literal the host does not hold and miss one it does.
-    let ip = policy::routed_form(ip);
-    !ip.is_loopback() && crate::net::holds_address(ip)
+    let routed = policy::routed_form(address.ip());
+    if routed.is_loopback() {
+        return false;
+    }
+
+    // A link-local IPv6 address is selected by its scope ID, and the routed
+    // form keeps the same address, so the scope has to survive into the probe.
+    // A transition form becomes IPv4 and has no scope to keep.
+    let probe = match (routed, address) {
+        (std::net::IpAddr::V6(v6), std::net::SocketAddr::V6(original))
+            if v6 == *original.ip() =>
+        {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                v6,
+                0,
+                original.flowinfo(),
+                original.scope_id(),
+            ))
+        }
+        _ => std::net::SocketAddr::new(routed, 0),
+    };
+
+    crate::net::holds_address(probe)
 }
 
 /// Turns a request's target into the addresses it may be dialled on, answering
@@ -850,7 +876,7 @@ pub(crate) async fn admit_target(
 
     let mut allowed = ctx.policy.allowed_addresses(&addresses);
     let judged = allowed.len();
-    allowed.retain(|address| !is_the_proxys_own(address.ip()));
+    allowed.retain(|address| !is_the_proxys_own(*address));
     if allowed.len() < judged {
         debug!(
             stream_id,
@@ -977,21 +1003,23 @@ mod tests {
     /// question is asked at all.
     #[test]
     fn only_a_non_loopback_address_of_this_host_is_the_proxys_own() {
-        for literal in ["127.0.0.1", "::1", "::ffff:127.0.0.1"] {
+        for literal in ["127.0.0.1:0", "[::1]:0", "[::ffff:127.0.0.1]:0"] {
             assert!(
-                !is_the_proxys_own(literal.parse().expect("an address")),
+                !is_the_proxys_own(literal.parse().expect("a socket address")),
                 "{literal} is the localhost class, not this one"
             );
         }
 
         // RFC 5737 TEST-NET-1: on no interface anywhere.
-        assert!(!is_the_proxys_own("192.0.2.1".parse().expect("an address")));
+        assert!(!is_the_proxys_own(
+            "192.0.2.1:0".parse().expect("a socket address")
+        ));
 
         // And the class itself, on a host that has an address to show it with.
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").expect("bind a probe socket");
         if socket.connect("192.0.2.1:9").is_ok() {
-            let own = socket.local_addr().expect("a local address").ip();
-            if !own.is_loopback() && !own.is_unspecified() {
+            let own = socket.local_addr().expect("a local address");
+            if !own.ip().is_loopback() && !own.ip().is_unspecified() {
                 assert!(
                     is_the_proxys_own(own),
                     "{own} is an address this host holds"
@@ -1055,9 +1083,10 @@ mod tests {
             (std::net::IpAddr::V6(six_to_four.into()), "6to4"),
             (std::net::IpAddr::V6(teredo.into()), "Teredo"),
         ] {
+            let address = std::net::SocketAddr::new(form, 0);
             assert!(
-                is_the_proxys_own(form),
-                "the {name} form {form} carries this host's own {own} and must be \
+                is_the_proxys_own(address),
+                "the {name} form {address} carries this host's own {own} and must be \
                  recognised as one of the proxy's own"
             );
         }

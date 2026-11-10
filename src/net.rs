@@ -9,7 +9,7 @@
 //! * The destination ACL (M4) can only filter what it can see.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -339,14 +339,19 @@ enum LookupSlot {
     },
 }
 
-/// Whether this host holds `ip`, meaning a socket of this process may be bound
-/// to it.
+/// Whether this host holds `address`, meaning a socket of this process may be
+/// bound to it.
 ///
 /// One `bind(2)` on a UDP socket at an ephemeral port, and the socket is dropped
 /// on the way out. The kernel answers `EADDRNOTAVAIL` for an address no local
 /// interface carries and succeeds for one it does, on both Linux and macOS, so
 /// this asks the kernel the question directly. There is no interface
 /// enumeration in `std` to ask instead.
+///
+/// The `SocketAddr` rather than the `IpAddr` is what keeps an IPv6 scope ID:
+/// binding a link-local address without the scope that selects its interface
+/// fails even when the host holds the address, so the scope has to survive the
+/// call.
 ///
 /// Nothing is cached. The call is on the tunnel-open path, which is per request
 /// and never per packet, an interface can come and go while the server runs, and
@@ -359,8 +364,45 @@ enum LookupSlot {
 /// verdict about the target. The tunnel that follows fails on its own socket a
 /// moment later and reports `proxy_internal_error`, which is the truthful
 /// answer.
-pub fn holds_address(ip: std::net::IpAddr) -> bool {
-    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+pub fn holds_address(address: SocketAddr) -> bool {
+    std::net::UdpSocket::bind(address).is_ok()
+}
+
+/// One address an interface carries, with the scope that selects the interface
+/// for a link-local IPv6 address.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct LocalAddress {
+    ip: IpAddr,
+    scope_id: u32,
+}
+
+/// Whether `address` is one of `interfaces`.
+///
+/// Pure so the scope rule can be tested against a fabricated list. A link-local
+/// IPv6 address is matched only by an entry with the same scope ID, because the
+/// same `fe80::` address can exist on more than one interface and the scope is
+/// what selects between them. Every other address is matched by value.
+///
+/// The interface list comes from the enumeration in the next change; until then
+/// the rule is exercised by the test below.
+#[cfg(test)]
+fn on_interface(address: SocketAddr, interfaces: &[LocalAddress]) -> bool {
+    let scope = match address {
+        SocketAddr::V6(v6) => v6.scope_id(),
+        SocketAddr::V4(_) => 0,
+    };
+
+    interfaces.iter().any(|interface| {
+        interface.ip == address.ip()
+            && (!is_link_local(address.ip()) || interface.scope_id == scope)
+    })
+}
+
+/// `fe80::/10`, the one IPv6 range whose local binding depends on a scope.
+#[cfg(test)]
+fn is_link_local(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(v6) if crate::policy::is_unicast_link_local(v6))
 }
 
 /// The process's soft limit on open file descriptors, or `None` if it has none.
@@ -936,13 +978,58 @@ mod tests {
     #[test]
     fn the_bind_probe_tells_this_hosts_addresses_from_everything_else() {
         assert!(
-            holds_address("127.0.0.1".parse().unwrap()),
+            holds_address("127.0.0.1:0".parse().unwrap()),
             "loopback is held by every host"
         );
         assert!(
-            !holds_address("192.0.2.1".parse().unwrap()),
+            !holds_address("192.0.2.1:0".parse().unwrap()),
             "a documentation address is on no interface"
         );
+    }
+
+    /// The scope rule, against a fabricated interface list.
+    ///
+    /// The same `fe80::` address can exist on more than one interface, and the
+    /// scope ID is what selects between them. A link-local target therefore
+    /// matches only an entry with the same scope; every other address is
+    /// matched by value.
+    #[test]
+    fn a_link_local_address_is_matched_with_its_scope() {
+        let interfaces = [
+            LocalAddress {
+                ip: "fe80::1".parse().expect("an address"),
+                scope_id: 7,
+            },
+            LocalAddress {
+                ip: "fe80::1".parse().expect("an address"),
+                scope_id: 8,
+            },
+            LocalAddress {
+                ip: "192.168.1.10".parse().expect("an address"),
+                scope_id: 0,
+            },
+            LocalAddress {
+                ip: "2606:4700::1111".parse().expect("an address"),
+                scope_id: 0,
+            },
+        ];
+
+        for (target, expected) in [
+            ("[fe80::1%7]:0", true),
+            ("[fe80::1%8]:0", true),
+            ("[fe80::1%9]:0", false),
+            ("[fe80::1]:0", false),
+            ("[2606:4700::1111]:443", true),
+            ("[2606:4700::1112]:443", false),
+            ("192.168.1.10:53", true),
+            ("192.168.1.11:53", false),
+        ] {
+            assert_eq!(
+                on_interface(target.parse().expect("a socket address"), &interfaces),
+                expected,
+                "{target}"
+            );
+        }
     }
 
     /// Two of each family, interleaved, so both the partition and its stability
