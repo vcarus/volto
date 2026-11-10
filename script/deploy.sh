@@ -309,8 +309,8 @@ else
     # The /releases/latest redirect carries the tag; following it with HEAD asks
     # GitHub for one URL instead of an API call, so there is no rate limit to
     # think about on a timer.
-    location="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
-        "https://github.com/$REPO/releases/latest")" ||
+    location="$(curl -fsSLI --connect-timeout 10 --max-time 30 -o /dev/null \
+        -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" ||
         die "could not reach github.com to resolve the latest release"
     TAG="${location##*/}"
     case "$TAG" in
@@ -387,9 +387,11 @@ else
     trap 'rm -rf "$TMP"' EXIT
 
     echo "==> downloading $NAME.tar.gz ($TAG)"
-    curl -fsSL --retry 3 -o "$TMP/$NAME.tar.gz" "$BASE/$NAME.tar.gz" ||
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+        -o "$TMP/$NAME.tar.gz" "$BASE/$NAME.tar.gz" ||
         die "download failed: $BASE/$NAME.tar.gz"
-    curl -fsSL --retry 3 -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+        -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
         die "download failed: $BASE/SHA256SUMS"
 
     grep -F "  $NAME.tar.gz" "$TMP/SHA256SUMS" >"$TMP/expected" ||
@@ -520,6 +522,9 @@ if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "$TIMER_UNIT" ]; then
         exit 0
     fi
 
+    # systemd disables the start timeout for Type=oneshot, and this oneshot runs
+    # a network download. Without a bound a stalled path holds the daily run
+    # indefinitely, and the next tick cannot start.
     cat >"$TIMER_SERVICE" <<'EOF'
 [Unit]
 Description=Deploy or update volto from the latest GitHub release
@@ -528,6 +533,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=15min
 ExecStart=/usr/local/sbin/volto-deploy
 EOF
 

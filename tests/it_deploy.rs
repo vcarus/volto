@@ -685,6 +685,53 @@ fn restoring_the_previous_files_starts_the_service() {
     );
 }
 
+/// Every network call is bounded, and so is the timer service that makes them.
+///
+/// The latest-release HEAD request and the two downloads used curl without time
+/// limits, and the timer service carried no `TimeoutStartSec`. systemd disables
+/// the start timeout for `Type=oneshot`, so a stalled network path holds the
+/// daily run indefinitely and the next tick cannot start.
+#[test]
+fn every_network_call_and_the_timer_service_are_bounded() {
+    let text = fs::read_to_string(repo_root().join("script/deploy.sh"))
+        .expect("the deploy script must be readable");
+
+    let curls: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("curl "))
+        .collect();
+    assert!(
+        !curls.is_empty(),
+        "no line starting with `curl ` was found in script/deploy.sh; the reader \
+         is broken, not the script"
+    );
+    for line in &curls {
+        assert!(
+            line.contains("--connect-timeout"),
+            "this curl call has no --connect-timeout: {line}"
+        );
+        assert!(
+            line.contains("--max-time"),
+            "this curl call has no --max-time: {line}"
+        );
+    }
+
+    let service = text
+        .find("[Service]")
+        .expect("the timer service heredoc must carry a [Service] section");
+    let heredoc = &text[service..];
+    let end = heredoc
+        .find("\nEOF")
+        .expect("the timer service heredoc must be closed");
+    assert!(
+        heredoc[..end].contains("TimeoutStartSec="),
+        "the timer service carries no TimeoutStartSec, so a stalled network path \
+         holds the daily run indefinitely: {}",
+        &heredoc[..end]
+    );
+}
+
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
 /// not a file. This once aborted the whole run; it must be a quiet no-op.
 #[test]
