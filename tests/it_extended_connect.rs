@@ -20,7 +20,7 @@ use common::{
     basic_credentials, echoes, respond_to, spawn_echo_target,
 };
 use volto::h3::frame;
-use volto::h3api::{Method, Request, Status};
+use volto::h3api::{FieldValue, Method, Request, Status};
 
 /// The user the requests below authenticate as.
 const USER: (&str, &str) = ("surge", "s3cret-p4ssw0rd");
@@ -106,6 +106,115 @@ async fn a_connect_protocol_that_is_not_a_token_is_malformed() {
     echoes(&mut tunnel, b"after the malformed :protocol").await;
 }
 
+/// A Host-only extended CONNECT for an unimplemented protocol is answered 501,
+/// not refused as malformed.
+///
+/// RFC 8441 §4 requires `:scheme` and `:path` alongside `:protocol` and says
+/// how `:authority` is interpreted when it is present; it does not make
+/// `:authority` mandatory. RFC 9114 §4.3.1: "If the :scheme pseudo-header field
+/// identifies a scheme that has a mandatory authority component (including
+/// "http" and "https"), the request MUST contain either an :authority
+/// pseudo-header field or a Host header field." The `:authority` requirement is
+/// RFC 9298 §3.4's -- "The :authority pseudo-header field SHALL contain the
+/// authority of the UDP proxy" -- and that section is about `connect-udp`
+/// alone.
+#[tokio::test]
+async fn a_host_only_extended_connect_is_answered_501() {
+    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let proxy = server.addr.to_string();
+    let mut request = connect_ip_request(&proxy);
+    request.authority = None;
+    request.fields.append(
+        "host",
+        FieldValue::parse(proxy.as_bytes()).expect("a valid Host"),
+    );
+
+    let response = respond_to(&mut client, request).await;
+    assert_eq!(
+        response.status,
+        Status::NOT_IMPLEMENTED,
+        "an unsupported :protocol named through Host is still answered 501"
+    );
+
+    // One request this server will not serve is not a reason to drop the rest.
+    let mut tunnel =
+        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
+    echoes(&mut tunnel, b"after a Host-only 501").await;
+}
+
+/// `connect-udp` still requires `:authority`, even when Host names the proxy.
+///
+/// RFC 9298 §3.4: "The :authority pseudo-header field SHALL contain the
+/// authority of the UDP proxy." RFC 9114 §4.3.1's either/or does not reach it,
+/// so a Host field cannot stand in.
+#[tokio::test]
+async fn connect_udp_with_host_but_no_authority_is_malformed() {
+    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let proxy = server.addr.to_string();
+    let mut request = connect_ip_request(&proxy);
+    request.protocol = Some("connect-udp".into());
+    request.authority = None;
+    request.fields.append(
+        "host",
+        FieldValue::parse(proxy.as_bytes()).expect("a valid Host"),
+    );
+
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .expect("send a connect-udp request naming the proxy only through Host");
+    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the server must answer promptly")
+        .expect_err("connect-udp without :authority must be refused as malformed");
+    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+
+    // A malformed request is a stream error, so the connection carries on.
+    let mut tunnel =
+        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
+    echoes(&mut tunnel, b"after malformed connect-udp").await;
+}
+
+/// An extended CONNECT for another protocol with neither `:authority` nor Host
+/// is malformed.
+///
+/// RFC 9114 §4.3.1 requires one of the two when the scheme has a mandatory
+/// authority component, and with neither the request is malformed. The protocol
+/// being unsupported does not make the request routable: the malformed verdict
+/// comes first.
+#[tokio::test]
+async fn an_extended_connect_with_no_authority_and_no_host_is_malformed() {
+    let server = TestServer::start_with(&format!("{}{ALLOW_PRIVATE}", auth_section(&[USER]))).await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut request = connect_ip_request(&server.addr.to_string());
+    request.authority = None;
+
+    let mut stream = client
+        .send
+        .send_request(request)
+        .await
+        .expect("send an extended CONNECT with neither :authority nor Host");
+    let error = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the server must answer promptly")
+        .expect_err("an extended CONNECT with no authority and no Host must be malformed");
+    assert_peer_reset(&error, H3_MESSAGE_ERROR);
+
+    // A malformed request is a stream error, so the connection carries on.
+    let mut tunnel =
+        common::open_tcp_tunnel_as(&mut client, &target.to_string(), USER.0, USER.1).await;
+    echoes(&mut tunnel, b"after the authority-less request").await;
+}
+
 /// The whole connection ends when a field section references the dynamic table.
 ///
 /// This server advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0`, so a
@@ -149,9 +258,11 @@ async fn a_dynamic_table_reference_closes_the_connection() {
 
 /// An extended CONNECT for `connect-ip`, authenticated.
 ///
-/// RFC 8441 §4 makes `:scheme`, `:path` and `:authority` mandatory alongside
-/// `:protocol`, so all three are here: a request missing one of them would be
-/// malformed and never reach the routing arm under test.
+/// RFC 8441 §4 requires `:scheme` and `:path` alongside `:protocol` and says
+/// how `:authority` is interpreted when it is present; it does not make
+/// `:authority` mandatory. That requirement is RFC 9298 §3.4's, and it is
+/// `connect-udp`'s alone. The authority here names the proxy, so the request
+/// reaches the routing arm under test whether or not it is set.
 fn connect_ip_request(proxy: &str) -> Request {
     let mut request = Request::new(Method::Connect);
     request.scheme = Some("https".into());

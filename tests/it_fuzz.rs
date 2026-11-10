@@ -2310,20 +2310,20 @@ proptest! {
     //# A CONNECT request that does not conform to these restrictions is
     //# malformed.
     ///
-    /// The five pseudo-headers are switched on and off independently, so all
-    /// thirty-two combinations are reachable for each method, with and without a
+    /// The presence pseudo-headers are switched on and off independently, and
+    /// `:protocol` is absent, `connect-udp` or `connect-ip`, with and without a
     /// Host field. That is the shape of the rule: a classic CONNECT is the one
     /// request that must *omit* `:scheme` and `:path`, an extended CONNECT is an
-    /// ordinary request that additionally may not lean on Host for its
-    /// authority, and `:protocol` anywhere but a CONNECT is a pseudo-header
-    /// outside the context RFC 8441 §4 defined it in.
+    /// ordinary request whose authority may come from Host unless its protocol
+    /// is `connect-udp` (RFC 9298 §3.4), and `:protocol` anywhere but a CONNECT
+    /// is a pseudo-header outside the context RFC 8441 §4 defined it in.
     #[test]
     fn which_pseudo_headers_a_request_needs_is_decided_by_its_method(
         method in prop::option::of(any_method_bytes()),
         scheme in any::<bool>(),
         authority in any::<bool>(),
         path in any::<bool>(),
-        protocol in any::<bool>(),
+        protocol in prop::option::of(prop::sample::select(vec!["connect-udp", "connect-ip"])),
         host in prop::option::of(prop::sample::select(vec![AUTHORITY, OTHER_AUTHORITY])),
     ) {
         let mut section = Vec::new();
@@ -2339,16 +2339,16 @@ proptest! {
         if path {
             section.push(field(b":path", b"/"));
         }
-        if protocol {
-            section.push(field(b":protocol", b"connect-udp"));
+        if let Some(protocol) = protocol {
+            section.push(field(b":protocol", protocol.as_bytes()));
         }
         if let Some(host) = host {
             section.push(field(b"host", host.as_bytes()));
         }
 
         let connect = method.as_deref() == Some(b"CONNECT".as_slice());
-        let classic = connect && !protocol;
-        let expected = if method.is_none() || (protocol && !connect) {
+        let classic = connect && protocol.is_none();
+        let expected = if method.is_none() || (protocol.is_some() && !connect) {
             false
         } else if classic {
             // §4.4: the authority and nothing else. A Host field is not
@@ -2359,9 +2359,11 @@ proptest! {
             scheme && path && match (authority, host) {
                 (true, Some(host)) => host == AUTHORITY,
                 (true, None) => true,
-                // RFC 8441 §4 makes the authority mandatory on a request that
-                // carries :protocol, so Host cannot stand in for it.
-                (false, _) if protocol => false,
+                // RFC 9298 §3.4 makes :authority mandatory on a connect-udp
+                // request, so Host cannot stand in there. Every other protocol
+                // is an ordinary HTTP/3 request, where RFC 9114 §4.3.1's
+                // either/or applies.
+                (false, _) if protocol == Some("connect-udp") => false,
                 (false, Some(_)) => true,
                 (false, None) => false,
             }
@@ -2371,14 +2373,14 @@ proptest! {
         prop_assert_eq!(
             built.is_ok(),
             expected,
-            "method {:?}, scheme {}, authority {}, path {}, protocol {}, host {:?}: {:?}",
+            "method {:?}, scheme {}, authority {}, path {}, protocol {:?}, host {:?}: {:?}",
             method, scheme, authority, path, protocol, host,
             built.as_ref().err().map(ToString::to_string)
         );
 
         match built {
             Ok(request) => {
-                prop_assert_eq!(request.protocol.is_some(), protocol);
+                prop_assert_eq!(request.protocol.is_some(), protocol.is_some());
                 // Whichever of the two named it: `:authority` when it is there,
                 // and the Host field standing in for it when it is not.
                 prop_assert_eq!(

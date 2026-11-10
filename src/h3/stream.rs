@@ -393,16 +393,32 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         //
         // One table for both request shapes, because §4.3.1's agreement rule is
         // the same rule either way -- an extended CONNECT is still an HTTP/3
-        // request. RFC 8441 §4 changes one row of it and no more: on a request
-        // carrying :protocol the authority is mandatory rather than one of two
-        // ways to name the target, so a Host field cannot stand in for it.
+        // request. RFC 8441 §4 does not make :authority mandatory on a request
+        // carrying :protocol; it says what :authority means when it is present:
+        //
+        //= https://www.rfc-editor.org/rfc/rfc8441#section-4
+        //# On requests bearing the :protocol pseudo-header field, the
+        //# :authority pseudo-header field is interpreted according to
+        //# Section 8.1.2.3 of [RFC7540] instead of Section 8.3 of that
+        //# document.
+        //
+        // The one requirement is RFC 9298 §3.4's, and it is connect-udp's
+        // alone:
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9298#section-3.4
+        //# The :authority pseudo-header field SHALL contain the authority of
+        //# the UDP proxy.
+        //
+        // The comparison is exact, matching `tunnel::route`: a different case
+        // or spelling is an unsupported protocol, not a connect-udp request,
+        // and may name the proxy through Host.
         let named = match (authority.as_deref(), fields.get("host")) {
             (Some(authority), Some(host)) if authority != host.as_bytes() => {
                 return Err(malformed(":authority and Host disagree"));
             }
             (Some(authority), _) => authority,
-            (None, _) if protocol.is_some() => {
-                return Err(malformed("an extended CONNECT request without :authority"));
+            (None, _) if protocol.as_deref() == Some(b"connect-udp".as_slice()) => {
+                return Err(malformed("a connect-udp request without :authority"));
             }
             (None, Some(host)) => host.as_bytes(),
             (None, None) => return Err(malformed("a request with neither :authority nor Host")),
@@ -1355,7 +1371,9 @@ mod tests {
         // RFC 9114 §4.4: and it must carry :authority.
         refused(vec![field(":method", "CONNECT")]);
 
-        // RFC 8441 §4: an extended CONNECT needs all three.
+        // RFC 8441 §4 requires :scheme and :path on an extended CONNECT, and
+        // RFC 9298 §3.4 requires :authority for the connect-udp request this
+        // one is.
         for missing in [":scheme", ":path", ":authority"] {
             let fields = connect_udp()
                 .into_iter()
@@ -1365,7 +1383,8 @@ mod tests {
         }
 
         // RFC 9114 §4.3.1: the agreement rule holds for an extended CONNECT
-        // too, where :authority is mandatory rather than optional.
+        // too. For connect-udp :authority is mandatory (RFC 9298 §3.4), but the
+        // rule about the two values agreeing is the same either way.
         let mut disagreeing = connect_udp();
         disagreeing.push(field("host", "other.example:443"));
         refused(disagreeing);
