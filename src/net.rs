@@ -6,7 +6,7 @@
 //!
 //! * RFC 9298 §3.1 requires a CONNECT-UDP request to be resolved *before* the
 //!   2xx response is sent.
-//! * The destination ACL (M4) can only filter what it can see.
+//! * The destination ACL ([`crate::policy`]) can only filter what it can see.
 
 use std::io;
 use std::net::SocketAddr;
@@ -23,10 +23,10 @@ use crate::config::IpFamilyPreference;
 /// order survives untouched, so whatever RFC 6724 decided between two IPv6
 /// addresses (or two IPv4 ones) still decides which of them is tried first. Only
 /// the choice *between* the families is taken away from the resolver, because
-/// only that choice is an operator's to make — see [`IpFamilyPreference`].
+/// only that choice is an operator's to make. See [`IpFamilyPreference`].
 ///
 /// [`System`](IpFamilyPreference::System) leaves the list exactly as it arrived.
-/// A list that is empty or single-family — an IP literal is always the latter —
+/// A list that is empty or single-family (an IP literal is always the latter)
 /// is unchanged by any preference.
 pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreference) {
     let prefer_ipv6 = match preference {
@@ -43,7 +43,7 @@ pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreferenc
 
 /// Resolves `host`/`port` to a non-empty list of socket addresses.
 ///
-/// **Unbudgeted** — this takes no slot from the D90 lookup budget, so nothing a
+/// **Unbudgeted**: this takes no slot from the D90 lookup budget, so nothing a
 /// client controls may reach it: a tunnel target resolves through
 /// [`ConnectionResolver::lookup`] or not at all. What keeps this `pub` is the
 /// tests (`it_resolver_pool` proves its injected resolver took hold by watching
@@ -51,7 +51,7 @@ pub fn prefer_family(addresses: &mut [SocketAddr], preference: IpFamilyPreferenc
 ///
 /// An IP literal resolves to itself without consulting the resolver, and an IPv6
 /// one is written bare: the brackets belong to the syntax a target arrived in,
-/// and each of the two places a target arrives has already taken them off --
+/// and each of the two places a target arrives has already taken them off:
 /// `tunnel::tcp` splitting an RFC 3986 authority, `tunnel::udp` decoding an
 /// RFC 9298 template, which carries them bare to begin with. Stripping them here
 /// as well would mean accepting a host neither of those produced, and answering
@@ -76,7 +76,7 @@ fn literal(host: &str, port: u16) -> Option<SocketAddr> {
 /// `tokio::net::lookup_host`, which spawns exactly this, for one reason: the
 /// permit has to be dropped by the *thread*, not by the future. A
 /// `connect_timeout` that expires drops the caller, and `getaddrinfo` is not
-/// cancellable -- the thread stays in the resolver until the stub gives up. A
+/// cancellable: the thread stays in the resolver until the stub gives up. A
 /// permit released at that moment would say a slot is free while the thread it
 /// stands for is still gone, which is the accounting that lets a client park
 /// the pool one `connect_timeout` at a time (D90).
@@ -122,7 +122,7 @@ async fn on_the_blocking_pool(
 /// hands a name to `getaddrinfo` on the runtime's *blocking* pool, and that call
 /// is not cancellable. A `connect_timeout` that expires drops the future and
 /// answers the client, but the thread stays in the resolver until the stub gives
-/// up on its own — five seconds per attempt on a stock `resolv.conf`, tens of
+/// up on its own: five seconds per attempt on a stock `resolv.conf`, tens of
 /// seconds where the nameserver answers nothing at all. So an unbounded proxy
 /// converts one client's black-holed names directly into parked threads, and the
 /// pool is process-wide: with the default `max_connections` x
@@ -138,14 +138,14 @@ pub const SHARED_LOOKUPS: usize = 128;
 /// guarantee worth having. A connection opening a page's worth of tunnels wants
 /// its lookups to run at once, so the figure is well clear of a browser's
 /// per-page domain count, and four connections at it exhaust the shared
-/// allowance -- which is the point at which everyone else falls back on their
+/// allowance. That is the point at which everyone else falls back on their
 /// reserved slot rather than on nothing.
 pub const BURST_LOOKUPS: usize = 32;
 
 /// Blocking threads the pool keeps clear of name resolution.
 ///
 /// Nothing else in this process uses the blocking pool today. The headroom is
-/// for the day something does -- and so that the arithmetic below never has to
+/// for the day something does, and so that the arithmetic below never has to
 /// be exact.
 pub const LOOKUP_FREE_THREADS: usize = 64;
 
@@ -164,7 +164,7 @@ pub const RESERVED_LOOKUP_CEILING: usize = 1024;
 /// numbers that matter are related on purpose: every connection's reserved
 /// lookup slot has a thread to run on, the shared allowance has its own, and
 /// [`LOOKUP_FREE_THREADS`] are left over. Threads are created on demand and
-/// reaped when idle, so this is a ceiling and not an allocation -- a server with
+/// reaped when idle, so this is a ceiling and not an allocation: a server with
 /// three clients holds three of them.
 ///
 /// Startup-only: a `SIGHUP` that raises `max_connections` does not resize the
@@ -227,10 +227,10 @@ impl Default for ResolverBudget {
 ///
 /// * **One reserved slot**, held by this connection alone and by nothing else.
 ///   No number of hostile connections can take it away, so a connection is never
-///   starved outright -- at worst its lookups run one at a time. This is the
+///   starved outright: at worst its lookups run one at a time. This is the
 ///   guarantee; the shared allowance is only ever an optimisation on top of it.
-/// * **[`BURST_LOOKUPS`] from the shared allowance**, so ordinary use --
-///   a client opening thirty tunnels at once -- still resolves them in parallel,
+/// * **[`BURST_LOOKUPS`] from the shared allowance**, so ordinary use (a
+///   client opening thirty tunnels at once) still resolves them in parallel,
 ///   while one connection can never hold more than its share of the pool.
 ///
 /// The waiting itself is inside the caller's `connect_timeout`, so a lookup that
@@ -241,9 +241,9 @@ impl Default for ResolverBudget {
 /// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
 /// counting separately would be no bound at all. That is also why the three
 /// semaphores are held inline rather than behind an `Arc`: with one owner and no
-/// clone, the allocation bought nothing. Each semaphore keeps its own, because
-/// `acquire_owned` needs an `Arc<Semaphore>` and one of them is the server-wide
-/// allowance every connection really does share.
+/// clone, an outer `Arc` would be an allocation for nothing. Each semaphore
+/// keeps its own, because `acquire_owned` needs an `Arc<Semaphore>` and one of
+/// them is the server-wide allowance every connection really does share.
 #[derive(Debug)]
 pub struct ConnectionResolver {
     /// This connection's own slot. One permit, never shared.
@@ -276,7 +276,7 @@ impl ConnectionResolver {
     /// free *while* a lookup waits: the shared allowance may not come back for
     /// tens of seconds under attack, while the reserved slot turns over as
     /// fast as this connection's own lookups finish. A lookup parked on the
-    /// shared queue therefore keeps a claim on the reserved slot too — that is
+    /// shared queue therefore keeps a claim on the reserved slot too. That is
     /// what makes "serial at worst" literally true instead of "one lookup per
     /// burst of arrivals". `biased` puts the reserved slot first so a free one
     /// is taken before the shared allowance is touched.
@@ -380,12 +380,12 @@ pub fn holds_address(address: SocketAddr) -> bool {
 /// under: exhausting it does not degrade the proxy gracefully, it makes every
 /// `accept`, `connect` and `socket` call fail at once, including the ones the
 /// QUIC endpoint needs. Checked at startup against `limits.max_targets_per_conn`
-/// rather than discovered at 3am.
+/// rather than discovered in production.
 ///
 /// `getrlimit` needs no `cfg` split: it is POSIX and present on both the Linux
 /// production host and the macOS dev host. It also cannot fail for a resource
 /// the kernel always knows about, which is why rustix's wrapper returns no
-/// `Result` — so `None` here is `RLIM_INFINITY` rather than a failed read: the
+/// `Result`. So `None` here is `RLIM_INFINITY` rather than a failed read: the
 /// process has no ceiling at all, and there is nothing for the startup check to
 /// compare a budget against. See [`crate::quic`]'s `warn_if_fd_budget_is_tight`,
 /// which treats that as room to spare.
@@ -479,7 +479,7 @@ pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
 ///
 /// A proxy must not let the kernel fragment tunnelled UDP: fragments defeat PMTU
 /// discovery end to end and are widely dropped. Failure is logged rather than
-/// fatal — the tunnel still works, it just may lose oversized packets silently.
+/// fatal: the tunnel still works, but it may lose oversized packets silently.
 #[cfg(target_os = "linux")]
 fn set_dont_fragment(socket: &UdpSocket) {
     use rustix::net::sockopt::{Ipv4PathMtuDiscovery, Ipv6PathMtuDiscovery};

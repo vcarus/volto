@@ -110,21 +110,19 @@ fn validate_limits(limits: &Limits) -> Result<()> {
 
     // Strictly below half, not at it: at exactly half, losing a single
     // keep-alive packet is enough for the connection to time out. The relay in
-    // front of this server is the reason keep-alives exist at all — its UDP
+    // front of this server is the reason keep-alives exist at all. Its UDP
     // conntrack entry expires on its own schedule (30s by default), and only a
-    // keep-alive that comfortably beats both timeouts keeps the NAT mapping
-    // alive.
+    // keep-alive well inside both timeouts keeps the NAT mapping alive.
     //
     // Written as `interval >= ceil(idle / 2)` rather than the more obvious
     // `interval * 2 >= idle`: the two reject exactly the same pairs of
-    // integers, and this one cannot overflow. The doubling could, and a
-    // `u64` large enough to make it — anything above `u64::MAX / 2` — is
-    // reachable straight from the file, since TOML integers deserialize
-    // across the whole target type's range. A debug build panicked inside
-    // this function; a release build wrapped the product to something small,
-    // accepted the interval, and handed it to quinn, where it becomes
-    // `Instant::now() + interval` the moment a connection is established and
-    // panics the connection driver instead (D86).
+    // integers, and this one cannot overflow. The doubling could, and a `u64`
+    // above `u64::MAX / 2` is reachable straight from the file, since TOML
+    // integers deserialize across the whole target type's range. A debug
+    // build would panic inside this function. A release build would wrap the
+    // product to something small, accept the interval and hand it to quinn,
+    // where `Instant::now() + interval` panics the connection driver once a
+    // connection is established (D86).
     if limits.keep_alive_interval > 0
         && limits.keep_alive_interval >= limits.max_idle_timeout.div_ceil(2)
     {
@@ -235,7 +233,7 @@ fn validate_auth(auth: &Auth) -> Result<()> {
         if user.username.len() > crate::logfmt::MAX_TOKEN {
             // A user-id this long is unusable in a subtler way. Failures are
             // bucketed by the user-id the request claimed, in the form a log
-            // line carries it -- truncated at `logfmt::MAX_TOKEN` -- so a
+            // line carries it (truncated at `logfmt::MAX_TOKEN`), so a
             // name past that bound never matches the configured one, and its
             // failures land in the bucket no success can clear. The client
             // that really does hold those credentials would then lose its
@@ -245,7 +243,7 @@ fn validate_auth(auth: &Auth) -> Result<()> {
             //
             // The name is not echoed: it is not a secret, but it lives in
             // the same table as one, and nothing out of `[auth]` goes to
-            // stderr -- see `parse_error`. The index and the limit are what
+            // stderr (see `parse_error`). The index and the limit are what
             // it takes to find and fix it.
             bail!(
                 "auth.users[{i}].username is {} bytes, over the {}-byte limit a user-id has \
@@ -334,10 +332,9 @@ fn validate_log_level(level: &str) -> Result<()> {
 ///
 /// Rejected rather than normalised away, because every one of these is a name an
 /// operator meant to type and none of them can ever match: a name that cannot
-/// appear in a ClientHello turns the gate into a server nobody can reach, and
-/// that failure is silent by construction — the whole point of the gate is that
-/// a refused handshake gets no answer, so the operator would see a working
-/// service that no client can open.
+/// appear in a ClientHello turns the gate into a server nobody can reach. That
+/// failure is silent by construction: the gate gives a refused handshake no
+/// answer, so the operator would see a working service that no client can open.
 ///
 //= https://www.rfc-editor.org/rfc/rfc6066#section-3
 //# The hostname is represented as a byte

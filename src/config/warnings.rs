@@ -3,10 +3,10 @@ use super::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 impl Config {
     /// Settings that are legal but that an operator should be told about.
     ///
-    /// Returned rather than logged so the caller can emit them *after* the
-    /// tracing subscriber exists — a warning logged during `load()` would be
-    /// written to a subscriber that has not been installed yet, i.e. nowhere —
-    /// and so they can be asserted on in tests.
+    /// Returned rather than logged, so the caller can emit them *after* the
+    /// tracing subscriber exists and so they can be asserted on in tests. A
+    /// warning logged during `load()` would be written to a subscriber that has
+    /// not been installed yet, which is nowhere.
     ///
     /// This opens and parses `server.cert` when `security.expected_sni` is not
     /// empty, so it is a blocking file read and not only a walk over the parsed
@@ -49,7 +49,7 @@ impl Config {
 
         // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
         // only thing this server can serve once a connection is up. A list
-        // without it is legal -- the key exists for interop debugging -- but it
+        // without it is legal (the key exists for interop debugging), but it
         // is a server nobody can reach.
         if !self.server.alpn.iter().any(|id| id == "h3") {
             warnings.push(format!(

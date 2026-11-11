@@ -83,12 +83,12 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default grace period for a graceful shutdown, in seconds.
 ///
 /// Long enough for an in-flight page load or API call to finish, and short on
-/// purpose: a client that keeps using a connection after GOAWAY instead of
-/// opening a fresh one — the Surge client does — has every new request fail
-/// for as long as the drain lasts, so the grace period is also a window of
-/// failed requests on the client, and it only buys time for transfers that are
-/// already running. Five seconds keeps that window short while still letting
-/// short exchanges complete. Well below a service manager's own kill timeout
+/// purpose. A client that keeps using a connection after GOAWAY instead of
+/// opening a fresh one (the Surge client does) has every new request fail for
+/// as long as the drain lasts. So the grace period is also a window of failed
+/// requests on the client, and it only helps transfers that are already
+/// running. Five seconds keeps that window short and still lets short
+/// exchanges complete. It is well below a service manager's own kill timeout
 /// (systemd's default `TimeoutStopSec` is 90s).
 pub const DEFAULT_SHUTDOWN_GRACE: u64 = 5;
 
@@ -113,15 +113,15 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 /// Applied twice per request and separately: once to name resolution, once to
 /// the whole list of addresses the name resolved to. A tunnel slot and the file
 /// descriptor behind it are held for the length of both, so without a budget an
-/// unreachable target pins them for however long the operating system waits on a
-/// SYN that draws no answer — on Linux roughly two minutes, which is long enough
+/// unreachable target holds them for as long as the operating system waits on a
+/// SYN that draws no answer. On Linux that is roughly two minutes, long enough
 /// for ordinary browsing to a black-holed address to exhaust
 /// `max_targets_per_conn` on its own.
 ///
 /// Ten seconds is well past a healthy connect on any path this proxy serves (the
-/// production RTT is under 100 ms) while being short enough that a client's
-/// budget is not consumed by one dead target. Zero restores the unbounded
-/// behaviour and leaves the wait to the operating system.
+/// production RTT is under 100 ms) and short enough that one dead target does
+/// not consume a client's budget. Zero removes the bound and leaves the wait to
+/// the operating system.
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
 
 /// Default number of authentication failures tolerated on one connection.
@@ -135,8 +135,8 @@ pub const DEFAULT_MAX_STREAMS_BIDI: u32 = 1024;
 
 /// Default QUIC idle timeout, in seconds.
 ///
-/// Deliberately longer than a typical relay's 30s UDP conntrack entry, so that the
-/// keep-alive below — not the timeout — decides connection liveness.
+/// Deliberately longer than a typical relay's 30s UDP conntrack entry, so that
+/// the keep-alive below, not the timeout, keeps the connection live.
 ///
 /// Not the value in force on its own: RFC 9000 §10.1 makes the effective idle
 /// timeout the minimum of what the two endpoints advertise, and Surge advertises
@@ -183,15 +183,14 @@ pub const MIN_INITIAL_MTU: u16 = 1200;
 /// traffic at it is lost. This value is sent blind in the handshake, and the
 /// next paragraph says what a wrong value costs here.
 ///
-/// There is no floor to fall back to if this is wrong: quinn applies the value
+/// There is no floor to fall back to if this is wrong. quinn applies the value
 /// with a `max()` against the 1200-byte minimum and no `min()` above it, so the
-/// handshake flight goes out in packets the path drops and the server is simply
-/// unreachable. Its black-hole detector is no help either -- that runs inside an
+/// handshake flight goes out in packets the path drops and the server is
+/// unreachable. Its black-hole detector does not help either: it runs inside an
 /// established connection, and with this wrong there is never one. A reload
-/// applies the value to connections accepted from then on, which is what makes
-/// the mistake worth rejecting rather than tolerating: a `SIGHUP` with a typo
-/// here turns a running server into one that still answers `systemctl status`
-/// and nothing else (audit 2026-08-23).
+/// applies the value to connections accepted from then on, which is why the
+/// mistake is rejected rather than tolerated: a `SIGHUP` with a typo here
+/// leaves a server that still answers `systemctl status` and nothing else.
 pub const MAX_INITIAL_MTU: u16 = 1452;
 
 /// Default ceiling for path MTU discovery, in bytes.
@@ -257,44 +256,44 @@ const INITIAL_RTT_RANGE_MS: std::ops::RangeInclusive<u64> = 10..=10_000;
 /// conntrack entry will have expired long before, so a larger timeout only delays
 /// noticing a peer that is already unreachable.
 ///
-/// For the two application timers it is also a hard-safety line: they are added
-/// to `Instant::now()` to make deadlines, and an absurd number of seconds —
-/// they are plain `u64`s — would panic that addition rather than mean anything.
-/// The ceiling keeps every such sum far from the edge.
+/// For the two application timers it is also a safety bound. They are plain
+/// `u64`s added to `Instant::now()` to make deadlines, and an absurd number of
+/// seconds would panic that addition. The ceiling keeps every such sum far from
+/// the edge.
 const MAX_IDLE_TIMEOUT_CEILING: u64 = 3600;
 
 /// Largest accepted `shutdown_grace`, in seconds.
 ///
-/// The same number as [`MAX_IDLE_TIMEOUT_CEILING`] and half of the same
-/// reasoning — past an hour a wait stops describing anything anybody observes,
-/// and a drain that long has outlived any service manager's own patience
-/// (systemd's default `TimeoutStopSec` is 90 seconds).
+/// The same number as [`MAX_IDLE_TIMEOUT_CEILING`], for half of the same
+/// reason: past an hour a wait stops describing anything anybody observes, and
+/// a drain that long exceeds any service manager's stop timeout (systemd's
+/// default `TimeoutStopSec` is 90 seconds).
 ///
 /// The other half is this key's own, and it is the opposite of the timers'.
 /// A grace period that cannot be added to `Instant::now()` does not panic:
-/// `tokio::time::timeout` folds a duration it cannot add into a deadline in the
-/// far future instead, so an absurd `u64` of seconds fails quietly rather than
-/// loudly — it removes the bound `crate::quic`'s drain is built around, leaving
-/// the process waiting on connections that may never end until a `SIGKILL`
-/// arrives, which is precisely the ungraceful ending the grace period exists to
-/// avoid. Bounding the key is what keeps that state unreachable.
+/// `tokio::time::timeout` turns a duration it cannot add into a deadline in the
+/// far future, so an absurd `u64` of seconds fails quietly. That removes the
+/// bound `crate::quic`'s drain is built around, and the process waits on
+/// connections that may never end until a `SIGKILL` arrives, which is the
+/// ungraceful ending the grace period exists to avoid. Bounding the key keeps
+/// that state unreachable.
 const MAX_SHUTDOWN_GRACE: u64 = MAX_IDLE_TIMEOUT_CEILING;
 
 /// Default UDP socket receive buffer to request, in bytes.
 ///
 /// Not a size that arrives on its own. quinn never calls
-/// `setsockopt(SO_RCVBUF)`, so a QUIC server that does not ask keeps whatever
-/// the kernel hands out — `net.core.rmem_default`, around 208 KiB on a stock
-/// Linux — however high `net.core.rmem_max` has been raised, because that
+/// `setsockopt(SO_RCVBUF)`, so a QUIC server that does not ask keeps what the
+/// kernel hands out: `net.core.rmem_default`, around 208 KiB on a stock Linux.
+/// That holds however high `net.core.rmem_max` has been raised, because that
 /// sysctl is only a ceiling on what an application may *request*, not an
 /// allocation.
 ///
-/// 2 MiB is cheap insurance in the same spirit as the per-stream flow-control
-/// window in [`crate::quic`]: it costs nothing until a burst needs it, and the
-/// bursts it covers are ordinary ones — a batch of packets arriving while the
-/// read loop is elsewhere, a GSO segment train, a scheduling hiccup. What it
-/// buys is the absence of a silent drop, which the kernel counts as `receive
-/// buffer errors` in `netstat -su` and the sender pays for in retransmissions.
+/// Like the per-stream flow-control window in [`crate::quic`], 2 MiB costs
+/// nothing until a burst needs it. The bursts it covers are ordinary ones: a
+/// batch of packets arriving while the read loop is elsewhere, a GSO segment
+/// train, a scheduling delay. Without it such a burst is dropped silently. The
+/// kernel counts the drop as `receive buffer errors` in `netstat -su`, and the
+/// sender has to retransmit.
 ///
 /// Requested when the socket is created, so this is a startup-only setting.
 /// Zero leaves the operating system's own value alone.
@@ -302,13 +301,13 @@ pub const DEFAULT_SOCKET_RECV_BUFFER: usize = 2 * 1024 * 1024;
 
 /// Default UDP socket send buffer to request, in bytes.
 ///
-/// The mirror of [`DEFAULT_SOCKET_RECV_BUFFER`] on the way out: capped by
+/// The send side of [`DEFAULT_SOCKET_RECV_BUFFER`]: capped by
 /// `net.core.wmem_max` rather than `rmem_max`, and drained by the network
-/// interface rather than by this process. It binds on the same bursts, with a
-/// milder ending: when the endpoint hands the kernel more at once than the
+/// interface rather than by this process. It matters on the same bursts, with a
+/// milder result. When the endpoint hands the kernel more at once than the
 /// buffer holds, the send returns `EAGAIN` and quinn holds the packet until the
-/// socket drains — a stall rather than a drop, though the kernel still counts
-/// each one as a `send buffer error` in `netstat -su`.
+/// socket drains. That is a stall rather than a drop, though the kernel still
+/// counts each one as a `send buffer error` in `netstat -su`.
 ///
 /// Requested when the socket is created, so this is a startup-only setting.
 /// Zero leaves the operating system's own value alone.
@@ -321,8 +320,7 @@ pub const DEFAULT_SOCKET_SEND_BUFFER: usize = 2 * 1024 * 1024;
 /// leaves the buffer at the operating system's minimum, and 3000000000 becomes
 /// a negative integer the kernel clamps. [`Config::validate`] rejects both
 /// socket buffer keys above this instead, naming the API limit, so a typo cannot
-/// silently become a different number. `0` is still the escape hatch that leaves
-/// the socket alone.
+/// silently become a different number. `0` still leaves the socket alone.
 #[allow(clippy::as_conversions)]
 pub const MAX_SOCKET_BUFFER: usize = i32::MAX as usize;
 
@@ -381,7 +379,7 @@ pub struct Config {
     pub log: Log,
 }
 
-/// `[auth]` — the accepted credentials.
+/// `[auth]`: the accepted credentials.
 ///
 /// An empty user list disables authentication entirely, which makes this an open
 /// proxy; [`Config::warnings`] says so at startup.
@@ -426,12 +424,12 @@ impl std::fmt::Debug for User {
 /// throughput where CUBIC and NewReno stall, matching what the Linux kernel does
 /// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
 ///
-/// Since 1.2.0 the value `bbr` selects quinn's BBR with its window capped
+/// The value `bbr` selects quinn's BBR with its window capped
 /// ([`crate::congestion`], D108), because quinn's BBR overestimates the
 /// bottleneck and loses the difference on a bulk download. The capped
-/// controller took over the name so that an existing file, whether it writes
-/// `bbr` or leaves the key out, gets it without an edit. quinn's controller as
-/// it ships stays selectable as `bbr-uncapped`.
+/// controller has the plain name so that a file that writes `bbr`, or leaves
+/// the key out, gets it without an edit. quinn's controller as it ships is
+/// selectable as `bbr-uncapped`.
 ///
 /// The other controllers are kept as a fallback: quinn's BBR is a port marked
 /// "experimental", so an operator who hits trouble after a dependency bump can
@@ -440,12 +438,10 @@ impl std::fmt::Debug for User {
 #[serde(rename_all = "lowercase")]
 pub enum CongestionControl {
     /// quinn's BBR with its window capped at 1.25 times the measured
-    /// bandwidth-delay product; see [`crate::congestion`]. The default since
-    /// 1.2.0. Its v1.1.x name `bbr-capped` was an alias in 1.2.0 and is not
-    /// accepted since 1.3.0.
+    /// bandwidth-delay product; see [`crate::congestion`]. The default.
     Bbr,
     /// quinn's BBR as it ships (its experimental port of BBRv1), without the
-    /// cap. The controller `bbr` selected before 1.2.0.
+    /// cap.
     #[serde(rename = "bbr-uncapped")]
     BbrUncapped,
     /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
@@ -459,22 +455,21 @@ pub enum CongestionControl {
 /// `[limits].ip_family_preference`.
 ///
 /// The default is IPv4, which is deliberately *not* what the C library hands
-/// back. `getaddrinfo` — glibc and musl alike — orders its answers by RFC 6724,
+/// back. `getaddrinfo` (glibc and musl alike) orders its answers by RFC 6724,
 /// and that ordering puts a global IPv6 address ahead of every IPv4 one whenever
 /// the host has a usable IPv6 route. On a host that is only a client of the
-/// internet that is the right answer. On a proxy it is an operator policy
-/// wearing a resolver's clothes: a host whose IPv6 egress is tunnelled, or
-/// otherwise weaker than its native IPv4 — a common shape on a VPS — would send
-/// every dual-stack target down the weaker path first. A TCP tunnel pays for
-/// that with the whole IPv6 attempt before IPv4 is even tried, because
-/// [`crate::tunnel::tcp`] walks the address list in order; a CONNECT-UDP session
-/// pays for it outright, because its socket is connected to the first address
-/// that has a route and there is no failover behind that choice.
+/// internet that is the right answer. On a proxy it is an operator policy made
+/// by the resolver. A host whose IPv6 egress is tunnelled, or otherwise weaker
+/// than its native IPv4 (a common shape on a VPS), would send every dual-stack
+/// target down the weaker path first. For a TCP tunnel that costs the whole
+/// IPv6 attempt before IPv4 is tried, because [`crate::tunnel::tcp`] walks the
+/// address list in order. For a CONNECT-UDP session the choice is final,
+/// because its socket is connected to the first address that has a route and
+/// there is no failover behind that choice.
 ///
-/// [`System`](Self::System) is the escape hatch back to RFC 6724 ordering, which
-/// on glibc an operator can shape further through `gai.conf`. The knob and its
-/// default have precedent: shadowsocks-rust carries the same choice as
-/// `ipv6_first`, likewise off by default.
+/// [`System`](Self::System) keeps RFC 6724 ordering, which on glibc an operator
+/// can shape further through `gai.conf`. shadowsocks-rust carries the same
+/// choice as `ipv6_first`, likewise off by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpFamilyPreference {
@@ -486,7 +481,7 @@ pub enum IpFamilyPreference {
     System,
 }
 
-/// `[limits]` — resource and lifetime limits.
+/// `[limits]`: resource and lifetime limits.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
@@ -529,8 +524,8 @@ pub struct Limits {
     ///
     /// Between 1 and 65536. The ceiling is not a formality: the credit is
     /// reserved slot by slot when the allowance is granted rather than when a
-    /// stream is opened, so it is work paid in one go — at the first
-    /// authentication now, and at every handshake before the clamp.
+    /// stream is opened, so the whole allowance is paid for at once, at the
+    /// connection's first authenticated request.
     pub max_streams_bidi: u32,
     /// Seconds a QUIC connection may go without traffic before it is closed.
     ///
@@ -551,7 +546,7 @@ pub struct Limits {
     /// Probe for a larger path MTU than `initial_mtu` (RFC 8899 DPLPMTUD).
     ///
     /// On by default. Turning it off stops the upward search: packets start at
-    /// `initial_mtu` and are never probed larger. It is not a hard pin, though —
+    /// `initial_mtu` and are never probed larger. It is not a hard pin, though.
     /// quinn's black-hole detector still runs, and if it fires it drops the packet
     /// size to the 1200-byte floor for the rest of the connection, with nothing
     /// left to probe it back up. Trades throughput for predictability on a path
@@ -570,8 +565,8 @@ pub struct Limits {
     /// follow `initial_mtu` up while a written one is checked exactly. Read the
     /// ceiling in effect through [`Limits::mtu_upper_bound`].
     pub mtu_upper_bound: Option<u16>,
-    /// QUIC congestion controller. Defaults to `bbr`, which since 1.2.0 is
-    /// quinn's BBR with its window capped; see [`CongestionControl`].
+    /// QUIC congestion controller. Defaults to `bbr`, quinn's BBR with its
+    /// window capped; see [`CongestionControl`].
     pub congestion_control: CongestionControl,
     /// Milliseconds of round-trip time assumed before the first measurement.
     ///
@@ -582,14 +577,15 @@ pub struct Limits {
     ///
     /// Applied to the socket when it is created, which makes this a startup-only
     /// setting: a `SIGHUP` reload does not rebind the socket, so a change here
-    /// needs a restart — the same class as [`Server::listen`], and unlike every
-    /// key above it. A reload carrying a different value is accepted, applies
-    /// nothing, and says so, exactly as one carrying a different `listen` does.
+    /// needs a restart. That is the same class as [`Server::listen`], unlike
+    /// every key above it. A reload carrying a different value is accepted,
+    /// applies nothing, and says so, exactly as one carrying a different
+    /// `listen` does.
     ///
     /// Two things the kernel does with the request are worth knowing before
-    /// reading a log line about it. It is capped at a host ceiling —
-    /// `net.core.rmem_max` on Linux, `kern.ipc.maxsockbuf` on macOS — and a host
-    /// may fail the call outright instead of clamping. And on Linux the value
+    /// reading a log line about it. It is capped at a host ceiling
+    /// (`net.core.rmem_max` on Linux, `kern.ipc.maxsockbuf` on macOS), and a
+    /// host may fail the call outright instead of clamping. And on Linux the value
     /// read back is *double* what was granted, because the accounting includes
     /// per-packet overhead, so a satisfied 2 MiB request reads as 4194304 both
     /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
@@ -599,8 +595,7 @@ pub struct Limits {
     /// The socket API takes a signed 32-bit integer, so this key is limited to
     /// [`MAX_SOCKET_BUFFER`] = `i32::MAX`; a larger value is refused at load
     /// time rather than truncated to a different number on its way to the
-    /// kernel. `0` is still the escape hatch that leaves the socket on the
-    /// operating system's own value.
+    /// kernel. `0` still leaves the socket on the operating system's own value.
     pub socket_recv_buffer: usize,
     /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
     ///
@@ -612,7 +607,7 @@ pub struct Limits {
     pub socket_send_buffer: usize,
 }
 
-/// `[security]` — destination policy and abuse mitigations.
+/// `[security]`: destination policy and abuse mitigations.
 ///
 /// The defaults are the ones RFC 9298 §7 asks for: private address space is out
 /// of reach, the classic relay port is closed, and a session that has not heard
@@ -638,8 +633,8 @@ pub struct Security {
     pub max_auth_failures: u32,
     /// Host names this server answers to, or an empty list to answer to any.
     ///
-    /// Empty is the default and the behaviour every release before this one had:
-    /// the name a client asks for is logged and otherwise ignored. A non-empty
+    /// Empty is the default: the name a client asks for is logged and otherwise
+    /// ignored. A non-empty
     /// list turns on the SNI gate (D106): a handshake whose ClientHello does not
     /// name one of these hosts is dropped at the socket, before quinn sees it,
     /// so a port scan of this address gets no answer at all. See
@@ -647,7 +642,7 @@ pub struct Security {
     pub expected_sni: Vec<String>,
 }
 
-/// `[server]` — the QUIC listener and its TLS identity.
+/// `[server]`: the QUIC listener and its TLS identity.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Server {
@@ -663,13 +658,13 @@ pub struct Server {
     /// Seconds to let existing tunnels finish after SIGTERM, at most an hour.
     ///
     /// Zero closes everything at once. The wait ends early if all tunnels finish
-    /// sooner, so a generous value costs nothing in the common case — but it is
-    /// a bound rather than a wish, which is why it has a ceiling of its own.
+    /// sooner, so a generous value costs nothing in the common case. It is still
+    /// a bound, which is why it has a ceiling of its own.
     #[serde(default = "default_shutdown_grace")]
     pub shutdown_grace: u64,
 }
 
-/// `[log]` — logging settings.
+/// `[log]`: logging settings.
 ///
 /// `RUST_LOG` takes precedence over [`Log::level`] when set, so an operator can
 /// raise verbosity without editing the config file.
@@ -748,11 +743,11 @@ impl Limits {
     /// it to `initial_mtu..=`[`MAX_MTU_UPPER_BOUND`]. An absent one is
     /// [`DEFAULT_MTU_UPPER_BOUND`], raised to `initial_mtu` when that is larger.
     /// The raise exists because the default (1436) is below
-    /// [`MAX_INITIAL_MTU`] (1452): a file from a release whose default ceiling
-    /// was 1452 may set `initial_mtu` anywhere up to 1452 and no ceiling, and it
-    /// has to keep loading. quinn would raise a ceiling below the starting size
-    /// to that size on its own; this makes the same value explicit, so the
-    /// transport and the logs see the ceiling that is actually used.
+    /// [`MAX_INITIAL_MTU`] (1452): a file may set `initial_mtu` anywhere up to
+    /// 1452 and no ceiling, and it has to load. quinn would raise a ceiling
+    /// below the starting size to that size on its own; this makes the same
+    /// value explicit, so the transport and the logs see the ceiling that is
+    /// actually used.
     pub fn mtu_upper_bound(&self) -> u16 {
         self.mtu_upper_bound
             .unwrap_or_else(|| DEFAULT_MTU_UPPER_BOUND.max(self.initial_mtu))
@@ -812,7 +807,7 @@ impl Config {
 
 /// Upper bound on `limits.max_targets_per_conn`.
 ///
-/// Not a protocol limit — a sanity limit. A value beyond this cannot be backed by
+/// Not a protocol limit but a sanity limit. A value beyond this cannot be backed by
 /// file descriptors on any realistic host, so it is more likely a typo.
 const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 
@@ -821,18 +816,16 @@ const MAX_TARGETS_PER_CONN_CEILING: u32 = 65_536;
 /// The same number as [`MAX_TARGETS_PER_CONN_CEILING`], because one tunnel is
 /// one stream: credit past the ceiling on tunnels could not carry one anyway.
 ///
-/// What makes it worth rejecting rather than tolerating is where the cost is
-/// paid. quinn does not allocate a stream when one is opened — `StreamsState`
-/// reserves a slot for every unit of the credit when the allowance is granted,
-/// which since the pre-authentication clamp is once per connection, at its
-/// first authenticated request (before the clamp, at every handshake, by any
-/// peer). Measured on the dev host when it was paid per handshake (D86): about
-/// 11 ms at the default of 1024, 135 ms at this ceiling, 7.3 s at a million,
-/// and no completed handshake inside ten seconds at four million — where
-/// `u32::MAX`, which a config file can hold, is a further thousandfold. The
-/// raise measures cheaper than the handshake did, but the shape is the same:
-/// a typo here buys every connection's first request a stall, which is the
-/// same class of self-inflicted outage `MAX_INITIAL_MTU` is written against.
+/// It is rejected rather than tolerated because of where the cost is paid.
+/// quinn does not allocate a stream when one is opened: `StreamsState` reserves
+/// a slot for every unit of the credit when the allowance is granted, once per
+/// connection at its first authenticated request. The cost grows with the
+/// credit. D86 measured it on the dev host, when it was paid per handshake:
+/// about 11 ms at the default of 1024, 135 ms at this ceiling, 7.3 s at a
+/// million, and no completed handshake within ten seconds at four million.
+/// `u32::MAX`, which a config file can hold, is a thousand times more again. A
+/// typo here gives every connection's first request a stall, the same kind of
+/// self-inflicted outage `MAX_INITIAL_MTU` is written against.
 const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 
 /// The longest host name a `server_name` extension can carry, in bytes.

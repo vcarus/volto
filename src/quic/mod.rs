@@ -75,10 +75,8 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
 /// Starting one arriving connection's handshake on a stated configuration.
 ///
 /// One method, so that [`Server::accept_under_the_swap`] can be exercised with
-/// no peer on the other end. It was `IntoFuture` until the server configuration
-/// became something this process chooses rather than something quinn reads for
-/// itself. What the regression test has to observe now is the argument, and
-/// `IntoFuture::into_future` takes none.
+/// no peer on the other end. What the regression test has to observe is the
+/// server configuration argument, and `IntoFuture::into_future` takes none.
 trait AcceptWith {
     /// The handshake, once started.
     type Accepted;
@@ -101,8 +99,8 @@ impl AcceptWith for quinn::Incoming {
 /// `Connecting`.
 ///
 /// quinn's `IncomingFuture` is exactly this and cannot be built from outside:
-/// its field is private and `IntoFuture for Incoming` is the only way to reach
-/// it, which is the call this replaces. The `Result` is resolved before the
+/// its field is private and `IntoFuture for Incoming`, which takes no server
+/// configuration, is the only way to reach it. The `Result` is resolved before the
 /// future exists, and that is what keeps the accept eager: by the time anything
 /// polls this, quinn has answered the client's Initial and the TLS server flight
 /// is on its way. [`Server::serve`] depends on that and says so.
@@ -148,8 +146,8 @@ pub struct Server {
     /// Server-wide because the pool is: what one connection may hold at once is
     /// bounded here so that a client whose targets never resolve cannot park
     /// every thread the process has and starve the rest (D90). Built at bind
-    /// time and never reloaded -- it is sized against the runtime the process
-    /// was started with, which a `SIGHUP` cannot resize.
+    /// time and never reloaded, because it is sized against the runtime the
+    /// process was started with, which a `SIGHUP` cannot resize.
     resolver: crate::net::ResolverBudget,
     /// The host names the SNI gate admits, shared with the socket wrapper.
     ///
@@ -169,7 +167,7 @@ pub struct Server {
     /// are not the same answer: `local_addr()` reports the port the kernel
     /// chose, so a configured `:0` would never compare equal to itself. It is
     /// the *configured* address a reload has to be judged against, and it
-    /// cannot come from the live configuration either -- a reload swaps that
+    /// cannot come from the live configuration either. A reload swaps that
     /// whole value in, so the second reload naming a new address would find
     /// the first one's already there and say nothing.
     listen: SocketAddr,
@@ -188,11 +186,10 @@ impl Server {
     /// `quinn::Endpoint::server` is expanded by hand here, because the socket has
     /// to be reachable between the bind and the endpoint: quinn's own helper is a
     /// bare `std::net::UdpSocket::bind` and never touches `SO_RCVBUF`/`SO_SNDBUF`,
-    /// so a server that does not ask keeps `net.core.rmem_default` — around
-    /// 208 KiB — however high `net.core.rmem_max` is set, that sysctl being a
-    /// ceiling on requests rather than an allocation (D56). Everything passed to
+    /// so the socket would keep the kernel's default (D56; see
+    /// [`crate::config::DEFAULT_SOCKET_RECV_BUFFER`]). Everything passed to
     /// [`quinn::Endpoint::new_with_abstract_socket`] below is what the helper
-    /// passes internally; none of it may be dropped in the name of tidiness.
+    /// passes internally, and none of it may be dropped.
     ///
     /// The second reason for expanding it is [`Gate`], which wraps the socket
     /// the runtime hands back so that a datagram quinn would *answer* can be
@@ -330,9 +327,9 @@ impl Server {
     ///
     /// Each connection is handled in its own task, so a failure only ever affects
     /// that connection. The tasks are tracked in a `JoinSet` rather than detached,
-    /// because the shutdown path needs to know when they are finished — and
-    /// because dropping the set is what finally cuts off anything still running
-    /// once the grace period is over.
+    /// because the shutdown path needs to know when they are finished, and
+    /// because dropping the set is what cuts off anything still running once
+    /// the grace period is over.
     pub async fn run(&self) {
         let config = self.config();
         info!(
@@ -343,8 +340,8 @@ impl Server {
             version = env!("CARGO_PKG_VERSION"),
             listen = %config.server.listen,
             alpn = ?config.server.alpn,
-            // Empty when the SNI gate is off, which is the shipped default and
-            // the behaviour of every release before it (D106).
+            // Empty when the SNI gate is off, which is the shipped default
+            // (D106).
             expected_sni = ?config.security.expected_sni,
             grace_secs = config.server.shutdown_grace,
             // The kernel's numbers, not the configured ones: these are what
@@ -363,10 +360,10 @@ impl Server {
             // Reap eagerly rather than only in the select below: with `biased`
             // ordering a steady stream of new connections would starve that
             // branch, and finished tasks would pile up in the set for as long as
-            // the stream lasted. Nothing about the cap rides on this any more --
-            // that is decided against the roster, in [`Self::admit`] -- so what
-            // is at stake is the memory of the join handles and the length of
-            // the walk `drain` does at shutdown.
+            // the stream lasted. The cap does not depend on this (it is decided
+            // against the roster, in [`Self::admit`]), so what is at stake is
+            // the memory of the join handles and the length of the walk `drain`
+            // does at shutdown.
             while connections.try_join_next().is_some() {}
 
             tokio::select! {
@@ -404,8 +401,8 @@ impl Server {
     /// it itself when it may not.
     ///
     /// `Some` is a connection the accept loop should go on and serve. `None`
-    /// means this arrival has already been dealt with -- asked for a Retry,
-    /// or refused -- and there is nothing left for the caller to do with it.
+    /// means this arrival has already been dealt with (asked for a Retry, or
+    /// refused), and there is nothing left for the caller to do with it.
     ///
     /// Below the cap this is a configuration read and a length read and
     /// nothing else: every branch past the first belongs to a full server.
@@ -437,7 +434,7 @@ impl Server {
         // The roster rather than the `JoinSet`: a slot is entered before the
         // QUIC handshake starts and given up by a guard, so the roster counts
         // exactly the connections that hold one. The set is kept for draining,
-        // and its length *leads* the roster rather than trailing it -- a task
+        // and its length *leads* the roster rather than trailing it. A task
         // that has finished but not been reaped has already dropped its
         // registration, and an evicted one leaves the roster before its task
         // ends, so the set holds everything the roster does and sometimes
@@ -456,10 +453,10 @@ impl Server {
         let remote = incoming.remote_address();
 
         // Taking somebody else's slot is a privilege, and a source address
-        // that has proved nothing does not have it: one spoofed Initial per
-        // datagram, from addresses that never have to receive anything, would
-        // otherwise walk the whole roster out of the door -- and every one of
-        // those datagrams would start a TLS server flight, since `serve`
+        // that has proved nothing does not have it. Otherwise one spoofed
+        // Initial per datagram, from addresses that never have to receive
+        // anything, could evict every connection on the roster, and every one
+        // of those datagrams would start a TLS server flight, since `serve`
         // accepts the connection eagerly. So at the cap the unvalidated
         // newcomer is asked to come back with a token instead, which costs
         // this server no crypto and no slot, and is what QUIC provides for the
@@ -478,13 +475,13 @@ impl Server {
         // The second of those is why the round trip is rarer than it looks.
         // quinn's `bloom` feature is on (see `Cargo.toml`), so this server
         // sends two NEW_TOKEN frames on every connection whose path it
-        // validated, and a client that keeps them -- quinn's own default token
-        // store does -- comes back already validated and evicts without a
-        // Retry. What pays the extra round trip is an address this server
-        // holds no token from: a first contact, a token past its two-week
-        // lifetime, or one sealed by a key this process no longer has, since
+        // validated, and a client that keeps them (quinn's own default token
+        // store does) comes back already validated and evicts without a
+        // Retry. The extra round trip falls on an address this server holds
+        // no token from: a first contact, a token past its two-week lifetime,
+        // or one sealed by a key this process no longer has, since
         // `ServerConfig::with_crypto` draws a fresh one every time
-        // `server_config` builds a config -- at startup and again on every
+        // `server_config` builds a config, at startup and again on every
         // `SIGHUP`. And it is paid only while the server is full: below the
         // cap this branch is not entered at all, so an ordinary Surge
         // handshake is untouched.
@@ -539,10 +536,10 @@ impl Server {
                         );
                         return None;
                     }
-                    // Unreachable as quinn stands -- it documents
-                    // `may_retry()` as guaranteed true whenever the address is
-                    // unvalidated -- and handled rather than unwrapped because
-                    // the fallback is the safe one either way.
+                    // Unreachable as quinn stands: it documents `may_retry()`
+                    // as guaranteed true whenever the address is unvalidated.
+                    // Handled rather than unwrapped because the fallback is
+                    // the safe one either way.
                     //
                     //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
                     //# In response to processing an Initial packet
@@ -571,14 +568,14 @@ impl Server {
         // that has never had a request pass the credentials check is not owed
         // the slot it is sitting on, and a peer that completes a handshake a
         // second and never authenticates would otherwise hold every slot there
-        // is for as long as it cared to -- each one bounded, all of them
-        // replaced (audit 2026-08-23).
+        // is for as long as it wanted. Each one is bounded, but each one that
+        // ends is replaced.
         for victim in self.roster.evict_until_below(ceiling) {
             // DEBUG, not INFO: this fires once per arrival for as long as a
             // flood lasts, which is exactly the shape the refusal beside it is
-            // DEBUG for. The victim's own closing line stays at INFO -- that
-            // one is once per connection actually lost, and it is what an
-            // operator is looking for.
+            // DEBUG for. The victim's own closing line stays at INFO: that one
+            // is once per connection actually lost, and it is what an operator
+            // is looking for.
             debug!(
                 evicted = %victim,
                 %remote,
@@ -652,15 +649,15 @@ impl Server {
     /// # The handshake deadline
     ///
     /// The `max_connections` slot is taken by the roster registration below,
-    /// before the QUIC and TLS handshake this starts with has happened — so the
+    /// before the QUIC and TLS handshake this starts with has happened. So the
     /// cap counts handshakes in progress as well as connections, and something
     /// has to bound the first of those. quinn has no handshake-specific timer: its idle
     /// timeout is reset by any authenticated packet in any packet number space,
     /// so a peer that sends an Initial-space PING every `max_idle_timeout` and
     /// never completes the handshake holds a slot for as long as it likes, and
     /// makes this endpoint retransmit its handshake flight on every PTO
-    /// meanwhile (review M6). `Connection::handshake`'s deadline is no help
-    /// either: it starts one layer later, once there is a connection at all.
+    /// meanwhile. `Connection::handshake`'s deadline does not help either: it
+    /// starts one layer later, once there is a connection at all.
     ///
     /// One idle timeout bounds it, for the same reason it bounds the HTTP/3
     /// handshake: a peer that cannot finish a handshake in the time it is
@@ -677,8 +674,8 @@ impl Server {
     /// Dropping a `Connecting` closes the connection the way an application
     /// close does, and RFC 9000 §10.2.3 has an application close sent before the
     /// handshake completes go out as a transport one, so what the peer receives
-    /// is `CONNECTION_CLOSE` with APPLICATION_ERROR and an empty reason — not
-    /// the CONNECTION_REFUSED that `Incoming::refuse` sends, and not silence.
+    /// is `CONNECTION_CLOSE` with APPLICATION_ERROR and an empty reason. That is
+    /// not the CONNECTION_REFUSED that `Incoming::refuse` sends, and not silence.
     ///
     /// # Eviction
     ///
@@ -688,8 +685,8 @@ impl Server {
     /// in, its work is dropped. Before the handshake completes that is the
     /// `Connecting` close described above; after it, dropping `conn::handle`'s
     /// future drops the HTTP/3 connection, whose own `Drop` closes the QUIC
-    /// connection with H3_NO_ERROR — nothing went wrong, the slot was simply
-    /// owed to somebody else.
+    /// connection with H3_NO_ERROR. Nothing went wrong; the slot was owed to
+    /// somebody else.
     fn serve(&self, incoming: quinn::Incoming) -> impl std::future::Future<Output = ()> + use<> {
         let remote = incoming.remote_address();
 
@@ -719,7 +716,7 @@ impl Server {
             let quic = tokio::select! {
                 () = evicted.notified() => {
                     // Dropping the half-built connection ends it, exactly as
-                    // letting the deadline below lapse does -- with the
+                    // letting the deadline below lapse does, with the
                     // `CONNECTION_CLOSE(APPLICATION_ERROR)` and empty reason
                     // this function's documentation describes, since the
                     // `Incoming` was accepted before either arm could run.
@@ -741,9 +738,9 @@ impl Server {
                         //
                         // Through `peer_error` because a peer that closes during
                         // the handshake writes the reason phrase inside this
-                        // error, and `Display` escapes nothing: the connection
-                        // that completed has the same door, and both call the
-                        // one name.
+                        // error, and `Display` escapes nothing. An established
+                        // connection has the same exposure, and both use the
+                        // same function.
                         debug!(
                             %remote,
                             error = %crate::logfmt::peer_error(error),
@@ -778,10 +775,10 @@ impl Server {
 
             // `conn::handle` consumes the connection; keep a handle so the close
             // logs can report what the connection learned about its path: the
-            // RTT it measured, the address the peer ended on — `remote_now`
-            // differing from `remote` is the only externally visible trace of a
-            // migration or NAT rebind during the connection's life — and the
-            // MTU.
+            // RTT it measured, the address the peer ended on, and the MTU.
+            // `remote_now` differing from `remote` is the only externally
+            // visible trace of a migration or NAT rebind during the
+            // connection's life.
             let rtt_probe = quic.clone();
 
             // Created here rather than inside the connection so they survive
@@ -798,8 +795,8 @@ impl Server {
             // H3_NO_ERROR; quinn's close path then unconditionally overwrites
             // the stored reason with `LocallyClosed`. So by the time control is
             // back here, `close_reason()` reports that drop rather than whatever
-            // actually ended the connection — which is precisely how the idle
-            // timeout ended up logged as an error for a whole release cycle.
+            // actually ended the connection, and an idle timeout would be
+            // logged as an error.
             let closed = tokio::select! {
                 // The newcomer that took this slot is already being served; all
                 // that is left here is to stop. Graded with the idle endings
@@ -837,9 +834,9 @@ impl Server {
     /// Winds the endpoint down: no new connections, then a bounded wait, then
     /// close regardless.
     ///
-    /// The GOAWAY frames are not sent from here — every connection is watching the
-    /// same signal and sends its own, which is what lets a connection start
-    /// draining the instant the signal fires rather than waiting to be told.
+    /// The GOAWAY frames are not sent from here. Every connection watches the
+    /// same signal and sends its own, so a connection starts draining the
+    /// instant the signal fires rather than waiting to be told.
     async fn drain(&self, connections: &mut JoinSet<()>) {
         // Stop new handshakes at the source. Packets for existing connections are
         // unaffected; a client that arrives now sees the port as closed and can
@@ -913,10 +910,9 @@ impl Server {
 ///
 /// Written here rather than at the end of [`Server::serve`] so the two field
 /// lists cannot drift apart. They carry the same eleven fields and differ in
-/// two, `log_id` and `reason` against `error`, which is what makes an operator
-/// able to grep one journal for both -- and what a second copy of a list this
-/// long invites losing, as D72's traffic counters would have been had they
-/// landed on only one of them.
+/// two, `log_id` and `reason` against `error`, which lets an operator grep one
+/// journal for both. With a second copy of a list this long, a new field such
+/// as D72's traffic counters could land on only one of them.
 ///
 /// `closed` is graded from the error *value* rather than from
 /// `Connection::close_reason()`, for the reason [`Server::serve`] gives where it
@@ -924,30 +920,29 @@ impl Server {
 ///
 /// # What the fields report
 ///
-/// `mtu` is the packet size DPLPMTUD settled on in this direction — a report,
-/// not a knob: it is here so an operator can see whether discovery ever got
-/// past `initial_mtu` on their path. On a connection that lived long enough to
-/// probe, a value still at the floor means the probes went unanswered (the
-/// shape a path that black-holes large packets has) or a black hole was
-/// detected later and discovery fell back; anything above it is discovery
-/// having done its job.
+/// `mtu` is the packet size DPLPMTUD settled on in this direction. It is a
+/// report, not a setting: it is here so an operator can see whether discovery
+/// ever got past `initial_mtu` on their path. On a connection that lived long
+/// enough to probe, a value still at the floor means the probes went
+/// unanswered (the shape a path that black-holes large packets has) or a black
+/// hole was detected later and discovery fell back. Anything above it means
+/// discovery worked.
 ///
 /// `mtu_black_holes` counts how often quinn's black-hole detector fired and
-/// pushed the packet size back to the floor for its cooldown. It is what tells
-/// those two apart when `mtu` alone cannot: discovery may have climbed back by
-/// the time the connection ends, hiding a fall-back that a bulk transfer in the
-/// middle paid for. quinn's detector is a heuristic over loss bursts, and a
-/// burst of full-size packets lost to ordinary congestion looks the same to it
-/// as a path that stopped carrying them, so a non-zero count on a path that
-/// other connections probe fine is the signature of a false positive rather
-/// than of the path.
+/// pushed the packet size back to the floor for its cooldown. It tells those
+/// two apart when `mtu` alone cannot: discovery may have climbed back by the
+/// time the connection ends, hiding a fall-back that cost a bulk transfer in
+/// the middle. quinn's detector is a heuristic over loss bursts, and a burst of
+/// full-size packets lost to ordinary congestion looks the same to it as a
+/// path that stopped carrying them. So a non-zero count on a path that other
+/// connections probe fine points to a false positive rather than to the path.
 ///
 /// `tunnels` is how many requests on this connection were granted a tunnel slot
-/// — TCP CONNECT and CONNECT-UDP alike — so a connection that only ever failed
+/// (TCP CONNECT and CONNECT-UDP alike), so a connection that only ever failed
 /// authentication reports zero.
 ///
 /// `dropped_datagrams` is how many inbound HTTP Datagrams the connection's
-/// router dropped instead of delivering — an unknown Context ID, a Quarter
+/// router dropped instead of delivering: an unknown Context ID, a Quarter
 /// Stream ID no session claims, a session whose inbound queue was full, or a
 /// datagram cut short of its Context ID. Each drop is silent where it happens,
 /// because the RFCs ask for exactly that, so this total is the only trace a
@@ -958,7 +953,7 @@ impl Server {
 /// `tx_bytes` and `rx_bytes` are UDP-level byte counts: everything this
 /// endpoint put on or took off the wire for this connection, QUIC and HTTP/3
 /// framing, retransmissions, ACKs and padding included. They are neither tunnel
-/// payload — always smaller — nor bytes the peer acknowledged, since a packet
+/// payload (always smaller) nor bytes the peer acknowledged, since a packet
 /// is counted when it is sent whether or not it arrived, so they answer "how
 /// much did this connection move through this host" and nothing finer.
 /// `sent_packets` and `lost_packets` are reported together because a loss rate
@@ -971,7 +966,7 @@ fn log_connection_closed(
     dropped_datagrams: u64,
 ) {
     // One snapshot for every transport field below, so they all describe the
-    // same instant — and the only read of them there is, so the counters cost
+    // same instant. It is also the only read of them, so the counters cost
     // nothing while the connection runs.
     let stats = quic.stats();
     let path = stats.path;

@@ -23,9 +23,9 @@ use super::transport::transport_config;
 /// Builds the quinn server configuration: TLS identity plus transport parameters.
 ///
 /// Shared by [`Server::bind`] and [`ReloadHandle::reload`] so the two cannot drift
-/// — a reload that quietly dropped the stream limit or the keep-alive would be a
-/// miserable bug to find, since everything would work until the connection went
-/// idle behind a relay. It is also what makes every value below reloadable: a
+/// apart. A reload that quietly dropped the stream limit or the keep-alive would
+/// be hard to find, since everything would work until the connection went idle
+/// behind a relay. It is also what makes every value below reloadable: a
 /// `SIGHUP` rebuilds this, writes it to the slot [`Server::accept_under_the_swap`]
 /// reads and hands a copy to `Endpoint::set_server_config`, so the new numbers
 /// apply to every connection this process accepts from then on.
@@ -39,9 +39,8 @@ use super::transport::transport_config;
 /// [`Config`] on one side of a reload (D22).
 ///
 /// Connections already open keep the transport parameters they negotiated at
-/// handshake time — QUIC has no
-/// way to renegotiate them mid-connection, so this is a property of the protocol
-/// rather than a shortcut.
+/// handshake time. QUIC has no way to renegotiate them mid-connection, so this
+/// is a property of the protocol rather than a shortcut.
 pub(super) fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
     let crypto = tls::server_crypto(config)?;
     let quic_crypto = QuicServerConfig::try_from(crypto)
@@ -57,7 +56,7 @@ pub(super) fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
 ///
 /// A plain `RwLock` rather than anything fancier: it is read once per accepted
 /// connection and written once per `SIGHUP`, and the guard is never held across an
-/// await — only long enough to clone the `Arc`.
+/// await, only long enough to clone the `Arc`.
 pub(super) type LiveConfig = Arc<RwLock<Arc<Config>>>;
 
 /// The `quinn::ServerConfig` a new connection is accepted with.
@@ -98,7 +97,7 @@ pub(super) type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
 /// writes, `drain` across its own `set_server_config(None)`, and
 /// [`Server::accept_under_the_swap`] across the pair of reads that decide what
 /// one new connection runs on. The third closes the second race rather than
-/// narrowing it, because both of those reads are now reads this process makes.
+/// narrowing it, because both of those reads are reads this process makes.
 /// The first is the live [`Config`]. The second is [`LiveQuicConfig`], which
 /// `Incoming::accept_with` then uses in place of the copy quinn-proto 0.11.x
 /// pinned to the connection when its first Initial arrived. Nothing about the
@@ -133,10 +132,10 @@ impl ConfigSwap {
 /// Replaces the configuration of a running server.
 ///
 /// The point of this type is a guarantee: a `SIGHUP` with a broken configuration
-/// file — a typo, a half-written certificate mid-renewal — must leave the server
+/// file (a typo, a half-written certificate mid-renewal) must leave the server
 /// running exactly as it was. A proxy that exits when handed a bad config would
-/// turn a typo into an outage, and `certbot --deploy-hook` will send `SIGHUP` at
-/// three in the morning with nobody watching.
+/// turn a typo into an outage, and `certbot --deploy-hook` sends `SIGHUP` with
+/// nobody watching.
 ///
 /// So nothing is applied until everything has been parsed and validated: the file
 /// is read, the new certificate and key are loaded, and only then is anything
@@ -187,7 +186,7 @@ impl ReloadHandle {
     /// Re-reads the configuration file and applies it, or changes nothing.
     ///
     /// Returns the newly applied configuration, or an error describing why the old
-    /// one is still in force. Existing connections are deliberately unaffected —
+    /// one is still in force. Existing connections are deliberately unaffected:
     /// they keep the configuration they were accepted with (see `Server::serve`).
     pub fn reload(&self, path: &Path) -> Result<Arc<Config>> {
         // Parses, validates, and checks that the certificate files are readable.
@@ -201,7 +200,7 @@ impl ReloadHandle {
         // Rendered before the guard is taken, because it opens and parses
         // `server.cert` a second time (see `Config::warnings`), and the guard
         // is the one `Server::accept_under_the_swap` takes for every connection
-        // it accepts. The strings are logged after the swap, where they were.
+        // it accepts. The strings are logged after the swap.
         let warnings = config.warnings();
 
         // One value, two homes. `Server::accept_under_the_swap` reads the slot
@@ -242,18 +241,16 @@ impl ReloadHandle {
         // while the endpoint still holds the old certificate, which is a
         // handshake that gets as far as the TLS layer and is refused there. The
         // other order would have the endpoint present the new certificate to a
-        // name the socket still drops, which is the same refusal with the reply
-        // removed -- and the gate's whole point is that a name it does not know
-        // gets no reply at all.
+        // name the socket still drops, which is the same refusal without the
+        // reply. The gate exists so that a name it does not know gets no reply
+        // at all.
         //
-        // The live `Config` goes before the slot for a second reason, now that
+        // No connection depends on the order of the live `Config` and the slot:
         // `Server::accept_under_the_swap` takes this lock across both of the
-        // reads a new connection makes: an accept can no longer land between the
-        // two at all, so the order of these two is what a reader of this
-        // function should be able to follow rather than what a connection
-        // depends on. New users before new transport parameters is the order the
-        // sentence above describes for the gate, read the same way: the half
-        // that decides who gets in goes first.
+        // reads a new connection makes, so an accept cannot land between the
+        // two writes. New users go before new transport parameters so the order
+        // reads the same way as the gate's: the half that decides who gets in
+        // goes first.
         //
         // Two of the four writes are read in the endpoint driver, which never
         // takes the swap: `Gate::poll_recv` reads the gate's list on every
@@ -286,13 +283,12 @@ impl ReloadHandle {
             "configuration reloaded; new connections will use it"
         );
 
-        // Said rather than done. A reload never rebinds -- `docs/configuration.md`
+        // Said rather than done. A reload never rebinds: `docs/configuration.md`
         // and `docs/deployment.md` both promise that, because the usual sender of
-        // SIGHUP is a renewal hook that rewrites the whole file and a rebind
-        // would take the proxy off the air over a key nobody meant to change.
-        // What was missing was the operator being told: the rest of the file
-        // applied, this one key silently did not, and until now the only way to
-        // find out was to notice the socket had not moved.
+        // SIGHUP is a renewal hook that rewrites the whole file, and a rebind
+        // would take the proxy offline over a key nobody meant to change. This
+        // line tells the operator that the rest of the file applied and this one
+        // key did not.
         if config.server.listen != self.listen {
             warn!(
                 log_id = "amplq5bv",

@@ -2,9 +2,9 @@
 //!
 //! RFC 9298 §7 and RFC 9114 §4.4 both warn about the same thing from different
 //! angles: a proxy that will dial anything is a reflector, a port scanner, and a
-//! way to borrow the proxy's own source address. That last one is the sharpest —
-//! plenty of services trust `127.0.0.1` or a private range without further
-//! authentication, and the proxy is *inside* that perimeter.
+//! way to borrow the proxy's own source address. That last one is the most
+//! serious: plenty of services trust `127.0.0.1` or a private range without
+//! further authentication, and the proxy is *inside* that perimeter.
 //!
 //! So the defaults deny private address space, and the operator can open it with
 //! `security.allow_private_networks` for the deployments where the point of the
@@ -12,7 +12,7 @@
 //!
 //! # Normalization comes first
 //!
-//! `::ffff:127.0.0.1` is loopback wearing an IPv6 hat: the kernel routes it to
+//! `::ffff:127.0.0.1` is loopback written as IPv6: the kernel routes it to
 //! 127.0.0.1, while a naive matcher sees an IPv6 address that matches none of the
 //! IPv4 rules. Every check therefore starts by canonicalizing
 //! ([`canonical`]), and the deprecated `::/96` compatible range is folded in for
@@ -39,8 +39,8 @@
 //!
 //! The well-known NAT64 prefix, 6to4 and Teredo addresses embed an IPv4 address
 //! at a fixed place, and a host that routes them reaches exactly that address.
-//! `64:ff9b::7f00:1` is therefore 127.0.0.1 with three extra steps, and letting
-//! it past because it is syntactically a global IPv6 address would undo the
+//! `64:ff9b::7f00:1` therefore reaches 127.0.0.1, and letting it past
+//! because it is syntactically a global IPv6 address would undo the
 //! whole IPv4 half of this module. `embedded_ipv4` unwraps them before any rule
 //! is applied.
 //!
@@ -119,15 +119,15 @@ impl Policy {
 /// blockers answer a blocked name with the unspecified address rather than with
 /// NXDOMAIN. Those answers are refused by [`Policy::allows_address`] like any
 /// other unroutable target, but the refusal is routine housekeeping rather than
-/// evidence of anything — on a host whose resolver filters, it is the bulk of all
-/// refusals.
+/// evidence of anything. On a host whose resolver filters, it is the bulk of
+/// all refusals.
 ///
 /// Callers use this to decide two things (decision D49). It picks the log level:
 /// a blackhole is an INFO, every other refusal a WARN. And it picks the answer:
 /// a blackholed name gets a 200 whose stream closes immediately, so the client
-/// sees a tunnel that opened and died — the same thing a transport without an
-/// in-band refusal channel shows it — while every other refusal keeps its 403
-/// and its RFC 9209 `destination_ip_prohibited` reason. The split exists because
+/// sees a tunnel that opened and closed at once. That is what a transport
+/// without an in-band refusal channel shows it. Every other refusal keeps its
+/// 403 and its RFC 9209 `destination_ip_prohibited` reason. The split exists because
 /// the blackhole decision was made by the resolver upstream, not by this proxy,
 /// and a refusal from this proxy would misattribute it.
 ///
@@ -210,7 +210,7 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 ///
 /// One entry is here despite having left the registry: `fec0::/10`, the IPv6
 /// site-local prefix RFC 3879 deprecated. New stacks treat it as global unicast,
-/// which is exactly why it is worth denying — a network that numbered its
+/// which is exactly why it is worth denying: a network that numbered its
 /// interior with it before 2004 still routes it, and nothing on the public
 /// internet answers there, so a request for it is either a mistake or a way in.
 ///
@@ -238,7 +238,7 @@ fn is_private(ip: IpAddr) -> bool {
 
             // `is_private` is 10/8, 172.16/12 and 192.168/16; `is_link_local` is
             // 169.254/16.
-            // 0.0.0.0/8 — "this host on this network" (RFC 6890 Table 1, from
+            // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from
             // RFC 1122). Only the all-zero address at the bottom of the block is
             // `is_never_allowed`, and that check runs first; the rest of it is a
             // source address a host uses before it has one, never a destination.
@@ -246,7 +246,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
-                // 100.64.0.0/10 — shared address space (RFC 6598), i.e. the
+                // 100.64.0.0/10, shared address space (RFC 6598), i.e. the
                 // inside of a carrier-grade NAT.
                 || (octets[0] == 100 && octets[1] & 0xc0 == 64)
                 // 192.0.0.0/24, IETF protocol assignments (RFC 6890). Its PCP
@@ -258,14 +258,14 @@ fn is_private(ip: IpAddr) -> bool {
                 // 192.52.193.0/24, AMT relay discovery (RFC 7450). See
                 // `is_amt_relay_discovery` for the IPv6 prefix and the reason.
                 || (octets[0] == 192 && octets[1] == 52 && octets[2] == 193)
-                // 198.18.0.0/15 — benchmarking (RFC 2544).
+                // 198.18.0.0/15, benchmarking (RFC 2544).
                 || (octets[0] == 198 && octets[1] & 0xfe == 18)
-                // 192.88.99.0/24 — 6to4 relay anycast (RFC 6890 Table 10, from
+                // 192.88.99.0/24, 6to4 relay anycast (RFC 6890 Table 10, from
                 // RFC 3068). RFC 7526 deprecated the relays and the registry
                 // kept the entry, so the prefix now reaches whoever still
                 // announces it rather than any relay this proxy meant to use.
                 || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                // 240.0.0.0/4 — reserved (RFC 1112 §4). The broadcast address at
+                // 240.0.0.0/4, reserved (RFC 1112 §4). The broadcast address at
                 // the top of it is already `is_never_allowed`, which runs first.
                 || octets[0] & 0xf0 == 240
                 || is_ipv4_documentation(octets)
@@ -293,7 +293,7 @@ fn is_private(ip: IpAddr) -> bool {
 /// The three IPv4 documentation ranges (RFC 5737).
 ///
 /// Reachable nowhere by definition, and the ranges examples and test fixtures
-/// are written with — so a request for one is a misconfiguration rather than a
+/// are written with, so a request for one is a misconfiguration rather than a
 /// destination, and it should not turn into a connection attempt against
 /// whoever happens to announce them.
 fn is_ipv4_documentation(octets: [u8; 4]) -> bool {
@@ -349,7 +349,7 @@ fn is_amt_relay_discovery(v6: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] == 0x0003
 }
 
-/// `2001:2::/48` — the IPv6 benchmarking range (RFC 6890 Table 24, from
+/// `2001:2::/48` is the IPv6 benchmarking range (RFC 6890 Table 24, from
 /// RFC 5180).
 ///
 /// The IPv6 counterpart of `198.18.0.0/15`, and there for the same reason: it is
@@ -386,7 +386,7 @@ fn is_det(v6: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0030
 }
 
-/// `100::/64` — the discard-only prefix (RFC 6666).
+/// `100::/64` is the discard-only prefix (RFC 6666).
 ///
 /// Traffic to it is meant to be black-holed, which makes it a way to ask this
 /// proxy to open a tunnel that can only ever hold a slot.
@@ -431,15 +431,15 @@ fn is_local_use_nat64(v6: Ipv6Addr) -> bool {
 /// The IPv4 address an IPv6 transition address carries, if it carries one.
 ///
 /// A host that routes any of these reaches the embedded IPv4 address, so this is
-/// what the IPv4 rules must be applied to — otherwise `2002:0a00:0001::` is a
+/// what the IPv4 rules must be applied to. Otherwise `2002:0a00:0001::` is a
 /// route to 10.0.0.1 that `allow_private_networks = false` never sees.
 ///
 /// The three forms that matter here:
 ///
-/// * `64:ff9b::/96` — the well-known NAT64 prefix (RFC 6052 §2.1), with the
+/// * `64:ff9b::/96`: the well-known NAT64 prefix (RFC 6052 §2.1), with the
 ///   address in the last 32 bits;
-/// * `2002::/16` — 6to4 (RFC 3056), with the address at bits 16-47;
-/// * `2001::/32` — Teredo (RFC 4380 §4). The client's own IPv4 address is the
+/// * `2002::/16`: 6to4 (RFC 3056), with the address at bits 16-47;
+/// * `2001::/32`: Teredo (RFC 4380 §4). The client's own IPv4 address is the
 ///   last 32 bits with every bit inverted, which is the one this proxy would
 ///   reach.
 ///
@@ -501,21 +501,21 @@ fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     None
 }
 
-/// `fc00::/7` — unique local addresses (RFC 4193).
+/// `fc00::/7` is the unique local address range (RFC 4193).
 ///
 /// Hand-rolled because `Ipv6Addr::is_unique_local` is still unstable.
 fn is_unique_local(v6: Ipv6Addr) -> bool {
     v6.segments()[0] & 0xfe00 == 0xfc00
 }
 
-/// `fe80::/10` — link-local unicast (RFC 4291 §2.5.6).
+/// `fe80::/10` is link-local unicast (RFC 4291 §2.5.6).
 ///
 /// Hand-rolled because `Ipv6Addr::is_unicast_link_local` is still unstable.
 fn is_unicast_link_local(v6: Ipv6Addr) -> bool {
     v6.segments()[0] & 0xffc0 == 0xfe80
 }
 
-/// `fec0::/10` — the deprecated site-local unicast prefix (RFC 3879).
+/// `fec0::/10` is the deprecated site-local unicast prefix (RFC 3879).
 ///
 /// Adjacent to link-local and, on a network old enough to still use it, just as
 /// internal. Nothing routes it globally, so denying it costs no legitimate
@@ -524,7 +524,7 @@ fn is_site_local(v6: Ipv6Addr) -> bool {
     v6.segments()[0] & 0xffc0 == 0xfec0
 }
 
-/// `::/96` — the deprecated IPv4-compatible range, and `::1` with it.
+/// `::/96` is the deprecated IPv4-compatible range, and `::1` with it.
 ///
 /// Treated as private rather than as ordinary IPv6: stacks that still honour the
 /// range route `::127.0.0.1` to loopback, which would otherwise be a second way
