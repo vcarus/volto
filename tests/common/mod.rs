@@ -1155,6 +1155,36 @@ pub async fn spawn_flooding_udp_target(count: usize, size: usize) -> SocketAddr 
     addr
 }
 
+/// A UDP target that answers the first packet with `count` numbered replies of
+/// `size` bytes, sent from a thread of its own with no await between them.
+///
+/// The replies queue on the proxy's socket faster than a session forwards one
+/// per wake, which is the shape that makes a session take several per wake.
+/// Each reply starts with its index as a big-endian `u32`. The thread waits
+/// [`TIMEOUT`] for the first packet and then ends, so a failed test leaves
+/// nothing behind.
+pub async fn spawn_bursting_udp_target(count: u32, size: usize) -> SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp target");
+    socket
+        .set_read_timeout(Some(TIMEOUT))
+        .expect("udp target read timeout");
+    let addr = socket.local_addr().expect("udp target address");
+
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        let Ok((_, from)) = socket.recv_from(&mut buf) else {
+            return;
+        };
+        let mut reply = vec![0x5au8; size];
+        for index in 0..count {
+            reply[..4].copy_from_slice(&index.to_be_bytes());
+            let _ = socket.send_to(&reply, from);
+        }
+    });
+
+    addr
+}
+
 /// Reads from a client stream until `enough` accepts what has arrived, or until
 /// the server finishes its sending side.
 ///

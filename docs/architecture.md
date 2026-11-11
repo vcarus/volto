@@ -384,7 +384,9 @@ dripping fragments of a capsule that never completes is reclaimed on schedule.
 As on the connection bound above, that clock is read on each pass and not only
 awaited: a peer with another payload always queued — the ones the amplification
 cap drops re-arm nothing, and cost it only bandwidth — kept the session's wait
-finishing on its own and the deadline was never measured against it. Closing the
+finishing on its own and the deadline was never measured against it. One pass
+forwards up to 32 packets or payloads that one source already has ready, so the
+other sources and the clock are read again at least once per 32. Closing the
 socket must also close the request stream.
 
 ## Datagram routing

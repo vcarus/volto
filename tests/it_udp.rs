@@ -11,9 +11,9 @@ use common::rawstream::{H3_DATAGRAM_ERROR, H3_NO_ERROR, H3_REQUEST_CANCELLED};
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
     closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
-    send_udp_payload, spawn_flooding_udp_target, spawn_large_reply_udp_target,
-    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
-    spawn_udp_echo_target, udp_round_trip, windowless_transport,
+    send_udp_payload, spawn_bursting_udp_target, spawn_flooding_udp_target,
+    spawn_large_reply_udp_target, spawn_pushing_udp_target, spawn_silent_udp_target,
+    spawn_tagged_udp_target, spawn_udp_echo_target, udp_round_trip, windowless_transport,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -232,6 +232,72 @@ async fn a_datagram_flood_at_a_live_session_is_survived() {
     assert!(
         client.quic.close_reason().is_none(),
         "a flood is met with drops, never with a close"
+    );
+}
+
+/// Packets a target sends back to back all reach the client, in order.
+///
+/// The session takes up to 32 packets that are already readable per wake
+/// rather than one, so this is the shape that exercises the bursts: a hundred
+/// numbered replies to one request, sent from a thread with nothing between
+/// them, so they queue on the proxy's socket.
+#[tokio::test]
+async fn packets_a_target_sends_back_to_back_all_reach_the_client_in_order() {
+    const REPLIES: u32 = 100;
+
+    let server = TestServer::start().await;
+    let target = spawn_bursting_udp_target(REPLIES, 200).await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
+    send_udp_payload(&client.quic, qsid, b"go");
+
+    for nth in 0..REPLIES {
+        let decoded = common::recv_datagram(&client.quic).await;
+        assert_eq!(decoded.quarter_stream_id, qsid);
+        assert_eq!(decoded.payload.len(), 200, "reply {nth} arrived whole");
+        assert_eq!(
+            decoded.payload[..4],
+            nth.to_be_bytes(),
+            "reply {nth} out of order or lost"
+        );
+    }
+}
+
+/// Payloads a client sends back to back all reach the target, in order.
+///
+/// The mirror of the test above: the session forwards up to 32 payloads that
+/// are already queued per wake. Fewer than the 64 the inbound queue holds and
+/// the default unanswered budget allows, so none of them may be dropped, and
+/// numbered, so the echoes show the order the target saw.
+#[tokio::test]
+async fn payloads_a_client_sends_back_to_back_all_reach_the_target_in_order() {
+    const PAYLOADS: u8 = 48;
+
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
+    for nth in 0..PAYLOADS {
+        send_udp_payload(&client.quic, qsid, &[b'n', nth]);
+    }
+
+    for nth in 0..PAYLOADS {
+        let decoded = common::recv_datagram(&client.quic).await;
+        assert_eq!(decoded.quarter_stream_id, qsid);
+        assert_eq!(
+            &decoded.payload[..],
+            &[b'n', nth],
+            "echo {nth} out of order or lost"
+        );
+    }
+
+    // A burst ends when a source has nothing more ready, and that is not the
+    // end of the session.
+    assert_eq!(
+        &udp_round_trip(&client, qsid, b"still open").await[..],
+        b"still open"
     );
 }
 
