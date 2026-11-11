@@ -7,10 +7,9 @@
 //! ```
 //!
 //! The **Quarter Stream ID** is the request stream's id divided by four
-//! (RFC 9297 §2.1) — not the stream id itself. Getting this wrong is the failure
-//! mode that makes every UDP session after the first on a connection misroute,
-//! which is exactly the `h3-datagram` 0.0.2 bug this crate avoids by encoding
-//! datagrams here instead. The unit tests below pin the relationship.
+//! (RFC 9297 §2.1), not the stream id itself. Getting this wrong makes every
+//! UDP session after the first on a connection misroute. The unit tests below
+//! pin the relationship.
 //!
 //! For CONNECT-UDP the Context ID is 0, meaning "the payload is a raw UDP
 //! datagram" (RFC 9298 §4).
@@ -58,9 +57,9 @@ impl DecodeError {
     /// value above 2^60-1, and one "whose payload is too short to allow parsing
     /// the Quarter Stream ID field", must each "be treated as an HTTP/3
     /// connection error of type H3_DATAGRAM_ERROR (0x33)". Both are quoted
-    /// verbatim, with their machine-readable anchors, where they are acted on --
-    /// `h3::connection::route_datagram` -- and this is the pointer to them
-    /// rather than a second copy (D79).
+    /// verbatim, with their machine-readable anchors, where they are acted on,
+    /// in `h3::connection::route_datagram`. This is the pointer to them rather
+    /// than a second copy (D79).
     ///
     /// A truncated Context ID is deliberately *not* one of them. Nothing in
     /// RFC 9298 §5 says what to do with it, so dropping the datagram is

@@ -41,32 +41,26 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// mid-sentence. Two details make that work:
 ///
 /// * dropping the HTTP/3 connection closes the QUIC connection, so returning
-///   early would kill the very tunnels being drained — the loop has to stay;
+///   early would end the tunnels being drained. The loop has to stay.
 /// * `accept()` cannot report the end of the drain: a client GOAWAY says nothing
 ///   about the requests already in flight, so [`crate::h3api::Connection::accept`]
-///   never reports one. The connection going idle is the signal instead —
+///   never reports one. The connection going idle is the signal instead:
 ///   [`crate::tunnel::Quota::is_busy`], which counts accepted requests as well as
-///   open tunnels. Both halves are needed: a request stream is accepted the
-///   moment the peer opens it and does not take a tunnel slot until its headers
-///   have arrived and its credentials have been checked, so a drain that watched
-///   only the tunnel count reported "nothing left to do" while a request below
-///   the GOAWAY identifier was still being read. RFC 9114 §5.2 tells the peer
-///   such requests "might have been processed" and leaves a server the choice
-///   of rejecting them individually (REQUEST_REJECTED, §4.1.1, so the client
-///   knows to retry); this server's choice is to serve them, and closing the
-///   connection mid-request is neither.
+///   open tunnels. Both halves are needed, because a request stream does not
+///   take a tunnel slot until its headers have arrived and its credentials have
+///   been checked. RFC 9114 §5.2 tells the peer such requests "might have been
+///   processed" and leaves a server the choice of rejecting them individually
+///   (REQUEST_REJECTED, §4.1.1, so the client knows to retry). This server's
+///   choice is to serve them, and closing the connection mid-request is
+///   neither.
 ///
 /// The wait for the tunnels is deliberately unbounded here: the grace period
 /// belongs to the endpoint ([`crate::quic`]), which closes everything when it
 /// expires. Bounding it in both places would mean two timeouts to keep
 /// consistent.
 ///
-/// Sending the GOAWAY is a different matter and is bounded, because it is a
-/// write and the peer decides when a write completes: the control stream
-/// carries the peer's flow control, and this one sits in the same `select!` as
-/// the drain, so a peer granting no window used to park the drain behind it for
-/// the whole grace period. A frame that cannot be sent within one idle timeout
-/// is given up on and the connection drains without it.
+/// Sending the GOAWAY is bounded, because it is a write and the peer decides
+/// when a write completes; see `announce_goaway`.
 ///
 /// # The unauthenticated bound
 ///
@@ -80,17 +74,17 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// authenticates the bound is gone for the life of the connection.
 ///
 /// The deadline is absolute rather than rearmed on each wait, which is the
-/// difference between bounding a connection and bounding a pause in it: a
-/// request stream is accepted the moment the peer opens it, so a peer that
-/// opened one every other idle timeout — a byte apiece, never a request, never
-/// a credential — used to reset the timer for ever and hold the slot anyway
-/// (review C1'). Nothing legitimate is near it: a client that has just
-/// completed two handshakes sends its first request within a round trip.
+/// difference between bounding a connection and bounding a pause in it. A
+/// request stream is accepted the moment the peer opens it, so with a rearmed
+/// timer a peer that opened one every other idle timeout (a byte apiece, never
+/// a request, never a credential) would hold the slot for ever. Nothing
+/// legitimate is near the deadline: a client that has just completed two
+/// handshakes sends its first request within a round trip.
 ///
-/// The deadline bounds how long such a connection may last; what bounds how
-/// much of this server it may occupy while it does is a second, transport-level
-/// clamp on its request streams (`quic::INITIAL_BIDI_STREAMS`), lifted by the
-/// same request that lifts this one.
+/// The deadline bounds how long such a connection may last. How much of this
+/// server it may occupy meanwhile is bounded by a second, transport-level clamp
+/// on its request streams (`quic::INITIAL_BIDI_STREAMS`), lifted by the same
+/// request that lifts this one.
 ///
 /// `resolver` is the server's blocking-pool allowance; the connection takes its
 /// own view of it here, which is what bounds the threads its name lookups can
@@ -99,8 +93,8 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
 /// reason `tunnels` does: the accept loop reads it after this has been handed
 /// the connection, to decide which connection loses its slot when the server is
-/// full. `dropped_datagrams` belongs there too — it is read for the closing
-/// line, at the same moment `tunnels` is — and is handed on to the HTTP/3
+/// full. `dropped_datagrams` belongs there too, because it is read for the
+/// closing line at the same moment `tunnels` is. It is handed on to the HTTP/3
 /// connection, whose datagram router is the thing that drops.
 pub async fn handle(
     quic: quinn::Connection,
@@ -115,12 +109,12 @@ pub async fn handle(
     // context needs the connection itself, not only its datagram half: a UDP
     // session sends datagrams on it and asks it per packet how large one may be
     // and how far behind the send queue is, and the first authenticated
-    // request raises its stream allowance (D98).
-    // Inbound datagrams are not among those uses -- they are routed by the
-    // HTTP/3 connection to the request stream that claimed them (D79).
+    // request raises its stream allowance (D98). Inbound datagrams are not
+    // among those uses: they are routed by the HTTP/3 connection to the request
+    // stream that claimed them (D79).
     let for_context = quic.clone();
 
-    // One idle timeout for the whole HTTP/3 handshake -- the same value
+    // One idle timeout for the whole HTTP/3 handshake, the same value
     // `quic/transport.rs` puts in this connection's transport parameters. Why a
     // handshake needs a deadline of its own is on
     // `h3api::Connection::handshake`.
@@ -130,7 +124,7 @@ pub async fn handle(
 
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
-    // what the copy cost.
+    // why.
     let context = Arc::new(Context::new(
         &config,
         for_context,
@@ -180,11 +174,9 @@ pub async fn handle(
                     // spawn: what it records is that this connection has
                     // accepted a request, which is true from this line on
                     // whether or not the task has been polled yet. Held for the
-                    // task's whole life, so the drain below cannot mistake a
-                    // request whose headers are still arriving -- one this
-                    // server means to serve, per the GOAWAY identifier above it
-                    // (RFC 9114 §5.2) -- for a connection with nothing left to
-                    // do.
+                    // task's whole life, so the drain cannot mistake a request
+                    // whose headers are still arriving for a connection with
+                    // nothing left to do (see [`crate::tunnel::Pending`]).
                     let pending = context.quota.enter();
                     let context = Arc::clone(&context);
                     tokio::spawn(async move {
@@ -230,17 +222,16 @@ pub async fn handle(
 /// peer that is merely gone.
 ///
 /// Two therefore separates them: a peer that stops sending is closed by the
-/// transport, exactly as before, and this bound acts only on the peers the
-/// transport cannot see as idle at all -- one whose stack is answering our
-/// keep-alive PINGs, or one sending packets of its own. The cost of the factor
-/// is that such a peer holds its slot for two idle timeouts rather than one,
-/// which is bounded either way.
+/// transport, and this bound acts only on the peers the transport cannot see as
+/// idle at all: one whose stack is answering our keep-alive PINGs, or one
+/// sending packets of its own. The cost of the factor is that such a peer holds
+/// its slot for two idle timeouts rather than one, which is bounded either way.
 ///
 /// Visible to the crate because [`crate::config`]'s test for D86 multiplies by
 /// it: the ceiling on `max_idle_timeout` is what keeps `Instant::now() + idle *
 /// this` inside what the arithmetic can take, and a ceiling pinned against a
 /// copy of the factor would stop meaning anything the day the factor moved.
-/// `validate` itself never multiplies -- it compares against the ceiling
+/// `validate` itself never multiplies. It compares against the ceiling
 /// constant, and this is the number that ceiling was chosen for.
 pub(crate) const SILENCE_FACTOR: u32 = 2;
 
@@ -255,16 +246,13 @@ enum Drain {
 /// Tells the peer this connection is going away, and reports whether anything
 /// is left to drain.
 ///
-/// Split out of the accept loop's `select!` arm, where it was the only branch
-/// that could end the connection two ways.
-///
 /// The GOAWAY write is bounded like every other write that depends on the peer
-/// taking it ([`h3api::Stream::respond_within`]): the control stream applies
+/// taking it ([`h3api::Stream::respond_within`]). The control stream applies
 /// the peer's flow control, and this runs inside the loop that drains the
-/// connection, so a peer granting no window parks the drain with it -- the
-/// accept arm never polled again, the connection never reported finished, and
-/// the whole process waiting out `server.shutdown_grace` for one peer that is
-/// under no obligation to read anything (adversarial pass 2026-08-29).
+/// connection, so a peer granting no window would park the drain with it. The
+/// accept arm would never be polled again, the connection would never report
+/// finished, and the whole process would wait out `server.shutdown_grace` for
+/// one peer that is under no obligation to read anything.
 async fn announce_goaway(
     connection: &mut h3api::Connection,
     context: &Context,
@@ -304,10 +292,7 @@ async fn announce_goaway(
 
     // Not `live == 0`: a request accepted before the signal whose headers are
     // still arriving holds no tunnel slot yet, and it is below the identifier
-    // this GOAWAY just published -- one the peer was told "might have been
-    // processed" (RFC 9114 §5.2). This server serves those rather than
-    // rejecting them individually, and reading only the tunnel count closed the
-    // connection out from under it instead (adversarial pass 2026-08-30).
+    // this GOAWAY just published. See [`crate::tunnel::Quota::is_busy`].
     if context.quota.is_busy() {
         Drain::Pending
     } else {
@@ -357,20 +342,20 @@ impl From<Result<Option<h3api::Resolver>, h3api::ConnectionError>> for NextReque
 /// value without ever consulting the clock, so a lapsed deadline is only noticed
 /// on a poll where nothing was ready. [`h3api::Connection::accept`] is ready the
 /// moment the peer has opened a stream, and a peer may always have another one
-/// queued: with `max_streams_bidi` raised, one that opens a request stream and
-/// finishes it empty -- a stream error apiece, so the connection survives every
-/// one and the allowance comes straight back -- kept the loop supplied
-/// indefinitely and was never measured against the deadline at all. D76 made the
-/// deadline absolute so that it could not be *rearmed*; this is what stops it
-/// being stepped over (adversarial pass 2026-08-29).
+/// queued. With `max_streams_bidi` raised, a peer that opens request streams
+/// and finishes each one empty (a stream error apiece, so the connection
+/// survives every one and the allowance comes straight back) can keep the loop
+/// supplied indefinitely, and the deadline is then never measured. D76 made the
+/// deadline absolute so that it could not be *rearmed*; this stops it being
+/// skipped.
 ///
-/// A peer under the pre-authentication clamp (`quic::INITIAL_BIDI_STREAMS`) can
-/// no longer keep a supply of that depth: the configured allowance does not
-/// reach it at all, and sixteen streams' worth of credit comes back three at a
-/// time. That makes this the second line rather than the first, and it stays,
-/// because hard to reach is not the same as unreachable -- the clamp is lifted
-/// by authentication and the deadline exists only until authentication, so
-/// neither can be the other's proof.
+/// A peer under the pre-authentication clamp (`quic::INITIAL_BIDI_STREAMS`)
+/// cannot keep a supply of that depth: the configured allowance does not reach
+/// it at all, and sixteen streams' worth of credit comes back three at a time.
+/// That makes this the second defence rather than the first. It stays, because
+/// hard to reach is not unreachable: the clamp is lifted by authentication and
+/// the deadline exists only until authentication, so neither can stand in for
+/// the other.
 ///
 /// So the clock is read before each wait. The cost is one `Instant::now()` per
 /// accepted stream, and only while the connection has yet to authenticate.
@@ -385,8 +370,8 @@ async fn next_request(
         }
 
         // The verdict, and the only place it is reached. The authentication
-        // flag has just been read above, so this races a request that is
-        // authenticating exactly as the wait below used to.
+        // flag has just been read above, so a request that is authenticating
+        // can race this only in the moment between that read and this one.
         if tokio::time::Instant::now() >= deadline {
             return NextRequest::Silent;
         }
@@ -394,8 +379,8 @@ async fn next_request(
         match tokio::time::timeout_at(deadline, connection.accept()).await {
             Ok(accepted) => return accepted.into(),
             // Back round the loop rather than deciding here: the next pass
-            // re-reads the authentication flag -- a request may have
-            // authenticated while this waited -- and then the clock, which has
+            // re-reads the authentication flag, because a request may have
+            // authenticated while this waited, and then the clock, which has
             // just reached the deadline. Deciding in this arm as well would be
             // a second copy of that judgement to keep in step.
             Err(_elapsed) => continue,
@@ -426,10 +411,10 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     // Before authentication, before the quota, before routing: RFC 9114 §4.2
     // makes a message carrying a connection-specific field malformed, and that
     // is a judgement about the message rather than about who sent it or what it
-    // asks for. The other half of the same sentence -- the `Connection` field
-    // itself -- is refused in the codec, which is earlier still, so judging this
-    // half after the credentials check made one MUST answer 407 to an
-    // unauthenticated peer and 400 to an authenticated one (review M4).
+    // asks for. The other half of the same sentence, the `Connection` field
+    // itself, is refused in the codec, which is earlier still. Judging this
+    // half after the credentials check would answer one MUST with 407 to an
+    // unauthenticated peer and 400 to an authenticated one.
     if let Some(field) = tunnel::connection_specific_field(&req) {
         debug!(
             stream_id,
@@ -444,9 +429,9 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     // name is every value that answers for. A request carrying more is asking
     // this server to run the constant-time comparison once per value and to
     // answer one 407 for all of them, which is a batch of guesses at the price
-    // of a single failure (audit M1, D76 addendum of 2026-09-04). It is a
-    // judgement about the message rather than about who sent it, so it is a 400
-    // like the field check above it.
+    // of a single failure (D76 addendum of 2026-09-04). It is a judgement about
+    // the message rather than about who sent it, so it is a 400 like the field
+    // check above it.
     let offered = auth::credential_values(&req.fields);
     if offered > auth::MAX_CREDENTIAL_VALUES {
         debug!(
@@ -461,26 +446,26 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
 
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
-    // every CONNECT — TCP or UDP — has to pass through here.
+    // every CONNECT, TCP or UDP, has to pass through here.
     match context.auth.authenticate(&req.fields) {
         Ok(Some(username)) => {
             // Lifts D76's bound for the rest of this connection's life: the peer
             // has proved who it is, and may now hold the connection idle for as
-            // long as the transport allows -- and, on the first request to get
-            // here, raises the connection's request-stream allowance from the
-            // handshake's clamp to the configured one. Both are the same door,
-            // so both are opened in one place. `false` means an eviction claimed
-            // the connection first: the accept loop is already closing it, and
-            // the request must not be routed or answered.
+            // long as the transport allows. On the first request to get here it
+            // also raises the connection's request-stream allowance from the
+            // handshake's clamp to the configured one. Both follow from the same
+            // check, so both are done in one place. `false` means an eviction
+            // claimed the connection first: the accept loop is already closing
+            // it, and the request must not be routed or answered.
             if !context.mark_authenticated(Some(username)) {
                 return;
             }
             debug!(stream_id, username, "request authenticated");
         }
         // No users configured: an open proxy, as warned about at startup. There
-        // is no door to get past, so the first request past this point counts as
-        // having got past it -- otherwise every connection to an unauthenticated
-        // proxy would be living under D76's bound, tunnels and all.
+        // is no check to pass, so the first request past this point counts as
+        // having passed it. Otherwise every connection to an unauthenticated
+        // proxy would live under D76's bound, tunnels and all.
         Ok(None) => {
             if !context.mark_authenticated(None) {
                 return;
@@ -504,28 +489,28 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
                 // peer's, and tracing prints a `str` field quoted and escaped, so
                 // a newline or a terminal escape in a guessed user-id cannot
                 // forge a journal line. See `logfmt`'s third rule. Their number
-                // is the peer's too -- a user-id is whatever it put before the
-                // first colon of a field section -- and `auth` has already cut
-                // it to what a log line can carry (review H3).
+                // is the peer's too, since a user-id is whatever it put before
+                // the first colon of a field section, and `auth` has already
+                // cut it to what a log line can carry.
                 username = denied.username().unwrap_or(crate::logfmt::ABSENT),
                 reason = denied.reason(),
                 "authentication failed"
             );
 
-            // Counted before the answer goes out rather than after it: what is
-            // counted is a wrong guess, not the peer having been told about it.
-            // With the count on the far side of the write, a peer that grants no
-            // flow-control window never reaches it and guesses for free until it
-            // runs out of streams (review H1).
             // Guessing should cost a handshake every few attempts rather than
-            // being free for the life of one connection. The close is decided
-            // here too, before the 407 is written: a peer that will not take
-            // the answer must not keep the connection for another idle timeout
-            // while the write waits on it (review H1, re-verification).
+            // being free for the life of one connection. Counted before the
+            // answer goes out: what is counted is a wrong guess, not the peer
+            // having been told about it. With the count after the write, a
+            // peer that grants no flow-control window would never reach it and
+            // would guess for free until it ran out of streams. The close is
+            // decided here too, before the 407 is written, so a peer that will
+            // not take the answer cannot keep the connection for another idle
+            // timeout while the write waits on it.
+            //
             // One charge per credential value that was tried and refused, each
             // to the user-id that value claimed: a guess is a guess whether it
-            // arrived alone or beside another one, and charging per request let
-            // a batch of them cost a single failure (audit M1, D76 addendum of
+            // arrived alone or beside another one, and charging per request
+            // would let a batch of them cost a single failure (D76 addendum of
             // 2026-09-04). Every value is charged before the answer is decided,
             // so `|` rather than `||`.
             let mut spent = false;
@@ -568,9 +553,9 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
         // Sampled for the reason `tunnel::admit_target`'s refusal is: a
         // connection that has reached its limit answers every further request
         // this way, at one HEADERS frame apiece, for as long as the peer keeps
-        // asking. The first refusal is as loud as it ever was and the reports
-        // carry the running total, so an operator still sees both that the
-        // limit was hit and how hard (`crate::logfmt::Sampler`).
+        // asking. The first refusal is a warning and the reports carry the
+        // running total, so an operator sees both that the limit was hit and
+        // how hard (`crate::logfmt::Sampler`).
         let live = context.quota.live();
         match context.limit_refusals.record() {
             Some(refusals) => warn!(
@@ -618,10 +603,9 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
                 // As a `str` rather than through `%`: `bounded` cuts the length
                 // and nothing else. A `:protocol` is an RFC 9110 §5.6.2 token
                 // by the time it gets here, so it carries no control character
-                // to forge a journal line with; this stays because the escaping
-                // is what made that true before the check existed, and neither
-                // half is worth depending on alone (review M5, audit L6). See
-                // `logfmt`.
+                // to forge a journal line with. The escaping a `str` field gets
+                // is kept as well, so that neither the token check nor the
+                // escaping is relied on alone. See `logfmt`.
                 protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
@@ -641,8 +625,8 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
 /// Logs every inbound request at DEBUG, with credentials redacted.
 ///
 /// This is the primary tool for establishing empirically what Surge actually
-/// sends — which header it puts credentials in, which URI template it uses for
-/// CONNECT-UDP — so every header *line* is logged. What is redacted is only the
+/// sends (which header it puts credentials in, which URI template it uses for
+/// CONNECT-UDP), so every header *line* is logged. What is redacted is only the
 /// secret itself: the header name and the auth scheme survive, because
 ///
 /// * which of `Proxy-Authorization` and `Authorization` Surge uses is still
@@ -672,11 +656,10 @@ fn log_request(req: &Request, stream_id: u64) {
 
     // Every `:protocol` token alike, through `bounded`, which cuts the length
     // and nothing else: a token may be a whole field section's worth of bytes.
-    // A newline cannot reach here -- a `:protocol` is an RFC 9110 §5.6.2 token
-    // and a request carrying anything else is malformed (audit L6) -- and the
-    // `?` it is recorded with escapes control characters anyway, which is the
-    // same division of labour the 501 path above states for the `str` it logs.
-    // See `logfmt`.
+    // A newline cannot reach here, because a `:protocol` is an RFC 9110 §5.6.2
+    // token and a request carrying anything else is malformed. The `?` it is
+    // recorded with escapes control characters anyway, as the 501 path in
+    // `handle_request` states for the `str` it logs. See `logfmt`.
     let protocol = req.protocol.as_deref().map(bounded);
 
     debug!(
@@ -693,10 +676,10 @@ fn log_request(req: &Request, stream_id: u64) {
 
 /// Renders a credential header value as its scheme plus the size of the secret.
 ///
-/// The length is kept because it is diagnostic — "Basic <redacted 0 bytes>" is a
-/// client sending an empty credential, which looks nothing like a wrong password
-/// — and because it reveals nothing a network observer could not count for
-/// itself.
+/// The length is kept because it is diagnostic ("Basic <redacted 0 bytes>" is a
+/// client sending an empty credential, which looks nothing like a wrong
+/// password), and because it reveals nothing a network observer could not count
+/// for itself.
 ///
 /// The scheme is echoed only when it is short and alphanumeric. It is
 /// attacker-controlled, so this bounds what an unauthenticated peer can write

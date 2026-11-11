@@ -51,7 +51,7 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// ([`crate::h3::connection::INBOUND_QUEUE_DEPTH`] accounts for all three). A
 /// value has to be buffered whole because a UDP payload cannot be forwarded
 /// piecewise, and a peer that declares the largest one allowed and then stops
-/// one byte short is doing nothing RFC 9297 §3.2 forbids — so what is held is
+/// one byte short is doing nothing RFC 9297 §3.2 forbids. So what is held is
 /// held until the session's idle timeout. One capsule's worth is all of it:
 /// bytes past a declared value belong to the next capsule and are cut out of the
 /// buffer as they are decoded, and an unknown type is discarded as it arrives
@@ -184,7 +184,7 @@ impl CapsuleDecoder {
 
     /// Decodes the next capsule of interest.
     ///
-    /// `Ok(None)` means more bytes are needed — not an error. Unknown capsule
+    /// `Ok(None)` means more bytes are needed, not an error. Unknown capsule
     /// types are consumed internally and never returned.
     pub fn next_capsule(&mut self) -> Result<Option<Capsule>, Error> {
         loop {

@@ -4,8 +4,8 @@
 //! here so that `tunnel::refuse` and `tunnel::Quota` stay the paths the rest of
 //! the crate uses:
 //!
-//! * `status` — refusals and the RFC 9209 vocabulary they are written in.
-//! * `quota` — the per-connection tunnel budget and the guards that spend it.
+//! * `status`: refusals and the RFC 9209 vocabulary they are written in.
+//! * `quota`: the per-connection tunnel budget and the guards that spend it.
 
 mod quota;
 mod status;
@@ -50,9 +50,7 @@ pub enum Route<'a> {
 /// Classifies a request by method and `:protocol`.
 ///
 /// The pseudo-header is read straight off the [`Request`], as the tunnels read
-/// every other field of one (D78). It used to arrive through a classifier in
-/// [`crate::h3api`], but that enum was this one's three variants under other
-/// names and existed only to be translated into them on the next line.
+/// every other field of one (D78).
 pub fn route(req: &Request) -> Route<'_> {
     if req.method != Method::Connect {
         return Route::NotConnect;
@@ -67,14 +65,14 @@ pub fn route(req: &Request) -> Route<'_> {
 
 /// The field, if any, that makes `req` malformed under RFC 9114 §4.2.
 ///
-/// RFC 9114 §4.2's rule -- quoted in full in `crate::h3::stream`, where the
-/// `Connection` field itself is refused at decode time -- is that "any message
-/// containing connection-specific fields MUST be treated as malformed". The
-/// fields RFC 9110 §7.6.1 names as connection-specific beyond `Connection`
-/// itself are judged here rather than in the codec so that the answer can be a
-/// 400 instead of a reset: RFC 9114 §4.1.2 lets a server "send an HTTP response
-/// indicating the error prior to closing or resetting the stream", and a client
-/// is told more by a status than by `H3_MESSAGE_ERROR`.
+/// RFC 9114 §4.2's rule is that "any message containing connection-specific
+/// fields MUST be treated as malformed". It is quoted in full in
+/// `crate::h3::stream`, where the `Connection` field itself is refused at
+/// decode time. The fields RFC 9110 §7.6.1 names as connection-specific beyond
+/// `Connection` itself are judged here rather than in the codec so that the
+/// answer can be a 400 instead of a reset: RFC 9114 §4.1.2 lets a server "send
+/// an HTTP response indicating the error prior to closing or resetting the
+/// stream", and a client is told more by a status than by `H3_MESSAGE_ERROR`.
 ///
 /// Named one at a time so the log says which field was the problem.
 ///
@@ -93,11 +91,10 @@ pub fn connection_specific_field(req: &Request) -> Option<&'static str> {
 /// RFC 9110 §7.6.1's connection-specific fields other than `Connection`.
 ///
 /// Four of the five that section lists. The fifth is `TE`, which RFC 9114 §4.2
-/// exempts when it says `trailers` and nothing else -- the sentence is quoted in
-/// `crate::h3::stream`, where the value it carries is checked and where the
-/// answer is the reset a malformed field section gets. So `TE` is not judged
-/// here, and its absence from this list is the exemption rather than an
-/// oversight.
+/// exempts when it says `trailers` and nothing else. That sentence is quoted in
+/// `crate::h3::stream`, where the value is checked and where the answer is the
+/// reset a malformed field section gets. So `TE` is not judged here, and its
+/// absence from this list is the exemption rather than an oversight.
 const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "proxy-connection",
     "keep-alive",
@@ -116,30 +113,30 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// ```
 ///
 /// Asked by both parsers before `u16::from_str`, which is more generous than the
-/// grammar: it takes a leading `+` or `-`, so `example.com:+443` was dialled as
-/// 443 and `/.well-known/masque/udp/example.com/+443/` with it. Nothing was
-/// bypassed, because `Policy::allows_port` judges the number that came out of
-/// the parse and that is the number the socket is opened on. What it cost is
-/// normalisation: one target had two spellings, the authority in the log and the
-/// port on the wire disagreed, and RFC 9110 §9.3.6 asks a server to "reject a
-/// CONNECT request that targets an empty or invalid port number".
+/// grammar: it takes a leading `+` or `-`. Without this check `example.com:+443`
+/// and `/.well-known/masque/udp/example.com/+443/` would be dialled as 443.
+/// Nothing would be bypassed, because `Policy::allows_port` judges the number
+/// that came out of the parse and that is the number the socket is opened on.
+/// The cost is normalisation: one target would have two spellings, the
+/// authority in the log and the port on the wire would disagree, and RFC 9110
+/// §9.3.6 asks a server to "reject a CONNECT request that targets an empty or
+/// invalid port number".
 ///
 /// The empty string is refused here as well, which is not what `*DIGIT` says on
 /// its own. RFC 9298 §3 requires `target_port` to "represent an integer between
 /// 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty port beside an
-/// invalid one; both callers already refused it by way of the parse that
-/// follows, and saying so here keeps the two rules in one place.
+/// invalid one. Both callers would refuse it in the parse that follows anyway;
+/// saying so here keeps the two rules in one place.
 ///
-/// Written once because it is one rule. Two copies of a spelling rule is how the
-/// trailing-dot defect happened.
+/// Written once so that the two parsers cannot spell a port differently.
 pub(crate) fn is_port(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Whether a host component carries a bracket that is not part of an IP literal.
 ///
-/// RFC 3986 §3.2.2 gives "[" and "]" to the IP-literal form alone, in as many
-/// words: "This is the only place where square bracket characters are allowed
+/// RFC 3986 §3.2.2 gives "[" and "]" to the IP-literal form alone, and says so
+/// explicitly: "This is the only place where square bracket characters are allowed
 /// in the URI syntax." The grammar it says that of is
 ///
 /// ```text
@@ -159,12 +156,10 @@ pub(crate) fn is_port(text: &str) -> bool {
 /// bracketed routes a "]" cannot survive, because the split that found the
 /// literal takes the first one, and asking costs nothing.
 ///
-/// Written once beside [`is_port`] and for the same reason: two copies of a
-/// spelling rule is how the trailing-dot defect happened. This one was three
-/// copies with three separate comments arguing the same point, on the two
-/// routes a client can name a host by. The refusal each call site answers with
-/// stays at the call site, because a CONNECT authority and a URI template are
-/// refused in different words.
+/// Written once beside [`is_port`] and for the same reason, for the two routes
+/// a client can name a host by. The refusal each call site answers with stays
+/// at the call site, because a CONNECT authority and a URI template are refused
+/// in different words.
 pub(crate) fn stray_bracket(host: &str) -> bool {
     host.contains(['[', ']'])
 }
@@ -184,8 +179,8 @@ pub(crate) fn stray_bracket(host: &str) -> bool {
 /// probing a stale address list), and one that has spent eight full session
 /// budgets without a single target ever answering is not doing that any more.
 /// The product is what a connection can reflect at silent targets in its whole
-/// life: 512 packets at the defaults, against an unbounded number before this
-/// existed. A client that wants another allowance pays for another handshake,
+/// life: 512 packets at the defaults, where the per-session budget alone sets no
+/// limit. A client that wants another allowance pays for another handshake,
 /// which is the price this server charges everywhere else.
 ///
 /// Not a configuration key. `unanswered_packet_budget` already carries the
@@ -217,13 +212,13 @@ const _: () = assert!(
 /// guess at another user's password with it: with one counter cleared by any
 /// success, it interleaves a good request between guesses and never reaches
 /// `max_auth_failures`. One counter *per user-id guessed at* closes that, and
-/// leaves the case the clearing exists for — one client, one credential, an app
-/// that drops the header now and then — exactly as it was.
+/// keeps the case the clearing exists for: one client, one credential, an app
+/// that drops the header now and then.
 ///
-/// A single run charged to the first failure that named somebody was the earlier
-/// answer and was not enough: the peer opens each cycle with a deliberate
-/// failure as *itself*, which claims the run, and its success as itself then
-/// clears the whole thing, guesses at everybody else included.
+/// A single counter charged to the first failure that named somebody is not
+/// enough either: the peer opens each cycle with a deliberate failure as
+/// *itself*, which claims the counter, and its success as itself then clears
+/// the whole thing, guesses at everybody else included.
 ///
 /// The cap is on the **total** across the buckets, not on any one of them. A
 /// per-bucket cap would hand a guesser `max_auth_failures - 1` free guesses for
@@ -239,10 +234,10 @@ pub struct AuthFailures {
     ///
     /// A success as that user clears its counter and nothing else. Keyed by a
     /// name that compared equal to a configured one, so the key's length comes
-    /// from the configuration file rather than from the peer — a user-id too
-    /// long to log is truncated by [`crate::auth::Denied::username`] (review
-    /// H3) and therefore matches nothing here, which lands its guesses in
-    /// `unconfigured` below.
+    /// from the configuration file rather than from the peer. A user-id too
+    /// long to log is truncated by [`crate::auth::Denied::username`] and
+    /// therefore matches nothing here, so its guesses land in `unconfigured`
+    /// below.
     configured: std::collections::HashMap<String, u32>,
     /// Failures naming a user-id nobody has.
     ///
@@ -252,12 +247,12 @@ pub struct AuthFailures {
     unconfigured: u32,
     /// Failures that named nobody.
     ///
-    /// They carried no user-id this server could read — no credentials field at
-    /// all, or one it could not parse — so they are the benign case: the app
+    /// They carried no user-id this server could read (no credentials field at
+    /// all, or one it could not parse), so they are the benign case: the app
     /// that dropped the header, not the peer that guessed. Any success clears
     /// this one, because any success is a client proving it is that client.
     ///
-    /// It cannot be used to launder a guess: a guess names somebody and is
+    /// It cannot be used to hide a guess: a guess names somebody and is
     /// charged to that name's bucket however many credential-less requests are
     /// sent around it.
     anonymous: u32,
@@ -268,7 +263,7 @@ impl AuthFailures {
     ///
     /// Saturating rather than wrapping: `max_auth_failures = 0` disables the cap
     /// and nothing then ever clears a bucket, so a connection left open long
-    /// enough could otherwise overflow the sum. Saturated is the honest answer —
+    /// enough could otherwise overflow the sum. Saturated is the correct answer:
     /// a total that large is over any cap there could be.
     fn total(&self) -> u32 {
         self.configured
@@ -343,8 +338,8 @@ pub struct Context {
     /// client that has proved who it is may hold an idle connection for as long
     /// as the transport's own idle timeout allows, which is what makes a proxy
     /// worth reconnecting to. A server with no users configured has nothing to
-    /// check, so its first request opens it too -- the state means "this peer
-    /// got past the door", not "credentials were seen".
+    /// check, so its first request opens it too. The state means "this peer
+    /// passed the credentials check", not "credentials were seen".
     ///
     /// The third state is the accept loop's: an eviction claims the cell with a
     /// compare-and-swap, so a request racing an eviction either opens the gate
@@ -352,7 +347,7 @@ pub struct Context {
     /// gate reads closed, so the connection stays under every
     /// pre-authentication bound for the moment it has left.
     ///
-    /// Its transition is load-bearing as well as its value: the
+    /// Its transition matters as well as its value: the
     /// unknown-to-authenticated edge is what raises this connection's
     /// bidirectional stream allowance to the configured one, exactly once. That
     /// is why it is an [`AuthGate`] and not the bare atomic it wraps. See
@@ -360,7 +355,7 @@ pub struct Context {
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
     /// from outside the connection as well: the accept loop needs to know which
-    /// of the connections it is holding has never got past the door, so that a
+    /// of its connections has never passed the credentials check, so that a
     /// full server can take that slot back rather than refuse a client that has
     /// credentials.
     pub authenticated: AuthGate,
@@ -376,16 +371,16 @@ pub struct Context {
     /// It is not what the handshake advertised. A connection is accepted on the
     /// small allowance `quic::INITIAL_BIDI_STREAMS` describes and raised to this
     /// by `Context::mark_authenticated`, so the number is carried here for the
-    /// one moment it is needed — snapshotted with the rest of this connection's
-    /// `[limits]`, so a reload changes what connections accepted from then on
-    /// are worth and leaves a running one alone.
+    /// one moment it is needed. It is snapshotted with the rest of this
+    /// connection's `[limits]`, so a reload changes what connections accepted
+    /// from then on are worth and leaves a running one alone.
     pub max_streams_bidi: u32,
     /// How many tunnels this connection has been granted a slot for so far.
     ///
     /// Counted once per request that gets past [`Quota::acquire`], TCP and
     /// CONNECT-UDP alike, so this is slots taken rather than requests made: a
-    /// request refused before the slot — 407, a malformed message, the tunnel
-    /// limit itself — never reaches it. It is *not* tunnels that carried
+    /// request refused before the slot (407, a malformed message, the tunnel
+    /// limit itself) never reaches it. It is *not* tunnels that carried
     /// anything, though: the slot is taken before the target is judged, so a
     /// destination the policy rejects and a target that cannot be reached are
     /// both counted here. Owned by [`crate::quic`], which reads it once when
@@ -399,13 +394,13 @@ pub struct Context {
     /// direction is reclaimed, and once one direction of a TCP tunnel has ended
     /// cleanly, each write in the surviving direction has this long to complete
     /// (`tcp` module docs). Both come from `[limits] udp_session_timeout`,
-    /// whose name is the CONNECT-UDP half alone for compatibility -- the field
-    /// documents the other half.
+    /// whose name covers only the CONNECT-UDP half for compatibility. This
+    /// field documents the other half.
     pub stall_budget: Duration,
     /// Budget for reaching a target, or `None` when it is disabled.
     ///
-    /// Spent twice per request and separately — once on name resolution, once on
-    /// the whole list of addresses it resolved to — so the worst case a tunnel
+    /// Spent twice per request and separately: once on name resolution, once on
+    /// the whole list of addresses it resolved to. So the worst case a tunnel
     /// slot is held before any byte flows is twice this.
     pub connect_timeout: Option<Duration>,
     /// This connection's share of the blocking pool, spent on name resolution.
@@ -440,12 +435,11 @@ pub struct Context {
     /// nothing else does (D84, the 2026-09-05 addendum). The repayment is that
     /// session's own `charged_unanswered` count and it is capped at the total
     /// the connection was created with, so no sequence of sessions can lift the
-    /// counter above where it started. The objection this rule had to answer,
-    /// a client keeping one consenting target on the side and buying back
-    /// packet for packet the allowance it is spending on a silent one, does not
-    /// apply to an own-session refund: a silent session's spend stays spent,
-    /// and the bound is unchanged for what it was written for, packets to
-    /// targets that never answer.
+    /// counter above where it started. A client cannot keep one consenting
+    /// target on the side to buy back, packet for packet, the allowance it
+    /// spends on a silent one: the refund is per session, so a silent session's
+    /// spend stays spent, and the bound on packets to targets that never answer
+    /// holds.
     ///
     /// A connection that spends the total with nothing outstanding to repay it
     /// keeps it spent for its own life, and a client that wants another
@@ -482,9 +476,9 @@ pub struct Context {
     /// The same, for requests refused because this connection is already
     /// holding every tunnel it may.
     ///
-    /// Reaching the limit costs a peer `max_targets_per_conn` live tunnels,
-    /// which is real; staying there costs it nothing at all, and every further
-    /// request was a warning for as long as it cared to keep asking.
+    /// Reaching the limit costs a peer `max_targets_per_conn` live tunnels.
+    /// Staying there costs it nothing, and without sampling every further
+    /// request would be a warning for as long as it kept asking.
     pub limit_refusals: crate::logfmt::Sampler,
     /// A lower bound of the room left in quinn's outgoing datagram queue, in
     /// the units `quinn::Connection::datagram_send_buffer_space` reports.
@@ -504,10 +498,10 @@ impl Context {
     /// Builds the context for one accepted connection.
     ///
     /// `peer_datagrams` comes from the HTTP/3 connection, which keeps writing
-    /// to it; `tunnels` is the connection's tunnel counter and `authenticated`
-    /// its door flag, both created by [`crate::quic`] so that they outlive this
-    /// context — the first is read once the connection is over, the second
-    /// while it runs.
+    /// to it. `tunnels` is the connection's tunnel counter and `authenticated`
+    /// its authentication flag, both created by [`crate::quic`] so that they
+    /// outlive this context: the first is read once the connection is over, the
+    /// second while it runs.
     pub fn new(
         config: &Config,
         quic: quinn::Connection,
@@ -577,9 +571,9 @@ impl Context {
     /// quinn's own API, so a datagram another session queues between this
     /// session's reading and its store is not counted. The bound can then be
     /// that datagram's cost too high, and a later datagram can be graded as
-    /// fitting by that much when it did not. A single session is exact; the
-    /// reading and the send were two lock acquisitions before this bound
-    /// existed, with the same interleaving between them.
+    /// fitting by that much when it did not. A single session is exact. Two
+    /// separate lock acquisitions for the reading and the send would have the
+    /// same interleaving.
     pub(crate) fn reset_datagram_room(&self, space: usize, len: usize) {
         self.datagram_room.store(
             space.saturating_sub(len.saturating_add(QUEUED_DATAGRAM_COST)),
@@ -657,7 +651,7 @@ impl Context {
     ///
     /// Counts across the whole connection, so opening more streams does not reset
     /// the budget, and the answer is about the *total* of every bucket. A request
-    /// that succeeds *as `username`* clears one of them — see
+    /// that succeeds *as `username`* clears one of them; see
     /// [`Self::mark_authenticated`] and [`AuthFailures`].
     ///
     /// `username` is the user-id the failing request claimed, or `None` when it
@@ -713,13 +707,13 @@ impl Context {
     /// would otherwise spend the budget a failure at a time over hours and then
     /// lose every live tunnel to a cap meant for an attacker.
     ///
-    /// Exactly two buckets are answered for: `username`'s own, and the one for
+    /// Exactly two buckets are cleared: `username`'s own, and the one for
     /// failures that named nobody. Nothing else, because a guesser *can* arrive
-    /// here — `auth.users` is a list, and one valid credential is enough to
+    /// here: `auth.users` is a list, and one valid credential is enough to
     /// interleave a success between guesses at a second user's password. See
-    /// [`AuthFailures`]. `None` means there was nothing to check — no users are
-    /// configured — so there is no user's bucket to clear, and no failure can
-    /// have been recorded either.
+    /// [`AuthFailures`]. `None` means there was nothing to check because no
+    /// users are configured, so there is no user's bucket to clear, and no
+    /// failure can have been recorded either.
     ///
     /// # The stream allowance
     ///
@@ -925,23 +919,23 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 ///
 /// `Some(addresses)` is a non-empty, policy-filtered, family-ordered list, ready
 /// for the caller to dial. `None` means the request has **already been
-/// answered** — with a 403, a 502, a 504, or the 200 that closes on the spot —
+/// answered** (with a 403, a 502, a 504, or the 200 that closes on the spot),
 /// and the caller has nothing left to do but return.
 ///
 /// Both tunnel types run exactly this preamble, which is why it is written once:
-/// two copies drift, and a drift here is the two protocols disagreeing about
-/// what a policy refusal looks like.
+/// two copies could drift, and the two protocols would then disagree about what
+/// a policy refusal looks like.
 ///
 /// The order of the three steps is part of the design:
 ///
 /// * The port rule needs no address, so it is applied before the resolver is
 ///   asked anything: a denied port cannot be used to make the proxy run lookups.
 /// * Resolution is explicit, rather than left to the connect call, so the
-///   addresses are visible to the policy below — and bounded, because the tunnel
-///   slot and the file descriptor it stands for are already held. A resolver
-///   failure is not the client's fault (decision D9), so it is a 502 with the
-///   RFC 9209 reason rather than a 400, and a resolver that never answered is a
-///   504 `dns_timeout` instead, because those are different things to an
+///   addresses are visible to the policy below. It is bounded, because the
+///   tunnel slot and the file descriptor it stands for are already held. A
+///   resolver failure is not the client's fault (decision D9), so it is a 502
+///   with the RFC 9209 reason rather than a 400. A resolver that never answered
+///   is a 504 `dns_timeout` instead, because those are different things to an
 ///   operator reading the log. The list comes back ordered by `[limits]
 ///   ip_family_preference` (decision D58) and the callers dial it in that order,
 ///   so on a dual-stack target the non-preferred family is only reached after
@@ -956,10 +950,10 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// Nothing left after that filter splits two ways (decision D49). A name whose
 /// every address is the unspecified one was blocked by a filtering resolver
 /// upstream, and that verdict is not this proxy's: answering 403 would make the
-/// client attribute an ad blocker's decision to the proxy, and this is the only
-/// protocol in the client's stable with an in-band channel to say anything at
-/// all, so it is the only one that gets blamed. Such a request is accepted and
-/// closed on the spot instead. Every other refusal — loopback, RFC 1918, a mix —
+/// client attribute an ad blocker's decision to the proxy. Of the client's
+/// protocols this is the only one with an in-band channel to say anything at
+/// all, so it would be the only one blamed. Such a request is accepted and
+/// closed on the spot instead. Every other refusal (loopback, RFC 1918, a mix)
 /// keeps its loud 403 with the RFC 9209 reason, because that is what an SSRF
 /// probe looks like from here and the client really is being refused by this
 /// proxy. The criterion belongs to [`policy::is_dns_blackhole`] and the response
@@ -967,7 +961,7 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// here.
 ///
 /// `accepted_fields` supplies what an accepted response of the caller's tunnel
-/// type has to carry — nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
+/// type has to carry: nothing for a TCP tunnel, the RFC 9297 `Capsule-Protocol`
 /// field for CONNECT-UDP. Deferred, so only the one path that sends a 200 pays
 /// for building it.
 pub(crate) async fn admit_target(
@@ -1033,9 +1027,9 @@ pub(crate) async fn admit_target(
         // Loud on a doubling schedule rather than every time: this is the
         // evidence an operator has that somebody is probing the private side of
         // the host, and one line per request would let the peer decide how much
-        // of the journal is left to record it in. The first refusal warns as
-        // immediately as it ever did, and `refusals` is what a scan announces
-        // itself by. See [`Context::policy_refusals`].
+        // of the journal is left to record it in. The first refusal warns at
+        // once, and the `refusals` count is what shows a scan. See
+        // [`Context::policy_refusals`].
         match ctx.policy_refusals.record() {
             Some(refusals) => warn!(
                 log_id = "ucmaf4w6",

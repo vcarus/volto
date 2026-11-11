@@ -17,10 +17,10 @@
 //! share one sticky `watch` channel that carries the tunnel's `State`: running,
 //! one direction ended cleanly, or torn down. The teardown is for the abnormal
 //! cases where one direction failing must stop the other. It carries *why* the
-//! tunnel is being torn down — see `Teardown` below — because the code the pump
-//! that did not see the failure has to put on its own half follows from the
-//! reason: `H3_CONNECT_ERROR` when the target failed, `H3_REQUEST_CANCELLED`
-//! when the client cancelled.
+//! tunnel is being torn down (see `Teardown` below), because the pump that did
+//! not see the failure chooses the code for its own half from the reason:
+//! `H3_CONNECT_ERROR` when the target failed, `H3_REQUEST_CANCELLED` when the
+//! client cancelled.
 //!
 //! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
@@ -29,67 +29,63 @@
 //!
 //! While both directions are live nothing here is on a timer, and nothing needs
 //! to be: each pump is the other's watchdog. A client that abandons the request
-//! stream is met by the read pump, or -- when that pump is parked in a write --
-//! by the `Reader::reset_by_peer` arm beside it; a target that fails is met by
+//! stream is met by the read pump, or by the `Reader::reset_by_peer` arm beside
+//! it when that pump is parked in a write. A target that fails is met by
 //! whichever pump touches the socket next. Every one of those raises a teardown,
 //! and a teardown is what ends the other pump's wait.
 //!
 //! Those two arms cover a client that **resets** its request stream. A client
-//! that merely **stops reading** the response -- `STOP_SENDING`, which is half
-//! of what dropping a request stream sends -- is a signal on the other half of
-//! the stream, and `Writer::stopped` in `target_to_client` is what watches for
-//! it. It has to be watched rather than met by a write, because the two things
-//! that would otherwise notice can both be absent at once: the client's own FIN
-//! ends the opposite pump without raising a teardown, and a target that has yet
-//! to say anything leaves this pump nothing to write (D87).
+//! that only **stops reading** the response sends `STOP_SENDING`, which is half
+//! of what dropping a request stream sends. That is a signal on the other half
+//! of the stream, and `Writer::stopped` in `target_to_client` watches for it. It
+//! has to be watched rather than met by a write, because the two things that
+//! would otherwise notice can both be absent at once: the client's own FIN ends
+//! the opposite pump without raising a teardown, and a target that has yet to
+//! say anything leaves this pump nothing to write (D87).
 //!
 //! The first two rows of the table above take that watchdog away, because they
 //! are the two endings that end a direction *without* a teardown: the pump
-//! returns, and the surviving direction is left with nobody watching it. A
-//! client that finishes its sending side and then stops granting flow-control
-//! credit, or a target that reaches EOF and then stops reading, would hold the
-//! target socket, its file descriptor and the tunnel slot for as long as the
-//! QUIC connection lasts -- which keep-alives can make indefinite.
+//! returns, and nothing watches the surviving direction. A client that finishes
+//! its sending side and then stops granting flow-control credit, or a target
+//! that reaches EOF and then stops reading, would hold the target socket, its
+//! file descriptor and the tunnel slot for as long as the QUIC connection lasts,
+//! which keep-alives can make indefinite.
 //!
 //! So from the moment one direction has ended cleanly, each write in the
 //! surviving direction is bounded by `[limits] udp_session_timeout`, the same
 //! knob a CONNECT-UDP session's idle bound comes from. Each write gets its own
 //! budget, so a client that keeps reading may take hours to drain a download
-//! after its FIN. What the budget bounds is the *completion* of one write
-//! rather than progress on it, though: a peer that takes a few bytes every so
-//! often, and never enough to finish the write it woke, is cut once that one
-//! write has been outstanding for a whole budget. So there is a floor under how
-//! slowly a half-closed tunnel may be drained -- one relay chunk, up to
-//! `RELAY_BLOCK_SIZE`, per budget on the target -> client side, and one gathered
-//! write, up to `WRITE_BATCH_BYTES` (the same 64 KiB) plus at most one piece, per
-//! budget on the other -- which at the default 180 s is orders of magnitude
-//! under any real client. A tunnel whose two directions are both still open is
-//! untouched however long a write parks, because there the other pump is still
-//! the watchdog.
+//! after its FIN. The budget bounds the *completion* of one write, not progress
+//! on it: a peer that takes a few bytes now and then, and never enough to finish
+//! the write, is cut once that write has been outstanding for a whole budget.
+//! That sets a floor on how slowly a half-closed tunnel may be drained. On the
+//! target -> client side it is one relay chunk, up to `RELAY_BLOCK_SIZE`, per
+//! budget. On the other side it is one gathered write, up to `WRITE_BATCH_BYTES`
+//! (the same 64 KiB) plus at most one piece, per budget. At the default 180 s
+//! that is orders of magnitude under any real client. A tunnel whose two
+//! directions are both still open is not bounded however long a write parks,
+//! because there the other pump is still the watchdog.
+//!
+//! Nothing bounds *by time* the surviving direction parked in a read. A target
+//! that has taken the client's FIN may legitimately take minutes to answer, and
+//! a bound there would cut the half-closes this proxy exists to carry, so a
+//! half-closed tunnel with no traffic at all on it is deliberately left to run.
+//! What limits that is capacity rather than time: `max_connections` x
+//! `max_targets_per_conn` sockets, the product the fd budget is sized from.
+//!
+//! Such a tunnel is still watched (D87): it ends the moment the client says it
+//! wants no more of it, however quiet the target stays. Only a client that is
+//! still waiting for an answer keeps one alive.
 //!
 //! # One write per read
 //!
 //! The client -> target pump writes with `writev`. A tunnel's reader takes up to
 //! `h3api::READ_AHEAD_CHUNKS` chunks from quinn per read, and the pump gathers
 //! the awaited piece and every piece already decodable from that read into one
-//! vectored write (`gather`, `write_batch`). Before, each ~1.4 KB piece cost its
-//! own `write`. The order of bytes, and of the client's FIN, a reset or a
-//! protocol violation relative to them, is unchanged: anything that ends the
-//! direction is reported by the next `Reader::recv_data`, which runs only after
-//! the gathered write has completed.
-//!
-//! What nothing bounds *by time* is the surviving direction parked in a read. A
-//! target that has taken the client's FIN may legitimately take minutes to
-//! answer, and a bound there would cut the very half-closes this proxy exists to
-//! carry, so a half-closed tunnel with no traffic at all on it is deliberately
-//! left to run. What limits that is capacity rather than time:
-//! `max_connections` x `max_targets_per_conn` sockets, the product the fd budget
-//! is sized from.
-//!
-//! Left to run is not left unwatched, though, and the distinction is the whole
-//! of D87: such a tunnel ends the moment the client says it wants no more of it,
-//! however quiet the target stays. Only a client that is still waiting for an
-//! answer keeps one alive.
+//! vectored write (`gather`, `write_batch`). The order of bytes, and of the
+//! client's FIN, a reset or a protocol violation relative to them, is kept:
+//! anything that ends the direction is reported by the next `Reader::recv_data`,
+//! which runs only after the gathered write has completed.
 
 use std::io::{self, IoSlice};
 use std::net::SocketAddr;
@@ -127,14 +123,14 @@ pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 ///
 /// # Why a block rather than a buffer
 ///
-/// `BytesMut::split` hands the filled bytes on without copying them, which is
-/// what keeps the relay allocation-light — but the piece handed on and the
-/// piece kept share one heap block, and quinn holds its piece until the segment
-/// carrying it has been acknowledged. So the memory a tunnel occupies is
-/// *blocks* × block size, while the only thing bounding it — quinn's
-/// `send_window`, 10 MB per connection — counts bytes. Reserving a fresh
-/// [`RELAY_BUF_SIZE`] block per read made every read, however small, pin 16 KiB:
-/// 11.7x amplification for MTU-sized reads and 238x for 64-byte ones.
+/// `BytesMut::split` hands the filled bytes on without copying them, which
+/// keeps the relay allocation-light. But the piece handed on and the piece kept
+/// share one heap block, and quinn holds its piece until the segment carrying it
+/// has been acknowledged. So the memory a tunnel occupies is *blocks* × block
+/// size, while the only thing bounding it, quinn's `send_window` of 10 MB per
+/// connection, counts bytes. A fresh [`RELAY_BUF_SIZE`] block per read would
+/// make every read, however small, pin 16 KiB: 11.7x amplification for
+/// MTU-sized reads and 238x for 64-byte ones.
 ///
 /// # The arithmetic
 ///
@@ -155,29 +151,26 @@ pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 /// | 64 to 16383 bytes | 2 | 1.37x, from 67 counted per 69 used at 64 bytes |
 /// | 1 to 63 bytes | 3 | 2.67x, from 3 counted per 6 used at 1 byte |
 ///
-/// All three are bounded, against a factor that grew without bound as reads
-/// got smaller before blocks existed. Before the room existed the figure was
-/// 1.33x at every read size, but it counted only the payload: each frame
-/// header was then a second `Bytes` cut from a 16-byte scratch block that was
-/// reallocated every few frames, and that cost more per small frame than the
-/// unused room does now.
+/// All three are bounded. A frame header in a `Bytes` of its own, cut from a
+/// separate scratch block, would cost more per small frame than the unused room
+/// does.
 ///
 /// # What it costs at rest
 ///
 /// The trade is paid in resting size: a tunnel that has relayed a single byte
 /// holds one whole block across every wait from then on, so an idle tunnel
 /// costs 64 KiB rather than the 16 KiB it started with. Saturated at the
-/// default limits -- `max_connections` x `max_targets_per_conn` -- that is
-/// 4 GiB, and at the ~20 live tunnels per connection seen in production about
-/// 1.3 MB per connection. The amplification is what produces the memory peaks
-/// worth avoiding, and 1.33x beats 2x there; `docs/configuration.md` says the
-/// same to operators.
+/// default limits (`max_connections` x `max_targets_per_conn`) that is 4 GiB,
+/// and at the ~20 live tunnels per connection seen in production about 1.3 MB
+/// per connection. The amplification is what produces the memory peaks worth
+/// avoiding, and 1.33x beats 2x there; `docs/configuration.md` says the same to
+/// operators.
 pub const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 
 /// Why the tunnel is being torn down, carried as [`State::TornDown`].
 ///
 /// A bare "stop now" flag is not enough, because neither pump can tell from a
-/// flag alone how to close its own half — and simply returning gets it wrong in
+/// flag alone how to close its own half, and simply returning gets it wrong in
 /// one direction each time. `quinn::SendStream::drop` finishes the stream, so a
 /// writer dropped on a target error puts a clean FIN on the wire and a truncated
 /// response reads to the client as a complete one; `quinn::RecvStream::drop`
@@ -187,12 +180,11 @@ pub const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 /// With the reason attached, a target error reaches the client as
 /// `H3_CONNECT_ERROR` whichever pump noticed it (RFC 9114 §4.4), and a client
 /// abort cancels the direction the client left alone. §4.4 asks for that
-/// second one in as many words: "If the stream is reset or reading is aborted
+/// second one explicitly: "If the stream is reset or reading is aborted
 /// by the client, a proxy SHOULD perform the same operation on the other
 /// direction in order to ensure that both directions of the stream are
-/// cancelled." Leaving it alone was the older reading, and it left a client
-/// that reset only its sending side reading a truncated response as a complete
-/// one.
+/// cancelled." Leaving that direction alone would let a client that reset only
+/// its sending side read a truncated response as a complete one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Teardown {
     /// The client reset the request stream or stopped reading it.
@@ -270,17 +262,16 @@ enum State {
 /// how long that one write has been outstanding, not how long the peer has been
 /// silent.
 ///
-/// Cancel-safe by construction rather than by care: the caller builds a fresh
-/// one of these per write, so the sleep it ends with is the budget for *that*
-/// write and the previous write having completed has already reset it. Awaiting
-/// the state before the sleep is what also catches a FIN that lands while a
-/// write is already parked -- the arm is armed at the write's first poll,
-/// whether or not the other direction has ended by then.
+/// Cancel-safe because the caller builds a fresh one of these per write, so the
+/// sleep it ends with is the budget for *that* write. Awaiting the state before
+/// the sleep also catches a FIN that lands while a write is already parked: the
+/// arm is set up at the write's first poll, whether or not the other direction
+/// has ended by then.
 ///
 /// If the other pump ended some other way, the state is `TornDown`, and this
 /// stays pending for good: the other pump wrote its one value and returned, and
 /// this pump is still running, so nothing writes again while this waits. The
-/// teardown is the arm that acts on it, and this one stays out of the way.
+/// teardown arm acts on that state, not this one.
 ///
 /// Written as the same check-then-`changed` loop as [`torn_down`], for the
 /// reason given there.
@@ -310,7 +301,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     };
 
     // Port policy, resolution and destination policy, in that order and with
-    // every refusal already answered by the time this returns — see
+    // every refusal already answered by the time this returns; see
     // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
     // fields of its own, so the 200-then-close path is handed an empty list.
     let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, Fields::new).await
@@ -367,10 +358,10 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     // In all these cases, if the underlying TCP implementation permits it, the
     // proxy SHOULD send a TCP segment with the RST bit set." A write that
     // failed outright is the first case and a lapse is the second. Returning
-    // drops `tcp` and closes it either way; arming the reset first is what
-    // makes it the abortive close the SHOULD asks for, so a target is not left
-    // believing it was finished politely. Written once so the two cannot
-    // differ: the `Failed` arm used to return without it (review L8).
+    // drops `tcp` and closes it either way; arming the reset first makes it the
+    // abortive close the SHOULD asks for, so a target is not left believing it
+    // was finished politely. One check covers both cases, so they cannot
+    // differ.
     if !sent.landed(
         stream_id,
         Status::OK,
@@ -413,7 +404,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// several unreachable addresses cannot multiply the wait by their number. Why
 /// it is bounded at all: the tunnel slot and the file descriptor behind it are
 /// held for the length of this call, and a target that silently drops SYNs
-/// otherwise holds them for as long as the operating system retries — around two
+/// otherwise holds them for as long as the operating system retries, around two
 /// minutes on Linux. No attacker is needed for that; a handful of black-holed
 /// addresses during ordinary browsing is enough to spend a connection's whole
 /// `max_targets_per_conn` on tunnels that will never open.
@@ -498,8 +489,8 @@ async fn client_to_target(
     // made once per tunnel: at most `WRITE_BATCH_PIECES` handles.
     let mut batch: Vec<Bytes> = Vec::new();
 
-    // The two places that can notice a teardown — the wait for the client's
-    // next chunk and the write of the ones already in hand — end this direction
+    // Two places can notice a teardown: the wait for the client's next chunk
+    // and the write of the ones already in hand. Both end this direction
     // identically, and `OwnedWriteHalf::forget` consumes the half, so the
     // reason is carried out of the loop and acted on once below.
     let reason = loop {
@@ -517,25 +508,25 @@ async fn client_to_target(
                 // one read took. Nothing here waits or reports an ending: the
                 // client's FIN, a reset and a protocol violation found while
                 // gathering all come from the next `recv_data` above, after
-                // this write has finished, which is the order they had when
-                // each piece was written before the next was read.
+                // this write has finished.
                 gather(data, &mut reader, &mut batch);
 
                 // The write is under the same signal as the read, because it is
-                // the half that can park indefinitely: a target that has stopped
-                // reading fills every buffer between here and it, and a teardown
-                // raised by the other pump would otherwise wait for that write
-                // to finish before the socket could be closed at all —
+                // the half that can park indefinitely. A target that has
+                // stopped reading fills every buffer between here and it, and a
+                // teardown raised by the other pump would otherwise wait for
+                // that write to finish before the socket could be closed.
                 // RFC 9114 §4.4's "if a proxy detects an error with the stream
                 // or the QUIC connection, it MUST close the TCP connection"
-                // delayed for as long as a target chooses to stall.
+                // would then be delayed for as long as a target chooses to
+                // stall. `target_to_client` points here for this argument.
                 //
                 // Abandoning `write_batch` part-way is acceptable here and only
                 // here. Every path that raises a teardown ends with the target
                 // socket reset or dropped, so the target never sees a truncated
                 // batch followed by more of the tunnel: it sees the end of the
-                // connection. Resource bounds are unchanged: every path out of
-                // this arm but a completed write returns, and drops `batch`.
+                // connection. Every path out of this arm but a completed write
+                // returns, and drops `batch`.
                 //
                 // The client's own RESET_STREAM is the third thing that can
                 // end the wait, and it needs a branch of its own: the read
@@ -543,20 +534,20 @@ async fn client_to_target(
                 // write is, and a target that has stopped reading never ends
                 // the write. Without it, RFC 9114 §4.4's "If the proxy detects
                 // that the client has reset the stream or aborted reading from
-                // the stream, it MUST close the TCP connection" went unmet for
-                // the life of the QUIC connection -- the target socket, its
-                // file descriptor and the tunnel slot all held by a request the
-                // client had already abandoned.
+                // the stream, it MUST close the TCP connection" would go unmet
+                // for the life of the QUIC connection, with the target socket,
+                // its file descriptor and the tunnel slot all held by a request
+                // the client had already abandoned.
                 //
-                // That branch goes *last*, which is the one thing the ordering
-                // here decides. `biased` polls in order and stops at the first
-                // arm that is ready, so a write that completes on its first
-                // poll -- the ordinary case, a target keeping up -- never polls
-                // the watcher at all, and never arms the timer
+                // That branch goes *last*. `biased` polls in order and stops at
+                // the first arm that is ready, so a write that completes on its
+                // first poll (the ordinary case, a target keeping up) never
+                // polls the watcher at all. It then never arms the timer
                 // `Reader::reset_by_peer` falls back on while the client's next
-                // chunks are already buffered in quinn. The watcher only starts
-                // costing anything once the write is genuinely parked, which is
-                // the only state it is there for.
+                // chunks are already buffered in quinn. The watcher costs
+                // something only once the write is parked, which is the only
+                // state it is there for. Every watcher arm in both pumps goes
+                // last for this reason.
                 let written = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
@@ -565,13 +556,11 @@ async fn client_to_target(
                         client_aborted(&error, tcp_write, state);
                         return;
                     }
-                    // The mirror of the arm in `target_to_client`, and the same
-                    // argument in the other direction: once the target has sent
-                    // its EOF, the pump that would have noticed it stall is
-                    // gone, and a target that stops *reading* parks this write
-                    // for the life of the QUIC connection. It arms only after
-                    // that EOF, and it goes last for the reason the watcher
-                    // above does.
+                    // The mirror of the arm in `target_to_client`: once the
+                    // target has sent its EOF, the pump that would have noticed
+                    // it stall is gone, and a target that stops *reading* parks
+                    // this write for the life of the QUIC connection. It arms
+                    // only after that EOF, and goes last for the reason above.
                     () = stalled(&mut half_close_rx, State::TargetEof, budget) => {
                         debug!(
                             timeout_secs = budget.as_secs(),
@@ -602,10 +591,9 @@ async fn client_to_target(
             // and leave the other direction running, so anything the target
             // still has to say reaches the client.
             Ok(None) => {
-                // Recorded before the shutdown rather than after it, because
-                // this is the moment the other direction loses its watchdog:
-                // from here nothing but its own bound is left to notice a
-                // client that stops reading what it asked for.
+                // Recorded before the shutdown, because from this moment the
+                // other direction's own bound is the only thing left to notice
+                // a client that stops reading what it asked for.
                 state.send_replace(State::ClientFinished);
                 if let Err(error) = tcp_write.shutdown().await {
                     debug!(%error, "failed to shut down the target write side");
@@ -619,24 +607,23 @@ async fn client_to_target(
         }
     };
 
-    // The other direction ended the tunnel abnormally. Whatever ended it is
-    // spelled out on this half too, rather than left to the `Reader` drop to
-    // stop the client with code 0 — which would leave the two halves carrying
-    // different verdicts on the same event.
+    // The other direction ended the tunnel abnormally. The reason is put on
+    // this half too. Leaving it to the `Reader` drop would stop the client with
+    // code 0, and the two halves would carry different verdicts on one event.
     //
-    // Which code says which (RFC 9114 §4.4) is [`Teardown::code`]'s, so that
-    // the two pumps cannot answer the same event differently.
+    // [`Teardown::code`] chooses the code (RFC 9114 §4.4), so that the two
+    // pumps cannot answer the same event differently.
     //
-    // The ask reaches the wire here and not later: `stop_receiving` is
-    // `quinn::RecvStream::stop`, which queues STOP_SENDING at the point of call.
-    // On the half a client has already closed it is a no-op — quinn answers
+    // The STOP_SENDING reaches the wire here and not later: `stop_receiving` is
+    // `quinn::RecvStream::stop`, which queues it at the point of call. On the
+    // half a client has already closed it is a no-op: quinn answers
     // `ClosedStream`, which `FrameReader::stop` discards, because a stream that
     // is already over has nothing left to stop.
     reader.stop_receiving(reason.code());
 
     // Forgotten rather than dropped: shutting the write side down on the way out
     // would put a FIN on the wire, which is the wrong signal for every path that
-    // gets here — and would overtake the reset when the other pump armed one.
+    // gets here, and would overtake the reset when the other pump armed one.
     tcp_write.forget();
 }
 
@@ -686,13 +673,12 @@ fn gather(first: Bytes, reader: &mut Reader, batch: &mut Vec<Bytes>) {
 /// `write_vectored` may take any prefix of what it is offered, so after each
 /// call the pieces it took whole are dropped and the one it took part of is
 /// trimmed, and the rest is offered again. A TCP write half reports
-/// `is_write_vectored`, so each call is one `writev`; on a writer that did not,
+/// `is_write_vectored`, so each call is one `writev`. On a writer that did not,
 /// tokio would write the first piece per call, and the loop would still write
-/// every byte in order, one `write` per piece as before.
+/// every byte in order, one `write` per piece.
 ///
-/// Not cancel-safe, as `write_all` was not: abandoned part-way, some of `batch`
-/// has been written. `client_to_target` says why the places that abandon it
-/// may.
+/// Not cancel-safe: abandoned part-way, some of `batch` has been written.
+/// `client_to_target` says why the places that abandon it may.
 async fn write_batch(tcp: &mut OwnedWriteHalf, batch: &mut Vec<Bytes>) -> io::Result<()> {
     while !batch.is_empty() {
         let mut written = {
@@ -763,10 +749,10 @@ async fn target_to_client(
     let stopped = writer.stopped();
     tokio::pin!(stopped);
 
-    // Both places that can notice a teardown -- the wait for the target's next
-    // read and the write of the bytes already in hand -- end this direction
-    // identically, so the reason is carried out of the loop and acted on once
-    // below, exactly as `client_to_target` does it.
+    // The wait for the target's next read and the write of the bytes already
+    // in hand end this direction identically on a teardown, so the reason is
+    // carried out of the loop and acted on once below, as in
+    // `client_to_target`.
     let reason = loop {
         ensure_window(&mut buf);
         // Room for the DATA frame header, so that the read lands behind it and
@@ -778,23 +764,21 @@ async fn target_to_client(
             reason = torn_down(&mut teardown_rx) => break reason,
             read = tcp_read.read_buf(&mut buf) => read,
             // The third place a client abort can arrive, and the one the write
-            // arm below cannot cover: this read. RFC 9114 §4.4 -- "If the proxy
+            // arm below cannot cover: this read. RFC 9114 §4.4's "If the proxy
             // detects that the client has reset the stream or aborted reading
-            // from the stream, it MUST close the TCP connection" -- is met by
-            // the *other* pump for as long as that pump exists, and by
+            // from the stream, it MUST close the TCP connection" is met by the
+            // *other* pump for as long as that pump exists, and by
             // `send_data_in_place` failing for as long as there is something
-            // to send.
-            // Neither holds here: the client's own FIN ends the other pump
-            // without raising a teardown, and a target that has yet to say
-            // anything gives this one nothing to write. So a client that
-            // half-closed and then abandoned the tunnel -- which is what
-            // dropping a request stream is, a FIN and a STOP_SENDING -- left
-            // the target socket, its file descriptor and the tunnel slot held
-            // for the life of the QUIC connection (D87).
+            // to send. Neither holds here: the client's own FIN ends the other
+            // pump without raising a teardown, and a target that has yet to
+            // say anything gives this one nothing to write. Dropping a request
+            // stream sends a FIN and a STOP_SENDING, so without this arm a
+            // client that did so would leave the target socket, its file
+            // descriptor and the tunnel slot held for the life of the QUIC
+            // connection (D87).
             //
-            // Last in the order for the reason the watchers in
-            // `client_to_target` are: a read that is ready on its first poll
-            // never reaches this arm, so a busy tunnel never pays for it.
+            // Last in the order for the reason given in `client_to_target`: a
+            // read that is ready on its first poll never reaches this arm.
             error = &mut stopped => {
                 match h3api::peer_reset_code(&error) {
                     Some(code) => debug!(code, "client stopped reading the tunnel"),
@@ -832,11 +816,10 @@ async fn target_to_client(
                 let block = buf.split();
 
                 // The write is under the same signal as the read, for the
-                // reason its opposite number in `client_to_target` is: a client
-                // that has stopped reading grants no more flow-control credit,
+                // reason given in `client_to_target`. Here it is a client that
+                // has stopped reading: it grants no more flow-control credit,
                 // so this write parks until the connection ends, and a teardown
-                // raised by the other pump would wait behind it -- the target
-                // socket held open for as long as the client cares to stall.
+                // raised by the other pump would wait behind it.
                 //
                 // `send_data_in_place` is not cancel-safe, and its rustdoc
                 // carries the rule: the frame is one chunk, but quinn may have
@@ -850,30 +833,27 @@ async fn target_to_client(
                     reason = torn_down(&mut teardown_rx) => break reason,
                     sent = writer.send_data_in_place(block) => sent,
                     // Once the client has finished its sending side, the pump
-                    // that would have noticed it stop reading is gone -- its
-                    // `Ok(None)` arm raises no teardown, by design -- so this
-                    // write is all that is left to notice, and it would
+                    // that would have noticed it stop reading is gone (its
+                    // `Ok(None)` arm raises no teardown, by design). This write
+                    // is then the only thing left to notice, and it would
                     // otherwise park until the connection ends. Last in the
-                    // order for the reason the watcher in `client_to_target`
-                    // is: a write that completes on its first poll never arms
-                    // the timer at all.
+                    // order for the reason given in `client_to_target`.
                     () = stalled(&mut half_close_rx, State::ClientFinished, budget) => {
                         debug!(
                             timeout_secs = budget.as_secs(),
                             "client stopped reading after its own FIN, cutting the tunnel"
                         );
-                        // Reset rather than left to a FIN, and for the reason
-                        // the teardown arm below is: this write was abandoned
+                        // Reset rather than left to a FIN, for the reason the
+                        // teardown arm below is: this write was abandoned
                         // part-way, so the DATA frame on the wire is truncated
                         // and only a RESET_STREAM behind it stops that
-                        // truncation reading as a complete response. The same
-                        // argument, with RFC 9114 §7.1 quoted, is above.
+                        // truncation reading as a complete response.
+                        // `Writer::send_data` quotes RFC 9114 §7.1 on this.
                         writer.reset(h3api::REQUEST_CANCELLED);
                         abort_target(tcp_read.as_ref());
-                        // Nobody is listening -- the other pump returned when
-                        // the client finished -- but every other exit from this
-                        // loop says why it left, and an exit that quietly did
-                        // not would be the one to misread later.
+                        // Nobody reads this: the other pump returned when the
+                        // client finished. It is written so that every exit
+                        // from this loop records why it left.
                         state.send_replace(State::TornDown(Teardown::ClientAbort));
                         return;
                     }
@@ -904,18 +884,16 @@ async fn target_to_client(
         }
     };
 
-    // Returning without saying anything would drop the `Writer` — and a dropped
+    // Returning without a reset would drop the `Writer`, and a dropped
     // `quinn::SendStream` finishes rather than resets, so whatever of the
     // target's answer had not been sent would reach the client as a complete
-    // response. Both reasons are therefore spelled out here; only the code
-    // differs.
+    // response. Both reasons therefore reset here; only the code differs.
     //
-    // Which code says which is [`Teardown::code`]'s, the same table the read
-    // pump uses: RFC 9114 §4.4 asks that "if the stream is reset or reading is
-    // aborted by the client, a proxy SHOULD perform the same operation on the
-    // other direction in order to ensure that both directions of the stream are
-    // cancelled", and a client that reset only its sending side is exactly the
-    // case that used to be told its truncated response was complete.
+    // [`Teardown::code`] chooses the code, the same table the read pump uses:
+    // RFC 9114 §4.4 asks that "if the stream is reset or reading is aborted by
+    // the client, a proxy SHOULD perform the same operation on the other
+    // direction in order to ensure that both directions of the stream are
+    // cancelled".
     writer.reset(reason.code());
 }
 
@@ -927,10 +905,10 @@ async fn target_to_client(
 /// Reserved a block at a time rather than a window at a time: after the `split`
 /// that hands filled bytes on, what is left of the block is shared with the
 /// `Bytes` quinn is holding, so a `reserve` that cannot be satisfied from it
-/// allocates a whole new one. Asking only when fewer than a window remains is
-/// what lets consecutive reads come out of the same block -- see
-/// [`RELAY_BLOCK_SIZE`] for the arithmetic, and the tests below for the two
-/// halves of it that are pinned: every read, with its header room, is offered
+/// allocates a whole new one. Asking only when fewer than a window remains
+/// lets consecutive reads come out of the same block. See [`RELAY_BLOCK_SIZE`]
+/// for the arithmetic, and the tests below for the two halves of it that are
+/// pinned: every read, with its header room, is offered
 /// [`RELAY_BUF_SIZE`], and a block carries at least
 /// `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` before it is replaced.
 ///
@@ -961,20 +939,20 @@ fn ensure_window(buf: &mut BytesMut) {
 /// **This is only ever called on a path that cuts a live tunnel short**: the two
 /// client aborts, and the two bounds that fire when a half-closed tunnel's
 /// surviving direction stalls. A clean client FIN, a target EOF, and a target
-/// that resets or errors all keep their existing FIN semantics — the half-close
-/// table at the top of this module is the behaviour this proxy exists to get
-/// right, and a reset is not a substitute for any of it. The bounds are on the
-/// abortive side of that line because they leave a transfer unfinished: a FIN
-/// would tell the target the tunnel was seen through.
+/// that resets or errors all keep their FIN semantics. The half-close table at
+/// the top of this module is the behaviour this proxy exists to get right, and
+/// a reset is not a substitute for any of it. The bounds are on the abortive
+/// side because they leave a transfer unfinished: a FIN would tell the target
+/// the tunnel was seen through.
 ///
-/// On the FIN-then-stalled-client path that promise is only as good as the
-/// kernel makes it: the clean FIN went to the target when the client
-/// half-closed, so the socket is in FIN_WAIT_2 by cut time, and the armed reset
-/// can only chase a FIN the target already has. macOS sends that trailing RST;
-/// Linux's `tcp_need_reset()` does not include FIN_WAIT_2, so the close there
-/// is silent and the target learns nothing beyond the FIN — a SHOULD unmet, as
-/// below. The mirror path never sent a FIN, sits in ESTABLISHED or CLOSE_WAIT,
-/// and resets on every stack.
+/// On the FIN-then-stalled-client path the kernel decides whether the reset is
+/// sent. The clean FIN went to the target when the client half-closed, so the
+/// socket is in FIN_WAIT_2 when the tunnel is cut, and the armed reset can only
+/// follow a FIN the target already has. macOS sends that trailing RST. Linux's
+/// `tcp_need_reset()` does not include FIN_WAIT_2, so the close there is silent
+/// and the target learns nothing beyond the FIN: a SHOULD unmet, as below. The
+/// mirror path never sent a FIN, sits in ESTABLISHED or CLOSE_WAIT, and resets
+/// on every stack.
 ///
 /// `set_linger` is deprecated in tokio because `SO_LINGER` can make a close block
 /// the thread while the send buffer drains. That is the *non-zero* timeout; at
