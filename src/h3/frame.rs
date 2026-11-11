@@ -473,8 +473,7 @@ pub enum StreamKind {
     /// frame type alone are applied from the frame header, before the buffered
     /// length is looked at, so a frame the connection must close on cannot earn
     /// the stream error an oversized frame gets. Which of the rules applies
-    /// depends on whether SETTINGS has already been accepted, which the caller
-    /// carries in with `FrameDecoder::note_settings_seen`.
+    /// depends on whether the decoder has already handed out a SETTINGS frame.
     ServerControl,
     /// A request stream whose request has not completed.
     Request,
@@ -565,13 +564,13 @@ pub struct FrameDecoder {
     /// the moment its CONNECT is answered, and RFC 9114 §4.4 narrows what may
     /// follow to DATA alone.
     stream: StreamKind,
-    /// Whether the peer's SETTINGS has already been accepted on this stream.
+    /// Whether this decoder has handed out a SETTINGS frame that parsed.
     ///
-    /// Only [`StreamKind::ServerControl`] reads it. The decoder parses one item
-    /// at a time and cannot know what the caller did with the last one, so the
-    /// caller carries it in through [`Self::note_settings_seen`]. A fresh
-    /// decoder has not seen SETTINGS, which is the first-frame rule's starting
-    /// point (RFC 9114 §6.2.1).
+    /// Only [`StreamKind::ServerControl`] reads it. It is set when the frame is
+    /// handed out, so the next frame header is judged against it. A SETTINGS
+    /// whose payload was refused never sets it. A fresh decoder has not seen
+    /// SETTINGS, which is the first-frame rule's starting point (RFC 9114
+    /// §6.2.1).
     settings_seen: bool,
     /// Reserved or unknown frames skipped so far while this was a request
     /// stream (RFC 9114 §10.5).
@@ -606,15 +605,6 @@ impl FrameDecoder {
             skipped: 0,
             state: State::Header,
         }
-    }
-
-    /// Tells the decoder whether the peer's SETTINGS has been accepted yet.
-    ///
-    /// Called by the reader before asking for the next item, once per item the
-    /// caller has judged. Only [`StreamKind::ServerControl`] reads it: on every
-    /// other kind the timing rules stay with the caller.
-    pub(super) fn note_settings_seen(&mut self, seen: bool) {
-        self.settings_seen = seen;
     }
 
     /// Hands the decoder the next chunk of stream.
@@ -726,7 +716,9 @@ impl FrameDecoder {
                     // Before the parse, which may fail: the frame is no longer
                     // being held either way.
                     self.release();
-                    return Ok(Some(Item::Frame(parse(kind, payload)?)));
+                    let frame = parse(kind, payload)?;
+                    self.settings_seen |= matches!(frame, Frame::Settings(_));
+                    return Ok(Some(Item::Frame(frame)));
                 }
 
                 State::Skipping { kind, remaining } => {
@@ -868,8 +860,8 @@ impl FrameReader {
     /// from the frame header, and they are decided here before the buffered
     /// length is looked at: the length check hands out a stream error, and a
     /// stream error is the wrong answer to a frame the connection must close
-    /// on. Which of them applies depends on whether SETTINGS has been accepted,
-    /// so [`Self::note_settings_seen`] carries that in before each read.
+    /// on. Which of them applies depends on whether the decoder has handed out
+    /// a SETTINGS frame, which it records itself.
     pub(super) fn on_server_control(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
         Self::with_kind(recv, StreamKind::ServerControl, budget)
     }
@@ -881,12 +873,9 @@ impl FrameReader {
         Self::with_kind(recv, StreamKind::Request, budget)
     }
 
-    /// Carries the caller's SETTINGS state into the decoder.
-    ///
-    /// Called before each [`Self::next`] once the caller has judged the item
-    /// before it; see [`FrameDecoder::note_settings_seen`].
-    pub(super) fn note_settings_seen(&mut self, seen: bool) {
-        self.decoder.note_settings_seen(seen);
+    /// Whether this stream has handed out a SETTINGS frame that parsed.
+    pub(super) fn settings_seen(&self) -> bool {
+        self.decoder.settings_seen
     }
 
     fn with_kind(recv: quinn::RecvStream, stream: StreamKind, budget: Arc<BufferBudget>) -> Self {
@@ -1030,8 +1019,8 @@ fn unexpected(detail: &'static str) -> Violation {
 /// stream's first-frame rule is H3_MISSING_SETTINGS, so the violation is
 /// returned whole rather than as a reason phrase for the caller to wrap.
 ///
-/// `settings_seen` is the caller's answer to whether the peer's SETTINGS has
-/// been accepted and `length` the frame's declared payload length; only
+/// `settings_seen` is whether the decoder has already handed out a SETTINGS
+/// frame and `length` the frame's declared payload length; only
 /// [`StreamKind::ServerControl`] reads either. On that kind, the first-frame
 /// rule is judged from the header at every length for every buffered type but
 /// SETTINGS; after SETTINGS, HEADERS, PUSH_PROMISE and a second SETTINGS are

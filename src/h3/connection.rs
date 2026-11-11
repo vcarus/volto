@@ -1041,11 +1041,9 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
     //# The sender MUST NOT close the control stream, and the receiver
     //# MUST NOT request that the sender close the control stream.
     let ended: Cow<'static, str> = loop {
-        // Carried in before every read: the decoder parses one frame at a time,
-        // so the frame header it is about to judge has to be judged against
-        // what the last item left behind. `accept` is what sets it.
-        frames.note_settings_seen(control.settings);
-
+        // Read before `next`: the decoder records a SETTINGS when it returns
+        // one, and `accept` needs the state from before this item.
+        let settings_seen = frames.settings_seen();
         let item = match frames.next().await {
             Ok(Some(item)) => item,
 
@@ -1070,7 +1068,7 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
             }
         };
 
-        if let Err(violation) = control.accept(item, &handle.shared) {
+        if let Err(violation) = control.accept(item, settings_seen, &handle.shared) {
             handle.fail(violation);
             return;
         }
@@ -1125,11 +1123,11 @@ fn critical_stream_closed(
 /// The control stream's frame rules (RFC 9114 §6.2.1).
 ///
 /// Separated from the reading loop so the rules can be tested as a table rather
-/// than through a live connection.
+/// than through a live connection. Whether SETTINGS has been seen is not stored
+/// here: the stream's `FrameReader` records it, and [`Self::accept`] takes it as an
+/// argument.
 #[derive(Debug, Default)]
 struct Control {
-    /// Whether the peer's SETTINGS frame has been seen.
-    settings: bool,
     /// The last GOAWAY identifier the peer sent.
     goaway: Option<u64>,
     /// The largest push ID the peer has allowed (RFC 9114 §7.2.7), if any.
@@ -1157,7 +1155,9 @@ struct Control {
 
 impl Control {
     /// Applies one item from the control stream.
-    fn accept(&mut self, item: Item, shared: &Shared) -> Result<(), Violation> {
+    ///
+    /// `seen` is whether a SETTINGS frame came before this item.
+    fn accept(&mut self, item: Item, seen: bool, shared: &Shared) -> Result<(), Violation> {
         let frame = match item {
             Item::Frame(frame) => frame,
 
@@ -1166,7 +1166,7 @@ impl Control {
             // one is no different: §6.2.1 asks which frame *type* came first,
             // and a DATA frame that carries nothing is still a DATA frame.
             Item::Data(_) => {
-                return Err(if self.settings {
+                return Err(if seen {
                     unexpected("a DATA frame on the control stream")
                 } else {
                     missing_settings()
@@ -1179,7 +1179,7 @@ impl Control {
             // greasing endpoint is precisely the one testing whether this
             // server enforces that.
             Item::Skipped { kind } => {
-                if !self.settings {
+                if !seen {
                     return Err(missing_settings());
                 }
                 if let Some(skipped) = self.skipped.record() {
@@ -1194,9 +1194,8 @@ impl Control {
             }
         };
 
-        match (frame, self.settings) {
+        match (frame, seen) {
             (Frame::Settings(settings), false) => {
-                self.settings = true;
                 if settings.datagrams {
                     shared.peer_datagrams.store(true, Ordering::Relaxed);
                 }
@@ -1571,13 +1570,17 @@ mod tests {
             },
         ] {
             let error = Control::default()
-                .accept(first, &shared)
+                .accept(first, false, &shared)
                 .expect_err("refused");
             assert_eq!(error.code(), Code::H3_MISSING_SETTINGS);
             assert!(error.is_connection_error());
         }
 
-        assert!(Control::default().accept(settings(true), &shared).is_ok());
+        assert!(
+            Control::default()
+                .accept(settings(true), false, &shared)
+                .is_ok()
+        );
     }
 
     /// RFC 9114 §9 once the connection is up: an unknown frame type on the
@@ -1586,20 +1589,23 @@ mod tests {
     fn an_unknown_frame_after_settings_is_ignored() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         control
             .accept(
                 Item::Skipped {
                     kind: 0x1f * 6 + 0x21,
                 },
+                true,
                 &shared,
             )
             .expect("ignored");
 
         // And the stream carries on working afterwards.
         control
-            .accept(Item::Frame(Frame::Goaway(4)), &shared)
+            .accept(Item::Frame(Frame::Goaway(4)), true, &shared)
             .expect("accepted");
     }
 
@@ -1619,7 +1625,9 @@ mod tests {
 
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         for kind in 0..FLOOD {
             control
@@ -1627,6 +1635,7 @@ mod tests {
                     Item::Skipped {
                         kind: 0x1f * kind + 0x21,
                     },
+                    true,
                     &shared,
                 )
                 .expect("ignored");
@@ -1646,10 +1655,12 @@ mod tests {
     fn an_empty_data_frame_after_settings_is_still_unexpected() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         let error = control
-            .accept(Item::Data(Bytes::new()), &shared)
+            .accept(Item::Data(Bytes::new()), true, &shared)
             .expect_err("refused");
         assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
     }
@@ -1665,7 +1676,7 @@ mod tests {
             assert!(!seen_by_a_session.load(Ordering::Relaxed), "nothing yet");
 
             Control::default()
-                .accept(settings(datagrams), &shared)
+                .accept(settings(datagrams), false, &shared)
                 .expect("accepted");
 
             assert_eq!(seen_by_a_session.load(Ordering::Relaxed), datagrams);
@@ -1676,10 +1687,12 @@ mod tests {
     fn a_second_settings_frame_is_refused() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         let error = control
-            .accept(settings(true), &shared)
+            .accept(settings(true), true, &shared)
             .expect_err("refused");
         assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
     }
@@ -1689,10 +1702,12 @@ mod tests {
         let shared = Shared::default();
         for frame in [Frame::Headers(Bytes::new()), Frame::PushPromise] {
             let mut control = Control::default();
-            control.accept(settings(true), &shared).expect("accepted");
+            control
+                .accept(settings(true), false, &shared)
+                .expect("accepted");
 
             let error = control
-                .accept(Item::Frame(frame), &shared)
+                .accept(Item::Frame(frame), true, &shared)
                 .expect_err("refused");
             assert_eq!(error.code(), Code::H3_FRAME_UNEXPECTED);
         }
@@ -1704,10 +1719,12 @@ mod tests {
     fn a_cancel_push_names_a_push_that_was_never_promised() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         let error = control
-            .accept(Item::Frame(Frame::CancelPush(7)), &shared)
+            .accept(Item::Frame(Frame::CancelPush(7)), true, &shared)
             .expect_err("refused");
         assert_eq!(error.code(), Code::H3_ID_ERROR);
     }
@@ -1716,15 +1733,17 @@ mod tests {
     fn a_max_push_id_may_grow_but_not_shrink() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         for push_id in [9, 9, 12] {
             control
-                .accept(Item::Frame(Frame::MaxPushId(push_id)), &shared)
+                .accept(Item::Frame(Frame::MaxPushId(push_id)), true, &shared)
                 .expect("a push ID that does not shrink is allowed");
         }
         let error = control
-            .accept(Item::Frame(Frame::MaxPushId(8)), &shared)
+            .accept(Item::Frame(Frame::MaxPushId(8)), true, &shared)
             .expect_err("a smaller push ID is refused");
         assert_eq!(error.code(), Code::H3_ID_ERROR);
     }
@@ -1916,17 +1935,19 @@ mod tests {
     fn a_goaway_identifier_may_shrink_but_not_grow() {
         let shared = Shared::default();
         let mut control = Control::default();
-        control.accept(settings(true), &shared).expect("accepted");
+        control
+            .accept(settings(true), false, &shared)
+            .expect("accepted");
 
         control
-            .accept(Item::Frame(Frame::Goaway(12)), &shared)
+            .accept(Item::Frame(Frame::Goaway(12)), true, &shared)
             .expect("accepted");
         control
-            .accept(Item::Frame(Frame::Goaway(8)), &shared)
+            .accept(Item::Frame(Frame::Goaway(8)), true, &shared)
             .expect("a smaller identifier is allowed");
 
         let error = control
-            .accept(Item::Frame(Frame::Goaway(9)), &shared)
+            .accept(Item::Frame(Frame::Goaway(9)), true, &shared)
             .expect_err("refused");
         assert_eq!(error.code(), Code::H3_ID_ERROR);
     }
