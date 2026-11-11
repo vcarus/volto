@@ -26,7 +26,8 @@
 //! * **Private**: the special-purpose space this proxy might actually reach,
 //!   drawn from the IANA registries that RFC 6890 set up: `0.0.0.0/8`,
 //!   loopback, RFC 1918, link-local, shared address space, IETF protocol
-//!   assignments (`192.0.0.0/24`), the benchmarking and documentation ranges
+//!   assignments (`192.0.0.0/24`), the IPv6 anycast service addresses
+//!   (`2001:1::1` to `2001:1::3`), the benchmarking and documentation ranges
 //!   (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA, ORCHID
 //!   and ORCHIDv2, the DETs prefix, the discard-only prefix, the SRv6 SID
 //!   block, the local-use NAT64 prefix and the deprecated IPv4-compatible and
@@ -222,14 +223,13 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// Protocol Assignments (from RFC 2928), the IPv6 counterpart of
 /// `192.0.0.0/24`. Every one of its Source, Destination, Forwardable and Global
 /// attributes is "False\[1\]", and footnote \[1\] is "Unless allowed by a more
-/// specific allocation". Inside the /23 sit allocations that are routed
-/// services rather than reserved space: `2001:1::1` and `2001:1::2` (the PCP and
-/// TURN anycast addresses) and `2001:4:112::/48` (AS112). Denying the whole
-/// block would take those with it. So it is left public, and the more-specific
-/// allocations worth denying are claimed one at a time: the benchmarking range,
-/// ORCHID, ORCHIDv2 and DETs below. Teredo, also inside the /23, is not claimed.
-/// A Teredo address is judged by the IPv4 address it carries
-/// ([`embedded_ipv4`]).
+/// specific allocation". Inside the /23 sit allocations that are public
+/// services rather than reserved space, such as `2001:4:112::/48` (AS112).
+/// Denying the whole block would take those with it. So it is left public, and
+/// the more-specific allocations worth denying are claimed one at a time: the
+/// three anycast service addresses, the benchmarking range, ORCHID, ORCHIDv2
+/// and DETs below. Teredo, also inside the /23, is not claimed. A Teredo
+/// address is judged by the IPv4 address it carries ([`embedded_ipv4`]).
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -273,6 +273,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_site_local(v6)
                 || is_ipv4_compatible(v6)
                 || is_ipv6_documentation(v6)
+                || is_ipv6_protocol_anycast(v6)
                 || is_ipv6_benchmarking(v6)
                 || is_orchid(v6)
                 || is_det(v6)
@@ -305,6 +306,21 @@ fn is_ipv6_documentation(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
     (segments[0] == 0x2001 && segments[1] == 0x0db8)
         || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
+}
+
+/// `2001:1::1`, `2001:1::2` and `2001:1::3` are the IPv6 anycast service
+/// addresses: Port Control Protocol (RFC 7723), TURN (RFC 8155) and DNS-SD
+/// Service Registration Protocol (RFC 9665).
+///
+/// The IANA registry marks all three globally reachable. An anycast address
+/// reaches the instance nearest the sender, and through this proxy the sender
+/// is the proxy. The service a client reaches is therefore the one of the
+/// proxy's own network, which acts on the proxy's address: a PCP server opens
+/// a mapping for the host that asked. That is the rule `192.0.0.9` and
+/// `192.0.0.10` follow inside `192.0.0.0/24`, and these are the same services
+/// over IPv6. Each is one address, so the rest of `2001:1::/32` stays public.
+fn is_ipv6_protocol_anycast(v6: Ipv6Addr) -> bool {
+    matches!(v6.segments(), [0x2001, 0x0001, 0, 0, 0, 0, 0, 1..=3])
 }
 
 /// `2001:2::/48` — the IPv6 benchmarking range (RFC 6890 Table 24, from
@@ -869,6 +885,36 @@ mod tests {
             assert!(
                 permissive.allows_address(ip(address)),
                 "{address} must follow allow_private_networks"
+            );
+        }
+    }
+
+    /// The three IPv6 anycast service addresses in `2001:1::/32` are private,
+    /// and nothing else in that block is.
+    ///
+    /// They are the IPv6 counterparts of `192.0.0.9` and `192.0.0.10`, plus the
+    /// service registration address that has no IPv4 twin. The neighbours on
+    /// both sides stay public, because the block is claimed one allocation at a
+    /// time, and so does AS112, which is a public service rather than one of
+    /// the proxy's own network.
+    #[test]
+    fn the_ipv6_protocol_anycast_addresses_are_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+        for address in ["2001:1::1", "2001:1::2", "2001:1::3"] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is an anycast service address and must be denied by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+        for address in ["2001:1::", "2001:1::4", "2001:1:0:0:1::1", "2001:4:112::1"] {
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} is not one of the three anycast addresses and stays public"
             );
         }
     }
