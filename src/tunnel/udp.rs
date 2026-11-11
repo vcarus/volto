@@ -33,8 +33,13 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
 
-use bytes::Bytes;
+use std::cell::RefCell;
+use std::io::{IoSliceMut, Read};
+
+use bytes::{Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
+use socket2::SockRef;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
@@ -54,6 +59,176 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 /// Next to the template prefix because the two are the same RFC's wire syntax
 /// for the same request, and [`super::route`] is the one place that reads it.
 pub(super) const CONNECT_UDP: &str = "connect-udp";
+
+/// Bytes of block each receive from the target is offered behind the datagram
+/// prefix.
+///
+/// Every packet the QUIC datagram path can carry fits in it: a QUIC datagram
+/// travels inside one QUIC packet, and this server never lets a path's MTU
+/// exceed `config::MAX_MTU_UPPER_BOUND`, 1472 bytes. A longer packet continues
+/// into the receiving thread's overflow buffer and is copied out of it, which
+/// costs one copy on a packet the datagram path drops anyway and the capsule
+/// path copies anyway.
+pub const RECV_WINDOW: usize = 2 * 1024;
+
+/// The block a session receives its target's packets into.
+///
+/// # Why a block
+///
+/// Each packet is received straight behind its datagram prefix, and the
+/// prefix plus the packet are cut off the block and handed to quinn as one
+/// `Bytes`, with no copy and no allocation of their own. The pieces quinn
+/// holds share the block with the part the session goes on receiving into,
+/// so a block is freed only when the last piece cut from it has been sent or
+/// evicted.
+///
+/// # The arithmetic
+///
+/// A block is replaced only once fewer than the prefix plus [`RECV_WINDOW`]
+/// bytes are left in it, at most 9 + 2048 = 2057, so at least 14327 bytes of
+/// it have been used by then. A packet that is sent uses its encoded length
+/// of block; one that is dropped uses none, because the next packet is
+/// received over it. quinn counts each queued datagram as its encoded length
+/// plus 32 bytes of bookkeeping against `datagram_send_buffer_size`, 1 MiB by
+/// default, and sends and evicts in queue order. So the blocks a session's
+/// queued pieces keep alive are at most its counted bytes over 14327, plus the
+/// oldest block, partly released, plus the one being received into: at most
+/// 16384 / 14327 = 1.15 times what quinn counts, plus two blocks per session.
+///
+/// # What it costs at rest
+///
+/// Nothing until the target first sends: the block is allocated by the first
+/// receive, which runs only once the socket is readable. From then on a
+/// session holds one block across every wait, 16 KiB. The overflow buffer is
+/// one per runtime thread rather than one per session, 63479 bytes, and is
+/// allocated by the first long packet a thread receives.
+pub const RECV_BLOCK_SIZE: usize = 16 * 1024;
+
+thread_local! {
+    /// Where a target packet longer than [`RECV_WINDOW`] continues.
+    ///
+    /// Together with the window it offers [`MAX_UDP_PAYLOAD`] bytes, so no
+    /// packet is ever truncated: a UDP receive cuts a longer packet short
+    /// without saying so. One per thread is enough because it is filled and
+    /// emptied inside one synchronous call, [`PacketBlock::recv`], so no other
+    /// session can see its contents.
+    static OVERFLOW: RefCell<Box<[u8]>> =
+        RefCell::new(vec![0; MAX_UDP_PAYLOAD - RECV_WINDOW].into_boxed_slice());
+}
+
+/// The receive side of a session's target socket: each packet lands behind
+/// its datagram prefix in a [`RECV_BLOCK_SIZE`] block.
+///
+/// The prefix is the session's Quarter Stream ID and the Context ID 0, so it
+/// is the same for every packet. It is written once per piece cut from the
+/// block: a receive that finds nothing, and a packet that is dropped, leave
+/// the prefix and the window in place for the next receive.
+struct PacketBlock {
+    quarter_stream_id: u64,
+    prefix_len: usize,
+    /// The prefix and then [`RECV_WINDOW`] bytes while a packet may land in
+    /// them, and empty once a piece has been cut off.
+    block: BytesMut,
+    /// The packet in hand with its prefix, copied out, when it was longer than
+    /// the window.
+    spilled: Option<Bytes>,
+    /// The payload length of the packet in hand.
+    len: usize,
+}
+
+impl PacketBlock {
+    /// An empty receiver for `quarter_stream_id`'s session. Allocates nothing.
+    fn new(quarter_stream_id: u64) -> Self {
+        Self {
+            quarter_stream_id,
+            prefix_len: datagram::udp_payload_prefix_len(quarter_stream_id),
+            block: BytesMut::new(),
+            spilled: None,
+            len: 0,
+        }
+    }
+
+    /// Receives one packet from `socket` without waiting, returning its length.
+    ///
+    /// The `io::Result` is the socket's own: `WouldBlock` when nothing is
+    /// queued, which is what lets tokio's `async_io` and `try_io` drive this,
+    /// and every other error unchanged for [`read_verdict`]. A failed receive
+    /// changes nothing about the packet in hand.
+    fn recv(&mut self, socket: &UdpSocket) -> std::io::Result<usize> {
+        if self.block.is_empty() {
+            self.prepare();
+        }
+
+        let prefix_len = self.prefix_len;
+        let block = &mut self.block;
+        let (len, spilled) = OVERFLOW.with_borrow_mut(|overflow| {
+            let len = {
+                let socket = SockRef::from(socket);
+                let mut parts = [
+                    IoSliceMut::new(&mut block[prefix_len..]),
+                    IoSliceMut::new(overflow),
+                ];
+                (&*socket).read_vectored(&mut parts)?
+            };
+            // Copied out before the call returns, so the overflow is free for
+            // the next session on this thread.
+            let spilled = (len > RECV_WINDOW).then(|| {
+                let mut whole = BytesMut::with_capacity(prefix_len + len);
+                whole.extend_from_slice(&block[..]);
+                whole.extend_from_slice(&overflow[..len - RECV_WINDOW]);
+                whole.freeze()
+            });
+            Ok::<_, std::io::Error>((len, spilled))
+        })?;
+
+        self.len = len;
+        self.spilled = spilled;
+        Ok(len)
+    }
+
+    /// Writes the prefix and offers the window behind it, replacing the block
+    /// first if too little of it is left.
+    ///
+    /// Called only while `block` is empty. A `reserve` on an empty buffer whose
+    /// pieces have all been released takes the whole block back without
+    /// allocating; one whose pieces quinn still holds allocates a fresh block.
+    fn prepare(&mut self) {
+        debug_assert!(self.block.is_empty(), "the prefix is written once");
+        if self.block.capacity() < self.prefix_len + RECV_WINDOW {
+            self.block.reserve(RECV_BLOCK_SIZE);
+        }
+        datagram::put_udp_payload_prefix(&mut self.block, self.quarter_stream_id);
+        self.block.resize(self.prefix_len + RECV_WINDOW, 0);
+    }
+
+    /// The length of the packet in hand as an HTTP Datagram.
+    fn encoded_len(&self) -> usize {
+        self.prefix_len + self.len
+    }
+
+    /// The packet in hand, without its prefix.
+    fn payload(&self) -> &[u8] {
+        match &self.spilled {
+            Some(whole) => &whole[self.prefix_len..],
+            None => &self.block[self.prefix_len..self.prefix_len + self.len],
+        }
+    }
+
+    /// The packet in hand as an HTTP Datagram, cut off the block.
+    ///
+    /// Byte for byte what [`datagram::encode_udp_payload`] makes of
+    /// [`Self::payload`]. Called at most once per packet, and only for a packet
+    /// that is sent: the next receive prepares a fresh prefix and window.
+    fn take(&mut self) -> Bytes {
+        if let Some(whole) = self.spilled.take() {
+            return whole;
+        }
+
+        let piece = self.block.split_to(self.prefix_len + self.len).freeze();
+        self.block.clear();
+        piece
+    }
+}
 
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
@@ -301,7 +476,8 @@ enum Event {
     /// A payload the connection's datagram router decoded for this session, or
     /// `None` if it will send nothing further.
     Inbound(Option<Bytes>),
-    /// A packet read from the target socket, or the error that ended it.
+    /// A packet read from the target socket into the session's
+    /// [`PacketBlock`], with its length, or the error that ended it.
     Socket(std::io::Result<usize>),
     /// A chunk of the request stream's capsule sequence, its end, or its error.
     Stream(Result<Option<Bytes>, h3api::StreamError>),
@@ -356,22 +532,27 @@ impl Session<'_> {
     async fn run(&mut self) {
         let stream_id = self.stream_id;
 
-        // A UDP datagram can be at most this big, so one buffer serves forever.
-        // It cannot be smaller: `UdpSocket::recv` truncates a longer packet
-        // silently rather than reporting it, and the capsule fallback forwards
-        // packets up to this size. The ~64 KiB is held for the life of the
-        // session, and is one of the two per-session terms in the memory
+        // Each target packet lands behind its datagram prefix in a block, so
+        // the datagram path hands quinn a piece of the block rather than a
+        // copy. Nothing is allocated until the target first sends; after that
+        // the session holds one `RECV_BLOCK_SIZE` block, 16 KiB, across every
+        // wait. That block is one of the per-session terms in the memory
         // product `docs/configuration.md` gives for `max_connections` x
-        // `max_targets_per_conn`; the other is the inbound datagram queue,
-        // `INBOUND_QUEUE_DEPTH` in `crate::h3::connection`.
-        let mut packet = vec![0u8; MAX_UDP_PAYLOAD];
+        // `max_targets_per_conn`; the others are the inbound datagram queue,
+        // `INBOUND_QUEUE_DEPTH` in `crate::h3::connection`, and the capsule
+        // decoder. See [`RECV_BLOCK_SIZE`] for what pieces still in quinn's
+        // queue can add to it.
+        let mut packets = PacketBlock::new(self.quarter_stream_id);
 
         loop {
             // The deadline covers *waiting for* one of the three sources and
             // nothing else: all three awaits below are cancel-safe
-            // (`DatagramReceiver::recv`, `UdpSocket::recv` and the stream read
-            // all resume where they left off), so an expiry here cannot lose
-            // anything half-done.
+            // (`DatagramReceiver::recv`, the socket's `async_io` and the stream
+            // read all resume where they left off), so an expiry here cannot
+            // lose anything half-done. The socket's receive runs only once the
+            // socket is ready, inside one poll, and the same `READABLE |
+            // ERROR` interest `UdpSocket::recv` waits on is what wakes the
+            // session for an ICMP error queued on the socket.
             //
             // Handling the event is deliberately outside it. `forward_to_client`
             // writes to the request stream on the capsule path, and a write in
@@ -397,7 +578,10 @@ impl Session<'_> {
             let sources = async {
                 tokio::select! {
                     payload = self.inbound.recv() => Event::Inbound(payload),
-                    received = self.socket.recv(&mut packet) => Event::Socket(received),
+                    received = self.socket.async_io(
+                        Interest::READABLE | Interest::ERROR,
+                        || packets.recv(&self.socket),
+                    ) => Event::Socket(received),
                     chunk = self.reader.recv_data() => Event::Stream(chunk),
                 }
             };
@@ -416,7 +600,7 @@ impl Session<'_> {
                 // Only reachable if the routing table lost this session's
                 // entry, which nothing but dropping `inbound` can do.
                 Event::Inbound(None) => Step::Stop,
-                Event::Socket(Ok(length)) => self.forward_to_client(&packet[..length]).await,
+                Event::Socket(Ok(_)) => self.forward_to_client(&mut packets).await,
                 Event::Socket(Err(error)) => {
                     // ICMP errors surface here on a connected socket, and they
                     // are not all the same thing. A socket the operating system
@@ -584,8 +768,8 @@ impl Session<'_> {
             .flatten()
     }
 
-    /// Forwards a packet received from the target to the client.
-    async fn forward_to_client(&mut self, packet: &[u8]) -> Step {
+    /// Forwards the packet in `packets` to the client.
+    async fn forward_to_client(&mut self, packets: &mut PacketBlock) -> Step {
         let stream_id = self.stream_id;
 
         // The socket is connected, so anything arriving here really is from the
@@ -599,11 +783,7 @@ impl Session<'_> {
         self.ctx.refund_unanswered(charged);
         self.touch();
 
-        let encoded_len = datagram::encoded_len(
-            self.quarter_stream_id,
-            datagram::CONTEXT_ID_UDP_PAYLOAD,
-            packet.len(),
-        );
+        let encoded_len = packets.encoded_len();
 
         // Both halves of the datagram path have to be there, and they are
         // negotiated separately: `SETTINGS_H3_DATAGRAM` is the HTTP/3 one
@@ -656,7 +836,9 @@ impl Session<'_> {
                 }
             }
 
-            let encoded = datagram::encode_udp_payload(self.quarter_stream_id, packet);
+            // Cut off the block only now, once the packet is known to be sent:
+            // a dropped packet leaves its bytes to the next receive.
+            let encoded = packets.take();
 
             // quinn's `send_datagram` is `send(data, drop = true)`: when the
             // outgoing queue would grow past `datagram_send_buffer_size` it
@@ -722,7 +904,7 @@ impl Session<'_> {
         // not the same situation as the oversize case above: there a datagram
         // path exists and RFC 9298 §6.1 says not to bypass it, whereas here
         // there is none, so capsules are the correct channel.
-        let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packet);
+        let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packets.payload());
 
         // The one write in this session that can block for as long as the peer
         // likes: `send_data` applies the peer's flow control, so a client that
@@ -1238,6 +1420,206 @@ mod tests {
             before_deadline(deadline, std::future::pending::<()>()).await,
             None,
             "the idle bound did not expire at the deadline"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The receive block
+    // -----------------------------------------------------------------------
+    //
+    // A pair of connected loopback sockets stands in for a session's target
+    // socket and the target. The socket is driven the way the session drives
+    // it, through `async_io` with the interest `UdpSocket::recv` uses.
+
+    /// A target socket and the socket of the target it is connected to.
+    async fn socket_pair() -> (UdpSocket, UdpSocket) {
+        let ours = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        ours.connect(target.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        target
+            .connect(ours.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        (ours, target)
+    }
+
+    /// Sends `payload` from the target and receives it into `packets`.
+    async fn deliver(
+        packets: &mut PacketBlock,
+        ours: &UdpSocket,
+        target: &UdpSocket,
+        payload: &[u8],
+    ) {
+        target.send(payload).await.expect("send");
+        let len = ours
+            .async_io(Interest::READABLE | Interest::ERROR, || packets.recv(ours))
+            .await
+            .expect("receive");
+        assert_eq!(len, payload.len(), "the packet arrived whole");
+        assert_eq!(packets.payload(), payload);
+    }
+
+    /// Payload bytes that differ from packet to packet and within one.
+    fn payload(seed: usize, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from((seed * 31 + i) % 251).expect("below 251"))
+            .collect()
+    }
+
+    /// Two packets in a row are cut from one block, one right behind the
+    /// other, and each is the datagram `encode_udp_payload` would have built.
+    ///
+    /// The Quarter Stream IDs are the edges of the one- and two-byte varints,
+    /// so the prefix is written at both lengths a real session uses.
+    #[tokio::test]
+    async fn consecutive_packets_come_out_of_one_block() {
+        for quarter_stream_id in [0, 0x3f, 0x40, 0x3fff] {
+            let (ours, target) = socket_pair().await;
+            let mut packets = PacketBlock::new(quarter_stream_id);
+
+            let first = payload(1, 100);
+            deliver(&mut packets, &ours, &target, &first).await;
+            let first_piece = packets.take();
+
+            let second = payload(2, 1200);
+            deliver(&mut packets, &ours, &target, &second).await;
+            let second_piece = packets.take();
+
+            assert_eq!(
+                first_piece,
+                datagram::encode_udp_payload(quarter_stream_id, &first)
+            );
+            assert_eq!(
+                second_piece,
+                datagram::encode_udp_payload(quarter_stream_id, &second)
+            );
+            assert!(
+                std::ptr::eq(first_piece.as_ptr_range().end, second_piece.as_ptr()),
+                "the second datagram of quarter stream id {quarter_stream_id} was not cut \
+                 from the block right behind the first"
+            );
+        }
+    }
+
+    /// A packet that is dropped gives its bytes to the next one.
+    ///
+    /// The oversize drop never cuts the packet off the block, so the next
+    /// packet is received over it rather than behind it.
+    #[tokio::test]
+    async fn a_dropped_packet_leaves_its_bytes_to_the_next() {
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(9);
+
+        deliver(&mut packets, &ours, &target, &payload(1, 1400)).await;
+        let dropped_at = packets.payload().as_ptr();
+
+        let kept = payload(2, 64);
+        deliver(&mut packets, &ours, &target, &kept).await;
+        assert!(
+            std::ptr::eq(packets.payload().as_ptr(), dropped_at),
+            "the packet after a drop landed somewhere other than where the drop was"
+        );
+        assert_eq!(packets.take(), datagram::encode_udp_payload(9, &kept));
+    }
+
+    /// A receive that finds nothing leaves the prefix in place, and the next
+    /// receive does not write it again.
+    ///
+    /// The session's wait can end in the socket being ready with nothing to
+    /// read, or in another source winning the `select!`; either way the
+    /// prepared window is kept, and a second prefix in front of it would put
+    /// the payload two bytes late.
+    #[tokio::test]
+    async fn a_receive_that_finds_nothing_keeps_one_prefix() {
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(0x40);
+
+        let nothing = packets.recv(&ours).expect_err("nothing was sent yet");
+        assert_eq!(nothing.kind(), std::io::ErrorKind::WouldBlock);
+
+        let sent = payload(3, 500);
+        deliver(&mut packets, &ours, &target, &sent).await;
+        assert_eq!(packets.take(), datagram::encode_udp_payload(0x40, &sent));
+    }
+
+    /// A packet longer than the window arrives whole, through the overflow, and
+    /// the packet after it is back in the block.
+    ///
+    /// 8000 bytes stays under the 9216-byte datagram limit macOS applies by
+    /// default, so the test runs on both hosts.
+    #[tokio::test]
+    async fn a_packet_longer_than_the_window_arrives_whole() {
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(5);
+
+        for len in [RECV_WINDOW, RECV_WINDOW + 1, 8000] {
+            let long = payload(len, len);
+            deliver(&mut packets, &ours, &target, &long).await;
+            assert_eq!(packets.encoded_len(), 2 + len);
+            assert_eq!(packets.take(), datagram::encode_udp_payload(5, &long));
+        }
+
+        let short = payload(4, 300);
+        deliver(&mut packets, &ours, &target, &short).await;
+        assert!(packets.spilled.is_none(), "a short packet is not copied");
+        assert_eq!(packets.take(), datagram::encode_udp_payload(5, &short));
+    }
+
+    /// The window and the overflow together hold the largest UDP payload, and
+    /// the window holds every packet the datagram path can carry.
+    #[test]
+    fn a_receive_is_offered_a_whole_udp_payload() {
+        let overflow = OVERFLOW.with_borrow(|overflow| overflow.len());
+        assert_eq!(RECV_WINDOW + overflow, MAX_UDP_PAYLOAD);
+        assert!(RECV_WINDOW >= usize::from(crate::config::MAX_MTU_UPPER_BOUND));
+
+        let mut packets = PacketBlock::new(datagram::MAX_QUARTER_STREAM_ID);
+        packets.prepare();
+        assert_eq!(packets.block.len(), 9 + RECV_WINDOW);
+        assert!(packets.block.capacity() <= RECV_BLOCK_SIZE);
+    }
+
+    /// Small packets fill a block before it is replaced, so what a session
+    /// pins is bounded by the bytes it sent rather than by how small its
+    /// packets are.
+    ///
+    /// Every piece is held for the whole run, the way quinn holds a queued
+    /// datagram, so a `reserve` cannot quietly take a block back. Blocks are
+    /// counted by the pointer jumping.
+    #[tokio::test]
+    async fn a_block_carries_what_its_arithmetic_says() {
+        const PACKET: usize = 100;
+        const PACKETS: usize = 2000;
+        /// What a block must carry before it may be replaced: 16384 less the
+        /// largest prefix and the window. Spelled out rather than derived, so
+        /// that a change to either constant has to change this as well.
+        const CARRIED: usize = 14327;
+
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(1);
+        let mut held = Vec::with_capacity(PACKETS);
+        let mut blocks = 0usize;
+        let mut next = std::ptr::null();
+
+        for seed in 0..PACKETS {
+            deliver(&mut packets, &ours, &target, &payload(seed, PACKET)).await;
+            let piece = packets.take();
+            if !std::ptr::eq(piece.as_ptr(), next) {
+                blocks += 1;
+            }
+            next = piece.as_ptr_range().end;
+            held.push(piece);
+        }
+
+        assert_eq!(RECV_BLOCK_SIZE - 9 - RECV_WINDOW, CARRIED);
+        let used = PACKETS * (2 + PACKET);
+        let ceiling = used / CARRIED + 1;
+        assert!(
+            blocks <= ceiling,
+            "{PACKETS} packets of {PACKET} bytes used {used} bytes of block and took \
+             {blocks} blocks, over the {ceiling} that carrying {CARRIED} bytes each allows"
         );
     }
 

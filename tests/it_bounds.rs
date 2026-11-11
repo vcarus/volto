@@ -282,8 +282,8 @@ const MAX_CAPSULE_VALUE: u64 = 8 + 65527;
 /// because a UDP payload cannot be forwarded piecewise. A peer that declares the
 /// largest value the decoder admits and then stops one byte short leaves that
 /// much buffered until the session's idle timeout -- which is a *third*
-/// per-session buffer, beside the 64 KiB target-socket buffer and the ~92 KiB
-/// inbound datagram queue.
+/// per-session buffer, beside the 16 KiB block target packets are received into
+/// and the ~92 KiB inbound datagram queue.
 ///
 /// The ceiling is four times the value itself: room for `BytesMut` to have
 /// doubled its way there and for the reads that carried it, and a refusal of any
@@ -389,12 +389,12 @@ const CHURNED_SESSIONS: usize = 64;
 /// Live bytes one connection may keep per session it has already closed.
 ///
 /// Nothing keeps a *session's* memory: the tunnel slot, the Quarter Stream ID
-/// registration, the inbound queue, the target socket, the 64 KiB packet buffer,
+/// registration, the inbound queue, the target socket, the 16 KiB packet block,
 /// the capsule decoder and the decoded request are all owned by things that end
 /// with it. What a connection does keep is quinn's own per-stream bookkeeping,
 /// which is why this is not zero.
 ///
-/// 8 KiB apiece is two orders of magnitude under the ~156 KiB a live session
+/// 8 KiB apiece is an order of magnitude under the ~108 KiB a live session
 /// costs, so a release path that stopped firing cannot pass this.
 const KEPT_PER_CLOSED_SESSION: i64 = 8 * 1024;
 
@@ -432,9 +432,10 @@ async fn close_session(session: &mut ClientStream) {
 ///
 /// On the dev host (macOS, debug build), 64 sessions opened, exercised and
 /// closed one after another leave about 39 KiB behind in total: roughly 630
-/// bytes a session, against the ~156 KiB each of them held while it was live.
-/// Left open instead of closed, the same run leaves 4.5 MiB behind, so the
-/// allowance below is thirteen times the measurement and a ninth of a leak.
+/// bytes a session, against the ~108 KiB each of them held while it was live.
+/// Left open instead of closed, the same run leaves 1.9 MiB behind (4.5 MiB
+/// while a session still read its target into a 64 KiB buffer), so the
+/// allowance below is thirteen times the measurement and a quarter of a leak.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_keeps_nothing_for_the_sessions_it_has_closed() {
     let _scales = SCALES.lock().await;

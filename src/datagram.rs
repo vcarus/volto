@@ -111,6 +111,29 @@ pub fn quarter_stream_id(stream_id: u64) -> u64 {
     stream_id >> 2
 }
 
+/// The length of the bytes in front of a raw UDP payload: the Quarter Stream ID
+/// and the Context ID 0, each as a varint.
+///
+/// Constant for a session, because both values are. [`put_udp_payload_prefix`]
+/// writes exactly this many bytes.
+pub fn udp_payload_prefix_len(quarter_stream_id: u64) -> usize {
+    varint_len(quarter_stream_id) + varint_len(CONTEXT_ID_UDP_PAYLOAD)
+}
+
+/// Writes the bytes [`encode_udp_payload`] puts in front of a raw UDP payload.
+///
+/// For a caller that receives the payload straight behind this prefix in a
+/// buffer of its own, so the datagram is never copied. The prefix and the
+/// payload together are byte for byte what [`encode_udp_payload`] returns.
+///
+/// # Panics
+///
+/// As [`put_varint`] does, if `buf` cannot hold the prefix.
+pub fn put_udp_payload_prefix(buf: &mut impl BufMut, quarter_stream_id: u64) {
+    put_varint(buf, quarter_stream_id);
+    put_varint(buf, CONTEXT_ID_UDP_PAYLOAD);
+}
+
 /// Encodes a datagram for `quarter_stream_id` carrying a raw UDP payload.
 pub fn encode_udp_payload(quarter_stream_id: u64, payload: &[u8]) -> Bytes {
     encode(quarter_stream_id, CONTEXT_ID_UDP_PAYLOAD, payload)
@@ -392,6 +415,43 @@ mod tests {
                 encoded.len(),
                 encoded_len(qsid, CONTEXT_ID_UDP_PAYLOAD, payload_len)
             );
+        }
+    }
+
+    /// A prefix written in place followed by the payload is the datagram
+    /// [`encode_udp_payload`] builds, at Quarter Stream IDs on both sides of
+    /// every varint length boundary.
+    #[test]
+    fn a_prefix_written_in_place_is_the_encoded_datagram() {
+        let quarter_stream_ids = [
+            0,
+            0x3f,
+            0x40,
+            0x3fff,
+            0x4000,
+            0x3fff_ffff,
+            0x4000_0000,
+            MAX_QUARTER_STREAM_ID,
+        ];
+
+        for quarter_stream_id in quarter_stream_ids {
+            for payload in [&b""[..], b"x", &[0xa5; 1200]] {
+                let mut built = BytesMut::new();
+                put_udp_payload_prefix(&mut built, quarter_stream_id);
+                assert_eq!(
+                    built.len(),
+                    udp_payload_prefix_len(quarter_stream_id),
+                    "prefix length at quarter stream id {quarter_stream_id}"
+                );
+                built.extend_from_slice(payload);
+
+                assert_eq!(
+                    built.freeze(),
+                    encode_udp_payload(quarter_stream_id, payload),
+                    "quarter stream id {quarter_stream_id}, {} payload bytes",
+                    payload.len()
+                );
+            }
         }
     }
 
