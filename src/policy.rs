@@ -30,7 +30,7 @@
 //!   (`2001:1::1` to `2001:1::3`), the AMT relay discovery prefixes
 //!   (`192.52.193.0/24` and `2001:3::/32`), the benchmarking and documentation
 //!   ranges (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA,
-//!   ORCHID and ORCHIDv2, the DETs prefix, the discard-only prefix, the SRv6 SID
+//!   ORCHID and ORCHIDv2, the DETs prefix, the discard-only and dummy prefixes, the SRv6 SID
 //!   block, the local-use NAT64 prefix and the deprecated IPv4-compatible and
 //!   IPv6 site-local spaces. Denied by default, unlocked by
 //!   `allow_private_networks`.
@@ -283,6 +283,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_orchid(v6)
                 || is_det(v6)
                 || is_discard_only(v6)
+                || is_dummy_prefix(v6)
                 || is_local_use_nat64(v6)
                 || is_srv6_sids(v6)
         }
@@ -392,6 +393,17 @@ fn is_det(v6: Ipv6Addr) -> bool {
 fn is_discard_only(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
     segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0)
+}
+
+/// `100:0:0:1::/64` is the Dummy IPv6 Prefix (RFC 9780).
+///
+/// The IANA registry marks it not globally reachable and not a destination.
+/// RFC 9780 Section 1 allocates it for the address written into the IP/UDP
+/// encapsulation of management, control and OAM packets, where it is meant to
+/// raise an exception and not to be delivered. Nothing answers there, so a
+/// tunnel to it can only hold a slot.
+fn is_dummy_prefix(v6: Ipv6Addr) -> bool {
+    matches!(v6.segments(), [0x0100, 0, 0, 1, ..])
 }
 
 /// `5f00::/16` is the Segment Routing (SRv6) SID block.
@@ -643,7 +655,7 @@ mod tests {
         "fbff::1",      // just below fc00::/7
         "fe7f::1",      // just below fe80::/10; above it fec0::/10 runs into ff00::/8
         "2001:db9::1",  // just above 2001:db8::/32
-        "100:0:0:1::1", // just outside 100::/64
+        "100:0:0:2::1", // just above 100::/64 and the dummy prefix 100:0:0:1::/64
         // Teredo is 2001::/32 and is unwrapped before the rules run, so the
         // address just below 2001:2::/48 is taken from 2001:1::/32.
         "2001:1:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:2::/48
@@ -985,6 +997,32 @@ mod tests {
                 "{address} is outside the AMT prefixes and stays public"
             );
         }
+    }
+
+    /// The Dummy IPv6 Prefix `100:0:0:1::/64` is private, and the /64 after it
+    /// is not.
+    #[test]
+    fn the_dummy_ipv6_prefix_is_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+        for address in [
+            "100:0:0:1::",
+            "100:0:0:1::1",
+            "100:0:0:1:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is in the dummy prefix and must be denied by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+        assert!(
+            strict.allows_address(ip("100:0:0:2::1")),
+            "the /64 after the dummy prefix is ordinary address space"
+        );
     }
 
     /// NAT64, 6to4 and Teredo addresses are routes to an IPv4 address, so they
