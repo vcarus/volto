@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, bail};
 
 use super::{
-    Config, INITIAL_RTT_RANGE_MS, MAX_EXPECTED_SNI, MAX_IDLE_TIMEOUT_CEILING, MAX_INITIAL_MTU,
-    MAX_MTU_UPPER_BOUND, MAX_SHUTDOWN_GRACE, MAX_SOCKET_BUFFER, MAX_STREAMS_BIDI_CEILING,
-    MAX_TARGETS_PER_CONN_CEILING, MIN_INITIAL_MTU,
+    Auth, Config, INITIAL_RTT_RANGE_MS, Limits, MAX_EXPECTED_SNI, MAX_IDLE_TIMEOUT_CEILING,
+    MAX_INITIAL_MTU, MAX_MTU_UPPER_BOUND, MAX_SHUTDOWN_GRACE, MAX_SOCKET_BUFFER,
+    MAX_STREAMS_BIDI_CEILING, MAX_TARGETS_PER_CONN_CEILING, MIN_INITIAL_MTU, Security, Server,
 };
 
 impl Config {
@@ -15,270 +15,293 @@ impl Config {
     /// without touching the filesystem.
     pub fn validate(&self) -> Result<()> {
         validate_log_level(&self.log.level)?;
-
-        if self.server.alpn.is_empty() {
-            bail!("server.alpn must list at least one protocol identifier");
-        }
-        for (i, id) in self.server.alpn.iter().enumerate() {
-            if id.is_empty() {
-                bail!("server.alpn[{i}] is empty");
-            }
-            // An ALPN identifier is length-prefixed with a single byte on the
-            // wire, so it cannot exceed 255 bytes.
-            if id.len() > 255 {
-                bail!(
-                    "server.alpn[{i}] is {} bytes, the wire format allows at most 255",
-                    id.len()
-                );
-            }
-        }
-
-        if self.server.shutdown_grace > MAX_SHUTDOWN_GRACE {
-            bail!(
-                "server.shutdown_grace = {} exceeds {MAX_SHUTDOWN_GRACE} seconds; \
-                 a drain that long outlives the service manager's own kill timeout, \
-                 and use 0 to close every tunnel at once instead",
-                self.server.shutdown_grace
-            );
-        }
-
-        if self.limits.udp_session_timeout == 0
-            || self.limits.udp_session_timeout > MAX_IDLE_TIMEOUT_CEILING
-        {
-            bail!(
-                "limits.udp_session_timeout = {} must be between 1 and \
-                 {MAX_IDLE_TIMEOUT_CEILING} seconds",
-                self.limits.udp_session_timeout
-            );
-        }
-        if self.limits.connect_timeout > MAX_IDLE_TIMEOUT_CEILING {
-            bail!(
-                "limits.connect_timeout = {} exceeds {MAX_IDLE_TIMEOUT_CEILING} seconds; \
-                 use 0 to disable the budget instead",
-                self.limits.connect_timeout
-            );
-        }
-        if self.limits.max_targets_per_conn == 0 {
-            bail!("limits.max_targets_per_conn must be greater than zero");
-        }
-        if self.limits.max_targets_per_conn > MAX_TARGETS_PER_CONN_CEILING {
-            bail!(
-                "limits.max_targets_per_conn = {} exceeds the {MAX_TARGETS_PER_CONN_CEILING} \
-                 this server allows; every tunnel costs a file descriptor",
-                self.limits.max_targets_per_conn
-            );
-        }
-
-        if self.limits.max_streams_bidi == 0 {
-            bail!(
-                "limits.max_streams_bidi must be greater than zero, or no tunnel could \
-                 ever be opened"
-            );
-        }
-        if self.limits.max_streams_bidi > MAX_STREAMS_BIDI_CEILING {
-            bail!(
-                "limits.max_streams_bidi = {} exceeds the {MAX_STREAMS_BIDI_CEILING} this \
-                 server allows; a stream slot is reserved for every unit of the credit when \
-                 the allowance is granted, so the value is paid in one go by a connection's \
-                 first authenticated request rather than when a stream is opened",
-                self.limits.max_streams_bidi
-            );
-        }
-
-        if self.limits.max_idle_timeout == 0
-            || self.limits.max_idle_timeout > MAX_IDLE_TIMEOUT_CEILING
-        {
-            bail!(
-                "limits.max_idle_timeout = {} must be between 1 and \
-                 {MAX_IDLE_TIMEOUT_CEILING} seconds",
-                self.limits.max_idle_timeout
-            );
-        }
-
-        // Strictly below half, not at it: at exactly half, losing a single
-        // keep-alive packet is enough for the connection to time out. The relay in
-        // front of this server is the reason keep-alives exist at all — its UDP
-        // conntrack entry expires on its own schedule (30s by default), and only a
-        // keep-alive that comfortably beats both timeouts keeps the NAT mapping
-        // alive.
-        //
-        // Written as `interval >= ceil(idle / 2)` rather than the more obvious
-        // `interval * 2 >= idle`: the two reject exactly the same pairs of
-        // integers, and this one cannot overflow. The doubling could, and a
-        // `u64` large enough to make it — anything above `u64::MAX / 2` — is
-        // reachable straight from the file, since TOML integers deserialize
-        // across the whole target type's range. A debug build panicked inside
-        // this function; a release build wrapped the product to something small,
-        // accepted the interval, and handed it to quinn, where it becomes
-        // `Instant::now() + interval` the moment a connection is established and
-        // panics the connection driver instead (D86).
-        if self.limits.keep_alive_interval > 0
-            && self.limits.keep_alive_interval >= self.limits.max_idle_timeout.div_ceil(2)
-        {
-            // The ceiling on this field is 3600 seconds, so the halving is
-            // always exact in an `f64`; `From` has no `u64` impl to say so.
-            #[allow(clippy::as_conversions)]
-            let half = self.limits.max_idle_timeout as f64 / 2.0;
-            bail!(
-                "limits.keep_alive_interval = {} must be less than half of \
-                 limits.max_idle_timeout = {} (i.e. below {}), so that a lost keep-alive \
-                 packet cannot let the connection time out",
-                self.limits.keep_alive_interval,
-                self.limits.max_idle_timeout,
-                half
-            );
-        }
-
-        if self.limits.initial_mtu < MIN_INITIAL_MTU {
-            bail!(
-                "limits.initial_mtu = {} is below the {MIN_INITIAL_MTU} bytes QUIC \
-                 requires (RFC 9000 §14); a smaller value cannot carry a QUIC \
-                 handshake packet",
-                self.limits.initial_mtu
-            );
-        }
-
-        if self.limits.initial_mtu > MAX_INITIAL_MTU {
-            bail!(
-                "limits.initial_mtu = {} is above the {MAX_INITIAL_MTU} bytes this \
-                 server allows; the value is a UDP payload size, and an Ethernet \
-                 frame leaves that much of one over IPv6, so a handshake sent in \
-                 larger packets is dropped by the path with nothing to fall back to",
-                self.limits.initial_mtu
-            );
-        }
-
-        // Only a ceiling the file writes is checked. An absent one resolves to
-        // a value that is in range by construction (`Limits::mtu_upper_bound`).
-        if let Some(upper_bound) = self.limits.mtu_upper_bound {
-            if upper_bound < self.limits.initial_mtu {
-                bail!(
-                    "limits.mtu_upper_bound = {} is below limits.initial_mtu = {}; \
-                     discovery searches upward from the initial size, so a ceiling \
-                     under the start describes a search that cannot happen",
-                    upper_bound,
-                    self.limits.initial_mtu
-                );
-            }
-
-            if upper_bound > MAX_MTU_UPPER_BOUND {
-                bail!(
-                    "limits.mtu_upper_bound = {} is above the {MAX_MTU_UPPER_BOUND} bytes this \
-                     server allows; the value is a UDP payload size, and an Ethernet \
-                     frame leaves at most that much of one over IPv4, so a larger \
-                     bound could only probe sizes no standard path carries",
-                    upper_bound
-                );
-            }
-        }
-
-        if !INITIAL_RTT_RANGE_MS.contains(&self.limits.initial_rtt_ms) {
-            bail!(
-                "limits.initial_rtt_ms = {} must be between {} and {}; it seeds the \
-                 handshake retransmission timers, and a value below the real path \
-                 RTT retransmits packets that were never lost",
-                self.limits.initial_rtt_ms,
-                INITIAL_RTT_RANGE_MS.start(),
-                INITIAL_RTT_RANGE_MS.end()
-            );
-        }
-
-        // `socket2` converts these with `size as c_int`, so a value above
-        // `i32::MAX` reaches the kernel truncated to a different number: 2^32
-        // becomes 0, which is the operating system's minimum rather than the
-        // default the operator asked to leave alone. Refusing at load time is
-        // what makes the number in the file the number the kernel receives.
-        for (key, value) in [
-            ("limits.socket_recv_buffer", self.limits.socket_recv_buffer),
-            ("limits.socket_send_buffer", self.limits.socket_send_buffer),
-        ] {
-            if value > MAX_SOCKET_BUFFER {
-                bail!(
-                    "{key} = {value} is above the {MAX_SOCKET_BUFFER} bytes the socket \
-                     API accepts; the value is passed to setsockopt as a signed 32-bit \
-                     integer, so a larger one is truncated before the kernel sees it. \
-                     Use 0 to keep the operating system default instead"
-                );
-            }
-        }
-
-        for (i, user) in self.auth.users.iter().enumerate() {
-            if user.username.is_empty() {
-                bail!("auth.users[{i}].username is empty");
-            }
-            if user.username.contains(':') {
-                // RFC 7617 §2: the colon separates user-id from password inside
-                // the credentials, so a user-id containing one is unusable.
-                bail!(
-                    "auth.users[{i}].username contains a colon, which RFC 7617 §2 does not allow \
-                     in HTTP Basic credentials"
-                );
-            }
-            if user.username.len() > crate::logfmt::MAX_TOKEN {
-                // A user-id this long is unusable in a subtler way. Failures are
-                // bucketed by the user-id the request claimed, in the form a log
-                // line carries it -- truncated at `logfmt::MAX_TOKEN` -- so a
-                // name past that bound never matches the configured one, and its
-                // failures land in the bucket no success can clear. The client
-                // that really does hold those credentials would then lose its
-                // connection at the `security.max_auth_failures`-th lifetime
-                // failure however often it authenticates in between. Refusing
-                // the name here is what makes that state unreachable.
-                //
-                // The name is not echoed: it is not a secret, but it lives in
-                // the same table as one, and nothing out of `[auth]` goes to
-                // stderr -- see `parse_error`. The index and the limit are what
-                // it takes to find and fix it.
-                bail!(
-                    "auth.users[{i}].username is {} bytes, over the {}-byte limit a user-id has \
-                     to stay within to be told apart in the logs and in the authentication \
-                     failure counters",
-                    user.username.len(),
-                    crate::logfmt::MAX_TOKEN
-                );
-            }
-            if user.password.is_empty() {
-                bail!("auth.users[{i}].password is empty");
-            }
-            if let Some(first) = self.auth.users[..i]
-                .iter()
-                .position(|other| other.username == user.username)
-            {
-                // Not echoed either, for the reason given above: the two
-                // indices name both entries, which is what it takes to find
-                // and fix them.
-                bail!("auth.users[{i}].username duplicates auth.users[{first}].username");
-            }
-        }
-
-        if let Some(i) = self
-            .security
-            .denied_ports
-            .iter()
-            .position(|port| *port == 0)
-        {
-            bail!("security.denied_ports[{i}] is 0, which is not a usable port");
-        }
-
-        for (i, name) in self.security.expected_sni.iter().enumerate() {
-            validate_expected_sni(i, name)?;
-        }
-
-        if !self.server.cert.is_file() {
-            bail!(
-                "server.cert = {} is not a readable file",
-                self.server.cert.display()
-            );
-        }
-        if !self.server.key.is_file() {
-            bail!(
-                "server.key = {} is not a readable file",
-                self.server.key.display()
-            );
-        }
+        validate_server(&self.server)?;
+        validate_limits(&self.limits)?;
+        validate_auth(&self.auth)?;
+        validate_security(&self.security)?;
+        validate_certificate_paths(&self.server)?;
 
         Ok(())
     }
+}
+
+/// Validates `[server]` apart from the certificate and key paths, which
+/// [`validate_certificate_paths`] checks last.
+fn validate_server(server: &Server) -> Result<()> {
+    if server.alpn.is_empty() {
+        bail!("server.alpn must list at least one protocol identifier");
+    }
+    for (i, id) in server.alpn.iter().enumerate() {
+        if id.is_empty() {
+            bail!("server.alpn[{i}] is empty");
+        }
+        // An ALPN identifier is length-prefixed with a single byte on the
+        // wire, so it cannot exceed 255 bytes.
+        if id.len() > 255 {
+            bail!(
+                "server.alpn[{i}] is {} bytes, the wire format allows at most 255",
+                id.len()
+            );
+        }
+    }
+
+    if server.shutdown_grace > MAX_SHUTDOWN_GRACE {
+        bail!(
+            "server.shutdown_grace = {} exceeds {MAX_SHUTDOWN_GRACE} seconds; \
+             a drain that long outlives the service manager's own kill timeout, \
+             and use 0 to close every tunnel at once instead",
+            server.shutdown_grace
+        );
+    }
+
+    Ok(())
+}
+
+/// Validates `[limits]`.
+fn validate_limits(limits: &Limits) -> Result<()> {
+    if limits.udp_session_timeout == 0 || limits.udp_session_timeout > MAX_IDLE_TIMEOUT_CEILING {
+        bail!(
+            "limits.udp_session_timeout = {} must be between 1 and \
+             {MAX_IDLE_TIMEOUT_CEILING} seconds",
+            limits.udp_session_timeout
+        );
+    }
+    if limits.connect_timeout > MAX_IDLE_TIMEOUT_CEILING {
+        bail!(
+            "limits.connect_timeout = {} exceeds {MAX_IDLE_TIMEOUT_CEILING} seconds; \
+             use 0 to disable the budget instead",
+            limits.connect_timeout
+        );
+    }
+    if limits.max_targets_per_conn == 0 {
+        bail!("limits.max_targets_per_conn must be greater than zero");
+    }
+    if limits.max_targets_per_conn > MAX_TARGETS_PER_CONN_CEILING {
+        bail!(
+            "limits.max_targets_per_conn = {} exceeds the {MAX_TARGETS_PER_CONN_CEILING} \
+             this server allows; every tunnel costs a file descriptor",
+            limits.max_targets_per_conn
+        );
+    }
+
+    if limits.max_streams_bidi == 0 {
+        bail!(
+            "limits.max_streams_bidi must be greater than zero, or no tunnel could \
+             ever be opened"
+        );
+    }
+    if limits.max_streams_bidi > MAX_STREAMS_BIDI_CEILING {
+        bail!(
+            "limits.max_streams_bidi = {} exceeds the {MAX_STREAMS_BIDI_CEILING} this \
+             server allows; a stream slot is reserved for every unit of the credit when \
+             the allowance is granted, so the value is paid in one go by a connection's \
+             first authenticated request rather than when a stream is opened",
+            limits.max_streams_bidi
+        );
+    }
+
+    if limits.max_idle_timeout == 0 || limits.max_idle_timeout > MAX_IDLE_TIMEOUT_CEILING {
+        bail!(
+            "limits.max_idle_timeout = {} must be between 1 and \
+             {MAX_IDLE_TIMEOUT_CEILING} seconds",
+            limits.max_idle_timeout
+        );
+    }
+
+    // Strictly below half, not at it: at exactly half, losing a single
+    // keep-alive packet is enough for the connection to time out. The relay in
+    // front of this server is the reason keep-alives exist at all — its UDP
+    // conntrack entry expires on its own schedule (30s by default), and only a
+    // keep-alive that comfortably beats both timeouts keeps the NAT mapping
+    // alive.
+    //
+    // Written as `interval >= ceil(idle / 2)` rather than the more obvious
+    // `interval * 2 >= idle`: the two reject exactly the same pairs of
+    // integers, and this one cannot overflow. The doubling could, and a
+    // `u64` large enough to make it — anything above `u64::MAX / 2` — is
+    // reachable straight from the file, since TOML integers deserialize
+    // across the whole target type's range. A debug build panicked inside
+    // this function; a release build wrapped the product to something small,
+    // accepted the interval, and handed it to quinn, where it becomes
+    // `Instant::now() + interval` the moment a connection is established and
+    // panics the connection driver instead (D86).
+    if limits.keep_alive_interval > 0
+        && limits.keep_alive_interval >= limits.max_idle_timeout.div_ceil(2)
+    {
+        // The ceiling on this field is 3600 seconds, so the halving is
+        // always exact in an `f64`; `From` has no `u64` impl to say so.
+        #[allow(clippy::as_conversions)]
+        let half = limits.max_idle_timeout as f64 / 2.0;
+        bail!(
+            "limits.keep_alive_interval = {} must be less than half of \
+             limits.max_idle_timeout = {} (i.e. below {}), so that a lost keep-alive \
+             packet cannot let the connection time out",
+            limits.keep_alive_interval,
+            limits.max_idle_timeout,
+            half
+        );
+    }
+
+    if limits.initial_mtu < MIN_INITIAL_MTU {
+        bail!(
+            "limits.initial_mtu = {} is below the {MIN_INITIAL_MTU} bytes QUIC \
+             requires (RFC 9000 §14); a smaller value cannot carry a QUIC \
+             handshake packet",
+            limits.initial_mtu
+        );
+    }
+
+    if limits.initial_mtu > MAX_INITIAL_MTU {
+        bail!(
+            "limits.initial_mtu = {} is above the {MAX_INITIAL_MTU} bytes this \
+             server allows; the value is a UDP payload size, and an Ethernet \
+             frame leaves that much of one over IPv6, so a handshake sent in \
+             larger packets is dropped by the path with nothing to fall back to",
+            limits.initial_mtu
+        );
+    }
+
+    // Only a ceiling the file writes is checked. An absent one resolves to
+    // a value that is in range by construction (`Limits::mtu_upper_bound`).
+    if let Some(upper_bound) = limits.mtu_upper_bound {
+        if upper_bound < limits.initial_mtu {
+            bail!(
+                "limits.mtu_upper_bound = {} is below limits.initial_mtu = {}; \
+                 discovery searches upward from the initial size, so a ceiling \
+                 under the start describes a search that cannot happen",
+                upper_bound,
+                limits.initial_mtu
+            );
+        }
+
+        if upper_bound > MAX_MTU_UPPER_BOUND {
+            bail!(
+                "limits.mtu_upper_bound = {} is above the {MAX_MTU_UPPER_BOUND} bytes this \
+                 server allows; the value is a UDP payload size, and an Ethernet \
+                 frame leaves at most that much of one over IPv4, so a larger \
+                 bound could only probe sizes no standard path carries",
+                upper_bound
+            );
+        }
+    }
+
+    if !INITIAL_RTT_RANGE_MS.contains(&limits.initial_rtt_ms) {
+        bail!(
+            "limits.initial_rtt_ms = {} must be between {} and {}; it seeds the \
+             handshake retransmission timers, and a value below the real path \
+             RTT retransmits packets that were never lost",
+            limits.initial_rtt_ms,
+            INITIAL_RTT_RANGE_MS.start(),
+            INITIAL_RTT_RANGE_MS.end()
+        );
+    }
+
+    // `socket2` converts these with `size as c_int`, so a value above
+    // `i32::MAX` reaches the kernel truncated to a different number: 2^32
+    // becomes 0, which is the operating system's minimum rather than the
+    // default the operator asked to leave alone. Refusing at load time is
+    // what makes the number in the file the number the kernel receives.
+    for (key, value) in [
+        ("limits.socket_recv_buffer", limits.socket_recv_buffer),
+        ("limits.socket_send_buffer", limits.socket_send_buffer),
+    ] {
+        if value > MAX_SOCKET_BUFFER {
+            bail!(
+                "{key} = {value} is above the {MAX_SOCKET_BUFFER} bytes the socket \
+                 API accepts; the value is passed to setsockopt as a signed 32-bit \
+                 integer, so a larger one is truncated before the kernel sees it. \
+                 Use 0 to keep the operating system default instead"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates `[auth]`.
+fn validate_auth(auth: &Auth) -> Result<()> {
+    for (i, user) in auth.users.iter().enumerate() {
+        if user.username.is_empty() {
+            bail!("auth.users[{i}].username is empty");
+        }
+        if user.username.contains(':') {
+            // RFC 7617 §2: the colon separates user-id from password inside
+            // the credentials, so a user-id containing one is unusable.
+            bail!(
+                "auth.users[{i}].username contains a colon, which RFC 7617 §2 does not allow \
+                 in HTTP Basic credentials"
+            );
+        }
+        if user.username.len() > crate::logfmt::MAX_TOKEN {
+            // A user-id this long is unusable in a subtler way. Failures are
+            // bucketed by the user-id the request claimed, in the form a log
+            // line carries it -- truncated at `logfmt::MAX_TOKEN` -- so a
+            // name past that bound never matches the configured one, and its
+            // failures land in the bucket no success can clear. The client
+            // that really does hold those credentials would then lose its
+            // connection at the `security.max_auth_failures`-th lifetime
+            // failure however often it authenticates in between. Refusing
+            // the name here is what makes that state unreachable.
+            //
+            // The name is not echoed: it is not a secret, but it lives in
+            // the same table as one, and nothing out of `[auth]` goes to
+            // stderr -- see `parse_error`. The index and the limit are what
+            // it takes to find and fix it.
+            bail!(
+                "auth.users[{i}].username is {} bytes, over the {}-byte limit a user-id has \
+                 to stay within to be told apart in the logs and in the authentication \
+                 failure counters",
+                user.username.len(),
+                crate::logfmt::MAX_TOKEN
+            );
+        }
+        if user.password.is_empty() {
+            bail!("auth.users[{i}].password is empty");
+        }
+        if let Some(first) = auth.users[..i]
+            .iter()
+            .position(|other| other.username == user.username)
+        {
+            // Not echoed either, for the reason given above: the two
+            // indices name both entries, which is what it takes to find
+            // and fix them.
+            bail!("auth.users[{i}].username duplicates auth.users[{first}].username");
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates `[security]`.
+fn validate_security(security: &Security) -> Result<()> {
+    if let Some(i) = security.denied_ports.iter().position(|port| *port == 0) {
+        bail!("security.denied_ports[{i}] is 0, which is not a usable port");
+    }
+
+    for (i, name) in security.expected_sni.iter().enumerate() {
+        validate_expected_sni(i, name)?;
+    }
+
+    Ok(())
+}
+
+/// Checks that `server.cert` and `server.key` name files. The only check that
+/// touches the filesystem, so [`Config::validate`] runs it last.
+fn validate_certificate_paths(server: &Server) -> Result<()> {
+    if !server.cert.is_file() {
+        bail!(
+            "server.cert = {} is not a readable file",
+            server.cert.display()
+        );
+    }
+    if !server.key.is_file() {
+        bail!(
+            "server.key = {} is not a readable file",
+            server.key.display()
+        );
+    }
+
+    Ok(())
 }
 
 /// Levels accepted as a bare `log.level`.
