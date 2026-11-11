@@ -652,9 +652,8 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
 /// The body of the shell function `name` in `script`, from its opening brace to
 /// the closing brace at column zero.
 ///
-/// The braces bound the latch: `deploy.sh` carries a `systemctl restart
-/// "$SERVICE_NAME" || true` in the rollback branch as well, so a whole-file
-/// search would pass even while `restore_previous` itself never restarted.
+/// The braces bound the function, so a test runs exactly that function and
+/// none of the script around it.
 fn shell_function_body(script: &str, name: &str) -> String {
     let text = fs::read_to_string(repo_root().join(script)).expect("the script must be readable");
     let start = text
@@ -667,54 +666,146 @@ fn shell_function_body(script: &str, name: &str) -> String {
     rest[..end].to_owned()
 }
 
-/// Restoring the previous files is not enough when the restart itself failed.
+/// Runs the shell function `name` from `script` on its own, with the stubs in
+/// `stubs` first on `PATH` and `prelude` run before the call.
 ///
-/// If `systemctl restart` returns nonzero after stopping the old unit, for
-/// example because the new unit cannot start at the job level, `restore_previous`
-/// puts the old binary and unit back and reloads systemd, but the unit stays
-/// inactive. The service has to be started here as well.
-#[test]
-fn restoring_the_previous_files_starts_the_service() {
-    let body = shell_function_body("script/deploy.sh", "restore_previous");
+/// `die` is defined as a recorder that exits nonzero, so a test can read what
+/// the function reported. The function runs under `set -eE`, as in the script.
+fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> Output {
+    let body = shell_function_body(script, name);
+    let program = format!(
+        "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name}\n"
+    );
 
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    let path = std::env::join_paths(
+        std::iter::once(stubs.to_path_buf()).chain(std::env::split_paths(&path)),
+    )
+    .expect("the stub directory must fit in PATH");
+
+    Command::new("bash")
+        .args(["-c", &program])
+        .env("PATH", path)
+        .output()
+        .expect("bash must be runnable")
+}
+
+/// The rollback starts the service and never restarts it.
+///
+/// `restore_previous` runs when any step of the swap window fails. A failure
+/// before the restart, in the binary or unit `install` or in `daemon-reload`,
+/// leaves the old process running and serving its tunnels. A failure of the
+/// restart itself can leave the unit inactive. `systemctl start` covers both:
+/// it does nothing to an active unit and starts an inactive one. A `restart`
+/// here would drop every live tunnel for a failure that had cost nothing.
+#[test]
+fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
+    let dir = scratch_tree("deploy", "restore-previous", &["stubs", "bin", "unit"]);
+    let stubs = dir.join("stubs");
+    let log = dir.join("systemctl.log");
+
+    write_executable(
+        &stubs.join("systemctl"),
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+    );
+    write_executable(&stubs.join("install"), "#!/bin/sh\nexit 0\n");
+
+    let bin = dir.join("bin/volto");
+    let unit = dir.join("unit/volto.service");
+    fs::write(bin.with_extension("prev"), "old binary").expect("plant the previous binary");
+    fs::write(unit.with_extension("service.prev"), "old unit").expect("plant the previous unit");
+
+    let prelude = format!(
+        "BIN='{}'; UNIT='{}'; SERVICE_NAME=volto; VERSION=9.9.9",
+        bin.display(),
+        unit.display()
+    );
+    let output = run_shell_function("script/deploy.sh", "restore_previous", &stubs, &prelude);
+
+    let stderr = stderr_of(&output);
     assert!(
-        body.contains("systemctl restart \"$SERVICE_NAME\" || true"),
-        "restore_previous puts the previous binary and unit back but never starts \
-         the service. A systemctl restart that failed after stopping the old unit \
-         leaves the restored files in place and the unit inactive. The body is:\n{body}"
+        !output.status.success() && stderr.contains("restored the previous binary and unit"),
+        "restore_previous must report what it restored and fail the run: {stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        calls.lines().any(|line| line == "start volto"),
+        "restore_previous must start the service: systemctl saw\n{calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line.starts_with("restart")),
+        "restore_previous must not restart a service that may still be serving: \
+         systemctl saw\n{calls}"
     );
 }
 
-/// Every network call is bounded, and so is the timer service that makes them.
+/// The value of `flag` on a curl command line, as whole seconds.
+fn curl_seconds(call: &str, flag: &str) -> Option<u64> {
+    let mut words = call.split_whitespace();
+    words.find(|word| *word == flag)?;
+    let value = words
+        .next()
+        .unwrap_or_else(|| panic!("{flag} has no value in: {call}"));
+    Some(
+        value
+            .parse()
+            .unwrap_or_else(|_| panic!("{flag} {value} is not whole seconds in: {call}")),
+    )
+}
+
+/// Every network call is bounded, and together they fit inside the timer
+/// service's start timeout.
 ///
-/// The latest-release HEAD request and the two downloads used curl without time
-/// limits, and the timer service carried no `TimeoutStartSec`. systemd disables
-/// the start timeout for `Type=oneshot`, so a stalled network path holds the
-/// daily run indefinitely and the next tick cannot start.
+/// systemd disables the start timeout for `Type=oneshot`, so the timer service
+/// carries its own `TimeoutStartSec`. When that timeout fires, systemd sends
+/// SIGTERM, and the script traps only ERR and EXIT. A SIGTERM inside the binary
+/// swap window would leave the new files in place with no health check and no
+/// rollback. So the worst case of every curl call, added up, must leave time
+/// for the rest of the run.
+///
+/// The worst case of one call is `--max-time` when it does not retry. With
+/// `--retry` it is `--retry-max-time`, after which curl starts no retry, plus
+/// the longest default backoff sleep before the last retry, plus `--max-time`
+/// for that last attempt. A retrying call without `--retry-max-time` has no
+/// bound: a server's Retry-After header could set the sleep.
+///
+/// Every logical line that runs `curl -` is read, continuation lines joined,
+/// including the one inside `location="$(curl`.
 #[test]
 fn every_network_call_and_the_timer_service_are_bounded() {
     let text = fs::read_to_string(repo_root().join("script/deploy.sh"))
         .expect("the deploy script must be readable");
+    let joined = text.replace("\\\n", " ");
 
-    let curls: Vec<&str> = text
+    let calls: Vec<&str> = joined
         .lines()
         .map(str::trim)
-        .filter(|line| line.starts_with("curl "))
+        .filter(|line| !line.starts_with('#') && line.contains("curl -"))
         .collect();
     assert!(
-        !curls.is_empty(),
-        "no line starting with `curl ` was found in script/deploy.sh; the reader \
-         is broken, not the script"
+        calls.len() >= 3,
+        "script/deploy.sh makes at least three curl calls (the latest-release \
+         request and two downloads), but the reader found {}: {calls:?}",
+        calls.len()
     );
-    for line in &curls {
+
+    let mut worst_case = 0;
+    for call in &calls {
         assert!(
-            line.contains("--connect-timeout"),
-            "this curl call has no --connect-timeout: {line}"
+            call.contains("--connect-timeout"),
+            "this curl call has no --connect-timeout: {call}"
         );
-        assert!(
-            line.contains("--max-time"),
-            "this curl call has no --max-time: {line}"
-        );
+        let max_time = curl_seconds(call, "--max-time")
+            .unwrap_or_else(|| panic!("this curl call has no --max-time: {call}"));
+        worst_case += match curl_seconds(call, "--retry") {
+            None | Some(0) => max_time,
+            Some(retries) => {
+                let retry_max_time = curl_seconds(call, "--retry-max-time").unwrap_or_else(|| {
+                    panic!("this curl call retries with no --retry-max-time: {call}")
+                });
+                retry_max_time + (1 << (retries - 1)) + max_time
+            }
+        };
     }
 
     let service = text
@@ -724,11 +815,32 @@ fn every_network_call_and_the_timer_service_are_bounded() {
     let end = heredoc
         .find("\nEOF")
         .expect("the timer service heredoc must be closed");
+    let timeout = heredoc[..end]
+        .lines()
+        .find_map(|line| line.strip_prefix("TimeoutStartSec="))
+        .unwrap_or_else(|| {
+            panic!(
+                "the timer service carries no TimeoutStartSec, so a stalled network \
+                 path holds the daily run indefinitely: {}",
+                &heredoc[..end]
+            )
+        });
+    let timeout: u64 = match timeout.strip_suffix("min") {
+        Some(minutes) => minutes.parse::<u64>().expect("whole minutes") * 60,
+        None => timeout
+            .trim_end_matches('s')
+            .parse()
+            .expect("TimeoutStartSec in whole minutes or seconds"),
+    };
+
+    // The rest of the run: the checksum, the config check, the swap, the
+    // restart and the three-second health wait.
+    let rest_of_the_run = 120;
     assert!(
-        heredoc[..end].contains("TimeoutStartSec="),
-        "the timer service carries no TimeoutStartSec, so a stalled network path \
-         holds the daily run indefinitely: {}",
-        &heredoc[..end]
+        worst_case + rest_of_the_run <= timeout,
+        "the curl calls can take {worst_case} s, which with {rest_of_the_run} s for \
+         the rest of the run exceeds TimeoutStartSec ({timeout} s): systemd could \
+         stop the run inside the binary swap window"
     );
 }
 

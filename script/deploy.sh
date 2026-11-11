@@ -151,8 +151,11 @@ note() {
 # still running the release it was already running, or systemd is bringing it
 # back under Restart=on-failure. That assumption does not hold when the restart
 # itself failed after stopping the unit: the restored files are in place and the
-# unit is inactive, so it is started here. `|| true` because a failed start must
-# not mask the original failure, which `die` reports either way.
+# unit is inactive, so it is started here. `start` rather than `restart`,
+# because `start` does nothing to an active unit: when the failure came before
+# the restart, the old process keeps serving its tunnels. `|| true` because a
+# failed start must not mask the original failure, which `die` reports either
+# way.
 restore_previous() {
     trap - ERR
     local restored=""
@@ -164,7 +167,7 @@ restore_previous() {
         restored="${restored:+$restored and }unit"
     fi
     systemctl daemon-reload || true
-    systemctl restart "$SERVICE_NAME" || true
+    systemctl start "$SERVICE_NAME" || true
 
     [ -n "$restored" ] ||
         die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
@@ -386,11 +389,20 @@ else
     TMP="$(mktemp -d)"
     trap 'rm -rf "$TMP"' EXIT
 
+    # Every network call fits inside the timer service's TimeoutStartSec=15min
+    # (900 s), so systemd cannot stop the run inside the binary swap window
+    # below. curl starts no retry after --retry-max-time, and the longest
+    # default backoff sleep before the third retry is 4 s, so one call takes at
+    # most --retry-max-time + 4 + --max-time. The tarball takes at most
+    # 120 + 4 + 300 = 424 s and SHA256SUMS 60 + 4 + 60 = 124 s. With the 30 s
+    # latest-release request that is 578 s, which leaves 322 s for the rest of
+    # the run. --retry-max-time also stops a server's Retry-After header from
+    # setting a longer sleep.
     echo "==> downloading $NAME.tar.gz ($TAG)"
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+    curl -fsSL --retry 3 --retry-max-time 120 --connect-timeout 10 --max-time 300 \
         -o "$TMP/$NAME.tar.gz" "$BASE/$NAME.tar.gz" ||
         die "download failed: $BASE/$NAME.tar.gz"
-    curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+    curl -fsSL --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
         -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
         die "download failed: $BASE/SHA256SUMS"
 
