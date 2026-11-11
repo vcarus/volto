@@ -47,13 +47,10 @@
 // The two raw syscalls this crate used to make by hand -- `getrlimit` for the
 // startup fd check and `IP_MTU_DISCOVER` for the DF bit -- now go through
 // rustix's safe wrappers, so "no `unsafe` in the server" is a property worth
-// pinning rather than one that merely happens to hold. It stays `deny` rather
-// than `forbid` because `getifaddrs` has no safe wrapper in this tree's
-// dependencies: rustix does not implement it, and the interface enumeration in
-// `net` needs the raw call. That one site carries `#[allow(unsafe_code)]` with
-// its safety argument beside it; a second site is a change to argue here, not a
-// local `allow`.
-#![deny(unsafe_code)]
+// pinning rather than one that merely happens to hold. `forbid` rather than
+// `deny` so it cannot be opted out of module by module: a future need for
+// `unsafe` should be an argued change to this line, not a local `allow`.
+#![forbid(unsafe_code)]
 // Every public item carries prose, and the gate says so rather than the habit.
 // `cargo doc` is published for this crate, so a `pub` item without a doc comment
 // is a hole in the page a reader lands on; `warn` here rather than `deny`,

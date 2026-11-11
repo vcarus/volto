@@ -85,10 +85,8 @@ anyhow = "1"
 # Safe wrappers around the syscalls that have no portable equivalent in std:
 # getrlimit(RLIMIT_NOFILE) for the startup fd-budget check (POSIX, both hosts)
 # and IP_MTU_DISCOVER for the DF bit (Linux only, behind cfg in net.rs). Both
-# used to be hand-written `libc` FFI, and replacing them is what leaves `src/`
-# with `#![deny(unsafe_code)]` and one argued exception: `getifaddrs` in
-# `net.rs`, which rustix does not wrap and which carries its own
-# `#[allow(unsafe_code)]`.
+# used to be hand-written `libc` FFI, and replacing them is what lets `src/`
+# carry `#![forbid(unsafe_code)]`.
 #
 # It is pure Rust with no C to build -- on Linux it issues the syscalls itself
 # rather than linking libc's -- so it adds nothing to the musl cross-build that
@@ -105,9 +103,8 @@ rustix = { version = "1", default-features = false, features = [
 
 # Errno constants only -- `EMFILE`, `ENOBUFS` and their neighbours, which
 # `tunnel` matches on to tell a per-target failure from a process-wide one.
-# The only `libc` calls in `src/` are `getifaddrs` and `freeifaddrs` in
-# `net.rs`, both unwrapped by rustix. The one remaining call outside `src/` is
-# `getrusage` in `tests/it_bench.rs`, which rustix does not wrap either.
+# There are no `libc` calls left in `src/`; the one remaining call in the tree is
+# `getrusage` in `tests/it_bench.rs`, which rustix does not wrap.
 libc = "0.2"
 
 # SO_RCVBUF/SO_SNDBUF on the endpoint's UDP socket (D56). Already in the tree via
@@ -264,9 +261,8 @@ strip = true
 [lints.rust]
 # The default for every target in the package, tests and examples included: a
 # new file that wants `unsafe` must argue for a file-level `allow` (today there
-# are three, all in tests). `src/` is stricter still -- the binary root carries
-# `forbid`, which an inner `allow` cannot weaken, and the library root carries
-# `deny` with one argued `getifaddrs` site.
+# are three, all in tests). `src/` is stricter still -- its two crate roots
+# carry `forbid`, which an inner `allow` cannot weaken.
 unsafe_code = "deny"
 
 [lints.clippy]

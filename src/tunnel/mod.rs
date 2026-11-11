@@ -779,35 +779,41 @@ where
 /// is recognised, and the `SocketAddr` keeps the scope ID that selects the
 /// interface for a link-local address.
 ///
-/// The cost is one interface enumeration per allowed address per tunnel opened,
-/// which is per request and never per packet, and it is paid only by addresses
-/// the policy has already let through, and the loopback test above it is free.
+/// The cost is one `bind(2)` per allowed address per tunnel opened, which is per
+/// request and never per packet, and it is paid only by addresses the policy has
+/// already let through, and the loopback test above it is free.
 fn is_the_proxys_own(address: std::net::SocketAddr) -> bool {
-    // The routed form first: `::ffff:127.0.0.1` is loopback wearing an IPv6
-    // hat, and a NAT64, 6to4 or Teredo address is a route to the IPv4 address
-    // it carries. Both must be judged as that address, or the check would bind
-    // a literal the host does not hold and miss one it does.
-    let routed = policy::routed_form(address.ip());
-    if routed.is_loopback() {
-        return false;
-    }
+    let probe = own_address_probe(address);
+    !probe.ip().is_loopback() && crate::net::holds_address(probe)
+}
 
-    // A link-local IPv6 address is selected by its scope ID, and the routed
-    // form keeps the same address, so the scope has to survive into the probe.
-    // A transition form becomes IPv4 and has no scope to keep.
-    let probe = match (routed, address) {
-        (std::net::IpAddr::V6(v6), std::net::SocketAddr::V6(original)) if v6 == *original.ip() => {
+/// The address [`is_the_proxys_own`] binds to ask whether `address` is this
+/// host's.
+///
+/// The routed form, at port 0. `::ffff:127.0.0.1` is loopback in its
+/// IPv4-mapped form, and a NAT64, 6to4 or Teredo address is a route to the IPv4
+/// address it carries. Both are judged as that IPv4 address.
+///
+/// A link-local IPv6 address is selected by its scope ID. Its routed form is the
+/// same address, so the scope is copied into the probe. A transition form
+/// becomes IPv4 and has no scope to keep.
+///
+/// Pure, so the scope rule is tested here without a link-local address on the
+/// test host.
+fn own_address_probe(address: std::net::SocketAddr) -> std::net::SocketAddr {
+    match (policy::routed_form(address.ip()), address) {
+        (std::net::IpAddr::V6(routed), std::net::SocketAddr::V6(original))
+            if routed == *original.ip() =>
+        {
             std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                v6,
+                routed,
                 0,
                 original.flowinfo(),
                 original.scope_id(),
             ))
         }
-        _ => std::net::SocketAddr::new(routed, 0),
-    };
-
-    crate::net::holds_address(probe)
+        (routed, _) => std::net::SocketAddr::new(routed, 0),
+    }
 }
 
 /// Turns a request's target into the addresses it may be dialled on, answering
@@ -1045,6 +1051,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The scope ID of a link-local target reaches the bind.
+    ///
+    /// Binding `fe80::1` without the scope that selects its interface fails
+    /// even on a host that holds it, so a probe that dropped the scope would
+    /// call an own link-local address someone else's. A test host cannot be
+    /// relied on to carry a link-local address, so the probe address is
+    /// asserted instead of the bind.
+    #[test]
+    fn a_link_local_target_is_probed_with_its_scope() {
+        for (target, scope) in [("[fe80::1%7]:443", 7), ("[fe80::1]:443", 0)] {
+            let target: std::net::SocketAddr = target.parse().expect("a socket address");
+            let std::net::SocketAddr::V6(probe) = own_address_probe(target) else {
+                panic!("{target} must be probed as IPv6");
+            };
+            assert_eq!(
+                probe.ip(),
+                &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap()
+            );
+            assert_eq!(probe.scope_id(), scope, "{target}");
+            assert_eq!(probe.port(), 0, "{target}");
+        }
+
+        // A transition form becomes IPv4, where there is no scope.
+        let teredo: std::net::SocketAddr = "[2001:0:4136:e378:8000:63bf:3fff:fdd2%7]:443"
+            .parse()
+            .expect("a socket address");
+        assert_eq!(
+            own_address_probe(teredo),
+            "192.0.2.45:0".parse::<std::net::SocketAddr>().unwrap()
+        );
     }
 
     /// A transition address is a route to the IPv4 address it carries, so a
