@@ -3,16 +3,15 @@
 //! This server advertises `SETTINGS_QPACK_MAX_TABLE_CAPACITY = 0` and
 //! `SETTINGS_QPACK_BLOCKED_STREAMS = 0`, which RFC 9204 §3.2.3 and §2.1.2 make
 //! binding on the encoder: it may not insert into the dynamic table, so every
-//! field line it sends is either a static-table reference or a literal. That is what lets the
-//! whole dynamic table -- insertion, eviction, the two instruction streams, and
-//! the head-of-line blocking they can introduce -- be left out rather than
-//! written and never used. A field line that does reference the dynamic table is
-//! therefore not merely unsupported but a protocol violation, and is answered as
-//! RFC 9204 §2.2.3 requires.
+//! field line it sends is either a static-table reference or a literal. So the
+//! whole dynamic table is left out: insertion, eviction, the two instruction
+//! streams, and the head-of-line blocking they can introduce. A field line that
+//! does reference the dynamic table is therefore a protocol violation, and is
+//! answered as RFC 9204 §2.2.3 requires.
 //!
-//! Encoding is the mirror image and just as small: the exact `(name, value)` in
-//! the static table when there is one, its name alone when only that matches,
-//! and a literal otherwise. Nothing is Huffman-encoded -- see [`super::huffman`].
+//! Encoding uses the exact `(name, value)` in the static table when there is
+//! one, its name alone when only that matches, and a literal otherwise. Nothing
+//! is Huffman-encoded; [`super::huffman`] says why.
 
 use std::borrow::Cow;
 
@@ -36,8 +35,8 @@ const FIELD_OVERHEAD: u64 = 32;
 /// while the two kinds are still one sequence. Sorting them out is
 /// [`super::stream`]'s job, and it is the same pass that validates them.
 ///
-/// `Cow` rather than `Vec` so that a static-table hit -- which is what every
-/// pseudo-header of a CONNECT request is -- costs a pointer instead of a copy.
+/// `Cow` rather than `Vec` so that a static-table hit costs a pointer instead
+/// of a copy. Every pseudo-header of a CONNECT request is one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     /// The field name, always lowercase on the wire (RFC 9114 §4.2).
@@ -197,13 +196,12 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
     //# if the value of Required Insert Count is less than or equal to the
     //# value of Delta Base.
     //
-    // Required Insert Count is zero above -- with a zero table capacity it can
-    // be nothing else -- and zero is less than or equal to every Delta Base, so
-    // here a Sign bit of 1 is invalid whatever follows it. "Invalid" is not
-    // given a class in §4.5.1.2; this decoder answers it as the same connection
-    // error as the Required Insert Count fault above, because a prefix that
-    // cannot be read leaves this endpoint unable to say what the field lines
-    // after it were encoded against.
+    // Required Insert Count is zero above, as a zero table capacity requires,
+    // and zero is less than or equal to every Delta Base. So a Sign bit of 1 is
+    // invalid here whatever follows it. §4.5.1.2 gives "invalid" no class. This
+    // decoder answers it as the same connection error as the Required Insert
+    // Count fault above, because after a prefix it cannot read this endpoint
+    // cannot say what the field lines were encoded against.
     if flags & 1 == 1 {
         return Err(connection_error(
             "a Sign bit of 1 with a zero Required Insert Count",
@@ -267,8 +265,8 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
 
 /// Encodes a field section: the prefix, then one line per field.
 ///
-/// The prefix is always `0x00 0x00` -- Required Insert Count 0, Base 0 -- which
-/// RFC 9204 §4.5.1 requires of a section that references no dynamic entry.
+/// The prefix is always `0x00 0x00`: Required Insert Count 0, Base 0. RFC 9204
+/// §4.5.1 requires that of a section that references no dynamic entry.
 pub fn encode<'a, I>(out: &mut BytesMut, fields: I)
 where
     I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
@@ -358,8 +356,8 @@ fn dynamic_reference() -> Violation {
 /// reference to the dynamic table (§2.2.3), an invalid static table index
 /// (§3.1), and a Required Insert Count no conformant encoder could have
 /// produced (§4.5.1.1). A fourth, the field block §4.5.1.2 makes invalid
-/// through its Sign bit, is graded the same way by this server's own reading --
-/// the RFC leaves that one's class unstated. Each is quoted at the point it is
+/// through its Sign bit, is graded the same way by this server's own reading.
+/// The RFC leaves that one's class unstated. Each is quoted at the point it is
 /// raised.
 fn connection_error(detail: &'static str) -> Violation {
     Violation::connection(Code::QPACK_DECOMPRESSION_FAILED, detail)
@@ -367,18 +365,19 @@ fn connection_error(detail: &'static str) -> Violation {
 
 /// A failure answered on the one stream it arrived on.
 ///
-/// Everything else a field section can be wrong about -- a representation that
-/// ends early, a string literal Huffman decoding rejects -- carries the same
+/// Everything else a field section can be wrong about carries the same
 /// QPACK_DECOMPRESSION_FAILED code but ends only the request that carried it.
-/// That is this server's own reading, not a rule the RFC states: RFC 9204
-/// mandates a connection error for the three cases in [`connection_error`] and
-/// for those only, while RFC 7541 §5.2 calls a bad literal a "decoding error"
-/// without naming a class at all. With a zero dynamic table capacity this
-/// decoder holds no state between field sections, so a section it could not
-/// read leaves nothing desynchronised, and the narrower answer costs one
-/// request rather than every tunnel on the connection. The one case the RFC
-/// does class is an integer too large to decode, which §7.4 makes a stream
-/// error on a request stream -- quoted where it is raised.
+/// Examples are a representation that ends early and a string literal that
+/// Huffman decoding rejects. That is this server's own reading, not a rule the
+/// RFC states. RFC 9204 mandates a connection error for the three cases in
+/// [`connection_error`] and for those only, while RFC 7541 §5.2 calls a bad
+/// literal a "decoding error" without naming a class at all. With a zero
+/// dynamic table capacity this decoder holds no state between field sections,
+/// so a section it could not read leaves nothing desynchronised, and the
+/// narrower answer costs one request rather than every tunnel on the
+/// connection. The one case the RFC does class is an integer too large to
+/// decode, which §7.4 makes a stream error on a request stream. It is quoted
+/// where it is raised.
 fn stream_error(detail: &'static str) -> Violation {
     Violation::stream(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }
@@ -400,14 +399,14 @@ impl<'a> Reader<'a> {
 
     /// Reads a prefixed integer with a `prefix_bits`-wide field (RFC 7541 §5.1).
     ///
-    /// Returns the bits above the prefix -- the representation's flags -- along
-    /// with the value.
+    /// Returns the bits above the prefix, which are the representation's flags,
+    /// along with the value.
     fn take_int(&mut self, prefix_bits: u32) -> Result<(u8, u64), Violation> {
         let (first, rest) = self.buf.split_first().ok_or_else(truncated)?;
         self.buf = rest;
 
-        // Computed in `u16` so a full eight-bit prefix -- the Required Insert
-        // Count -- does not shift a `u8` by its own width. Back to `u8` is
+        // Computed in `u16` so a full eight-bit prefix (the Required Insert
+        // Count) does not shift a `u8` by its own width. Back to `u8` is
         // exact both times: no call site passes more than eight prefix bits, so
         // the mask is at most 255, and the flags are what is left of a byte
         // after a shift right.
@@ -507,7 +506,7 @@ fn put_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
 /// Writes a string literal, never Huffman-encoded.
 ///
 /// `flags` are the bits above the `H` bit, which this encoder always leaves
-/// clear -- see [`super::huffman`] for why nothing is Huffman-encoded.
+/// clear. [`super::huffman`] says why nothing is Huffman-encoded.
 fn put_string(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: &[u8]) {
     // A byte count is a `usize` and a prefixed integer is a `u64`; the widening
     // is exact on both supported targets and has no `From` to express it.

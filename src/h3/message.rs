@@ -1,21 +1,17 @@
 //! What a request and a response are made of: a status, a method, field lines.
 //!
-//! These types replace the `http` crate, which this server reached for only
-//! because the `h3` crate's API was written in it. It was never free: QPACK had
-//! already produced a name and a value for every field when `HeaderName` and
-//! `HeaderValue` validated and copied them a second time, and the pseudo-headers
-//! were folded into a URI that [`crate::tunnel`] then took apart again. What a
-//! proxy needs of an HTTP message is small enough to state here -- five
-//! pseudo-headers, the fields that followed them, and a status line -- so a
-//! field section is now decoded once, validated once, and carried in one type.
+//! These types are used instead of the `http` crate. A proxy needs five
+//! pseudo-headers, the fields that followed them, and a status line, so a field
+//! section is decoded once, validated once, and carried in one type. There is
+//! no second validation and copy into `HeaderName` and `HeaderValue`, and no
+//! URI for [`crate::tunnel`] to take apart again.
 //!
 //! # What belongs here
 //!
 //! Syntax: which octets a name, a value or a status may be made of. The rules
-//! about a *message* -- which pseudo-headers a CONNECT request carries, what
-//! makes one malformed -- belong to [`super::stream`], which is where a decoded
-//! field section becomes a [`Request`] and where RFC 9114 §4.1.2's verdict is
-//! reached.
+//! about a *message* belong to [`super::stream`]: which pseudo-headers a CONNECT
+//! request carries and what makes one malformed. That is where a decoded field
+//! section becomes a [`Request`] and where RFC 9114 §4.1.2 is applied.
 
 use std::fmt;
 
@@ -81,8 +77,6 @@ impl Status {
     /// `str` will not hold. The check is kept rather than made unchecked
     /// because it costs three comparisons on a path that writes a response.
     pub fn as_str(&self) -> &str {
-        // ASCII digits by construction: every constant is a literal and `parse`
-        // accepts nothing else.
         std::str::from_utf8(&self.0).expect("a status is three ASCII digits")
     }
 }
@@ -118,9 +112,9 @@ impl Method {
     /// Reads a `:method` value, or `None` if it is not a token.
     ///
     /// RFC 9110 §5.6.2's `token`: one or more `tchar`. A method name is
-    /// case-sensitive (RFC 9110 §9.1), so nothing here folds case -- `connect`
-    /// is not CONNECT and is answered with a 501 like any other method this
-    /// server does not implement.
+    /// case-sensitive (RFC 9110 §9.1), so nothing here folds case. `connect` is
+    /// not CONNECT and is answered with a 501 like any other method this server
+    /// does not implement.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
         Some(match token(bytes)? {
             "CONNECT" => Self::Connect,
@@ -147,8 +141,8 @@ impl fmt::Display for Method {
 ///
 /// Bytes rather than a `str`: RFC 9110 §5.5 admits `obs-text` (%x80-FF) into a
 /// field value, so one is not necessarily UTF-8. The single place this server
-/// reads a value as text -- credentials -- asks for it with [`Self::to_str`] and
-/// says what it does when the answer is no.
+/// reads a value as text is credentials, which uses [`Self::to_str`] and
+/// handles a value that is not UTF-8.
 #[derive(Clone, PartialEq, Eq)]
 pub struct FieldValue(Box<[u8]>);
 
@@ -157,10 +151,10 @@ impl FieldValue {
     ///
     /// # Panics
     ///
-    /// On an octet no field value may carry. The bound to `'static` is what
-    /// makes that acceptable: the argument is a literal in this tree, so a panic
-    /// here is a bug found by the first test that sends the field, never
-    /// something a peer can provoke.
+    /// On an octet no field value may carry. The `'static` bound makes that
+    /// acceptable: the argument is a literal in this tree, so a panic here is a
+    /// bug found by the first test that sends the field, never something a peer
+    /// can provoke.
     pub fn from_static(value: &'static str) -> Self {
         assert!(
             is_field_value(value.as_bytes()),
@@ -175,14 +169,14 @@ impl FieldValue {
     /// makes that a malformed message, and [`super::stream`] is where it becomes
     /// one.
     ///
-    /// The accepted set is `VCHAR` (%x21-7E), `obs-text` (%x80-FF), SP and HTAB
-    /// -- so CR, LF, NUL, every other control character and DEL are refused.
+    /// The accepted set is `VCHAR` (%x21-7E), `obs-text` (%x80-FF), SP and
+    /// HTAB. CR, LF, NUL, every other control character and DEL are refused.
     /// RFC 9110 §5.5's `field-content` additionally forbids a leading or
     /// trailing SP or HTAB, and that placement rule is deliberately not enforced
-    /// here: §10.3's concern is the three characters that would be exploited by
-    /// an intermediary translating the message, all three of which are refused,
-    /// and refusing a value with a stray leading space would turn a request that
-    /// every other HTTP/3 implementation accepts into a stream error.
+    /// here. §10.3's concern is the three characters an intermediary translating
+    /// the message could exploit, and all three are refused. Refusing a value
+    /// with a stray leading space would turn a request that every other HTTP/3
+    /// implementation accepts into a stream error.
     pub fn parse(value: &[u8]) -> Option<Self> {
         is_field_value(value).then(|| Self(value.into()))
     }
@@ -222,14 +216,13 @@ impl fmt::Debug for FieldValue {
 ///
 /// A list rather than a map, because a field section is a list: RFC 9110 §5.3
 /// lets a name repeat, and the order of the values under one name is part of
-/// what they mean. Lookups walk it, which for the two or three fields a CONNECT
-/// request carries is what any map would have done more slowly.
+/// what they mean. Lookups walk it, which is fast for the two or three fields a
+/// CONNECT request carries.
 ///
 /// Names are compared without regard to case. On the wire they are lowercase
-/// already -- RFC 9114 §4.2 makes an uppercase one malformed, and
-/// [`super::stream`] enforces it -- so the folding is not what makes a lookup
-/// find the field; it is what keeps a lookup from depending on that rule holding
-/// somewhere else.
+/// already, because RFC 9114 §4.2 makes an uppercase one malformed and
+/// [`super::stream`] enforces it. The case folding keeps a lookup correct
+/// without depending on that rule being enforced elsewhere.
 #[derive(Debug, Clone, Default)]
 pub struct Fields(Vec<(Box<str>, FieldValue)>);
 
@@ -246,8 +239,7 @@ impl Fields {
     /// debug builds, and for the reason [`FieldValue::from_static`] gives: every
     /// name this server appends is a literal in this tree or one
     /// [`field_name`] has already accepted, so a violation is a bug rather than
-    /// something a peer can provoke -- and a release build has no business
-    /// panicking over it.
+    /// something a peer can provoke. A release build does not panic over it.
     pub fn append(&mut self, name: impl Into<Box<str>>, value: FieldValue) {
         let name = name.into();
         debug_assert!(
@@ -323,7 +315,7 @@ pub struct Request {
     /// The authority this request names.
     ///
     /// Its `:authority` pseudo-header, or the Host field where RFC 9114 §4.3.1
-    /// lets that stand in for one -- the two are required to agree, so which of
+    /// lets that stand in for one. The two are required to agree, so which of
     /// them it came from changes nothing downstream.
     pub authority: Option<Box<str>>,
     /// The path part of `:path`: everything before the first "?".
@@ -375,8 +367,7 @@ pub fn token(bytes: &[u8]) -> Option<&str> {
         return None;
     }
 
-    // `tchar` is a subset of ASCII, so this cannot fail; written fallibly for
-    // the reason `Method::parse` gives.
+    // `tchar` is a subset of ASCII, so this cannot fail.
     std::str::from_utf8(bytes).ok()
 }
 
@@ -394,7 +385,7 @@ pub fn field_name(bytes: &[u8]) -> Option<&str> {
 
 /// Whether `byte` is an RFC 9110 §5.6.2 `tchar`.
 ///
-/// Every VCHAR except the delimiters -- DQUOTE and `(),/:;<=>?@[\]{}`.
+/// Every VCHAR except the delimiters: DQUOTE and `(),/:;<=>?@[\]{}`.
 fn is_tchar(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
 }
