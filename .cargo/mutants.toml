@@ -97,6 +97,6 @@ exclude_re = [
 
 # One known-equivalent mutant cannot be excluded by name without also hiding
 # killed siblings that share it: `keep_alive_interval > 0` -> `>= 0` in
-# Config::validate (u64, and validate has already refused a zero idle timeout,
+# validate_limits (u64, and validate_limits has already refused a zero idle timeout,
 # so the widened case is unreachable). A run over src/config/validate.rs reports it as
 # the one standing missed mutant.
