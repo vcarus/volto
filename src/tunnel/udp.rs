@@ -123,12 +123,20 @@ thread_local! {
 /// is the same for every packet. It is written once per piece cut from the
 /// block: a receive that finds nothing, and a packet that is dropped, leave
 /// the prefix and the window in place for the next receive.
+///
+/// A receive needs initialised bytes to write into, because a safe
+/// `IoSliceMut` is a `&mut [u8]`. The block is zero-filled once, when it is
+/// allocated or taken back, and the window of each packet is a part of it that
+/// is already initialised. Nothing is filled per packet.
 struct PacketBlock {
     quarter_stream_id: u64,
     prefix_len: usize,
-    /// The prefix and then [`RECV_WINDOW`] bytes while a packet may land in
-    /// them, and empty once a piece has been cut off.
+    /// What is left of the current block, all of it initialised. A piece is
+    /// cut off its front by [`Self::take`].
     block: BytesMut,
+    /// Whether `block` starts with the prefix, so that a packet may land
+    /// behind it in the next [`RECV_WINDOW`] bytes.
+    prepared: bool,
     /// The packet in hand with its prefix, copied out, when it was longer than
     /// the window.
     spilled: Option<Bytes>,
@@ -143,6 +151,7 @@ impl PacketBlock {
             quarter_stream_id,
             prefix_len: datagram::udp_payload_prefix_len(quarter_stream_id),
             block: BytesMut::new(),
+            prepared: false,
             spilled: None,
             len: 0,
         }
@@ -155,17 +164,17 @@ impl PacketBlock {
     /// and every other error unchanged for [`read_verdict`]. A failed receive
     /// changes nothing about the packet in hand.
     fn recv(&mut self, socket: &UdpSocket) -> std::io::Result<usize> {
-        if self.block.is_empty() {
+        if !self.prepared {
             self.prepare();
         }
 
         let prefix_len = self.prefix_len;
-        let block = &mut self.block;
+        let window = &mut self.block[..prefix_len + RECV_WINDOW];
         let (len, spilled) = OVERFLOW.with_borrow_mut(|overflow| {
             let len = {
                 let socket = SockRef::from(socket);
                 let mut parts = [
-                    IoSliceMut::new(&mut block[prefix_len..]),
+                    IoSliceMut::new(&mut window[prefix_len..]),
                     IoSliceMut::new(overflow),
                 ];
                 (&*socket).read_vectored(&mut parts)?
@@ -174,7 +183,7 @@ impl PacketBlock {
             // the next session on this thread.
             let spilled = (len > RECV_WINDOW).then(|| {
                 let mut whole = BytesMut::with_capacity(prefix_len + len);
-                whole.extend_from_slice(&block[..]);
+                whole.extend_from_slice(window);
                 whole.extend_from_slice(&overflow[..len - RECV_WINDOW]);
                 whole.freeze()
             });
@@ -186,19 +195,27 @@ impl PacketBlock {
         Ok(len)
     }
 
-    /// Writes the prefix and offers the window behind it, replacing the block
-    /// first if too little of it is left.
+    /// Writes the prefix at the front of what is left of the block, replacing
+    /// the block first if the prefix and the window no longer fit.
     ///
-    /// Called only while `block` is empty. A `reserve` on an empty buffer whose
-    /// pieces have all been released takes the whole block back without
-    /// allocating; one whose pieces quinn still holds allocates a fresh block.
+    /// Called only while no prefix is in place. The block is cleared before the
+    /// `reserve`, so no bytes of the old one are copied. A `reserve` on an
+    /// empty buffer whose pieces have all been released takes the whole block
+    /// back without allocating; one whose pieces quinn still holds allocates a
+    /// fresh block. Either way the `resize` zero-fills it, which is the only
+    /// fill a block gets.
     fn prepare(&mut self) {
-        debug_assert!(self.block.is_empty(), "the prefix is written once");
-        if self.block.capacity() < self.prefix_len + RECV_WINDOW {
+        debug_assert!(!self.prepared, "the prefix is written once");
+        if self.block.len() < self.prefix_len + RECV_WINDOW {
+            self.block.clear();
             self.block.reserve(RECV_BLOCK_SIZE);
+            self.block.resize(RECV_BLOCK_SIZE, 0);
         }
-        datagram::put_udp_payload_prefix(&mut self.block, self.quarter_stream_id);
-        self.block.resize(self.prefix_len + RECV_WINDOW, 0);
+        datagram::put_udp_payload_prefix(
+            &mut &mut self.block[..self.prefix_len],
+            self.quarter_stream_id,
+        );
+        self.prepared = true;
     }
 
     /// The length of the packet in hand as an HTTP Datagram.
@@ -218,15 +235,14 @@ impl PacketBlock {
     ///
     /// Byte for byte what [`datagram::encode_udp_payload`] makes of
     /// [`Self::payload`]. Called at most once per packet, and only for a packet
-    /// that is sent: the next receive prepares a fresh prefix and window.
+    /// that is sent: the next receive writes a fresh prefix behind it.
     fn take(&mut self) -> Bytes {
         if let Some(whole) = self.spilled.take() {
             return whole;
         }
 
-        let piece = self.block.split_to(self.prefix_len + self.len).freeze();
-        self.block.clear();
-        piece
+        self.prepared = false;
+        self.block.split_to(self.prefix_len + self.len).freeze()
     }
 }
 
@@ -1718,6 +1734,41 @@ mod tests {
         assert_eq!(packets.take(), datagram::encode_udp_payload(0x40, &sent));
     }
 
+    /// The window a packet is received into is not filled again: only the
+    /// prefix is written in front of it.
+    ///
+    /// The block is zero-filled once, when it is allocated. After the first
+    /// packet is cut off, the test marks the rest of the block, and the window
+    /// of the second packet must still carry the mark behind the packet. A fill
+    /// per packet, of the window or of anything around it, overwrites the mark.
+    #[tokio::test]
+    async fn a_window_is_not_filled_per_packet() {
+        const MARK: u8 = 0xa5;
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(0x40);
+
+        let first = payload(5, 100);
+        deliver(&mut packets, &ours, &target, &first).await;
+        let first_piece = packets.take();
+        packets.block.fill(MARK);
+
+        let second = payload(6, 64);
+        deliver(&mut packets, &ours, &target, &second).await;
+        let prefix_len = packets.prefix_len;
+        let behind = &packets.block[prefix_len + second.len()..prefix_len + RECV_WINDOW];
+        assert!(
+            behind.iter().all(|&byte| byte == MARK),
+            "the window behind the second packet was written before the receive"
+        );
+        let second_piece = packets.take();
+
+        assert_eq!(second_piece, datagram::encode_udp_payload(0x40, &second));
+        assert!(
+            std::ptr::eq(first_piece.as_ptr_range().end, second_piece.as_ptr()),
+            "the second packet was not received into the same block"
+        );
+    }
+
     /// A packet longer than the window arrives whole, through the overflow, and
     /// the packet after it is back in the block.
     ///
@@ -1751,8 +1802,9 @@ mod tests {
 
         let mut packets = PacketBlock::new(datagram::MAX_QUARTER_STREAM_ID);
         packets.prepare();
-        assert_eq!(packets.block.len(), 9 + RECV_WINDOW);
+        assert_eq!(packets.block.len(), RECV_BLOCK_SIZE);
         assert!(packets.block.capacity() <= RECV_BLOCK_SIZE);
+        assert!(packets.block.len() >= 9 + RECV_WINDOW);
     }
 
     /// Small packets fill a block before it is replaced, so what a session
@@ -1785,6 +1837,10 @@ mod tests {
             }
             next = piece.as_ptr_range().end;
             held.push(piece);
+            assert!(
+                packets.block.capacity() <= RECV_BLOCK_SIZE,
+                "packet {seed}: a replaced block is larger than {RECV_BLOCK_SIZE} bytes"
+            );
         }
 
         assert_eq!(RECV_BLOCK_SIZE - 9 - RECV_WINDOW, CARRIED);
@@ -1835,7 +1891,7 @@ mod tests {
 
     /// Puts `payload` in `packets` as a receive would, without a socket.
     fn landed(packets: &mut PacketBlock, payload: &[u8]) {
-        if packets.block.is_empty() {
+        if !packets.prepared {
             packets.prepare();
         }
         let prefix_len = packets.prefix_len;
@@ -1892,7 +1948,7 @@ mod tests {
 
         assert_eq!(path.oversize_drops.seen(), 0, "a packet that fits is sent");
         assert_eq!(path.limit, limit);
-        assert!(packets.block.is_empty(), "the packet was cut off the block");
+        assert!(!packets.prepared, "the packet was cut off the block");
     }
 
     /// Evictions are graded exactly as a reading before every send grades
