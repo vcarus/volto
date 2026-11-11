@@ -694,10 +694,13 @@ fn the_fuzz_lockfile_records_the_current_crate_version() {
 /// The unit must let libc resolution open every address family it may need.
 ///
 /// `RestrictAddressFamilies=AF_INET AF_INET6` covered the sockets volto opens
-/// itself and nothing else. getaddrinfo resolves through NSS modules, and on a
-/// host whose nsswitch.conf names `resolve` or `myhostname` those modules open
-/// AF_UNIX and AF_NETLINK sockets; a denied family fails the lookup and the
-/// tunnel with it. The unit is the only place that restriction is expressed.
+/// itself and nothing else. The own-address check is one of those: it binds an
+/// AF_INET or AF_INET6 socket and needs neither extra family. In a glibc build
+/// getaddrinfo resolves through NSS modules, and on a host whose nsswitch.conf
+/// names `resolve` or `myhostname` those modules open AF_UNIX and AF_NETLINK
+/// sockets. A denied family can fail the lookup and the tunnel with it. The
+/// static musl release binary has no NSS, but one unit serves both builds. The
+/// unit is the only place that restriction is expressed.
 #[test]
 fn the_unit_allows_the_address_families_name_resolution_needs() {
     let unit = read_text(&repo_root().join("script/masque.service"));

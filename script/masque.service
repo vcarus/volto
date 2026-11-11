@@ -95,9 +95,14 @@ ReadOnlyPaths=/etc/volto
 
 # --- Syscall and network surface -------------------------------------------
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-# AF_UNIX and AF_NETLINK are for libc name resolution: NSS modules such as
-# `resolve` and `myhostname` open sockets in those families, and a denied family
-# fails the lookup. volto does not read routes.
+# AF_INET and AF_INET6 are the families of the sockets volto opens itself,
+# including the bind that checks whether a target is one of this host's own
+# addresses. AF_UNIX and AF_NETLINK are for name resolution in a glibc build:
+# getaddrinfo goes through NSS, modules such as `resolve` and `myhostname` open
+# sockets in those families, and a denied family can fail the lookup. The static
+# musl release binary has no NSS and does not need them. They stay allowed so
+# that one unit serves both builds. volto does not read routes or list
+# interfaces.
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
