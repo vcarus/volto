@@ -465,6 +465,10 @@ fn crate_constants() -> BTreeMap<&'static str, u64> {
             volto::tunnel::tcp::RELAY_BLOCK_SIZE as u64,
         ),
         (
+            "RECV_BLOCK_SIZE",
+            volto::tunnel::udp::RECV_BLOCK_SIZE as u64,
+        ),
+        (
             "DEFAULT_UDP_SESSION_TIMEOUT",
             volto::config::DEFAULT_UDP_SESSION_TIMEOUT,
         ),

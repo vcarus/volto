@@ -320,12 +320,13 @@ impl Shared {
 /// even though RFC 9298 §5 permits a 65527-byte UDP payload in principle. At
 /// `INBOUND_QUEUE_DEPTH` = 64 that is ~92 KiB.
 ///
-/// The second is the buffer a running session reads its *target* socket into
-/// ([`crate::tunnel`]'s UDP path), one per session and sized for the largest UDP
-/// payload there can be — the whole 65527 bytes, ~64 KiB — because a packet that
-/// has arrived must fit somewhere before its length is known. Unlike the queue it
-/// exists only once the session loop is running, so a session refused before its
-/// socket is bound never allocates one.
+/// The second is the block a running session receives its *target's* packets
+/// into ([`crate::tunnel`]'s UDP path), 16 KiB per session. Unlike the queue it
+/// is allocated only once the target first sends, so a session refused before
+/// its socket is bound, or whose target never answers, never allocates one. A
+/// packet longer than the block's 2 KiB window continues into a buffer each
+/// runtime thread has once, which is what lets the block be this small: a
+/// packet that has arrived must fit somewhere before its length is known.
 ///
 /// The third is the [`crate::capsule::CapsuleDecoder`] on the request stream,
 /// which buffers a DATAGRAM capsule's value until all of it has arrived —
@@ -335,10 +336,10 @@ impl Shared {
 /// to 64 KiB rather than landing on it
 /// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`).
 ///
-/// A session therefore costs ~236 KiB, and the worst case is that times
+/// A session therefore costs ~188 KiB, and the worst case is that times
 /// `max_targets_per_conn` times `max_connections`. With the shipped defaults
-/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~59 MiB per
-/// connection and ~14.7 GiB across a server saturated at both limits — an
+/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~47 MiB per
+/// connection and ~11.8 GiB across a server saturated at both limits — an
 /// operator lowering either limit lowers it proportionally.
 ///
 /// All three are released by dropping what owns them rather than by any explicit

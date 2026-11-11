@@ -400,7 +400,10 @@ its Quarter Stream ID by asking its stream for a `DatagramReceiver` and holds
 the claim exactly as long as it holds that receiver, so a session that ends —
 however it ends — takes its routing entry with it. Sending is the other half and
 stays outside: a UDP session writes its datagrams straight onto the
-`quinn::Connection`.
+`quinn::Connection`. Each target packet is received behind its datagram prefix
+in the session's `RECV_BLOCK_SIZE` = 16 KiB block, and the datagram quinn is
+handed is a piece of that block rather than a copy; `tunnel/udp.rs` gives the
+memory arithmetic.
 
 Two fields decide where a packet goes, and getting either subtly wrong is
 silent:
