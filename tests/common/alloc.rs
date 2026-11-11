@@ -1,25 +1,31 @@
 //! The pass-through half of the three measuring allocators.
 //!
 //! `it_bounds`, `it_relay_memory` and `it_bench` each install a
-//! [`GlobalAlloc`] that forwards to the system allocator and counts something
-//! on the way past. What they count is genuinely different — signed live bytes,
+//! [`GlobalAlloc`] that forwards to another allocator and counts something on
+//! the way past. What they count is genuinely different — signed live bytes,
 //! allocations at or above the relay's read window, every allocation and its
 //! size — and stays in each of those files, next to the measurement it serves.
 //! What was written out three times is the forwarding itself: four `unsafe`
-//! methods that call [`System`] and report what happened.
+//! methods that call the inner allocator and report what happened.
+//!
+//! The inner allocator is [`System`] unless the binary names another one.
+//! `it_bench` names `volto::alloc::Global`, the allocator the `volto` binary
+//! installs, so that its CPU numbers come from the allocator a release ships
+//! with. The other two count bytes and allocations, which do not depend on the
+//! allocator, and keep [`System`].
 //!
 //! Reached with `#[path = "common/alloc.rs"] mod alloc;` rather than declared
 //! inside `common`, so the binaries that do not measure allocations do not
 //! compile it (the same leaf-module route D66's QR5 did not consider).
 //!
 //! One deliberate difference from the copies this replaces: an allocation is
-//! reported only once the system allocator has returned a non-null pointer, the
+//! reported only once the inner allocator has returned a non-null pointer, the
 //! way `it_bounds` already did it and the other two did not. A null return is
 //! the allocator failing, and nothing was handed out to count.
 
 // One of the package's argued exceptions to `unsafe_code = "deny"`: a global
 // allocator is an `unsafe` contract by definition, and these methods only
-// forward to `System` and touch atomics on the way past.
+// forward to the inner allocator and touch atomics on the way past.
 #![allow(unsafe_code)]
 #![allow(dead_code)] // Each measuring binary uses a subset of this.
 
@@ -47,13 +53,28 @@ pub trait Record {
     }
 }
 
-/// A `GlobalAlloc` that forwards to [`System`] and reports to `R`.
-pub struct PassThrough<R>(PhantomData<fn() -> R>);
+/// A `GlobalAlloc` that forwards to `A` and reports to `R`.
+pub struct PassThrough<R, A = System> {
+    inner: A,
+    record: PhantomData<fn() -> R>,
+}
 
 impl<R> PassThrough<R> {
-    /// The one value of this type, for the `#[global_allocator]` static.
+    /// The value that forwards to [`System`], for the `#[global_allocator]`
+    /// static.
     pub const fn new() -> Self {
-        Self(PhantomData)
+        Self::over(System)
+    }
+}
+
+impl<R, A> PassThrough<R, A> {
+    /// The value that forwards to `inner`, for the `#[global_allocator]`
+    /// static.
+    pub const fn over(inner: A) -> Self {
+        Self {
+            inner,
+            record: PhantomData,
+        }
     }
 }
 
@@ -63,14 +84,15 @@ impl<R> Default for PassThrough<R> {
     }
 }
 
-// SAFETY: every method forwards to `System`, which is a correct `GlobalAlloc`,
-// and returns exactly what it returned. The bookkeeping between the calls
-// allocates nothing itself -- the implementations of `Record` in the test
-// binaries only touch atomics -- so it cannot re-enter the allocator.
-unsafe impl<R: Record> GlobalAlloc for PassThrough<R> {
+// SAFETY: every method forwards to `A`, which is a correct `GlobalAlloc` by its
+// own `unsafe impl`, and returns exactly what it returned. The bookkeeping
+// between the calls allocates nothing itself -- the implementations of
+// `Record` in the test binaries only touch atomics -- so it cannot re-enter the
+// allocator.
+unsafe impl<R: Record, A: GlobalAlloc> GlobalAlloc for PassThrough<R, A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         unsafe {
-            let ptr = System.alloc(layout);
+            let ptr = self.inner.alloc(layout);
             if !ptr.is_null() {
                 R::allocated(layout.size());
             }
@@ -80,7 +102,7 @@ unsafe impl<R: Record> GlobalAlloc for PassThrough<R> {
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         unsafe {
-            let ptr = System.alloc_zeroed(layout);
+            let ptr = self.inner.alloc_zeroed(layout);
             if !ptr.is_null() {
                 R::allocated(layout.size());
             }
@@ -90,7 +112,7 @@ unsafe impl<R: Record> GlobalAlloc for PassThrough<R> {
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         unsafe {
-            let moved = System.realloc(ptr, layout, new_size);
+            let moved = self.inner.realloc(ptr, layout, new_size);
             if !moved.is_null() {
                 R::reallocated(layout.size(), new_size);
             }
@@ -100,7 +122,7 @@ unsafe impl<R: Record> GlobalAlloc for PassThrough<R> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe {
-            System.dealloc(ptr, layout);
+            self.inner.dealloc(ptr, layout);
             R::freed(layout.size());
         }
     }
