@@ -27,9 +27,10 @@
 //!   drawn from the IANA registries that RFC 6890 set up: `0.0.0.0/8`,
 //!   loopback, RFC 1918, link-local, shared address space, IETF protocol
 //!   assignments (`192.0.0.0/24`), the IPv6 anycast service addresses
-//!   (`2001:1::1` to `2001:1::3`), the benchmarking and documentation ranges
-//!   (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA, ORCHID
-//!   and ORCHIDv2, the DETs prefix, the discard-only prefix, the SRv6 SID
+//!   (`2001:1::1` to `2001:1::3`), the AMT relay discovery prefixes
+//!   (`192.52.193.0/24` and `2001:3::/32`), the benchmarking and documentation
+//!   ranges (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA,
+//!   ORCHID and ORCHIDv2, the DETs prefix, the discard-only prefix, the SRv6 SID
 //!   block, the local-use NAT64 prefix and the deprecated IPv4-compatible and
 //!   IPv6 site-local spaces. Denied by default, unlocked by
 //!   `allow_private_networks`.
@@ -227,8 +228,8 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// services rather than reserved space, such as `2001:4:112::/48` (AS112).
 /// Denying the whole block would take those with it. So it is left public, and
 /// the more-specific allocations worth denying are claimed one at a time: the
-/// three anycast service addresses, the benchmarking range, ORCHID, ORCHIDv2
-/// and DETs below. Teredo, also inside the /23, is not claimed. A Teredo
+/// three anycast service addresses, the AMT relay discovery prefix, the
+/// benchmarking range, ORCHID, ORCHIDv2 and DETs below. Teredo, also inside the /23, is not claimed. A Teredo
 /// address is judged by the IPv4 address it carries ([`embedded_ipv4`]).
 fn is_private(ip: IpAddr) -> bool {
     match ip {
@@ -254,6 +255,9 @@ fn is_private(ip: IpAddr) -> bool {
                 // instance nearest the proxy, which is the PCP or TURN service
                 // of the proxy's own network.
                 || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                // 192.52.193.0/24, AMT relay discovery (RFC 7450). See
+                // `is_amt_relay_discovery` for the IPv6 prefix and the reason.
+                || (octets[0] == 192 && octets[1] == 52 && octets[2] == 193)
                 // 198.18.0.0/15 — benchmarking (RFC 2544).
                 || (octets[0] == 198 && octets[1] & 0xfe == 18)
                 // 192.88.99.0/24 — 6to4 relay anycast (RFC 6890 Table 10, from
@@ -274,6 +278,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_ipv4_compatible(v6)
                 || is_ipv6_documentation(v6)
                 || is_ipv6_protocol_anycast(v6)
+                || is_amt_relay_discovery(v6)
                 || is_ipv6_benchmarking(v6)
                 || is_orchid(v6)
                 || is_det(v6)
@@ -321,6 +326,26 @@ fn is_ipv6_documentation(v6: Ipv6Addr) -> bool {
 /// over IPv6. Each is one address, so the rest of `2001:1::/32` stays public.
 fn is_ipv6_protocol_anycast(v6: Ipv6Addr) -> bool {
     matches!(v6.segments(), [0x2001, 0x0001, 0, 0, 0, 0, 0, 1..=3])
+}
+
+/// `2001:3::/32` is the IPv6 AMT relay discovery prefix (RFC 7450). Its IPv4
+/// counterpart `192.52.193.0/24` is claimed in [`is_private`].
+///
+/// The IANA registry marks both globally reachable. RFC 7450 Section 4.1.4
+/// says how they are used: "a gateway sends a message to an anycast IP address
+/// within that prefix. This message is routed to the topologically nearest
+/// relay that has advertised the prefix." Through this proxy the sender is the
+/// proxy, so a client reaches the multicast relay of the proxy's own network.
+/// That is the same reason the PCP and TURN anycast addresses are claimed.
+///
+/// AS112 (`192.31.196.0/24`, `192.175.48.0/24`, `2001:4:112::/48` and
+/// `2620:4f:8000::/48`) is anycast too and is not claimed. It is a public DNS
+/// service that gives every sender the same answer and does nothing on the
+/// sender's behalf, so the instance nearest the proxy is an ordinary
+/// destination.
+fn is_amt_relay_discovery(v6: Ipv6Addr) -> bool {
+    let segments = v6.segments();
+    segments[0] == 0x2001 && segments[1] == 0x0003
 }
 
 /// `2001:2::/48` — the IPv6 benchmarking range (RFC 6890 Table 24, from
@@ -915,6 +940,49 @@ mod tests {
             assert!(
                 strict.allows_address(ip(address)),
                 "{address} is not one of the three anycast addresses and stays public"
+            );
+        }
+    }
+
+    /// The AMT relay discovery prefixes are private in both families, and
+    /// their neighbours and the AS112 prefixes are not.
+    ///
+    /// A message to an address in an AMT prefix is routed to the relay nearest
+    /// the sender (RFC 7450), which through this proxy is the relay nearest the
+    /// proxy. AS112 is anycast as well, but it is a public DNS service that
+    /// answers every sender alike, so it stays a destination.
+    #[test]
+    fn the_amt_relay_discovery_prefixes_are_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+        for address in [
+            "192.52.193.0",
+            "192.52.193.1",
+            "192.52.193.255",
+            "2001:3::1",
+            "2001:3:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is an AMT relay discovery address and must be denied by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+        for address in [
+            "192.52.192.255",
+            "192.52.194.0",
+            "2001:4::1",
+            "192.31.196.1",
+            "192.175.48.1",
+            "2001:4:112::1",
+            "2620:4f:8000::1",
+        ] {
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} is outside the AMT prefixes and stays public"
             );
         }
     }
