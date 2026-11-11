@@ -100,8 +100,12 @@ impl alloc::Record for Counting {
     }
 }
 
+// Forwards to `volto::alloc::Global` rather than `System`: on musl that is
+// mimalloc, the allocator the release binary installs, and the CPU numbers this
+// file prints should come from it.
 #[global_allocator]
-static GLOBAL: alloc::PassThrough<Counting> = alloc::PassThrough::new();
+static GLOBAL: alloc::PassThrough<Counting, volto::alloc::Global> =
+    alloc::PassThrough::over(volto::alloc::GLOBAL);
 
 // ---------------------------------------------------------------------------
 // Measurement

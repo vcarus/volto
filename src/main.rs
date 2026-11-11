@@ -22,6 +22,10 @@ use volto::config::Config;
 use volto::quic::Server;
 use volto::shutdown::Trigger;
 
+// mimalloc on the musl targets, `System` elsewhere. `volto::alloc` says why.
+#[global_allocator]
+static GLOBAL: volto::alloc::Global = volto::alloc::GLOBAL;
+
 /// Command line arguments.
 #[derive(Debug, Parser)]
 #[command(name = "volto", version, about = "MASQUE proxy server")]

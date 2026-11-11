@@ -115,6 +115,32 @@ libc = "0.2"
 # one-line `socket2::SockRef` wrapper quinn repeats when it wraps the socket.
 socket2 = "0.6"
 
+# The global allocator of the musl builds, installed in `src/main.rs` through
+# `src/alloc.rs`. The release binaries are static musl, and on 2026-11-11
+# `tests/it_bench.rs` measured them against `x86_64-unknown-linux-gnu` on
+# `3df1a21`: same host, a `rust:1` container, three interleaved rounds, the
+# range of the medians. Allocation counts were identical on both targets, so
+# the gap is libc, and musl's `malloc` is the first part of it to replace.
+#
+#     test                          gnu             musl
+#     tcp_download   cpu-s/GB       6.64 to 6.91    11.81 to 14.98
+#     tcp_upload     cpu-s/GB       5.78 to 6.54    8.65 to 12.48
+#     udp_1200 t->c  cpu-us/pkt     12.34 to 12.69  18.41 to 20.35
+#     udp_1200 c->t  cpu-us/pkt     12.09 to 12.48  13.94 to 14.64
+#     tcp_churn      cpu-us/cycle   325 to 329      392 to 413
+#     udp_churn      cpu-us/cycle   294 to 316      373 to 400
+#
+# musl only: glibc's allocator already keeps per-thread caches, and the gnu,
+# macOS and test builds stay on `std::alloc::System`, so mimalloc is not
+# compiled there at all. The cost is C code that `libmimalloc-sys` builds with
+# `cc`. The musl cross-builds in release.yml and cross.yml already need a C
+# toolchain for aws-lc-rs, so they need nothing new. `default-features = false`
+# keeps the feature set empty, which builds the mimalloc v3 C sources the sys
+# crate vendors. `secure` (guard pages and encrypted free lists) stays off. It
+# adds CPU cost, and CPU cost is the reason this dependency exists.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
 # The volto half of the QPACK/Huffman differential oracle: a filter that turns
 # bytes into this server's verdict about them, so that `tests/interop/difforacle`
 # can put the same bytes through an independent decoder and compare. An example

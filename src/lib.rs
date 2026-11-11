@@ -7,6 +7,7 @@
 //!
 //! # Module layout
 //!
+//! * [`alloc`]: the global allocator the binary installs, mimalloc on musl.
 //! * [`auth`] — HTTP Basic authentication of CONNECT requests.
 //! * [`config`] — TOML configuration and its validation.
 //! * [`policy`] — the destination ACL: which targets may be reached.
@@ -63,6 +64,7 @@
 #![doc(html_logo_url = "https://vcarus.github.io/volto/assets/logo.png")]
 #![doc(html_favicon_url = "https://vcarus.github.io/volto/theme/favicon.png")]
 
+pub mod alloc;
 pub mod auth;
 pub mod capsule;
 pub mod config;
