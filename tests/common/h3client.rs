@@ -1085,19 +1085,16 @@ async fn drive(quic: quinn::Connection, peer: Arc<Peer>) {
 
 /// Dispatches one of the server's unidirectional streams by its type.
 ///
-/// A stream that ends before its type, or carries a malformed one, is a fault
-/// unless the connection itself has ended, which ends every stream with it.
-/// RFC 9114 §6.2.1 allows exactly one control stream, so a second one is
-/// recorded rather than read as if it were the first.
+/// A stream that ends before its type is not a fault, and is left alone. RFC
+/// 9114 §6.2.1 allows exactly one control stream, so a second one is recorded
+/// rather than read as if it were the first.
 async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
+    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+    //# A sender can close or reset a unidirectional stream unless otherwise
+    //# specified.  A receiver MUST tolerate unidirectional streams being
+    //# closed or reset prior to the reception of the unidirectional stream
+    //# header.
     let Some(stream_type) = read_varint(&mut recv).await else {
-        if quic.close_reason().is_none() {
-            peer.broke(
-                "the server's unidirectional stream ended before its type or carried a malformed \
-                 type"
-                    .into(),
-            );
-        }
         return;
     };
 
@@ -1124,19 +1121,39 @@ async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Co
 /// still passed. Unknown and reserved-for-greasing types stay ignored, because
 /// §9 requires exactly that.
 ///
-/// Now also recorded as faults: a unidirectional stream that ends before its
-/// type or carries a malformed one, a second control stream, and a control
-/// stream that ends in the middle of a frame. A stream that ends because the
-/// connection itself has ended is not a fault, since every stream ends with its
-/// connection. [`Peer::check`] re-raises the first fault at the next request or
-/// response, after every data read, and at [`H3Client`] teardown.
+/// Also recorded as faults: a second control stream, a control stream that
+/// the server closes at a frame boundary, and one that ends in the middle of a
+/// frame. A stream that ends because the connection itself has ended is not a
+/// fault, since every stream ends with its connection. [`Peer::check`]
+/// re-raises the first fault at the next request or response, after every data
+/// read, and at [`H3Client`] teardown.
 async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
     let mut settings_seen = false;
 
     loop {
-        let (Some(kind), Some(length)) =
-            (read_varint(&mut recv).await, read_varint(&mut recv).await)
-        else {
+        let kind = match read_varint_or_end(&mut recv).await {
+            VarintRead::Value(kind) => kind,
+            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+            //# If either control stream is closed at any point, this MUST be
+            //# treated as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+            VarintRead::EndedBefore => {
+                if quic.close_reason().is_none() {
+                    peer.broke(
+                        "the server closed its control stream at a frame boundary, which is \
+                         H3_CLOSED_CRITICAL_STREAM"
+                            .into(),
+                    );
+                }
+                return;
+            }
+            VarintRead::EndedInside => {
+                if quic.close_reason().is_none() {
+                    peer.broke("the server's control stream ended in the middle of a frame".into());
+                }
+                return;
+            }
+        };
+        let Some(length) = read_varint(&mut recv).await else {
             if quic.close_reason().is_none() {
                 peer.broke("the server's control stream ended in the middle of a frame".into());
             }
@@ -1260,20 +1277,47 @@ fn max_field_section_size(mut payload: &[u8]) -> Option<u64> {
 
 /// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
 ///
+/// `None` when the stream ends, or is reset, before the whole integer has
+/// arrived. [`read_varint_or_end`] tells the two places it can end apart.
+async fn read_varint(recv: &mut quinn::RecvStream) -> Option<u64> {
+    match read_varint_or_end(recv).await {
+        VarintRead::Value(value) => Some(value),
+        VarintRead::EndedBefore | VarintRead::EndedInside => None,
+    }
+}
+
+/// What [`read_varint_or_end`] found.
+enum VarintRead {
+    /// A whole integer.
+    Value(u64),
+    /// The stream ended, or was reset, before the integer's first byte.
+    EndedBefore,
+    /// The stream ended, or was reset, after the first byte and before the last.
+    EndedInside,
+}
+
+/// Reads one QUIC variable-length integer, and says where the stream ended if
+/// it did.
+///
 /// Only the length has to be worked out here -- it is in the first byte's two
 /// most significant bits -- after which the bytes go to `peek_varint`, the same
 /// shape the server's own `read_stream_type` uses. `it_settings` keeps a reader
 /// of its own that decodes independently, for the frame Surge disconnects over.
-async fn read_varint(recv: &mut quinn::RecvStream) -> Option<u64> {
+async fn read_varint_or_end(recv: &mut quinn::RecvStream) -> VarintRead {
     let mut buf = [0u8; 8];
-    recv.read_exact(&mut buf[..1]).await.ok()?;
-
-    let length = 1usize << (buf[0] >> 6);
-    if length > 1 {
-        recv.read_exact(&mut buf[1..length]).await.ok()?;
+    if recv.read_exact(&mut buf[..1]).await.is_err() {
+        return VarintRead::EndedBefore;
     }
 
-    peek_varint(&buf[..length]).map(|(value, _)| value)
+    let length = 1usize << (buf[0] >> 6);
+    if length > 1 && recv.read_exact(&mut buf[1..length]).await.is_err() {
+        return VarintRead::EndedInside;
+    }
+
+    match peek_varint(&buf[..length]) {
+        Some((value, _)) => VarintRead::Value(value),
+        None => VarintRead::EndedInside,
+    }
 }
 
 /// Reads a stream to its end, discarding everything on it.
