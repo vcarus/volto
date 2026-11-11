@@ -104,6 +104,19 @@ still unacknowledged: the pieces cut from a block share it, and each goes on
 counting until the storage holding it is released, which is after its
 acknowledgement rather than at it, so the block outlives them all.
 
+**Both kinds of tunnel read the client's side in batches.** Once a request has
+been accepted, its stream's reader takes up to `READ_AHEAD_CHUNKS` = 32 chunks
+from quinn per read, and the TCP relay writes what one read took with one
+`writev`. The slots cost 1 KiB per tunnel, and a TCP tunnel adds a 2 KiB list
+for its vectored write once it has carried an upload. The chunks are quinn's own
+buffers, about 1.4 KB each in a bulk upload, so a tunnel in the middle of one
+holds some 45 KB that quinn's flow-control windows no longer count, on top of
+the figures above. The worst case per tunnel is unchanged: one read takes at
+most what quinn had buffered for the stream, which the 2 MiB stream receive
+window bounds, and a single chunk could already be that large. Nothing of this
+applies before a request has been accepted, so it adds nothing to what an
+unauthenticated peer can make the server hold.
+
 **Every tunnel also holds its request's header fields.** volto advertises
 `MAX_FIELD_SECTION_SIZE` = 65536 in its SETTINGS, and a client is entitled to
 send a request that large; decoded, it costs roughly that much again — about 77

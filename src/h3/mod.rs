@@ -13,7 +13,8 @@
 //!   the crate sees.
 //! * [`huffman`] — RFC 7541 Appendix B, decoding only.
 //! * [`qpack`] — RFC 9204 field sections against the static table.
-//! * [`frame`] — RFC 9114 §7 framing, incremental and copy-free for DATA.
+//! * [`frame`] — RFC 9114 §7 framing, incremental and copy-free for DATA, with
+//!   one bounded read-ahead on a tunnel ([`frame::READ_AHEAD_CHUNKS`]).
 //! * [`message`] — what a request and a response are made of: a status, a
 //!   method, field lines.
 //! * [`connection`] — the connection: SETTINGS, the control stream, GOAWAY,

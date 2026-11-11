@@ -266,6 +266,13 @@ fn congestion_factory(
 /// tunnel pumps read continuously, so it binds exactly when the target is slower
 /// than the client — which is the case that should be bounded.
 ///
+/// Read means taken from quinn. A tunnel's reader takes up to
+/// [`crate::h3api::READ_AHEAD_CHUNKS`] chunks per read, and those count as read
+/// while they wait to be relayed, so each established tunnel can hold one read's
+/// worth beyond this cap. A request stream is read one chunk at a time until its
+/// request has been accepted, so the read-ahead adds nothing to what an
+/// unauthenticated peer can make the process hold.
+///
 /// 16 MiB against the 2 MiB per-stream window: eight simultaneously saturated
 /// tunnels still get their full stream windows, while the worst case stops being
 /// a function of `max_streams_bidi`.

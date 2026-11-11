@@ -58,11 +58,23 @@
 //! often, and never enough to finish the write it woke, is cut once that one
 //! write has been outstanding for a whole budget. So there is a floor under how
 //! slowly a half-closed tunnel may be drained -- one relay chunk, up to
-//! `RELAY_BLOCK_SIZE`, per budget on the target -> client side and one of
-//! quinn's ~1.4 KB pieces per budget on the other -- which at the default 180 s
-//! is orders of magnitude under any real client. A tunnel whose two directions
-//! are both still open is untouched however long a write parks, because there
-//! the other pump is still the watchdog.
+//! `RELAY_BLOCK_SIZE`, per budget on the target -> client side, and one gathered
+//! write, up to `WRITE_BATCH_BYTES` (the same 64 KiB) plus at most one piece, per
+//! budget on the other -- which at the default 180 s is orders of magnitude
+//! under any real client. A tunnel whose two directions are both still open is
+//! untouched however long a write parks, because there the other pump is still
+//! the watchdog.
+//!
+//! # One write per read
+//!
+//! The client -> target pump writes with `writev`. A tunnel's reader takes up to
+//! `h3api::READ_AHEAD_CHUNKS` chunks from quinn per read, and the pump gathers
+//! the awaited piece and every piece already decodable from that read into one
+//! vectored write (`gather`, `write_batch`). Before, each ~1.4 KB piece cost its
+//! own `write`. The order of bytes, and of the client's FIN, a reset or a
+//! protocol violation relative to them, is unchanged: anything that ends the
+//! direction is reported by the next `Reader::recv_data`, which runs only after
+//! the gathered write has completed.
 //!
 //! What nothing bounds *by time* is the surviving direction parked in a read. A
 //! target that has taken the client's FIN may legitimately take minutes to
@@ -77,11 +89,11 @@
 //! however quiet the target stays. Only a client that is still waiting for an
 //! answer keeps one alive.
 
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -462,8 +474,12 @@ async fn client_to_target(
 ) {
     let budget = half.budget;
 
+    // The pieces of one write, kept across iterations so its allocation is
+    // made once per tunnel: at most `WRITE_BATCH_PIECES` handles.
+    let mut batch: Vec<Bytes> = Vec::new();
+
     // The two places that can notice a teardown — the wait for the client's
-    // next chunk and the write of the one already in hand — end this direction
+    // next chunk and the write of the ones already in hand — end this direction
     // identically, and `OwnedWriteHalf::forget` consumes the half, so the
     // reason is carried out of the loop and acted on once below.
     let reason = loop {
@@ -475,6 +491,16 @@ async fn client_to_target(
 
         match chunk {
             Ok(Some(data)) => {
+                // The awaited piece, then whatever the same read from quinn
+                // already took and the decoder can hand out without waiting
+                // (`Reader::try_recv_data`), so that one `writev` carries what
+                // one read took. Nothing here waits or reports an ending: the
+                // client's FIN, a reset and a protocol violation found while
+                // gathering all come from the next `recv_data` above, after
+                // this write has finished, which is the order they had when
+                // each piece was written before the next was read.
+                gather(data, &mut reader, &mut batch);
+
                 // The write is under the same signal as the read, because it is
                 // the half that can park indefinitely: a target that has stopped
                 // reading fills every buffer between here and it, and a teardown
@@ -484,12 +510,12 @@ async fn client_to_target(
                 // or the QUIC connection, it MUST close the TCP connection"
                 // delayed for as long as a target chooses to stall.
                 //
-                // Abandoning `write_all` part-way is acceptable here and only
+                // Abandoning `write_batch` part-way is acceptable here and only
                 // here. Every path that raises a teardown ends with the target
                 // socket reset or dropped, so the target never sees a truncated
-                // chunk followed by more of the tunnel: it sees the end of the
-                // connection. Resource bounds are unchanged — `data` is dropped
-                // with this arm either way.
+                // batch followed by more of the tunnel: it sees the end of the
+                // connection. Resource bounds are unchanged: every path out of
+                // this arm but a completed write returns, and drops `batch`.
                 //
                 // The client's own RESET_STREAM is the third thing that can
                 // end the wait, and it needs a branch of its own: the read
@@ -508,13 +534,13 @@ async fn client_to_target(
                 // poll -- the ordinary case, a target keeping up -- never polls
                 // the watcher at all, and never arms the timer
                 // `Reader::reset_by_peer` falls back on while the client's next
-                // chunks are already buffered. The watcher only starts costing
-                // anything once the write is genuinely parked, which is the
-                // only state it is there for.
+                // chunks are already buffered in quinn. The watcher only starts
+                // costing anything once the write is genuinely parked, which is
+                // the only state it is there for.
                 let written = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
-                    written = tcp_write.write_all(&data) => written,
+                    written = write_batch(&mut tcp_write, &mut batch) => written,
                     error = reader.reset_by_peer() => {
                         client_aborted(&error, tcp_write, teardown);
                         return;
@@ -592,6 +618,90 @@ async fn client_to_target(
     // would put a FIN on the wire, which is the wrong signal for every path that
     // gets here — and would overtake the reset when the other pump armed one.
     tcp_write.forget();
+}
+
+/// Most pieces of the client's body one write to the target carries.
+///
+/// Twice [`h3api::READ_AHEAD_CHUNKS`], because one chunk from quinn can hold
+/// the end of one DATA frame and the start of the next, and the decoder hands
+/// those out as two pieces. Far under `IOV_MAX` (1024 on Linux and macOS), so
+/// one call is one `writev`. The handles cost 32 bytes each, 2 KiB per tunnel
+/// once it has carried an upload.
+const WRITE_BATCH_PIECES: usize = 2 * h3api::READ_AHEAD_CHUNKS;
+
+/// Bytes past which [`gather`] adds no further piece to a write.
+///
+/// The pieces are in memory already, in the read-ahead, so this is not a memory
+/// bound. It bounds one write instead, and with it the half-close bound's
+/// floor: once the target has sent its EOF, a write that does not complete
+/// within one `stall_budget` cuts the tunnel, so the most one write may carry
+/// is the least a target must take per budget. This is the size of the largest
+/// read the opposite direction makes, which keeps that floor the same in both
+/// directions. One piece can still exceed it on its own; a write always carries
+/// at least the piece it was started for.
+const WRITE_BATCH_BYTES: usize = RELAY_BLOCK_SIZE;
+
+/// Fills `batch` with `first` and whatever more of the client's body `reader`
+/// can hand out without waiting, up to [`WRITE_BATCH_PIECES`] and
+/// [`WRITE_BATCH_BYTES`].
+///
+/// What is not taken stays in the reader, in order, for the next
+/// `Reader::recv_data`.
+fn gather(first: Bytes, reader: &mut Reader, batch: &mut Vec<Bytes>) {
+    debug_assert!(batch.is_empty(), "the previous write left pieces behind");
+    let mut bytes = first.len();
+    batch.push(first);
+
+    while batch.len() < WRITE_BATCH_PIECES && bytes < WRITE_BATCH_BYTES {
+        let Some(piece) = reader.try_recv_data() else {
+            break;
+        };
+        bytes += piece.len();
+        batch.push(piece);
+    }
+}
+
+/// Writes every byte of `batch` to the target, in order, and leaves it empty.
+///
+/// `write_vectored` may take any prefix of what it is offered, so after each
+/// call the pieces it took whole are dropped and the one it took part of is
+/// trimmed, and the rest is offered again. A TCP write half reports
+/// `is_write_vectored`, so each call is one `writev`; on a writer that did not,
+/// tokio would write the first piece per call, and the loop would still write
+/// every byte in order, one `write` per piece as before.
+///
+/// Not cancel-safe, as `write_all` was not: abandoned part-way, some of `batch`
+/// has been written. `client_to_target` says why the places that abandon it
+/// may.
+async fn write_batch(tcp: &mut OwnedWriteHalf, batch: &mut Vec<Bytes>) -> io::Result<()> {
+    while !batch.is_empty() {
+        let mut written = {
+            let mut slices = [IoSlice::new(&[]); WRITE_BATCH_PIECES];
+            for (slice, piece) in slices.iter_mut().zip(batch.iter()) {
+                *slice = IoSlice::new(piece);
+            }
+            let offered = batch.len().min(WRITE_BATCH_PIECES);
+            tcp.write_vectored(&slices[..offered]).await?
+        };
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+
+        let mut whole = 0;
+        while let Some(piece) = batch.get(whole)
+            && piece.len() <= written
+        {
+            written -= piece.len();
+            whole += 1;
+        }
+        batch.drain(..whole);
+        // What is left of `written` is less than the first remaining piece,
+        // so that piece exists whenever anything is left.
+        if let Some(partial) = batch.first_mut() {
+            partial.advance(written);
+        }
+    }
+    Ok(())
 }
 
 /// Ends the client → target direction after the client abandoned the stream.
@@ -926,13 +1036,13 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HalfClose, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, connect_any_with, ensure_window,
-        split_authority,
+        HalfClose, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, WRITE_BATCH_PIECES, connect_any_with,
+        ensure_window, split_authority, write_batch,
     };
     // The deadlines here and the resolver's are asserted the same way; the
     // helper lives beside the first of them rather than in both files.
     use crate::tunnel::tests::poll_once;
-    use bytes::BytesMut;
+    use bytes::{Bytes, BytesMut};
     use std::io;
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1204,7 +1314,7 @@ mod tests {
     /// `stalled()`.
     ///
     /// What the pumps rely on and no test held: the future is rebuilt inside
-    /// the `select!` for each chunk, so a write that completes resets the bound
+    /// the `select!` for each write, so a write that completes resets the bound
     /// for the next one. Two writes of nine tenths of a budget apiece must cut
     /// nothing, where a bound shared across writes would cut on the second.
     #[tokio::test(start_paused = true)]
@@ -1280,6 +1390,98 @@ mod tests {
         assert!(
             poll_once(stalled.as_mut()).is_none(),
             "an abnormal ending armed the half-close bound as well as a teardown"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The gathered write
+    // -----------------------------------------------------------------------
+
+    /// A connected loopback pair: this side's write half, and the other end.
+    async fn tcp_pair() -> (tokio::net::tcp::OwnedWriteHalf, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (ours, theirs) = tokio::join!(TcpStream::connect(address), listener.accept());
+        let (_, write) = ours.expect("connect").into_split();
+        (write, theirs.expect("accept").0)
+    }
+
+    /// The write half the pump holds turns a write of many pieces into one
+    /// `writev`.
+    ///
+    /// `write_batch` is correct without it, but it would make one `write` per
+    /// piece, which is what it exists to stop.
+    #[tokio::test]
+    async fn a_tcp_write_half_writes_vectored() {
+        use tokio::io::AsyncWrite;
+
+        let (write, _peer) = tcp_pair().await;
+        assert!(write.is_write_vectored());
+    }
+
+    /// Every byte of every batch reaches the target, in order, however the
+    /// kernel splits the writes.
+    ///
+    /// Each batch is several times what the socket buffers hold, and the
+    /// target does not read until a batch is parked, so `writev` takes a
+    /// prefix that ends part-way through a piece over and over. The pieces
+    /// vary in size, and each byte is numbered, so a piece dropped, repeated or
+    /// reordered by the trimming changes what the target reads.
+    #[tokio::test]
+    async fn a_batch_reaches_the_target_whole_and_in_order_through_partial_writes() {
+        const BATCHES: usize = 6;
+
+        let (mut write, mut peer) = tcp_pair().await;
+
+        let mut sent = Vec::new();
+        let mut batches = Vec::new();
+        let mut counter = 0u32;
+        for _ in 0..BATCHES {
+            let mut batch = Vec::new();
+            for index in 0..WRITE_BATCH_PIECES {
+                let size = 1 + (index * 997) % 9000;
+                let piece: Vec<u8> = (0..size)
+                    .map(|_| {
+                        counter = counter.wrapping_add(1);
+                        counter.to_le_bytes()[0] ^ counter.to_le_bytes()[1]
+                    })
+                    .collect();
+                sent.extend_from_slice(&piece);
+                batch.push(Bytes::from(piece));
+            }
+            batches.push(batch);
+        }
+
+        let total = sent.len();
+        let reader = tokio::spawn(async move {
+            // Late, so the first batch fills the buffers and parks.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut received = Vec::with_capacity(total);
+            let mut buf = vec![0u8; 3000];
+            while received.len() < total {
+                let n = tokio::io::AsyncReadExt::read(&mut peer, &mut buf)
+                    .await
+                    .expect("read");
+                assert!(n > 0, "the writer closed early");
+                received.extend_from_slice(&buf[..n]);
+            }
+            received
+        });
+
+        for mut batch in batches {
+            tokio::time::timeout(Duration::from_secs(10), write_batch(&mut write, &mut batch))
+                .await
+                .expect("the target keeps reading")
+                .expect("the write succeeds");
+            assert!(batch.is_empty(), "a completed write leaves nothing behind");
+        }
+
+        let received = reader.await.expect("the reader");
+        assert!(
+            received == sent,
+            "the target read something other than what was sent"
         );
     }
 

@@ -317,9 +317,10 @@ behind it, so only the resources are reclaimed there. Every write gets its own
 budget, so a client that keeps reading may take hours to drain a download after
 its FIN — but progress alone does not save a write that never finishes, which
 puts a floor of roughly one `RELAY_BLOCK_SIZE` = 64 KiB relay chunk per budget
-under how slowly a half-closed download may be drained (about one 1.4 KB piece
-per budget in the other direction). A tunnel whose two directions are both still
-open is never on a timer at all, however long a write parks.
+under how slowly a half-closed download may be drained (about the same in the
+other direction, where one write gathers up to 64 KiB of the client's upload). A
+tunnel whose two directions are both still open is never on a timer at all,
+however long a write parks.
 
 The bound covers the parked *write* half of the problem and only that. A
 half-closed tunnel whose surviving direction is parked in a **read** — no bytes
@@ -465,7 +466,11 @@ is what a CONNECT proxy needs, and it is stated in full:
 - **Framing** (RFC 9114 §7) — an incremental decoder that hands DATA payload on
   in the chunks quinn delivered it in, buffers every other frame because none of
   them can be acted on piecewise, and skips an unknown frame type by its declared
-  length without allocating for it. A frame's *type* is judged before its
+  length without allocating for it. Once a request stream carries a tunnel, its
+  reader takes up to `READ_AHEAD_CHUNKS` = 32 of those chunks per read rather
+  than one, so a bulk upload takes the connection's lock once per read-ahead and
+  the TCP relay writes it with one `writev`; no chunk is copied, and a stream
+  read before its request is accepted still takes one chunk at a time. A frame's *type* is judged before its
   length: the decoder knows which of the three kinds of stream it is reading —
   the peer's control stream, a request stream, or a request stream whose CONNECT
   has been answered — and a frame type that may not appear there is a connection
