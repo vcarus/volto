@@ -1138,7 +1138,7 @@ async fn a_reloaded_gate_name_with_an_empty_label_is_refused() {
 /// reported, because a gate that admits a name no certificate covers refuses the
 /// handshake at TLS and the operator has nothing else to go on; the covered one
 /// must be silent, or a configuration written the absolute way draws a warning
-/// it does not deserve. The warning had unit coverage in `src/config.rs` and
+/// it does not deserve. The warning had unit coverage in `src/config/warnings.rs` and
 /// none through `reload`, which is where an operator meets it.
 ///
 /// Not a red proof of the trailing-dot helper. `rustls::pki_types::ServerName`

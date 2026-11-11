@@ -49,7 +49,7 @@
 //! for a different purpose. Reading rows under a table heading picks up exactly
 //! the reference tables and nothing else.
 //!
-//! The example configuration is read with the convention `src/config.rs`'s own
+//! The example configuration is read with the convention `src/config/mod.rs`'s own
 //! tests describe: an optional key is written `#key = value` with the `#` hard
 //! against the key, and prose is `# sentence` with a space. A value that spans
 //! lines (`[auth] users`) is taken to its closing bracket.
@@ -74,7 +74,7 @@
 //!
 //! # Where the neighbouring claims live
 //!
-//! `src/config.rs`'s `the_example_documents_every_key_and_pins_every_default`
+//! `src/config/mod.rs`'s `the_example_documents_every_key_and_pins_every_default`
 //! already owns the other two corners of the same triangle: the example against
 //! `Config`'s fields, and every `# Default: N` in it against the compiled
 //! default. This binary adds `docs/` as the third corner and does not repeat
@@ -231,7 +231,7 @@ fn prose_lines(text: &str) -> Vec<(usize, &str)> {
 /// Column zero and a bare `lower_snake` name, which is what keeps the
 /// `{ username = ... }` entries inside the example's `users` array -- indented,
 /// and inside a value besides -- from being read as keys of the table they sit
-/// in. The same rule `src/config.rs`'s tests use, for the same reason.
+/// in. The same rule `src/config/mod.rs`'s tests use, for the same reason.
 fn assigned_key(line: &str) -> Option<&str> {
     let (name, _) = line.split_once(" = ")?;
     let plausible = !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_');
@@ -1129,7 +1129,7 @@ fn documented_defaults() -> BTreeMap<(String, String), Option<String>> {
 /// 2026-09-07 review found in the `allow_private_networks` and
 /// `unanswered_packet_budget` comments.
 ///
-/// It closes the last edge of a triangle. `src/config.rs`'s
+/// It closes the last edge of a triangle. `src/config/mod.rs`'s
 /// `the_example_documents_every_key_and_pins_every_default` holds the example's
 /// own values to the compiled defaults, and gate 2 above holds the constants the
 /// pages quote to the crate; the page's Default column was pinned by nothing,
@@ -1139,7 +1139,7 @@ fn documented_defaults() -> BTreeMap<(String, String), Option<String>> {
 ///
 /// What it does not reach: the `# Default:` comment text is compared against the
 /// page and not against the value beside it, which is the one thing
-/// `src/config.rs` holds. The two keys the example deliberately sets away from
+/// `src/config/mod.rs` holds. The two keys the example deliberately sets away from
 /// their defaults (`initial_mtu`, `initial_rtt_ms`) are why that comparison
 /// cannot be made unconditionally.
 #[test]
