@@ -13,12 +13,14 @@
 //! | target resets or errors | reset the request stream with `H3_CONNECT_ERROR`, whichever direction noticed |
 //! | client resets the request stream, or stops reading it | close the TCP connection with a reset, and cancel the direction the client left alone with `H3_REQUEST_CANCELLED` |
 //!
-//! The two directions therefore run as independent pumps that are joined, plus a
-//! sticky teardown signal for the abnormal cases where one direction failing
-//! must stop the other. The signal carries *why* the tunnel is being torn down —
-//! see `Teardown` below — because the code the pump that did not see the failure
-//! has to put on its own half follows from the reason: `H3_CONNECT_ERROR` when
-//! the target failed, `H3_REQUEST_CANCELLED` when the client cancelled.
+//! The two directions therefore run as independent pumps that are joined, and
+//! share one sticky `watch` channel that carries the tunnel's `State`: running,
+//! one direction ended cleanly, or torn down. The teardown is for the abnormal
+//! cases where one direction failing must stop the other. It carries *why* the
+//! tunnel is being torn down — see `Teardown` below — because the code the pump
+//! that did not see the failure has to put on its own half follows from the
+//! reason: `H3_CONNECT_ERROR` when the target failed, `H3_REQUEST_CANCELLED`
+//! when the client cancelled.
 //!
 //! Only the last row aborts the TCP connection; see `abort_target` for why the
 //! other three keep their FIN semantics.
@@ -172,10 +174,7 @@ pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 /// same to operators.
 pub const RELAY_BLOCK_SIZE: usize = 64 * 1024;
 
-/// Why the tunnel is being torn down, carried on the teardown channel.
-///
-/// The channel carries `Option<Teardown>`, and `None` means both directions are
-/// still relaying.
+/// Why the tunnel is being torn down, carried as [`State::TornDown`].
 ///
 /// A bare "stop now" flag is not enough, because neither pump can tell from a
 /// flag alone how to close its own half — and simply returning gets it wrong in
@@ -222,63 +221,79 @@ impl Teardown {
     }
 }
 
-/// One direction's clean ending, and the bound it puts on the other's writes.
+/// Where a TCP tunnel stands, on the one `watch` channel both pumps share.
 ///
-/// Deliberately *not* a [`Teardown`] variant. A clean FIN is not an abnormal
-/// end and must not reach the other pump as one: the teardown channel's whole
-/// job is to say which party failed, and a sticky "the client finished" on it
-/// would have every exit arm asking whether this teardown is really a teardown.
-/// A separate flag says only what it says, and only the two `select!` arms that
-/// need it ever look.
-struct HalfClose {
-    /// Raised when *this* direction reaches the ending that raises no teardown:
-    /// the client's FIN in one pump, the target's EOF in the other.
-    ///
-    /// The receiver keeps the value after this sender is dropped, which is what
-    /// lets the pump that raises it return immediately afterwards.
-    mine: watch::Sender<bool>,
-    /// The other direction's flag.
-    other: watch::Receiver<bool>,
-    /// How long a write has to complete in, once `other` is set.
-    budget: Duration,
+/// The sender lives in [`run`] and outlives both pumps, so a value stays
+/// readable after the pump that wrote it has returned: the client pump returns
+/// right after its FIN, and the other pump's bound still has to see it.
+///
+/// | from | to | written by |
+/// |---|---|---|
+/// | `Running` | `ClientFinished` | the client → target pump, on the client's FIN |
+/// | `Running` | `TargetEof` | the target → client pump, on the target's EOF |
+/// | `Running` | `TornDown(reason)` | either pump, on an abnormal ending |
+/// | `ClientFinished` or `TargetEof` | the other clean ending, or `TornDown(reason)` | the surviving pump, as it returns |
+///
+/// Each pump writes at most once, and returns right after it writes without
+/// reading the channel again. So the second write, if there is one, comes from
+/// the surviving pump as it leaves, and nobody reads the value it replaces or
+/// the value it writes. That is also why a plain overwrite is enough and no
+/// write checks what it replaces: a teardown is never replaced while a pump
+/// can still read it, so it is sticky for every reader there is. For the same
+/// reason the two clean endings never have to be held at once.
+///
+/// The clean endings are deliberately *not* [`Teardown`] variants. A clean FIN
+/// is not an abnormal end and must not reach the other pump as one: a teardown
+/// says which party failed, and a "the client finished" among the teardowns
+/// would have every exit arm asking whether this teardown is really a
+/// teardown. [`torn_down`] resolves only on `TornDown`, and only the two
+/// [`stalled`] arms look at a clean ending.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum State {
+    /// Both directions are relaying.
+    Running,
+    /// The client finished its sending side (FIN): the ending of the client →
+    /// target direction that raises no teardown.
+    ClientFinished,
+    /// The target reached EOF: the ending of the target → client direction
+    /// that raises no teardown.
+    TargetEof,
+    /// The tunnel is being torn down, for this reason.
+    TornDown(Teardown),
 }
 
-impl HalfClose {
-    /// Records that this direction has ended cleanly.
-    fn ended(&self) {
-        // Fails only if the other pump has already dropped its receiver, which
-        // means it has ended too and there is nothing left to bound.
-        let _ = self.mine.send(true);
-    }
-
-    /// Resolves once the other direction has ended cleanly and a whole budget
-    /// has then passed without this direction's write completing.
-    ///
-    /// A write that is progressing but not finishing is cut like any other: the
-    /// budget is per write and starts when the write does, so what it measures
-    /// is how long that one write has been outstanding, not how long the peer
-    /// has been silent.
-    ///
-    /// Cancel-safe by construction rather than by care: the caller builds a
-    /// fresh one of these per write, so the sleep it ends with is the budget
-    /// for *that* write and the previous write having completed has already
-    /// reset it. Awaiting the flag before the sleep is what also catches a FIN
-    /// that lands while a write is already parked -- the arm is armed at the
-    /// write's first poll, whether or not the other direction has ended by
-    /// then.
-    async fn stalled(&mut self) {
-        while !*self.other.borrow_and_update() {
-            if self.other.changed().await.is_err() {
-                // The other pump dropped its sender without ever ending
-                // cleanly, so it ended some other way -- and every other way
-                // raises a teardown, which is the arm that acts on it. Nothing
-                // for this one to do but stay out of the way.
-                return std::future::pending().await;
-            }
+/// Resolves once the `other` clean ending is on the channel and a whole
+/// `budget` has then passed without this direction's write completing.
+///
+/// A write that is progressing but not finishing is cut like any other: the
+/// budget is per write and starts when the write does, so what it measures is
+/// how long that one write has been outstanding, not how long the peer has been
+/// silent.
+///
+/// Cancel-safe by construction rather than by care: the caller builds a fresh
+/// one of these per write, so the sleep it ends with is the budget for *that*
+/// write and the previous write having completed has already reset it. Awaiting
+/// the state before the sleep is what also catches a FIN that lands while a
+/// write is already parked -- the arm is armed at the write's first poll,
+/// whether or not the other direction has ended by then.
+///
+/// If the other pump ended some other way, the state is `TornDown`, and this
+/// stays pending for good: the other pump wrote its one value and returned, and
+/// this pump is still running, so nothing writes again while this waits. The
+/// teardown is the arm that acts on it, and this one stays out of the way.
+///
+/// Written as the same check-then-`changed` loop as [`torn_down`], for the
+/// reason given there.
+async fn stalled(rx: &mut watch::Receiver<State>, other: State, budget: Duration) {
+    while *rx.borrow_and_update() != other {
+        if rx.changed().await.is_err() {
+            // The sender outlives both pumps, so this cannot actually fail.
+            // A closed channel is no clean ending, so arm nothing.
+            return std::future::pending().await;
         }
-
-        tokio::time::sleep(self.budget).await;
     }
+
+    tokio::time::sleep(budget).await;
 }
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
@@ -376,37 +391,13 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     let (writer, reader) = stream.split();
     let (tcp_read, tcp_write) = tcp.into_split();
 
-    // Sticky so a teardown cannot be missed by a pump that is not yet waiting.
-    // The sender lives here, outliving both pumps.
-    let (teardown, teardown_rx) = watch::channel(None);
-
-    // The two clean endings, each watched by the direction it leaves alone.
-    let (client_finished, client_finished_rx) = watch::channel(false);
-    let (target_eof, target_eof_rx) = watch::channel(false);
+    // Sticky so a teardown or a clean ending cannot be missed by a pump that is
+    // not yet waiting. The sender lives here, outliving both pumps.
+    let state = watch::Sender::new(State::Running);
 
     tokio::join!(
-        client_to_target(
-            reader,
-            tcp_write,
-            &teardown,
-            teardown_rx.clone(),
-            HalfClose {
-                mine: client_finished,
-                other: target_eof_rx,
-                budget: ctx.stall_budget,
-            },
-        ),
-        target_to_client(
-            writer,
-            tcp_read,
-            &teardown,
-            teardown_rx,
-            HalfClose {
-                mine: target_eof,
-                other: client_finished_rx,
-                budget: ctx.stall_budget,
-            },
-        ),
+        client_to_target(reader, tcp_write, &state, ctx.stall_budget),
+        target_to_client(writer, tcp_read, &state, ctx.stall_budget),
     );
 
     debug!(stream_id, authority, "tcp tunnel closed");
@@ -495,11 +486,13 @@ where
 async fn client_to_target(
     mut reader: Reader,
     mut tcp_write: OwnedWriteHalf,
-    teardown: &watch::Sender<Option<Teardown>>,
-    mut teardown_rx: watch::Receiver<Option<Teardown>>,
-    mut half: HalfClose,
+    state: &watch::Sender<State>,
+    budget: Duration,
 ) {
-    let budget = half.budget;
+    // Two receivers of the one channel, because the teardown arm and the
+    // half-close arm of one `select!` each need their own to wait on.
+    let mut teardown_rx = state.subscribe();
+    let mut half_close_rx = state.subscribe();
 
     // The pieces of one write, kept across iterations so its allocation is
     // made once per tunnel: at most `WRITE_BATCH_PIECES` handles.
@@ -569,7 +562,7 @@ async fn client_to_target(
                     reason = torn_down(&mut teardown_rx) => break reason,
                     written = write_batch(&mut tcp_write, &mut batch) => written,
                     error = reader.reset_by_peer() => {
-                        client_aborted(&error, tcp_write, teardown);
+                        client_aborted(&error, tcp_write, state);
                         return;
                     }
                     // The mirror of the arm in `target_to_client`, and the same
@@ -579,7 +572,7 @@ async fn client_to_target(
                     // for the life of the QUIC connection. It arms only after
                     // that EOF, and it goes last for the reason the watcher
                     // above does.
-                    () = half.stalled() => {
+                    () = stalled(&mut half_close_rx, State::TargetEof, budget) => {
                         debug!(
                             timeout_secs = budget.as_secs(),
                             "target stopped reading after its own EOF, cutting the tunnel"
@@ -592,7 +585,7 @@ async fn client_to_target(
                         reader.stop_receiving(h3api::CONNECT_ERROR);
                         abort_target(tcp_write.as_ref());
                         tcp_write.forget();
-                        let _ = teardown.send(Some(Teardown::TargetError));
+                        state.send_replace(State::TornDown(Teardown::TargetError));
                         return;
                     }
                 };
@@ -601,7 +594,7 @@ async fn client_to_target(
                     // The target is gone (RST, EPIPE): the tunnel is broken.
                     debug!(%error, "write to target failed");
                     reader.stop_receiving(h3api::CONNECT_ERROR);
-                    let _ = teardown.send(Some(Teardown::TargetError));
+                    state.send_replace(State::TornDown(Teardown::TargetError));
                     return;
                 }
             }
@@ -609,18 +602,18 @@ async fn client_to_target(
             // and leave the other direction running, so anything the target
             // still has to say reaches the client.
             Ok(None) => {
-                // Raised before the shutdown rather than after it, because this
-                // is the moment the other direction loses its watchdog: from
-                // here nothing but its own bound is left to notice a client
-                // that stops reading what it asked for.
-                half.ended();
+                // Recorded before the shutdown rather than after it, because
+                // this is the moment the other direction loses its watchdog:
+                // from here nothing but its own bound is left to notice a
+                // client that stops reading what it asked for.
+                state.send_replace(State::ClientFinished);
                 if let Err(error) = tcp_write.shutdown().await {
                     debug!(%error, "failed to shut down the target write side");
                 }
                 return;
             }
             Err(error) => {
-                client_aborted(&error, tcp_write, teardown);
+                client_aborted(&error, tcp_write, state);
                 return;
             }
         }
@@ -737,11 +730,7 @@ async fn write_batch(tcp: &mut OwnedWriteHalf, batch: &mut Vec<Bytes>) -> io::Re
 /// both the same answer: the read that fails with a reset, and the write that
 /// was parked when the RESET_STREAM landed. The two differ only in where the
 /// news came from.
-fn client_aborted(
-    error: &StreamError,
-    tcp_write: OwnedWriteHalf,
-    teardown: &watch::Sender<Option<Teardown>>,
-) {
+fn client_aborted(error: &StreamError, tcp_write: OwnedWriteHalf, state: &watch::Sender<State>) {
     match h3api::peer_reset_code(error) {
         Some(code) => debug!(code, "client reset the tunnel"),
         None => debug!(%error, "reading from the client failed"),
@@ -752,18 +741,19 @@ fn client_aborted(
     // would produce.
     abort_target(tcp_write.as_ref());
     tcp_write.forget();
-    let _ = teardown.send(Some(Teardown::ClientAbort));
+    state.send_replace(State::TornDown(Teardown::ClientAbort));
 }
 
 /// Pumps target → client.
 async fn target_to_client(
     mut writer: Writer,
     mut tcp_read: OwnedReadHalf,
-    teardown: &watch::Sender<Option<Teardown>>,
-    mut teardown_rx: watch::Receiver<Option<Teardown>>,
-    mut half: HalfClose,
+    state: &watch::Sender<State>,
+    budget: Duration,
 ) {
-    let budget = half.budget;
+    // Two receivers, for the reason `client_to_target` gives.
+    let mut teardown_rx = state.subscribe();
+    let mut half_close_rx = state.subscribe();
     let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
 
     // Built once and kept, which is what makes it affordable: it borrows
@@ -816,7 +806,7 @@ async fn target_to_client(
                 // it. `abort_target` records what the two stacks make of that
                 // on a socket already in FIN_WAIT_2.
                 abort_target(tcp_read.as_ref());
-                let _ = teardown.send(Some(Teardown::ClientAbort));
+                state.send_replace(State::TornDown(Teardown::ClientAbort));
                 return;
             }
         };
@@ -827,10 +817,10 @@ async fn target_to_client(
             // buffer: a read of nothing never becomes a frame, and an empty
             // DATA frame is never sent.
             Ok(0) => {
-                // As in the opposite pump: raised first, because this is the
+                // As in the opposite pump: recorded first, because this is the
                 // moment the client -> target direction is left with no
                 // watchdog but its own bound.
-                half.ended();
+                state.send_replace(State::TargetEof);
                 if let Err(error) = writer.finish() {
                     debug!(%error, "failed to finish the response stream");
                 }
@@ -867,7 +857,7 @@ async fn target_to_client(
                     // order for the reason the watcher in `client_to_target`
                     // is: a write that completes on its first poll never arms
                     // the timer at all.
-                    () = half.stalled() => {
+                    () = stalled(&mut half_close_rx, State::ClientFinished, budget) => {
                         debug!(
                             timeout_secs = budget.as_secs(),
                             "client stopped reading after its own FIN, cutting the tunnel"
@@ -884,7 +874,7 @@ async fn target_to_client(
                         // the client finished -- but every other exit from this
                         // loop says why it left, and an exit that quietly did
                         // not would be the one to misread later.
-                        let _ = teardown.send(Some(Teardown::ClientAbort));
+                        state.send_replace(State::TornDown(Teardown::ClientAbort));
                         return;
                     }
                 };
@@ -899,7 +889,7 @@ async fn target_to_client(
                     // connection is closed with a reset. The other pump does the
                     // dropping; this only decides how the socket closes.
                     abort_target(tcp_read.as_ref());
-                    let _ = teardown.send(Some(Teardown::ClientAbort));
+                    state.send_replace(State::TornDown(Teardown::ClientAbort));
                     return;
                 }
             }
@@ -908,7 +898,7 @@ async fn target_to_client(
                 // a stream reset with H3_CONNECT_ERROR.
                 debug!(%error, "read from target failed");
                 writer.reset(h3api::CONNECT_ERROR);
-                let _ = teardown.send(Some(Teardown::TargetError));
+                state.send_replace(State::TornDown(Teardown::TargetError));
                 return;
             }
         }
@@ -1000,10 +990,16 @@ fn abort_target(tcp: &TcpStream) {
 }
 
 /// Resolves once either direction has asked for the tunnel to be torn down,
-/// with the reason it gave.
-async fn torn_down(teardown_rx: &mut watch::Receiver<Option<Teardown>>) -> Teardown {
+/// with the reason it gave. A clean ending on the channel does not resolve it.
+///
+/// A loop that checks the value before it awaits `changed`, rather than
+/// `Receiver::wait_for`: tokio counts `wait_for` against the task's
+/// cooperative budget from its first check, so with the budget spent a fresh
+/// arm would miss a teardown that is already set, and a later arm of the
+/// `biased` select would win in its place. `borrow_and_update` is not counted.
+async fn torn_down(teardown_rx: &mut watch::Receiver<State>) -> Teardown {
     loop {
-        if let Some(reason) = *teardown_rx.borrow_and_update() {
+        if let State::TornDown(reason) = *teardown_rx.borrow_and_update() {
             return reason;
         }
         // The sender outlives both pumps, so this cannot actually fail; treat a
@@ -1078,8 +1074,8 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HalfClose, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, WRITE_BATCH_PIECES, connect_any_with,
-        ensure_window, split_authority, write_batch,
+        RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, State, Teardown, WRITE_BATCH_PIECES, connect_any_with,
+        ensure_window, split_authority, stalled, write_batch,
     };
     // The deadlines here and the resolver's are asserted the same way; the
     // helper lives beside the first of them rather than in both files.
@@ -1261,34 +1257,23 @@ mod tests {
     // The half-close bound
     // -----------------------------------------------------------------------
     //
-    // `HalfClose::stalled` is the only timer in this file the pumps arm
-    // themselves, and it is armed on the path where one direction has already
-    // ended cleanly and the other's write is parked -- so the pump that would
-    // have noticed is gone and this is all that is left. Its two claims are
-    // that it never fires while both directions are running, and that it fires
-    // a whole budget after the *later* of the other direction ending and this
-    // write starting. On a paused clock both are exact.
+    // `stalled` is the only timer in this file the pumps arm themselves, and it
+    // is armed on the path where one direction has already ended cleanly and
+    // the other's write is parked -- so the pump that would have noticed is
+    // gone and this is all that is left. Its two claims are that it never
+    // fires while both directions are running, and that it fires a whole
+    // budget after the *later* of the other direction ending and this write
+    // starting. On a paused clock both are exact.
 
-    /// The two halves of a `HalfClose` pair, as the pumps hold them.
+    /// The channel as [`run`] creates it, and a receiver of it for the bound
+    /// under test.
     ///
-    /// `mine`/`other` are crossed the way [`run`] crosses them: what one pump
-    /// raises is what the other watches.
-    fn half_close_pair(budget: Duration) -> (HalfClose, HalfClose) {
-        let (client_finished, client_finished_rx) = watch::channel(false);
-        let (target_eof, target_eof_rx) = watch::channel(false);
-
-        (
-            HalfClose {
-                mine: client_finished,
-                other: target_eof_rx,
-                budget,
-            },
-            HalfClose {
-                mine: target_eof,
-                other: client_finished_rx,
-                budget,
-            },
-        )
+    /// Every test here holds the client → target pump's bound, which waits for
+    /// the target's EOF.
+    fn channel() -> (watch::Sender<State>, watch::Receiver<State>) {
+        let state = watch::Sender::new(State::Running);
+        let rx = state.subscribe();
+        (state, rx)
     }
 
     /// A running tunnel has no bound: the other pump is the watchdog, and the
@@ -1300,14 +1285,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_write_is_not_bounded_while_both_directions_run() {
         let budget = Duration::from_secs(180);
-        let (mut client_to_target, _target_to_client) = half_close_pair(budget);
+        let (_state, mut rx) = channel();
 
-        let mut stalled = Box::pin(client_to_target.stalled());
-        assert!(poll_once(stalled.as_mut()).is_none());
+        let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+        assert!(poll_once(bound.as_mut()).is_none());
 
         tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
         assert!(
-            poll_once(stalled.as_mut()).is_none(),
+            poll_once(bound.as_mut()).is_none(),
             "a running tunnel was cut by a bound that is only for a half-closed one"
         );
     }
@@ -1320,21 +1305,21 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_budget_starts_when_the_other_direction_ends() {
         let budget = Duration::from_secs(180);
-        let (mut client_to_target, target_to_client) = half_close_pair(budget);
+        let (state, mut rx) = channel();
 
-        let mut stalled = Box::pin(client_to_target.stalled());
-        assert!(poll_once(stalled.as_mut()).is_none());
+        let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+        assert!(poll_once(bound.as_mut()).is_none());
 
         // An hour of a healthy tunnel, then the target's EOF.
         tokio::time::advance(Duration::from_secs(60 * 60)).await;
-        assert!(poll_once(stalled.as_mut()).is_none());
-        target_to_client.ended();
+        assert!(poll_once(bound.as_mut()).is_none());
+        state.send_replace(State::TargetEof);
 
-        // The flag alone cuts nothing: this poll is the wake the `watch`
-        // delivers to the `select!` in production, and all it does is start the
-        // budget.
+        // The clean ending alone cuts nothing: this poll is the wake the
+        // `watch` delivers to the `select!` in production, and all it does is
+        // start the budget.
         assert!(
-            poll_once(stalled.as_mut()).is_none(),
+            poll_once(bound.as_mut()).is_none(),
             "the other direction ending cut the write on the spot"
         );
 
@@ -1342,13 +1327,13 @@ mod tests {
         // hour has already passed and the whole budget is still owed.
         tokio::time::advance(budget - Duration::from_millis(1)).await;
         assert!(
-            poll_once(stalled.as_mut()).is_none(),
+            poll_once(bound.as_mut()).is_none(),
             "the budget was counted from before the other direction ended"
         );
 
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(
-            poll_once(stalled.as_mut()).is_some(),
+            poll_once(bound.as_mut()).is_some(),
             "the budget did not expire at the budget"
         );
     }
@@ -1363,26 +1348,26 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn each_write_gets_the_whole_budget() {
         let budget = Duration::from_secs(180);
-        let (mut client_to_target, target_to_client) = half_close_pair(budget);
-        target_to_client.ended();
+        let (state, mut rx) = channel();
+        state.send_replace(State::TargetEof);
 
         for write in 0..2 {
-            let mut stalled = Box::pin(client_to_target.stalled());
-            assert!(poll_once(stalled.as_mut()).is_none());
+            let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+            assert!(poll_once(bound.as_mut()).is_none());
             tokio::time::advance(budget * 9 / 10).await;
             assert!(
-                poll_once(stalled.as_mut()).is_none(),
+                poll_once(bound.as_mut()).is_none(),
                 "write {write} was cut inside its own budget"
             );
             // The write completed: the `select!` drops this arm and the next
             // iteration builds a fresh one.
         }
 
-        let mut stalled = Box::pin(client_to_target.stalled());
-        assert!(poll_once(stalled.as_mut()).is_none());
+        let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+        assert!(poll_once(bound.as_mut()).is_none());
         tokio::time::advance(budget).await;
         assert!(
-            poll_once(stalled.as_mut()).is_some(),
+            poll_once(bound.as_mut()).is_some(),
             "a write that really did stall a whole budget was not cut"
         );
     }
@@ -1395,15 +1380,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_clock_that_jumps_hours_cuts_a_stalled_write() {
         let budget = Duration::from_secs(180);
-        let (mut client_to_target, target_to_client) = half_close_pair(budget);
-        target_to_client.ended();
+        let (state, mut rx) = channel();
+        state.send_replace(State::TargetEof);
 
-        let mut stalled = Box::pin(client_to_target.stalled());
-        assert!(poll_once(stalled.as_mut()).is_none());
+        let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+        assert!(poll_once(bound.as_mut()).is_none());
 
         tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
         assert!(
-            poll_once(stalled.as_mut()).is_some(),
+            poll_once(bound.as_mut()).is_some(),
             "a jump past the budget left the write parked"
         );
     }
@@ -1411,29 +1396,31 @@ mod tests {
     /// The other pump ending *abnormally* arms nothing, however far the clock
     /// moves.
     ///
-    /// Its sender is dropped without the flag ever being raised, which is what
-    /// every abnormal ending does — and every one of those raises a teardown,
-    /// which is the arm that acts on it. This one must stay out of the way, or
-    /// a tunnel would be cut twice with two different verdicts on the same
-    /// event. The `pending()` branch inside `stalled` is the whole of that
-    /// promise, and a mass timer firing is exactly when it would be tested.
+    /// The channel then holds a teardown and never the clean ending, which is
+    /// what every abnormal ending leaves, and the teardown is the arm that acts
+    /// on it. This one must stay out of the way, or a tunnel would be cut twice
+    /// with two different verdicts on the same event. Waiting for the clean
+    /// ending and nothing else is the whole of that promise, and a mass timer
+    /// firing is exactly when it would be tested.
     #[tokio::test(start_paused = true)]
     async fn an_abnormally_ended_pump_arms_no_bound() {
         let budget = Duration::from_secs(180);
-        let (mut client_to_target, target_to_client) = half_close_pair(budget);
 
-        // Dropped without `ended()`: the shape of a target error or a client
-        // abort, both of which raise a teardown instead.
-        drop(target_to_client);
+        // The shape of a target error and of a client abort: a teardown, and
+        // no clean ending.
+        for reason in [Teardown::TargetError, Teardown::ClientAbort] {
+            let (state, mut rx) = channel();
+            state.send_replace(State::TornDown(reason));
 
-        let mut stalled = Box::pin(client_to_target.stalled());
-        assert!(poll_once(stalled.as_mut()).is_none());
+            let mut bound = Box::pin(stalled(&mut rx, State::TargetEof, budget));
+            assert!(poll_once(bound.as_mut()).is_none());
 
-        tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
-        assert!(
-            poll_once(stalled.as_mut()).is_none(),
-            "an abnormal ending armed the half-close bound as well as a teardown"
-        );
+            tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
+            assert!(
+                poll_once(bound.as_mut()).is_none(),
+                "an abnormal ending armed the half-close bound as well as a teardown"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
