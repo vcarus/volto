@@ -461,9 +461,11 @@ const QUINN_PROTO_SOURCE_PATHS: [&str; 4] = [
 
 /// Paths and names that mark a line of `src/` as a citation of quinn-proto.
 ///
-/// The crate name, then every source path above. `src/config.rs` is not one of
-/// them: it is a file of this crate, and its comments speak of "line 7" in a
-/// TOML document.
+/// The crate name, then every source path above. A marker is matched against
+/// the text of a line, not against the path of the file being scanned, so
+/// `src/config/mod.rs` above is quinn-proto's file. This crate's own
+/// `src/config/` files are not marked by their path, and their comments speak of
+/// "line 7" in a TOML document.
 const QUINN_PROTO_MARKERS: [&str; 5] = [
     "quinn-proto",
     QUINN_PROTO_SOURCE_PATHS[0],

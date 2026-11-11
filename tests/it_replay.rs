@@ -1299,7 +1299,7 @@ async fn production_shapes_are_replayed() {
         // default, but RFC 9000 §10.1 makes the effective value the smaller of
         // the two advertisements and the client advertises 30 -- so 30 is what
         // an idle-ended connection in the capture actually waited out. See
-        // `DEFAULT_MAX_IDLE_TIMEOUT` in `src/config.rs`.
+        // `DEFAULT_MAX_IDLE_TIMEOUT` in `src/config/mod.rs`.
         production_idle_seconds: 30,
         max_transfer: settings.max_transfer,
         max_tunnels: settings.max_tunnels,
