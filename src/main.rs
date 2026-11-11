@@ -1,4 +1,4 @@
-//! `volto` — MASQUE proxy server binary: CLI, logging, assembly.
+//! `volto`, the MASQUE proxy server binary: CLI, logging, assembly.
 
 // As in `lib.rs`: the binary crate is assembly over the library, and there is
 // nothing here that could need `unsafe` either.
@@ -55,12 +55,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Loaded and validated before logging exists, so configuration errors are
-    // reported by returning them from main -- and before the runtime exists,
-    // which is what the hand-built runtime below needs: the blocking pool is
+    // reported by returning them from main. It is also before the runtime
+    // exists, which the hand-built runtime below needs: the blocking pool is
     // sized from `max_connections` rather than left at tokio's 512, so that
     // every connection's reserved name-lookup slot has a thread to run on
-    // (D90). `#[tokio::main]` cannot express that, which is the only reason it
-    // is gone.
+    // (D90). `#[tokio::main]` cannot express that.
     let config = Config::load(&cli.config)?;
 
     // Deliberately the very next thing, and before the runtime is built: what
@@ -70,8 +69,8 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // The same place and the same promise. The two cannot both be set -- clap
-    // refuses that command line -- so the order between them decides nothing.
+    // The same place and the same promise. The two cannot both be set (clap
+    // refuses that command line), so the order between them does not matter.
     if cli.diagnostics {
         report_diagnostics(&cli.config, &config);
         return Ok(());
@@ -94,15 +93,9 @@ fn main() -> Result<()> {
     let served = runtime.block_on(run(cli, config));
     let grace = served.as_ref().copied().unwrap_or(startup_grace);
 
-    // Deliberately not the implicit drop this used to end on. tokio's
-    // `Runtime::drop` waits without limit for blocking tasks that have started,
-    // and name resolution is one of those: `getaddrinfo` cannot be cancelled,
-    // the thread stays in the stub resolver for as long as it takes, and a
-    // client chooses the name (D90). So the process used to exit one resolver
-    // timeout after the grace period rather than one grace period after the
-    // signal, which `script/masque.service` turns into a SIGKILL at
-    // `TimeoutStopSec`. Bounding it leaks the thread instead, which the process
-    // is about to end anyway.
+    // Deliberately not an implicit drop: tokio's `Runtime::drop` waits without
+    // limit for blocking tasks that have started, and a name lookup is one of
+    // those (D90). `volto::shutdown::blocking_grace` gives the bound and why.
     volto::shutdown::stop_runtime(runtime, grace);
 
     served.map(|_| ())
@@ -113,14 +106,14 @@ fn main() -> Result<()> {
 /// Reached only when [`Config::load`] has already succeeded, so the failure
 /// direction is not here: it is the `?` in `main`, which prints the same error
 /// the service would print at startup and exits non-zero. That symmetry is the
-/// whole value of the flag — `script/deploy.sh` asks the binary it is about to
+/// whole value of the flag. `script/deploy.sh` asks the binary it is about to
 /// install whether it can read the configuration this host already has, and an
 /// answer that did not match what the service does on the same file would be
 /// worse than no answer (D93, D94).
 ///
 /// What it therefore covers is exactly what `Config::load` covers: the TOML
 /// itself, every table's refusal of a key it does not know, and every range and
-/// cross-field rule in `Config::validate` — the certificate and key existing as
+/// cross-field rule in `Config::validate`, the certificate and key existing as
 /// files included. What it cannot cover is everything that is only decidable
 /// once the process is the service: whether the port is free, whether the
 /// certificate and key parse and match, whether `RLIMIT_NOFILE` (a property of
@@ -153,7 +146,7 @@ fn report_config_check(path: &Path, config: &Config) {
 ///
 /// What it deliberately does not do bounds the trust it needs. Nothing is bound,
 /// connected or resolved, no journal is read, and nothing goes through
-/// `tracing` -- the subscriber is not installed at this point in `main` and this
+/// `tracing`: the subscriber is not installed at this point in `main` and this
 /// output is not a log line, so D100's accounted set is untouched. Everything
 /// here is either this process's own memory, a `getrlimit` on itself, four files
 /// under `/proc/sys`, the `exe` link, `comm` and `limits` of the processes
@@ -165,7 +158,7 @@ fn report_config_check(path: &Path, config: &Config) {
 /// already does it: `impl Debug for config::User` renders the password as
 /// `<redacted>`, which is the same guard that keeps a password out of the error
 /// a malformed file produces. `conn::redact_credentials` is the other half of
-/// that rule and is not reachable here -- it is for a header value, and no
+/// that rule and is not reachable here: it is for a header value, and no
 /// header exists in this process.
 fn report_diagnostics(path: &Path, config: &Config) {
     println!("volto {} diagnostics", env!("CARGO_PKG_VERSION"));
@@ -248,9 +241,9 @@ fn print_udp_buffer_sysctls() {
 /// The descriptor limits of the running volto service, if one is running.
 ///
 /// The two `getrlimit` lines above are this process's own, and this command is
-/// typed into an SSH shell far more often than it is run by the service. That
-/// shell is where 1024 and 1048576 came from in two deploy reports about hosts
-/// whose unit sets `LimitNOFILE=131072`. The figure an operator wants is in
+/// typed into an SSH shell far more often than it is run by the service. Such a
+/// shell can report 1024 or 1048576 on a host whose unit sets
+/// `LimitNOFILE=131072`. The figure an operator wants is in
 /// `/proc/<pid>/limits` of the service process, so it is read here rather than
 /// left to a second command nobody runs.
 ///
@@ -373,8 +366,8 @@ fn uname() -> String {
 async fn run(cli: Cli, config: Config) -> Result<Duration> {
     init_tracing(&config.log.level)?;
 
-    // Only now that a subscriber exists: settings that are legal but risky —
-    // "authentication is off" above all — are useless if they are logged into a
+    // Only now that a subscriber exists: settings that are legal but risky
+    // ("authentication is off" above all) are useless if they are logged into a
     // subscriber that has not been installed yet.
     for warning in config.warnings() {
         tracing::warn!(log_id = "f9be058r", "{warning}");
@@ -402,8 +395,8 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 ///
 /// The contract is that a bad configuration is a no-op, not an outage: on any
 /// failure the error is logged and the running configuration stays in force. This
-/// matters because the usual sender of this signal is unattended — a
-/// `certbot --deploy-hook` after a renewal — and a proxy that exited on a
+/// matters because the usual sender of this signal is unattended (a
+/// `certbot --deploy-hook` after a renewal), and a proxy that exited on a
 /// half-written certificate file would turn a routine renewal into downtime.
 ///
 /// Only new connections pick up the change; existing ones keep the configuration
@@ -477,7 +470,7 @@ async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
 /// runtime's `docker stop`), SIGINT is Ctrl-C in a terminal. Both mean the same
 /// thing here: stop taking new work, let the existing tunnels finish, then exit.
 ///
-/// A second signal is not special-cased into an immediate exit — the grace period
+/// A second signal is not special-cased into an immediate exit: the grace period
 /// already bounds the wait, and an operator in a hurry has SIGKILL.
 async fn watch_for_signals(trigger: Trigger) {
     #[cfg(unix)]
@@ -561,7 +554,7 @@ fn init_tracing(level: &str) -> Result<()> {
     if logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref()) {
         builder
             // The journal stores whatever bytes arrive, and the default ANSI
-            // detection only consults NO_COLOR — without this, colour escapes
+            // detection only consults NO_COLOR. Without this, colour escapes
             // end up inside journald and the forwarded syslog files.
             .with_ansi(false)
             .event_format(JournalPriority(
@@ -641,7 +634,7 @@ fn logs_to_journal(journal_stream: Option<&OsStr>) -> bool {
 ///
 /// Syslog has eight severities and tracing has five, so the mapping is not onto:
 /// ERROR/WARN/INFO land on their namesakes (3/4/6), while DEBUG and TRACE share
-/// 7 — debug, the least severe thing syslog can say.
+/// 7, debug, the least severe thing syslog can say.
 fn syslog_prefix(level: &Level) -> &'static str {
     match *level {
         Level::ERROR => "<3>",
@@ -655,16 +648,16 @@ fn syslog_prefix(level: &Level) -> &'static str {
 /// Wraps an event formatter so each line starts with its syslog priority.
 ///
 /// volto writes plain text to stdout, and journald files plain text as PRIORITY=6
-/// (info) whatever the line says — so `journalctl -u volto -p warning` used to
-/// return nothing and an operator had to grep for the word "WARN". A leading
-/// `<N>` fixes that: journald parses it, strips it, and files the record with that
-/// priority. `SyslogLevelPrefix=` defaults to true, so the shipped unit needs no
-/// change for this to take effect.
+/// (info) whatever the line says, so without a prefix `journalctl -u volto -p
+/// warning` returns nothing. A leading `<N>` fixes that: journald parses it,
+/// strips it, and files the record with that priority. `SyslogLevelPrefix=`
+/// defaults to true, so the shipped unit needs no change for this to take
+/// effect.
 ///
 /// Only the prefix is ours; everything after it is the wrapped formatter's
 /// output, so the log format does not fork into two. The default formatter emits
 /// exactly one line per event, which is what makes writing the prefix once per
-/// event the same thing as writing it at the start of the line — the only place
+/// event the same thing as writing it at the start of the line, the only place
 /// systemd looks for it.
 struct JournalPriority<F>(F);
 

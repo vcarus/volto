@@ -12,14 +12,14 @@ use super::{ReloadHandle, Server};
 ///
 /// Every tunnel costs one descriptor, and the quota is per connection, so the
 /// budget the process actually has to meet is
-/// `max_connections * max_targets_per_conn` — not one connection's share of it.
+/// `max_connections * max_targets_per_conn`, not one connection's share of it.
 /// The two keys are halves of one number and only their product can be compared
-/// against `RLIMIT_NOFILE`; checking one connection's worth was checking a bound
-/// no adversary is under, since a client holding credentials may open
-/// `max_connections` of them (review M7).
+/// against `RLIMIT_NOFILE`. A client holding credentials may open
+/// `max_connections` connections, so one connection's worth is a bound no
+/// adversary is under.
 ///
 /// fd exhaustion is not a graceful failure mode. It degrades rather than
-/// crashes here — a `socket()` that fails becomes one refused tunnel — but it
+/// crashes here (a `socket()` that fails becomes one refused tunnel), but it
 /// does so for every connection at once and for anything else the process needs
 /// a descriptor for, a certificate reload included (spec §5.2).
 pub(super) fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
@@ -164,17 +164,17 @@ impl SocketBuffers {
 /// function does not branch on the variant at all.
 ///
 /// Nothing here is fatal, and that is deliberate. A refused `setsockopt` leaves
-/// the socket exactly where it was — on the operating system's default, which is
-/// where every release before this one ran — so refusing to start over it would
-/// trade a working server for a tuning preference.
+/// the socket exactly where it was, on the operating system's default, so
+/// refusing to start over it would trade a working server for a tuning
+/// preference.
 ///
 /// Two ways a host can decline. It can clamp, which is what both hosts we build
 /// for do: Linux at `net.core.rmem_max`, macOS at `kern.ipc.maxsockbuf` (8 MiB
 /// by default, measured on Darwin 24). Or it can fail the call outright, which
 /// older macOS releases are documented to do above the same ceiling and which
 /// costs nothing to handle. Both endings are warned about and neither stops the
-/// server; `0` asks for nothing at all, the escape hatch for a host whose
-/// operator has already sized these elsewhere.
+/// server. `0` asks for nothing at all, for a host whose operator has already
+/// sized these elsewhere.
 fn request_socket_buffer(
     socket: &SockRef<'_>,
     which: SocketBuffer,

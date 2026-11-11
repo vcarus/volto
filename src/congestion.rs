@@ -1,10 +1,8 @@
 //! The `bbr` congestion controller: quinn's BBR with its congestion window held
 //! to 1.25 times the measured bandwidth-delay product.
 //!
-//! It is the default since 1.2.0 (D108). In v1.1.0 and v1.1.1 it was opt-in
-//! under the value `bbr-capped`, an alias 1.2.0 still accepted and 1.3.0
-//! removed. quinn's BBR as it ships is the value `bbr-uncapped`. The type keeps
-//! the name [`BbrCapped`].
+//! It is the default (D108). quinn's BBR as it ships is the value
+//! `bbr-uncapped`. The type is named [`BbrCapped`].
 //!
 //! quinn-proto 0.11.x's BBR overestimates the bottleneck bandwidth, so its
 //! congestion window never limits what is in flight. Paths below are in that
@@ -85,8 +83,9 @@
 //!
 //! The minimum RTT is the wrapper's own, and it expires. quinn's
 //! `RttEstimator::min` never does within a path, so with it a lasting RTT rise
-//! left the cap below the new bandwidth-delay product, each delivery-rate
-//! sample came out lower than the last, and the window fell to its floor.
+//! would leave the cap below the new bandwidth-delay product, each
+//! delivery-rate sample would come out lower than the last, and the window
+//! would fall to its floor.
 //! Expiry alone would not fix that. A minimum measured again with the standing
 //! queue in it would raise the cap, and with it the queue, each time. So the
 //! wrapper empties the queue before it measures, the way BBR's ProbeRTT does.
@@ -583,7 +582,7 @@ impl DeliveryRate {
             // it is given a new one (`minmax_running_max` in
             // `lib/win_minmax.c`). A zero sample expires nothing, so expiry
             // alone never empties the estimate; ten stored zero samples still
-            // do, through the ring, as before.
+            // do, through the ring.
             if sample > 0 {
                 for (slot, &at) in self.samples.iter_mut().zip(&self.stored_at) {
                     if self.intervals.wrapping_sub(at) >= SAMPLES {

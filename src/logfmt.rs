@@ -2,19 +2,18 @@
 //!
 //! Operator-facing fields print the value, never Rust's `Option` spelling: a line
 //! reads `alpn=h3`, not `alpn=Some("h3")`. When the value is absent the field
-//! still appears, carrying [`ABSENT`] — dropping it instead would make the shape
+//! still appears, carrying [`ABSENT`]. Dropping it instead would make the shape
 //! of the line depend on its contents, which is exactly what a `grep` or a log
 //! shipper cannot cope with.
 //!
 //! The rule is about *audience*, not about level: `info`/`warn` lines are read by
 //! whoever is running the server, so they print values. The `debug` forensic dump
-//! in [`crate::conn`] deliberately keeps `Debug` shapes — there the Rust spelling
-//! of a header map, or of an absent `:protocol`, *is* the evidence D3 is waiting
-//! for.
+//! in [`crate::conn`] deliberately keeps `Debug` shapes: there the Rust spelling
+//! of a header map, or of an absent `:protocol`, *is* the evidence D3 needs.
 //!
 //! The third rule is about *provenance*: [`or_dash`] prints with `Display`, which
 //! escapes nothing, so it is only for values the server produced or validated
-//! itself — the ALPN it negotiated from its own list, the SNI rustls accepted as
+//! itself: the ALPN it negotiated from its own list, the SNI rustls accepted as
 //! a DNS name, a `SocketAddr` it resolved. Bytes the peer chose (the user-id of
 //! a rejected credential) are recorded as a plain `str` field instead, which
 //! tracing prints quoted and `Debug`-escaped: `username="user1"`, and a newline
@@ -25,20 +24,20 @@
 //! The fourth rule is about *size*: several of those peer-chosen values are a
 //! whole field section's worth of bytes, so [`bounded`] caps what any one of
 //! them can write into the journal. Length and provenance are separate
-//! concerns, and both apply to the same fields -- `bounded` does not escape
+//! concerns, and both apply to the same fields. `bounded` does not escape
 //! anything, and recording its result with `%` would undo the third rule.
 //!
 //! Some peer bytes have no field of their own to be recorded in: they arrive
 //! already inside somebody else's `Display`, and the log sees only the sentence
-//! they ended up in -- a QUIC close reason phrase inside the error the closing
-//! line reports, say. The sigil cannot save those, because by the time the sigil
-//! is chosen the peer's bytes are already part of a value that formats itself.
-//! [`escaped_bytes`] is the answer for them: applied where the peer's bytes
-//! enter the value rather than where the value is logged, it applies both rules
-//! at once and hands back something the rest of the program may print with
-//! `Display` from then on. [`peer_error`] is that answer applied to the value
-//! this server meets it in -- a QUIC connection error -- so that the two places
-//! one of those reaches a log line apply the rule by calling the same name.
+//! they ended up in (a QUIC close reason phrase inside the error the closing
+//! line reports, for example). The sigil cannot escape those, because by the
+//! time the sigil is chosen the peer's bytes are already part of a value that
+//! formats itself. [`escaped_bytes`] handles them: applied where the peer's
+//! bytes enter the value rather than where the value is logged, it applies both
+//! rules at once and returns something the rest of the program may print with
+//! `Display` from then on. [`peer_error`] applies it to the value this server
+//! meets such bytes in, a QUIC connection error, so that the two places one of
+//! those reaches a log line apply the rule by calling the same function.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -62,7 +61,7 @@ pub(crate) const MAX_TOKEN: usize = 32;
 /// Caps a peer-chosen token at what a log line can afford to carry.
 ///
 /// Some of the tokens that reach a log line are a field section's worth of
-/// bytes -- up to [`crate::h3api::MAX_FIELD_SECTION_SIZE`] -- from a peer that
+/// bytes (up to [`crate::h3api::MAX_FIELD_SECTION_SIZE`]) from a peer that
 /// has not authenticated: the `:protocol` of an extended CONNECT, the user-id
 /// of a rejected credential. Logging one whole puts tens of kilobytes in the
 /// journal per request, for free, and journald's rate limiting counts lines
@@ -114,7 +113,7 @@ pub fn bounded_bytes(token: &[u8]) -> Cow<'_, str> {
 ///
 /// The rest of this module divides the work: `bounded` cuts, and the recording
 /// sigil escapes. That division needs a *field* to record, and some peer bytes
-/// never get one -- a QUIC close reason phrase is inside `quinn`'s error by the
+/// never get one. A QUIC close reason phrase is inside `quinn`'s error by the
 /// time this server sees it, and the closing line in [`crate::quic`] records the
 /// whole error with `%`. Escaping at the call site is not available there, and
 /// choosing `?` instead would change how every other error on that line reads.
@@ -140,14 +139,14 @@ pub fn escaped_bytes(token: &[u8]) -> String {
 ///
 /// Both kinds of QUIC close carry a reason phrase of the peer's own composition
 /// (RFC 9000 §19.19), and `quinn`'s `Display` prints it as it arrived. Every
-/// door a `quinn::ConnectionError` reaches a log line through goes through here
-/// first, so that "a connection error a peer may have authored is escaped where
-/// it enters this program" is one name rather than a rule to remember: the
-/// handshake that never completed ([`crate::quic`]) and the connection that did
-/// ([`crate::h3api::ConnectionError`]) are the two of them.
+/// path by which a `quinn::ConnectionError` reaches a log line goes through
+/// here first, so that "a connection error a peer may have authored is escaped
+/// where it enters this program" is one function rather than a rule to
+/// remember. The handshake that never completed ([`crate::quic`]) and the
+/// connection that did ([`crate::h3api::ConnectionError`]) are the two paths.
 ///
-/// Every other variant is this server's own account of what went wrong -- a
-/// timeout, a transport error it raised itself -- and is left alone.
+/// Every other variant is this server's own account of what went wrong (a
+/// timeout, a transport error it raised itself) and is left alone.
 pub fn peer_error(error: quinn::ConnectionError) -> quinn::ConnectionError {
     match error {
         quinn::ConnectionError::ConnectionClosed(close) => {
@@ -176,24 +175,24 @@ fn truncated(head: &str, whole: usize) -> String {
 /// The rules above bound what one line may carry. This bounds how many lines
 /// there are, which is the other half of the same problem and the one an
 /// operator feels first: `journald` rate limiting counts *lines*, per unit, so a
-/// peer that can buy one warning per request does not merely fill a disk — it
-/// spends this service's whole allowance and the genuine lines that follow are
+/// peer that can buy one warning per request does not merely fill a disk. It
+/// spends this service's whole allowance, and the genuine lines that follow are
 /// dropped. Suppressing the real signal is the more expensive half of the
 /// attack, and a peer needs no privilege to run it: a refusal is a request that
 /// went nowhere, so the refusals are the cheapest lines there are.
 ///
 /// Silencing the repeats is not the answer either. The two warnings this guards
-/// are read as evidence — a client probing the private side of the host, a
-/// client sitting on its tunnel limit — and evidence that reports "it happened"
-/// while hiding "it happened sixty thousand times" is worse than useless.
+/// are read as evidence (a client probing the private side of the host, a
+/// client sitting on its tunnel limit), and evidence that reports "it happened"
+/// while hiding "it happened sixty thousand times" is misleading.
 ///
 /// So the schedule doubles: occurrence 1 is reported, then 2, 4, 8, and so on,
 /// each carrying the running total. A scan of every port on a host is 17 lines
-/// instead of 65535, the first of them lands as immediately as it does today,
-/// and the last one *says* it was 65536 — which is more than the unsampled
-/// version ever told anybody, since counting identical lines was left to whoever
-/// read the journal. The cost is that the count between reports is only known to
-/// within a factor of two until the next one arrives.
+/// instead of 65535, the first of them is written immediately, and the last one
+/// *says* it was 65536. That is more than an unsampled log tells anybody, since
+/// counting identical lines is left to whoever reads the journal. The cost is
+/// that the count between reports is only known to within a factor of two
+/// until the next one arrives.
 ///
 /// One of these per connection, so a peer cannot use a quiet neighbour's
 /// allowance, and nothing here is ever reset: the schedule is about a
@@ -209,7 +208,7 @@ impl Sampler {
 
     /// Records an occurrence: `Some(total)` when this one is to be reported.
     ///
-    /// `Relaxed` because the only thing ordered against is the counter itself —
+    /// `Relaxed` because the only thing ordered against is the counter itself:
     /// two threads racing here get two distinct totals and at most one of them
     /// is a power of two, which is all the schedule asks. Wrapping is
     /// unreachable (a `u64` of refusals is longer than the hardware lasts) and
@@ -266,8 +265,8 @@ const MAX_ADDRESSES: usize = 8;
 ///
 /// The list on the two refusal lines in [`crate::tunnel`] is what the *resolver*
 /// answered, before the policy filter, and nothing between `getaddrinfo` and the
-/// line bounds it: a name whose owner returns four thousand records — which a
-/// DNS answer over TCP has room for — puts every one of them on the line. The
+/// line bounds it: a name whose owner returns four thousand records (which a
+/// DNS answer over TCP has room for) puts every one of them on the line. The
 /// client picks the name, and on the blackhole line, which is deliberately not
 /// sampled because it fires on ordinary ad-blocked traffic, that is tens of
 /// kilobytes of INFO per request. The two `debug` lines naming the addresses a

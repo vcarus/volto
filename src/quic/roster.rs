@@ -32,31 +32,32 @@ struct Slot {
 /// What `max_connections` is decided against, and the reason it is a roster
 /// rather than a count: at the cap the newcomer is not the only candidate for
 /// refusal. Every bound an unauthenticated connection is under is a bound on
-/// *one* connection — one idle timeout for the QUIC handshake, one for the
-/// HTTP/3 handshake, then twice one for the first request to authenticate (D76)
-/// — and none of them bounds how many slots such connections may hold between
+/// *one* connection: one idle timeout for the QUIC handshake, one for the
+/// HTTP/3 handshake, then twice one for the first request to authenticate
+/// (D76). None of them bounds how many slots such connections may hold between
 /// them. A peer that completes a handshake about once a second and never sends
-/// a credential holds all 256 of the default slots for as long as it likes,
-/// each slot legitimately, while every client with credentials is refused
-/// (audit 2026-08-23).
+/// a credential would hold all 256 of the default slots for as long as it
+/// likes, each slot legitimately, while every client with credentials is
+/// refused.
 ///
 /// So at the cap the oldest connection that has never authenticated loses its
 /// slot to the newcomer, and only a server whose every live connection *has*
 /// authenticated refuses. A sub-quota for unauthenticated connections would not
-/// do: a legitimate client is unauthenticated at accept time too, so it would be
-/// squeezed by the same pool it is trying to join. An authenticated connection
-/// is never a candidate, and below the cap none of this runs at all.
+/// do: a legitimate client is unauthenticated at accept time too, so it would
+/// have to win a place in the same sub-quota that the flood fills. An
+/// authenticated connection is never a candidate, and below the cap none of
+/// this runs at all.
 ///
 /// `max_connections` is a soft cap on tasks, and an exact one on slots. A victim
 /// leaves the roster the moment it is chosen, while its task takes as long to
 /// notice as one poll takes, so for that moment the process is running one more
 /// connection than the cap names. That is harmless: what a slot rations is the
 /// right to sit here unauthenticated, and a connection in that state holds no
-/// tunnel, no target socket and no file descriptor beyond the endpoint's — the
+/// tunnel, no target socket and no file descriptor beyond the endpoint's. The
 /// resources worth rationing are behind [`crate::tunnel::Quota`], which counts
 /// per connection and is not touched by any of this.
 ///
-/// The lock is a `std::sync::Mutex` and is never held across an await — only
+/// The lock is a `std::sync::Mutex` and is never held across an await, only
 /// long enough to walk a map that has at most `max_connections` entries.
 #[derive(Clone)]
 pub(super) struct Roster {
@@ -121,26 +122,23 @@ impl Roster {
     /// against can move. One victim is all a server that has been sitting at a
     /// steady cap ever needs; a `SIGHUP` that lowers `max_connections` below the
     /// number of connections already live leaves the roster over the new cap,
-    /// and only this brings it back down — otherwise the reload would be
-    /// honoured for the newcomer and quietly ignored for everybody already in,
-    /// for the lifetime of those connections.
+    /// and only this brings it back down. Otherwise the reload would apply to
+    /// the newcomer and be ignored for everybody already in, for the lifetime
+    /// of those connections.
     ///
     /// It stops when there is nothing left that may be taken, which is the same
     /// condition the caller's refusal tests: an answer that leaves the roster at
     /// the cap means every live connection has authenticated.
     ///
     /// A method rather than the loop written out at the accept path, so that
-    /// what the unit tests run is what the server runs (audit follow-up
-    /// 2026-08-24): the tests used to walk a copy of it, and changing the
-    /// server's own loop back to a single eviction left every one of them green.
+    /// what the unit tests run is what the server runs. Tests that walked a copy
+    /// would stay green if the server's own loop went back to a single eviction.
     ///
     /// One guard for the whole loop rather than two acquisitions per pass. With
     /// the lock taken and released between the length read and the eviction, a
-    /// connection ending on another thread in that window left the roster below
-    /// the cap and the next pass evicted somebody who no longer had to go: one
-    /// extra unauthenticated connection dropped from a population that is
-    /// already churning. Benign, and recorded as F2 of D96 with the instruction
-    /// to fix it the next time this file changed.
+    /// connection ending on another thread in that window would leave the
+    /// roster below the cap, and the next pass would evict a connection that no
+    /// longer had to go (F2 of D96).
     pub(super) fn evict_until_below(&self, cap: usize) -> Vec<SocketAddr> {
         let mut victims = Vec::new();
         let mut slots = self.slots();
@@ -165,8 +163,8 @@ impl Roster {
 ///
 /// The candidacy is decided by winning the gate's compare-and-swap, not by
 /// reading it and removing afterwards: a request can authenticate between the
-/// read and the removal, and that race used to end a connection whose request
-/// had just got past the door. A slot whose mark won the swap loses here and
+/// read and the removal, and that race would end a connection whose request
+/// had just authenticated. A slot whose mark won the swap loses here and
 /// stays on the roster; only a slot this function claimed is removed and
 /// notified.
 ///
@@ -188,7 +186,7 @@ fn evict_oldest_from(slots: &mut BTreeMap<u64, Slot>) -> Option<SocketAddr> {
 /// A connection's place on the [`Roster`], given up when its task ends.
 ///
 /// A guard rather than a call at the end of the task, because the task has
-/// several endings — a refused handshake, an eviction, a panic — and a slot that
+/// several endings (a refused handshake, an eviction, a panic), and a slot that
 /// outlived any one of them would be a slot nothing can ever give back.
 pub(super) struct Registration {
     slots: Arc<Mutex<BTreeMap<u64, Slot>>>,

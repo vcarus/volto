@@ -21,10 +21,10 @@
 //! in a UDP datagram" and, in the same paragraph, "Senders MUST NOT coalesce
 //! QUIC packets with different connection IDs into a single UDP datagram":
 //!
-//! * **Short header** — passes. It belongs to a connection this endpoint may
+//! * **Short header**: passes. It belongs to a connection this endpoint may
 //!   already hold, and the gate keeps no connection state to judge it with; see
 //!   *What is left uncovered* below.
-//! * **Long header, version not 1** — refused, whatever the version is. What
+//! * **Long header, version not 1**: refused, whatever the version is. What
 //!   that removes depends on the version. quinn's default `EndpointConfig`,
 //!   which [`crate::quic::Server::bind`] takes unchanged, supports seven:
 //!   version 1 and the six draft numbers `0xff00001d` to `0xff000022`
@@ -33,19 +33,19 @@
 //!   and refusing removes the reply. For one of the six drafts quinn would
 //!   open a connection, and refusing removes the service. Nothing this server
 //!   interoperates with is affected, because Surge speaks version 1.
-//! * **Long header, not an Initial** — passes. quinn drops a Handshake or 0-RTT
+//! * **Long header, not an Initial**: passes. quinn drops a Handshake or 0-RTT
 //!   packet for an unknown connection without a word.
-//! * **An Initial in a datagram below 1200 bytes** — passes, because RFC 9000
+//! * **An Initial in a datagram below 1200 bytes**: passes, because RFC 9000
 //!   §14.1 has the server discard it and quinn does exactly that, silently.
 //! * **An Initial whose Destination Connection ID is shorter than eight
-//!   bytes** — refused, on the header alone and whether or not the packet
+//!   bytes**: refused, on the header alone and whether or not the packet
 //!   authenticates. RFC 9000 §7.2 gives a client's first Initial a floor of
 //!   eight bytes. Every later Initial of an admitted handshake is addressed by
 //!   the eight bytes this endpoint chose, and so is the one a Retry supplies,
 //!   so nothing legitimate is this shape. quinn's own rule is ahead of its
 //!   decryption as well, in `early_validate_first_packet`, and it answers this
 //!   shape with the CONNECTION_CLOSE named above before it reads a frame.
-//! * **An Initial this server cannot open** — passes. Only a client's *first*
+//! * **An Initial this server cannot open**: passes. Only a client's *first*
 //!   Initial packets are keyed by their own Destination Connection ID: once the
 //!   server has answered, the client addresses it by the connection ID the
 //!   server chose (RFC 9000 §7.2) while the Initial keys stay the ones derived
@@ -54,15 +54,15 @@
 //!   its state. They belong to a flight that was judged when it started; a
 //!   forgery that is not one of them fails quinn's own decryption and is
 //!   dropped there without a reply.
-//! * **An Initial with no CRYPTO frame at offset 0** — passes. It is an
+//! * **An Initial with no CRYPTO frame at offset 0**: passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started.
-//! * **An Initial whose ClientHello is cut short before its extensions** —
+//! * **An Initial whose ClientHello is cut short before its extensions**:
 //!   passes. A ClientHello may span several Initial packets, and a gate that
 //!   guessed here would refuse a legitimate client whose first flight is large;
 //!   the certificate resolver in [`crate::tls`] is the second gate that catches
 //!   what this one lets through.
-//! * **An Initial carrying a complete ClientHello** — refused unless its
+//! * **An Initial carrying a complete ClientHello**: refused unless its
 //!   `server_name` extension (RFC 6066 §3) names a host in the configured list.
 //!
 //! # How a datagram is refused
@@ -73,7 +73,7 @@
 //! in place with its Destination Connection ID *length* byte overwritten by a
 //! value no connection ID may have (RFC 9000 §17.2 caps it at 20 bytes), which
 //! is a header quinn's own decoder rejects before it looks at the version, the
-//! type or anything else — and rejects by returning, not by answering.
+//! type or anything else. It rejects it by returning, not by answering.
 //!
 //! The obvious alternative, clearing the fixed bit, does not work here: quinn
 //! accepts either value for it unless `EndpointConfig::grease_quic_bit` is
@@ -209,8 +209,8 @@ const FRAME_CONNECTION_CLOSE: u64 = 0x1c;
 
 /// The hosts a handshake may name, compared the way a name is compared.
 ///
-/// Held as normalised strings — lowercased and with a trailing root dot removed
-/// — so that the normalisation happens once at load rather than once per
+/// Held as normalised strings (lowercased, with a trailing root dot removed),
+/// so that the normalisation happens once at load rather than once per
 /// Initial packet, and so that both gates ([`Names::accepts`] here and the
 /// certificate resolver in [`crate::tls`]) can only ever agree.
 #[derive(Debug)]
@@ -234,7 +234,7 @@ impl Names {
     /// Whether `name` is one of them.
     ///
     /// DNS names are case-insensitive and a trailing dot is the same name
-    /// spelled absolutely, so both are normalised away on each side — the held
+    /// spelled absolutely, so both are normalised away on each side: the held
     /// side at load, this side without an allocation, since the held names are
     /// already lowercase. Nothing else is: no wildcards, no suffix matching. A
     /// name that is not on the list is not this server's.
@@ -250,17 +250,17 @@ impl Names {
 /// relative to the root.
 ///
 /// The whole of the rule "a configured host name may end in a root dot", in one
-/// place because it was in four and one of them was a different rule.
-/// `trim_end_matches('.')` in [`crate::tls::names_not_covered`] removed *every*
-/// trailing dot where the other three removed one, so `expected_sni =
-/// ["host.tw.."]` was held by the gate as `host.tw.`, a form no ClientHello can
-/// carry, because RFC 6066 §3 has the name represented "without a trailing
-/// dot"; it was then judged covered by the certificate as `host.tw`, so the
-/// D106 warning that exists for exactly this silent typo did not fire.
+/// place, because its four callers have to agree. If one of them removed
+/// *every* trailing dot where the others remove one, `expected_sni =
+/// ["host.tw.."]` would be held by the gate as `host.tw.`, a form no
+/// ClientHello can carry, because RFC 6066 §3 has the name represented "without
+/// a trailing dot". It would then be judged covered by the certificate as
+/// `host.tw`, so the D106 warning that exists for exactly this silent typo
+/// would not fire.
 ///
 /// One dot and no more, because a second dot is an empty label rather than a
 /// spelling of the root. `Config::validate` refuses those outright, so the four
-/// callers now agree on every name that can reach them.
+/// callers agree on every name that can reach them.
 pub(crate) fn root_relative(name: &str) -> &str {
     name.strip_suffix('.').unwrap_or(name)
 }
@@ -280,9 +280,9 @@ fn normalise(name: &str) -> String {
 /// per reload, so a plain `RwLock` around an `Arc` is all the sharing this needs.
 ///
 /// The flag beside it answers "is there a list at all" without taking the lock,
-/// because an empty list is the shipped default and every release before v0.9.0
-/// behaved that way. A gate that is off then costs a receive batch one atomic
-/// load rather than a read guard, an `Arc` clone and its drop.
+/// because an empty list is the shipped default. A gate that is off then costs
+/// a receive batch one atomic load rather than a read guard, an `Arc` clone and
+/// its drop.
 #[derive(Clone, Debug)]
 pub struct Expected(Arc<Held>);
 
@@ -345,13 +345,13 @@ impl Expected {
 /// A UDP socket that hands quinn only the datagrams the gate admits.
 ///
 /// Everything except [`AsyncUdpSocket::poll_recv`] is passed straight through,
-/// including the capability answers — `max_receive_segments` decides whether GRO
-/// is used at all and `may_fragment` decides whether MTU discovery runs, so a
-/// wrapper that answered them itself would quietly change the transport.
+/// including the capability answers. `max_receive_segments` controls whether
+/// GRO is used at all and `may_fragment` controls whether MTU discovery runs,
+/// so a wrapper that answered them itself would quietly change the transport.
 pub struct Gate {
     inner: Arc<dyn AsyncUdpSocket>,
     expected: Expected,
-    /// Everything that decides, which is everything that is not the socket.
+    /// The judging half, which is everything that is not the socket.
     judge: Judge,
 }
 
@@ -411,12 +411,13 @@ impl Gate {
     }
 }
 
-/// The half of the gate that decides, held by [`Gate`] and needing no socket.
+/// The half of the gate that judges datagrams, held by [`Gate`] and needing no
+/// socket.
 ///
 /// Separate from the socket because none of it reads one: a verdict is a
 /// function of the datagram's bytes, the list in force and the Initial keys.
-/// So judging is reachable without a bound port — through the [`judgement`]
-/// seam, by a fuzz target and by the tests that spell packets — and the receive
+/// So judging is reachable without a bound port (through the [`judgement`]
+/// seam, by a fuzz target and by the tests that spell packets), and the receive
 /// path is left as the only thing that has to know about batches, strides and
 /// blinding.
 struct Judge {
@@ -425,8 +426,8 @@ struct Judge {
     /// Held from bind time and never reloaded, because the initial secrets do
     /// not depend on the certificate: RFC 9001 §5.2 derives them from the
     /// Destination Connection ID in the client's own packet and a salt fixed by
-    /// the version. What a `SIGHUP` can change — the certificate, the key — is
-    /// not an input to any of it.
+    /// the version. What a `SIGHUP` can change (the certificate, the key) is not
+    /// an input to any of it.
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
 }
 
@@ -483,9 +484,9 @@ impl Judge {
         }
 
         let Some(header) = InitialHeader::parse(datagram) else {
-            // Not a packet quinn could decode either — a header that runs off
+            // Not a packet quinn could decode either (a header that runs off
             // the end of the datagram, a length field that claims more than
-            // arrived — and one it drops without a reply.
+            // arrived), and one it drops without a reply.
             return Verdict::Pass;
         };
 
@@ -504,10 +505,10 @@ impl Judge {
         // legitimate is ever this shape, and the reply quinn would send is one
         // of the three this gate exists to take away.
         //
-        // Before 2026-09-07 this sat after the decryption, which left the
-        // shape that costs an attacker no cryptography at all, a 1200-byte
-        // Initial with a four-byte connection ID and a payload nobody sealed,
-        // passing through to that reply.
+        // Placed after the decryption, this check would let the shape that costs an
+        // attacker no cryptography at all (a 1200-byte Initial with a four-byte
+        // connection ID and a payload nobody sealed) pass through to that
+        // reply, because a packet that fails decryption is passed.
         if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
             return Verdict::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
         }
@@ -518,7 +519,7 @@ impl Judge {
             // after the server has answered: the client has switched to the
             // server's connection ID while its Initial keys stay those of its
             // first packet, so such a packet is an acknowledgement or a later
-            // fragment of a first flight this gate already judged — and the
+            // fragment of a first flight this gate already judged. The
             // Handshake packet that carries the client's Finished is often
             // coalesced behind it, so dropping the datagram would cost every
             // admitted handshake a probe timeout. A packet that is none of that
@@ -556,8 +557,8 @@ impl Judge {
     /// Removes header protection and packet protection from an Initial packet,
     /// returning its frames.
     ///
-    /// `None` is either a packet too short for the keys to be applied — one
-    /// quinn could not read either — or an authentication failure under the
+    /// `None` is either a packet too short for the keys to be applied (one
+    /// quinn could not read either) or an authentication failure under the
     /// keys this packet's own Destination Connection ID derives: a later
     /// Initial of a handshake in progress, keyed by the client's first packet
     /// instead, or a packet that only says it is a QUIC v1 Initial. The caller
@@ -617,8 +618,8 @@ impl Judge {
 
         // The truncated packet number, used as the full one. A client's Initial
         // packet numbers start at zero and are still single digits by the time
-        // its first flight is complete, so the encoded bits are the whole number
-        // — RFC 9000 §17.1 makes the sender include enough of them for a peer
+        // its first flight is complete, so the encoded bits are the whole number.
+        // RFC 9000 §17.1 makes the sender include enough of them for a peer
         // that has acknowledged nothing to reconstruct it, and there is nothing
         // to acknowledge yet.
         let mut number = 0u64;
@@ -719,7 +720,7 @@ impl AsyncUdpSocket for Gate {
     }
 }
 
-/// What the gate decided about one datagram.
+/// The gate's verdict on one datagram.
 ///
 /// Public, and hidden, for the callers outside this module: the fuzz target and
 /// the tests behind [`judgement`] have to be able to say which verdict they got.
@@ -766,7 +767,7 @@ pub enum Refusal {
 /// §17.2 obliges every version-1 endpoint to drop the packet over (quoted at
 /// [`MAX_CONNECTION_ID`]). That field is read before the version, the packet
 /// type, the token or the payload, so the rejection does not depend on anything
-/// else in the packet being well formed — and quinn's own decoder answers it by
+/// else in the packet being well formed, and quinn's own decoder answers it by
 /// returning rather than by replying. A datagram too short to hold that byte is
 /// one quinn already drops without a reply.
 fn blind(datagram: &mut [u8]) {
@@ -838,8 +839,8 @@ impl InitialHeader {
 
 /// The CRYPTO stream bytes an Initial packet carries from offset 0 onwards.
 ///
-/// `None` means the packet has no CRYPTO frame starting at offset 0 — an
-/// acknowledgement, or a retransmitted middle of a first flight — which is the
+/// `None` means the packet has no CRYPTO frame starting at offset 0 (an
+/// acknowledgement, or a retransmitted middle of a first flight), which is the
 /// case the gate passes through rather than judging.
 ///
 /// Frames are walked rather than searched for, because a frame's length is
@@ -962,8 +963,8 @@ pub enum FirstFlight<'a> {
 ///
 /// Hidden, and public for the fuzz target: this and the `Reader` under it are
 /// the hand-written TLS parsing in this module, and the only way to reach them
-/// through [`judgement`] is to spell a whole Initial packet that authenticates
-/// — which a fuzzer cannot do by luck. So the CRYPTO bytes can be handed over
+/// through [`judgement`] is to spell a whole Initial packet that authenticates,
+/// which a fuzzer cannot do by luck. So the CRYPTO bytes can be handed over
 /// directly.
 #[doc(hidden)]
 pub fn first_flight(crypto: &[u8]) -> FirstFlight<'_> {
@@ -1099,7 +1100,7 @@ impl<'a> Reader<'a> {
 ///
 /// This is `Gate::screen`'s own `Judge::judge`, over a judge built once per
 /// process, so the judgement a fuzzer explores is the judgement a received
-/// datagram gets — the socket, the batch walk and the blinding are the only
+/// datagram gets. The socket, the batch walk and the blinding are the only
 /// parts left out, and none of them is a parser.
 ///
 /// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
@@ -1118,15 +1119,15 @@ pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
 ///
 /// Initial keys come from the client's Destination Connection ID and a salt
 /// fixed by the version (RFC 9001 §5.2, quoted at `Judge::decrypt`), never
-/// from the server's certificate — which is what `Judge::crypto` already rests
+/// from the server's certificate, which is what `Judge::crypto` already relies
 /// on for `SIGHUP`. So a configuration carrying no certificate derives exactly
 /// the keys the running server derives, and [`judgement`], the fuzz target and
 /// the tests that spell Initial packets need no key material, no file and no
-/// clock to open — or to build — the packets the real gate opens. The resolver
-/// is never asked for anything: nothing here starts a TLS session.
+/// clock to open or to build the packets the real gate opens. The resolver is
+/// never asked for anything: nothing here starts a TLS session.
 ///
-/// The panics are unreachable in the builds that call this, and would be a
-/// crypto provider without TLS 1.3 — the same condition [`crate::tls`] turns
+/// The panics are unreachable in the builds that call this. One would need a
+/// crypto provider without TLS 1.3, the same condition [`crate::tls`] turns
 /// into a startup error.
 #[doc(hidden)]
 pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {

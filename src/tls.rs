@@ -42,7 +42,7 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
 
     // The second SNI gate (D106). The first one is at the socket, in
     // [`crate::gate`], and it cannot see a ClientHello that arrives split across
-    // several Initial packets -- it passes those through deliberately, because
+    // several Initial packets. It passes those through deliberately, because
     // refusing a first flight it has not finished reading would turn a large
     // ClientHello into an unreachable server. This is where such a handshake is
     // stopped instead: no certificate is resolved for a name that is not ours,
@@ -71,16 +71,16 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
         }))
     };
 
-    // Stated rather than inherited. rustls already defaults this to 0, so not a
-    // byte on the wire changes, and QUIC allows only 0 or `u32::MAX` anyway --
-    // but a security property that holds because nobody set it is one nobody
+    // Stated rather than inherited. rustls already defaults this to 0, so
+    // nothing on the wire changes, and QUIC allows only 0 or `u32::MAX` anyway.
+    // But a security property that holds because nobody set it is one nobody
     // notices losing, and quinn's own `ServerConfig::with_single_cert` sets the
     // other value. RFC 9001 §9.2 puts the choice on the application protocol:
     // one that uses QUIC "MUST describe how the protocol uses 0-RTT and the
     // measures that are employed to protect against replay attack". This one
     // does not use it. Every request here is a CONNECT carrying credentials,
-    // and the resumption that matters to a mobile client -- not paying for a
-    // full handshake after a network switch -- is ordinary 1-RTT resumption,
+    // and the resumption that matters to a mobile client (not paying for a
+    // full handshake after a network switch) is ordinary 1-RTT resumption,
     // which this leaves untouched.
     //
     //= https://www.rfc-editor.org/rfc/rfc9001#section-9.2
@@ -92,7 +92,7 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
 
     if config.log.keylog {
         // `KeyLogFile` reads SSLKEYLOGFILE once, here, and is a no-op when the
-        // variable is unset — so enabling this without setting the variable is
+        // variable is unset, so enabling this without setting the variable is
         // harmless rather than a silent misconfiguration.
         crypto.key_log = Arc::new(rustls::KeyLogFile::new());
     }
@@ -102,8 +102,8 @@ pub fn server_crypto(config: &config::Config) -> Result<rustls::ServerConfig> {
 
 /// Presents the certificate only to a client that asked for a name we answer to.
 ///
-/// Not a certificate *selection* mechanism -- there is one certificate and one
-/// key, exactly as `with_single_cert` installs -- but a refusal: the resolver is
+/// Not a certificate *selection* mechanism (there is one certificate and one
+/// key, exactly as `with_single_cert` installs) but a refusal: the resolver is
 /// the only place in rustls where a server can see the requested name and decline
 /// before anything is sent back.
 #[derive(Debug)]
@@ -137,9 +137,7 @@ pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> 
         .filter(|name| {
             // The gate ignores a trailing root dot (`Names::new`); the name
             // check does not take one. The same helper, so the two cannot judge
-            // the same string differently -- this line read
-            // `trim_end_matches('.')` and so removed every trailing dot, which
-            // reported a name the gate held in an unmatchable form as covered.
+            // the same string differently; see `gate::root_relative`.
             let bare = crate::gate::root_relative(name);
             match rustls::pki_types::ServerName::try_from(bare) {
                 Ok(server_name) => {

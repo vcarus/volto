@@ -95,7 +95,7 @@ pub fn channel() -> (Trigger, Shutdown) {
 }
 
 impl Trigger {
-    /// Starts the shutdown. Idempotent — a second signal changes nothing.
+    /// Starts the shutdown. Idempotent: a second signal changes nothing.
     pub fn fire(&self) {
         // Fails only if every receiver is gone, in which case there is nobody
         // left to shut down.

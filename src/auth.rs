@@ -3,7 +3,7 @@
 //! # Which header
 //!
 //! Surge sends credentials on *every* CONNECT request, but its manual does not
-//! say in which field — `Proxy-Authorization` is the proxy-semantics answer and
+//! say in which field. `Proxy-Authorization` is the proxy-semantics answer and
 //! what comparable implementations use, while `Authorization` is what a client
 //! that treats the proxy as an origin would send. This is the one point the
 //! research left open (decision D3), so both are accepted: every value of
@@ -85,7 +85,7 @@ pub enum Denied {
         /// than where it is logged: the peer chooses its length as well as its
         /// bytes, and a user-id is everything before the first colon of a whole
         /// field section, so an unbounded one costs a 49 KB allocation on the
-        /// way to a log line five times that size (review H3).
+        /// way to a log line five times that size.
         username: String,
     },
 }
@@ -192,9 +192,9 @@ impl Authenticator {
     /// Compared the way [`Self::verify`] compares, and for the reason the module
     /// header gives: [`subtle::ConstantTimeEq`] over every configured user, with
     /// no early exit from the loop, so *which* configured user-id a guess
-    /// matched is not in how long the refusal took — the response is a 407
-    /// either way, and a name that can be found by timing is a directory of
-    /// user-ids.
+    /// matched is not in how long the refusal took. The response is a 407
+    /// either way, and a name that can be found by timing reveals which
+    /// user-ids exist.
     ///
     /// It claims no more than [`Self::verify`] does. `ct_eq` on two slices
     /// answers immediately when their lengths differ, which is the module
@@ -296,8 +296,8 @@ pub fn challenge_fields() -> Fields {
 
 /// Whether a field carries credentials, and so must never be logged verbatim.
 ///
-/// Both names this server accepts (decision D3), matched case-insensitively —
-/// a field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
+/// Both names this server accepts (decision D3), matched case-insensitively. A
+/// field name is lowercase by the time it gets here (RFC 9114 §4.2, enforced
 /// by `h3::stream`), but this must not depend on that. It reads the same list
 /// [`credentials`] does, so settling D3 cannot accept a third field name here
 /// and go on printing it in [`crate::conn`]'s request log.
@@ -345,7 +345,7 @@ fn basic_token(value: &str) -> Result<&str, Denied> {
 /// Hand-rolled for the same reason `datagram.rs` is (decision D2): this is the
 /// only base64 in the server, and ~40 lines is a smaller thing to own than
 /// another dependency in the production binary. Deliberately strict about
-/// framing — length a multiple of four, padding only at the very end — because
+/// framing (length a multiple of four, padding only at the very end), because
 /// the input is an authentication credential, and lenient only about the unused
 /// low bits of a padded quantum, which some encoders leave non-zero.
 fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {

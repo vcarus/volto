@@ -9,14 +9,14 @@ use anyhow::anyhow;
 /// file, and only for this file: a syntax error on a `password = ...` line puts
 /// the password on stderr at startup and into the journal on every `SIGHUP`
 /// reload, where `Restart=on-failure` reprints it every few seconds until
-/// somebody notices. So the error never reaches the chain at all — what is
+/// somebody notices. So the error never reaches the chain at all. What is
 /// reported is the parser's own message plus the position it points at, and the
 /// configuration text is not in scope for either.
 ///
 /// The operator loses nothing they need: the file, the line and the column are
 /// all still named, which is what it takes to find a typo. What the message
 /// carries is the parser's account of what it found and what it expected there,
-/// rather than a copy of what was written — see [`redact_quoted`] for the half
+/// rather than a copy of what was written. See [`redact_quoted`] for the half
 /// of that account which is a copy after all.
 pub(super) fn parse_error(path: &Path, text: &str, error: &toml::de::Error) -> anyhow::Error {
     let message = redact_quoted(error.message());
@@ -53,10 +53,9 @@ const REDACTED: &str = "`<redacted>`";
 /// found, and both kinds carry a value: `password = 8675309` renders as
 /// ``invalid type: integer `8675309`, expected a string``, while anything serde
 /// reads as a string keeps its double quotes, so `users = ["user1:hunter2"]`
-/// renders as `invalid type: string "user1:hunter2", expected struct User` —
-/// credentials and all. Either way that is the password on stderr again by a
-/// different route, and the double-quoted route survived the first fix, which
-/// knew only about backticks.
+/// renders as `invalid type: string "user1:hunter2", expected struct User`,
+/// credentials included. Either way that is the password on stderr by a
+/// different route.
 ///
 /// So both characters open a segment, and a segment ends at the same character
 /// that opened it: a backtick inside a double-quoted string belongs to the
@@ -100,13 +99,13 @@ fn redact_quoted(message: &str) -> String {
 /// only it is a `{:?}` rendering: serde spells the value it rejected with
 /// `Debug`, so a double quote inside it arrives as `\"` and a backslash as
 /// `\\`. Skipping the character after every backslash is what keeps both from
-/// being read as the end of the segment -- and the last backslash before the
-/// real closing quote is `\\`'s second half, so the skip lands on that quote
-/// rather than over it.
+/// being read as the end of the segment. The last backslash before the real
+/// closing quote is `\\`'s second half, so the skip lands on that quote rather
+/// than over it.
 ///
-/// A backtick segment is `{}`-rendered and has no escapes at all, so it is
-/// scanned as it always was: anything else would make a backslash in a value
-/// swallow the character behind it.
+/// A backtick segment is `{}`-rendered and has no escapes at all, so it ends at
+/// the next backtick. Honouring escapes there would make a backslash in a value
+/// skip the character after it.
 ///
 /// Bytes rather than characters throughout. Neither the backslash nor either
 /// quote can appear inside a multi-byte UTF-8 character, so a skip that lands
@@ -151,9 +150,9 @@ fn is_quote(character: char) -> bool {
 ///
 /// `None` for an offset past the end of `text` or one landing inside a
 /// multi-byte character: the position is a convenience on the way to an error
-/// message, so it must not become a panic of its own — and it must not become a
-/// fabricated line 1, column 1 either, which would send the operator to a line
-/// that is not the one at fault.
+/// message, so it must not become a panic of its own. Nor may it become a
+/// fabricated line 1, column 1, which would send the operator to a line that is
+/// not the one at fault.
 fn line_and_column(text: &str, offset: usize) -> Option<(usize, usize)> {
     let before = text.get(..offset)?;
 

@@ -84,10 +84,8 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
         // Stops the upward search, so packets start at `initial_mtu` and are
         // never probed larger: spec §5.4's conservative setting for a path that
         // black-holes large packets, where a stable small MTU beats an
-        // optimistic large one. Not a hard pin — quinn's black-hole detector
-        // keeps running with discovery off, and if it fires the packet size
-        // drops to the 1200-byte floor for the rest of the connection, since
-        // nothing is left to probe it back up.
+        // optimistic large one. It is not a hard pin; `Limits::mtu_discovery`
+        // says why.
         transport.mtu_discovery_config(None);
     }
 
@@ -105,7 +103,7 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
 /// The bidirectional stream allowance a connection is accepted with.
 ///
 /// A `min` rather than a flat constant, so that an operator who configures fewer
-/// than [`INITIAL_BIDI_STREAMS`] gets what they configured and not more —
+/// than [`INITIAL_BIDI_STREAMS`] gets what they configured and not more,
 /// before authentication as well as after it. Nothing here can raise the
 /// configured value; the clamp only ever lowers it.
 fn initial_bidi_streams(limits: &crate::config::Limits) -> u32 {
@@ -115,13 +113,13 @@ fn initial_bidi_streams(limits: &crate::config::Limits) -> u32 {
 /// Grants a connection the configured bidirectional stream allowance.
 ///
 /// The other half of [`INITIAL_BIDI_STREAMS`], called once per connection by
-/// [`crate::tunnel::Context::mark_authenticated`] — the one place both ways of
-/// getting past the door meet. It lives here rather than there so that the two
+/// [`crate::tunnel::Context::mark_authenticated`], the one place both ways of
+/// authenticating reach. It lives here rather than there so that the two
 /// values a connection's stream allowance can take are stated in the same file
 /// as each other, next to the reasoning that pairs them.
 ///
-/// quinn spells the two directions differently — `max_concurrent_bidi_streams`
-/// on `TransportConfig`, `set_max_concurrent_bi_streams` on `Connection` — and
+/// quinn spells the two directions differently (`max_concurrent_bidi_streams`
+/// on `TransportConfig`, `set_max_concurrent_bi_streams` on `Connection`), and
 /// they are the same parameter. Raising it allocates the new stream slots and
 /// queues a MAX_STREAMS frame, which reaches the peer on the next packet this
 /// connection sends: in practice the one carrying the response to the request
@@ -130,7 +128,8 @@ pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bid
     quic.set_max_concurrent_bi_streams(VarInt::from_u32(max_streams_bidi));
 }
 
-/// Whether a connection has got past the door, shared by everything that asks.
+/// Whether a request on a connection has passed the credentials check, shared
+/// by everything that asks.
 ///
 /// One cell with three states and two transitions. Its readers are in three
 /// modules: the accept loop's eviction candidacy (D80), the bound on how long a
@@ -156,7 +155,8 @@ pub struct AuthGate(Arc<AtomicU8>);
 
 /// Nothing has passed through this gate yet.
 const UNKNOWN: u8 = 0;
-/// A request got past the door; the gate stays open for the connection's life.
+/// A request passed the credentials check; the gate stays open for the
+/// connection's life.
 const AUTHENTICATED: u8 = 1;
 /// An eviction took the connection's slot; no request on it may proceed.
 const EVICTED: u8 = 2;
@@ -179,7 +179,7 @@ impl AuthGate {
         Self::default()
     }
 
-    /// Records that a request got past the door.
+    /// Records that a request passed the credentials check.
     ///
     /// `First` if this call won the transition and so must raise the stream
     /// allowance, `Already` if it was open, `Evicted` if the accept loop had
@@ -212,7 +212,7 @@ impl AuthGate {
             .is_ok()
     }
 
-    /// Whether a request has got past the door.
+    /// Whether a request has passed the credentials check.
     ///
     /// True only for the authenticated state: a gate an eviction took answers
     /// false, so the connection stays under every pre-authentication bound for
@@ -228,20 +228,18 @@ impl AuthGate {
 /// the mapping is invisible to the assertions on [`transport_config`]: a
 /// `Bbr => CubicConfig` slip passes every one of them. The failure it would
 /// cause is not subtle in production (the download direction of a long
-/// international path collapsed to near-zero on 2026-08-13, and it took a day to
-/// localise) but it is silent there, so the unit tests open a connection with
-/// the transport parameters and downcast the controller it runs.
+/// international path falls to near zero), but it is silent there, so the unit
+/// tests open a connection with the transport parameters and downcast the
+/// controller it runs.
 ///
 /// BBR by default. A loss-based controller (CUBIC, NewReno) reads the
 /// non-congestive packet loss of a long international path as congestion and
-/// collapses the window — the download direction stalls to near-zero while a
-/// co-located Shadowsocks server on the same box sails through, because the Linux
-/// kernel runs BBR for TCP. BBR models bandwidth and RTT instead, holding
-/// throughput on exactly these paths. See `config::CongestionControl` for why this
-/// is the default and stays configurable.
+/// keeps the window from opening. BBR models bandwidth and RTT instead. See
+/// `config::CongestionControl` for why this is the default and stays
+/// configurable.
 ///
-/// Since 1.2.0 `bbr` builds the capped controller of [`crate::congestion`]
-/// (D108), and `bbr-uncapped` builds quinn's BBR as it ships.
+/// `bbr` builds the capped controller of [`crate::congestion`] (D108), and
+/// `bbr-uncapped` builds quinn's BBR as it ships.
 fn congestion_factory(
     cc: CongestionControl,
 ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
@@ -256,15 +254,16 @@ fn congestion_factory(
 /// Aggregate flow-control window for one connection, in bytes.
 ///
 /// The bound on what an *unauthenticated* peer can make this process hold.
-/// quinn's own default is `VarInt::MAX` — no aggregate limit at all — and with
+/// quinn's own default is `VarInt::MAX`, no aggregate limit at all, and with
 /// this server's raised stream limit that is 1024 x the 2 MiB
-/// [`STREAM_RECEIVE_WINDOW`], so a single connection could pin 2 GiB of receive
-/// buffer before we ever see a request to authenticate: open the streams, fill
-/// each window, stop. On a 1 GB VPS one connection is enough to end the process.
+/// [`STREAM_RECEIVE_WINDOW`]. So a single connection could hold 2 GiB of
+/// receive buffer before we ever see a request to authenticate: open the
+/// streams, fill each window, stop. On a 1 GB VPS one connection is enough to
+/// end the process.
 ///
 /// The cap only constrains data that has arrived and not yet been read, and both
 /// tunnel pumps read continuously, so it binds exactly when the target is slower
-/// than the client — which is the case that should be bounded.
+/// than the client, which is the case that should be bounded.
 ///
 /// Read means taken from quinn. A tunnel's reader takes up to
 /// [`crate::h3api::READ_AHEAD_CHUNKS`] chunks per read, and those count as read
@@ -281,26 +280,25 @@ pub const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024)
 /// Per-stream flow-control window, in bytes.
 ///
 /// A deliberate raise above quinn's own default of 1,250,000, not inherited from
-/// it and not a pin at it. No RFC constrains the value — RFC 9000 §4.2 leaves the
+/// it and not a pin at it. No RFC constrains the value. RFC 9000 §4.2 leaves the
 /// amount of credit to implementations outright, and §4.3 only observes the
 /// consequence of getting it wrong: an endpoint that "cannot ensure that its peer
 /// always has available flow control credit that is greater than the peer's
 /// bandwidth-delay product" finds "its receive throughput will be limited by flow
 /// control". That is advice, not a requirement, and it is the whole of the case.
-/// The production path's BDP — a 100 Mbps client uplink over a 95 ms RTT — is
-/// about 1.19 MB, so quinn's default sat at roughly 1.05x it: exactly one BDP,
-/// with no margin for a window update still in flight. 2 MiB is about 1.75x.
-/// Measured corroboration: the peer we interoperate with sizes its own side far
-/// higher still, Surge's ClientHello advertising
+/// The production path's BDP (a 100 Mbps client uplink over a 95 ms RTT) is
+/// about 1.19 MB, so quinn's default is roughly 1.05x it: exactly one BDP, with
+/// no margin for a window update still in flight. 2 MiB is about 1.75x. Surge
+/// sizes its own side far higher: its ClientHello advertises
 /// `initial_max_stream_data_bidi_local` = 12 MiB per stream.
 ///
-/// Not a memory decision. [`CONNECTION_RECEIVE_WINDOW`] is the real bound — the
+/// Not a memory decision. [`CONNECTION_RECEIVE_WINDOW`] is the real bound: the
 /// invariant is that (the sum of the highest offsets received) minus (the bytes
-/// read) stays within it — so a larger per-stream window cannot raise the
-/// per-connection worst case, which is unchanged at 16 MiB. What this value
-/// actually decides is how few simultaneously saturated tunnels it takes to spend
-/// the whole connection's credit — 16 MiB / 2 MiB = 8 — which is a fairness
-/// property rather than a memory one, and 8:1 is still far more conservative than
+/// read) stays within it. So a larger per-stream window cannot raise the
+/// per-connection worst case, which is 16 MiB. What this value actually decides
+/// is how few simultaneously saturated tunnels it takes to spend the whole
+/// connection's credit (16 MiB / 2 MiB = 8). That is a fairness property
+/// rather than a memory one, and 8:1 is still far more conservative than
 /// the 1.33:1 the peer itself runs (16 MiB of `initial_max_data` against 12 MiB
 /// per stream). The per-tunnel ceiling in the download direction is whatever the
 /// client advertises to us and is not settable here.
@@ -331,8 +329,8 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// 10 MB over the ~90 ms path RTT is about 889 Mbps against a measured peak of
 /// 177 Mbps, so it is nowhere near a throughput constraint.
 ///
-/// Set to exactly what quinn already defaults to, so it changes not a byte on the
-/// wire today. It is pinned rather than inherited because upstream derives that
+/// Set to exactly what quinn already defaults to, so it changes nothing on the
+/// wire. It is pinned rather than inherited because upstream derives that
 /// default from `STREAM_RWND`, a private constant inside quinn's
 /// `TransportConfig::default` with no stability guarantee, while the arithmetic
 /// above is quoted against it. Dependabot proposes cargo bumps weekly; a patch
@@ -342,15 +340,14 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 ///
 /// Note the asymmetry it leaves: 16 MiB of inbound credit granted against a
 /// 10 MB outbound cap, on a proxy whose traffic is mostly outbound. That is an
-/// accepted decision, not an oversight — lifting the outbound cap to match would
+/// accepted decision, not an oversight. Lifting the outbound cap to match would
 /// add roughly 1.6 GiB of theoretical worst case across `max_connections` (256 by
 /// default) in exchange for throughput we cannot measure a need for.
 pub const SEND_WINDOW: u64 = 10_000_000;
 
-// D47's invariants and its validation rules, as arithmetic. Those rules were
-// written for the day these three might become configuration keys, and they are
-// the relationships between the values whether or not that day comes: the
-// stream window is at least 64 KiB, at most an eighth of the connection window,
+// D47's invariants and its validation rules, as arithmetic. The rules hold
+// between the values whether or not these three ever become configuration
+// keys: the stream window is at least 64 KiB, at most an eighth of the connection window,
 // and below 4 MiB, where the fairness crossover falls to four saturated
 // tunnels and which that ADR says is not to be tried; the send window is never
 // below the stream window it feeds.
@@ -375,8 +372,8 @@ const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
 /// buffers whatever the peer sends, `serve_peer` drains the queue, and before
 /// authentication every datagram in it is routed to the `Unroutable` drop
 /// because the session table is empty. Small next to the 16 MiB of
-/// [`CONNECTION_RECEIVE_WINDOW`] beside it, which is why the value is kept
-/// rather than lowered; what was missing was the pin, not a different number.
+/// [`CONNECTION_RECEIVE_WINDOW`] beside it, which is why the value is pinned
+/// rather than lowered.
 ///
 /// Not `None`, which would disable inbound datagrams altogether and with them
 /// CONNECT-UDP, and not a `[limits]` key, for D47's reason: three coupled
@@ -396,8 +393,8 @@ const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Unidirectional streams a peer may have open on one connection at a time.
 ///
-/// HTTP/3 gives a client exactly three of them — the control stream and the
-/// QPACK encoder/decoder pair (RFC 9114 §6.2, RFC 9204 §4.2) — and Surge opens
+/// HTTP/3 gives a client exactly three of them, the control stream and the
+/// QPACK encoder/decoder pair (RFC 9114 §6.2, RFC 9204 §4.2), and Surge opens
 /// those three and nothing else. Everything past them is either an unknown type,
 /// which RFC 9114 §6.2 has this server abort rather than reject, or a second
 /// stream of a kind that may only be opened once, which is a connection error.
@@ -407,54 +404,51 @@ const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 /// Sixteen rather than three: this is a transport parameter, so exceeding it is
 /// a QUIC-level failure with no application-level explanation attached, and the
 /// margin means an ordinary client can only meet it by doing something the
-/// HTTP/3 layer would refuse anyway. The number this replaces is quinn's own
-/// default of 100, which this server had never taken a position on — the bidi
-/// limit beside it has been a configuration key all along (review L3).
+/// HTTP/3 layer would refuse anyway. quinn's own default is 100.
 pub const MAX_PEER_UNI_STREAMS: u32 = 16;
 
 /// Bidirectional streams a peer may have open before it has authenticated.
 ///
-/// `[limits] max_streams_bidi` is what an authenticated connection is worth —
-/// one stream per tunnel, 1024 of them by default — and it used to be what the
-/// transport parameters advertised at the handshake, which handed it to every
-/// peer that could complete one. So a client that had proved nothing could open
-/// 1024 request streams at once and draw a 407 on each: 1024 parked request
-/// tasks and 1024 refusals written for a peer with no credentials. Neither
-/// bound that already applied there is a bound on *concurrency* — D77's 1 MiB
-/// HEADERS budget bounds bytes buffered, D76's absolute deadline bounds time —
-/// so nothing measured the one quantity that was free.
+/// `[limits] max_streams_bidi` is what an authenticated connection is worth:
+/// one stream per tunnel, 1024 of them by default. Advertised at the
+/// handshake, it would be handed to every peer that could complete one. A
+/// client that had proved nothing could then open 1024 request streams at once
+/// and draw a 407 on each: 1024 parked request tasks and 1024 refusals written
+/// for a peer with no credentials. Neither of the other pre-authentication
+/// bounds is a bound on *concurrency*: D77's 1 MiB HEADERS budget bounds bytes
+/// buffered, and D76's absolute deadline bounds time.
 ///
-/// It is also work this process pays for at the wrong moment. quinn reserves a
-/// stream slot for every unit of the allowance when the connection is
-/// *created*, not when a stream is opened (see `docs/configuration.md`), so the
-/// configured value was a per-handshake cost that a peer never had to
-/// authenticate to impose. Clamping moves it to the first request that gets
-/// past the door.
+/// It would also be work this process pays for at the wrong moment. quinn
+/// reserves a stream slot for every unit of the allowance when the connection
+/// is *created*, not when a stream is opened (see `docs/configuration.md`), so
+/// the configured value would be a per-handshake cost that a peer never had to
+/// authenticate to impose. Clamping moves it to the first request that passes
+/// the credentials check.
 ///
 /// Sixteen, the same number as [`MAX_PEER_UNI_STREAMS`] and for the same kind
 /// of reason: margin over what the protocol needs rather than the minimum,
 /// because running into a transport parameter is a QUIC-level stall with no
 /// application-level explanation attached. It happens to be exactly D77's
-/// budget as well — sixteen field sections at the 64 KiB per-frame cap is the
-/// 1 MiB a connection may buffer — so what an unauthenticated peer can hold in
-/// HEADERS is now bounded twice over by the same number.
+/// budget as well: sixteen field sections at the 64 KiB per-frame cap is the
+/// 1 MiB a connection may buffer. So what an unauthenticated peer can hold in
+/// HEADERS is bounded twice by the same number.
 ///
 /// # Why it cannot stall a client that bursts
 ///
 /// A client may fire several CONNECTs the moment the handshake completes,
 /// before the first 200 comes back, and more than sixteen of them would find
-/// the seventeenth blocked rather than refused — STREAMS_BLOCKED, which is
+/// the seventeenth blocked rather than refused: STREAMS_BLOCKED, which is
 /// backpressure and not an error. What unblocks it is the first of the sixteen
 /// to authenticate, and that is decided before any name is resolved and any
-/// socket is opened (`conn::handle_request`), so the raise happens in the same
-/// task that read the first HEADERS and its MAX_STREAMS rides the packet
+/// socket is opened (`conn::handle_request`). So the raise happens in the same
+/// task that read the first HEADERS, and its MAX_STREAMS goes out on the packet
 /// carrying that request's response. The seventeenth tunnel therefore waits the
 /// round trip the client was already waiting for its first answer, once per
 /// connection, and only on a connection that opens more than sixteen tunnels
 /// before any of them is answered. Below that this is never reached at all.
 ///
 /// Closing streams returns credit before authentication too, which is what
-/// keeps a well-behaved unauthenticated peer moving at all — RFC 9000 §4.6
+/// keeps a well-behaved unauthenticated peer moving at all. RFC 9000 §4.6
 /// leaves that to the receiver ("this document leaves implementations to decide
 /// when and how many streams should be advertised to a peer via MAX_STREAMS.
 /// Implementations might choose to increase limits as streams are closed"), and
