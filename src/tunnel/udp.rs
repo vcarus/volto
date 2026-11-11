@@ -284,11 +284,12 @@ enum Step {
     /// to guess which signal to believe.
     ///
     /// The code travels with the verdict so that the STOP_SENDING sent on the
-    /// way out can carry it too. Every one of the five sites that reaches here
-    /// resets the sending half with a code first, and the receiving half has to
-    /// end with the same one (review L9). Four of them send it; the fifth is
-    /// the stream ending mid-capsule, where the peer's FIN has already been
-    /// read, so quinn has nothing left to stop and the call is a no-op.
+    /// way out can carry it too. Only [`Session::abort`] builds this value, and
+    /// it resets the sending half with the code first, so the receiving half
+    /// ends with the same one. Four of the five callers send the
+    /// STOP_SENDING; the fifth is the stream ending mid-capsule, where the
+    /// peer's FIN has already been read, so quinn has nothing left to stop and
+    /// the call is a no-op.
     Aborted(h3api::Code),
 }
 
@@ -462,6 +463,13 @@ impl Session<'_> {
         }
     }
 
+    /// Resets the sending half with `code` and ends the session with
+    /// [`Step::Aborted`] carrying the same code.
+    fn abort(&mut self, code: h3api::Code) -> Step {
+        self.writer.reset(code);
+        Step::Aborted(code)
+    }
+
     /// Pushes the idle deadline out by one timeout from now.
     ///
     /// Called exactly twice: when a payload reaches the target, and when the
@@ -491,8 +499,7 @@ impl Session<'_> {
                 length = payload.len(),
                 "client sent an oversized UDP payload, aborting the session"
             );
-            self.writer.reset(h3api::DATAGRAM_ERROR);
-            return Step::Aborted(h3api::DATAGRAM_ERROR);
+            return self.abort(h3api::DATAGRAM_ERROR);
         }
 
         // RFC 9298 §7. The packet is dropped rather than the session closed: a
@@ -531,8 +538,7 @@ impl Session<'_> {
                         "the connection's unanswered packet budget is spent, closing this session"
                     ),
                 }
-                self.writer.reset(h3api::REQUEST_CANCELLED);
-                return Step::Aborted(h3api::REQUEST_CANCELLED);
+                return self.abort(h3api::REQUEST_CANCELLED);
             }
 
             *remaining -= 1;
@@ -741,8 +747,7 @@ impl Session<'_> {
                     timeout_secs = self.ctx.stall_budget.as_secs(),
                     "client stopped reading the capsule stream, resetting it"
                 );
-                self.writer.reset(h3api::REQUEST_CANCELLED);
-                Step::Aborted(h3api::REQUEST_CANCELLED)
+                self.abort(h3api::REQUEST_CANCELLED)
             }
         }
     }
@@ -787,8 +792,7 @@ impl Session<'_> {
                             // RFC 9297 §5.2 registers 0x33 as exactly this: a
                             // "Datagram or Capsule Protocol parse error".
                             debug!(stream_id, %error, "malformed capsule");
-                            self.writer.reset(h3api::DATAGRAM_ERROR);
-                            return Step::Aborted(h3api::DATAGRAM_ERROR);
+                            return self.abort(h3api::DATAGRAM_ERROR);
                         }
                     }
                 }
@@ -821,8 +825,7 @@ impl Session<'_> {
                         error = %capsule::Error::Truncated,
                         "connect-udp stream ended mid-capsule"
                     );
-                    self.writer.reset(h3api::MESSAGE_ERROR);
-                    Step::Aborted(h3api::MESSAGE_ERROR)
+                    self.abort(h3api::MESSAGE_ERROR)
                 }
             }
             Err(error) => {
