@@ -297,25 +297,20 @@ async fn connect_udp_to_a_prohibited_address_is_refused() {
 /// what opens it.
 #[tokio::test]
 async fn an_address_this_host_holds_is_refused_on_both_routes() {
-    let Some(own) = own_non_loopback_address() else {
+    let own = match own_address_precondition(
+        own_non_loopback_address(),
+        listed_ipv4_addresses(),
+        std::env::var_os("CI").is_some(),
+    ) {
+        Precondition::Test(own) => own,
+        Precondition::Skip(why) => {
+            eprintln!("skipped: {why}");
+            return;
+        }
         // A latch, not a silent skip: the test is the only coverage of RFC 9298
-        // §7's own-address class, so a host that must have an address but whose
-        // probe finds none would leave the rule untested with every run green.
-        // macOS is the platform CLAUDE.md requires to stay green, and GitHub's
-        // Linux runners have an address; anywhere else a host with no route may
-        // still skip, but only when the independent probe agrees it has none.
-        let second_probe = a_second_probe_finds_a_non_loopback_address();
-        let must_find_one = cfg!(target_os = "macos")
-            || (cfg!(target_os = "linux") && std::env::var_os("CI").is_some());
-        assert!(
-            !must_find_one && !second_probe,
-            "the own-address probe found no non-loopback address, but this host \
-             must have one (macOS or Linux CI) or a second probe to a different \
-             documentation address found one; the own-address rule would go \
-             untested silently"
-        );
-        eprintln!("skipped: this host carries no non-loopback address to test with");
-        return;
+        // §7's own-address class, so a probe that misses an address the host
+        // has would leave the rule untested with every run green.
+        Precondition::Missed(why) => panic!("{why}; the own-address rule would go untested"),
     };
 
     // The connect budget is pinned low so that a host which drops rather than
@@ -355,20 +350,159 @@ fn own_non_loopback_address() -> Option<std::net::IpAddr> {
     (!address.is_loopback() && !address.is_unspecified()).then_some(address)
 }
 
-/// A second probe for the same precondition, against a different documentation
-/// address.
+/// What the own-address test can do on this host.
+#[derive(Debug, PartialEq)]
+enum Precondition {
+    /// Run, with this address.
+    Test(std::net::IpAddr),
+    /// The host has no non-loopback IPv4 address to test with.
+    Skip(String),
+    /// The probe missed an address the host has, or could not be checked on a
+    /// host that must have one.
+    Missed(String),
+}
+
+/// Decides whether the own-address test runs, skips or fails.
 ///
-/// Independent of [`own_non_loopback_address`] in the destination it asks the
-/// kernel to route: if this one finds a non-loopback source address while the
-/// first finds none, the host has a route and the first probe is what failed,
-/// so the caller must not skip.
-fn a_second_probe_finds_a_non_loopback_address() -> bool {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| {
-            socket.connect("198.51.100.1:9")?;
-            socket.local_addr()
-        })
-        .is_ok_and(|address| !address.ip().is_loopback() && !address.ip().is_unspecified())
+/// `probed` is what [`own_non_loopback_address`] found. `listed` is the
+/// operating system's own list of non-loopback IPv4 addresses, or `None` when
+/// no listing tool could be run. The list is the independent witness: a host
+/// that lists an address the probe missed is a probe fault, and a host that
+/// lists none, offline or on an IPv6-only network, has nothing to test with.
+/// Without a list, a CI host must still find an address, because every CI
+/// runner has one, and any other host skips.
+fn own_address_precondition(
+    probed: Option<std::net::IpAddr>,
+    listed: Option<Vec<std::net::Ipv4Addr>>,
+    on_ci: bool,
+) -> Precondition {
+    match (probed, listed) {
+        (Some(own), _) => Precondition::Test(own),
+        (None, Some(listed)) if !listed.is_empty() => Precondition::Missed(format!(
+            "the own-address probe found no non-loopback address, but this host lists \
+             {listed:?}"
+        )),
+        (None, Some(_)) => {
+            Precondition::Skip("this host lists no non-loopback IPv4 address to test with".into())
+        }
+        (None, None) if on_ci => Precondition::Missed(
+            "the own-address probe found no non-loopback address on a CI host, and no \
+             address listing could be read to say why"
+                .into(),
+        ),
+        (None, None) => Precondition::Skip(
+            "the own-address probe found no non-loopback address, and no address listing \
+             could be read"
+                .into(),
+        ),
+    }
+}
+
+/// The non-loopback, non-link-local IPv4 addresses the operating system lists
+/// for this host, or `None` when no listing tool could be run.
+///
+/// Read from `ifconfig` on macOS and from `ip -o -4 addr show` on Linux, which
+/// read the interface table rather than a route. `169.254.0.0/16` is left out:
+/// a Mac with no network assigns itself one, and it has no route to the
+/// documentation address the probe asks about.
+fn listed_ipv4_addresses() -> Option<Vec<std::net::Ipv4Addr>> {
+    let output = if cfg!(target_os = "macos") {
+        std::process::Command::new("/sbin/ifconfig").output().ok()?
+    } else {
+        std::process::Command::new("ip")
+            .args(["-o", "-4", "addr", "show"])
+            .output()
+            .ok()?
+    };
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_listed_ipv4(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The IPv4 address after each `inet` word in `listing`, without loopback,
+/// link-local or unspecified addresses.
+///
+/// `ifconfig` writes `inet 192.0.2.7 netmask ...` and `ip -o` writes
+/// `inet 192.0.2.7/24 brd ...`, so a prefix length is cut off.
+fn parse_listed_ipv4(listing: &str) -> Vec<std::net::Ipv4Addr> {
+    let mut addresses = Vec::new();
+    for line in listing.lines() {
+        let mut words = line.split_whitespace();
+        while let Some(word) = words.next() {
+            if word != "inet" {
+                continue;
+            }
+            let Some(address) = words.next() else { break };
+            let address = address.split('/').next().unwrap_or(address);
+            if let Ok(address) = address.parse::<std::net::Ipv4Addr>()
+                && !address.is_loopback()
+                && !address.is_link_local()
+                && !address.is_unspecified()
+            {
+                addresses.push(address);
+            }
+        }
+    }
+    addresses
+}
+
+/// The latch decides from the host's own address list, not from the platform.
+///
+/// An offline Mac and a host on an IPv6-only network list no usable IPv4
+/// address and skip. A host that lists one while the probe found none fails,
+/// on any platform. Without a list, only a CI host fails.
+#[test]
+fn the_own_address_latch_follows_the_address_list() {
+    let own: std::net::IpAddr = "192.0.2.7".parse().unwrap();
+    let listed = vec!["192.0.2.7".parse().unwrap()];
+
+    assert_eq!(
+        own_address_precondition(Some(own), Some(listed.clone()), true),
+        Precondition::Test(own)
+    );
+    assert!(matches!(
+        own_address_precondition(None, Some(Vec::new()), false),
+        Precondition::Skip(_)
+    ));
+    assert!(matches!(
+        own_address_precondition(None, Some(Vec::new()), true),
+        Precondition::Skip(_)
+    ));
+    assert!(matches!(
+        own_address_precondition(None, Some(listed.clone()), false),
+        Precondition::Missed(_)
+    ));
+    assert!(matches!(
+        own_address_precondition(None, None, true),
+        Precondition::Missed(_)
+    ));
+    assert!(matches!(
+        own_address_precondition(None, None, false),
+        Precondition::Skip(_)
+    ));
+}
+
+/// The two listing formats, and what is left out of them.
+#[test]
+fn the_address_listing_is_read_in_both_formats() {
+    let ifconfig = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\
+                    \tinet 127.0.0.1 netmask 0xff000000\n\
+                    \tinet6 fe80::1%lo0 prefixlen 64 scopeid 0x1\n\
+                    en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\
+                    \tinet 169.254.10.20 netmask 0xffff0000 broadcast 169.254.255.255\n\
+                    \tinet 192.0.2.7 netmask 0xffffff00 broadcast 192.0.2.255\n";
+    assert_eq!(
+        parse_listed_ipv4(ifconfig),
+        vec!["192.0.2.7".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
+
+    let ip = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n\
+              2: eth0    inet 198.51.100.4/24 brd 198.51.100.255 scope global eth0\n";
+    assert_eq!(
+        parse_listed_ipv4(ip),
+        vec!["198.51.100.4".parse::<std::net::Ipv4Addr>().unwrap()]
+    );
 }
 
 /// A name whose every address is the unspecified one was blackholed by the
