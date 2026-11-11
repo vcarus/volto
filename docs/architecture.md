@@ -297,8 +297,10 @@ RFC 9114 §4.4 half-close semantics:
 | client resets the stream, or stops reading it | close the TCP connection with a reset, and cancel the direction the client left alone with `H3_REQUEST_CANCELLED` |
 
 Collapsing this into "one side closes, everything closes" breaks every protocol
-that depends on half-close. The abnormal paths coordinate through a sticky
-`watch` teardown channel so that neither pump can strand the other.
+that depends on half-close. The two pumps share one sticky `watch` channel that
+carries the tunnel's state: running, one direction ended cleanly, or torn down
+for a reason. The abnormal paths coordinate through the teardown on it so that
+neither pump can strand the other.
 
 While both directions are live, each pump is the other's watchdog and nothing in
 a tunnel is on a timer: whatever one pump notices — a reset stream, a target
