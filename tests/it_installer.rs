@@ -784,6 +784,71 @@ fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
     );
 }
 
+/// A failed ownership change removes every new file it cannot replace with an
+/// old one, and says only what it did.
+///
+/// On a first install there is no previous pair, so the rollback must remove
+/// both the new certificate and the new key. On a host that had a certificate
+/// but no key, the old certificate goes back and the new key must go, or the
+/// old certificate is left beside a key that does not match it. In both cases
+/// the message must name what was restored and what was removed.
+#[test]
+fn a_failed_ownership_change_removes_a_new_key_with_no_previous_one() {
+    for (name, plant_cert) in [("chown-fails-first", false), ("chown-fails-no-key", true)] {
+        let root = scratch_tree(
+            "install",
+            name,
+            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+        );
+        let conf_dir = root.join("etc/volto");
+        let cert = conf_dir.join("cert.pem");
+        let key = conf_dir.join("key.pem");
+        if plant_cert {
+            fs::write(&cert, "the old certificate\n").expect("cert must be writable");
+        }
+
+        let stubs = plant_root_stubs(&root, 0, "active");
+        write_executable(&stubs.join("chown"), "#!/bin/sh\nexit 1\n");
+
+        let output = run_full_install_with_stubs(&root, &stubs, &[]);
+        let stderr = stderr_of(&output);
+
+        assert!(
+            !output.status.success(),
+            "{name}: a failed chown must fail the install: {stderr}"
+        );
+        assert!(
+            !key.exists(),
+            "{name}: the new key must be removed, it has no previous key to give way to: {stderr}"
+        );
+        if plant_cert {
+            assert_eq!(
+                fs::read_to_string(&cert).ok().as_deref(),
+                Some("the old certificate\n"),
+                "{name}: the old certificate must be back: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("restored the previous {}", cert.display()))
+                    && stderr.contains(&format!("removed the new {}", key.display())),
+                "{name}: the message must say the certificate was restored and the new key removed: {stderr}"
+            );
+        } else {
+            assert!(
+                !cert.exists(),
+                "{name}: the new certificate must be removed on a first install: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "removed the new {} and {}",
+                    cert.display(),
+                    key.display()
+                )) && !stderr.contains("restored"),
+                "{name}: the message must say both new files were removed and nothing restored: {stderr}"
+            );
+        }
+    }
+}
+
 /// Runs the full install path with the given service status, relocating every
 /// install path under `root`.
 ///

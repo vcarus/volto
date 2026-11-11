@@ -388,23 +388,39 @@ install -d -o volto -g volto -m 0750 "$CONF_DIR"
 # is an old certificate to restore.
 restore_previous_pair() {
     trap - ERR
-    local restored=""
+    local restored="" removed=""
 
-    if [ -n "$key_backup" ] && mv -f "$key_backup" "$KEY"; then
-        restored="$KEY"
+    # A new file with no previous one to give way to is removed. Leaving a new
+    # key behind would put it beside a restored certificate it does not match,
+    # or leave half a pair after a first install.
+    if [ -n "$key_backup" ]; then
+        if mv -f "$key_backup" "$KEY"; then
+            restored="$KEY"
+        fi
+    elif [ "$key_placed" -eq 1 ]; then
+        if rm -f "$KEY"; then
+            removed="$KEY"
+        fi
     fi
     if [ -n "$cert_backup" ]; then
         if mv -f "$cert_backup" "$CERT"; then
             restored="$CERT${restored:+ and $restored}"
         fi
     elif [ "$cert_placed" -eq 1 ]; then
-        rm -f "$CERT"
+        if rm -f "$CERT"; then
+            removed="$CERT${removed:+ and $removed}"
+        fi
     fi
     rm -f "$CERT.new" "$KEY.new"
 
-    [ -n "$restored" ] ||
-        die "installing the new certificate failed; there was nothing to restore, and the new pair was removed"
-    die "installing the new certificate failed; restored the previous $restored, and the new pair was removed"
+    if [ -n "$restored" ] && [ -n "$removed" ]; then
+        die "installing the new certificate failed; restored the previous $restored and removed the new $removed"
+    elif [ -n "$restored" ]; then
+        die "installing the new certificate failed; restored the previous $restored"
+    elif [ -n "$removed" ]; then
+        die "installing the new certificate failed; there was no previous pair to restore, and removed the new $removed"
+    fi
+    die "installing the new certificate failed before anything was moved into place"
 }
 
 if [ -f "$CERT" ] && [ -f "$KEY" ] && [ "$FORCE" -eq 0 ]; then
@@ -444,6 +460,7 @@ else
     cert_backup=""
     key_backup=""
     cert_placed=0
+    key_placed=0
     trap restore_previous_pair ERR
 
     # One timestamp for both backups, so the pair keeps a name that says it is a
@@ -462,6 +479,7 @@ else
     mv "$CERT.new" "$CERT"
     cert_placed=1
     mv "$KEY.new" "$KEY"
+    key_placed=1
 
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi
