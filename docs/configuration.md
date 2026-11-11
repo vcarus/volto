@@ -185,11 +185,11 @@ either way. `0` asks for nothing and leaves that default in place. Both keys are
 range-checked to `0..=2147483647`, the largest value the socket API's signed
 32-bit argument can carry: the value is converted to a `c_int` before
 `setsockopt`, so anything above that limit would reach the kernel truncated to a
-different number — `4294967296` becomes `0`, which is the operating system's
+different number: `4294967296` becomes `0`, which is the operating system's
 minimum rather than a request. A larger value is refused at load time, naming
 the key, the value and the limit. The reason these keys exist at all is that
 quinn never calls `setsockopt` itself, so a server that does not ask gets
-`net.core.rmem_default` — around 208 KiB — however high `rmem_max` has been
+`net.core.rmem_default`, around 208 KiB, however high `rmem_max` has been
 raised; see [UDP socket buffers](deployment.md#udp-socket-buffers).
 
 **`[log].level` is startup-only.** The tracing subscriber that applies it is

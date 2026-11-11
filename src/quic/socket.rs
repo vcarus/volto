@@ -244,9 +244,9 @@ fn request_socket_buffer(
 /// overhead, while macOS reports the number unchanged. Comparing the two the
 /// same way is wrong in one direction or the other. On Linux the kernel clamps
 /// to the sysctl and reports double the clamped value, so a request above the
-/// ceiling but below twice the ceiling — 300 000 bytes against a 212 992-byte
-/// ceiling, read back as 425 984 — satisfies a plain `<` although the kernel
-/// granted only the ceiling. Halving the read-back before the comparison closes
+/// ceiling but below twice the ceiling satisfies a plain `<` although the
+/// kernel granted only the ceiling. For example, 300 000 bytes against a
+/// 212 992-byte ceiling reads back as 425 984. Halving the read-back before the comparison closes
 /// that band. Elsewhere the number is reported unchanged and compared directly.
 ///
 /// [`socket_buffer_was_capped_with`] is the same judgement with the convention

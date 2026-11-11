@@ -296,7 +296,7 @@ fn is_ipv4_documentation(octets: [u8; 4]) -> bool {
         || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
 }
 
-/// `2001:db8::/32` and `3fff::/20` — the IPv6 documentation ranges.
+/// `2001:db8::/32` and `3fff::/20` are the IPv6 documentation ranges.
 ///
 /// Reachable nowhere by definition, and the ranges examples and test fixtures
 /// are written with. RFC 3849's block is the one in long use; the IANA registry
@@ -318,7 +318,7 @@ fn is_ipv6_benchmarking(v6: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000
 }
 
-/// `2001:10::/28` and `2001:20::/28` — ORCHID and ORCHIDv2.
+/// `2001:10::/28` and `2001:20::/28` are ORCHID and ORCHIDv2.
 ///
 /// An ORCHID is a hash of a host identity, not a locator: nothing forwards one,
 /// so a tunnel to it can only ever hold a slot. The original block's registry
@@ -332,7 +332,7 @@ fn is_orchid(v6: Ipv6Addr) -> bool {
     segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020)
 }
 
-/// `2001:30::/28` — the Drone Remote ID Protocol Entity Tags (DETs) prefix.
+/// `2001:30::/28` is the Drone Remote ID Protocol Entity Tags (DETs) prefix.
 ///
 /// The IANA registry lists the block as globally reachable, but its name says
 /// what it carries: entity tags, identifiers for a drone's remote identity. An
@@ -353,7 +353,7 @@ fn is_discard_only(v6: Ipv6Addr) -> bool {
     segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0)
 }
 
-/// `5f00::/16` — Segment Routing (SRv6) SIDs.
+/// `5f00::/16` is the Segment Routing (SRv6) SID block.
 ///
 /// The IANA registry marks the block not globally reachable. A host with SRv6
 /// routes can still deliver it to an internal SID, which is the class
@@ -1101,8 +1101,8 @@ mod tests {
             &["[::ffff:0.0.0.0]:443"][..],
             &["0.0.0.0:443", "[::]:443", "[::ffff:0.0.0.0]:443"][..],
             // Transition forms of the unspecified address: the routed form is
-            // 0.0.0.0, so a DNS64 network's blocked answer arrives wearing a
-            // global-looking IPv6 hat.
+            // 0.0.0.0, so a DNS64 network's blocked answer arrives as an IPv6
+            // address that looks global and still routes to 0.0.0.0.
             &["[64:ff9b::]:443"][..],
             &["[2002::]:443"][..],
             // Teredo: the last 32 bits are the client address with every bit

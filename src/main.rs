@@ -409,8 +409,8 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 ///
 /// The reload itself runs on the blocking pool rather than on the async task.
 /// It reads the configuration file and parses the certificate and key, which is
-/// file I/O and CPU work, and on a host whose runtime has one worker thread — a
-/// one-vCPU VPS — that worker also drives the endpoint and every connection.
+/// file I/O and CPU work. On a host whose runtime has one worker thread, such as
+/// a one-vCPU VPS, that worker also drives the endpoint and every connection.
 /// Running it inline would stop every packet and timer for the length of the
 /// parse; `spawn_blocking` uses the pool `main` already sizes for this kind of
 /// work.
@@ -588,9 +588,9 @@ fn init_tracing(level: &str) -> Result<()> {
 /// Three outcomes, because an unset `RUST_LOG` and a set-but-unparseable one
 /// are not the same thing: the first says nothing and `log.level` is the only
 /// instruction, while the second is an operator's mistake worth a line in the
-/// journal. [`EnvFilter::try_from_default_env`] alone cannot tell them apart —
-/// it returns `Err` for both — which is why the variable's presence is read
-/// first.
+/// journal. [`EnvFilter::try_from_default_env`] alone cannot tell them apart,
+/// because it returns `Err` for both. That is why the variable's presence is
+/// read first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FilterSource {
     /// `RUST_LOG` is absent: `log.level` applies.

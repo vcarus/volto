@@ -980,7 +980,7 @@ impl Config {
         }
 
         // `socket2` converts these with `size as c_int`, so a value above
-        // `i32::MAX` reaches the kernel truncated to a different number — 2^32
+        // `i32::MAX` reaches the kernel truncated to a different number: 2^32
         // becomes 0, which is the operating system's minimum rather than the
         // default the operator asked to leave alone. Refusing at load time is
         // what makes the number in the file the number the kernel receives.

@@ -218,7 +218,7 @@ fn mirrored_block(name: &str, open: &str, close: &str) -> String {
 
     assert!(
         closed,
-        "{} carries no `{open}` … `{close}` block — has the step moved, or were \
+        "{} carries no `{open}` … `{close}` block. Has the step moved, or were \
          the markers dropped?",
         path.display()
     );

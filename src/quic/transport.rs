@@ -132,8 +132,8 @@ pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bid
 
 /// Whether a connection has got past the door, shared by everything that asks.
 ///
-/// One cell with three states and two transitions, and every reader in three
-/// modules — the accept loop's eviction candidacy (D80), the bound on how long a
+/// One cell with three states and two transitions. Its readers are in three
+/// modules: the accept loop's eviction candidacy (D80), the bound on how long a
 /// connection may say nothing (D76), and the stream allowance above (D98).
 /// A request opens the gate with [`AuthGate::mark`], and the accept loop claims
 /// it for eviction with `AuthGate::evict`; both are a compare-and-swap from

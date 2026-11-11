@@ -344,8 +344,8 @@ pub struct Context {
     ///
     /// Its transition is load-bearing as well as its value: the
     /// unknown-to-authenticated edge is what raises this connection's
-    /// bidirectional stream allowance to the configured one, exactly once —
-    /// which is why it is an [`AuthGate`] and not the bare atomic it wraps. See
+    /// bidirectional stream allowance to the configured one, exactly once. That
+    /// is why it is an [`AuthGate`] and not the bare atomic it wraps. See
     /// `Context::mark_authenticated`.
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
