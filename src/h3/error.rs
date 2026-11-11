@@ -115,12 +115,20 @@ impl fmt::Debug for Code {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     code: Code,
-    fatal: bool,
-    /// Whether the peer's fault is a field section this server would not hold,
-    /// which is the one thing a 431 answers -- see
-    /// [`Self::field_section_too_large`].
-    field_section: bool,
+    class: Class,
     detail: Cow<'static, str>,
+}
+
+/// What a [`Violation`] ends, and whether a 431 answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Class {
+    /// A stream error, answered by a bare reset.
+    Stream,
+    /// A stream error about a field section this server would not hold, which
+    /// is the one thing a 431 answers. See [`Violation::field_section_too_large`].
+    FieldSectionTooLarge,
+    /// A connection error.
+    Connection,
 }
 
 impl Violation {
@@ -128,8 +136,7 @@ impl Violation {
     pub fn stream(code: Code, detail: impl Into<Cow<'static, str>>) -> Self {
         Self {
             code,
-            fatal: false,
-            field_section: false,
+            class: Class::Stream,
             detail: detail.into(),
         }
     }
@@ -138,8 +145,7 @@ impl Violation {
     pub fn connection(code: Code, detail: impl Into<Cow<'static, str>>) -> Self {
         Self {
             code,
-            fatal: true,
-            field_section: false,
+            class: Class::Connection,
             detail: detail.into(),
         }
     }
@@ -163,8 +169,7 @@ impl Violation {
     pub fn field_section_too_large(detail: impl Into<Cow<'static, str>>) -> Self {
         Self {
             code: Code::H3_EXCESSIVE_LOAD,
-            fatal: false,
-            field_section: true,
+            class: Class::FieldSectionTooLarge,
             detail: detail.into(),
         }
     }
@@ -176,17 +181,18 @@ impl Violation {
 
     /// Whether the whole connection has to be closed.
     pub fn is_connection_error(&self) -> bool {
-        self.fatal
+        self.class == Class::Connection
     }
 
     /// Whether a 431 is the right thing to tell the peer about this.
     ///
-    /// True only for [`Self::field_section_too_large`], which says why. The one
+    /// True only for [`Self::field_section_too_large`], which says why, and
+    /// false once such a violation is escalated to a connection error. The one
     /// reader is [`crate::h3::stream::Resolver::resolve`]; every other
     /// stream-class violation, this code included, is answered by the bare reset
     /// that says nothing a peer could act on wrongly.
     pub fn is_field_section_too_large(&self) -> bool {
-        self.field_section
+        self.class == Class::FieldSectionTooLarge
     }
 
     /// The same violation, escalated to end the connection.
@@ -195,12 +201,15 @@ impl Violation {
     /// makes any failure of a critical stream fatal, whatever the underlying
     /// rule would have been on a request stream.
     ///
+    /// A field-section violation escalated here becomes a plain connection
+    /// error, so [`Self::is_field_section_too_large`] is false for the result.
+    ///
     /// Not public: escalating someone else's verdict is a judgement only the
     /// reader of a critical stream is entitled to make, and all of those are in
     /// [`super::connection`].
     pub(super) fn into_fatal(self) -> Self {
         Self {
-            fatal: true,
+            class: Class::Connection,
             ..self
         }
     }
@@ -551,6 +560,18 @@ mod tests {
 
         let fatal = violation.clone().into_fatal();
         assert!(fatal.is_connection_error());
+        assert_eq!(fatal.code(), violation.code());
+        assert_eq!(fatal.to_string(), violation.to_string());
+    }
+
+    #[test]
+    fn an_escalated_field_section_violation_is_no_longer_answered_with_a_431() {
+        let violation = Violation::field_section_too_large("a 70000-byte frame");
+        assert!(violation.is_field_section_too_large());
+
+        let fatal = violation.clone().into_fatal();
+        assert!(fatal.is_connection_error());
+        assert!(!fatal.is_field_section_too_large());
         assert_eq!(fatal.code(), violation.code());
         assert_eq!(fatal.to_string(), violation.to_string());
     }

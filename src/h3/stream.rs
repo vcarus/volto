@@ -150,17 +150,14 @@ impl Resolver {
             // carries the same code and sent no header field at all, so a 431
             // would tell that peer to shrink something it never sent.
             //
-            // The `is_connection_error` guard stays because that is what decides
-            // between answering and closing everywhere else in this file, and a
-            // critical stream's reader is entitled to escalate a verdict after
-            // it was made.
+            // A field-section violation is never a connection error: escalating
+            // one with `into_fatal` makes it connection-class, and this test is
+            // then false.
             //
             // The write is bounded and, when the bound lapses, abandoned with
             // a reset: [`Stream::respond_within`] says why, and a peer that
             // grants no flow-control window never takes these fifty-odd bytes.
-            Err(frame::Error::Protocol(violation))
-                if violation.is_field_section_too_large() && !violation.is_connection_error() =>
-            {
+            Err(frame::Error::Protocol(violation)) if violation.is_field_section_too_large() => {
                 stream.stop_receiving(violation.code());
 
                 if stream
