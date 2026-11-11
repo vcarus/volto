@@ -172,11 +172,17 @@ pub fn varint_len(value: u64) -> usize {
 ///
 /// If `value` exceeds [`VARINT_MAX`], which is unrepresentable.
 ///
+/// Also if `buf` cannot hold the encoding. Only a fixed slice can fail that
+/// way, because a `BytesMut` grows.
+///
 /// Each arm narrows to the width `varint_len` has just proved the value fits:
 /// one byte only below 0x40, two only below 0x4000, four only below
 /// 0x4000_0000.
+///
+/// Generic over the buffer so that a frame header can be written into room
+/// already reserved inside a slice, which `h3::frame::seal_data` does.
 #[allow(clippy::as_conversions)]
-pub fn put_varint(buf: &mut BytesMut, value: u64) {
+pub fn put_varint(buf: &mut impl BufMut, value: u64) {
     assert!(
         value <= VARINT_MAX,
         "{value} is too large for a QUIC varint"
