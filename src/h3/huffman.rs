@@ -10,11 +10,10 @@
 //! handful of bytes at best, and not encoding removes a whole error path from
 //! the send side.
 //!
-//! The code is *canonical* — within each length the codes are consecutive and
-//! assigned in increasing symbol order — which is what makes the decoder below
-//! two small arrays rather than a tree. The unit tests re-derive that property
-//! from the table, so a mistyped entry fails the build rather than one client's
-//! request.
+//! The code is *canonical*: within each length the codes are consecutive and
+//! assigned in increasing symbol order. That is why the decoder below is two
+//! small arrays rather than a tree. The unit tests re-derive that property from
+//! the table, so a mistyped entry fails the tests rather than a request.
 
 use std::sync::OnceLock;
 
@@ -166,14 +165,13 @@ fn table() -> &'static Table {
 /// Decodes a Huffman-encoded string literal.
 ///
 /// Every failure is the same stream error, carrying QPACK_DECOMPRESSION_FAILED
-/// and ending only the request that carried the literal -- this server's own
-/// rule, not one RFC 7541 or RFC 9204 states; see `failed` below for why.
+/// and ending only the request that carried the literal. This is this server's
+/// own rule, not one RFC 7541 or RFC 9204 states; `failed` below says why.
 pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
     let table = table();
 
-    // A Huffman code is at least five bits, so this cannot over-reserve by more
-    // than a factor of eight -- and never under-reserves, so the loop below
-    // never grows the vector.
+    // A Huffman code is at least five bits, so this never under-reserves and
+    // the loop below never grows the vector.
     let mut out = Vec::with_capacity(encoded.len() * 8 / 5 + 1);
 
     // The bits seen since the last complete symbol, and how many there are.
@@ -230,13 +228,10 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
 
 /// The one error this module produces: a stream error, not a connection one.
 ///
-/// RFC 7541 §5.2 states each of these faults as a "decoding error" and says
-/// nothing about which class it belongs to, and RFC 9204 mandates a connection
-/// error only for the three cases named in [`super::qpack`], none of which a
-/// string literal can be. So this is our own rule rather than the RFC's: with a
-/// zero dynamic table capacity nothing is carried between field sections, so a
-/// literal this decoder cannot read desynchronises nothing, and answering on the
-/// stream costs the one request instead of every tunnel on the connection.
+/// RFC 7541 §5.2 states each of these faults as a "decoding error" without a
+/// class, and none of them is one of the three connection errors RFC 9204
+/// names. The stream class is our own rule; `stream_error` in
+/// [`super::qpack`] states the reason.
 fn failed(detail: &'static str) -> Violation {
     Violation::stream(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }

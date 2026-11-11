@@ -25,19 +25,18 @@
 //! and it is exercised on every connection: clients send reserved "grease"
 //! types precisely to catch a peer that cannot skip them.
 //!
-//! A frame's *type* is judged before its length, and which verdict it earns
-//! depends on the stream it arrived on. SETTINGS on a request
-//! stream is a connection error at any size, so refusing it for being large
-//! would be answering a question the peer did not ask -- and charging the
-//! buffering budget for a frame that was never allowed there would let a peer
-//! hold the budget with frames it is not entitled to send at all.
+//! A frame's *type* is judged before its length, and the verdict depends on the
+//! stream it arrived on. SETTINGS on a request stream is a connection error at
+//! any size, so refusing it for being large would report the wrong fault.
+//! Charging the buffering budget for a frame that is not allowed there would
+//! let a peer hold the budget with frames it may not send at all.
 //!
 //! The decoder is pure: it holds every byte of state, and [`FrameReader`] is
-//! the few lines that feed it from a QUIC stream. That split is what makes
-//! the frame layer testable a byte at a time, and what makes [`FrameReader`]
-//! cancel-safe -- the only await is the read, and nothing it produces is lost
-//! by dropping the future. `tunnel::udp` reads request streams inside a
-//! `select!` with a timeout, so that property is load-bearing.
+//! the few lines that feed it from a QUIC stream. That split makes the frame
+//! layer testable a byte at a time, and makes [`FrameReader`] cancel-safe: the
+//! only await is the read, and nothing it produces is lost by dropping the
+//! future. `tunnel::udp` reads request streams inside a `select!` with a
+//! timeout, so that property is required.
 //!
 //! # The one read-ahead
 //!
@@ -87,9 +86,8 @@ pub const MAX_PUSH_ID: u64 = 0x0d;
 /// server skip rather than judge.
 ///
 /// A type rather than a list of codes, so that `parse` can be exhaustive over
-/// it: a seventh buffered frame is then a compiler error at the one place that
-/// would have to parse it, where a seventh entry in a list of codes compiled
-/// and let the first frame of it reach an arm that said it could not happen.
+/// it. A seventh buffered frame is then a compiler error at the one place that
+/// would have to parse it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BufferedKind {
     /// HEADERS (RFC 9114 §7.2.2).
@@ -157,23 +155,22 @@ const RESERVED_HTTP2_SETTINGS: [u64; 5] = [0x00, 0x02, 0x03, 0x04, 0x05];
 /// Largest payload this reader will buffer for one non-DATA frame.
 ///
 /// A policy bound on *encoded* bytes, and this server's own rule rather than
-/// anything the RFC asks for. It applies to every buffered frame -- HEADERS,
-/// SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- because each of
-/// them declares its length as a varint that may claim 2^62 bytes, and the
-/// declared length is refused here before a single byte is allocated for it.
+/// anything the RFC asks for. It applies to every buffered frame (HEADERS,
+/// SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE), because each of
+/// them declares its length as a varint that may claim 2^62 bytes. The declared
+/// length is refused here before a single byte is allocated for it.
 ///
-/// Its value is [`MAX_FIELD_SECTION_SIZE`], which makes it the same number as
-/// the advertised field-section limit without being the same *rule*: RFC 9114
-/// §4.2.2 sizes a field section by the uncompressed name and value plus 32
-/// bytes per field, while this counts the octets that arrived. The two usually
-/// run the same way round, since the static table and Huffman coding shrink a
-/// real request -- but not always. A Huffman code is up to 30 bits wide
-/// (RFC 7541 Appendix B), so a literal made of bytes the table codes poorly can
-/// grow by up to 3.75x, and such a section can be inside the advertised limit
-/// and still refused here. No encoder produces one, because Huffman coding is
-/// optional per field and an encoder that would grow a literal sends it as it
-/// is; what this bounds is what a peer that is *not* a real encoder can make an
-/// unauthenticated connection hold.
+/// Its value is [`MAX_FIELD_SECTION_SIZE`], the same number as the advertised
+/// field-section limit but not the same *rule*. RFC 9114 §4.2.2 sizes a field
+/// section by the uncompressed name and value plus 32 bytes per field, while
+/// this counts the octets that arrived. The static table and Huffman coding
+/// usually make the encoded form the smaller one, but not always. A Huffman
+/// code is up to 30 bits wide (RFC 7541 Appendix B), so a literal made of bytes
+/// the table codes poorly can grow by up to 3.75x, and such a section can be
+/// inside the advertised limit and still refused here. No encoder produces
+/// one, because Huffman coding is optional per field and an encoder sends a
+/// literal unencoded when coding would grow it. This bounds what a peer that is
+/// *not* a real encoder can make an unauthenticated connection hold.
 const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
 // D77's boundary, written as arithmetic rather than only as prose: the
@@ -210,13 +207,13 @@ pub(super) const NON_DATA_FRAME_ON_A_TUNNEL: &str =
 ///
 /// RFC 9114 §9 has this server ignore a frame type it does not know, and §7.2.8
 /// makes the reserved "grease" types (0x1f * N + 0x21) padding a peer MAY send
-/// "on any stream where frames are allowed to be sent". Both are legitimate --
+/// "on any stream where frames are allowed to be sent". Both are legitimate:
 /// §10.5 names "padding to increase resistance to traffic analysis" among the
-/// uses that are "entirely legitimate" -- and both are free of any per-frame
-/// cost here, because the payload is discarded as it arrives and never buffered.
-/// What is not free is the count: each skipped frame is a frame header to parse
-/// and an `Item::Skipped` to hand back, so a peer that sends nothing but grease
-/// keeps a request stream's reader busy without ever completing a request.
+/// uses that are "entirely legitimate". Their payload costs nothing here,
+/// because it is discarded as it arrives and never buffered. The count is not
+/// free: each skipped frame is a frame header to parse and an `Item::Skipped`
+/// to hand back, so a peer that sends nothing but grease keeps a request
+/// stream's reader busy without ever completing a request.
 ///
 //= https://www.rfc-editor.org/rfc/rfc9114#section-10.5
 //# Implementations SHOULD track the use of these features and set limits
@@ -225,18 +222,15 @@ pub(super) const NON_DATA_FRAME_ON_A_TUNNEL: &str =
 //# result in disrupting valid connections and requests.
 ///
 /// This is that limit for the frame skip. The count is of *frames*, not the
-/// bytes they carry: a grease frame declaring a zero-length payload is two
-/// bytes on the wire and would be charged nothing by any byte-counting bound,
-/// so counting bytes could never stop a flood of them -- and a flood of them is
-/// the cheapest shape this attack takes. It is per stream and unshared, since
-/// §7.2.8 padding is a legitimate thing to send on one stream and counting it
-/// against a connection-wide total would let one stream's padding refuse
-/// another stream's request. The value is generous on purpose: a real client
-/// greases with a handful of small frames, so several thousand leaves orders of
-/// magnitude of headroom while still bounding the count. The refusal is a
-/// *stream* error, so only the one request is lost -- §10.5's "false positives"
-/// caution is why this is not a connection error and why the limit is nowhere
-/// near what a client could reach.
+/// bytes they carry. A grease frame declaring a zero-length payload is two
+/// bytes on the wire and would be charged nothing by a byte-counting bound, and
+/// a flood of those is the cheapest form of this attack. It is per stream and
+/// unshared, since §7.2.8 padding is legitimate on one stream and a
+/// connection-wide total would let one stream's padding refuse another
+/// stream's request. The value is generous on purpose: a real client greases
+/// with a handful of small frames. The refusal is a *stream* error, so only the
+/// one request is lost. §10.5's "false positives" caution is why this is not a
+/// connection error and why the limit is far above what a client could reach.
 const MAX_SKIPPED_FRAMES: u32 = 4096;
 
 /// Most chunks [`FrameReader`] takes from quinn in one read, on a stream that
@@ -244,10 +238,10 @@ const MAX_SKIPPED_FRAMES: u32 = 4096;
 ///
 /// Every read of a QUIC stream takes the connection's lock, and quinn hands out
 /// one chunk per STREAM frame it received, about 1.4 KB each in a bulk upload.
-/// One chunk per read cost such an upload some 800 lock acquisitions per MiB,
-/// and `tunnel::tcp` wrote each chunk to its target with a `write` of its own.
-/// With up to this many chunks per read, both counts fall by up to this factor:
-/// `tunnel::tcp` gathers what is already decoded into one vectored write.
+/// At one chunk per read that is about 800 lock acquisitions per MiB, and one
+/// `write` to the target per chunk. With up to this many chunks per read, both
+/// counts fall by up to this factor: `tunnel::tcp` gathers what is already
+/// decoded into one vectored write.
 ///
 /// # What it holds
 ///
@@ -257,26 +251,22 @@ const MAX_SKIPPED_FRAMES: u32 = 4096;
 /// stream, and the reader reads again only after every chunk of the previous
 /// read has gone through the decoder. So the payload held is at most what quinn
 /// had buffered for the stream at one read, which quinn's stream receive window
-/// (`crate::quic::STREAM_RECEIVE_WINDOW`) bounds; in an ordinary upload it is
-/// this many chunks of about 1.4 KB, some 45 KB. One `read_chunk` could
-/// already return that much in a single chunk, when quinn had merged a stream's
-/// fragments into one buffer, so the worst case per tunnel is the same bound as
-/// before. What changes is the ordinary case, from one chunk to up to this
-/// many, and the fact that bytes taken from quinn no longer count against its
-/// flow-control windows: quinn grants the peer credit for them while they wait
-/// here.
+/// (`crate::quic::STREAM_RECEIVE_WINDOW`) bounds. In an ordinary upload it is
+/// this many chunks of about 1.4 KB, some 45 KB. A single `read_chunk` can
+/// return that much in one chunk when quinn has merged a stream's fragments,
+/// so the read-ahead does not raise the worst case per tunnel. Bytes taken from
+/// quinn do not count against its flow-control windows: quinn grants the peer
+/// credit for them while they wait here.
 ///
 /// # Why only a tunnel
 ///
 /// A request stream whose CONNECT has not completed, and the peer's control
-/// stream, still read one chunk at a time. A peer that has not authenticated
-/// can send on both, and keeping them as they were means the read-ahead adds
-/// nothing to what such a peer can make this server hold: a request stream
-/// becomes a tunnel only once its request has passed the credentials check
-/// (`crate::conn`) and been answered with a 2xx. [`BufferBudget`] and
-/// `MAX_SKIPPED_FRAMES` apply only to streams that still read one chunk at a
-/// time, since a tunnel buffers no frame and counts no skip, so neither
-/// changes.
+/// stream, read one chunk at a time. A peer that has not authenticated can send
+/// on both, so the read-ahead adds nothing to what such a peer can make this
+/// server hold: a request stream becomes a tunnel only once its request has
+/// passed the credentials check (`crate::conn`) and been answered with a 2xx.
+/// [`BufferBudget`] and `MAX_SKIPPED_FRAMES` apply only to streams that read one
+/// chunk at a time, since a tunnel buffers no frame and counts no skip.
 pub const READ_AHEAD_CHUNKS: usize = 32;
 
 /// What one connection may hold in `FrameDecoder` payload buffers, as a
@@ -307,18 +297,15 @@ impl BufferBudget {
     /// A budget of its own, for a stream that shares one with nothing.
     ///
     /// The counter is shared because a peer chooses how many request streams to
-    /// open; the control stream is one per connection and buffers one frame at a
-    /// time, so the per-frame bound holds it on its own and it has nothing to
-    /// share. Keeping it out of the shared counter is also what stops a peer
-    /// that has filled that counter with request streams from making its own
-    /// well-formed SETTINGS or GOAWAY the frame that is refused: a refusal there
-    /// could not be the stream-class one a charge past the budget hands out,
-    /// since closing the control stream is itself a connection error
-    /// (RFC 9114 §6.2.1, quoted in [`super::connection`]).
+    /// open. The control stream is one per connection and buffers one frame at
+    /// a time, so the per-frame bound holds it on its own. Keeping it out of the
+    /// shared counter also means a peer that has filled that counter with
+    /// request streams cannot get its own well-formed SETTINGS or GOAWAY
+    /// refused. A refusal there could not be the stream-class one a charge past
+    /// the budget produces, since closing the control stream is itself a
+    /// connection error (RFC 9114 §6.2.1, quoted in [`super::connection`]).
     ///
-    /// Not public: the one reader that needs it lives in [`super::connection`],
-    /// and a budget shared with nothing is this layer's own arrangement rather
-    /// than something a caller of the crate has any use for.
+    /// Not public: the one reader that needs it is in [`super::connection`].
     pub(super) fn unshared() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -327,20 +314,20 @@ impl BufferBudget {
     /// it.
     ///
     /// A *stream* error, on the stream whose frame is arriving. That stream is
-    /// not the one at fault -- the bound is a connection's, every stream holding
-    /// a share of it may be within [`MAX_BUFFERED_FRAME`], and the one that
-    /// happens to arrive last has done nothing the others did not. But the
-    /// alternative is to close a connection, and its tunnels, over a request
-    /// that is merely the seventeenth largest one allowed at once, which a
-    /// client breaking no rule can reach. RFC 9114 §4.2.2 says what to do with a
-    /// field section this server is unwilling to handle, and it is about the one
-    /// request: `stream::Resolver` answers this with the same 431 the per-frame
-    /// bound gets, and the connection carries on.
+    /// not singled out for a fault: the bound is a connection's, every stream
+    /// holding a share of it may be within [`MAX_BUFFERED_FRAME`], and the one
+    /// that arrives last has done nothing the others did not. The alternative
+    /// is to close a connection and its tunnels over a request that is merely
+    /// the seventeenth largest one allowed at once, which a client breaking no
+    /// rule can reach. RFC 9114 §4.2.2 says what to do with a field section
+    /// this server is unwilling to handle, and it concerns the one request:
+    /// `stream::Resolver` answers this with the same 431 the per-frame bound
+    /// gets, and the connection carries on.
     ///
     /// RFC 9114 §8.1 defines H3_EXCESSIVE_LOAD for a peer "exhibiting a
-    /// behavior that might be generating excessive load", which is what holding
-    /// a connection's whole buffering allowance in frames it never finishes is
-    /// -- the same reading [`super::qpack`] takes of the same code.
+    /// behavior that might be generating excessive load". Holding a
+    /// connection's whole buffering allowance in frames it never finishes is
+    /// such a behavior. [`super::qpack`] reads the same code the same way.
     ///
     /// `try_update` rather than an add-then-check: a rejected charge must
     /// leave the counter untouched, or two streams failing at once would each
@@ -364,13 +351,12 @@ impl BufferBudget {
 
     /// Gives `bytes` back to the budget.
     ///
-    /// Saturating, and asserted in debug builds: nothing today can return more
-    /// than it took -- `charged` is written only after a charge succeeds and
-    /// zeroed by the `mem::take` that hands it here -- but an underflow would
-    /// wrap the counter to somewhere near `usize::MAX` and leave the connection
-    /// refusing every request from then on, with a reason line reporting a
-    /// figure no machine has the memory for. A saturating subtraction turns that
-    /// into a budget that is merely wrong, which is recoverable and legible.
+    /// Saturating, and asserted in debug builds. Nothing can return more than
+    /// it took: `charged` is written only after a charge succeeds and zeroed by
+    /// the `mem::take` that hands it here. An underflow would wrap the counter
+    /// to near `usize::MAX` and make the connection refuse every request from
+    /// then on. A saturating subtraction limits that to a budget that is wrong,
+    /// which is recoverable.
     fn release(&self, bytes: usize) {
         if bytes > 0 {
             let held = self
@@ -478,23 +464,22 @@ pub enum Frame {
 /// honoured.
 ///
 /// One of the dropped values carries a SHOULD this server knowingly does not
-/// honour, so it is recorded here rather than left to be rediscovered:
+/// honour:
 ///
 //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2.2
 //# An implementation that has received this parameter SHOULD NOT send an
 //# HTTP message header that exceeds the indicated size, as the peer will
 //# likely refuse to process it.
 ///
-/// A peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is parsed -- so that a malformed
-/// or duplicated one is still caught -- and then dropped. Every response this
-/// server sends is a status line and at most two short fields, some 200 bytes
-/// by §4.2.2's own accounting, so honouring the SHOULD would mean carrying the
-/// value through the connection, the request and the response writer to change
-/// nothing: the only peer it could affect is one advertising a limit small
-/// enough to refuse a bare `407`, which has asked for a proxy it cannot use.
-/// Trimming fields to fit would also mean choosing which of a `Proxy-Status`
-/// explanation or a `Proxy-Authenticate` challenge to drop, and neither is
-/// better sent truncated than in full.
+/// A peer's `SETTINGS_MAX_FIELD_SECTION_SIZE` is parsed, so that a malformed or
+/// duplicated one is still caught, and then dropped. Every response this server
+/// sends is a status line and at most two short fields, some 200 bytes by
+/// §4.2.2's own accounting. Honouring the SHOULD would mean carrying the value
+/// through the connection, the request and the response writer, and it would
+/// only affect a peer advertising a limit small enough to refuse a bare `407`.
+/// Such a peer cannot use this proxy anyway. Trimming fields to fit would also
+/// mean dropping either a `Proxy-Status` explanation or a `Proxy-Authenticate`
+/// challenge, and neither is better sent truncated than in full.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Settings {
     /// `SETTINGS_H3_DATAGRAM = 1`.
@@ -523,7 +508,7 @@ pub enum StreamKind {
     ///
     /// Strict where [`Self::Control`] is permissive: the rules that turn on the
     /// frame type alone are applied from the frame header, before the buffered
-    /// length is looked at, so a frame the connection must close on cannot earn
+    /// length is looked at, so a frame the connection must close on cannot get
     /// the stream error an oversized frame gets. Which of the rules applies
     /// depends on whether the decoder has already handed out a SETTINGS frame.
     ServerControl,
@@ -563,18 +548,16 @@ enum State {
 ///
 /// Written the same way as [`crate::capsule::CapsuleDecoder`], and for the same
 /// reason: frames do not align with stream chunks in either direction, so the
-/// decoder has to be a state machine that can be fed a byte at a time -- which
-/// is exactly how the tests below feed it.
+/// decoder has to be a state machine that can be fed a byte at a time. The
+/// tests below feed it that way.
 ///
 /// Public, though nothing outside this module constructs one at run time:
 /// [`FrameReader`] is what the server uses, and `crate::h3api` deliberately
-/// re-exports neither. What needs this is `tests/it_fuzz.rs`, where the
-/// properties about chunk boundaries and about which frame type belongs on which
-/// stream are worth far more when they can be stated against the state machine
-/// itself -- a byte at a time, at chosen split points, on a [`StreamKind`] the
-/// test picks -- than against a loopback QUIC connection whose packetisation is
-/// quinn's to decide. It is documented rather than hidden because this module's
-/// own prose already names it as the design's centre.
+/// re-exports neither. `tests/it_fuzz.rs` needs it, to state the properties
+/// about chunk boundaries and about which frame type belongs on which stream
+/// against the state machine itself: a byte at a time, at chosen split points,
+/// on a [`StreamKind`] the test picks. Over a loopback QUIC connection, quinn
+/// would choose the packetisation.
 #[derive(Debug)]
 pub struct FrameDecoder {
     /// The chunk last pushed, with the consumed prefix removed.
@@ -583,9 +566,9 @@ pub struct FrameDecoder {
     ///
     /// A fixed array rather than a growable buffer, so that constructing a
     /// decoder allocates nothing: one is built per stream, and a peer opening
-    /// streams is not otherwise paying for a heap allocation each time. It
-    /// cannot overflow -- [`Self::take_frame_header`] stops as soon as two
-    /// varints have arrived, and RFC 9000 §16 bounds each at eight bytes.
+    /// streams should not cost a heap allocation each time. It cannot
+    /// overflow: [`Self::take_frame_header`] stops as soon as two varints have
+    /// arrived, and RFC 9000 §16 bounds each at eight bytes.
     header: [u8; MAX_FRAME_HEADER],
     /// How many bytes of [`Self::header`] have arrived.
     header_len: usize,
@@ -593,7 +576,7 @@ pub struct FrameDecoder {
     ///
     /// Taken rather than split when the frame completes, so the allocation
     /// leaves with the frozen payload and this decoder holds nothing between
-    /// frames (audit L1).
+    /// frames.
     payload: BytesMut,
     /// The connection's buffering budget, shared with every other decoder on
     /// it (D77).
@@ -606,7 +589,7 @@ pub struct FrameDecoder {
     /// Bytes charged to that budget for the frame being buffered, if any.
     ///
     /// The full length the frame announced, which is what this decoder has
-    /// committed to holding -- not what has arrived so far. Returned by
+    /// committed to holding, not what has arrived so far. Returned by
     /// [`Self::release`] on the two ways a commitment ends: the frame
     /// completes, or the decoder is dropped with it half-received.
     charged: usize,
@@ -630,11 +613,11 @@ pub struct FrameDecoder {
     /// Counted only in [`StreamKind::Request`], and [`MAX_SKIPPED_FRAMES`] says
     /// why the unit is frames rather than bytes. A tunnel's skips are DATA's
     /// equals under §4.4 and have their own reader. The control stream's are
-    /// deliberately not counted at all: greasing it is what §7.2.8 invites, and
-    /// what bounds the cost there is the [`logfmt::Sampler`] in
-    /// [`super::connection`] on the *log line* each one produces, not any limit
-    /// on the frames. It only grows -- a request stream that becomes a tunnel
-    /// stops adding to it, and there is nothing to reset.
+    /// deliberately not counted: greasing it is what §7.2.8 invites, and the
+    /// cost there is bounded by the [`logfmt::Sampler`] in
+    /// [`super::connection`] on the *log line* each one produces. It only
+    /// grows. A request stream that becomes a tunnel stops adding to it, and
+    /// there is nothing to reset.
     ///
     /// [`logfmt::Sampler`]: crate::logfmt::Sampler
     skipped: u32,
@@ -672,10 +655,9 @@ impl FrameDecoder {
     ///
     /// Called once the 2xx answering a CONNECT has gone out, which is what
     /// "completed" means in that section. From here a HEADERS frame is a
-    /// connection error like every other known type but DATA, and it is refused
-    /// from its header rather than after its payload -- so a peer cannot hold
-    /// the connection's buffering budget with field sections it was never
-    /// allowed to send.
+    /// connection error like every other known type but DATA. It is refused
+    /// from its header rather than after its payload, so a peer cannot hold
+    /// the connection's buffering budget with field sections it may not send.
     pub fn connect_completed(&mut self) {
         self.stream = StreamKind::Tunnel;
     }
@@ -752,18 +734,15 @@ impl FrameDecoder {
                         return Ok(None);
                     }
                     self.state = State::Header;
-                    // `take` rather than `split`: `split` leaves this decoder
-                    // holding a second handle on the allocation the payload
-                    // grew into, so the block survives the frozen half and a
-                    // decoder that outlives its frame keeps it. A tunnel's
-                    // reader and the peer's control stream are exactly that,
-                    // and `release` on the next line says the bytes are no
-                    // longer held, so up to `MAX_BUFFERED_FRAME` per tunnel and
-                    // per connection stayed alive outside the D77 budget and
-                    // the D99 ledger both. Taking the buffer hands the whole
-                    // allocation to the frozen half and leaves an empty one
-                    // here, at the cost of one allocation on a stream that
-                    // buffers a second frame (audit L1).
+                    // `take` rather than `split`: `split` would leave this
+                    // decoder holding a second handle on the allocation the
+                    // payload grew into. A decoder that outlives its frame (a
+                    // tunnel's reader, the peer's control stream) would then
+                    // keep up to `MAX_BUFFERED_FRAME` alive after `release`
+                    // below reports it free, outside both the D77 budget and
+                    // the D99 ledger. Taking the buffer hands the whole
+                    // allocation to the frozen half, at the cost of one
+                    // allocation on a stream that buffers a second frame.
                     let payload = std::mem::take(&mut self.payload).freeze();
                     // Before the parse, which may fail: the frame is no longer
                     // being held either way.
@@ -821,12 +800,10 @@ impl FrameDecoder {
     /// Counts one skipped frame against [`MAX_SKIPPED_FRAMES`], reporting a
     /// stream error once a request stream is past it (RFC 9114 §10.5).
     ///
-    /// Only a request stream is counted, so a tunnel's grease -- DATA's equal
-    /// under §4.4 -- and the control stream's cost nothing here. Called as each
-    /// skip *completes*, which is where a zero-length grease frame is counted
-    /// too: `count_skip` is reached whatever the payload length, so a frame that
-    /// declares no payload still advances the count, which is the whole point of
-    /// counting frames rather than their bytes.
+    /// Only a request stream is counted. A tunnel's grease (DATA's equal under
+    /// §4.4) and the control stream's cost nothing here. Called as each skip
+    /// *completes*, which is reached whatever the payload length, so a frame
+    /// that declares no payload still advances the count.
     ///
     /// The verdict is the plain `Violation::stream(H3_EXCESSIVE_LOAD, ..)`, not
     /// the `Violation::field_section_too_large` the field-section bounds use:
@@ -861,13 +838,12 @@ impl FrameDecoder {
 impl Drop for FrameDecoder {
     /// Returns the budget a half-received frame was holding (D77).
     ///
-    /// The guard that makes the accounting sound: a stream can end at any
-    /// point, and most of the ways it ends are the peer's to choose -- a
-    /// RESET_STREAM, a `STOP_SENDING` answered, the request deadline of D76
-    /// expiring, the connection going away. None of them reaches the decoding
-    /// loop, and a share not returned on any one of them would be a slow leak
-    /// of the connection's own allowance, ending in a peer being refused a
-    /// request it was entitled to.
+    /// This keeps the accounting sound. A stream can end at any point, mostly
+    /// by the peer's choice: a RESET_STREAM, a `STOP_SENDING` answered, the
+    /// request deadline of D76 expiring, the connection going away. None of
+    /// them reaches the decoding loop. A share not returned on any one of them
+    /// would leak the connection's allowance until a peer is refused a request
+    /// it was entitled to.
     fn drop(&mut self) {
         self.release();
     }
@@ -875,11 +851,11 @@ impl Drop for FrameDecoder {
 
 /// A `FrameDecoder` wired to a QUIC receive stream.
 ///
-/// All of the awaiting happens in one place -- the read from quinn,
-/// [`quinn::RecvStream::read_chunk`] or, on a tunnel,
-/// [`quinn::RecvStream::read_chunks`] -- and every byte it produces is
-/// accounted for in the decoder or the read-ahead before this returns, which is
-/// what makes [`Self::next`] cancel-safe. Both reads are cancel-safe themselves
+/// All of the awaiting happens in one place, the read from quinn
+/// ([`quinn::RecvStream::read_chunk`] or, on a tunnel,
+/// [`quinn::RecvStream::read_chunks`]). Every byte it produces is accounted for
+/// in the decoder or the read-ahead before this returns, which makes
+/// [`Self::next`] cancel-safe. Both reads are cancel-safe themselves
 /// and write nothing into `self` until they complete. `tunnel::udp` reads
 /// request streams inside a `select!` with a timeout, so a dropped read future
 /// must never lose a parsed frame header.
@@ -889,8 +865,8 @@ impl Drop for FrameDecoder {
 /// The read-ahead ([`READ_AHEAD_CHUNKS`]) is drained before quinn is read
 /// again, and quinn is the only source of a stream's ending: its FIN, a reset,
 /// or a lost connection. So every byte of every chunk taken before an ending is
-/// decoded and handed out before that ending is reported, which is the order a
-/// reader taking one chunk at a time had. `read_chunks` keeps the stream's
+/// decoded and handed out before that ending is reported, the same order as
+/// reading one chunk at a time. `read_chunks` keeps the stream's
 /// order inside one read: it fills the slots in stream order, each chunk
 /// starting where the one before it ended.
 pub struct FrameReader {
@@ -952,13 +928,9 @@ impl FrameReader {
     /// A reader for a stream on which every frame type this server parses may
     /// appear.
     ///
-    /// The permissive constructor, and the one a *client* wants for a response
-    /// stream: the suite's client (`tests/common/h3client.rs`) is built on this
-    /// module. The server reads the peer's control stream through the
-    /// crate-internal `Self::on_server_control` instead, where the rules that
-    /// turn on the frame type alone are applied from the frame header. A request
-    /// stream is read through `on_request_stream`, where SETTINGS, GOAWAY,
-    /// CANCEL_PUSH, MAX_PUSH_ID and PUSH_PROMISE are refused from the header.
+    /// The permissive constructor ([`StreamKind::Control`]), for the suite's
+    /// client. The server reads its streams through the crate-internal
+    /// `Self::on_server_control` and `Self::on_request_stream` instead.
     ///
     /// `budget` is the connection's, not this stream's: see [`BufferBudget`].
     pub fn new(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
@@ -966,15 +938,7 @@ impl FrameReader {
     }
 
     /// A reader for the peer's control stream, with its type rules applied from
-    /// the frame header.
-    ///
-    /// RFC 9114 §6.2.1's first-frame rule, §7.2.2's HEADERS rule, §7.2.4's
-    /// second-SETTINGS rule and §7.2.5's PUSH_PROMISE rule are all decidable
-    /// from the frame header, and they are decided here before the buffered
-    /// length is looked at: the length check hands out a stream error, and a
-    /// stream error is the wrong answer to a frame the connection must close
-    /// on. Which of them applies depends on whether the decoder has handed out
-    /// a SETTINGS frame, which it records itself.
+    /// the frame header ([`StreamKind::ServerControl`]).
     pub(super) fn on_server_control(recv: quinn::RecvStream, budget: Arc<BufferBudget>) -> Self {
         Self::with_kind(recv, StreamKind::ServerControl, budget)
     }
@@ -1033,14 +997,14 @@ impl FrameReader {
     /// so the decoder above stays authoritative for every byte of the stream.
     ///
     /// The question is about quinn alone. Chunks in the read-ahead have already
-    /// left quinn, so they are not counted: `Ok(false)` can be the answer while
-    /// the read-ahead still holds the last of the body, and with the read-ahead
-    /// holding everything quinn had, the read parks until quinn receives more,
-    /// or a reset.
+    /// left quinn, so they are not counted. `Ok(false)` can be the answer while
+    /// the read-ahead still holds the last of the body. When the read-ahead
+    /// holds everything quinn had, the read waits until quinn receives more, or
+    /// a reset.
     ///
     /// The one way to wait on a request stream without disturbing it, and the
-    /// only one [`super::stream::Reader::reset_by_peer`] is allowed to use --
-    /// its rustdoc has the reason `quinn::RecvStream::received_reset` is not.
+    /// only one [`super::stream::Reader::reset_by_peer`] may use. Its rustdoc
+    /// says why `quinn::RecvStream::received_reset` is not used.
     ///
     /// Cancel-safe, like the call underneath.
     pub(super) async fn readable(&mut self) -> Result<bool, quinn::ReadError> {
@@ -1115,20 +1079,13 @@ impl FrameReader {
 
 /// Decides what to do with a frame that has just been announced on `stream`.
 ///
-/// The order of the verdicts below is load-bearing. A frame type that may not
-/// appear on this stream at all is a connection error whatever length it
-/// declares, so the length check -- which hands out a *stream* error, and whose
-/// answer on a request stream is a 431 -- must not reach it first: a 431 is a
-/// nonsensical reply to a SETTINGS frame, and the connection would carry on
-/// after a MUST-close. The control stream's rules are the same ordering with a
-/// different code: before SETTINGS the first-frame rule is judged from the
-/// header at every length for every buffered type but SETTINGS; after SETTINGS,
-/// HEADERS, PUSH_PROMISE and a second SETTINGS are judged from the header at
-/// every length, and the other buffered types past `MAX_BUFFERED_FRAME`, so a
-/// frame RFC 9114 forbids there is not first answered with the stream error an
-/// oversized frame gets. Under the cap the remaining types are buffered and
-/// parsed first, and `connection::Control::accept` applies the state rules once
-/// the payload is whole.
+/// The order of the verdicts below matters. A frame type that may not appear on
+/// this stream at all is a connection error whatever length it declares. So
+/// the length check, which produces a *stream* error answered on a request
+/// stream with a 431, must not reach it first: a 431 is a wrong reply to a
+/// SETTINGS frame, and the connection would carry on after a MUST-close. The
+/// control stream follows the same ordering with other codes; `misplaced`
+/// states which of its rules are judged from the header.
 fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Result<State, Error> {
     if RESERVED_HTTP2_TYPES.contains(&kind) {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
@@ -1190,15 +1147,9 @@ fn unexpected(detail: &'static str) -> Violation {
 /// returned whole rather than as a reason phrase for the caller to wrap.
 ///
 /// `settings_seen` is whether the decoder has already handed out a SETTINGS
-/// frame and `length` the frame's declared payload length; only
-/// [`StreamKind::ServerControl`] reads either. On that kind, the first-frame
-/// rule is judged from the header at every length for every buffered type but
-/// SETTINGS; after SETTINGS, HEADERS, PUSH_PROMISE and a second SETTINGS are
-/// judged from the header at every length, and the other buffered types only
-/// past `MAX_BUFFERED_FRAME`: under the cap their payload is parsed first and
-/// `connection::Control::accept` applies the state rules, so a payload error
-/// keeps the precedence RFC 9114 does not rank against them -- the ordering
-/// `it_frameseq` models.
+/// frame and `length` the frame's declared payload length. Only
+/// [`StreamKind::ServerControl`] reads either; the comments in its arm state
+/// the ordering, which `it_frameseq` models.
 fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Option<Violation> {
     match stream {
         // Nothing: the permissive kind, built for a client's response stream.
@@ -1213,15 +1164,14 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
             //# H3_MISSING_SETTINGS.
             //
             // The first frame's type is in its header, so this is decided
-            // before the length cap and before any payload is parsed. Without
-            // it, an oversized HEADERS or PUSH_PROMISE sent first would earn
-            // the cap's stream error instead -- a 431 where the connection must
-            // close -- and a malformed first GOAWAY or MAX_PUSH_ID would earn
-            // its payload error where §6.2.1 has already decided the frame.
-            // DATA and unknown types carry no cap and are left to the caller,
-            // which judges them when it sees them; the first SETTINGS is the
-            // frame this stream is waiting for, so it is exempt here and its
-            // payload is parsed.
+            // before the length cap and before any payload is parsed.
+            // Otherwise an oversized HEADERS or PUSH_PROMISE sent first would
+            // get the cap's stream error (a 431 where the connection must
+            // close), and a malformed first GOAWAY or MAX_PUSH_ID would get its
+            // payload error where §6.2.1 has already decided the frame. DATA
+            // and unknown types carry no cap and are left to the caller. The
+            // first SETTINGS is the frame this stream is waiting for, so it is
+            // exempt here and its payload is parsed.
             if !settings_seen && kind != SETTINGS && BufferedKind::from_type(kind).is_some() {
                 return Some(Violation::connection(
                     Code::H3_MISSING_SETTINGS,
@@ -1229,20 +1179,17 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
                 ));
             }
 
-            // Once SETTINGS has opened the stream, HEADERS and PUSH_PROMISE are
-            // refused from the header at every length: their payload is never
-            // parsed on this stream -- the type is the offence -- so there is
-            // no payload verdict to preserve, and charging the budget for a
-            // frame this stream may never carry would let a peer hold it with
-            // frames it is not entitled to send. A second SETTINGS is refused
-            // from the header at every length too: RFC 9114 §7.2.4 makes the
-            // type the offence, whatever its payload holds. The remaining
+            // After SETTINGS, HEADERS and PUSH_PROMISE are refused from the
+            // header at every length. The type is the offence, so there is no
+            // payload verdict to preserve, and charging the budget for them
+            // would let a peer hold it with frames it may not send. A second
+            // SETTINGS is refused from the header at every length too, because
+            // RFC 9114 §7.2.4 makes the type the offence. The remaining
             // buffered types are parsed before `connection::Control::accept`
-            // sees them, so under the cap their payload verdict keeps its
-            // precedence, which RFC 9114 does not rank against the
-            // control-stream rules; past the cap there is no payload to parse
-            // and the header decides, or the cap would answer a MUST-close with
-            // a stream error.
+            // sees them, so under the cap their payload verdict comes first;
+            // RFC 9114 does not rank it against the control-stream rules. Past
+            // the cap there is no payload to parse and the header decides,
+            // or the cap would answer a MUST-close with a stream error.
             let type_decided =
                 matches!(kind, HEADERS | PUSH_PROMISE) || (settings_seen && kind == SETTINGS);
             if length <= MAX_BUFFERED_FRAME && !type_decided {
@@ -1311,10 +1258,10 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
             )),
 
             // GOAWAY is the one of the five whose "not on this stream" rule
-            // RFC 9114 §7.2.6 states for a client only -- "A client MUST treat a
+            // RFC 9114 §7.2.6 states for a client only: "A client MUST treat a
             // GOAWAY frame on a stream other than the control stream as a
-            // connection error of type H3_FRAME_UNEXPECTED" -- and this endpoint
-            // is not a client. What reaches it here is §4.1's rule about the
+            // connection error of type H3_FRAME_UNEXPECTED". This endpoint is
+            // not a client. The rule that applies here is §4.1's about the
             // sequence a request stream may carry, since a GOAWAY is no part of
             // any request message, and it names the same code:
             //
@@ -1337,13 +1284,12 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
         //# of type H3_FRAME_UNEXPECTED.
         //
         // "Any other known frame type": DATA carries the tunnel, and a type this
-        // server does not know is skipped under §9 rather than judged -- which is
-        // where the sentence's allowance for an extension frame lands, since an
-        // extension this server does not implement is one it cannot be reading.
-        // Everything in between is refused, a trailer section's HEADERS included:
-        // there is no representation on a tunnel for a trailer to describe, and
-        // RFC 9220 §3 extends CONNECT to other protocols by pointing at this
-        // same section rather than by reopening it.
+        // server does not know is skipped under §9 rather than judged. That
+        // covers the sentence's allowance for an extension frame, since this
+        // server implements no such extension. Every other known type is
+        // refused, a trailer section's HEADERS included: there is no
+        // representation on a tunnel for a trailer to describe, and RFC 9220 §3
+        // extends CONNECT to other protocols by pointing at this same section.
         StreamKind::Tunnel => match kind {
             DATA => None,
             _ if BufferedKind::from_type(kind).is_some() => {
@@ -1359,8 +1305,7 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
 ///
 /// One function for the DATA arm and the Skipping arm of [`FrameDecoder::next_item`],
 /// which compute the same thing: DATA hands the bytes out and Skipping throws
-/// them away, and neither may run past the frame it is in. Written here so the
-/// conversion and the argument for it are in one place rather than two.
+/// them away, and neither may run past the frame it is in.
 ///
 /// Both directions of the conversion are exact: the minimum is at most the
 /// chunk's own length, so it is a `usize` value, and it goes back to `u64` as
@@ -1407,12 +1352,11 @@ fn single_varint(kind: u64, payload: &[u8]) -> Result<u64, Violation> {
 fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
     let mut settings = Settings::default();
 
-    // A set rather than a list: the payload is bounded by `MAX_BUFFERED_FRAME`,
-    // not by anything the peer has earned, and 64 KiB holds some sixteen
-    // thousand distinct identifiers -- a quadratic scan over which is work an
-    // unauthenticated peer can ask for on its control stream. (A SETTINGS frame
-    // on a request stream is refused in `begin` from its header and never
-    // reaches this parser.)
+    // A set rather than a list: the payload is bounded only by
+    // `MAX_BUFFERED_FRAME`, and 64 KiB holds some sixteen thousand distinct
+    // identifiers. A quadratic scan over them is work an unauthenticated peer
+    // could ask for on its control stream. A SETTINGS frame on a request stream
+    // is refused in `begin` from its header and never reaches this parser.
     let mut seen = HashSet::new();
 
     while !payload.is_empty() {
@@ -1447,19 +1391,18 @@ fn parse_settings(mut payload: &[u8]) -> Result<Settings, Violation> {
             SETTING_H3_DATAGRAM => settings.datagrams = boolean(identifier, value)?,
 
             // RFC 9220 §3 gives this setting the semantics it has in HTTP/2,
-            // where RFC 8441 §3 constrains the value -- "The value of the
-            // parameter MUST be 0 or 1" -- but says of the direction this
+            // where RFC 8441 §3 constrains the value ("The value of the
+            // parameter MUST be 0 or 1") but says of the direction this
             // server receives it in:
             //
             //= https://www.rfc-editor.org/rfc/rfc8441#section-3
             //# Receipt of this parameter by a server does not have any impact.
             //
-            // So a client sending it at all is already sending something with
-            // no meaning here, and a value outside {0, 1} is that same nothing
-            // spelled wrong. Nothing in RFC 9114 §7.2.4 makes a malformed
-            // *value* of an otherwise ignored setting a connection error, and
-            // closing on one would drop tunnels over a field this server does
-            // not read. It is logged and ignored.
+            // So the setting has no meaning here, whatever its value. Nothing
+            // in RFC 9114 §7.2.4 makes a malformed *value* of an otherwise
+            // ignored setting a connection error, and closing on one would drop
+            // tunnels over a field this server does not read. It is logged and
+            // ignored.
             SETTING_ENABLE_CONNECT_PROTOCOL if value > 1 => tracing::debug!(
                 value,
                 "ignoring SETTINGS_ENABLE_CONNECT_PROTOCOL with a value other \
@@ -1562,16 +1505,14 @@ pub fn seal_data(mut block: BytesMut) -> Bytes {
 
 /// The SETTINGS frame this server sends, payload only.
 ///
-/// The two that Surge validates and disconnects without --
-/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` and `SETTINGS_H3_DATAGRAM` -- are the
-/// reason this server exists at all. The two QPACK settings are sent as zeroes
-/// on purpose: they are what makes a static-table-only decoder correct rather
-/// than merely adequate (see [`super::qpack`]), and they bind the peer's
-/// encoder: RFC 9204 §3.2.3 for the dynamic table capacity, §2.1.2 for the
-/// number of streams it may let block.
+/// Surge validates `SETTINGS_ENABLE_CONNECT_PROTOCOL` and `SETTINGS_H3_DATAGRAM`
+/// and disconnects without them. The two QPACK settings are sent as zeroes on
+/// purpose: they make a static-table-only decoder correct (see
+/// [`super::qpack`]), because they bind the peer's encoder: RFC 9204 §3.2.3 for
+/// the dynamic table capacity, §2.1.2 for the number of streams it may let
+/// block.
 ///
-/// Not public: [`super::connection`] is the one caller there will ever be, since
-/// what a server sends in its SETTINGS is this layer's own business.
+/// Not public: [`super::connection`] is the one caller.
 pub(super) fn settings_payload() -> BytesMut {
     /// One reserved identifier of the form 0x1f * N + 0x21, which RFC 9114
     /// §7.2.4.1 says endpoints SHOULD send so that peers keep exercising the

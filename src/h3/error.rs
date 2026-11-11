@@ -109,9 +109,9 @@ impl fmt::Debug for Code {
 ///
 /// Carries both halves of the answer the RFC prescribes: the error code to send,
 /// and whether the rule makes it a *connection* error rather than a stream one.
-/// Keeping the second half here rather than at the handling site is what stops
-/// the two from drifting apart — the same violation reported from a request
-/// stream and from the control stream must end the same thing either way.
+/// The class is kept here rather than at the handling site so the two cannot
+/// disagree. The same violation reported from a request stream and from the
+/// control stream must end the same thing either way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
     code: Code,
@@ -155,17 +155,16 @@ impl Violation {
     /// The 431 (Request Header Fields Too Large) that
     /// [`crate::h3::stream::Resolver::resolve`] sends is a *diagnosis*, not a
     /// consequence of the code: it tells a peer which part of its request to
-    /// shrink (RFC 9114 §10.5.1). That is worth saying only when the fault
-    /// really is a field section too large to hold -- the three sources being
-    /// the per-frame buffering limit, the advertised
-    /// `SETTINGS_MAX_FIELD_SECTION_SIZE`, and D77's connection-wide budget.
+    /// shrink (RFC 9114 §10.5.1). It is sent only when the fault is a field
+    /// section too large to hold. There are three sources: the per-frame
+    /// buffering limit, the advertised `SETTINGS_MAX_FIELD_SECTION_SIZE`, and
+    /// D77's connection-wide budget.
     ///
-    /// It is stated here rather than inferred at the answering site because
-    /// `H3_EXCESSIVE_LOAD` is a code, not a class: RFC 9114 §10.5's
-    /// reserved-frame flood carries the same code and no header field was ever
-    /// sent, so a peer told to shrink its field sections would be told to fix
-    /// something it never did. Marking the three that mean it keeps a fourth
-    /// source, added later, on the bare reset that is safe for anything.
+    /// It is marked here rather than inferred at the answering site because
+    /// `H3_EXCESSIVE_LOAD` is a code, not a class. RFC 9114 §10.5's
+    /// reserved-frame flood carries the same code with no header field sent, so
+    /// a 431 there would tell the peer to fix something it never did. A new
+    /// source of this code gets the bare reset unless it is marked here.
     pub fn field_section_too_large(detail: impl Into<Cow<'static, str>>) -> Self {
         Self {
             code: Code::H3_EXCESSIVE_LOAD,
@@ -204,9 +203,8 @@ impl Violation {
     /// A field-section violation escalated here becomes a plain connection
     /// error, so [`Self::is_field_section_too_large`] is false for the result.
     ///
-    /// Not public: escalating someone else's verdict is a judgement only the
-    /// reader of a critical stream is entitled to make, and all of those are in
-    /// [`super::connection`].
+    /// Not public: only the reader of a critical stream escalates, and all of
+    /// those are in [`super::connection`].
     pub(super) fn into_fatal(self) -> Self {
         Self {
             class: Class::Connection,
@@ -255,26 +253,24 @@ impl From<quinn::ConnectionError> for ConnectionError {
     ///
     /// # The reason phrase
     ///
-    /// Both kinds of QUIC close carry a reason phrase (RFC 9000 §19.19), and it
-    /// is whatever bytes the peer felt like sending -- bounded only by the
-    /// packet that carried it, and reaching this endpoint from anybody who can
-    /// complete a handshake, authenticated or not. It ends up in a production
-    /// log line: [`crate::quic`] records the whole error with `%` on the `WARN`
-    /// that closes a connection that ended badly, and `Display` escapes nothing.
-    /// A newline in there is a journal entry of the peer's own composition,
-    /// attributed to this server, and a kilobyte of prose is a kilobyte of
-    /// journal per handshake.
+    /// Both kinds of QUIC close carry a reason phrase (RFC 9000 §19.19). It is
+    /// any bytes the peer chooses, bounded only by the packet that carried it,
+    /// from anybody who can complete a handshake, authenticated or not. It ends
+    /// up in a production log line: [`crate::quic`] records the whole error
+    /// with `%` on the `WARN` for a connection that ended badly, and `Display`
+    /// escapes nothing. A newline in it would forge a journal entry attributed
+    /// to this server, and a kilobyte of text would be a kilobyte of journal per
+    /// handshake.
     ///
-    /// The application half never had the problem: only the code survives the
-    /// conversion, because [`crate::h3api::benign_close`] grades on the code and
-    /// nothing downstream wanted the text. The transport half keeps quinn's
-    /// error whole, which is worth keeping -- a peer's QUIC stack says useful
-    /// things there -- so the phrase is bounded and escaped in place instead,
-    /// where the peer's bytes enter this type rather than where they are logged
-    /// (the same point [`crate::auth`] cuts a claimed user-id at, and for the
-    /// same reason). [`crate::logfmt::peer_error`] is that cut, and it is the
-    /// same call [`crate::quic`] makes on the handshake that never got far
-    /// enough to reach this conversion at all.
+    /// For an application close only the code survives the conversion, because
+    /// [`crate::h3api::benign_close`] grades on the code and nothing downstream
+    /// reads the text. The transport case keeps quinn's error whole, because a
+    /// peer's QUIC stack reports useful detail there. Its phrase is bounded and
+    /// escaped here, where the peer's bytes enter this type, rather than where
+    /// they are logged. [`crate::auth`] cuts a claimed user-id at the same point
+    /// for the same reason. [`crate::logfmt::peer_error`] is that cut, and
+    /// [`crate::quic`] makes the same call on a handshake that fails before
+    /// this conversion.
     fn from(error: quinn::ConnectionError) -> Self {
         match error {
             quinn::ConnectionError::ApplicationClosed(close) => Self::ApplicationClose {
@@ -339,9 +335,8 @@ impl From<Violation> for StreamError {
 
 /// A quinn failure that is a fault in this stack rather than in the peer.
 ///
-/// The three conversions below all end here, so the code and the shape of the
-/// detail are written once. Which variants reach it, and why none of them is
-/// the peer doing anything:
+/// The three conversions below all end here. The variants that reach it, and
+/// why none of them is caused by the peer:
 ///
 /// * `ClosedStream`, on both `ReadError` and `WriteError`, is this endpoint
 ///   having already finished with the stream.

@@ -5,22 +5,19 @@
 //! A connection is three things:
 //!
 //! * the three unidirectional streams this endpoint opens and then holds open
-//!   for its lifetime -- control, QPACK encoder, QPACK decoder;
+//!   for its lifetime: control, QPACK encoder, QPACK decoder;
 //! * a background task that serves everything the peer sends outside its
 //!   request streams: its unidirectional streams, its control stream, and its
 //!   HTTP Datagrams;
 //! * [`Connection::accept`], which hands request streams to the caller.
 //!
-//! The background task is what makes the peer's SETTINGS usable the moment they
-//! arrive, and it is worth a paragraph because the alternative cost a release.
-//! `h3` reads the control stream only while its accept future is being polled,
-//! so a caller had to *sample* the answer -- and a CONNECT-UDP session started
-//! from the same breath as the handshake read a stale "datagrams not allowed"
-//! and stayed on the RFC 9297 capsule fallback, on a connection that opens one
-//! tunnel and keeps it, for good. Here the control stream has a reader of its
-//! own and the flag it writes is the very one the sessions hold
-//! ([`Connection::peer_datagrams`]), so there is no moment at which the peer's
-//! answer is known and not yet acted on, and nothing to poll.
+//! The background task makes the peer's SETTINGS usable when they arrive. The
+//! control stream has a reader of its own, and the flag it writes is the one
+//! the sessions hold ([`Connection::peer_datagrams`]). So there is no moment at
+//! which the peer's answer is known and not yet acted on. If the control stream
+//! were read only while an accept is polled, a CONNECT-UDP session started
+//! right after the handshake could read a stale "datagrams not allowed" and
+//! stay on the RFC 9297 capsule fallback for its whole life.
 //!
 //! # HTTP Datagrams
 //!
@@ -29,9 +26,9 @@
 //! Quarter Stream ID, which is a request stream's id divided by four. A session
 //! claims one by asking its stream for a [`DatagramReceiver`]
 //! ([`Stream::datagrams`](super::stream::Stream::datagrams)) and holds the
-//! claim for exactly as long as it holds the receiver, so a stream that ends --
-//! through any of the half-dozen paths a tunnel can end through -- takes its
-//! routing entry with it and nothing has to remember to deregister it (D79).
+//! claim for exactly as long as it holds the receiver. So a stream that ends,
+//! on any path, removes its routing entry, and no code has to deregister it
+//! (D79).
 //!
 //! Only the receiving half is here. A datagram goes *out* on the
 //! [`quinn::Connection`] itself, which the UDP sessions hold anyway for the
@@ -41,12 +38,12 @@
 //! # How a connection error is signalled
 //!
 //! RFC 9114 §8 defines an HTTP/3 connection error as a QUIC CONNECTION_CLOSE
-//! carrying the HTTP/3 error code, which is precisely
-//! [`quinn::Connection::close`]. So that call *is* the mechanism: there is no
-//! error to propagate between tasks, because closing the connection makes every
-//! operation on it fail on its own. The only thing that has to travel is the
-//! *reason*, which quinn overwrites with "closed locally" -- so it is recorded
-//! on the way past and read back by [`Connection::accept`].
+//! carrying the HTTP/3 error code, which is what [`quinn::Connection::close`]
+//! sends. So there is no error to propagate between tasks, because closing the
+//! connection makes every operation on it fail on its own. Only the *reason*
+//! has to be passed on, because quinn replaces it with "closed locally". It is
+//! recorded when the connection is closed and read back by
+//! [`Connection::accept`].
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -95,12 +92,10 @@ pub(crate) struct Shared {
     peer_datagrams: Arc<AtomicBool>,
     /// What this connection may hold in half-received frames at once (D77).
     ///
-    /// Its own `Arc` for the same reason `peer_datagrams` has one: it is held
-    /// by things that outlive no single scope. Every request stream's
-    /// [`FrameReader`] draws on this one, which is what makes the bound a
-    /// property of the connection rather than of each stream separately. The
-    /// peer's control stream is the one reader that does not: see
-    /// [`BufferBudget::unshared`].
+    /// Its own `Arc` because every request stream's [`FrameReader`] holds it,
+    /// which makes the bound a property of the connection rather than of each
+    /// stream separately. The peer's control stream is the one reader that
+    /// does not: see [`BufferBudget::unshared`].
     buffered: Arc<BufferBudget>,
     /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
     ///
@@ -108,7 +103,7 @@ pub(crate) struct Shared {
     /// session's claim on one Quarter Stream ID, put there by
     /// [`Self::register_datagrams`] and taken out again when the
     /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
-    /// never asks -- every TCP tunnel -- never appears here at all.
+    /// never asks, such as every TCP tunnel, never appears here.
     sessions: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
@@ -122,31 +117,27 @@ pub(crate) struct Shared {
     /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
     /// a session whose inbound queue was full.
     ///
-    /// The drops themselves are the silence RFC 9298 §5 and RFC 9297 §2.1 ask
-    /// for, so this counter is the only production-visible trace they leave —
-    /// it is read once, by the closing line in [`crate::quic`], which is
-    /// written after this struct is gone. Hence the `Arc`: injected by
-    /// [`Connection::handshake`]'s caller so the count outlives the
-    /// connection, for the same reason that line's `tunnels` counter is
-    /// created outside it.
+    /// RFC 9298 §5 and RFC 9297 §2.1 ask for silent drops, so this counter is
+    /// the only trace they leave in production. It is read once, by the
+    /// closing line in [`crate::quic`], which is written after this struct is
+    /// gone. So the `Arc` is passed in by [`Connection::handshake`]'s caller,
+    /// as that line's `tunnels` counter is.
     dropped_datagrams: Arc<AtomicU64>,
     /// How often each way of dropping has been reported, on a doubling
     /// schedule.
     ///
     /// Drops arrive at whatever rate the peer sends, so a line per drop would
-    /// be log amplification under a debug subscriber and a formatting cost on
-    /// the routing task either way. [`crate::logfmt::Sampler`] is the whole of
-    /// this crate's answer to that question, so these use it rather than a
-    /// flag of their own: the first drop of each shape names it as immediately
-    /// as it ever did, and the reports that follow say how far the count has
-    /// got without one line per packet. Four samplers rather than one because
-    /// the shapes have different diagnoses — an extension this server does not
-    /// speak, a session racing its own close (or a misdirected flood), a
-    /// target not draining, and a datagram cut short of its Context ID — and
-    /// each should be able to double at its own rate.
+    /// amplify the log under a debug subscriber and cost formatting on the
+    /// routing task either way. [`crate::logfmt::Sampler`] is this crate's one
+    /// mechanism for that. The first drop of each shape is reported at once,
+    /// and later reports give the running count. There are four samplers
+    /// because the shapes have different diagnoses, and each doubles at its
+    /// own rate: an extension this server does not speak, a session racing its
+    /// own close (or a misdirected flood), a target not draining, and a
+    /// datagram cut short of its Context ID.
     ///
     /// The closing line's `dropped_datagrams` is still the total across all
-    /// four; these bound the running commentary, not the count.
+    /// four. These bound the debug lines, not the count.
     unknown_context_drops: crate::logfmt::Sampler,
     unroutable_drops: crate::logfmt::Sampler,
     queue_full_drops: crate::logfmt::Sampler,
@@ -156,9 +147,9 @@ pub(crate) struct Shared {
 /// Which way an inbound HTTP Datagram was dropped, and so which of [`Shared`]'s
 /// four samplers keeps its schedule.
 ///
-/// Naming the shape rather than handing [`Shared::count_drop`] one of its own
-/// fields keeps the choice of sampler in one place, and lets the compiler say
-/// so when a fifth shape appears.
+/// Naming the shape rather than passing [`Shared::count_drop`] one of its own
+/// fields keeps the choice of sampler in one place. A fifth shape then fails to
+/// compile until it has a sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropKind {
     /// A Context ID this server has no extension for (RFC 9298 §5).
@@ -176,10 +167,10 @@ impl Shared {
     /// reason, and reports the one that was kept.
     ///
     /// The return value is what the CONNECTION_CLOSE must carry. Two tasks can
-    /// find a violation at the same moment -- the control stream reader and a
-    /// request stream, say -- and only one of them wins the `OnceLock`; closing
-    /// with the loser's code would then contradict the reason
-    /// [`Connection::accept`] goes on to report.
+    /// find a violation at the same moment, for example the control stream
+    /// reader and a request stream, and only one of them sets the `OnceLock`.
+    /// Closing with the other one's code would contradict the reason
+    /// [`Connection::accept`] reports.
     fn record(&self, violation: Violation) -> Violation {
         self.local_error.get_or_init(|| violation).clone()
     }
@@ -239,8 +230,8 @@ impl Shared {
         }
 
         // One map operation under the lock, `try_send` included: it never
-        // waits, and sending inside the guard spares the routing task a sender
-        // clone -- two refcount bumps -- on every datagram it routes.
+        // waits, and sending inside the guard saves a sender clone (two
+        // refcount bumps) on every datagram routed.
         let delivered = self
             .lock()
             .get(&decoded.quarter_stream_id)
@@ -272,12 +263,10 @@ impl Shared {
     /// Counts one dropped datagram, and lets its shape say so on the doubling
     /// schedule.
     ///
-    /// The count is for the closing line in [`crate::quic`]; the reports are
-    /// for whoever is reading a debug log while it happens, and each carries
-    /// the running total of its own shape so a report says how far this has
-    /// got rather than only that it started. Everything is `Relaxed` because
-    /// nothing is published through either atomic: each is a single
-    /// read-modify-write ordered against nothing else.
+    /// The count is for the closing line in [`crate::quic`]. The reports are
+    /// for a debug log, and each carries the running total of its own shape.
+    /// Everything is `Relaxed` because nothing is published through either
+    /// atomic: each is a single read-modify-write ordered against nothing else.
     fn count_drop(&self, kind: DropKind, report: impl FnOnce(u64)) {
         let sampler = match kind {
             DropKind::UnknownContext => &self.unknown_context_drops,
@@ -304,66 +293,64 @@ impl Shared {
 /// Inbound datagrams buffered per session before packets start being dropped.
 ///
 /// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
-/// slow target turn into unbounded memory growth. The same queue serves both
-/// phases of a session — the one before the target socket exists, where it holds
-/// what RFC 9298 §5 calls optimistically sent packets, and the running one — so
-/// this constant is the whole per-session bound rather than one of two.
+/// slow target cause unbounded memory growth. The same queue serves both phases
+/// of a session: before the target socket exists, where it holds what RFC 9298
+/// §5 calls optimistically sent packets, and while it runs. So this constant is
+/// the whole per-session bound.
 ///
 /// # What this costs at the configured limits
 ///
 /// A session holds three buffers, and this constant sizes only the first of
 /// them.
 ///
-/// The queue is `depth x payload`. Only the payload needs care: a QUIC DATAGRAM
-/// frame cannot be fragmented, so a datagram never exceeds the
-/// `max_udp_payload_size` this server advertises (quinn's default, 1472 bytes)
-/// even though RFC 9298 §5 permits a 65527-byte UDP payload in principle. At
-/// `INBOUND_QUEUE_DEPTH` = 64 that is ~92 KiB.
+/// The queue is `depth x payload`. A QUIC DATAGRAM frame cannot be fragmented,
+/// so a datagram never exceeds the `max_udp_payload_size` this server
+/// advertises (quinn's default, 1472 bytes), although RFC 9298 §5 permits a
+/// 65527-byte UDP payload. At `INBOUND_QUEUE_DEPTH` = 64 that is about 92 KiB.
 ///
 /// The second is the block a running session receives its *target's* packets
-/// into ([`crate::tunnel`]'s UDP path), 16 KiB per session. Unlike the queue it
-/// is allocated only once the target first sends, so a session refused before
-/// its socket is bound, or whose target never answers, never allocates one. A
-/// packet longer than the block's 2 KiB window continues into a buffer each
-/// runtime thread has once, which is what lets the block be this small: a
-/// packet that has arrived must fit somewhere before its length is known.
+/// into ([`crate::tunnel`]'s UDP path), 16 KiB per session. It is allocated
+/// only once the target first sends, so a session refused before its socket is
+/// bound, or whose target never answers, never allocates one. A packet longer
+/// than the block's 2 KiB window continues into a buffer each runtime thread has
+/// once. That is why the block can be this small: a packet that has arrived
+/// must fit somewhere before its length is known.
 ///
 /// The third is the [`crate::capsule::CapsuleDecoder`] on the request stream,
-/// which buffers a DATAGRAM capsule's value until all of it has arrived —
+/// which buffers a DATAGRAM capsule's value until all of it has arrived.
 /// [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`] bounds it, and a peer that
 /// declares that much and stops one byte short holds it for the session's idle
-/// timeout. Measured at ~78 KiB, since the `BytesMut` behind it doubles its way
-/// to 64 KiB rather than landing on it
+/// timeout. It measures about 78 KiB, because the `BytesMut` behind it grows by
+/// doubling past 64 KiB
 /// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`).
 ///
-/// A session therefore costs ~188 KiB, and the worst case is that times
+/// A session therefore costs about 188 KiB, and the worst case is that times
 /// `max_targets_per_conn` times `max_connections`. With the shipped defaults
-/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is ~47 MiB per
-/// connection and ~11.8 GiB across a server saturated at both limits — an
-/// operator lowering either limit lowers it proportionally.
+/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is about 47 MiB
+/// per connection and 11.8 GiB across a server saturated at both limits.
+/// Lowering either limit lowers it proportionally.
 ///
-/// All three are released by dropping what owns them rather than by any explicit
-/// call, on whichever of the half-dozen paths a session ends by;
+/// All three are released by dropping what owns them, on every path a session
+/// ends by.
 /// `tests/it_bounds.rs::a_connection_keeps_nothing_for_the_sessions_it_has_closed`
-/// is where that composition is weighed rather than reasoned about.
+/// measures that.
 ///
-/// Registering a session before its target socket exists does **not** raise that
-/// ceiling: the queue is the same size in both phases, sessions are still capped
-/// by the per-connection tunnel quota, and a full queue is already reachable on a
-/// running session whenever a client sends faster than the proxy forwards. What
-/// it changes is how long a full queue can sit undrained — no longer than name
-/// resolution takes, after which the session either starts draining or is refused
-/// and the queue is discarded with it.
+/// Registering a session before its target socket exists does **not** raise
+/// that ceiling. The queue is the same size in both phases, sessions are still
+/// capped by the per-connection tunnel quota, and a full queue is already
+/// reachable on a running session whenever a client sends faster than the proxy
+/// forwards. It only changes how long a full queue can stay undrained: no longer
+/// than name resolution takes. After that the session either starts draining or
+/// is refused and the queue is discarded with it.
 pub const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// One session's inbound HTTP Datagrams, and its claim on a Quarter Stream ID.
 ///
 /// Obtained from [`Stream::datagrams`](super::stream::Stream::datagrams) and
 /// held for the life of the session. Dropping it takes the Quarter Stream ID
-/// out of the connection's routing table, which is what keeps the table from
-/// leaking entries: a session can end through any of half a dozen paths --
-/// refused before it started, idle, reset, its socket broken -- and every one of
-/// them drops this.
+/// out of the connection's routing table, so the table does not leak entries.
+/// A session can end on several paths (refused before it started, idle, reset,
+/// its socket broken), and every one of them drops this.
 ///
 /// Datagrams that arrive after the drop are dropped like any other unknown id,
 /// which is exactly what RFC 9297 §2.1 permits for a stream that no longer
@@ -378,13 +365,13 @@ impl DatagramReceiver {
     /// Waits for the next payload routed to this session.
     ///
     /// `None` means the connection's router will send nothing further, which on
-    /// a live connection cannot happen: the sending half lives in the routing
-    /// table under this receiver's own entry, and that entry outlives the
-    /// receiver by nothing at all.
+    /// a live connection cannot happen: the sending half is in the routing
+    /// table under this receiver's own entry, and that entry is removed only
+    /// when the receiver is dropped.
     ///
     /// Cancel-safe ([`tokio::sync::mpsc::Receiver::recv`] is), so a session may
-    /// poll it inside a `select!` with a timeout -- which is what a UDP session
-    /// does with all three of its sources.
+    /// poll it inside a `select!` with a timeout. A UDP session does that with
+    /// all three of its sources.
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.inbound.recv().await
     }
@@ -415,11 +402,13 @@ pub(crate) struct Handle {
     pub(crate) quic: quinn::Connection,
     /// The connection's idle timeout, as [`Connection::handshake`] was given it.
     ///
-    /// Carried because it is the only clock this layer has for the waits that
-    /// nothing else bounds: `crate::quic` owns the transport parameter and
-    /// quinn's own idle timer is no help while the peer keeps a keep-alive
-    /// answered. [`serve_stream`] and every bounded response write
-    /// ([`super::stream::Stream::respond_within`]) are those waits.
+    /// The bound for every wait on the peer that no protocol rule ends: the
+    /// handshake, [`serve_stream`], a request's headers and every bounded
+    /// response write ([`super::stream::Stream::respond_within`]). quinn's own
+    /// idle timer does not end those waits, because [`crate::quic`] enables a
+    /// keep-alive whose PINGs the peer's stack answers without any application
+    /// involved. A peer that cannot finish within the time it may stay silent
+    /// will not finish.
     pub(super) idle: Duration,
     shared: Arc<Shared>,
 }
@@ -526,10 +515,10 @@ impl Handle {
     ///
     /// Routed through [`Self::fail`] rather than merely returned, because a
     /// connection error in this layer *is* the CONNECTION_CLOSE that carries the
-    /// code (RFC 9114 §8). Returning the violation on its own left the peer
-    /// seeing whatever came next -- in practice the H3_NO_ERROR that
-    /// [`Connection`]'s `Drop` sends -- which is this endpoint saying nothing
-    /// was wrong about the one thing the RFC names a MUST here.
+    /// code (RFC 9114 §8). If the violation were only returned, the peer would
+    /// see whatever close came next, in practice the H3_NO_ERROR that
+    /// [`Connection`]'s `Drop` sends. That would report no error for a fault
+    /// the RFC makes a MUST.
     fn critical_write(&self, error: quinn::WriteError) -> ConnectionError {
         match error {
             quinn::WriteError::ConnectionLost(error) => error.into(),
@@ -558,7 +547,7 @@ impl Handle {
     ///
     /// Every await here is on the peer: `open_uni` waits for the stream credit
     /// its transport parameters grant, and the writes wait for flow control. A
-    /// peer that grants neither parks this forever, which is why
+    /// peer that grants neither blocks this forever, which is why
     /// [`Connection::handshake`] runs it under a deadline.
     async fn open_critical_streams(&self) -> Result<[quinn::SendStream; 3], ConnectionError> {
         // The control stream goes out first, so that a peer reading streams in
@@ -613,31 +602,23 @@ impl Connection {
     ///
     /// The two QPACK streams are opened even though RFC 9204 §4.2 permits
     /// omitting them ("An endpoint MAY avoid creating an encoder stream if it
-    /// will not be used"). Nothing is ever written to them; they exist because
-    /// every deployed stack opens them, and interoperating with one particular
-    /// client is this server's whole purpose.
+    /// will not be used"). Nothing is ever written to them. They are opened
+    /// because every deployed stack opens them, and this server exists to
+    /// interoperate with one particular client.
     ///
     /// # The deadline
     ///
-    /// `within` bounds all of that, and it has to: opening three unidirectional
-    /// streams is the peer's decision, not this endpoint's. Transport
-    /// parameters that allow fewer than three of them -- or no data on them --
-    /// park the handshake with no way out, and the QUIC idle timeout is no
-    /// backstop, because [`crate::quic`] enables a keep-alive whose PINGs the
-    /// peer's stack answers without any application ever being involved. Each
-    /// such connection would hold a `max_connections` slot for as long as the
-    /// peer cares to keep the socket open.
-    ///
-    /// One idle timeout is the bound the caller passes, and it is generous by
-    /// construction: a peer that cannot complete a three-stream handshake in
-    /// the time it is allowed to say nothing at all is not going to complete
-    /// it.
+    /// `within` bounds all of that, because the peer decides whether three
+    /// unidirectional streams can be opened. Transport parameters that allow
+    /// fewer than three of them, or no data on them, would otherwise hold a
+    /// `max_connections` slot for as long as the peer keeps the socket open.
+    /// The caller passes one idle timeout; `Handle::idle` says why the QUIC
+    /// idle timeout alone does not end the wait.
     ///
     /// `dropped_datagrams` is where this connection counts every inbound HTTP
-    /// Datagram it drops rather than delivers. The caller supplies it, keeping
-    /// a clone of its own, because the count is read for the connection's
-    /// closing log line -- which is written after everything constructed here
-    /// is gone.
+    /// Datagram it drops rather than delivers. The caller supplies it and keeps
+    /// a clone, because the count is read for the connection's closing log
+    /// line, which is written after everything constructed here is gone.
     pub async fn handshake(
         quic: quinn::Connection,
         within: Duration,
@@ -657,9 +638,9 @@ impl Connection {
         // Our own rule, not the RFC's: nothing in RFC 9114 says what to do
         // about a peer that will not let these streams be created, because
         // nothing in it obliges a peer to allow them. H3_STREAM_CREATION_ERROR
-        // is the closest registered code -- §8.1 gives it for a stream that
-        // could not be created, which is exactly what happened -- and it tells
-        // the peer which half of the handshake it failed.
+        // is the closest registered code, since §8.1 gives it for a stream that
+        // could not be created. It tells the peer which half of the handshake
+        // it failed.
         let [control, encoder, decoder] = match opened {
             Ok(streams) => streams?,
             Err(_) => {
@@ -701,12 +682,11 @@ impl Connection {
     /// queued, so a caller may poll this inside a `select!`.
     ///
     /// `Ok(None)` would mean "the peer will send no further requests", and this
-    /// server never reports it. The only thing that could say so is a GOAWAY
-    /// from the client, which promises nothing about the requests already in
-    /// flight -- while the caller reads `Ok(None)` as permission to drop the
-    /// connection, and dropping it would cut those requests off mid-tunnel. A
-    /// connection therefore ends when the peer closes it or the idle timeout
-    /// fires, both of which arrive here as `Err`.
+    /// server never reports it. Only a GOAWAY from the client could mean that,
+    /// and it promises nothing about the requests already in flight. The caller
+    /// reads `Ok(None)` as permission to drop the connection, which would cut
+    /// those requests off mid-tunnel. A connection therefore ends when the peer
+    /// closes it or the idle timeout fires, both of which arrive here as `Err`.
     pub async fn accept(&mut self) -> Result<Option<Resolver>, ConnectionError> {
         loop {
             let (send, recv) = self
@@ -748,15 +728,14 @@ impl Connection {
 
     /// Starts a graceful shutdown by sending GOAWAY (RFC 9114 §5.2).
     ///
-    /// The identifier is the *first* request this connection will not serve --
-    /// four past the last one accepted, or zero if none was -- so everything
+    /// The identifier is the *first* request this connection will not serve:
+    /// four past the last one accepted, or zero if none was. So everything
     /// already in flight is untouched and the client knows to take new work
     /// elsewhere. Requests arriving past it are rejected in [`Self::accept`]
     /// with H3_REQUEST_REJECTED, the code a client may safely retry on.
     ///
-    /// Note what this does *not* do: it does not wait for anything, and the
-    /// connection stays usable afterwards. Deciding when the existing tunnels
-    /// are done is the caller's job.
+    /// This does not wait for anything, and the connection stays usable
+    /// afterwards. The caller decides when the existing tunnels are done.
     pub async fn shutdown(&mut self) -> Result<(), ConnectionError> {
         let next = next_request_id(self.last_accepted);
 
@@ -785,9 +764,10 @@ impl Connection {
     /// Ends the connection because this endpoint is done with it, not because
     /// anything went wrong.
     ///
-    /// The counterpart of the violation close: the same mechanism -- RFC 9114 §8
-    /// makes a CONNECTION_CLOSE carrying an HTTP/3 code *be* the connection
-    /// error -- with the code §8.1 defines for having nothing to report:
+    /// The counterpart of the violation close. It uses the same mechanism (RFC
+    /// 9114 §8 makes a CONNECTION_CLOSE carrying an HTTP/3 code *be* the
+    /// connection error) with the code §8.1 defines for having nothing to
+    /// report:
     ///
     //= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
     //# H3_NO_ERROR (0x0100):  No error.  This is used when the connection or
@@ -795,10 +775,10 @@ impl Connection {
     ///
     /// `reason` reaches the peer in the CONNECTION_CLOSE frame and comes back
     /// in the returned error, which [`crate::h3api::benign_close`] grades as a
-    /// routine ending rather than a fault -- so the caller can `break` on it
-    /// and let the connection's closing line stay at the level an idle timeout
-    /// gets. Returning the error rather than logging here is what keeps that
-    /// grading in one place (D50).
+    /// routine ending rather than a fault. So the caller can `break` on it and
+    /// the connection's closing line stays at the level an idle timeout gets.
+    /// The error is returned rather than logged here to keep that grading in
+    /// one place (D50).
     pub fn close_quietly(&self, reason: &'static str) -> ConnectionError {
         self.handle
             .quic
@@ -829,7 +809,7 @@ impl Drop for Connection {
 ///
 /// The GOAWAY identifier this server sends: the first request it will not
 /// serve. Clamped to [`crate::datagram::VARINT_MAX`] because the sum is written
-/// as a QUIC varint and nothing above that is representable -- RFC 9000 §2.1
+/// as a QUIC varint and nothing above that is representable. RFC 9000 §2.1
 /// bounds a stream id by the same value, so no legitimate peer can reach the
 /// clamp, and a saturating `u64::MAX` would be an assertion failure rather than
 /// a GOAWAY.
@@ -847,10 +827,10 @@ fn next_request_id(last_accepted: Option<u64>) -> u64 {
 /// stream's, both end when it does, and neither can be starved by the other:
 /// [`quinn::Connection::accept_uni`] leaves an unaccepted stream queued and
 /// [`quinn::Connection::read_datagram`] an undelivered datagram, so a branch
-/// that loses the race here loses nothing but the poll. Handling is not done
-/// inline either -- a unidirectional stream gets a task of its own, and a
-/// datagram is a map lookup and a `try_send` that never blocks -- so a flood of
-/// one kind cannot hold the other up.
+/// that loses the race here loses nothing but the poll. Handling is short: a
+/// unidirectional stream gets a task of its own, and a datagram is a map lookup
+/// and a `try_send` that never blocks. So a flood of one kind cannot hold the
+/// other up.
 async fn serve_peer(handle: Handle) {
     let mut streams = JoinSet::new();
 
@@ -894,7 +874,7 @@ async fn serve_peer(handle: Handle) {
 /// RFC 9297 §2.1 draws the lines:
 ///
 /// * a Quarter Stream ID that cannot be parsed, or one above 2^60-1, is a
-///   **connection error** of type H3_DATAGRAM_ERROR -- neither can name a QUIC
+///   **connection error** of type H3_DATAGRAM_ERROR. Neither can name a QUIC
 ///   stream, so there is nothing to drop it *for*;
 /// * a Quarter Stream ID with no live session is **dropped**. The RFC permits
 ///   discarding a datagram whose request stream does not exist, which happens
@@ -904,8 +884,9 @@ async fn serve_peer(handle: Handle) {
 /// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
 /// stream "that cannot be created due to client-initiated bidirectional stream
 /// limits" SHOULD draw H3_ID_ERROR. Those are this endpoint's limits, not the
-/// peer's — `initial_max_streams_bidi` is a transport parameter a receiver
-/// advertises — and RFC 9297 §2.1 grants the exemption this router relies on:
+/// peer's, because `initial_max_streams_bidi` is a transport parameter a
+/// receiver advertises. RFC 9297 §2.1 grants the exemption this router relies
+/// on:
 /// "Generating an error is not mandatory because the QUIC stream limit might be
 /// unknown to the HTTP/3 layer". It is unknown to this one. The limit is set by
 /// [`crate::quic`] from `[limits] max_streams_bidi` and nothing here reads it,
@@ -935,8 +916,8 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
         // The two conditions RFC 9297 §2.1 states as MUST-close. Reported
         // through `fail` like every other connection error in this layer, so
         // the code on the wire and the reason the caller is given cannot
-        // disagree -- and so a datagram violation racing with a stream one ends
-        // the connection once, with whichever was first.
+        // disagree, and a datagram violation racing with a stream one ends the
+        // connection once, with whichever was first.
         Err(error) if error.is_connection_error() => {
             handle.fail(Violation::connection(
                 Code::H3_DATAGRAM_ERROR,
@@ -966,22 +947,19 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
 ///
 /// # The deadline on the type
 ///
-/// A stream that has been opened but whose type varint has not arrived is a
-/// stream this endpoint can say nothing about: the type is what decides whether
-/// it is the control stream, a QPACK stream, or something to abort. Reading it
-/// is therefore the one wait here with no protocol answer to it, and a peer that
-/// opens streams and writes half a varint on each parks a task apiece for as
-/// long as the connection lives -- which is as long as it likes, since the QUIC
-/// idle timeout is fed by a keep-alive its own stack answers (review L3).
+/// Until its type varint arrives, a stream cannot be classified as the control
+/// stream, a QPACK stream, or something to abort. So reading the type is the
+/// one wait here that no protocol rule ends. A peer that opens streams and
+/// writes half a varint on each would hold a task apiece for as long as the
+/// connection lives.
 ///
-/// One idle timeout bounds it, matching [`Connection::handshake`]'s. What
-/// follows is a `stop`, not a connection error: nothing was violated, the
-/// stream simply never said what it was, and the peer keeps every stream it has
-/// underway. H3_STREAM_CREATION_ERROR is this endpoint's own choice of code and
-/// not the RFC's -- RFC 9114 §8.1 gives it for a stream that could not be
-/// created, which is the nearest registered thing to a stream that never
-/// declared itself, and it is what an unknown stream type is aborted with three
-/// arms below.
+/// One idle timeout bounds it, as `Handle::idle` describes. What
+/// follows is a `stop`, not a connection error: nothing was violated, and the
+/// peer keeps every stream it has underway. H3_STREAM_CREATION_ERROR is this
+/// endpoint's own choice of code, not the RFC's. RFC 9114 §8.1 gives it for a
+/// stream that could not be created, which is the nearest registered code for
+/// a stream that never declared its type. It is also the code an unknown
+/// stream type is aborted with three arms below.
 async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
     let typed = tokio::time::timeout(handle.idle, read_stream_type(&mut recv)).await;
 
@@ -1058,8 +1036,8 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
 
     // The two endings RFC 9114 §6.2.1 forbids, as a detail string for
     // [`critical_stream_closed`]. Both leave the loop rather than reporting on
-    // the spot, so the exemption is asked for once and cannot come to differ
-    // between a clean finish and a reset:
+    // the spot, so the exemption is checked once and is the same for a clean
+    // finish and a reset:
     //
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
     //# The sender MUST NOT close the control stream, and the receiver
@@ -1081,10 +1059,10 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
                 return;
             }
             // The connection ending under the control stream is not the
-            // control stream failing: whoever is waiting in `accept` already
-            // has the real reason, and reporting a critical-stream error here
-            // would overwrite an idle timeout -- the everyday goodbye -- with a
-            // protocol violation in the operator's log.
+            // control stream failing. The caller waiting in `accept` already
+            // has the real reason. A critical-stream error here would replace
+            // an idle timeout, the ordinary ending, with a protocol violation
+            // in the operator's log.
             Err(frame::Error::Stream(StreamError::Connection(_))) => return,
 
             Err(frame::Error::Stream(error)) => {
@@ -1114,13 +1092,11 @@ async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
 /// `close_reason` is [`quinn::Connection::close_reason`]: `Some` once the
 /// connection is over, whoever ended it.
 ///
-/// The rule below is not negotiable. What is negotiable is whether reaching its
-/// verdict is worth anything on a connection that has already ended: a peer
-/// tearing one down finishes or resets its send streams and sends
-/// CONNECTION_CLOSE in the same breath, and the two can be read here in either
-/// order. Answering an ordinary goodbye with a protocol error would turn that
-/// race into a fault in the operator's log, on behalf of a connection there is
-/// nothing left to protect.
+/// The rule below always applies while the connection is live. Once it has
+/// ended, there is nothing left to protect. A peer closing a connection
+/// finishes or resets its send streams and sends CONNECTION_CLOSE at the same
+/// time, and the two can be read here in either order. Answering an ordinary
+/// close with a protocol error would log that race as a fault.
 fn critical_stream_closed(
     detail: impl Into<Cow<'static, str>>,
     close_reason: Option<&quinn::ConnectionError>,
@@ -1163,17 +1139,15 @@ struct Control {
     /// is worth a line.
     ///
     /// An unknown frame with a zero length is two bytes on the wire, and RFC
-    /// 9114 §9 says to ignore it — so a peer may send them back to back for as
-    /// long as the connection lives, and a line apiece was the highest ratio of
-    /// journal to peer bytes anywhere in this server. It is a `debug!`, so it
-    /// does not reach a default production log at all; what it does reach is the
-    /// operator who turned `debug` on to read what a client is actually sending,
-    /// which is the one moment the flood costs the most.
+    /// 9114 §9 says to ignore it. So a peer may send them back to back for as
+    /// long as the connection lives, and a log line apiece would be a large
+    /// amplification. The line is a `debug!`, so it only reaches an operator
+    /// who turned `debug` on to read what a client sends.
     ///
-    /// Ignoring them silently is not the answer: greasing is exactly how a peer
-    /// checks that this server skips what it does not know, so an unexplained
-    /// gap in a debug trace would be the wrong reading. The doubling schedule
-    /// keeps the first one and the size of the flood, and drops the repetition.
+    /// The frames are not skipped silently, because greasing is how a peer
+    /// checks that this server skips what it does not know, and a debug trace
+    /// should show it. The doubling schedule keeps the first one and the size
+    /// of the flood, and drops the repetition.
     skipped: crate::logfmt::Sampler,
 }
 
@@ -1198,10 +1172,8 @@ impl Control {
             }
 
             // RFC 9114 §9's rule that unknown values are ignored, quoted in
-            // full in `super`. Ignored -- but only after SETTINGS. A grease
-            // frame sent first is still "any other frame type" below, and the
-            // greasing endpoint is precisely the one testing whether this
-            // server enforces that.
+            // full in `super`. Ignored, but only after SETTINGS. A grease frame
+            // sent first is still "any other frame type" below.
             Item::Skipped { kind } => {
                 if !seen {
                     return Err(missing_settings());
@@ -1340,12 +1312,11 @@ const MAX_INTEGER_CONTINUATION: usize = 9;
 
 /// How far the last accepted instruction's prefixed integer has run.
 ///
-/// The whole of [`serve_qpack`]'s per-byte state, in one place rather than in
-/// two bindings inside its loop. The peer chooses where its stream is cut into
-/// `read_chunk` results, and the judgement may not depend on that, so the state
-/// has to live across chunks and the step that advances it has to be a function
-/// of one byte and this. Both halves are testable that way, which the loop
-/// alone was not: driving it needs a live [`quinn::RecvStream`].
+/// The whole of [`serve_qpack`]'s per-byte state. The peer chooses where its
+/// stream is cut into `read_chunk` results, and the verdict may not depend on
+/// that. So the state lives across chunks, and the step that advances it is a
+/// function of one byte and this state. That also lets the tests drive it
+/// without a live [`quinn::RecvStream`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct QpackProgress {
     /// Whether the last accepted instruction's integer is still running.
@@ -1384,22 +1355,19 @@ impl QpackProgress {
 ///
 /// This decoder advertised a table capacity of zero and this encoder never
 /// touches the dynamic table, so neither stream can carry an instruction that
-/// changes anything here -- but they still have to be read: a receiver that
-/// never reads stalls the peer's stream flow control, and RFC 9204 §4.2 forbids
-/// the peer from closing them, so stopping them is not an option either. Reading
+/// changes anything here. They still have to be read: a receiver that never
+/// reads stalls the peer's stream flow control, and RFC 9204 §4.2 forbids the
+/// peer from closing them, so stopping them is not an option either. Reading
 /// means checking: with no table, nearly every instruction is one the RFC makes
 /// a connection error, and [`qpack_instruction`] says which. Only the first byte
-/// of each is ever needed, so the rest of an accepted instruction is read past.
-/// [`QpackProgress`] is the state that does the reading past, and it is held
-/// across `read_chunk` results rather than inside one: the peer chooses where
-/// its stream is cut into chunks, and the verdict may not depend on that.
+/// of each is needed, so the rest of an accepted instruction is skipped, with
+/// [`QpackProgress`] as the state.
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
-/// connection error of type H3_CLOSED_CRITICAL_STREAM, and
-/// [`critical_stream_closed`] reports it, with the one exemption the control
-/// stream makes for the same race: a connection that has already ended is not
-/// disturbed. Both endings count, a clean finish and a reset alike, which is
-/// what §4.2 says.
+/// connection error of type H3_CLOSED_CRITICAL_STREAM. [`critical_stream_closed`]
+/// reports it, with the same exemption as for the control stream: a connection
+/// that has already ended is not disturbed. A clean finish and a reset both
+/// count, as §4.2 says.
 async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
     if kind.seen(&handle.shared).swap(true, Ordering::Relaxed) {
         handle.fail(duplicate("a second QPACK stream of the same kind"));
@@ -1488,8 +1456,8 @@ fn qpack_instruction(kind: QpackStream, first: u8) -> Result<bool, Violation> {
                 //# type QPACK_DECODER_STREAM_ERROR.
                 //
                 // This encoder never uses the dynamic table, so no field section
-                // it sent had a non-zero Required Insert Count: on every stream,
-                // all of them -- none -- stand acknowledged already.
+                // it sent had a non-zero Required Insert Count. On every stream,
+                // all such sections (there are none) are already acknowledged.
                 return refuse("a Section Acknowledgment for a field section that needed none");
             }
             if first & 0b0100_0000 != 0 {

@@ -7,16 +7,16 @@
 //! for this server the body *is* the tunnel and every copy of it would be paid
 //! for per packet. A tunnel's reader takes several of those chunks from quinn
 //! per read without copying them (`frame::READ_AHEAD_CHUNKS`), and
-//! [`Reader::try_recv_data`] is how a caller gathers them into one write. Nothing follows the body -- RFC 9114 §4.4 permits only DATA
-//! on a stream whose CONNECT has completed, so the trailer section §4.1 allows
-//! an ordinary request is a frame this server never sees a use for.
+//! [`Reader::try_recv_data`] is how a caller gathers them into one write.
+//! Nothing follows the body: RFC 9114 §4.4 permits only DATA on a stream whose
+//! CONNECT has completed, so the trailer section §4.1 allows an ordinary
+//! request is never accepted here.
 //!
 //! # Validating
 //!
 //! [`Resolver::resolve`] is where a request becomes a [`Request`], and where
-//! RFC 9114 §4.1.2's "malformed" verdict is reached. The rules are worth
-//! stating together because they are what a proxy is judged on: a request that
-//! this server accepts is one it will open a socket for.
+//! RFC 9114 §4.1.2's "malformed" verdict is reached. A request that this server
+//! accepts is one it will open a socket for.
 //!
 //! A malformed request is a *stream* error: the stream is reset and stopped with
 //! H3_MESSAGE_ERROR and nothing else on the connection is disturbed. A frame
@@ -64,20 +64,18 @@ impl Resolver {
     /// Reads and validates the request headers, giving up after one QUIC idle
     /// timeout.
     ///
-    /// On failure the stream has already been ended -- reset and stopped for a
+    /// On failure the stream has already been ended: reset and stopped for a
     /// malformed request, or the whole connection closed for a frame sequence
-    /// that cannot be parsed -- so the caller has nothing left to do but log it.
+    /// that cannot be parsed. The caller only has to log it.
     ///
     /// # The deadline
     ///
     /// A peer opens a request stream by sending on it, and may then send one
-    /// byte and stop. Nothing in HTTP/3 obliges it to finish the request, and
-    /// the QUIC idle timeout is no backstop while [`crate::quic`]'s keep-alive
-    /// PINGs are being answered by its stack, so without a deadline each such
-    /// stream parks a task until the connection ends -- `max_streams_bidi` of
-    /// them per connection, at a byte apiece, from a peer that has not
-    /// authenticated (D76). The bound is the connection's own idle timeout,
-    /// which is the same value [`crate::quic`] put in its transport parameters.
+    /// byte and stop. Nothing in HTTP/3 obliges it to finish the request.
+    /// Without a deadline each such stream holds a task until the connection
+    /// ends: `max_streams_bidi` of them per connection, at a byte apiece, from
+    /// a peer that has not authenticated (D76). The bound is the connection's
+    /// own idle timeout, for the reason `connection::Handle::idle` gives.
     ///
     /// The stream is the only thing a lapsed deadline ends: it is reset and
     /// stopped, and the connection carries on serving everything else on it.
@@ -95,12 +93,10 @@ impl Resolver {
             //# H3_REQUEST_INCOMPLETE (0x010d):  The client's stream terminated
             //# without containing a fully formed request.
             //
-            // The stream has not terminated -- it has stopped, which no code in
-            // §8.1 names -- but what the peer is owed is the same answer either
-            // way: the request it began will not be served because it never
-            // finished arriving. `read_request` reaches for the same code when
-            // the stream really does end early, and a client cannot usefully
-            // tell "you stopped" from "you stopped for good".
+            // The stream has not terminated but stalled, which no code in §8.1
+            // names. The answer is the same either way: the request will not be
+            // served because it never finished arriving. `read_request` uses
+            // the same code when the stream does end early.
             Err(_elapsed) => {
                 let violation = Violation::stream(
                     Code::H3_REQUEST_INCOMPLETE,
@@ -126,43 +122,28 @@ impl Resolver {
             //# willing to handle can send an HTTP 431 (Request Header
             //# Fields Too Large) status code ([RFC6585]).
             //
-            // Which is worth the two extra lines: a client that has overshot
-            // the limit this server advertised is told which of its requests to
-            // fix, where a bare RESET_STREAM leaves it guessing. The receiving
-            // side is stopped first, because the rest of the section is
-            // precisely what this server has declined to read; the answer then
-            // goes out and that side is finished cleanly.
+            // A 431 tells a client that overshot the advertised limit which of
+            // its requests to fix, where a bare RESET_STREAM leaves it guessing.
+            // The receiving side is stopped, because the rest of the section is
+            // what this server has declined to read. The answer then goes out
+            // and that side is finished cleanly.
             //
-            // First rather than after the write, which is the order the other
-            // refusal writers keep (`tunnel::status::refuse_with` and
-            // `accept_then_close`): the write is bounded by one idle timeout and
-            // a peer that grants no window parks it for that whole timeout, and
-            // until the stop goes out quinn holds everything that peer sent on
-            // the stream, up to `STREAM_RECEIVE_WINDOW` per stream and
-            // `CONNECTION_RECEIVE_WINDOW` in aggregate. Stopping first cuts the
-            // hold to the duration of the parse (audit L2).
+            // The stop comes before the write, as in the other refusal writers
+            // (`tunnel::status::refuse_with` and `accept_then_close`). A peer
+            // that grants no window can hold the write for its whole idle
+            // timeout, and until the stop goes out quinn holds everything that
+            // peer sent on the stream, up to `STREAM_RECEIVE_WINDOW` per stream
+            // and `CONNECTION_RECEIVE_WINDOW` in aggregate. Stopping first
+            // limits that to the duration of the parse.
             //
-            // Which refusals those are is the verdict's own to say, and
-            // `Violation::field_section_too_large` is how it says it. Three
-            // sources build one: the per-frame buffering limit, a field section
-            // that decoded past what `SETTINGS_MAX_FIELD_SECTION_SIZE` told the
-            // peer to send -- the same 64 KiB either way -- and the
-            // connection-wide buffering budget of D77, which refuses the request
-            // that would overrun it rather than the connection holding it.
-            //
-            // Everything else falls through to the bare reset `answer` gives it,
-            // H3_EXCESSIVE_LOAD included: a request stream flooded with reserved
-            // or unknown frames (RFC 9114 §10.5, `frame::MAX_SKIPPED_FRAMES`)
-            // carries the same code and sent no header field at all, so a 431
-            // would tell that peer to shrink something it never sent.
-            //
-            // A field-section violation is never a connection error: escalating
-            // one with `into_fatal` makes it connection-class, and this test is
-            // then false.
+            // `Violation::field_section_too_large` marks the violations that
+            // get a 431 and lists their sources. Everything else falls through
+            // to the bare reset `answer` gives it, H3_EXCESSIVE_LOAD from
+            // `frame::MAX_SKIPPED_FRAMES` included. An escalated violation is
+            // connection-class, and this test is then false.
             //
             // The write is bounded and, when the bound lapses, abandoned with
-            // a reset: [`Stream::respond_within`] says why, and a peer that
-            // grants no flow-control window never takes these fifty-odd bytes.
+            // a reset; [`Stream::respond_within`] says why.
             Err(frame::Error::Protocol(violation)) if violation.is_field_section_too_large() => {
                 stream.stop_receiving(violation.code());
 
@@ -238,10 +219,8 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
             Some(Item::Frame(Frame::Headers(block))) => break block,
 
             // RFC 9114 §9's rule that unknown values are ignored, quoted in
-            // full in `super`. It applies before the request as much as during
-            // it: a client greasing its request stream is testing exactly this,
-            // and the frame is skipped rather than counted as the stream's
-            // first.
+            // full in `super`. It applies before the request too: a grease
+            // frame is skipped rather than counted as the stream's first.
             Some(Item::Skipped { .. }) => {}
 
             //= https://www.rfc-editor.org/rfc/rfc9114#section-4.1
@@ -294,13 +273,10 @@ async fn read_request(frames: &mut FrameReader) -> Result<Request, frame::Error>
 /// RFC 8441 §4).
 ///
 /// Public, though [`Resolver::resolve`] is the only caller the server has and
-/// `crate::h3api` re-exports neither: this is where every "malformed" verdict in
-/// the module doc above is actually decided, and reaching it needs nothing but a
-/// decoded field section -- so `tests/it_fuzz.rs` states properties over
-/// arbitrary pseudo-header *combinations* against it, which through a live
-/// request stream would be one QUIC connection per combination. Documented
-/// rather than hidden for the same reason: the rules it holds are what this
-/// module is about.
+/// `crate::h3api` re-exports neither. It needs nothing but a decoded field
+/// section, so `tests/it_fuzz.rs` states properties over arbitrary
+/// pseudo-header *combinations* against it without one QUIC connection per
+/// combination.
 pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     let mut method = None;
     let mut scheme = None;
@@ -395,7 +371,7 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
         //# fields are present, they MUST contain the same value.
         //
         // One table for both request shapes, because §4.3.1's agreement rule is
-        // the same rule either way -- an extended CONNECT is still an HTTP/3
+        // the same rule either way: an extended CONNECT is still an HTTP/3
         // request. RFC 8441 §4 does not make :authority mandatory on a request
         // carrying :protocol; it says what :authority means when it is present:
         //
@@ -459,15 +435,12 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
 /// that is not a token names nothing that could be in the registry, which makes
 /// it an invalid pseudo-header field and the message malformed.
 ///
-/// This was the one pseudo-header with no character-set check: `:method`,
-/// `:scheme`, `:authority` and `:path` each have one, and a `:protocol` was only
-/// required to be UTF-8. A value carrying CR or LF was answered 501, as a
-/// protocol this server has not implemented, where the RFC verdict is malformed
-/// (audit L6). RFC 9114 §10.3 names carriage return, line feed and the null
-/// character as octets an intermediary might translate verbatim, and
-/// `Request.protocol` was the only field on an *accepted* request carrying
-/// unvalidated octets, so this is also what keeps a future reader of it from
-/// inheriting the problem.
+/// `:method`, `:scheme`, `:authority` and `:path` each have a character-set
+/// check, and this is the one for `:protocol`. Without it a value carrying CR
+/// or LF would be answered 501, as a protocol this server has not implemented,
+/// where the RFC verdict is malformed. RFC 9114 §10.3 names carriage return,
+/// line feed and the null character as octets an intermediary might translate
+/// verbatim, so no field on an *accepted* request may carry unvalidated octets.
 fn connect_protocol(protocol: &[u8]) -> Result<&str, Violation> {
     //= https://www.rfc-editor.org/rfc/rfc8441#section-4
     //# A new pseudo-header field :protocol MAY be included on request
@@ -504,12 +477,12 @@ fn uri_scheme(scheme: &[u8]) -> Result<&str, Violation> {
 /// Checks an authority (RFC 3986 §3.2).
 ///
 /// The characters an authority is made of and no others: unreserved (§2.3),
-/// percent-encoding, sub-delims (§2.2), and ":", "@", "[", "]" -- the union of
-/// what a userinfo, a host and a port may contain. It is the *syntax* that is
-/// judged here and not the shape: `tunnel::tcp` splits the host from the port
-/// and refuses a userinfo, an unbracketed IPv6 literal and a port that is not a
-/// port, and answers each of them with a 400 rather than a stream error, which
-/// tells a client rather more.
+/// percent-encoding, sub-delims (§2.2), and ":", "@", "[", "]": the union of
+/// what a userinfo, a host and a port may contain. Only the *syntax* is judged
+/// here, not the shape. `tunnel::tcp` splits the host from the port and
+/// refuses a userinfo, an unbracketed IPv6 literal and a port that is not a
+/// port. It answers each of them with a 400 rather than a stream error, which
+/// tells a client more.
 fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
     let invalid = || malformed("an :authority that is not an authority");
 
@@ -582,9 +555,9 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
 ///
 /// None of the four conversions can fail, because every byte was matched
 /// against an ASCII set on the way in. It is written fallibly rather than as an
-/// `expect` because these are a peer's bytes: an `expect` here would be a panic
-/// waiting for one of the checks above to be widened. `invalid` is what each
-/// caller wants said in its place.
+/// `expect` because these are a peer's bytes: an `expect` here would panic if
+/// one of the checks above were widened. `invalid` is the error each caller
+/// returns instead.
 fn ascii(bytes: &[u8], invalid: impl Fn() -> Violation) -> Result<&str, Violation> {
     std::str::from_utf8(bytes).map_err(|_| invalid())
 }
@@ -617,17 +590,16 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //# evaluating the field value.
     //
     // HTTP/3 is one of the versions that allows it: SP and HTAB are ordinary
-    // field-value octets on the wire (`FieldValue::parse` accepts them, and
-    // refusing a stray leading space would turn a request every other stack
-    // serves into a stream error). Excluding it *here* is what makes every
-    // reading below evaluate the same value the RFC says was sent -- the
-    // agreement between `:authority` and Host, and `crate::auth`, which would
-    // otherwise see " Basic ..." as a credential with no scheme and answer a
-    // well-formed request with a 407 that costs the peer an attempt.
+    // field-value octets on the wire (`FieldValue::parse` accepts them). It is
+    // excluded *here* so that every later reading evaluates the value the RFC
+    // says was sent. That covers the agreement between `:authority` and Host,
+    // and `crate::auth`, which would otherwise see " Basic ..." as a credential
+    // with no scheme and answer a well-formed request with a 407 that costs the
+    // peer an attempt.
     //
     // Only SP and HTAB are stripped, and only from the ends. Trimming the wider
     // ASCII whitespace set would strip a leading CR or LF as well, and those are
-    // exactly the octets §10.3 refuses below.
+    // the octets §10.3 refuses below.
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
     //# Any request or response that contains a character not permitted in a
     //# field value MUST be treated as malformed.
@@ -663,13 +635,12 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //# Host = uri-host [ ":" port ] ; Section 4
     //
     // One host and one optional port: the grammar leaves no room for a list,
-    // and RFC 9110 §7.2 states no rule for a repeated Host field. So this is
-    // this server's own, and it is the strict reading, because the alternative
-    // is worse than strict. RFC 9114 §4.3.1 requires :authority and Host to
-    // "contain the same value", and the agreement check below reads one Host --
-    // whichever came first. Two Host fields that disagree would then let the
-    // second one say anything at all, which is the request-smuggling shape this
-    // proxy least wants to be the first hop of.
+    // and RFC 9110 §7.2 states no rule for a repeated Host field. So this rule
+    // is this server's own, and it is the strict reading. RFC 9114 §4.3.1
+    // requires :authority and Host to "contain the same value", and the
+    // agreement check in `build_request` reads only the first Host. A second
+    // Host that disagrees would then go unchecked, which is a request-smuggling
+    // pattern.
     if name == "host" && fields.contains("host") {
         return Err(malformed("more than one Host field"));
     }
@@ -725,8 +696,8 @@ impl Stream {
     /// Every datagram on the connection names a request stream by Quarter
     /// Stream ID, which is that stream's id divided by four; this is how the
     /// one stream that wants them says so. Until it is called nothing routes to
-    /// this stream and it costs nothing, which is what keeps a TCP tunnel --
-    /// which has no use for a datagram -- out of the routing table entirely.
+    /// this stream and it costs nothing, so a TCP tunnel, which has no use for a
+    /// datagram, never enters the routing table.
     ///
     /// `None` if they have already been claimed. Only the first caller can be
     /// the session, because the [`DatagramReceiver`] deregisters the stream when
@@ -754,13 +725,13 @@ impl Stream {
 
     /// Sends a response with `fields` and no body.
     ///
-    /// Only the field lines given are sent -- nothing synthesises a
+    /// Only the field lines given are sent. Nothing synthesises a
     /// Content-Length or Content-Type, both of which RFC 9297 §3.2 forbids on a
     /// capsule-carrying response. A 2xx answer to CONNECT must carry neither
     /// Content-Length nor Transfer-Encoding, which a caller meets by passing an
-    /// empty [`Fields`]. The two rules live apart: RFC 9110 §8.6 has the first
-    /// -- "A server MUST NOT send a Content-Length header field in any 2xx
-    /// (Successful) response to a CONNECT request" -- while the second is RFC
+    /// empty [`Fields`]. The two rules are in different places. RFC 9110 §8.6
+    /// has the first: "A server MUST NOT send a Content-Length header field in any 2xx
+    /// (Successful) response to a CONNECT request". The second is RFC
     /// 9114 §4.1's, and is about every HTTP/3 message rather than about CONNECT:
     /// transfer codings "are not defined for HTTP/3; the Transfer-Encoding
     /// header field MUST NOT be used".
@@ -796,21 +767,19 @@ impl Stream {
     /// # The deadline
     ///
     /// The write is the one step in answering a request that depends on the
-    /// peer: a client that grants no flow-control window never takes the
+    /// peer. A client that grants no flow-control window never takes the
     /// fifty-odd bytes of a 407, and without a deadline the task waits for that
     /// window until the connection ends. Every such request leaves a task
-    /// holding the whole decoded request behind it, and the count of
-    /// authentication failures that is meant to cost a guesser a handshake is
-    /// recorded around one of these calls (review H1/H2).
+    /// holding the whole decoded request, and the count of authentication
+    /// failures that makes a guesser pay a handshake is recorded around one of
+    /// these calls.
     ///
     /// The bound is the connection's own idle timeout, read from the
-    /// connection rather than passed in: it is the same value [`crate::quic`]
-    /// put in this connection's transport parameters, and quinn's idle timer is
-    /// no backstop while the peer's stack answers our keep-alive PINGs.
+    /// connection rather than passed in (see `connection::Handle::idle`).
     ///
     /// The lapsed answer is abandoned with a reset rather than left to a FIN
     /// that cannot be sent either: the request will not be answered, which is
-    /// exactly what RFC 9114 §8.1 gives H3_REQUEST_CANCELLED for. "The request
+    /// what RFC 9114 §8.1 gives H3_REQUEST_CANCELLED for. "The request
     /// or its response (including pushed response) is cancelled." Only the
     /// stream ends; the connection carries on serving everything else on it.
     pub async fn respond_within(
@@ -850,9 +819,9 @@ impl Stream {
     /// gets through to a peer that has stopped granting flow-control credit: a
     /// FIN travels at the end of the bytes already queued and so waits for a
     /// window that may never come, while a reset is a frame of its own and
-    /// leaves at once. That is what makes this the way to abandon a response
-    /// nobody is reading -- and abandoning it is what ends the stream, and
-    /// returns the peer's allowance of streams with it.
+    /// leaves at once. So this is the way to abandon a response nobody is
+    /// reading. Abandoning it ends the stream and returns the peer's stream
+    /// allowance.
     pub fn reset(&mut self, code: Code) {
         // Fails only if the stream is already finished or reset, which needs no
         // reporting: either way nothing more will be sent on it.
@@ -889,16 +858,15 @@ impl Stream {
 
 /// Why a bounded response never reached the peer.
 ///
-/// The two are worth telling apart because they say different things about the
-/// peer and leave the stream in different states: a failed write is a stream
+/// The two leave the stream in different states: a failed write is a stream
 /// that has already ended, while a lapsed deadline is a peer that is still
-/// there and simply will not read what it asked for.
+/// there and will not read what it asked for.
 ///
 /// Its [`Display`](std::fmt::Display) and [`std::error::Error`] impls have no
-/// caller in this tree and are kept anyway: they are what makes a public error
-/// type usable at all -- `?` into a `Box<dyn Error>` or an `anyhow::Error`, and
-/// a `source()` chain that reaches the [`StreamError`] underneath -- and a
-/// caller outside the crate has no other way to add them.
+/// caller in this tree. They make a public error type usable (`?` into a
+/// `Box<dyn Error>` or an `anyhow::Error`, and a `source()` chain that reaches
+/// the [`StreamError`] underneath), and a caller outside the crate cannot add
+/// them.
 #[derive(Debug)]
 pub enum RespondError {
     /// The write failed: the peer reset or stopped the stream, or the
@@ -948,17 +916,16 @@ impl Writer {
     /// [`Self::send_data_in_place`], which sends one chunk.
     ///
     /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
-    /// flow-control credit parks this for as long as it likes, so both tunnels
-    /// do abandon it, under a teardown signal or a timeout; what they may not
-    /// do afterwards is finish the stream. Abandoning the write part-way leaves
+    /// flow-control credit can block this indefinitely, so both tunnels do
+    /// abandon it, under a teardown signal or a timeout. They may not finish
+    /// the stream afterwards. Abandoning the write part-way leaves
     /// the header written and the payload not, which is a truncated DATA frame,
     /// and RFC 9114 §7.1 says what that costs: "When a stream terminates
     /// cleanly, if the last frame on the stream was truncated, this MUST be
     /// treated as a connection error of type H3_FRAME_ERROR. Streams that
     /// terminate abruptly may be reset at any point in a frame." So a reset
-    /// behind an abandoned send is not tidying up after the fact; it is what
-    /// makes the truncation legal, and a FIN in its place is the connection
-    /// error that sentence names.
+    /// behind an abandoned send is what makes the truncation legal, and a FIN
+    /// in its place is the connection error that sentence names.
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
         // The same widening the HEADERS length above states.
         #[allow(clippy::as_conversions)]
@@ -979,7 +946,7 @@ impl Writer {
     /// [`Self::send_data`] would produce for the same payload.
     ///
     /// Not cancel-safe, for the reason [`Self::send_data`] gives. The frame is
-    /// one chunk here, but quinn may take a prefix of it and park on the rest,
+    /// one chunk here, but quinn may take a prefix of it and wait on the rest,
     /// so an abandoned call can still leave a truncated DATA frame, and only a
     /// reset behind it makes that legal.
     ///
@@ -1003,27 +970,24 @@ impl Writer {
     /// Resolves when the peer stops this stream, or the connection under it
     /// ends.
     ///
-    /// The mirror of [`Reader::reset_by_peer`] on the sending half, and it
-    /// exists for the mirror of that reason. [`Self::send_data`] already reports
-    /// a `STOP_SENDING` -- it is the error a write fails with -- but only to a
-    /// caller that is writing, and a CONNECT tunnel spends much of its life not
-    /// writing: with the client's half of the tunnel finished and a target that
-    /// has yet to say anything, the pump is parked in a read of the *target*,
-    /// and nothing there watches the request stream. This is what such a read
-    /// can select on.
+    /// The counterpart of [`Reader::reset_by_peer`] on the sending half.
+    /// [`Self::send_data`] already reports a `STOP_SENDING` as the error a
+    /// write fails with, but only to a caller that is writing. A CONNECT tunnel
+    /// spends much of its life not writing: with the client's half of the
+    /// tunnel finished and a target that has yet to send anything, the pump
+    /// waits in a read of the *target*, and nothing there watches the request
+    /// stream. Such a read can select on this.
     ///
     /// # Why this one may be held across writes
     ///
-    /// The future borrows nothing -- [`quinn::SendStream::stopped`] clones the
-    /// connection handle and the stream id into an owned future -- so a caller
+    /// The future borrows nothing: [`quinn::SendStream::stopped`] clones the
+    /// connection handle and the stream id into an owned future. So a caller
     /// builds it once, before its loop, and keeps polling the same one while
-    /// writing to the same stream through `&mut self`. That is the point: a
-    /// fresh future per iteration would take the connection lock on every pass,
-    /// where one that is kept registers once and is a bare `Notified` poll
-    /// afterwards.
+    /// writing to the same stream through `&mut self`. A fresh future per
+    /// iteration would take the connection lock on every pass, while one that
+    /// is kept registers once and is a bare `Notified` poll afterwards.
     ///
-    /// It is also why this is safe where `quinn::RecvStream::received_reset` is
-    /// not (that comparison, and the panic it caused, is on
+    /// This is safe where `quinn::RecvStream::received_reset` is not (see
     /// [`Reader::reset_by_peer`]): quinn keeps no single-slot waker for it, but
     /// a `Notify` per stream that the connection wakes and removes when the
     /// stream is stopped or finished.
@@ -1033,12 +997,11 @@ impl Writer {
     /// # What it resolves to
     ///
     /// Only endings. `Ok(Some(code))` is the peer's `STOP_SENDING` and is the
-    /// case this exists for; a lost connection is reported as such; and quinn's
-    /// `Ok(None)` -- the stream gone from the transport, which on a live tunnel
-    /// means this endpoint finished it and the peer acknowledged every byte --
-    /// is reported as this endpoint's own clean ending, since no peer said
-    /// anything. All three mean the same thing to a caller: nothing more will be
-    /// sent on this stream.
+    /// case this exists for. A lost connection is reported as such. Quinn's
+    /// `Ok(None)` means the stream is gone from the transport, which on a live
+    /// tunnel means this endpoint finished it and the peer acknowledged every
+    /// byte. It is reported as this endpoint's own clean ending. All three mean
+    /// the same thing to a caller: nothing more will be sent on this stream.
     pub fn stopped(
         &self,
     ) -> impl std::future::Future<Output = StreamError> + Send + 'static + use<> {
@@ -1056,9 +1019,7 @@ impl Writer {
                 Err(quinn::StoppedError::ConnectionLost(error)) => {
                     StreamError::Connection(error.into())
                 }
-                // 0-RTT, which this server never accepts (`tls::server_crypto`
-                // sets `max_early_data_size` to 0, with RFC 9001 §9.2 quoted
-                // beside it), so there is no rejection to report.
+                // 0-RTT, which this server never accepts; see `error::internal`.
                 Err(other) => StreamError::Local(Violation::stream(
                     Code::H3_INTERNAL_ERROR,
                     other.to_string(),
@@ -1084,20 +1045,19 @@ pub struct Reader {
     /// Kept rather than acted on, because the pieces handed out before it may
     /// not have reached the far side of the tunnel yet. [`Self::recv_data`]
     /// reports it the next time it is called, which a caller does only once it
-    /// has dealt with those pieces: the order a reader that met the error there
-    /// would have had.
+    /// has dealt with those pieces.
     deferred: Option<frame::Error>,
 }
 
 impl Reader {
     /// Reads the next chunk of body data.
     ///
-    /// `Ok(None)` means the peer finished its sending side -- for a CONNECT
+    /// `Ok(None)` means the peer finished its sending side: for a CONNECT
     /// tunnel, the client's FIN.
     ///
     /// Cancel-safe: every byte read is accounted for in `self` before this
-    /// returns, so a caller may poll it inside a `select!` with a timeout, which
-    /// is exactly what a UDP session does.
+    /// returns, so a caller may poll it inside a `select!` with a timeout, as a
+    /// UDP session does.
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, StreamError> {
         if let Some(error) = self.deferred.take() {
             return Err(self.report(error));
@@ -1164,30 +1124,29 @@ impl Reader {
     /// How long [`Reader::reset_by_peer`] may take to notice a reset that
     /// arrived while quinn held bytes of the stream that no read had taken.
     ///
-    /// Only that case costs anything: a zero-length read cannot park on a
-    /// stream that has bytes to give, so the watcher has nothing to be woken by
-    /// and looks again on a timer instead. A reset that lands while quinn has
-    /// nothing of the stream wakes the parked read at once and never waits this
-    /// long. Bytes in the read-ahead do not count either way, because they have
-    /// already left quinn; [`Reader::reset_by_peer`] says what that changed.
+    /// Only that case costs anything: a zero-length read cannot wait on a
+    /// stream that has bytes to give, so the watcher looks again on a timer
+    /// instead. A reset that lands while quinn has nothing of the stream wakes
+    /// the waiting read at once. Bytes in the read-ahead do not count either
+    /// way, because they have already left quinn; [`Reader::reset_by_peer`]
+    /// says how that plays out.
     ///
     /// 250 ms is an order of magnitude under the bound the regression test
-    /// holds the target's close to, and the wait it replaces was unbounded: a
-    /// client that reset its request stream while its target had stopped
-    /// reading used to hold the target socket, its file descriptor and the
-    /// tunnel slot for the life of the QUIC connection. A peer cannot stretch
-    /// it -- the timer is this server's, and sending more bytes only keeps the
-    /// watcher on the timer it is already on.
+    /// holds the target's close to. Without a bound, a client that reset its
+    /// request stream while its target had stopped reading would hold the
+    /// target socket, its file descriptor and the tunnel slot for the life of
+    /// the QUIC connection. A peer cannot stretch it: the timer is this
+    /// server's, and sending more bytes only keeps the watcher on the same
+    /// timer.
     const RESET_PEEK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
     /// Resolves when the peer resets this stream, with the reset as an error.
     ///
-    /// [`Self::recv_data`] already reports a reset -- it is the `Err` a read
-    /// fails with -- but only to a caller that is reading. A CONNECT tunnel
-    /// spends much of its life not reading: with a chunk in hand and a target
-    /// that has stopped taking bytes, the pump is parked in a write instead,
-    /// and nothing there watches the request stream. This is what such a write
-    /// can select on.
+    /// [`Self::recv_data`] already reports a reset as the `Err` a read fails
+    /// with, but only to a caller that is reading. A CONNECT tunnel spends much
+    /// of its life not reading: with a chunk in hand and a target that has
+    /// stopped taking bytes, the pump waits in a write instead, and nothing
+    /// there watches the request stream. Such a write can select on this.
     ///
     /// It reports *only* a reset, and never resolves for any other ending. A
     /// clean FIN and a stream this endpoint stopped both belong to the reading
@@ -1196,7 +1155,7 @@ impl Reader {
     ///
     /// # Why not `quinn::RecvStream::received_reset`
     ///
-    /// Because it borrows a slot it never gives back, and quinn asserts on that
+    /// Because it takes a slot it never gives back, and quinn asserts on that
     /// slot being empty. quinn keeps **one** waker per stream for whoever is
     /// waiting to read, and exactly three things take an entry out of it: a
     /// `StreamEvent::Readable` for that stream, a `RecvStream::stop` while the
@@ -1206,58 +1165,54 @@ impl Reader {
     /// call writes into the slot on every poll that finds no reset, and a
     /// `select!` which drops the arm leaves it behind.
     ///
-    /// In release builds that is a leak -- one waker per tunnel, held until the
+    /// In release builds that is a leak: one waker per tunnel, held until the
     /// connection closes, keeping the finished task's cell alive with it. In
     /// debug builds it is a panic, because `RecvStream::drop` debug-asserts the
     /// slot is empty once the stream has been read to its end. An ordinary
-    /// upload trips it: the client sends chunk after chunk with its FIN behind
-    /// them, the pump is parked writing chunk *k* while *k+1* onwards are
-    /// already buffered, and every one of those iterations leaves another waker
-    /// behind. Nothing becomes readable after the FIN, so the last one is never
+    /// upload causes it. The client sends chunk after chunk with its FIN behind
+    /// them, the pump waits writing chunk *k* while *k+1* onwards are already
+    /// buffered, and every one of those iterations leaves another waker behind.
+    /// Nothing becomes readable after the FIN, so the last one is never
     /// cleared, and the clean end of the stream then panics the tunnel's task
     /// inside a destructor.
     ///
     /// So the wait is built on the zero-length read alone, which registers only
     /// through quinn's own read path. That kind of entry is safe to abandon:
-    /// quinn takes it out again the moment the stream becomes readable, and a
-    /// stream cannot reach its end without becoming readable first, so there is
-    /// never one left when the reading half meets the FIN.
+    /// quinn takes it out again when the stream becomes readable, and a stream
+    /// cannot reach its end without becoming readable first, so there is never
+    /// one left when the reading half meets the FIN.
     ///
     /// # What that costs
     ///
-    /// A zero-length read parks only while the stream has nothing to give. With
-    /// bytes already buffered it returns at once -- which is precisely the state
-    /// a stalled upload sits in -- so the wait there is a poll on a timer rather
-    /// than a wake-up, and `RESET_PEEK_INTERVAL` -- 250 ms, documented where it
-    /// is defined -- bounds how late the reset is noticed. A reset that arrives
-    /// while nothing is buffered needs no timer: it wakes the parked read at
-    /// once, as any read error would.
+    /// A zero-length read waits only while the stream has nothing to give.
+    /// With bytes already buffered it returns at once, and a stalled upload is
+    /// in that state. So the wait there is a poll on a timer rather than a
+    /// wake-up, and `RESET_PEEK_INTERVAL` bounds how late the reset is noticed.
+    /// A reset that arrives while nothing is buffered needs no timer: it wakes
+    /// the waiting read at once, as any read error would.
     ///
     /// # The read-ahead
     ///
     /// The zero-length read asks quinn, and the chunks in the read-ahead
     /// ([`frame::READ_AHEAD_CHUNKS`]) have already left quinn. So the choice
-    /// between the timer and a wake-up turns on whether quinn holds bytes
+    /// between the timer and a wake-up depends on whether quinn holds bytes
     /// beyond what the last read took. A stalled upload whose client keeps
-    /// sending refills quinn and is on the timer, as it was before the
-    /// read-ahead existed. A stalled upload whose last read took everything
-    /// quinn had now parks the zero-length read, and a reset wakes it at once
-    /// where it used to wait for the timer.
+    /// sending refills quinn and is on the timer. A stalled upload whose last
+    /// read took everything quinn had waits in the zero-length read, and a
+    /// reset wakes it at once.
     ///
     /// A reset found here is reported while the read-ahead may still hold
     /// bytes the client sent before it. The reading half would hand those out
     /// first; this reports only the reset, and a tunnel acting on it drops them
-    /// with the rest of the stream. Before the read-ahead, the same bytes sat
-    /// in quinn, which discards a reset stream's unread bytes, so the outcome
-    /// is the one it was.
+    /// with the rest of the stream. That matches quinn, which discards a reset
+    /// stream's unread bytes.
     ///
     /// Cancel-safe, so a `select!` may poll it and drop it repeatedly.
     pub async fn reset_by_peer(&mut self) -> StreamError {
         loop {
             match self.frames.readable().await {
-                // Bytes are waiting in quinn, so a read cannot park on this
-                // stream and there is nothing here to be woken by. Look again
-                // shortly.
+                // Bytes are waiting in quinn, so a read cannot wait on this
+                // stream and nothing will wake it. Look again shortly.
                 Ok(true) => tokio::time::sleep(Self::RESET_PEEK_INTERVAL).await,
 
                 // The peer finished and quinn has handed over everything it
@@ -1319,17 +1274,15 @@ fn body_piece(item: Item) -> Result<Option<Bytes>, frame::Error> {
 
         Item::Data(data) => Ok(Some(data)),
 
-        // RFC 9114 §4.4's rule -- once the CONNECT method has completed only
-        // DATA may follow, and any other known frame type is a connection error
-        // of type H3_FRAME_UNEXPECTED -- is applied a layer down, by
-        // `frame::misplaced`, so that it is decided from a frame's header rather
-        // than after its payload has been buffered and charged for.
-        // [`Stream::split`] is what puts a reader's decoder into that mode, and a
-        // [`Reader`] exists only through it.
+        // RFC 9114 §4.4's rule that only DATA may follow a completed CONNECT is
+        // applied a layer down, by `frame::misplaced`, so that it is decided
+        // from a frame's header rather than after its payload has been buffered
+        // and charged for. [`Stream::split`] puts a reader's decoder into that
+        // mode, and a [`Reader`] exists only through it.
         //
         // So nothing reaches this arm. It repeats the verdict rather than
-        // relaying an unexpected frame into a tunnel, because which mode a
-        // decoder is in is not something the type system knows.
+        // relaying an unexpected frame into a tunnel, because the type system
+        // does not know which mode a decoder is in.
         Item::Frame(_) => Err(Violation::connection(
             Code::H3_FRAME_UNEXPECTED,
             frame::NON_DATA_FRAME_ON_A_TUNNEL,
