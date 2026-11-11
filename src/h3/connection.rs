@@ -388,6 +388,16 @@ impl DatagramReceiver {
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.inbound.recv().await
     }
+
+    /// Takes the next payload routed to this session if one is already queued,
+    /// without waiting.
+    ///
+    /// `None` means nothing is queued at this moment. The end of the queue is
+    /// not told apart from that here: [`Self::recv`] reports it, so a caller
+    /// that drains the queue with this goes back to `recv` once it sees `None`.
+    pub fn try_recv(&mut self) -> Option<Bytes> {
+        self.inbound.try_recv().ok()
+    }
 }
 
 impl Drop for DatagramReceiver {
@@ -2092,6 +2102,25 @@ mod tests {
         );
         assert!(first.inbound.try_recv().is_err(), "one payload each");
         assert!(second.inbound.try_recv().is_err(), "one payload each");
+    }
+
+    /// `try_recv` hands out what is already queued, in order, and nothing
+    /// more, without waiting.
+    #[tokio::test]
+    async fn try_recv_takes_what_is_queued_in_order() {
+        let shared = Arc::new(Shared::default());
+        let mut inbound = shared.register_datagrams(1).expect("a free id");
+
+        assert_eq!(inbound.try_recv(), None, "nothing is queued yet");
+
+        for payload in [&b"first"[..], b"second", b"third"] {
+            shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
+        }
+
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"first".as_slice()));
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"second".as_slice()));
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"third".as_slice()));
+        assert_eq!(inbound.try_recv(), None, "three were queued");
     }
 
     /// The claim lasts exactly as long as the receiver: this is what keeps the

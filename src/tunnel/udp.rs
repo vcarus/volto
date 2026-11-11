@@ -468,6 +468,39 @@ enum Step {
     Aborted(h3api::Code),
 }
 
+/// How many events one wake of a session handles from the source that woke
+/// it before the session waits again.
+///
+/// A burst runs from the wait's own event through what the same source already
+/// has ready, and the wait comes back after at most this many. That bounds two
+/// things. The other two sources are polled again at least once per this many
+/// packets, so a target flooding the socket cannot keep the request stream or
+/// the inbound queue from being read, and a flooding client cannot do it to
+/// the socket. And the idle deadline is read on every wait, by
+/// [`before_deadline`], so it is read at least once per this many packets,
+/// which is D92's rule for a source the peer can keep ready: a burst of
+/// payloads the unanswered budget drops moves no packet and still reaches the
+/// clock. 32 spreads one wake over a burst of packets and keeps one wake to a
+/// few hundred microseconds of work.
+const BURST: usize = 32;
+
+/// Whether a burst that has handled `handled` events, the last ending in
+/// `step`, may take another.
+///
+/// Any step but [`Step::Continue`] ends it at once: the session is over.
+fn burst_continues(handled: usize, step: Step) -> bool {
+    step == Step::Continue && handled < BURST
+}
+
+/// A source a burst can take more from without waiting.
+#[derive(Debug, Clone, Copy)]
+enum Source {
+    /// The inbound datagram queue.
+    Inbound,
+    /// The target socket.
+    Socket,
+}
+
 /// Which of a session's three sources produced work, before it is handled.
 ///
 /// Exists so the idle timeout can cover the *waiting* and nothing else; see
@@ -595,30 +628,28 @@ impl Session<'_> {
                 break;
             };
 
-            let step = match event {
-                Event::Inbound(Some(payload)) => self.forward_to_target(payload).await,
-                // Only reachable if the routing table lost this session's
-                // entry, which nothing but dropping `inbound` can do.
-                Event::Inbound(None) => Step::Stop,
-                Event::Socket(Ok(_)) => self.forward_to_client(&mut packets).await,
-                Event::Socket(Err(error)) => {
-                    // ICMP errors surface here on a connected socket, and they
-                    // are not all the same thing. A socket the operating system
-                    // has given up on ends the session, which is RFC 9298 §3.1;
-                    // an error about one packet costs that packet, which is the
-                    // rule the send side has always applied. See
-                    // [`read_verdict`] for what was measured.
-                    let verdict = read_verdict(&error);
-                    debug!(
-                        stream_id,
-                        %error,
-                        per_packet = verdict == Step::Continue,
-                        "target socket failed"
-                    );
-                    verdict
-                }
-                Event::Stream(chunk) => self.handle_stream_chunk(chunk).await,
+            // What else the source that woke the session already has ready is
+            // handled before the next wait, up to `BURST` events in all; see
+            // there for the bound. Only payloads and packets: a stream chunk is
+            // decoded whole by `handle_stream_chunk`, and the request stream's
+            // reader already reads ahead.
+            let source = match &event {
+                Event::Inbound(Some(_)) => Some(Source::Inbound),
+                Event::Socket(Ok(_)) => Some(Source::Socket),
+                _ => None,
             };
+
+            let mut step = self.handle(event, &mut packets).await;
+            let mut handled = 1;
+            while let Some(source) = source
+                && burst_continues(handled, step)
+            {
+                let Some(event) = self.ready(source, &mut packets) else {
+                    break;
+                };
+                step = self.handle(event, &mut packets).await;
+                handled += 1;
+            }
 
             match step {
                 Step::Continue => {}
@@ -644,6 +675,71 @@ impl Session<'_> {
         self.reader.stop_receiving(h3api::NO_ERROR);
         if let Err(error) = self.writer.finish() {
             debug!(stream_id, %error, "failed to finish the connect-udp stream");
+        }
+    }
+
+    /// Handles one event from one of the three sources.
+    ///
+    /// Every rule that applies to a packet is applied here, one packet at a
+    /// time, whether the event came from the wait or from a burst.
+    async fn handle(&mut self, event: Event, packets: &mut PacketBlock) -> Step {
+        match event {
+            Event::Inbound(Some(payload)) => self.forward_to_target(payload).await,
+            // Only reachable if the routing table lost this session's
+            // entry, which nothing but dropping `inbound` can do.
+            Event::Inbound(None) => Step::Stop,
+            Event::Socket(Ok(_)) => self.forward_to_client(packets).await,
+            Event::Socket(Err(error)) => {
+                // ICMP errors surface here on a connected socket, and they
+                // are not all the same thing. A socket the operating system
+                // has given up on ends the session, which is RFC 9298 §3.1;
+                // an error about one packet costs that packet, which is the
+                // rule the send side has always applied. See
+                // [`read_verdict`] for what was measured.
+                let verdict = read_verdict(&error);
+                debug!(
+                    stream_id = self.stream_id,
+                    %error,
+                    per_packet = verdict == Step::Continue,
+                    "target socket failed"
+                );
+                verdict
+            }
+            Event::Stream(chunk) => self.handle_stream_chunk(chunk).await,
+        }
+    }
+
+    /// The next event `source` has ready, without waiting, or `None` if it has
+    /// nothing.
+    ///
+    /// The socket is read with `READABLE` alone. tokio's `try_io` compares its
+    /// cached readiness with `Interest::mask`, and in tokio 1.54 that mask is
+    /// empty for a combined interest such as `READABLE | ERROR`, so a combined
+    /// interest would never read at all. An error the kernel returns from the
+    /// read is graded as the wait grades it. An error with no readable packet
+    /// behind it ends the burst, and the next wait, which does include
+    /// `ERROR`, picks it up. The socket is read only while packets go out as
+    /// QUIC datagrams: on the capsule fallback every packet is a write to the
+    /// request stream that can wait for the client, and those are left one per
+    /// wake.
+    fn ready(&mut self, source: Source, packets: &mut PacketBlock) -> Option<Event> {
+        match source {
+            Source::Inbound => self
+                .inbound
+                .try_recv()
+                .map(|payload| Event::Inbound(Some(payload))),
+            Source::Socket => {
+                if self.datagrams.is_none() || !self.ctx.datagrams_allowed() {
+                    return None;
+                }
+                match self
+                    .socket
+                    .try_io(Interest::READABLE, || packets.recv(&self.socket))
+                {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+                    received => Some(Event::Socket(received)),
+                }
+            }
         }
     }
 
@@ -1876,6 +1972,30 @@ mod tests {
             after_first - cost,
             "the second packet read the room although the bound covered it"
         );
+    }
+
+    /// A burst takes at most `BURST` events, and ends at the first step that
+    /// ends the session.
+    ///
+    /// The bound is what lets the other two sources and the idle deadline be
+    /// read between bursts; the early end is what keeps a closed or aborted
+    /// session from handling another packet.
+    #[test]
+    fn a_burst_is_bounded_and_ends_with_the_session() {
+        // Counted over a range past the bound, so a burst with no bound fails
+        // here rather than running for ever.
+        let taken = (1..=4 * BURST)
+            .take_while(|&handled| burst_continues(handled, Step::Continue))
+            .count();
+        assert_eq!(taken + 1, BURST, "a burst handles {BURST} events in all");
+        assert!(!burst_continues(BURST, Step::Continue));
+
+        for over in [Step::Stop, Step::Aborted(h3api::REQUEST_CANCELLED)] {
+            assert!(
+                !burst_continues(1, over),
+                "{over:?} must end the burst after the event that produced it"
+            );
+        }
     }
 
     #[test]
