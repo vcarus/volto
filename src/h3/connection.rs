@@ -452,6 +452,28 @@ impl Handle {
         ConnectionError::Local(stored)
     }
 
+    /// Ends the connection for a reason of this endpoint's own, and records it
+    /// the way [`Self::fail`] records a violation.
+    ///
+    /// `code` and `reason` go on the wire as given. The record is what keeps
+    /// the connection's error naming this close: quinn still hands out stream
+    /// data it buffered before the close, a task can find a violation in it and
+    /// call [`Self::fail`], and the first record is the one both keep. If a
+    /// violation was recorded first, that one closed the connection, and its
+    /// code and text are used here too, as [`Self::fail`] would use them.
+    pub(crate) fn close_for(&self, code: Code, reason: &'static str) -> ConnectionError {
+        let ours = Violation::connection(code, reason);
+        let stored = self.shared.record(ours.clone());
+        let text = if stored == ours {
+            reason.to_owned()
+        } else {
+            stored.to_string()
+        };
+        self.quic.close(varint(stored.code()), text.as_bytes());
+
+        ConnectionError::Local(stored)
+    }
+
     /// Interprets a QUIC connection failure, restoring our own reason if the
     /// connection ended because [`Self::fail`] closed it.
     fn interpret(&self, error: quinn::ConnectionError) -> ConnectionError {
@@ -1957,6 +1979,50 @@ mod tests {
         let reported = shared.record(second);
         assert_eq!(reported, first);
         assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
+    }
+
+    /// A close for a reason of this endpoint's own is the reason reported, even
+    /// when a task finds a violation afterwards.
+    ///
+    /// After a local close quinn still hands out stream data it had buffered,
+    /// so a request stream can find a connection-level violation in it and
+    /// call [`Handle::fail`]. The connection's error, which the closing log
+    /// line prints, must still name the close that went out.
+    #[tokio::test]
+    async fn a_close_for_a_reason_of_our_own_is_not_renamed_by_a_later_violation() {
+        let (client, server) =
+            crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
+        let handle = Handle {
+            quic: server,
+            idle: Duration::from_secs(5),
+            shared: Arc::new(Shared::default()),
+        };
+
+        let _ = handle.close_for(
+            Code::H3_REQUEST_REJECTED,
+            "too many authentication failures",
+        );
+        let _ = handle.fail(Violation::connection(
+            Code::H3_FRAME_UNEXPECTED,
+            "a frame found later in buffered data",
+        ));
+
+        let ConnectionError::Local(reported) =
+            handle.interpret(quinn::ConnectionError::LocallyClosed)
+        else {
+            panic!("the connection was closed by this endpoint");
+        };
+        assert_eq!(reported.code(), Code::H3_REQUEST_REJECTED, "{reported}");
+
+        // The wire carries the code and the reason phrase as they were given.
+        let closed = tokio::time::timeout(Duration::from_secs(5), client.closed())
+            .await
+            .expect("the client must see the close");
+        let quinn::ConnectionError::ApplicationClosed(close) = closed else {
+            panic!("expected an application close, got {closed}");
+        };
+        assert_eq!(close.error_code.into_inner(), 0x10b);
+        assert_eq!(&close.reason[..], b"too many authentication failures");
     }
 
     /// A datagram as it arrives on the wire: two varints and a payload.

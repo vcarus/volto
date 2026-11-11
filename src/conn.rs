@@ -114,8 +114,8 @@ pub async fn handle(
     // Cloned before the handshake, which takes ownership of the connection. The
     // context needs the connection itself, not only its datagram half: a UDP
     // session sends datagrams on it and asks it per packet how large one may be
-    // and how far behind the send queue is, the auth-failure limit closes it,
-    // and the first authenticated request raises its stream allowance (D98).
+    // and how far behind the send queue is, and the first authenticated
+    // request raises its stream allowance (D98).
     // Inbound datagrams are not among those uses -- they are routed by the
     // HTTP/3 connection to the request stream that claimed them (D79).
     let for_context = quic.clone();
@@ -540,9 +540,13 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
                     failures = context.max_auth_failures,
                     "closing the connection after repeated authentication failures"
                 );
-                context.quic.close(
+                // Through the stream rather than `context.quic`, so the close
+                // is recorded as the connection's reason. A task that finds a
+                // violation afterwards in buffered data cannot rename it in the
+                // closing line.
+                stream.close_connection(
                     h3api::AUTH_FAILURE_LIMIT_CODE,
-                    b"too many authentication failures",
+                    "too many authentication failures",
                 );
                 return;
             }

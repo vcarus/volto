@@ -298,11 +298,13 @@ pub struct Context {
     /// Most uses are a datagram being sent, and only the sending half: an
     /// inbound datagram is routed to the request stream it names by the HTTP/3
     /// connection, and reaches a session through the
-    /// [`crate::h3api::DatagramReceiver`] that stream handed it (D79). The rest
-    /// are connection-wide decisions a request can reach — closing after repeated
-    /// authentication failures, and raising the stream allowance once one
-    /// succeeds (`Context::mark_authenticated`) — which is why the handle is
-    /// named for what it is rather than for what it mostly does.
+    /// [`crate::h3api::DatagramReceiver`] that stream handed it (D79). The other
+    /// use is a connection-wide decision a request can reach: raising the
+    /// stream allowance once a request authenticates
+    /// (`Context::mark_authenticated`). That is why the handle is named for what
+    /// it is rather than for what it mostly does. Closing after repeated
+    /// authentication failures goes through the request's stream instead, so
+    /// the HTTP/3 layer records it as the connection's reason.
     pub quic: quinn::Connection,
     /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
     ///
