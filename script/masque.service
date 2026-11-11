@@ -95,9 +95,10 @@ ReadOnlyPaths=/etc/volto
 
 # --- Syscall and network surface -------------------------------------------
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-# AF_INET and AF_INET6 are the families of the sockets volto opens itself,
-# including the bind that checks whether a target is one of this host's own
-# addresses. AF_UNIX and AF_NETLINK are for name resolution in a glibc build:
+# AF_INET and AF_INET6 are the families of the sockets volto opens itself with
+# socket(2), including the bind that checks whether a target is one of this
+# host's own addresses. The directive filters socket(2) only, so the AF_UNIX
+# socketpair that tokio uses for signals is not affected. AF_UNIX and AF_NETLINK are for name resolution in a glibc build:
 # getaddrinfo goes through NSS, modules such as `resolve` and `myhostname` open
 # sockets in those families, and a denied family can fail the lookup. The static
 # musl release binary has no NSS and does not need them. They stay allowed so
