@@ -553,16 +553,21 @@ client that keeps using a connection after GOAWAY instead of opening a new one
 — Surge does — has every new request fail until the drain ends, so a long
 grace period trades a longer outage for every new request against finishing the
 transfers already in flight. Raise it if long transfers matter more to you than
-a few seconds of failed requests at each restart. The drain costs twice the
-grace period plus a fixed tail: `2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT +
-EXIT_SLACK`, which is `2 * shutdown_grace + 3` seconds at the shipped
-constants, because each connection gets one grace period to drain its tunnels
-and one more to flush its CLOSE. Set systemd's `TimeoutStopSec` above that
-bound, not above the grace period alone: the shipped unit uses 45, which covers
-the default grace of 5 with 13 seconds of drain. An hour is the most that can
-be configured, and at that ceiling the bound is 7203 seconds, so
-`TimeoutStopSec` has to be raised past 45 as well, or systemd sends SIGKILL
-mid-drain.
+a few seconds of failed requests at each restart.
+
+The tunnels get one grace period. After it, the endpoint gets
+`CLOSE_FLUSH_TIMEOUT` (1 s) to flush its CLOSE, and then a name lookup still
+running on the blocking pool gets up to `shutdown_grace + CLOSE_FLUSH_TIMEOUT +
+EXIT_SLACK` more, because `getaddrinfo` cannot be cancelled. That second wait
+happens only while a lookup is still running. So the exit takes at most
+`2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT + EXIT_SLACK`, which is
+`2 * shutdown_grace + 3` seconds at the shipped constants. The bound is not
+the tunnels' allowance: with `shutdown_grace = 20` the tunnels are closed at
+20 s. Set systemd's `TimeoutStopSec` above the whole bound, not above the grace
+period alone: the shipped unit uses 45, which covers the 13 seconds the default
+grace of 5 can take. An hour is the most that can be configured, and at that
+ceiling the bound is 7203 seconds, so `TimeoutStopSec` has to be raised past 45
+as well, or systemd sends SIGKILL mid-drain.
 
 The GOAWAY carries an identifier, and it is a promise in both directions.
 Requests below it were already accepted and are still served during the drain,

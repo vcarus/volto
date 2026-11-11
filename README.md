@@ -79,7 +79,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Open-proxy defences** | Private, loopback and multicast ranges refused by default (IPv4-mapped bypasses included), port 25 denied, tunnels capped per connection, unanswered UDP sessions bounded, name-lookup budget per connection. |
 | **QUIC transport** | Stream limits, idle timeout, keep-alive, initial MTU, PMTU probing, congestion controller (BBR by default) and initial RTT are configuration, not constants. |
 | **Operations** | `SIGHUP` reload that rejects a bad configuration whole and keeps serving; graceful shutdown with GOAWAY and a grace period; systemd unit, installer and self-updating deploy script included. |
-| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which validates a file with the same `Config::load` path startup uses; certificate and key parsing stay startup's business ([what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
+| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which runs the same configuration loading as startup but does not parse the certificate or key ([what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
 
 **Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel.
 
@@ -92,7 +92,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Behind a relay** | Works behind a plain L4 UDP DNAT relay; TLS terminates only on volto. See [Running behind a UDP relay](docs/deployment.md#running-behind-a-udp-relay). |
 | **Development** | macOS or Linux, Rust 1.95+. The test suite is green on both. |
 
-From v1.0.0 on, configuration keys, their defaults and the command-line arguments are stable within 1.x, and a key is removed only after at least one minor release has warned about it, with one exception so far: `bbr-capped`, removed in v1.3.0 without a warning release. Log line shapes and the `volto` library API are outside that promise; see [Version compatibility](docs/configuration.md#version-compatibility).
+From v1.0.0 on, configuration keys, their defaults and the command-line arguments are stable within 1.x, and a key is removed only after at least one minor release has warned about it. One exception so far: v1.3.0 removed the accepted value `congestion_control = "bbr-capped"` without a warning release, so a file that sets it no longer loads. Log line shapes and the `volto` library API are outside that promise; see [Version compatibility](docs/configuration.md#version-compatibility).
 
 ## Documentation
 

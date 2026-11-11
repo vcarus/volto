@@ -30,7 +30,7 @@ whole and the running configuration keeps serving; see
 | `cert` | path | required | PEM certificate chain, leaf first |
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging. A list that does not offer `h3` starts a server no client can reach — HTTP/3 is the only protocol volto serves, so TLS ends every handshake with `no_application_protocol`, an alert that says nothing about why — and volto warns about it at startup |
-| `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. The drain costs `2 * shutdown_grace + 3` seconds at the shipped constants, because each connection gets one grace period to drain its tunnels and one more to flush its CLOSE, so systemd's `TimeoutStopSec` must be above that. The ceiling is there because the value is a bound: a drain longer than an hour has outlived any service manager's patience, so it would only replace the graceful ending with a `SIGKILL` |
+| `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. The tunnels get one grace period. The exit can take up to `2 * shutdown_grace + 3` seconds at the shipped constants, because after the grace period and a 1 s close flush, a name lookup still running on the blocking pool gets a second grace period plus 2 s (`getaddrinfo` cannot be cancelled), so systemd's `TimeoutStopSec` must be above that. The ceiling is there because the value is a bound: a drain longer than an hour has outlived any service manager's patience, so it would only replace the graceful ending with a `SIGKILL` |
 
 ## `[auth]`
 
@@ -675,11 +675,11 @@ warning. Two consequences, and they are not symmetric.
 **Upgrading is safe, with one exception.** A key a later release adds takes its
 documented default when the file does not mention it, and nothing ever rewrites
 `/etc/volto/config.toml`: not `script/deploy.sh` on an update, not
-`install-selfsigned.sh` on a re-run. No key has been renamed, one has been
-removed (`bbr-capped` in v1.3.0, documented under
-[What is stable from v1.0.0](#what-is-stable-from-v100)), a file that writes it
-is refused at startup, and apart from that exception a file written for any
-earlier release still loads.
+`install-selfsigned.sh` on a re-run. No key has been renamed or removed. One
+accepted value has been removed: `congestion_control = "bbr-capped"`, in v1.3.0
+(documented under [What is stable from v1.0.0](#what-is-stable-from-v100)). A
+file that sets it is refused at startup, and apart from that exception a file
+written for any earlier release still loads.
 
 **Rolling back is not.** A file that names a key the older binary does not know
 stops it from starting at all, which is the one moment that costs the most: a
@@ -731,9 +731,10 @@ Configuration keys and the command-line arguments are stable within 1.x, under
 four rules. A key keeps its name and its meaning. A file written for any earlier
 1.x release still loads. A documented default can move in a minor release when
 the release note says so, and the old value stays settable. A key is removed
-only after at least one minor release has warned about it at startup, with one
-exception recorded below: `bbr-capped`, removed in v1.3.0 without a warning
-release. The cases so far are these. v1.2.0 lowers the documented default of `mtu_upper_bound` from
+only after at least one minor release has warned about it at startup. One
+exception to the second rule is recorded below: v1.3.0 removed the accepted
+value `congestion_control = "bbr-capped"` without a warning release. The cases
+so far are these. v1.2.0 lowers the documented default of `mtu_upper_bound` from
 1452 to 1436 on measured evidence (the MTU paragraphs under [Notes that matter
 in practice](#notes-that-matter-in-practice) give it); a host that relied on
 1452 can set it explicitly. v1.2.0 also changes what `bbr`, the default value of
