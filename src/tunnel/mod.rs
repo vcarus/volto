@@ -1127,9 +1127,9 @@ mod tests {
     /// while no interface carries the public IPv4 address. Each of those
     /// targets reaches this host, so the check asks about both forms.
     ///
-    /// Every vector embeds 192.0.2.45. The Teredo one is the RFC 4380 §4
-    /// example layout, whose client field `3fff:fdd2` is that address with
-    /// every bit inverted. The scope ID on the Teredo literal is there to show
+    /// Every vector embeds 192.0.2.45. The Teredo one follows the RFC 4380 §4
+    /// layout, with 192.0.2.1 (`c000:201`) as the server field and a client
+    /// field, `3fff:fdd2`, that is 192.0.2.45 with every bit inverted. The scope ID on the Teredo literal is there to show
     /// that it is kept on the IPv6 probe, which is the form a scope belongs to.
     #[test]
     fn a_transition_address_is_probed_as_written_and_as_routed() {
@@ -1137,7 +1137,7 @@ mod tests {
         for written in [
             "[64:ff9b::c000:22d]:22",
             "[2002:c000:22d::1]:22",
-            "[2001:0:4136:e378:8000:63bf:3fff:fdd2]:22",
+            "[2001:0:c000:201:8000:63bf:3fff:fdd2]:22",
             "[::c000:22d]:22",
         ] {
             let target: std::net::SocketAddr = written.parse().expect("a socket address");
@@ -1154,13 +1154,13 @@ mod tests {
             assert_eq!(probes.len(), 2, "{written}: {probes:?}");
         }
 
-        let scoped: std::net::SocketAddr = "[2001:0:4136:e378:8000:63bf:3fff:fdd2%7]:22"
+        let scoped: std::net::SocketAddr = "[2001:0:c000:201:8000:63bf:3fff:fdd2%7]:22"
             .parse()
             .expect("a socket address");
         let probes = own_address_probes(scoped);
         assert!(
             probes.contains(&std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
-                "2001:0:4136:e378:8000:63bf:3fff:fdd2".parse().unwrap(),
+                "2001:0:c000:201:8000:63bf:3fff:fdd2".parse().unwrap(),
                 0,
                 0,
                 7,
