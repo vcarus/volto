@@ -12,7 +12,7 @@ mod status;
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -279,6 +279,16 @@ impl AuthFailures {
     }
 }
 
+/// What one queued datagram costs quinn's datagram send buffer beyond its own
+/// bytes, or more.
+///
+/// quinn charges `size_of` its frame struct per queued datagram, which wraps
+/// one `Bytes` and is 32 bytes on a 64-bit target. The struct is private to
+/// quinn, so twice that is used: a cost counted too high leaves
+/// [`Context::claim_datagram_room`]'s bound lower than the room, which costs a
+/// reading and never a wrong grade.
+const QUEUED_DATAGRAM_COST: usize = 2 * std::mem::size_of::<bytes::Bytes>();
+
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Built once per connection and held in an `Arc`, so sharing it with a request
@@ -476,6 +486,18 @@ pub struct Context {
     /// which is real; staying there costs it nothing at all, and every further
     /// request was a warning for as long as it cared to keep asking.
     pub limit_refusals: crate::logfmt::Sampler,
+    /// A lower bound of the room left in quinn's outgoing datagram queue, in
+    /// the units `quinn::Connection::datagram_send_buffer_space` reports.
+    ///
+    /// The UDP path reads that room only to say when a send evicts older
+    /// datagrams (`udp::DatagramPath`), and reading it takes the connection's
+    /// lock. This holds the last reading less what every session on the
+    /// connection has queued since, which stays a lower bound because quinn
+    /// only ever adds room: by sending, by evicting, or by dropping what no
+    /// longer fits the path. A datagram the bound already covers fits, so it is
+    /// graded without a reading. Shared by the connection's sessions because
+    /// they share the queue. Starts at zero, so the first datagram reads.
+    datagram_room: AtomicUsize,
 }
 
 impl Context {
@@ -525,7 +547,50 @@ impl Context {
             policy_refusals: crate::logfmt::Sampler::new(),
             limit_refusals: crate::logfmt::Sampler::new(),
             unanswered_closures: crate::logfmt::Sampler::new(),
+            datagram_room: AtomicUsize::new(0),
         }
+    }
+
+    /// Counts a datagram of `len` bytes against [`Self::datagram_room`] if the
+    /// bound shows room for it, reporting whether it did.
+    ///
+    /// `true` means quinn's queue has room for the datagram, by the same
+    /// `len <= space` comparison quinn makes, and the bound is lowered by what
+    /// queuing it costs. `false` changes nothing: the caller reads the real
+    /// room and hands the reading to [`Self::reset_datagram_room`].
+    ///
+    /// `Relaxed`, for the reason the unanswered budget gives: the bound is
+    /// ordered against nothing but itself, and the compare-and-swap is what
+    /// makes two sessions' claims both count.
+    pub(crate) fn claim_datagram_room(&self, len: usize) -> bool {
+        self.datagram_room
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |room| {
+                (len <= room).then(|| room.saturating_sub(len.saturating_add(QUEUED_DATAGRAM_COST)))
+            })
+            .is_ok()
+    }
+
+    /// Replaces [`Self::datagram_room`] with `space`, read from quinn just
+    /// before a datagram of `len` bytes is queued, less what queuing it costs.
+    ///
+    /// One reading and one queued datagram are not one step, here or in
+    /// quinn's own API, so a datagram another session queues between this
+    /// session's reading and its store is not counted. The bound can then be
+    /// that datagram's cost too high, and a later datagram can be graded as
+    /// fitting by that much when it did not. A single session is exact; the
+    /// reading and the send were two lock acquisitions before this bound
+    /// existed, with the same interleaving between them.
+    pub(crate) fn reset_datagram_room(&self, space: usize, len: usize) {
+        self.datagram_room.store(
+            space.saturating_sub(len.saturating_add(QUEUED_DATAGRAM_COST)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The current lower bound, for tests.
+    #[cfg(test)]
+    pub(crate) fn datagram_room(&self) -> usize {
+        self.datagram_room.load(Ordering::Relaxed)
     }
 
     /// Spends one packet of the connection's unanswered allowance, reporting

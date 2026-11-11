@@ -22,8 +22,7 @@
 //! [`Stream::datagrams`] and holds it for as long as it holds the
 //! [`DatagramReceiver`] (D79). Sending is the one half that stays outside:
 //! `tunnel::udp` writes datagrams straight onto the `quinn::Connection` it
-//! already holds for the send-buffer and datagram-size questions it asks per
-//! packet.
+//! already holds for the send-buffer and datagram-size questions it asks.
 //!
 //! [`DATA_HEADER_ROOM`] is the one number about frame layout a caller needs:
 //! the TCP relay leaves that many bytes in front of each read, and
