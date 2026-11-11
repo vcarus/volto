@@ -454,6 +454,7 @@ fn crate_constants() -> BTreeMap<&'static str, u64> {
             "HEADERS_BUFFER_BUDGET",
             volto::h3::HEADERS_BUFFER_BUDGET as u64,
         ),
+        ("READ_AHEAD_CHUNKS", volto::h3api::READ_AHEAD_CHUNKS as u64),
         (
             "CONNECTION_UNANSWERED_MULTIPLIER",
             u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER),

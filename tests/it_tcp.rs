@@ -293,6 +293,88 @@ async fn a_drained_client_fin_is_not_a_reset() {
     );
 }
 
+/// A TCP target that reads nothing for a while, then reads to EOF and echoes
+/// every byte back.
+///
+/// The pause is what makes the proxy gather: the client's upload piles up in
+/// the server's QUIC receive buffers while the relay's write is parked, so each
+/// read the relay makes afterwards takes many chunks, and each write it makes
+/// to this socket carries many pieces and is cut short by a full buffer.
+async fn spawn_late_echo_after_eof_target() -> SocketAddr {
+    const BEFORE_FIRST_READ: Duration = Duration::from_millis(300);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let addr = listener.local_addr().expect("target address");
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                tokio::time::sleep(BEFORE_FIRST_READ).await;
+                let mut received = Vec::new();
+                if socket.read_to_end(&mut received).await.is_err() {
+                    return;
+                }
+                let _ = socket.write_all(&received).await;
+            });
+        }
+    });
+
+    addr
+}
+
+/// An upload of many small DATA frames reaches the target whole and in order,
+/// and the target sees the client's FIN only after the last byte.
+///
+/// The relay gathers several pieces into one vectored write and trims the
+/// writes the kernel cuts short, so this is the end-to-end check on both: the
+/// frames differ in size and content, empty DATA frames sit among them, and
+/// the target echoes back exactly what it read before EOF. A piece lost,
+/// repeated or reordered, or a FIN written ahead of the last batch, changes
+/// what comes back.
+#[tokio::test]
+async fn an_upload_of_small_frames_reaches_the_target_whole_and_in_order() {
+    const FRAMES: usize = 600;
+
+    let server = TestServer::start().await;
+    let target = spawn_late_echo_after_eof_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+
+    let mut sent = Vec::new();
+    for index in 0..FRAMES {
+        let size = 1 + (index * 389) % 1500;
+        let piece: Vec<u8> = (0..size)
+            .map(|offset| u8::try_from((index + offset) % 251).expect("under 251"))
+            .collect();
+        sent.extend_from_slice(&piece);
+        stream
+            .send_data(Bytes::from(piece))
+            .await
+            .expect("send a frame of the upload");
+        if index % 7 == 0 {
+            stream
+                .send_data(Bytes::new())
+                .await
+                .expect("send an empty DATA frame");
+        }
+    }
+    stream.finish().expect("finish the sending side");
+
+    let echoed = tokio::time::timeout(TIMEOUT, read_to_end(&mut stream))
+        .await
+        .expect("the target's echo must arrive within the bound");
+    assert_eq!(
+        echoed.len(),
+        sent.len(),
+        "the target read a different length"
+    );
+    assert!(
+        echoed == sent,
+        "the target read the upload's bytes in a different order"
+    );
+}
+
 /// A bare QUIC server endpoint with a self-signed certificate.
 ///
 /// [`TestServer`] is the whole proxy and hands nothing of its HTTP/3 connection

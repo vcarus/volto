@@ -5,7 +5,9 @@
 //! A request stream carries HEADERS and then a body of DATA frames. Only the
 //! first is buffered: the body is handed on in the chunks it arrived in, because
 //! for this server the body *is* the tunnel and every copy of it would be paid
-//! for per packet. Nothing follows the body -- RFC 9114 §4.4 permits only DATA
+//! for per packet. A tunnel's reader takes several of those chunks from quinn
+//! per read without copying them (`frame::READ_AHEAD_CHUNKS`), and
+//! [`Reader::try_recv_data`] is how a caller gathers them into one write. Nothing follows the body -- RFC 9114 §4.4 permits only DATA
 //! on a stream whose CONNECT has completed, so the trailer section §4.1 allows
 //! an ordinary request is a frame this server never sees a use for.
 //!
@@ -875,6 +877,7 @@ impl Stream {
             Reader {
                 handle: self.handle,
                 frames,
+                deferred: None,
             },
         )
     }
@@ -1046,6 +1049,14 @@ impl Writer {
 pub struct Reader {
     handle: Handle,
     frames: FrameReader,
+    /// A frame-layer error [`Self::try_recv_data`] found and has not reported.
+    ///
+    /// Kept rather than acted on, because the pieces handed out before it may
+    /// not have reached the far side of the tunnel yet. [`Self::recv_data`]
+    /// reports it the next time it is called, which a caller does only once it
+    /// has dealt with those pieces: the order a reader that met the error there
+    /// would have had.
+    deferred: Option<frame::Error>,
 }
 
 impl Reader {
@@ -1058,6 +1069,10 @@ impl Reader {
     /// returns, so a caller may poll it inside a `select!` with a timeout, which
     /// is exactly what a UDP session does.
     pub async fn recv_data(&mut self) -> Result<Option<Bytes>, StreamError> {
+        if let Some(error) = self.deferred.take() {
+            return Err(self.report(error));
+        }
+
         loop {
             let item = match self.frames.next().await {
                 Ok(Some(item)) => item,
@@ -1065,52 +1080,66 @@ impl Reader {
                 Err(error) => return Err(self.report(error)),
             };
 
-            match item {
-                // RFC 9114 §9's rule that unknown values are ignored, quoted in
-                // full in `super`.
-                Item::Skipped { .. } => {}
+            match body_piece(item) {
+                Ok(Some(data)) => return Ok(Some(data)),
+                Ok(None) => {}
+                Err(error) => return Err(self.report(error)),
+            }
+        }
+    }
 
-                // An empty DATA frame is legal and says nothing, so it must not
-                // surface as `Some(empty)`: a caller relaying the body would
-                // put a zero-length packet on the far side of the tunnel, and a
-                // caller counting chunks would count one that carried nothing.
-                Item::Data(data) if data.is_empty() => {}
+    /// The next chunk of body data if it can be decoded without waiting, from
+    /// bytes this reader has already taken from quinn.
+    ///
+    /// The way to gather what one read took ([`frame::READ_AHEAD_CHUNKS`]) into
+    /// one write: call [`Self::recv_data`] for the first piece, then this until
+    /// it returns `None`.
+    ///
+    /// `None` means only that nothing more is ready. It never means the stream
+    /// ended: the client's FIN, a reset and a lost connection are all reported
+    /// by [`Self::recv_data`], after every piece that came before them. Like
+    /// that method it never hands out an empty piece.
+    ///
+    /// A protocol violation found here is not reported here. It is kept and
+    /// reported by the next [`Self::recv_data`], and this returns `None` until
+    /// then. The pieces before the violation have been handed out by the time
+    /// it is found, but the caller may not have written them yet; acting on the
+    /// violation now, which can close the connection, would put it ahead of
+    /// them.
+    ///
+    /// Does not take the connection's lock.
+    pub fn try_recv_data(&mut self) -> Option<Bytes> {
+        if self.deferred.is_some() {
+            return None;
+        }
 
-                Item::Data(data) => return Ok(Some(data)),
+        loop {
+            let found = match self.frames.try_next() {
+                Ok(Some(item)) => body_piece(item),
+                Ok(None) => return None,
+                Err(error) => Err(error),
+            };
 
-                // RFC 9114 §4.4's rule -- once the CONNECT method has completed
-                // only DATA may follow, and any other known frame type is a
-                // connection error of type H3_FRAME_UNEXPECTED -- is applied a
-                // layer down, by `frame::misplaced`, so that it is decided from
-                // a frame's header rather than after its payload has been
-                // buffered and charged for. [`Stream::split`] is what puts this
-                // reader's decoder into that mode, and a [`Reader`] exists only
-                // through it.
-                //
-                // So nothing reaches this arm. It repeats the verdict rather
-                // than relaying an unexpected frame into a tunnel, because
-                // which mode a decoder is in is not something the type system
-                // knows.
-                Item::Frame(_) => {
-                    return Err(self.report(
-                        Violation::connection(
-                            Code::H3_FRAME_UNEXPECTED,
-                            frame::NON_DATA_FRAME_ON_A_TUNNEL,
-                        )
-                        .into(),
-                    ));
+            match found {
+                Ok(Some(data)) => return Some(data),
+                Ok(None) => {}
+                Err(error) => {
+                    self.deferred = Some(error);
+                    return None;
                 }
             }
         }
     }
 
     /// How long [`Reader::reset_by_peer`] may take to notice a reset that
-    /// arrived while the peer's bytes were already buffered.
+    /// arrived while quinn held bytes of the stream that no read had taken.
     ///
     /// Only that case costs anything: a zero-length read cannot park on a
     /// stream that has bytes to give, so the watcher has nothing to be woken by
-    /// and looks again on a timer instead. A reset that lands while the stream
-    /// is quiet wakes the parked read at once and never waits this long.
+    /// and looks again on a timer instead. A reset that lands while quinn has
+    /// nothing of the stream wakes the parked read at once and never waits this
+    /// long. Bytes in the read-ahead do not count either way, because they have
+    /// already left quinn; [`Reader::reset_by_peer`] says what that changed.
     ///
     /// 250 ms is an order of magnitude under the bound the regression test
     /// holds the target's close to, and the wait it replaces was unbounded: a
@@ -1174,16 +1203,36 @@ impl Reader {
     /// while nothing is buffered needs no timer: it wakes the parked read at
     /// once, as any read error would.
     ///
+    /// # The read-ahead
+    ///
+    /// The zero-length read asks quinn, and the chunks in the read-ahead
+    /// ([`frame::READ_AHEAD_CHUNKS`]) have already left quinn. So the choice
+    /// between the timer and a wake-up turns on whether quinn holds bytes
+    /// beyond what the last read took. A stalled upload whose client keeps
+    /// sending refills quinn and is on the timer, as it was before the
+    /// read-ahead existed. A stalled upload whose last read took everything
+    /// quinn had now parks the zero-length read, and a reset wakes it at once
+    /// where it used to wait for the timer.
+    ///
+    /// A reset found here is reported while the read-ahead may still hold
+    /// bytes the client sent before it. The reading half would hand those out
+    /// first; this reports only the reset, and a tunnel acting on it drops them
+    /// with the rest of the stream. Before the read-ahead, the same bytes sat
+    /// in quinn, which discards a reset stream's unread bytes, so the outcome
+    /// is the one it was.
+    ///
     /// Cancel-safe, so a `select!` may poll it and drop it repeatedly.
     pub async fn reset_by_peer(&mut self) -> StreamError {
         loop {
             match self.frames.readable().await {
-                // Bytes are waiting, so a read cannot park on this stream and
-                // there is nothing here to be woken by. Look again shortly.
+                // Bytes are waiting in quinn, so a read cannot park on this
+                // stream and there is nothing here to be woken by. Look again
+                // shortly.
                 Ok(true) => tokio::time::sleep(Self::RESET_PEEK_INTERVAL).await,
 
-                // The peer finished and everything it sent has been read. That
-                // is not a reset and can no longer become one.
+                // The peer finished and quinn has handed over everything it
+                // sent; the read-ahead may still hold the last of it. That is
+                // not a reset and can no longer become one.
                 Ok(false) => std::future::pending().await,
 
                 Err(quinn::ReadError::Reset(code)) => {
@@ -1218,6 +1267,44 @@ impl Reader {
     /// client abort than for a target failure.
     fn report(&mut self, error: frame::Error) -> StreamError {
         answer(&self.handle, &mut self.frames, None, error)
+    }
+}
+
+/// What one decoded item of a tunnel's body is to a [`Reader`]: a piece to hand
+/// out, nothing, or a violation.
+///
+/// One function for [`Reader::recv_data`] and [`Reader::try_recv_data`], so the
+/// two cannot disagree about which items surface.
+fn body_piece(item: Item) -> Result<Option<Bytes>, frame::Error> {
+    match item {
+        // RFC 9114 §9's rule that unknown values are ignored, quoted in full in
+        // `super`.
+        Item::Skipped { .. } => Ok(None),
+
+        // An empty DATA frame is legal and says nothing, so it must not surface
+        // as `Some(empty)`: a caller relaying the body would put a zero-length
+        // packet on the far side of the tunnel, and a caller counting chunks
+        // would count one that carried nothing.
+        Item::Data(data) if data.is_empty() => Ok(None),
+
+        Item::Data(data) => Ok(Some(data)),
+
+        // RFC 9114 §4.4's rule -- once the CONNECT method has completed only
+        // DATA may follow, and any other known frame type is a connection error
+        // of type H3_FRAME_UNEXPECTED -- is applied a layer down, by
+        // `frame::misplaced`, so that it is decided from a frame's header rather
+        // than after its payload has been buffered and charged for.
+        // [`Stream::split`] is what puts a reader's decoder into that mode, and a
+        // [`Reader`] exists only through it.
+        //
+        // So nothing reaches this arm. It repeats the verdict rather than
+        // relaying an unexpected frame into a tunnel, because which mode a
+        // decoder is in is not something the type system knows.
+        Item::Frame(_) => Err(Violation::connection(
+            Code::H3_FRAME_UNEXPECTED,
+            frame::NON_DATA_FRAME_ON_A_TUNNEL,
+        )
+        .into()),
     }
 }
 
@@ -1601,5 +1688,189 @@ mod tests {
         // And an ordinary request is not thereby excused a real path.
         options[3] = field(":path", "masque/udp/");
         refused(options);
+    }
+
+    // -----------------------------------------------------------------------
+    // A tunnel's reader over a live QUIC stream
+    // -----------------------------------------------------------------------
+
+    use super::frame::loopback;
+
+    /// The [`Reader`] a split request stream hands a tunnel, on the server
+    /// side of `upload`.
+    fn tunnel_reader(upload: &mut loopback::Upload) -> Reader {
+        let handle = Handle::for_tests(upload.server.clone());
+        let mut frames = FrameReader::on_request_stream(upload.take_recv(), handle.budget());
+        frames.connect_completed();
+        Reader {
+            handle,
+            frames,
+            deferred: None,
+        }
+    }
+
+    /// Appends one frame of `kind` carrying `payload` to `wire`.
+    fn push_frame(wire: &mut BytesMut, kind: u64, payload: &[u8]) {
+        // A test length, far inside a `u64`.
+        #[allow(clippy::as_conversions)]
+        frame::put_header(wire, kind, payload.len() as u64);
+        wire.extend_from_slice(payload);
+    }
+
+    /// The value `future` has without waiting, or `None` if it would wait.
+    fn poll_once<F: std::future::Future>(future: std::pin::Pin<&mut F>) -> Option<F::Output> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match future.poll(&mut cx) {
+            std::task::Poll::Ready(value) => Some(value),
+            std::task::Poll::Pending => None,
+        }
+    }
+
+    /// One awaited read and then `try_recv_data` hand out the whole body, in
+    /// order, with no empty piece, and in far fewer awaits than there are
+    /// frames.
+    ///
+    /// The body mixes empty DATA frames and reserved frame types among the
+    /// ordinary ones, because both are items the decoder produces that must
+    /// not reach the tunnel as a piece.
+    #[tokio::test]
+    async fn try_recv_data_gathers_what_one_read_took_and_no_empty_piece() {
+        const FRAMES: u8 = 120;
+        let mut wire = BytesMut::new();
+        let mut payload = Vec::new();
+        for index in 0..FRAMES {
+            let body = vec![index; 700];
+            push_frame(&mut wire, frame::DATA, &body);
+            push_frame(&mut wire, frame::DATA, b"");
+            // 0x21 is the first reserved type of RFC 9114 §7.2.8.
+            push_frame(&mut wire, 0x21, b"grease");
+            payload.extend_from_slice(&body);
+        }
+
+        let mut upload = loopback::Upload::start(&wire).await;
+        upload.send.finish().expect("finish the request stream");
+        let mut reader = tunnel_reader(&mut upload);
+
+        let mut delivered = Vec::new();
+        let mut awaits = 0;
+        while let Some(first) = tokio::time::timeout(loopback::TIMEOUT, reader.recv_data())
+            .await
+            .expect("the body must arrive")
+            .expect("the body is well formed")
+        {
+            awaits += 1;
+            assert!(!first.is_empty(), "an empty piece surfaced");
+            delivered.extend_from_slice(&first);
+            while let Some(more) = reader.try_recv_data() {
+                assert!(!more.is_empty(), "an empty piece surfaced");
+                delivered.extend_from_slice(&more);
+            }
+        }
+
+        assert_eq!(delivered, payload, "every byte, in order");
+        assert!(
+            awaits < usize::from(FRAMES) / 4,
+            "{awaits} awaited reads for {FRAMES} frames"
+        );
+    }
+
+    /// A violation found while gathering is reported only after the pieces
+    /// before it, and by `recv_data`.
+    ///
+    /// A HEADERS frame on a tunnel is a connection error (RFC 9114 §4.4). It
+    /// sits behind ten DATA frames in the same read. `try_recv_data` hands out
+    /// all ten and then nothing, and the connection is still open at that
+    /// point: closing it is what reporting the violation does, and that must
+    /// wait until the caller has written the ten. The next `recv_data` reports
+    /// it.
+    #[tokio::test]
+    async fn a_violation_behind_data_is_reported_after_that_data() {
+        let mut wire = BytesMut::new();
+        let mut payload = Vec::new();
+        for index in 0..10u8 {
+            let body = vec![index; 1000];
+            push_frame(&mut wire, frame::DATA, &body);
+            payload.extend_from_slice(&body);
+        }
+        push_frame(&mut wire, frame::HEADERS, b"trailer");
+        push_frame(&mut wire, frame::DATA, b"never relayed");
+
+        let mut upload = loopback::Upload::start(&wire).await;
+        let mut reader = tunnel_reader(&mut upload);
+
+        let mut delivered = Vec::new();
+        let first = reader
+            .recv_data()
+            .await
+            .expect("the first piece is well formed")
+            .expect("the first piece");
+        delivered.extend_from_slice(&first);
+        while let Some(more) = reader.try_recv_data() {
+            delivered.extend_from_slice(&more);
+        }
+
+        assert_eq!(delivered, payload, "the ten frames before the violation");
+        assert!(
+            upload.server.close_reason().is_none(),
+            "the violation was acted on before the data ahead of it was handed back"
+        );
+        assert!(
+            reader.try_recv_data().is_none(),
+            "nothing follows a violation"
+        );
+
+        let error = tokio::time::timeout(loopback::TIMEOUT, reader.recv_data())
+            .await
+            .expect("the kept violation needs no read")
+            .expect_err("the violation must be reported");
+        assert!(
+            matches!(error, StreamError::Connection(_)),
+            "expected a connection error, got {error}"
+        );
+        assert!(
+            upload.server.close_reason().is_some(),
+            "reporting a connection error closes the connection"
+        );
+    }
+
+    /// A reset that arrives while the read-ahead holds the rest of the body,
+    /// and quinn holds nothing, wakes the watcher at once.
+    ///
+    /// The watcher asks quinn with a zero-length read. The first awaited read
+    /// took everything quinn had, so that read parks rather than finding bytes
+    /// and going on the 250 ms timer, and the reset completes it. Polled by
+    /// hand: a watcher on the timer would still be asleep on the second poll,
+    /// so the answer does not depend on how fast the host is.
+    #[tokio::test]
+    async fn the_watcher_wakes_for_a_reset_while_the_read_ahead_holds_bytes() {
+        let (wire, _) = loopback::numbered_frames(10, 1000);
+        let mut upload = loopback::Upload::start(&wire).await;
+        let mut reader = tunnel_reader(&mut upload);
+
+        reader
+            .recv_data()
+            .await
+            .expect("the first piece is well formed")
+            .expect("the first piece");
+
+        let watcher = reader.reset_by_peer();
+        tokio::pin!(watcher);
+        assert!(
+            poll_once(watcher.as_mut()).is_none(),
+            "nothing has been reset yet"
+        );
+
+        upload
+            .send
+            .reset(quinn::VarInt::from_u32(0x10c))
+            .expect("reset the request stream");
+        upload.settle().await;
+
+        let error = poll_once(watcher.as_mut())
+            .expect("the reset must complete the parked read without a timer");
+        assert!(
+            matches!(error, StreamError::RemoteTerminate { code } if code.value() == 0x10c),
+            "expected the peer's reset, got {error}"
+        );
     }
 }

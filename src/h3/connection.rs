@@ -413,6 +413,19 @@ pub(crate) struct Handle {
     shared: Arc<Shared>,
 }
 
+#[cfg(test)]
+impl Handle {
+    /// A handle on `quic` with nothing registered on it, for the tests of the
+    /// stream halves that hold one.
+    pub(crate) fn for_tests(quic: quinn::Connection) -> Self {
+        Self {
+            quic,
+            idle: Duration::from_secs(5),
+            shared: Arc::new(Shared::default()),
+        }
+    }
+}
+
 impl Handle {
     /// The connection's frame-buffering budget, for a request stream about to
     /// start reading frames (D77).
