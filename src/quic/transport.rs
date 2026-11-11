@@ -136,8 +136,8 @@ pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bid
 /// modules — the accept loop's eviction candidacy (D80), the bound on how long a
 /// connection may say nothing (D76), and the stream allowance above (D98).
 /// A request opens the gate with [`AuthGate::mark`], and the accept loop claims
-/// it for eviction with [`AuthGate::evict`]; both are a compare-and-swap from
-/// [`UNKNOWN`], so whichever wins is the only transition. That is the whole
+/// it for eviction with `AuthGate::evict`; both are a compare-and-swap from
+/// `UNKNOWN`, so whichever wins is the only transition. That is the whole
 /// point: an eviction cannot take a connection whose request has just
 /// authenticated, and a request cannot proceed on a connection the accept loop
 /// has already taken.

@@ -474,7 +474,7 @@ pub enum StreamKind {
     /// length is looked at, so a frame the connection must close on cannot earn
     /// the stream error an oversized frame gets. Which of the rules applies
     /// depends on whether SETTINGS has already been accepted, which the caller
-    /// carries in with [`FrameDecoder::note_settings_seen`].
+    /// carries in with `FrameDecoder::note_settings_seen`.
     ServerControl,
     /// A request stream whose request has not completed.
     Request,
@@ -850,7 +850,7 @@ impl FrameReader {
     /// The permissive constructor, and the one a *client* wants for a response
     /// stream: the suite's client (`tests/common/h3client.rs`) is built on this
     /// module. The server reads the peer's control stream through the
-    /// crate-internal [`Self::on_server_control`] instead, where the rules that
+    /// crate-internal `Self::on_server_control` instead, where the rules that
     /// turn on the frame type alone are applied from the frame header. A request
     /// stream is read through `on_request_stream`, where SETTINGS, GOAWAY,
     /// CANCEL_PUSH, MAX_PUSH_ID and PUSH_PROMISE are refused from the header.

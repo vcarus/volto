@@ -140,7 +140,7 @@ impl Policy {
 ///   The unspecified address is the one entry in the deny list that reaches
 ///   nothing at all.
 ///
-/// The unspecified address is judged in its routed form ([`routed_form`]), so a
+/// The unspecified address is judged in its routed form (`routed_form`), so a
 /// NAT64, 6to4 or Teredo address whose embedded IPv4 address is `0.0.0.0` is the
 /// same blackhole as `0.0.0.0` itself. On a DNS64 network that is the ordinary
 /// shape of a blocked name: the resolver answers the A query with `0.0.0.0` and
