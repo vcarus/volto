@@ -1341,7 +1341,8 @@ pub async fn spawn_reset_after_read_target() -> SocketAddr {
 ///
 /// * the flood — larger than the client's stream flow-control window, and the
 ///   client under test does not read the tunnel while it lasts — parks the read
-///   pump inside `send_data`, where it cannot see the socket fail at all;
+///   pump inside `send_data_in_place`, where it cannot see the socket fail at
+///   all;
 /// * never reading parks the write pump inside `write_all`, once the client's
 ///   upload has filled every buffer in between.
 ///

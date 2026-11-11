@@ -25,9 +25,13 @@
 //!
 //! # Writing
 //!
-//! A response is one HEADERS frame; body bytes are DATA frames whose header is
-//! written alongside the payload rather than copied in front of it, so a 16 KiB
-//! relay chunk reaches the wire as the same allocation it was read into.
+//! A response is one HEADERS frame; body bytes are DATA frames, and the payload
+//! is never copied to put a header in front of it. A relay block is read in
+//! behind [`frame::DATA_HEADER_ROOM`] bytes of room, the header is written into
+//! that room, and the frame reaches quinn as one chunk of the allocation it was
+//! read into ([`Writer::send_data_in_place`]). A payload that arrives as a
+//! ready `Bytes` goes out as two chunks, a header and the payload
+//! ([`Writer::send_data`]). The wire bytes are the same either way.
 
 use std::borrow::Cow;
 
@@ -939,7 +943,9 @@ impl Writer {
     ///
     /// The frame header and the payload go out as two chunks of one write, so
     /// the payload is never copied: what arrives here as a `Bytes` is what
-    /// quinn queues.
+    /// quinn queues. A caller that reads its payload into a buffer of its own
+    /// can leave room for the header in front of it and use
+    /// [`Self::send_data_in_place`], which sends one chunk.
     ///
     /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
     /// flow-control credit parks this for as long as it likes, so both tunnels
@@ -959,6 +965,30 @@ impl Writer {
         frame::put_header(&mut self.header, frame::DATA, data.len() as u64);
         let mut chunks = [self.header.split().freeze(), data];
         self.send.write_all_chunks(&mut chunks).await?;
+        Ok(())
+    }
+
+    /// Sends `block` as one DATA frame, applying the peer's flow-control
+    /// backpressure.
+    ///
+    /// `block` is [`frame::DATA_HEADER_ROOM`] bytes of room followed by a
+    /// payload that is not empty; [`frame::seal_data`] writes the header into
+    /// that room. The frame then reaches quinn as one chunk that shares the
+    /// buffer the payload was read into: no second `Bytes`, no scratch block
+    /// for the header, and no copy. The wire bytes are the ones
+    /// [`Self::send_data`] would produce for the same payload.
+    ///
+    /// Not cancel-safe, for the reason [`Self::send_data`] gives. The frame is
+    /// one chunk here, but quinn may take a prefix of it and park on the rest,
+    /// so an abandoned call can still leave a truncated DATA frame, and only a
+    /// reset behind it makes that legal.
+    ///
+    /// # Panics
+    ///
+    /// If `block` holds nothing behind its room: a caller with no payload has
+    /// reached EOF and has no frame to send.
+    pub async fn send_data_in_place(&mut self, block: BytesMut) -> Result<(), StreamError> {
+        self.send.write_chunk(frame::seal_data(block)).await?;
         Ok(())
     }
 

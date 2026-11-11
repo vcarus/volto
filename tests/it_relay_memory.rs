@@ -29,7 +29,8 @@ use tokio::net::TcpListener;
 // Counting allocator
 // ---------------------------------------------------------------------------
 
-/// The smallest allocation this counts, and `tunnel::tcp`'s read window.
+/// The smallest allocation this counts, and `tunnel::tcp`'s read window with
+/// the frame header room in front of it.
 ///
 /// Written out rather than imported: it is the size the relay used to pin per
 /// read, so a test that took it from the code under test would follow that code
@@ -137,8 +138,9 @@ async fn spawn_lockstep_target() -> SocketAddr {
 ///
 /// Both numbers are the arithmetic rather than an approximation of it: a
 /// 64 KiB block is abandoned once fewer than 16 KiB of it remain, so it carries
-/// at least 48 KiB, and 2000 x 100 bytes needs `200000 / 49152` = 5 of them --
-/// while a reserve per read is a block per read. The bound below is 200 to
+/// at least 48 KiB, and 2000 reads of 100 bytes, each behind 5 bytes of frame
+/// header room, use 210000 bytes and so need 5 of them (`210000 / 49152` is
+/// 4.3) -- while a reserve per read is a block per read. The bound below is 200 to
 /// leave room for a noisier host on both sides: forty times the working shape,
 /// a tenth of the broken one.
 #[tokio::test(flavor = "multi_thread")]

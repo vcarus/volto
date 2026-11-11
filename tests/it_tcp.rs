@@ -539,14 +539,15 @@ async fn target_reset_becomes_h3_connect_error() {
 /// The same target reset, noticed by the *write* pump instead.
 ///
 /// The client keeps uploading and does not read the tunnel while it does, which
-/// parks the write pump in `write_all` and the read pump in `send_data` — so
-/// when the RST lands only the write pump is in a position to see it. It used to
-/// stop the client's sending side and then simply return, dropping the writer,
-/// and a dropped `quinn::SendStream` finishes rather than resets: the response
-/// direction ended in a clean FIN. That is the truncation shape, and what an
-/// upload-shaped protocol through the tunnel would read as a complete response.
-/// RFC 9114 §4.4 rules it out — any error on the TCP connection, a received RST
-/// included, is a stream error of type H3_CONNECT_ERROR.
+/// parks the write pump in `write_all` and the read pump in
+/// `send_data_in_place` — so when the RST lands only the write pump is in a
+/// position to see it. It used to stop the client's sending side and then
+/// simply return, dropping the writer, and a dropped `quinn::SendStream`
+/// finishes rather than resets: the response direction ended in a clean FIN.
+/// That is the truncation shape, and what an upload-shaped protocol through the
+/// tunnel would read as a complete response. RFC 9114 §4.4 rules it out — any
+/// error on the TCP connection, a received RST included, is a stream error of
+/// type H3_CONNECT_ERROR.
 #[tokio::test]
 async fn target_reset_during_a_client_upload_becomes_h3_connect_error() {
     let server = TestServer::start().await;
@@ -781,8 +782,9 @@ async fn a_client_stop_sending_cancels_the_request_direction_too() {
 /// fills every buffer between the client and the target, so the proxy's
 /// client → target pump ends up inside `write_all`; writing without ever being
 /// read — the client under test does not read the tunnel either — fills the
-/// other direction, so the target → client pump ends up inside `send_data`,
-/// which is the only place it can notice a client's STOP_SENDING.
+/// other direction, so the target → client pump ends up inside
+/// `send_data_in_place`, which is the only place it can notice a client's
+/// STOP_SENDING.
 ///
 /// The end is reported from the blocked write rather than from a read, because
 /// reading is exactly what this target must not do: an abortive close makes a
@@ -815,8 +817,8 @@ async fn spawn_deaf_flooding_target()
 
 /// How long a target close may take once the client has aborted.
 ///
-/// Two orders of magnitude under the wait a stalled `write_all` or `send_data`
-/// would impose, which is unbounded.
+/// Two orders of magnitude under the wait a stalled `write_all` or
+/// `send_data_in_place` would impose, which is unbounded.
 const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 
 /// Opens a tunnel to a deaf, flooding target and uploads into it until the
@@ -825,10 +827,10 @@ const CLOSE_WITHIN: Duration = Duration::from_secs(2);
 ///
 /// The client → target pump ends up inside `write_all`, because the target
 /// never reads and every buffer between here and it is full; the target →
-/// client pump ends up inside `send_data`, because nothing here reads the
-/// response direction and its flow-control window is spent. Neither is reading
-/// the request stream in that state, which is what the two tests below start
-/// from — they differ only in how the client then abandons it.
+/// client pump ends up inside `send_data_in_place`, because nothing here reads
+/// the response direction and its flow-control window is spent. Neither is
+/// reading the request stream in that state, which is what the two tests below
+/// start from — they differ only in how the client then abandons it.
 ///
 /// One later caller has only one pump to park, its target having ended its own
 /// sending side before the upload begins. The upload loop is the same either
@@ -905,7 +907,8 @@ async fn a_client_abort_closes_a_target_that_stopped_reading() {
     let (_send, mut recv) = park_both_pumps(&client.quic, target).await;
 
     // Abort reading the response direction: the other pump meets this inside
-    // `send_data` and raises the teardown the write pump has to act on.
+    // `send_data_in_place` and raises the teardown the write pump has to act
+    // on.
     recv.stop(quinn::VarInt::from_u32(0))
         .expect("stop reading the response direction");
 
@@ -931,9 +934,9 @@ async fn a_client_abort_closes_a_target_that_stopped_reading() {
 /// reaches the proxy as an error on a *read* of the request stream, and with
 /// both pumps parked in writes nobody was reading: the client → target pump sat
 /// in `write_all` on a target that never reads, the target → client pump sat in
-/// `send_data` on a client that never reads, and neither ever looked again. The
-/// target socket, its file descriptor and the tunnel slot were held for the
-/// life of the QUIC connection.
+/// `send_data_in_place` on a client that never reads, and neither ever looked
+/// again. The target socket, its file descriptor and the tunnel slot were held
+/// for the life of the QUIC connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_client_reset_closes_a_target_that_stopped_reading() {
     let server = TestServer::start().await;
@@ -944,8 +947,9 @@ async fn a_client_reset_closes_a_target_that_stopped_reading() {
 
     // The sending direction only, and the response direction is left open and
     // unread: the client says "I will send no more" and nothing else. Reading
-    // the response would let `send_data` make progress and hand the other pump
-    // a chance to notice something, which is the case already covered above.
+    // the response would let `send_data_in_place` make progress and hand the
+    // other pump a chance to notice something, which is the case already
+    // covered above.
     send.reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a valid code"))
         .expect("reset the request direction");
 
@@ -1085,11 +1089,11 @@ const CUT_WITHIN: Duration = Duration::from_secs(5);
 
 /// A per-stream receive window too small to take one relay chunk.
 ///
-/// What it buys the test below is a proxy parked in `send_data` after a *short*
-/// burst from the target, rather than after the megabytes it would take to fill
-/// quinn's default 1.25 MB window. Short matters there: the bytes the proxy has
-/// not read off the target socket yet are what decide how its close looks on the
-/// wire.
+/// What it buys the test below is a proxy parked in `send_data_in_place` after
+/// a *short* burst from the target, rather than after the megabytes it would
+/// take to fill quinn's default 1.25 MB window. Short matters there: the bytes
+/// the proxy has not read off the target socket yet are what decide how its
+/// close looks on the wire.
 const CHUNKLESS_WINDOW: u32 = 4 * 1024;
 
 /// A TCP target that writes one short burst, says nothing more, and reports the
@@ -1156,11 +1160,11 @@ async fn spawn_quiet_burst_target(
 /// the tunnel open for the life of the connection.
 ///
 /// The clean FIN ends the client → target pump through the one arm that raises
-/// no teardown, which is what leaves the surviving direction unwatched: it parks
-/// in `send_data` as soon as the client's flow-control window is spent, and
-/// nothing is left to raise a teardown that would end that wait. The target
-/// socket, its file descriptor and the tunnel slot were held until the QUIC
-/// connection ended — which this server's own keep-alives can postpone
+/// no teardown, which is what leaves the surviving direction unwatched: it
+/// parks in `send_data_in_place` as soon as the client's flow-control window is
+/// spent, and nothing is left to raise a teardown that would end that wait. The
+/// target socket, its file descriptor and the tunnel slot were held until the
+/// QUIC connection ended — which this server's own keep-alives can postpone
 /// indefinitely.
 ///
 /// Both halves of the cut are asserted where they are observable: the client
@@ -1186,9 +1190,9 @@ async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     // The half-close, and then nothing: the target's burst is more than the
-    // window allows, so the proxy is parked in `send_data`. Reading here is what
-    // must not happen — a read would grant credit, the write would complete, and
-    // the next one would start on a budget of its own.
+    // window allows, so the proxy is parked in `send_data_in_place`. Reading
+    // here is what must not happen — a read would grant credit, the write would
+    // complete, and the next one would start on a budget of its own.
     stream.finish().expect("finish the sending side");
 
     // What the cut looks like from the target depends on the kernel. The
@@ -1245,10 +1249,10 @@ async fn a_half_closed_tunnel_whose_client_stops_reading_is_cut() {
 /// drains whatever the client sends.
 ///
 /// `total` is meant to be past the client's stream flow-control window, so the
-/// proxy is parked in `send_data` for as long as the client declines to read.
-/// Ending its own sending side afterwards is what lets the client tell a tunnel
-/// that survived from one that was cut: the bytes all arrive and the stream then
-/// ends cleanly.
+/// proxy is parked in `send_data_in_place` for as long as the client declines
+/// to read. Ending its own sending side afterwards is what lets the client tell
+/// a tunnel that survived from one that was cut: the bytes all arrive and the
+/// stream then ends cleanly.
 async fn spawn_bounded_flood_target(total: usize) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
     let addr = listener.local_addr().expect("target address");
@@ -1295,7 +1299,7 @@ async fn spawn_bounded_flood_target(total: usize) -> SocketAddr {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tunnel_whose_client_has_not_finished_survives_a_long_stall() {
     /// Comfortably past the client's 1.25 MB stream flow-control window, so the
-    /// proxy really is parked in `send_data` during the stall below.
+    /// proxy really is parked in `send_data_in_place` during the stall below.
     const TOTAL: usize = 4 * 1024 * 1024;
 
     let server = TestServer::start_with(&format!("{HALF_CLOSED_TIMEOUT}{ALLOW_PRIVATE}")).await;
@@ -1333,8 +1337,8 @@ async fn a_tunnel_whose_client_has_not_finished_survives_a_long_stall() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_half_closed_tunnel_survives_a_download_taken_in_sips() {
     /// Several times the client's 1.25 MB stream flow-control window, so the
-    /// proxy is parked in `send_data` through every pause below rather than
-    /// waiting on the target.
+    /// proxy is parked in `send_data_in_place` through every pause below rather
+    /// than waiting on the target.
     const TOTAL: usize = 4 * 1024 * 1024;
     /// How much is taken before each pause. Comfortably over one relay chunk,
     /// so the write the pause interrupted always completes when reading

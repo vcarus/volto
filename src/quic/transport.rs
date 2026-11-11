@@ -325,7 +325,9 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// data in flight. What it counts is bytes accepted from the buffers this process
 /// hands over, so a slice of a larger allocation can retain more than the limit
 /// accounts for. That is the amplification the 64 KiB relay block in
-/// `tunnel/tcp.rs` is shaped to hold at 1.33x; see D47's 2026-08-23 addendum.
+/// `tunnel/tcp.rs` is shaped to hold at 1.33x for reads of 16 KiB or more, and
+/// within the bounds by read size listed on `RELAY_BLOCK_SIZE` below that; see
+/// D47's 2026-08-23 addendum.
 /// 10 MB over the ~90 ms path RTT is about 889 Mbps against a measured peak of
 /// 177 Mbps, so it is nowhere near a throughput constraint.
 ///

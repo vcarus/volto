@@ -104,12 +104,21 @@ use crate::h3api::{self, Fields, Reader, Status, Stream, StreamError, Writer};
 use crate::tunnel;
 use crate::tunnel::{Context, Unreachable};
 
-/// Smallest window `read_buf` is ever offered on the target → client relay.
+/// Smallest window a read is ever offered on the target → client relay,
+/// counting the frame header room in front of it.
 ///
 /// The threshold half of the pair below: a block is kept in use until fewer
-/// than this many bytes are left in it, so every read still has at least 16 KiB
-/// of room. It is also the size of the *first* allocation a tunnel makes, so a
-/// tunnel that never carries a byte costs 16 KiB rather than a whole block.
+/// than this many bytes are left in it, so every read starts with at least
+/// 16 KiB of block. The first [`h3api::DATA_HEADER_ROOM`] bytes of that are
+/// left for [`Writer::send_data_in_place`] to write the DATA frame header into,
+/// so `read_buf` itself is offered at least 16379 bytes. It is also the size of
+/// the *first* allocation a tunnel makes, so a tunnel that never carries a byte
+/// costs 16 KiB rather than a whole block.
+///
+/// The room is counted inside the window rather than added to it so that both
+/// allocation sizes stay exact powers of two. A first allocation of 16 KiB plus
+/// 5 bytes would fall into the next size class of an allocator such as
+/// mimalloc, which is 20 KiB, for every tunnel.
 pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 
 /// The block reads are cut from once the initial 16 KiB is used up.
@@ -129,9 +138,27 @@ pub const RELAY_BUF_SIZE: usize = 16 * 1024;
 ///
 /// A block is abandoned only once its remaining capacity falls below
 /// [`RELAY_BUF_SIZE`], so at least `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` = 48 KiB
-/// of it has been handed to the client by then. Worst-case amplification is
-/// therefore 64 / 48 = 1.33x whatever the read sizes are, against a factor that
-/// grew without bound as reads got smaller.
+/// of it has been used by then. Each read uses [`h3api::DATA_HEADER_ROOM`]
+/// bytes of room plus its payload, and what is handed to quinn is one DATA
+/// frame cut from those bytes. The h3 layer writes the header at the end of
+/// the room in its minimal length encoding, so a payload too small to need the
+/// longest header leaves up to 3 bytes of the room unused in the block
+/// (`h3::frame::seal_data`). quinn's window counts the frames, so the
+/// worst-case amplification of block bytes over counted bytes depends on the
+/// payload of each read:
+///
+/// | payload per read | room left unused | worst case |
+/// |---|---|---|
+/// | 16384 bytes or more | 0 | 64 / 48 = 1.33x |
+/// | 64 to 16383 bytes | 2 | 1.37x, from 67 counted per 69 used at 64 bytes |
+/// | 1 to 63 bytes | 3 | 2.67x, from 3 counted per 6 used at 1 byte |
+///
+/// All three are bounded, against a factor that grew without bound as reads
+/// got smaller before blocks existed. Before the room existed the figure was
+/// 1.33x at every read size, but it counted only the payload: each frame
+/// header was then a second `Bytes` cut from a 16-byte scratch block that was
+/// reallocated every few frames, and that cost more per small frame than the
+/// unused room does now.
 ///
 /// # What it costs at rest
 ///
@@ -752,6 +779,9 @@ async fn target_to_client(
     // below, exactly as `client_to_target` does it.
     let reason = loop {
         ensure_window(&mut buf);
+        // Room for the DATA frame header, so that the read lands behind it and
+        // the frame can be sent as one piece of this block.
+        buf.resize(h3api::DATA_HEADER_ROOM, 0);
 
         let read = tokio::select! {
             biased;
@@ -762,7 +792,8 @@ async fn target_to_client(
             // detects that the client has reset the stream or aborted reading
             // from the stream, it MUST close the TCP connection" -- is met by
             // the *other* pump for as long as that pump exists, and by
-            // `send_data` failing for as long as there is something to send.
+            // `send_data_in_place` failing for as long as there is something
+            // to send.
             // Neither holds here: the client's own FIN ends the other pump
             // without raising a teardown, and a target that has yet to say
             // anything gives this one nothing to write. So a client that
@@ -792,7 +823,9 @@ async fn target_to_client(
 
         match read {
             // Target EOF: finish our sending side only. The client may still
-            // have data for the target.
+            // have data for the target. The header room is dropped with the
+            // buffer: a read of nothing never becomes a frame, and an empty
+            // DATA frame is never sent.
             Ok(0) => {
                 // As in the opposite pump: raised first, because this is the
                 // moment the client -> target direction is left with no
@@ -804,8 +837,9 @@ async fn target_to_client(
                 return;
             }
             Ok(_) => {
-                // `split` hands the filled bytes over without copying them.
-                let data: Bytes = buf.split().freeze();
+                // `split` hands the room and the filled bytes over without
+                // copying them, and the writer turns them into one frame.
+                let block = buf.split();
 
                 // The write is under the same signal as the read, for the
                 // reason its opposite number in `client_to_target` is: a client
@@ -814,15 +848,17 @@ async fn target_to_client(
                 // raised by the other pump would wait behind it -- the target
                 // socket held open for as long as the client cares to stall.
                 //
-                // `send_data` is not cancel-safe, and its rustdoc carries the
-                // rule: abandoning it can leave a truncated DATA frame, which
-                // is legal only behind a reset. The teardown arm below resets
-                // the writer before anything else can be written, so this
-                // stream never ends cleanly on a partial frame.
+                // `send_data_in_place` is not cancel-safe, and its rustdoc
+                // carries the rule: the frame is one chunk, but quinn may have
+                // taken only a prefix of it, so abandoning the write can leave
+                // a truncated DATA frame, which is legal only behind a reset.
+                // The teardown arm below resets the writer before anything else
+                // can be written, so this stream never ends cleanly on a
+                // partial frame.
                 let sent = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
-                    sent = writer.send_data(data) => sent,
+                    sent = writer.send_data_in_place(block) => sent,
                     // Once the client has finished its sending side, the pump
                     // that would have noticed it stop reading is gone -- its
                     // `Ok(None)` arm raises no teardown, by design -- so this
@@ -904,10 +940,16 @@ async fn target_to_client(
 /// allocates a whole new one. Asking only when fewer than a window remains is
 /// what lets consecutive reads come out of the same block -- see
 /// [`RELAY_BLOCK_SIZE`] for the arithmetic, and the tests below for the two
-/// halves of it that are pinned: every read is offered [`RELAY_BUF_SIZE`], and
-/// a block carries at least `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` before it is
-/// replaced.
+/// halves of it that are pinned: every read, with its header room, is offered
+/// [`RELAY_BUF_SIZE`], and a block carries at least
+/// `RELAY_BLOCK_SIZE - RELAY_BUF_SIZE` before it is replaced.
+///
+/// Called while `buf` is empty, before the header room is written into it. A
+/// `reserve` made with bytes already in `buf` asks for more than one block:
+/// a block quinn has released would then be doubled rather than reused, and a
+/// fresh one would be allocated a few bytes over 64 KiB.
 fn ensure_window(buf: &mut BytesMut) {
+    debug_assert!(buf.is_empty(), "the window is reserved before the room");
     if buf.capacity() < RELAY_BUF_SIZE {
         buf.reserve(RELAY_BLOCK_SIZE);
     }
@@ -1041,6 +1083,7 @@ mod tests {
     };
     // The deadlines here and the resolver's are asserted the same way; the
     // helper lives beside the first of them rather than in both files.
+    use crate::h3api::DATA_HEADER_ROOM;
     use crate::tunnel::tests::poll_once;
     use bytes::{Bytes, BytesMut};
     use std::io;
@@ -1572,31 +1615,34 @@ mod tests {
     /// Every read is offered a full-sized window, whatever the reads before it
     /// took out of the block.
     ///
-    /// The sizes are the ones a relay meets: a one-byte push, a small record, an
-    /// MTU-sized segment, and a read that fills the window exactly. The frozen
-    /// pieces are held for the whole run because that is what a tunnel does --
-    /// quinn keeps each until the segment carrying it is acknowledged -- and
-    /// holding them is what stops `reserve` from quietly reusing the block they
-    /// came out of.
+    /// The steps are the relay's own: the window is reserved, the header room is
+    /// written, and the read lands behind it. The sizes are the ones a relay
+    /// meets: a one-byte push, a small record, an MTU-sized segment, and a read
+    /// that fills the window exactly. The frozen pieces are held for the whole
+    /// run because that is what a tunnel does -- quinn keeps each until the
+    /// segment carrying it is acknowledged -- and holding them is what stops
+    /// `reserve` from quietly reusing the block they came out of.
     #[test]
     fn every_read_is_offered_a_full_window() {
         let mut buf = BytesMut::with_capacity(RELAY_BUF_SIZE);
         let mut held = Vec::new();
 
-        for size in [1usize, 64, 100, 1460, RELAY_BUF_SIZE]
+        for size in [1usize, 64, 100, 1460, RELAY_BUF_SIZE - DATA_HEADER_ROOM]
             .into_iter()
             .cycle()
             .take(100)
         {
             ensure_window(&mut buf);
+            buf.resize(DATA_HEADER_ROOM, 0);
+            let offered = buf.capacity() - buf.len();
             assert!(
-                buf.capacity() >= RELAY_BUF_SIZE,
-                "a read was offered {} bytes, under the {RELAY_BUF_SIZE}-byte window",
-                buf.capacity()
+                offered >= RELAY_BUF_SIZE - DATA_HEADER_ROOM,
+                "a read was offered {offered} bytes behind its {DATA_HEADER_ROOM}-byte room, \
+                 under the {RELAY_BUF_SIZE}-byte window"
             );
 
             // Stands in for a read that filled `size` bytes of that window.
-            buf.resize(size, 0);
+            buf.resize(DATA_HEADER_ROOM + size, 0);
             held.push(buf.split().freeze());
         }
     }
@@ -1633,7 +1679,7 @@ mod tests {
                 blocks += 1;
             }
 
-            buf.resize(READ, 0);
+            buf.resize(DATA_HEADER_ROOM + READ, 0);
             held.push(buf.split().freeze());
             // Where the next read will land: still inside this block until
             // `ensure_window` has to go and find another one.
@@ -1647,13 +1693,16 @@ mod tests {
             "a block no longer carries what the count below is measured against"
         );
 
+        // What a block carries is counted in bytes used, and each read uses its
+        // header room as well as its payload.
+        let used = RELAYED / READ * (DATA_HEADER_ROOM + READ);
         // Two blocks over the arithmetic: the 16 KiB one a tunnel starts with,
         // and however far into the last one the run happened to stop.
-        let ceiling = RELAYED / CARRIED + 2;
+        let ceiling = used / CARRIED + 2;
         assert!(
             blocks <= ceiling,
-            "{RELAYED} bytes of {READ}-byte reads pinned {blocks} blocks, over the {ceiling} \
-             that carrying {CARRIED} bytes of each allows"
+            "{RELAYED} bytes of {READ}-byte reads used {used} bytes of block and pinned \
+             {blocks} blocks, over the {ceiling} that carrying {CARRIED} bytes of each allows"
         );
     }
 }
