@@ -2,18 +2,15 @@
 //!
 //! Everything the rest of the crate needs from HTTP/3 is named here, and only
 //! here: `conn`, `quic` and the tunnels use `bytes` and `quinn` types plus the
-//! handful of names below. That facade began as insulation from the `h3` crate;
-//! it survives the move to [`crate::h3`] because it is worth having on its own
-//! terms -- it is the list of what a proxy actually asks of HTTP/3, and it is
-//! short.
+//! handful of names below. It is the list of what a proxy asks of HTTP/3, and
+//! it is short.
 //!
-//! The vocabulary of an HTTP message -- [`Request`], [`Status`], [`Fields`] --
-//! is [`crate::h3::message`]'s and is re-exported here rather than wrapped: a
+//! The vocabulary of an HTTP message ([`Request`], [`Status`], [`Fields`]) is
+//! [`crate::h3::message`]'s and is re-exported here rather than wrapped: a
 //! status is a status, and a second type in front of it would say nothing the
-//! first does not. The rule is about *where they are named*, and it is
-//! unchanged: nothing outside [`crate::h3`] reaches into it, so this module is
-//! the one place that has to be read to know what the rest of the crate may
-//! assume about HTTP/3.
+//! first does not. The rule is about *where they are named*: nothing outside
+//! [`crate::h3`] reaches into it, so this module is the one place that has to
+//! be read to know what the rest of the crate may assume about HTTP/3.
 //!
 //! Inbound HTTP Datagrams (RFC 9297) are named here too, because the routing
 //! they need is *per request stream*: a datagram carries the Quarter Stream ID
@@ -36,7 +33,7 @@ pub use crate::h3::frame::{DATA_HEADER_ROOM, READ_AHEAD_CHUNKS};
 pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};
 pub use crate::h3::stream::{Reader, Resolver, RespondError, Stream, Writer};
 
-/// No error -- a clean teardown.
+/// No error: a clean teardown.
 pub const NO_ERROR: Code = Code::H3_NO_ERROR;
 
 /// The proxy's connection to the target failed or was reset (RFC 9114 §8.1).
@@ -86,9 +83,9 @@ pub enum BenignClose {
 /// Classifies a connection-level error that is an ordinary goodbye rather than a
 /// failure, or `None` if it deserves a warning.
 ///
-/// The judgement is made on the error *value* on purpose. The obvious
-/// alternative — asking `quinn::Connection::close_reason()` afterwards — cannot
-/// work: dropping the HTTP/3 connection closes the QUIC connection with
+/// The judgement is made on the error *value* on purpose. Asking
+/// `quinn::Connection::close_reason()` afterwards cannot work: dropping the
+/// HTTP/3 connection closes the QUIC connection with
 /// H3_NO_ERROR, and quinn's close path unconditionally overwrites whatever
 /// reason was stored with `LocallyClosed`. By the time a caller could ask, the
 /// real reason is gone. An error value, by contrast, is immutable and independent
@@ -96,8 +93,8 @@ pub enum BenignClose {
 pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
     match error {
         // The QUIC idle timeout, and nothing else. Clients that abandon a
-        // connection without a CONNECTION_CLOSE — Surge does this on a network
-        // switch or app exit — all end up here.
+        // connection without a CONNECTION_CLOSE, as Surge does on a network
+        // switch or app exit, all end up here.
         ConnectionError::Timeout => Some(BenignClose::Idle),
 
         // 0x0 is the application error code Surge actually sends when it closes

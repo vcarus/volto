@@ -8,8 +8,8 @@
 //! [`h3api::Stream::respond_within`] sets.
 //!
 //! The choice of which answer to send is not here. It is made where the fact
-//! is known -- in [`super::admit_target`], in each tunnel's connect step, in
-//! [`crate::conn`] -- and this module is what those choices are said in.
+//! is known: in [`super::admit_target`], in each tunnel's connect step, in
+//! [`crate::conn`]. This module provides the words those choices are said in.
 
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ use crate::h3api::{self, FieldValue, Fields, RespondError, Status, Stream};
 ///
 /// Only registered types (RFC 9209 §2.3.2) appear here. There is no registered
 /// type for "that port is closed by policy", so a denied port is reported as
-/// `http_request_denied` — the registry's general "denied per policy" type —
+/// `http_request_denied`, the registry's general "denied per policy" type,
 /// rather than stretching `destination_ip_prohibited` to cover something that is
 /// not about the address at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,9 +69,9 @@ impl Unreachable {
     ///
     /// Both tunnel types walk a list of addresses and keep the last failure, so
     /// both need an answer for a list that was empty. Neither can actually reach
-    /// it — [`super::admit_target`] never hands back an empty list — so this is the
-    /// empty-list arm written out rather than asserted, and there is no hop to
-    /// name in it.
+    /// it, because [`super::admit_target`] never hands back an empty list. So
+    /// this is the empty-list arm written out rather than asserted, and there is
+    /// no hop to name in it.
     pub(crate) fn no_addresses() -> Self {
         Self {
             next_hop: None,
@@ -144,9 +144,9 @@ impl ProxyError {
     /// RFC 9209 §2.1.2 allows the parameter anywhere, so this list is a privacy
     /// judgement rather than a syntactic one, and every exclusion is deliberate:
     ///
-    /// * `dns_error` and `dns_timeout` — there is no hop to name. The lookup is
+    /// * `dns_error` and `dns_timeout`: there is no hop to name. The lookup is
     ///   what failed, so any address in the response would be invented.
-    /// * `destination_ip_prohibited` and `http_request_denied` — the request was
+    /// * `destination_ip_prohibited` and `http_request_denied`: the request was
     ///   refused *by this proxy*, and echoing the resolved address would turn
     ///   every refusal into a lookup oracle: a client that cannot reach an
     ///   internal resolver could read this server's view of a name straight out
@@ -154,7 +154,7 @@ impl ProxyError {
     ///   from-here information in, so the refusal must not carry it out.
     /// * `connection_limit_reached`, and the 407 path, say nothing about a
     ///   target: they are verdicts on the client.
-    /// * `proxy_internal_error` — nothing was contacted. The allocation this
+    /// * `proxy_internal_error`: nothing was contacted. The allocation this
     ///   host could not make failed before the first packet, so naming the
     ///   address would be reporting a hop that was never tried, and would hand
     ///   a client this server's resolution of a name it never reached (D89).
@@ -186,10 +186,9 @@ impl ProxyError {
         let mut fields = Fields::new();
         fields.append(
             PROXY_STATUS,
-            // A rendered socket address is printable ASCII, so this cannot fail;
-            // falling back to the parameterless value keeps that from being a
-            // panic if it ever somehow did, which is the property the whole
-            // refusal path is built on: refusing must never itself fail.
+            // A rendered socket address is printable ASCII, so this cannot fail.
+            // The fallback to the parameterless value keeps it from being a
+            // panic if it ever did: refusing must never itself fail.
             FieldValue::parse(value.as_bytes())
                 .unwrap_or_else(|| FieldValue::from_static(self.field_value())),
         );
@@ -222,17 +221,17 @@ impl ProxyError {
     ///
     /// One deliberate departure: `destination_ip_prohibited` is recommended as
     /// 502, and this server answers 403. Decision D11 made both policy refusals
-    /// — denied port and denied address — a 403, because they are refusals by
+    /// (denied port and denied address) a 403, because they are refusals by
     /// this proxy rather than reports about an upstream hop, and a client that
     /// sees 502 would reasonably retry.
     ///
-    /// One address refusal never arrives here at all (decision D49, a carve-out
-    /// from D11 rather than a revision of it): a target whose every resolved
-    /// address is the unspecified one is a name the upstream resolver filtered,
-    /// so it is answered with a 200 that closes on the spot — see
-    /// `accept_then_close` — and carries no `Proxy-Status` field, because
-    /// nothing about it is this proxy's verdict. Every refusal that is actually
-    /// sent still follows the table below.
+    /// One address refusal never arrives here at all (decision D49, an exception
+    /// to D11 rather than a revision of it): a target whose every resolved
+    /// address is the unspecified one is a name the upstream resolver filtered.
+    /// It is answered with a 200 that closes on the spot (`accept_then_close`)
+    /// and carries no `Proxy-Status` field, because nothing about it is this
+    /// proxy's verdict. Every refusal that is actually sent follows the table
+    /// below.
     pub fn recommended_status(self) -> Status {
         match self {
             Self::DnsError | Self::ConnectionRefused => Status::BAD_GATEWAY,
@@ -251,24 +250,24 @@ impl ProxyError {
 /// The distinction the RFC 9209 registry draws, and the one D89 is about.
 /// `destination_unavailable` is defined as "the intermediary considers the next
 /// hop to be unavailable; e.g., recent attempts to communicate with it may have
-/// failed, or a health check may indicate that it is down" (§2.3.4) — a
+/// failed, or a health check may indicate that it is down" (§2.3.4), which is a
 /// statement about the target. None of the errors below is one. They are raised
 /// by the allocation itself, before a single packet is addressed anywhere, so
 /// what they report is that this process ran out of something:
 ///
-/// * `EMFILE` / `ENFILE` — no descriptor, per process or system-wide. This is
+/// * `EMFILE` / `ENFILE`: no descriptor, per process or system-wide. This is
 ///   the one an operator meets: `max_connections` x `max_targets_per_conn`
 ///   sockets is what `crate::quic`'s startup check sizes `RLIMIT_NOFILE`
 ///   against, and a host that is over it fails every `socket()` at once.
-/// * `ENOBUFS` / `ENOMEM` — no kernel buffer or memory for another socket.
-/// * `EADDRNOTAVAIL` — no source address left to bind, which on a connect to a
+/// * `ENOBUFS` / `ENOMEM`: no kernel buffer or memory for another socket.
+/// * `EADDRNOTAVAIL`: no source address left to bind, which on a connect to a
 ///   remote address is the ephemeral port range exhausted. A target address
 ///   that is itself unassignable cannot reach here: the unspecified address is
 ///   answered by decision D49 before any dial, and every other refusal by the
 ///   destination policy.
 ///
-/// Reported as `proxy_internal_error` — "the intermediary encountered an
-/// internal error unrelated to the origin" (§2.3.30) — which is the registry's
+/// Reported as `proxy_internal_error`, "the intermediary encountered an
+/// internal error unrelated to the origin" (§2.3.30), which is the registry's
 /// own name for this, rather than as a healthy destination being down.
 ///
 /// Deliberately *not* here: `EACCES` and `EPERM`. A local firewall refusing the
@@ -292,10 +291,9 @@ const PROXY_STATUS: &str = "proxy-status";
 /// Renders `value` as a structured field String (RFC 8941 §3.3.3).
 ///
 /// A String is DQUOTE-delimited, and inside it only DQUOTE and backslash are
-/// escaped. A rendered socket address contains neither, so this never actually
-/// escapes anything today — it exists so that the one field value this server
-/// builds at runtime is correct by construction rather than by argument about its
-/// inputs.
+/// escaped. A rendered socket address contains neither, so this never escapes
+/// anything today. It exists so that the one field value this server builds at
+/// runtime is correct by construction rather than by argument about its inputs.
 fn sf_string(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
@@ -355,12 +353,12 @@ impl Responded {
 /// outright.
 ///
 /// Every response this server sends with no tunnel behind it is written this
-/// way, and for the reason the bound exists: a peer that grants no flow-control
+/// way, for the reason the bound exists: a peer that grants no flow-control
 /// credit never takes even the few bytes of a status line, and nothing else
-/// would ever end the wait — whatever the caller does next does not exist until
-/// this write returns. It is also why the count of authentication failures that
-/// is meant to cost a guesser a handshake is recorded by the caller before this
-/// call rather than after it (review H1/H2).
+/// would ever end the wait, because whatever the caller does next does not
+/// exist until this write returns. For the same reason the count of
+/// authentication failures, which is meant to cost a guesser a handshake, is
+/// recorded by the caller before this call rather than after it.
 ///
 /// `failed` is the caller's own wording for a write that failed, kept a literal
 /// at the call site so what this server can say still reads out of `src/`.
@@ -393,7 +391,7 @@ pub(crate) async fn refuse(stream: &mut Stream, status: Status) {
 /// Refuses a request, explaining why in an RFC 9209 `Proxy-Status` field.
 ///
 /// The status is the error's own (`recommended_status`), so the table that
-/// argues for each pairing — including D11's departure from the registry — is
+/// argues for each pairing, including D11's departure from the registry, is
 /// the only thing that decides one.
 pub(crate) async fn refuse_because(stream: &mut Stream, error: ProxyError) {
     refuse_with(stream, error.recommended_status(), error.fields()).await;
@@ -442,50 +440,46 @@ pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fie
 /// Accepts a request with a 200 and closes the tunnel again immediately.
 ///
 /// **Not a refusal, and deliberately not named like one.** The response carries
-/// no `Proxy-Status` field and says nothing about a failure; `fields` is
-/// whatever an accepted response of that tunnel type has to carry — nothing for
+/// no `Proxy-Status` field and says nothing about a failure. `fields` is
+/// whatever an accepted response of that tunnel type has to carry: nothing for
 /// a TCP tunnel, the RFC 9297 `Capsule-Protocol` field for CONNECT-UDP.
 ///
 /// Exactly one case uses it (decision D49): a target whose every resolved
 /// address is the unspecified one, which is how a filtering resolver upstream
 /// says "this name is blocked". That block is not this proxy's verdict, and an
-/// error status makes the client attribute it here; a tunnel that opens and
-/// closes at once is instead what every transport without an in-band refusal
-/// channel shows for such a name, and what a target that accepts a connection
-/// and hangs up immediately looks like on the wire.
+/// error status makes the client attribute it here. A tunnel that opens and
+/// closes at once is what every transport without an in-band refusal channel
+/// shows for such a name, and what a target that accepts a connection and
+/// hangs up immediately looks like on the wire.
 ///
-/// Mechanically the close is the tidy one, and it is the same one an
-/// established session ends with: STOP_SENDING with H3_NO_ERROR for anything
-/// the client is still sending, then a FIN on the response stream. **Never a
-/// reset** — RFC 9114 §4.4 reserves an abruptly terminated stream for a failure
-/// of the target connection (H3_CONNECT_ERROR), which this is not, and a reset
-/// would also be the one signal a client is entitled to read as "the proxy
-/// broke".
+/// The close is the tidy one that an established session also ends with:
+/// STOP_SENDING with H3_NO_ERROR for anything the client is still sending, then
+/// a FIN on the response stream. **Never a reset.** RFC 9114 §4.4 reserves an
+/// abruptly terminated stream for a failure of the target connection
+/// (H3_CONNECT_ERROR), which this is not, and a client is entitled to read a
+/// reset as "the proxy broke".
 ///
-/// The FIN that follows is this server's own choice rather than a rule read off
-/// a spec. RFC 9297 §3.3 mentions a cleanly terminated capsule stream only to
-/// rule on what a truncated last capsule means then — "If the receive side of a
-/// stream carrying Capsules is terminated cleanly (for example, in HTTP/3 this
-/// is defined as receiving a QUIC STREAM frame with the FIN bit set) and the
-/// last Capsule on the stream was truncated, this MUST be treated as if it were
-/// a malformed or incomplete message" — and says nothing about ending one on
+/// The FIN is this server's own choice rather than a rule read off a spec.
+/// RFC 9297 §3.3 mentions a cleanly terminated capsule stream only to rule on
+/// what a truncated last capsule means then: "If the receive side of a stream
+/// carrying Capsules is terminated cleanly (for example, in HTTP/3 this is
+/// defined as receiving a QUIC STREAM frame with the FIN bit set) and the last
+/// Capsule on the stream was truncated, this MUST be treated as if it were a
+/// malformed or incomplete message". It says nothing about ending one on
 /// purpose. RFC 9298 §3.1 ties the request stream to a socket that exists: a
 /// UDP proxy "MUST keep the socket open while the request stream is open", and
 /// when it closes a socket it "MUST close the request stream". No socket is
-/// ever opened here, so neither sentence reaches this case. So this is this
-/// server's own, and the FIN is what it picks: the ending an established
-/// session gets, and the only one that says nothing went wrong.
+/// ever opened here, so neither sentence reaches this case. The FIN is the
+/// ending an established session gets, and the only one that says nothing went
+/// wrong.
 ///
-/// The STOP_SENDING up front is the shape to keep. RFC 9114 §4.1 leaves the
-/// choice open — a server may abort reading the request, or leave the client to
-/// finish and close it — and the other shape was tried once (D59): 200 and FIN
-/// only, then read and discard until the client closed, on the theory that a
-/// stop landing on a client still writing its first bytes was what made one
-/// client stack answer with a transport-level PROTOCOL_VIOLATION. A frame-level
-/// A/B against that very stack showed the two shapes are indistinguishable to it
-/// (it resets within a round trip either way) and production kept failing under
-/// the drain, so the simpler shape came back. That fault is on the client's
-/// side and does not depend on what this close sends.
+/// Keep the STOP_SENDING up front (D59). RFC 9114 §4.1 leaves the choice open:
+/// a server may abort reading the request, or leave the client to finish and
+/// close it. The other shape, 200 and FIN followed by reading and discarding
+/// until the client closes, makes no difference to the client stack that
+/// answers this close with a transport-level PROTOCOL_VIOLATION: a frame-level
+/// comparison showed it resets within a round trip either way. That fault is
+/// on the client's side and does not depend on what this close sends.
 pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields) {
     let stream_id = stream.id();
     stream.stop_receiving(h3api::NO_ERROR);

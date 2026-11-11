@@ -4,7 +4,7 @@
 //!
 //! A CONNECT-UDP request opens a *session*: one request stream plus one
 //! connected UDP socket. Unlike a TCP tunnel, the payload does not travel on the
-//! request stream — it travels in QUIC DATAGRAM frames shared by every session
+//! request stream. It travels in QUIC DATAGRAM frames shared by every session
 //! on the connection, each tagged with the Quarter Stream ID of its request
 //! stream. So a session needs three things pumped at once:
 //!
@@ -27,11 +27,11 @@
 //!   (RFC 9298 §6.1).
 //! * On the capsule fallback, a write to the client that does not complete
 //!   within one idle timeout ends the session by **resetting** the request
-//!   stream rather than finishing it — see `Session::forward_to_client`, which
-//!   is also why the idle timeout covers only the wait for work and not the
-//!   work.
+//!   stream rather than finishing it. `Session::forward_to_client` says why,
+//!   and that is also why the idle timeout covers only the wait for work and
+//!   not the work.
 //! * Closing the socket also closes the request stream, and vice versa
-//!   (RFC 9298 §3.1) — a half-open UDP session has no meaning.
+//!   (RFC 9298 §3.1). A half-open UDP session has no meaning.
 
 use std::cell::RefCell;
 use std::io::{IoSliceMut, Read};
@@ -268,7 +268,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
 
     // The Quarter Stream ID follows from the stream id alone, so the session can
     // start collecting datagrams as soon as the request is known to be a
-    // well-formed CONNECT-UDP one — before the resolver is asked anything.
+    // well-formed CONNECT-UDP one, before the resolver is asked anything.
     //
     // RFC 9298 §5: "A client MAY optimistically start sending UDP packets in
     // HTTP Datagrams before receiving the response to its UDP proxying request",
@@ -279,7 +279,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // immediately does not lose its first packets to name resolution.
     //
     // Every refusal below returns, dropping the receiver and with it both the
-    // queue and the claim — which is the discard the same paragraph calls for
+    // queue and the claim. That is the discard the same paragraph calls for
     // when the request the datagrams were waiting on never succeeds.
     let quarter_stream_id = datagram::quarter_stream_id(stream_id);
     let Some(inbound) = stream.datagrams() else {
@@ -296,19 +296,19 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     };
 
     // Port policy, resolution and destination policy, in that order and with
-    // every refusal already answered by the time this returns — see
-    // [`tunnel::admit_target`]. RFC 9298 §3.1 is what puts it here rather than
-    // after the 2xx: resolution must complete first, so a bad name is refused
-    // instead of silently swallowing every packet. The 200-then-close path is
-    // handed [`capsule_fields`] because that answer is a real successful
-    // response to a CONNECT-UDP request, and the RFC 9297 `Capsule-Protocol`
-    // field is what makes it one.
+    // every refusal already answered by the time this returns; see
+    // [`tunnel::admit_target`]. RFC 9298 §3.1 puts it before the 2xx:
+    // resolution must complete first, so a bad name is refused instead of
+    // silently swallowing every packet. The 200-then-close path is handed
+    // [`capsule_fields`] because that answer is a real successful response to a
+    // CONNECT-UDP request, and the RFC 9297 `Capsule-Protocol` field is what
+    // makes it one.
     //
     // Every path out of here that answers the request returns, dropping
-    // `inbound` with it — which gives up the Quarter Stream ID and discards
-    // whatever the client sent optimistically; the router then drops later
-    // datagrams for that id silently, exactly as it does for a session that has
-    // just closed.
+    // `inbound` with it. That gives up the Quarter Stream ID and discards
+    // whatever the client sent optimistically. The router then drops later
+    // datagrams for that id silently, as it does for a session that has just
+    // closed.
     let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, capsule_fields).await
     else {
         return;
@@ -417,7 +417,7 @@ struct Session<'a> {
     ///
     /// RFC 9298 §7: until the target says something, this session might be an
     /// attempt to use the proxy as a reflector or a port scanner, so what it can
-    /// emit is capped. `None` means uncapped — either the target has answered,
+    /// emit is capped. `None` means uncapped: either the target has answered,
     /// which lifts the cap for good because the target has consented to the
     /// conversation, or the operator disabled the mitigation.
     ///
@@ -444,8 +444,7 @@ struct Session<'a> {
     /// When this session becomes idle enough to close.
     ///
     /// Pushed out by [`Self::touch`] whenever a packet crosses the proxy, and
-    /// by nothing else — see [`Self::run`] for why arrival alone must not
-    /// count.
+    /// by nothing else. [`Self::run`] says why arrival alone must not count.
     deadline: tokio::time::Instant,
     /// The connection state this session reads its budgets and its QUIC
     /// connection from.
@@ -461,9 +460,9 @@ enum Step {
     /// Keep going.
     ///
     /// Deliberately not what re-arms the idle deadline: the steps that moved a
-    /// packet call [`Session::touch`] themselves, so one that merely consumed
-    /// bytes — a skipped capsule, a dropped packet — continues without buying
-    /// the session time.
+    /// packet call [`Session::touch`] themselves, so one that only consumed
+    /// bytes (a skipped capsule, a dropped packet) continues without extending
+    /// the deadline.
     Continue,
     /// The session is over; close the request stream tidily.
     Stop,
@@ -543,16 +542,12 @@ enum Event {
 /// value without consulting the clock, so a lapsed deadline is only noticed on a
 /// poll where the inner future was not already ready. Two of a session's three
 /// sources are things a peer can keep ready for as long as it likes without a
-/// single packet crossing the proxy — bytes that finish no capsule, and payloads
-/// the unanswered-packet budget drops — and the second of those, sent fast
-/// enough, kept the loop supplied so that the deadline was never measured at
-/// all. Measured on a dev host: a 1 s timeout closed anywhere between on time
-/// and 2.4 s late under one flooding sender, ran 9.3 s past its deadline under
-/// four, and in one run of four had not closed at all when the test gave up at
-/// 30 s. How far it ran was a matter of how long the queue stayed non-empty, so
-/// a busy host was the worst case — and this is the only bound an authenticated
-/// peer's session is under, since D76's covers connections that never
-/// authenticated.
+/// single packet crossing the proxy: bytes that finish no capsule, and payloads
+/// the unanswered-packet budget drops. The second of those, sent fast enough,
+/// keeps the loop supplied so that the deadline is never measured. On a dev
+/// host a 1 s timeout under four flooding senders ran 9.3 s late, and in one run
+/// had not closed after 30 s. This is the only bound an authenticated peer's
+/// session is under, since D76's covers connections that never authenticated.
 ///
 /// So the clock is read before each wait, which is D92's rule for the
 /// connection's own silence deadline applied to the other absolute deadline in
@@ -560,11 +555,11 @@ enum Event {
 /// to be *read*, not only awaited. The cost is one `Instant::now()` per packet,
 /// the same price D92 accepted there.
 ///
-/// The timer arm decides as well, and may: `timeout_at` expires only once the
-/// clock has passed `deadline`, so it is the same verdict as the read above
-/// reached by the other road, with nothing else to weigh. That is where this
-/// differs from D92's loop, which had to go back round because a second input —
-/// the authentication flag — could have changed while it waited.
+/// The timer arm may decide as well: `timeout_at` expires only once the clock
+/// has passed `deadline`, so it reaches the same verdict as the read above,
+/// with nothing else to weigh. D92's loop differs here: it has to go back round
+/// because a second input, the authentication flag, could have changed while it
+/// waited.
 async fn before_deadline<T>(
     deadline: tokio::time::Instant,
     work: impl std::future::Future<Output = T>,
@@ -605,25 +600,24 @@ impl Session<'_> {
             //
             // Handling the event is deliberately outside it. `forward_to_client`
             // writes to the request stream on the capsule path, and a write in
-            // flight is exactly what must not be cancelled: the backend keeps a
-            // partial DATA frame, which the tidy `finish()` below would then FIN
-            // in the middle of a capsule. That branch bounds its own write
-            // instead, and ends the session by resetting rather than finishing.
+            // flight must not be cancelled: the stream keeps a partial DATA
+            // frame, which the tidy `finish()` below would then FIN in the
+            // middle of a capsule. That branch bounds its own write instead,
+            // and ends the session by resetting rather than finishing.
             //
             // A deadline rather than a per-wait timeout, because "idle" has to
             // mean "no packet crossed the proxy", not "no bytes arrived":
             // [`Self::touch`] pushes it out when a payload reaches the target
             // or the target answers, and nothing else does. A wait re-armed by
             // arrival alone would let a peer hold this session's socket,
-            // buffers and tunnel slot for ever by dripping bytes that complete
-            // nothing — one a second into a capsule that never finishes — and
-            // an authenticated peer is under no other bound: D76's deadline
-            // covers only connections that never authenticated.
+            // buffers and tunnel slot for ever by sending bytes that complete
+            // nothing, such as one byte a second into a capsule that never
+            // finishes. An authenticated peer is under no other bound: D76's
+            // deadline covers only connections that never authenticated.
             //
             // Waited on through [`before_deadline`] rather than `timeout_at`
-            // alone, because two of the three sources are ones a peer can keep
-            // ready for ever without moving a packet: see that function for why
-            // the clock has to be read as well as awaited (D92).
+            // alone; see that function for why the clock has to be read as
+            // well as awaited (D92).
             let sources = async {
                 tokio::select! {
                     payload = self.inbound.recv() => Event::Inbound(payload),
@@ -675,9 +669,9 @@ impl Session<'_> {
                 // saying so does not leave the peer with nothing: dropping the
                 // `Reader` makes quinn send STOP_SENDING with code 0, which RFC
                 // 9114 §8.1 makes equivalent to H3_NO_ERROR, so the peer would
-                // read a fault on one half and "no error" on the other. One
-                // verdict on both halves instead (review L9). The socket still
-                // closes, with `self`.
+                // read a fault on one half and "no error" on the other. Both
+                // halves carry the one code instead. The socket still closes,
+                // with `self`.
                 Step::Aborted(code) => {
                     self.reader.stop_receiving(code);
                     return;
@@ -709,9 +703,9 @@ impl Session<'_> {
                 // ICMP errors surface here on a connected socket, and they
                 // are not all the same thing. A socket the operating system
                 // has given up on ends the session, which is RFC 9298 §3.1;
-                // an error about one packet costs that packet, which is the
-                // rule the send side has always applied. See
-                // [`read_verdict`] for what was measured.
+                // an error about one packet costs that packet, the same rule
+                // the send side applies. See [`read_verdict`] for what was
+                // measured.
                 let verdict = read_verdict(&error);
                 debug!(
                     stream_id = self.stream_id,
@@ -768,18 +762,17 @@ impl Session<'_> {
 
     /// Pushes the idle deadline out by one timeout from now.
     ///
-    /// Called exactly twice: when a payload reaches the target, and when the
-    /// target answers. Bytes that produce neither — a capsule still being
-    /// assembled or skipped, a packet dropped by a budget or a full queue —
-    /// leave the deadline where it is, which is what makes the timeout a
-    /// measure of the session doing its job rather than of the peer talking.
+    /// Called from exactly two places: when a payload reaches the target, and
+    /// when the target answers. Bytes that produce neither (a capsule still
+    /// being assembled or skipped, a packet dropped by a budget or a full
+    /// queue) leave the deadline where it is. So the timeout measures the
+    /// session moving packets, not the peer sending bytes.
     ///
-    /// The two directions are deliberately not symmetric about drops: a target
+    /// The two directions are deliberately not symmetric about drops. A target
     /// packet counts on receipt, before the RFC 9298 §6.1 size check that may
     /// yet drop it, because a target answering at all is the target consenting
-    /// to the conversation — while a client payload the unanswered budget
-    /// drops counts for nothing, because the budget exists precisely to doubt
-    /// that consent.
+    /// to the conversation. A client payload the unanswered budget drops counts
+    /// for nothing, because the budget exists to doubt that consent.
     fn touch(&mut self) {
         self.deadline = tokio::time::Instant::now() + self.ctx.stall_budget;
     }
@@ -882,13 +875,12 @@ impl Session<'_> {
         // negotiated separately: `SETTINGS_H3_DATAGRAM` is the HTTP/3 one
         // (RFC 9297 §2.1.1), while `max_datagram_frame_size` is the QUIC
         // transport parameter that says how large a DATAGRAM frame the peer will
-        // accept — `None` from quinn meaning it sent none, so the peer cannot
+        // accept. `None` from quinn means it sent none, so the peer cannot
         // receive a QUIC datagram at all (RFC 9221 §3). A peer that advertises
-        // the first without the second is contradicting itself, but nothing in
-        // either RFC makes that a protocol error, and treating the missing limit
-        // as a limit of zero made every packet "too large" and the session a
-        // silent no-op. There is no datagram path to bypass, so the capsule
-        // stream is the correct channel rather than a downgrade.
+        // the first without the second contradicts itself, but neither RFC
+        // makes that a protocol error. Treating the missing limit as a limit of
+        // zero would make every packet "too large" and the session a silent
+        // no-op.
         if self.ctx.datagrams_allowed()
             && let Some(datagrams) = self.datagrams.as_mut()
         {
@@ -900,17 +892,17 @@ impl Session<'_> {
         // SETTINGS_H3_DATAGRAM, which RFC 9297 §2.1.1 makes a prohibition rather
         // than a preference, or it never told QUIC what size of DATAGRAM frame
         // it accepts. Either way the request stream is the only way out. This is
-        // not the same situation as the oversize case above: there a datagram
-        // path exists and RFC 9298 §6.1 says not to bypass it, whereas here
-        // there is none, so capsules are the correct channel.
+        // not the oversize case in `DatagramPath::send`: there a datagram path
+        // exists and RFC 9298 §6.1 says not to bypass it, whereas here there is
+        // none, so capsules are the correct channel rather than a downgrade.
         let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packets.payload());
 
         // The one write in this session that can block for as long as the peer
         // likes: `send_data` applies the peer's flow control, so a client that
         // stops reading the stream parks it indefinitely. A write that has not
-        // completed within a whole idle timeout is that client — the bound is
-        // on the write finishing, not on progress inside it, the same reading
-        // the TCP half-close bound gives the same knob.
+        // completed within a whole idle timeout is treated as that client. The
+        // bound is on the write finishing, not on progress inside it, as with
+        // the TCP half-close bound that uses the same knob.
         //
         // It cannot simply be abandoned: `send_data` is not cancel-safe, and
         // its rustdoc carries the rule. The tidy `finish()` this session
@@ -997,10 +989,9 @@ impl Session<'_> {
                     // decoder. 0x33 is registered as a "Datagram or Capsule
                     // Protocol parse error", and nothing failed to parse here:
                     // every capsule received was well formed, and the message
-                    // simply ended somewhere other than a capsule boundary. The
-                    // two codes cover different faults and this one is the
-                    // message's, so the code the RFC names for a malformed
-                    // message is the right one to send.
+                    // ended somewhere other than a capsule boundary. That is a
+                    // fault of the message, so the code the RFC names for a
+                    // malformed message is sent.
                     debug!(
                         stream_id,
                         error = %capsule::Error::Truncated,
@@ -1025,7 +1016,7 @@ impl Session<'_> {
 /// Holds what sending a packet as a QUIC datagram needs to remember between
 /// packets, so that a packet that fits takes one acquisition of the
 /// connection's lock, the one inside `send_datagram`. Asking for the size limit
-/// and for the room in the send queue on every packet took two more.
+/// and for the room in the send queue on every packet would take two more.
 struct DatagramPath {
     stream_id: u64,
     quarter_stream_id: u64,
@@ -1067,9 +1058,9 @@ impl DatagramPath {
     ///
     /// A packet under the last limit read, for which
     /// [`Context::claim_datagram_room`] shows room in quinn's queue, goes
-    /// straight to `send_datagram`. Any other packet takes both readings first
-    /// and is handled as every packet was before the readings were kept: the
-    /// size checked against a fresh limit, then the room read and graded.
+    /// straight to `send_datagram`. Any other packet takes both readings first:
+    /// the size is checked against a fresh limit, then the room is read and
+    /// graded.
     fn send(&mut self, ctx: &Context, packets: &mut PacketBlock) {
         let encoded_len = packets.encoded_len();
 
@@ -1096,13 +1087,13 @@ impl DatagramPath {
             // silently drops the *oldest* queued datagrams to make room, saying
             // so only in its own `trace!`. The `Blocked` error that would
             // otherwise report it is `unreachable!()` on this path, so the
-            // `debug!` below can never see this loss — the remaining space,
-            // read before the send, is the only handle on it there is (D72).
+            // `debug!` below can never see this loss. The remaining space,
+            // read before the send, is the only way to detect it (D72).
             //
             // The packet still goes out unchanged: the eviction was decided by
             // how far behind the queue already is, and holding this packet back
-            // would only trade a fresh datagram for a stale one. Visibility,
-            // nothing more.
+            // would only trade a fresh datagram for a stale one. The reading
+            // only decides what is logged.
             //
             // The reading is taken only here, when the connection's lower bound
             // of the room ([`Context::claim_datagram_room`]) does not cover the
@@ -1113,11 +1104,11 @@ impl DatagramPath {
             // Exactly-enough space is room, not an eviction.
             // `datagram_send_buffer_space()` is the limit minus what is queued
             // minus one datagram's own overhead, which makes `len <= space`
-            // quinn's own "this one fits" predicate written the other way round
-            // -- the same comparison that would return `Blocked` if the caller
-            // had asked not to drop. A datagram larger than that is what puts
+            // quinn's own "this one fits" predicate written the other way
+            // round. It is the same comparison that would return `Blocked` if
+            // the caller had asked not to drop. A datagram larger than that puts
             // the queue over its limit, and quinn brings it back under by
-            // discarding from the front, on this send or the next one; either
+            // discarding from the front, on this send or the next one. Either
             // way the loss is already decided by the time anything here could
             // react to it, which is why only how loudly to say so is graded.
             let space = ctx.quic.datagram_send_buffer_space();
@@ -1170,15 +1161,14 @@ impl DatagramPath {
     /// Says that a packet of `encoded_len` bytes was dropped as too large, as
     /// loudly as `graded` says.
     ///
-    /// At `debug!` the drop was invisible in production, and the condition is
-    /// not hypothetical: Surge advertises `max_datagram_frame_size = 1300`,
-    /// which a large EDNS0 or DNSSEC answer and any QUIC-in-QUIC flow through
-    /// the tunnel clear routinely. So the drops the schedule picks are raised
-    /// to `info!` -- one line naming the length, the limit and how many drops
-    /// there have been, enough for an operator to recognise what is happening
-    /// and how hard -- and the rest stay at `debug!`, because these arrive per
-    /// packet and a flood of one benign message is what buries the warnings
-    /// that matter.
+    /// A drop logged only at `debug!` is invisible in production, and the
+    /// condition is not hypothetical: Surge advertises
+    /// `max_datagram_frame_size = 1300`, which a large EDNS0 or DNSSEC answer
+    /// and any QUIC-in-QUIC flow through the tunnel exceed routinely. So the
+    /// drops the schedule picks are raised to `info!`, one line naming the
+    /// length, the limit and how many drops there have been. The rest stay at
+    /// `debug!`, because these arrive per packet and a flood of one benign
+    /// message hides the warnings that matter.
     fn report_oversize(&self, graded: Graded, encoded_len: usize) {
         let limit = self.limit;
         match graded {
@@ -1229,12 +1219,11 @@ enum Graded {
 /// call sites carry an argument each and they are different arguments.
 ///
 /// [`crate::logfmt::Sampler`] is the doubling schedule this crate bounds every
-/// peer-repeatable line with: the first occurrence of a session is as immediate
-/// as it ever was, and the reports after it are 2, 4, 8 and so on rather than
-/// silence. `sampler` is the session's own, so one session cannot quieten
-/// another, and it is advanced only where the condition arose, which is the
-/// whole state this costs: no allocation, no lock, one atomic increment on the
-/// forwarding path.
+/// peer-repeatable line with: the first occurrence of a session is reported at
+/// once, and the reports after it are 2, 4, 8 and so on rather than silence.
+/// `sampler` is the session's own, so one session cannot quieten another. It is
+/// advanced only where the condition arose, and that is the whole cost: no
+/// allocation, no lock, one atomic increment on the forwarding path.
 fn grade(value: usize, limit: usize, sampler: &crate::logfmt::Sampler) -> Graded {
     if value <= limit {
         return Graded::Clear;
@@ -1257,27 +1246,22 @@ fn occurrence(sampler: &crate::logfmt::Sampler) -> Graded {
 
 /// What a failure of the target socket's *read* side costs.
 ///
-/// The old rule was that any error ends the session, on the reading that an
-/// error arriving here is the operating system reporting the socket unusable
-/// (RFC 9298 §3.1). That is true of most of them and not of all: Linux queues an
-/// ICMP-derived error on a connected socket and hands it to whichever syscall
-/// comes next, which is `recv` whenever the session is parked waiting for the
+/// Most errors arriving here are the operating system reporting the socket
+/// unusable, which ends the session (RFC 9298 §3.1). Not all of them are: Linux
+/// queues an ICMP-derived error on a connected socket and hands it to whichever
+/// syscall comes next, which is `recv` whenever the session is waiting for the
 /// target rather than forwarding to it.
 ///
-/// **Measured before it was changed** (2026-09-04, Linux 7.0.14 in Docker, two
-/// network namespaces either side of a router with a 1280-byte link). A UDP
-/// socket with `IP_PMTUDISC_DO`, which is what [`crate::net`] sets on Linux,
-/// sent a 1400-byte payload: the send succeeded, the router answered ICMP type 3
-/// code 4, and the following `recv` returned **`EMSGSIZE`**. That is one of the
-/// four errnos the send side forgives, and it used to end the session here. The
-/// same run measured what else reaches the read side: an ICMP port-unreachable
-/// arrives as `ECONNREFUSED`, `--reject-with icmp-admin-prohibited` as
-/// `EHOSTUNREACH` and `icmp-net-prohibited` as `ENETUNREACH`, all three of which
-/// are verdicts on the socket and still end the session. `EPERM` from a local
-/// firewall rule was reported by `send` itself, synchronously, and never reached
-/// a read.
+/// Measured on Linux 7.0.14, across a router with a 1280-byte link: a UDP
+/// socket with `IP_PMTUDISC_DO`, which [`crate::net`] sets on Linux, sent a
+/// 1400-byte payload, the router answered ICMP type 3 code 4, and the following
+/// `recv` returned **`EMSGSIZE`**, one of the errnos the send side forgives. An
+/// ICMP port-unreachable arrives as `ECONNREFUSED`, admin-prohibited as
+/// `EHOSTUNREACH` and net-prohibited as `ENETUNREACH`, all verdicts on the
+/// socket that end the session. `EPERM` from a local firewall rule is returned
+/// by `send` itself and never reaches a read.
 ///
-/// So the two directions grade errors the same way now, with
+/// So the two directions grade errors the same way, with
 /// [`is_per_packet_error`] as the one rule. A read that is forgiven does **not**
 /// call [`Session::touch`]: nothing crossed the proxy, so the session still ends
 /// at its idle deadline if the target never answers. There is no loop to spin
@@ -1295,7 +1279,7 @@ fn read_verdict(error: &std::io::Error) -> Step {
 ///
 /// RFC 9298 draws the line in two places. §3.1 requires the request stream to be
 /// closed when "a UDP proxy is notified by its operating system that its socket
-/// is no longer usable" — ECONNREFUSED from an ICMP port-unreachable is that
+/// is no longer usable". ECONNREFUSED from an ICMP port-unreachable is that
 /// case. §5, on the other hand, says a proxy that "can only send out UDP packets
 /// of a certain length due to its underlying link MTU [...] has no choice but to
 /// discard incoming HTTP Datagrams" longer than that. Discard means discard: the
@@ -1303,16 +1287,16 @@ fn read_verdict(error: &std::io::Error) -> Step {
 ///
 /// The errors below are per-packet verdicts, not verdicts on the socket:
 ///
-/// * `EMSGSIZE` — the direct consequence of the DF bit [`crate::net`] sets on
+/// * `EMSGSIZE`: the direct consequence of the DF bit [`crate::net`] sets on
 ///   Linux (`IP_PMTUDISC_DO`), raised for every payload above the path MTU. This
 ///   is the one that matters in production: a client is entitled to send a 4 KiB
 ///   UDP packet, and tearing its tunnel down for it would be a bug the dev host
 ///   cannot reproduce, since macOS has no equivalent socket option.
-/// * `EPERM` / `EACCES` — a local firewall rejecting individual packets.
-/// * `ENOBUFS` — the kernel's send buffer momentarily full. The socket is
-///   still usable, the shortage is local and transient, and dropping the
-///   packet is exactly what the network would have done with it (D89's rule
-///   in miniature: a local shortage is not a verdict on the peer).
+/// * `EPERM` / `EACCES`: a local firewall rejecting individual packets.
+/// * `ENOBUFS`: the kernel's send buffer momentarily full. The socket is still
+///   usable, the shortage is local and transient, and dropping the packet is
+///   what the network would have done with it (D89: a local shortage is not a
+///   verdict on the peer).
 ///
 /// Kept as a plain function over the OS error number because `std` maps none of
 /// these onto a stable `ErrorKind`.
@@ -1368,12 +1352,12 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unrea
 ///
 /// Two of them, both stated as requirements on the receiver:
 ///
-/// * RFC 9298 §3.4 — "The :path and :scheme pseudo-header fields SHALL NOT be
+/// * RFC 9298 §3.4: "The :path and :scheme pseudo-header fields SHALL NOT be
 ///   empty", and "a UDP proxying request that does not conform to these
 ///   restrictions is malformed". RFC 9220 says the same in the other direction:
 ///   an extended CONNECT request must carry both. `:path` needs no check here
 ///   because [`parse_target`] already refuses anything that is not the template.
-/// * RFC 9297 §3.2 — "The Capsule Protocol MUST NOT be used with messages that
+/// * RFC 9297 §3.2: "The Capsule Protocol MUST NOT be used with messages that
 ///   contain Content-Length, Content-Type, or Transfer-Encoding header fields
 ///   [...] A receiver that observes a violation of these requirements MUST treat
 ///   the HTTP message as malformed." The body of this request stream is a
@@ -1388,7 +1372,7 @@ async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unrea
 /// * `Capsule-Protocol: ?0`, or a value that is not a Boolean, is not rejected.
 ///   RFC 9297 §3.4 says a non-Boolean value "MUST be handled as if the field
 ///   were not present" and that a false value "has the same semantics as when
-///   the header is not present" — so the conformant reaction to both is to
+///   the header is not present". So the conformant reaction to both is to
 ///   ignore the field, which is what this server does by never reading it. The
 ///   field tells an *intermediary* that capsules are in flight; an endpoint that
 ///   knows the `connect-udp` upgrade token knows it already (RFC 9297 §3).
@@ -1428,10 +1412,10 @@ pub fn validate(req: &Request) -> Result<(), &'static str> {
 /// /.well-known/masque/udp/{target_host}/{target_port}/
 /// ```
 ///
-/// Parsing is deliberately lenient about the things clients disagree on — the
-/// trailing slash is optional, and an IPv6 literal is accepted both in the
-/// RFC 9298 §3 form (bare, only the colons escaped) and bracketed — while
-/// staying strict about anything ambiguous. What comes out is a host, with the
+/// Parsing is deliberately lenient about the things clients disagree on, and
+/// strict about anything ambiguous. The trailing slash is optional, and an IPv6
+/// literal is accepted both in the RFC 9298 §3 form (bare, only the colons
+/// escaped) and bracketed. What comes out is a host, with the
 /// brackets of the second form already off: [`crate::net::resolve`] resolves
 /// names and literals, not URI components.
 pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'static str> {
@@ -1463,9 +1447,9 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
 
     // The brackets belong to this template and come off here. RFC 9298 §3
     // writes an IPv6 literal bare, with only its colons escaped, but some
-    // clients send the bracketed form and it costs nothing to accept -- and
-    // taking them off is this parser's job rather than the resolver's, which is
-    // handed a host and not a piece of URI syntax.
+    // clients send the bracketed form and it costs nothing to accept. Taking
+    // them off is this parser's job rather than the resolver's, which is handed
+    // a host and not a piece of URI syntax.
     let unbracketed = host
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
@@ -1478,8 +1462,8 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
 
     // A bracket that survived that pair is not part of any host
     // ([`tunnel::stray_bracket`]). The two routes are the same malformation and
-    // earn the same 400: until this, `example.com%5D` went on to the resolver
-    // and came back a 502 dns_error.
+    // get the same 400. Without this check `example.com%5D` would reach the
+    // resolver and come back a 502 dns_error.
     if tunnel::stray_bracket(&host) {
         return Err("stray bracket in host");
     }

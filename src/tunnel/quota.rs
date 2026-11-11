@@ -13,7 +13,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 /// One connection's tunnel budget.
 ///
-/// Every tunnel — TCP or UDP — costs a file descriptor on the target side, and a
+/// Every tunnel, TCP or UDP, costs a file descriptor on the target side, and a
 /// single client multiplexes as many as it likes onto one QUIC connection. This
 /// is the bound that keeps one client from exhausting the process fd limit, so
 /// both tunnel types draw on the *same* budget rather than one each.
@@ -22,31 +22,29 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 /// shutdown path needs to *observe* the count reaching zero without competing
 /// for it.
 ///
-/// The two used to be one thing — `wait_until_idle` was `acquire_many(limit)`,
-/// on the reading that taking every permit at once is the same as waiting for
-/// every tunnel to end. It is not. `tokio`'s semaphore is fair, so a waiter that
-/// cannot be satisfied yet *takes the permits that are free* and queues for the
-/// rest; while the drain waited, `available_permits()` was zero, so `live()`
-/// reported the full limit and `acquire()` refused every caller. The connection
-/// then answered `503 connection_limit_reached` to requests below the GOAWAY
-/// identifier — ones the peer had been told "might have been processed",
-/// RFC 9114 §5.2, and this server means to serve — with one tunnel open out of
-/// a hundred (adversarial pass 2026-08-29).
+/// The drain must not wait by taking every permit with `acquire_many(limit)`.
+/// `tokio`'s semaphore is fair, so a waiter that cannot be satisfied yet *takes
+/// the permits that are free* and queues for the rest. While it waited,
+/// `available_permits()` would be zero, so `live()` would report the full limit
+/// and `acquire()` would refuse every caller. The connection would answer
+/// `503 connection_limit_reached` to requests below the GOAWAY identifier, which
+/// the peer was told "might have been processed" (RFC 9114 §5.2) and which this
+/// server means to serve.
 pub struct Quota {
     permits: Arc<Semaphore>,
     limit: u32,
     /// Accepted requests that have not finished, whether or not they ever take
     /// a slot.
     ///
-    /// The slot is taken late on purpose -- after the credentials check, so an
+    /// The slot is taken late on purpose: after the credentials check, so an
     /// unauthenticated peer cannot spend one, and after the 400 an RFC 9114 §4.2
-    /// violation gets -- which leaves a stretch of every request's life during
+    /// violation gets. That leaves a stretch of every request's life during
     /// which it is being served and holds nothing. The semaphore cannot see that
     /// stretch, and the drain must: a request below the GOAWAY identifier is
     /// one the peer was told "might have been processed" (RFC 9114 §5.2), and
-    /// this server serves those rather than rejecting them individually -- so a
-    /// request whose HEADERS frame is still arriving is squarely its business
-    /// (adversarial pass 2026-08-30).
+    /// this server serves those rather than rejecting them individually. So a
+    /// request whose HEADERS frame is still arriving must keep the connection
+    /// open.
     pending: Arc<AtomicU32>,
     /// Signalled by every [`Slot`] and every [`Pending`] as it goes, so the
     /// drain can watch the count instead of taking part in it.
@@ -55,10 +53,10 @@ pub struct Quota {
 
 /// One occupied tunnel slot, released when dropped.
 ///
-/// Dropping is the *only* way a slot is returned, which is what makes every exit
-/// path — response failure, idle timeout, reset, panic — leak-free by
-/// construction, in the same spirit as the [`crate::h3api::DatagramReceiver`] a
-/// UDP session holds for as long as its Quarter Stream ID routes.
+/// Dropping is the *only* way a slot is returned, which makes every exit path
+/// (response failure, idle timeout, reset, panic) leak-free by construction, as
+/// with the [`crate::h3api::DatagramReceiver`] a UDP session holds for as long
+/// as its Quarter Stream ID routes.
 pub struct Slot {
     /// `None` only inside [`Drop::drop`], which is how the permit is given back
     /// before the announcement that it was; see there.
@@ -72,8 +70,8 @@ impl Drop for Slot {
         // fields are dropped *after* this body runs. On the multi-threaded
         // runtime the server actually uses, waking the drain first lets it
         // re-read a count that has not moved yet on another core and park again
-        // with nothing left to wake it. A current-thread runtime -- what the
-        // tests below run on -- cannot show the difference, so this ordering is
+        // with nothing left to wake it. A current-thread runtime, which the
+        // tests below run on, cannot show the difference, so this ordering is
         // stated rather than asserted.
         drop(self.permit.take());
         self.idle.notify_one();
@@ -85,11 +83,11 @@ impl Drop for Slot {
 /// The companion to [`Slot`], and deliberately not the same thing: a slot is
 /// rationed and is taken only once a request has proved it deserves one, while
 /// this is taken the moment the request stream is accepted and rations nothing.
-/// What it buys is the drain being able to see a request that is *between* those
-/// two points — headers still arriving, credentials being checked — which is
-/// exactly the request a tunnel-count drain used to close the connection on,
-/// against the "might have been processed" its own GOAWAY identifier had just
-/// signalled (RFC 9114 §5.2).
+/// It lets the drain see a request that is *between* those two points (headers
+/// still arriving, credentials being checked). A drain that counted only
+/// tunnels would close the connection on such a request, against the "might
+/// have been processed" its own GOAWAY identifier had just signalled (RFC 9114
+/// §5.2).
 ///
 /// Dropping is the only way it is given back, for the reason [`Slot`] gives.
 pub struct Pending {
@@ -104,9 +102,9 @@ impl Drop for Pending {
         // count that has yet to move.
         //
         // `Relaxed` is enough on the counter itself. Nothing is published
-        // through it, and the only reader is the drain -- which either reaches
-        // it through `Notify`, whose own synchronisation orders this write
-        // before that wake-up, or is about to look again anyway.
+        // through it, and the only reader is the drain. The drain either
+        // reaches it through `Notify`, whose own synchronisation orders this
+        // write before that wake-up, or is about to look again anyway.
         self.pending.fetch_sub(1, Ordering::Relaxed);
         self.idle.notify_one();
     }
@@ -139,8 +137,8 @@ impl Quota {
     /// Held by the task from the moment the request stream is accepted until
     /// that task ends, which is the span [`Self::acquire`] cannot cover: a
     /// request only reaches the semaphore once its headers have arrived and its
-    /// credentials have been checked, and the ones that never get that far --
-    /// the 400s, the 407s -- never reach it at all. Nothing is rationed here;
+    /// credentials have been checked, and the ones that never get that far (the
+    /// 400s, the 407s) never reach it at all. Nothing is rationed here;
     /// the count exists so the drain can tell "no work left" from "no work that
     /// has a slot yet".
     pub fn enter(&self) -> Pending {
@@ -173,7 +171,7 @@ impl Quota {
     /// Resolves once every request on this connection has finished.
     ///
     /// Used by the graceful shutdown path. The caller is responsible for
-    /// bounding the wait — a tunnel that never ends would otherwise hold
+    /// bounding the wait: a tunnel that never ends would otherwise hold
     /// shutdown open forever.
     ///
     /// Cancel-safe, which it has to be: `crate::conn::handle` polls this as one
