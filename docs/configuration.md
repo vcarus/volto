@@ -403,10 +403,13 @@ family, an IP literal above all, is unaffected by any of the three.
   one above, off by default and opened by `allow_private_networks`. So a target
   is refused with `403` and `destination_ip_prohibited` when it resolves to an
   address of this host other than loopback, whether that address is public, on
-  the LAN, or the one the server listens on. The check asks the kernel whether
-  it would bind the address, so on a Linux host with `net.ipv4.ip_nonlocal_bind`
-  or `net.ipv6.ip_nonlocal_bind` set every address of that family looks like
-  this host's own, and every tunnel to that family is refused.
+  the LAN, or the one the server listens on. An IPv6 address that carries an
+  IPv4 address (NAT64, 6to4, Teredo or the deprecated `::a.b.c.d`) counts as
+  this host's when the host holds either the IPv6 address itself or the IPv4
+  address it carries. The check asks the kernel whether it would bind the
+  address, so on a Linux host with `net.ipv4.ip_nonlocal_bind` or
+  `net.ipv6.ip_nonlocal_bind` set every address of that family looks like this
+  host's own, and every tunnel to that family is refused.
 - **What that rule does not cover, said rather than left to be discovered.**
   With `allow_private_networks = true` a client can still reach this server's own
   listener through `127.0.0.1`, exactly as it can reach every other loopback
