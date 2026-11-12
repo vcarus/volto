@@ -36,7 +36,9 @@
 //! `64:ff9b::7f00:1` therefore reaches 127.0.0.1, and letting it past
 //! because it is syntactically a global IPv6 address would undo the
 //! whole IPv4 half of this module. `embedded_ipv4` unwraps them before any rule
-//! is applied.
+//! is applied. Teredo (`2001::/32`) lies inside `2001::/23`, which is refused
+//! whole, and is still judged by the IPv4 address it carries, because the
+//! unwrapping comes first.
 //!
 //! The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) is the one transition
 //! form that is not unwrapped. Its operator chooses the layout, RFC 8215 §5
@@ -294,11 +296,10 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// The special-purpose prefixes in the private bucket, in both families.
 ///
 /// The list is drawn from the IANA special-purpose address registries that
-/// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed
-/// and the `2001::/23` block discussed below. Everything on it is either not
-/// globally reachable or not a destination an internet-facing proxy has any
-/// business dialling, and every one of them is a way past
-/// `allow_private_networks = false` if it is missing: `100.64.0.0/10` is where a
+/// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed.
+/// Everything on it is either not globally reachable or not a destination an
+/// internet-facing proxy has any business dialling, and every one of them is a
+/// way past `allow_private_networks = false` if it is missing: `100.64.0.0/10` is where a
 /// carrier-grade NAT keeps its subscribers, `198.18.0.0/15` is what some
 /// networks number their own infrastructure with, `192.0.0.0/24` holds protocol
 /// assignments including the DS-Lite `192.0.0.0/29` link, and `240.0.0.0/4` is
@@ -312,19 +313,8 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// multicast, which no switch opens), and the transition forms [`routed_form`]
 /// unwraps before this table is consulted (IPv4-mapped, the well-known NAT64
 /// prefix, 6to4 and Teredo), since those are judged by the IPv4 address they
-/// carry rather than matched as a prefix.
-///
-/// One entry is deliberately absent: `2001::/23`, RFC 6890 Table 22's IETF
-/// Protocol Assignments (from RFC 2928), the IPv6 counterpart of
-/// `192.0.0.0/24`. Every one of its Source, Destination, Forwardable and Global
-/// attributes is "False\[1\]", and footnote \[1\] is "Unless allowed by a more
-/// specific allocation". So the block is left public, and its more-specific
-/// allocations are rows of their own: the three anycast service addresses, the
-/// AMT relay discovery prefix, the AS112 prefix `2001:4:112::/48`, the
-/// benchmarking range, ORCHID, ORCHIDv2 and DETs. Teredo, also inside the /23,
-/// is not a row. A Teredo address is judged by the IPv4 address it carries
-/// ([`embedded_ipv4`]). The rest of the /23 has no allocation in the registry
-/// and stays public.
+/// carry rather than matched as a prefix. Teredo lies inside the `2001::/23`
+/// row and is still judged that way, because the unwrapping runs first.
 const PRIVATE_PREFIXES: &[Prefix] = &[
     // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from RFC 1122).
     // Only the all-zero address at the bottom of the block is
@@ -360,38 +350,44 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // 100.64.0.0/10, shared address space (RFC 6598), the inside of a
     // carrier-grade NAT.
     v4([100, 64, 0, 0], 10, "Shared Address Space", "RFC 6598"),
-    // 192.0.0.0/24, IETF protocol assignments (RFC 6890), and the IPv6 anycast
-    // service addresses: Port Control Protocol (RFC 7723), TURN (RFC 8155) and
-    // DNS-SD Service Registration Protocol (RFC 9665).
+    // `192.0.0.0/24` and `2001::/23`, IETF Protocol Assignments (RFC 6890 for
+    // the IPv4 block, RFC 2928 for the IPv6 one). Both are refused whole.
     //
-    // The IPv4 block is refused whole. Its PCP and TURN anycast addresses,
-    // 192.0.0.9 and 192.0.0.10, are not carved out. The IANA registry marks
-    // those two and the three IPv6 ones globally reachable. An anycast address
-    // reaches the instance nearest the sender, and through this proxy the
-    // sender is the proxy. The service a client reaches is therefore the one of
-    // the proxy's own network, which acts on the proxy's address: a PCP server
-    // opens a mapping for the host that asked. The IPv6 rows are one address
-    // each, so the rest of `2001:1::/32` stays public.
+    // RFC 6890 Table 22 gives every one of the /23's Source, Destination,
+    // Forwardable and Global attributes as "False[1]", and footnote [1] is
+    // "Unless allowed by a more specific allocation". The allocations inside it
+    // are the anycast service addresses `2001:1::1` (Port Control Protocol,
+    // RFC 7723), `2001:1::2` (TURN, RFC 8155) and `2001:1::3` (DNS-SD Service
+    // Registration Protocol, RFC 9665), Benchmarking `2001:2::/48` (RFC 5180),
+    // AMT `2001:3::/32` (RFC 7450), AS112-v6 `2001:4:112::/48` (RFC 7535),
+    // ORCHID `2001:10::/28` (RFC 4843), ORCHIDv2 `2001:20::/28` (RFC 7343), the
+    // Drone Remote ID Protocol Entity Tags (DETs) prefix `2001:30::/28`
+    // (RFC 9374), and Teredo `2001::/32` (RFC 4380). Apart from Teredo, this
+    // proxy refuses each of them for a reason of its own. The anycast service
+    // addresses, AMT and AS112 reach a service of the proxy's own network, for
+    // the reason given below and beside the IPv4 rows that follow. Benchmarking
+    // is what a lab numbers a device under test with. An ORCHID is a hash of a
+    // host identity and a DET an identifier for a drone's remote identity:
+    // neither is a locator, nothing forwards one, and a tunnel to it can only
+    // hold a slot. The space between the allocations has no allocation to
+    // allow it.
+    //
+    // Teredo is the one allocation inside the /23 that this row does not
+    // decide. `routed_form` unwraps a Teredo address before the table is
+    // consulted, so it is judged by the IPv4 address it carries and never
+    // meets this row.
+    //
+    // Inside `192.0.0.0/24`, the PCP and TURN anycast addresses 192.0.0.9 and
+    // 192.0.0.10 are not carved out. The IANA registry marks those two and the
+    // three IPv6 ones globally reachable. An anycast address reaches the
+    // instance nearest the sender, and through this proxy the sender is the
+    // proxy. The service a client reaches is therefore the one of the proxy's
+    // own network, which acts on the proxy's address: a PCP server opens a
+    // mapping for the host that asked.
     v4([192, 0, 0, 0], 24, "IETF Protocol Assignments", "RFC 6890"),
-    v6(
-        &[0x2001, 1, 0, 0, 0, 0, 0, 1],
-        128,
-        "Port Control Protocol Anycast",
-        "RFC 7723",
-    ),
-    v6(
-        &[0x2001, 1, 0, 0, 0, 0, 0, 2],
-        128,
-        "Traversal Using Relays around NAT Anycast",
-        "RFC 8155",
-    ),
-    v6(
-        &[0x2001, 1, 0, 0, 0, 0, 0, 3],
-        128,
-        "DNS-SD Service Registration Protocol Anycast",
-        "RFC 9665",
-    ),
-    // `192.52.193.0/24` and `2001:3::/32`, AMT relay discovery (RFC 7450).
+    v6(&[0x2001], 23, "IETF Protocol Assignments", "RFC 2928"),
+    // `192.52.193.0/24`, AMT relay discovery (RFC 7450). Its IPv6 half,
+    // `2001:3::/32`, lies inside the `2001::/23` row.
     //
     // The IANA registry marks both globally reachable. RFC 7450 Section 4.1.4
     // says how they are used: "a gateway sends a message to an anycast IP
@@ -401,10 +397,10 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // proxy's own network. That is the same reason the PCP and TURN anycast
     // addresses are refused.
     v4([192, 52, 193, 0], 24, "AMT", "RFC 7450"),
-    v6(&[0x2001, 3], 32, "AMT", "RFC 7450"),
     // The AS112 prefixes. `192.31.196.0/24` and `2001:4:112::/48` serve DNAME
     // redirection (RFC 7535), and `192.175.48.0/24` and `2620:4f:8000::/48`
-    // serve Direct Delegation (RFC 7534 Section 2.3).
+    // serve Direct Delegation (RFC 7534 Section 2.3). `2001:4:112::/48` lies
+    // inside the `2001::/23` row.
     //
     // The IANA registries mark all four globally reachable. RFC 7534 Section 1
     // says how they are reached: "Each nameserver functions as a single node in
@@ -414,7 +410,6 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // the proxy. The same rule refuses the AMT relay discovery prefixes and the
     // anycast service addresses (D111).
     v4([192, 31, 196, 0], 24, "AS112-v4", "RFC 7535"),
-    v6(&[0x2001, 4, 0x112], 48, "AS112-v6", "RFC 7535"),
     v4(
         [192, 175, 48, 0],
         24,
@@ -427,13 +422,12 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
         "Direct Delegation AS112 Service",
         "RFC 7534",
     ),
-    // Benchmarking, `198.18.0.0/15` (RFC 2544) and `2001:2::/48` (RFC 6890
-    // Table 24, from RFC 5180). It is what a lab numbers a device under test
-    // with, and some networks number their own infrastructure with the IPv4
-    // range, so a request for it is either a misconfiguration or an attempt to
-    // reach that lab.
+    // Benchmarking, `198.18.0.0/15` (RFC 2544). It is what a lab numbers a
+    // device under test with, and some networks number their own
+    // infrastructure with it, so a request for it is either a misconfiguration
+    // or an attempt to reach that lab. Its IPv6 half, `2001:2::/48`, lies
+    // inside the `2001::/23` row.
     v4([198, 18, 0, 0], 15, "Benchmarking", "RFC 2544"),
-    v6(&[0x2001, 2, 0], 48, "Benchmarking", "RFC 5180"),
     // The documentation ranges: three IPv4 blocks (RFC 5737), and
     // `2001:db8::/32` (RFC 3849) and `3fff::/20` for IPv6. RFC 3849's block is
     // the one in long use; the IANA registry added `3fff::/20` as a second
@@ -471,30 +465,6 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // 240.0.0.0/4, reserved (RFC 1112 §4). The broadcast address at the top of
     // it is already `is_never_allowed`, which runs first.
     v4([240, 0, 0, 0], 4, "Reserved", "RFC 1112"),
-    // `2001:10::/28` and `2001:20::/28` are ORCHID and ORCHIDv2.
-    //
-    // An ORCHID is a hash of a host identity, not a locator: nothing forwards
-    // one, so a tunnel to it can only ever hold a slot. The original block's
-    // registry entry carries a termination date of March 2014, and its
-    // successor is listed as ORCHIDv2. The IANA registry marks ORCHIDv2
-    // globally reachable, but it is still an identifier rather than a location,
-    // so the second clause of this table's rule covers it: it is not a
-    // destination an internet-facing proxy has any business dialling.
-    v6(&[0x2001, 0x10], 28, "ORCHID (deprecated)", "RFC 4843"),
-    v6(&[0x2001, 0x20], 28, "ORCHIDv2", "RFC 7343"),
-    // `2001:30::/28` is the Drone Remote ID Protocol Entity Tags (DETs) prefix.
-    //
-    // The IANA registry lists the block as globally reachable, but its name
-    // says what it carries: entity tags, identifiers for a drone's remote
-    // identity. An entity tag is not a service to dial, so the second clause of
-    // this table's rule covers it. `allow_private_networks` opens it too, but
-    // only together with loopback and the rest of the private bucket.
-    v6(
-        &[0x2001, 0x30],
-        28,
-        "Drone Remote ID Protocol Entity Tags (DETs) Prefix",
-        "RFC 9374",
-    ),
     // `100::/64` is the discard-only prefix (RFC 6666). Traffic to it is meant
     // to be black-holed, which makes it a way to ask this proxy to open a
     // tunnel that can only ever hold a slot.
@@ -1111,6 +1081,103 @@ mod tests {
 
         // The mirror image: private-looking server field, public client field.
         assert!(strict.allows_address(ip("2001:0:a00:1:0:0:f7f7:f7f7")));
+    }
+
+    /// `2001::/23` is refused whole, the space between its allocations
+    /// included, and the address on each side of it is not.
+    ///
+    /// Every address below lies in the /23 outside Teredo and outside every
+    /// allocation the registry lists there, so the /23 row is the only rule that
+    /// refuses it. `2001:db8::/32` sits above the /23 and is refused by its own
+    /// row.
+    #[test]
+    fn the_whole_ietf_protocol_assignments_block_is_refused() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for address in [
+            "2001:1::",                               // below the PCP anycast address
+            "2001:1::4",                              // above the DNS-SD SRP anycast address
+            "2001:1:0:0:1::1",                        // elsewhere in 2001:1::/32
+            "2001:1:ffff:ffff:ffff:ffff:ffff:ffff",   // just below 2001:2::/48
+            "2001:2:1::",                             // just above it
+            "2001:4::1",                              // above the AMT prefix 2001:3::/32
+            "2001:4:113::",                           // just above AS112-v6
+            "2001:f:ffff:ffff:ffff:ffff:ffff:ffff",   // just below ORCHID
+            "2001:40::",                              // just above DETs
+            "2001:100::1",                            // unallocated
+            "2001:1ff:ffff:ffff:ffff:ffff:ffff:ffff", // the last address of the /23
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is inside 2001::/23 and must be refused by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+
+        for address in ["2000:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "2001:200::"] {
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} is just outside 2001::/23 and stays public"
+            );
+        }
+
+        assert!(
+            !strict.allows_address(ip("2001:db8::")),
+            "2001:db8::/32 is refused by its own row"
+        );
+    }
+
+    /// Teredo, `2001::/32`, is judged by the IPv4 address it carries under both
+    /// policies, whatever else the table refuses around it.
+    ///
+    /// The prefix lies inside `2001::/23`. [`Policy::allows_address`] unwraps a
+    /// Teredo address with [`routed_form`] before any row is consulted, so a row
+    /// covering the /23 never sees one.
+    #[test]
+    fn teredo_follows_its_embedded_address_inside_the_ietf_block() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for (address, carried) in [
+            ("2001:0:0:0:0:0:f7f7:f7f7", "8.8.8.8"),
+            ("2001:0:808:808:8000:f227:fefe:fefe", "1.1.1.1"),
+            // Near the top of the /32.
+            ("2001:0:ffff:ffff:ffff:ffff:f7f7:f7f7", "8.8.8.8"),
+            ("2001:0:a00:1:0:0:a247:27dd", "93.184.216.34"),
+        ] {
+            assert_eq!(
+                embedded_ipv4(ip(address)).map(IpAddr::V4),
+                Some(ip(carried))
+            );
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} carries the public {carried} and must be reachable"
+            );
+            assert!(permissive.allows_address(ip(address)), "{address}");
+        }
+
+        for (address, carried) in [
+            ("2001:0:0:0:0:0:f5ff:fffe", "10.0.0.1"),
+            ("2001:0:808:808:0:0:80ff:fffe", "127.0.0.1"),
+            ("2001:0:ffff:ffff:ffff:ffff:5601:5601", "169.254.169.254"),
+        ] {
+            assert_eq!(
+                embedded_ipv4(ip(address)).map(IpAddr::V4),
+                Some(ip(carried))
+            );
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} carries the private {carried} and must be refused"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow the switch like {carried}"
+            );
+        }
     }
 
     /// The deprecated sibling of the mapped form, `::a.b.c.d`.
