@@ -9,6 +9,13 @@
 //! cargo test --release --features operator-runs --test it_bench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
+//! Set `TOKIO_WORKER_THREADS` to half the CPU count for a run whose figures
+//! are to be compared. The proxy runtime and the test runtime each start that
+//! many workers, so the default starts two workers per CPU, and on 8 CPUs that
+//! raised the proxy's CPU per unit by 9 to 43 percent on the musl target
+//! against the gnu one. With 4 workers each the two targets read within 8
+//! percent of each other on every path.
+//!
 //! # What the numbers mean, and what they do not
 //!
 //! The test harness runs the client, the proxy and the target **in one
