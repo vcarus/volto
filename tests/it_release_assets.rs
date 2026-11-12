@@ -32,6 +32,8 @@
 //! * **`src/` cites quinn-proto by symbol, not by line number.** A line number
 //!   goes stale on every quinn-proto bump, and a stale one still points at
 //!   some line.
+//! * **One MSRV.** `fuzz/Cargo.toml`, the `msrv` job in `ci.yml`, `README.md`
+//!   and `docs/deployment.md` state the `rust-version` of `Cargo.toml`.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -720,6 +722,74 @@ fn the_unit_allows_the_address_families_name_resolution_needs() {
         assert!(
             families.contains(&family),
             "the unit must allow {family}, or libc name resolution can fail; it allows {families:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One MSRV
+// ---------------------------------------------------------------------------
+
+/// The files that state the MSRV besides `Cargo.toml`, each with the number of
+/// statements of it this test finds there today.
+const MSRV_COPIES: [(&str, usize); 4] = [
+    ("fuzz/Cargo.toml", 1),
+    ("README.md", 3),
+    ("docs/deployment.md", 1),
+    (".github/workflows/ci.yml", 3),
+];
+
+/// What precedes a toolchain version where these files state the MSRV: the
+/// manifest key, the workflow's pin, the prose, and the README badge.
+const MSRV_MARKERS: [&str; 4] = ["rust-version = \"", "MSRV: \"", "Rust ", "rust-"];
+
+/// Every version `text` states after one of [`MSRV_MARKERS`].
+fn stated_versions(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for marker in MSRV_MARKERS {
+        for (offset, _) in text.match_indices(marker) {
+            let rest = &text[offset + marker.len()..];
+            let version: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_digit() || *ch == '.')
+                .collect();
+            let version = version.trim_end_matches('.');
+            if version.starts_with(|ch: char| ch.is_ascii_digit()) {
+                found.push(version.to_owned());
+            }
+        }
+    }
+    found
+}
+
+/// The manifests, the MSRV job and the prose state the same MSRV as
+/// `Cargo.toml`'s `rust-version`.
+///
+/// The `msrv` job in `ci.yml` compares its own pin with `Cargo.toml` and
+/// nothing else, so the fuzz manifest and the prose are held here.
+#[test]
+fn every_copy_of_the_msrv_is_the_one_cargo_toml_declares() {
+    let root = repo_root();
+    let declared = stated_versions(&read_text(&root.join("Cargo.toml")));
+    let [declared] = declared.as_slice() else {
+        panic!("Cargo.toml must state exactly one rust-version, and states {declared:?}");
+    };
+
+    for (file, expected) in MSRV_COPIES {
+        let stated = stated_versions(&read_text(&root.join(file)));
+        assert!(
+            stated.len() >= expected,
+            "{file} states the MSRV {} time(s), and this test expects {expected}; \
+             the reader is broken or a statement was removed: {stated:?}",
+            stated.len()
+        );
+        let wrong: Vec<&String> = stated
+            .iter()
+            .filter(|version| *version != declared)
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "Cargo.toml declares rust-version {declared}, and {file} states {wrong:?}"
         );
     }
 }
