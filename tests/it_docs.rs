@@ -16,7 +16,10 @@
 //!    `#key = value` -- must appear in `docs/configuration.md`, and every key
 //!    that page documents must exist in the example and be accepted by
 //!    [`volto::config::Config`], whose `deny_unknown_fields` makes the second
-//!    half a real question rather than a formality.
+//!    half a real question rather than a formality. The "Introduced in" table
+//!    under `## Version compatibility` is held to the same set: every key has a
+//!    row or is in the fixed list of v0.1.0 keys, and no row names a key the
+//!    page does not document.
 //! 2. **Numbers quoted from the crate are the crate's numbers.** A doc page
 //!    quotes a constant as `` `IDENT` = value `` -- backticked
 //!    SCREAMING_SNAKE identifier, ` = `, then the value -- and this gate reads
@@ -416,6 +419,110 @@ fn every_configuration_key_is_documented_and_every_documented_key_parses() {
         1,
         "the document assembled from the documented keys must carry the \
          example's values, not defaults"
+    );
+}
+
+/// The keys that existed in v0.1.0, as `[table].key`.
+///
+/// `docs/configuration.md` gives these no row in its "Introduced in" table and
+/// covers them with one sentence instead. The list is fixed: the history cannot
+/// be read at test time, and a key added later belongs in a row.
+const KEYS_IN_V0_1_0: [&str; 22] = [
+    "[server].listen",
+    "[server].cert",
+    "[server].key",
+    "[server].alpn",
+    "[server].shutdown_grace",
+    "[auth].users",
+    "[limits].udp_session_timeout",
+    "[limits].max_targets_per_conn",
+    "[limits].max_connections",
+    "[limits].max_streams_bidi",
+    "[limits].max_idle_timeout",
+    "[limits].keep_alive_interval",
+    "[limits].initial_mtu",
+    "[limits].mtu_discovery",
+    "[limits].congestion_control",
+    "[limits].initial_rtt_ms",
+    "[security].allow_private_networks",
+    "[security].denied_ports",
+    "[security].unanswered_packet_budget",
+    "[security].max_auth_failures",
+    "[log].level",
+    "[log].keylog",
+];
+
+/// The sentence that covers [`KEYS_IN_V0_1_0`] on the page.
+const V0_1_0_BASELINE: &str = "Everything else has been there since v0.1.0.";
+
+/// Every documented key has a row in the "Introduced in" table or is one of
+/// [`KEYS_IN_V0_1_0`], and every key the table or the list names is documented.
+///
+/// A rollback past a key's release refuses the whole file, which is the reason
+/// the table exists, so a key added without a row is the case it warns about.
+/// The version numbers in the rows are not checked.
+#[test]
+fn the_introduced_in_table_accounts_for_every_key() {
+    let text = read_text(&doc_path("configuration.md"));
+    let section = text
+        .split_once("\n## Version compatibility\n")
+        .expect("docs/configuration.md has a `## Version compatibility` section")
+        .1;
+    assert!(
+        section.contains(V0_1_0_BASELINE),
+        "docs/configuration.md no longer says {V0_1_0_BASELINE:?} under \
+         `## Version compatibility`, which is what KEYS_IN_V0_1_0 stands for"
+    );
+
+    // The first cell of each row under the `| Key | Introduced in |` header,
+    // where each backticked span is one key.
+    let rows: BTreeSet<String> = section
+        .lines()
+        .skip_while(|line| !line.starts_with("| Key | Introduced in |"))
+        .skip(2)
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|row| row.split('|').nth(1))
+        .flat_map(|cell| cell.split('`').skip(1).step_by(2))
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "no rows found under `| Key | Introduced in |` in docs/configuration.md; \
+         the reader is broken, not the page"
+    );
+
+    let documented: BTreeSet<String> = documented_keys()
+        .into_iter()
+        .map(|(table, key)| format!("[{table}].{key}"))
+        .collect();
+    let baseline: BTreeSet<String> = KEYS_IN_V0_1_0.iter().map(|key| (*key).to_owned()).collect();
+
+    let missing: Vec<&String> = documented
+        .iter()
+        .filter(|key| !rows.contains(*key) && !baseline.contains(*key))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/configuration.md documents keys that have no row in the \"Introduced \
+         in\" table under `## Version compatibility`; add a row with the release \
+         that introduced each: {missing:?}"
+    );
+
+    let twice: Vec<&String> = rows.intersection(&baseline).collect();
+    assert!(
+        twice.is_empty(),
+        "the \"Introduced in\" table has rows for keys KEYS_IN_V0_1_0 in this file \
+         says were there in v0.1.0: {twice:?}"
+    );
+
+    let unknown: Vec<&String> = rows
+        .union(&baseline)
+        .filter(|key| !documented.contains(*key))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "the \"Introduced in\" table in docs/configuration.md or KEYS_IN_V0_1_0 in \
+         this file names keys the page's reference tables do not document: {unknown:?}"
     );
 }
 
