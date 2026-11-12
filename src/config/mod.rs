@@ -1160,54 +1160,67 @@ pub(crate) mod tests {
         plausible.then_some(name)
     }
 
-    /// Every key the example must document, section by section.
+    /// A deserializer that records the field names a derived `Deserialize`
+    /// passes to `deserialize_struct`, and then returns an error.
+    struct FieldNames<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> serde::Deserializer<'de> for FieldNames<'_> {
+        type Error = serde::de::value::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("only a struct has field names"))
+        }
+
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(serde::de::Error::custom("field names recorded"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    /// The keys serde accepts in the table `T` is read from.
+    fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+        let mut fields: &'static [&'static str] = &[];
+        let _ = T::deserialize(FieldNames(&mut fields));
+        assert!(
+            !fields.is_empty(),
+            "{} passed no field names to deserialize_struct",
+            std::any::type_name::<T>()
+        );
+        fields
+    }
+
+    /// Every key the example must document, section by section: the field
+    /// names serde accepts for each table.
     ///
-    /// The exhaustive destructuring in [`the_example_documents_every_key_and_pins_every_default`]
-    /// is what keeps this list honest in one direction: a field added to
-    /// `Limits`, `Security`, `Log` or `Server` stops that test compiling until it
-    /// is named and answered there, and this is the half a value assertion cannot
-    /// do -- a key left out of the example parses to exactly the default the
-    /// assertion is comparing against, so only the key set can catch it.
-    /// `deny_unknown_fields` covers the other direction.
+    /// Read from the structs, so a field added to `Server`, `Limits`, `Security`
+    /// or `Log` is a key [`the_example_documents_every_key_and_pins_every_default`]
+    /// requires the example to carry. That is the half a value assertion cannot
+    /// do: a key left out of the example parses to exactly the default the
+    /// assertion compares against, so only the key set can catch it.
     ///
     /// `[auth]` is not here: `users` is the operator's own and has no default.
-    const DOCUMENTED_KEYS: [(&str, &[&str]); 4] = [
-        (
-            "server",
-            &["listen", "cert", "key", "alpn", "shutdown_grace"],
-        ),
-        (
-            "limits",
-            &[
-                "udp_session_timeout",
-                "max_targets_per_conn",
-                "max_connections",
-                "connect_timeout",
-                "ip_family_preference",
-                "max_streams_bidi",
-                "max_idle_timeout",
-                "keep_alive_interval",
-                "initial_mtu",
-                "mtu_discovery",
-                "mtu_upper_bound",
-                "congestion_control",
-                "initial_rtt_ms",
-                "socket_recv_buffer",
-                "socket_send_buffer",
-            ],
-        ),
-        (
-            "security",
-            &[
-                "allow_private_networks",
-                "denied_ports",
-                "unanswered_packet_budget",
-                "max_auth_failures",
-                "expected_sni",
-            ],
-        ),
-        ("log", &["level", "keylog"]),
-    ];
+    fn documented_keys() -> [(&'static str, &'static [&'static str]); 4] {
+        [
+            ("server", field_names::<Server>()),
+            ("limits", field_names::<Limits>()),
+            ("security", field_names::<Security>()),
+            ("log", field_names::<Log>()),
+        ]
+    }
 
     /// The example with every commented-out key uncommented, and the keys it
     /// documents in each section.
@@ -1292,7 +1305,7 @@ pub(crate) mod tests {
     fn the_example_documents_every_key_and_pins_every_default() {
         let (text, documented) = example_with_every_key_uncommented();
 
-        for (section, keys) in DOCUMENTED_KEYS {
+        for (section, keys) in documented_keys() {
             let found = documented
                 .get(section)
                 .unwrap_or_else(|| panic!("the example must have a [{section}] section"));
@@ -1307,9 +1320,9 @@ pub(crate) mod tests {
             toml::from_str(&text).expect("the example with every key uncommented must still parse");
         assert_valid_apart_from_certs(&cfg, "the example with every key uncommented");
 
-        // Destructured rather than read field by field: this is what stops
-        // compiling when a field is added, which is the only thing that can force
-        // a new key to be documented above and answered here.
+        // Destructured rather than read field by field: this stops compiling
+        // when a field is added, which forces the new key's value to be answered
+        // here. `documented_keys` already requires the example to carry it.
         let Limits {
             udp_session_timeout,
             max_targets_per_conn,
