@@ -55,8 +55,9 @@
 mod scripts;
 
 use std::collections::BTreeSet;
+use std::fs;
 
-use scripts::{code_only, read_text, rust_files, source_root};
+use scripts::{code_only, read_text, repo_root, rust_files, source_root};
 
 /// What keeps one production log statement from becoming a flood.
 ///
@@ -101,11 +102,14 @@ struct Accounted {
     ///
     /// A column for the reader rather than part of the key, so that moving a
     /// statement between files is a row to update and not a bound to re-argue.
+    /// [`every_entry_names_its_statements_file_and_message`] holds it to the
+    /// source.
     file: &'static str,
     /// The message it writes, exactly — the last string literal of the macro
     /// invocation, with Rust's escapes resolved.
     ///
-    /// A column for the reader, for the same reason the file is one.
+    /// A column for the reader, for the same reason the file is one, and held to
+    /// the source by the same test.
     message: &'static str,
     /// Which kind of bound applies.
     bound: Bound,
@@ -848,6 +852,93 @@ fn the_table_names_no_statement_that_is_gone() {
          a different line:\n  {}",
         stale.len(),
         stale.join("\n  ")
+    );
+}
+
+/// The file and message columns say what the source says.
+///
+/// They are not part of the key, so a moved or reworded statement keeps its row,
+/// and this test makes that row be updated with it.
+#[test]
+fn every_entry_names_its_statements_file_and_message() {
+    let found = scan();
+    assert!(!found.is_empty(), "the scanner found nothing to check");
+
+    let mut wrong = Vec::new();
+    for statement in &found {
+        let Some(entry) = ACCOUNTED
+            .iter()
+            .find(|entry| statement.id.as_deref() == Some(entry.id))
+        else {
+            continue;
+        };
+        if entry.file != statement.file {
+            wrong.push(format!(
+                "{}: `file` is {:?} in the table, and the statement is in src/{}",
+                entry.id, entry.file, statement.file
+            ));
+        }
+        if entry.message != statement.message {
+            wrong.push(format!(
+                "{}: `message` is {:?} in the table, and src/{}:{} writes {:?}",
+                entry.id, entry.message, statement.file, statement.line, statement.message
+            ));
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "{} column(s) of `ACCOUNTED` in this file differ from the statement they \
+         describe; copy the source into the row:\n  {}",
+        wrong.len(),
+        wrong.join("\n  ")
+    );
+}
+
+/// Every `log_id=` a tracked page quotes names a statement in `src/`.
+///
+/// The pages are `README.md`, `SECURITY.md` and every `*.md` under `docs/`. A
+/// quote is `log_id=` followed by the id, with or without the double quotes the
+/// journal writes around it.
+#[test]
+fn every_log_id_the_docs_quote_names_a_statement() {
+    let ids: BTreeSet<String> = scan().into_iter().filter_map(|s| s.id).collect();
+
+    let root = repo_root();
+    let mut pages = vec![root.join("README.md"), root.join("SECURITY.md")];
+    let docs = fs::read_dir(root.join("docs")).expect("docs/ must exist");
+    pages.extend(
+        docs.map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|kind| kind == "md")),
+    );
+
+    let mut quoted = 0;
+    let mut unknown = Vec::new();
+    for page in &pages {
+        let text = read_text(page);
+        for (offset, _) in text.match_indices("log_id=") {
+            let rest = text[offset + "log_id=".len()..].trim_start_matches('"');
+            let id: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+                .collect();
+            quoted += 1;
+            if !ids.contains(&id) {
+                let relative = page.strip_prefix(&root).unwrap_or(page);
+                unknown.push(format!("{}: log_id={id}", relative.display()));
+            }
+        }
+    }
+
+    assert!(
+        quoted > 0,
+        "no page quotes a `log_id=` at all, and docs/deployment.md does: the reader \
+         is broken, not the pages"
+    );
+    assert!(
+        unknown.is_empty(),
+        "these pages quote a `log_id` that no production statement in src/ carries:\n  {}",
+        unknown.join("\n  ")
     );
 }
 
