@@ -24,18 +24,10 @@
 //!   all multicast. These are not unicast targets at all; sending to them is an
 //!   amplification primitive, so `allow_private_networks` does not unlock them.
 //! * **Private**: the special-purpose space this proxy might actually reach,
-//!   drawn from the IANA registries that RFC 6890 set up: `0.0.0.0/8`,
-//!   loopback, RFC 1918, link-local, shared address space, IETF protocol
-//!   assignments (`192.0.0.0/24`), the IPv6 anycast service addresses
-//!   (`2001:1::1` to `2001:1::3`), the AMT relay discovery prefixes
-//!   (`192.52.193.0/24` and `2001:3::/32`), the AS112 prefixes
-//!   (`192.31.196.0/24`, `192.175.48.0/24`, `2001:4:112::/48` and
-//!   `2620:4f:8000::/48`), the benchmarking and documentation
-//!   ranges (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA,
-//!   ORCHID and ORCHIDv2, the DETs prefix, the discard-only and dummy prefixes, the SRv6 SID
-//!   block, the local-use NAT64 prefix and the deprecated IPv4-compatible and
-//!   IPv6 site-local spaces. Denied by default, unlocked by
-//!   `allow_private_networks`.
+//!   drawn from the IANA registries that RFC 6890 set up. The list is one table,
+//!   `PRIVATE_PREFIXES`: each row is a prefix with its name, its source and, in
+//!   the comment above it, the reason it is refused. Denied by default, unlocked
+//!   by `allow_private_networks`.
 //!
 //! # Transition addresses are judged as IPv4
 //!
@@ -199,7 +191,107 @@ fn is_never_allowed(ip: IpAddr) -> bool {
     }
 }
 
-/// Addresses only reachable when `allow_private_networks` is on.
+/// Addresses only reachable when `allow_private_networks` is on: those inside a
+/// row of [`PRIVATE_PREFIXES`].
+///
+/// [`Policy::allows_address`] calls this on the routed form ([`routed_form`]),
+/// after [`is_never_allowed`], so a transition address meets these rows as the
+/// IPv4 address it carries.
+fn is_private(ip: IpAddr) -> bool {
+    PRIVATE_PREFIXES
+        .iter()
+        .any(|prefix| prefix.net.contains(ip))
+}
+
+/// One row of [`PRIVATE_PREFIXES`].
+struct Prefix {
+    /// The addresses the row covers.
+    net: Net,
+    /// The allocation's name, as the IANA registry or its RFC gives it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the tests"))]
+    name: &'static str,
+    /// The RFC or registry the allocation is defined in.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the tests"))]
+    source: &'static str,
+}
+
+/// An address prefix: the network address and its length in bits.
+#[derive(Clone, Copy, Debug)]
+enum Net {
+    V4(Ipv4Addr, u32),
+    V6(Ipv6Addr, u32),
+}
+
+impl Net {
+    /// Whether `ip` is inside the prefix. An address of the other family never is.
+    fn contains(self, ip: IpAddr) -> bool {
+        match (self, ip) {
+            (Self::V4(base, len), IpAddr::V4(v4)) => {
+                (v4.to_bits() ^ base.to_bits()) & v4_mask(len) == 0
+            }
+            (Self::V6(base, len), IpAddr::V6(v6)) => {
+                (v6.to_bits() ^ base.to_bits()) & v6_mask(len) == 0
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The network bits of an IPv4 prefix of length `len`, which is at most 32.
+const fn v4_mask(len: u32) -> u32 {
+    match u32::MAX.checked_shl(32 - len) {
+        Some(mask) => mask,
+        None => 0,
+    }
+}
+
+/// The network bits of an IPv6 prefix of length `len`, which is at most 128.
+const fn v6_mask(len: u32) -> u128 {
+    match u128::MAX.checked_shl(128 - len) {
+        Some(mask) => mask,
+        None => 0,
+    }
+}
+
+/// An IPv4 row. A length over 32 or a host bit set in `octets` fails the build.
+const fn v4(octets: [u8; 4], len: u32, name: &'static str, source: &'static str) -> Prefix {
+    assert!(len <= 32, "an IPv4 prefix is at most 32 bits long");
+    let base = Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]);
+    assert!(
+        base.to_bits() & !v4_mask(len) == 0,
+        "a prefix row sets no host bits"
+    );
+    Prefix {
+        net: Net::V4(base, len),
+        name,
+        source,
+    }
+}
+
+/// An IPv6 row, written as its leading segments with the rest zero. A length
+/// over 128 or a host bit set fails the build.
+const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str) -> Prefix {
+    assert!(len <= 128, "an IPv6 prefix is at most 128 bits long");
+    let mut segments = [0u16; 8];
+    let mut index = 0;
+    while index < leading.len() {
+        segments[index] = leading[index];
+        index += 1;
+    }
+    let [a, b, c, d, e, f, g, h] = segments;
+    let base = Ipv6Addr::new(a, b, c, d, e, f, g, h);
+    assert!(
+        base.to_bits() & !v6_mask(len) == 0,
+        "a prefix row sets no host bits"
+    );
+    Prefix {
+        net: Net::V6(base, len),
+        name,
+        source,
+    }
+}
+
+/// The special-purpose prefixes in the private bucket, in both families.
 ///
 /// The list is drawn from the IANA special-purpose address registries that
 /// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed
@@ -212,246 +304,237 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// assignments including the DS-Lite `192.0.0.0/29` link, and `240.0.0.0/4` is
 /// routed inside more than one large private network in practice.
 ///
-/// One entry is here despite having left the registry: `fec0::/10`, the IPv6
-/// site-local prefix RFC 3879 deprecated. New stacks treat it as global unicast,
-/// which is exactly why it is worth denying: a network that numbered its
-/// interior with it before 2004 still routes it, and nothing on the public
-/// internet answers there, so a request for it is either a mistake or a way in.
+/// Where an allocation has an IPv4 and an IPv6 half, the two rows sit together
+/// under one comment. `docs/configuration.md` and `script/config.example.toml`
+/// name every row; a unit test below holds them to it.
 ///
-/// One entry is here because its contents cannot be read: `64:ff9b:1::/48`, the
-/// local-use NAT64 prefix (RFC 8215). It carries an IPv4 address, but the
-/// operator picks the layout and RFC 8215 §5 forbids assuming one, so the whole
-/// prefix follows the switch rather than the address it might contain
-/// ([`is_local_use_nat64`], and [`embedded_ipv4`] for the reasoning).
+/// What is not a row: [`is_never_allowed`] (unspecified, broadcast and
+/// multicast, which no switch opens), and the transition forms [`routed_form`]
+/// unwraps before this table is consulted (IPv4-mapped, the well-known NAT64
+/// prefix, 6to4 and Teredo), since those are judged by the IPv4 address they
+/// carry rather than matched as a prefix.
 ///
 /// One entry is deliberately absent: `2001::/23`, RFC 6890 Table 22's IETF
 /// Protocol Assignments (from RFC 2928), the IPv6 counterpart of
 /// `192.0.0.0/24`. Every one of its Source, Destination, Forwardable and Global
 /// attributes is "False\[1\]", and footnote \[1\] is "Unless allowed by a more
 /// specific allocation". So the block is left public, and its more-specific
-/// allocations are claimed one at a time: the three anycast service addresses,
-/// the AMT relay discovery prefix, the AS112 prefix `2001:4:112::/48`, the
-/// benchmarking range, ORCHID, ORCHIDv2 and DETs below. Teredo, also inside the
-/// /23, is not claimed. A Teredo address is judged by the IPv4 address it
-/// carries ([`embedded_ipv4`]). The rest of the /23 has no allocation in the
-/// registry and stays public.
-fn is_private(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-
-            // `is_private` is 10/8, 172.16/12 and 192.168/16; `is_link_local` is
-            // 169.254/16.
-            // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from
-            // RFC 1122). Only the all-zero address at the bottom of the block is
-            // `is_never_allowed`, and that check runs first; the rest of it is a
-            // source address a host uses before it has one, never a destination.
-            (octets[0] == 0)
-                || v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                // 100.64.0.0/10, shared address space (RFC 6598), i.e. the
-                // inside of a carrier-grade NAT.
-                || (octets[0] == 100 && octets[1] & 0xc0 == 64)
-                // 192.0.0.0/24, IETF protocol assignments (RFC 6890). Its PCP
-                // and TURN anycast addresses, 192.0.0.9 and 192.0.0.10, are not
-                // carved out: through the proxy an anycast address reaches the
-                // instance nearest the proxy, which is the PCP or TURN service
-                // of the proxy's own network.
-                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-                // 192.52.193.0/24, AMT relay discovery (RFC 7450). See
-                // `is_amt_relay_discovery` for the IPv6 prefix and the reason.
-                || (octets[0] == 192 && octets[1] == 52 && octets[2] == 193)
-                // 192.31.196.0/24 and 192.175.48.0/24, AS112 (RFC 7535 and
-                // RFC 7534). See `is_as112` for the IPv6 prefixes and the
-                // reason.
-                || (octets[0] == 192 && octets[1] == 31 && octets[2] == 196)
-                || (octets[0] == 192 && octets[1] == 175 && octets[2] == 48)
-                // 198.18.0.0/15, benchmarking (RFC 2544).
-                || (octets[0] == 198 && octets[1] & 0xfe == 18)
-                // 192.88.99.0/24, 6to4 relay anycast (RFC 6890 Table 10, from
-                // RFC 3068). RFC 7526 deprecated the relays and the registry
-                // kept the entry, so the prefix now reaches whoever still
-                // announces it rather than any relay this proxy meant to use.
-                || (octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
-                // 240.0.0.0/4, reserved (RFC 1112 §4). The broadcast address at
-                // the top of it is already `is_never_allowed`, which runs first.
-                || octets[0] & 0xf0 == 240
-                || is_ipv4_documentation(octets)
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || is_unique_local(v6)
-                || is_unicast_link_local(v6)
-                || is_site_local(v6)
-                || is_ipv4_compatible(v6)
-                || is_ipv6_documentation(v6)
-                || is_ipv6_protocol_anycast(v6)
-                || is_amt_relay_discovery(v6)
-                || is_as112(v6)
-                || is_ipv6_benchmarking(v6)
-                || is_orchid(v6)
-                || is_det(v6)
-                || is_discard_only(v6)
-                || is_dummy_prefix(v6)
-                || is_local_use_nat64(v6)
-                || is_srv6_sids(v6)
-        }
-    }
-}
-
-/// The three IPv4 documentation ranges (RFC 5737).
-///
-/// Reachable nowhere by definition, and the ranges examples and test fixtures
-/// are written with, so a request for one is a misconfiguration rather than a
-/// destination, and it should not turn into a connection attempt against
-/// whoever happens to announce them.
-fn is_ipv4_documentation(octets: [u8; 4]) -> bool {
-    // 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24.
-    (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
-        || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
-        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
-}
-
-/// `2001:db8::/32` and `3fff::/20` are the IPv6 documentation ranges.
-///
-/// Reachable nowhere by definition, and the ranges examples and test fixtures
-/// are written with. RFC 3849's block is the one in long use; the IANA registry
-/// added `3fff::/20` as a second documentation block in July 2024.
-fn is_ipv6_documentation(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    (segments[0] == 0x2001 && segments[1] == 0x0db8)
-        || (segments[0] == 0x3fff && segments[1] & 0xf000 == 0)
-}
-
-/// `2001:1::1`, `2001:1::2` and `2001:1::3` are the IPv6 anycast service
-/// addresses: Port Control Protocol (RFC 7723), TURN (RFC 8155) and DNS-SD
-/// Service Registration Protocol (RFC 9665).
-///
-/// The IANA registry marks all three globally reachable. An anycast address
-/// reaches the instance nearest the sender, and through this proxy the sender
-/// is the proxy. The service a client reaches is therefore the one of the
-/// proxy's own network, which acts on the proxy's address: a PCP server opens
-/// a mapping for the host that asked. That is the rule `192.0.0.9` and
-/// `192.0.0.10` follow inside `192.0.0.0/24`, and these are the same services
-/// over IPv6. Each is one address, so the rest of `2001:1::/32` stays public.
-fn is_ipv6_protocol_anycast(v6: Ipv6Addr) -> bool {
-    matches!(v6.segments(), [0x2001, 0x0001, 0, 0, 0, 0, 0, 1..=3])
-}
-
-/// `2001:3::/32` is the IPv6 AMT relay discovery prefix (RFC 7450). Its IPv4
-/// counterpart `192.52.193.0/24` is claimed in [`is_private`].
-///
-/// The IANA registry marks both globally reachable. RFC 7450 Section 4.1.4
-/// says how they are used: "a gateway sends a message to an anycast IP address
-/// within that prefix. This message is routed to the topologically nearest
-/// relay that has advertised the prefix." Through this proxy the sender is the
-/// proxy, so a client reaches the multicast relay of the proxy's own network.
-/// That is the same reason the PCP and TURN anycast addresses are claimed.
-/// The AS112 prefixes are claimed for the same reason ([`is_as112`]).
-fn is_amt_relay_discovery(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0003
-}
-
-/// `2001:4:112::/48` and `2620:4f:8000::/48` are the IPv6 AS112 prefixes. Their
-/// IPv4 counterparts `192.31.196.0/24` and `192.175.48.0/24` are claimed in
-/// [`is_private`].
-///
-/// The IANA registries mark all four globally reachable. `192.31.196.0/24` and
-/// `2001:4:112::/48` serve DNAME redirection (RFC 7535), and
-/// `192.175.48.0/24` and `2620:4f:8000::/48` serve Direct Delegation
-/// (RFC 7534 Section 2.3). RFC 7534 Section 1 says how they are reached: "Each
-/// nameserver functions as a single node in an AS112 anycast cloud \[RFC4786\]
-/// and is configured to answer authoritatively for a particular set of
-/// nominated zones." Through this proxy the sender is the proxy, so a client
-/// reaches the AS112 node nearest the proxy. The same rule claims the AMT
-/// relay discovery prefixes and the anycast service addresses (D111).
-fn is_as112(v6: Ipv6Addr) -> bool {
-    matches!(
-        v6.segments(),
-        [0x2001, 0x0004, 0x0112, ..] | [0x2620, 0x004f, 0x8000, ..]
-    )
-}
-
-/// `2001:2::/48` is the IPv6 benchmarking range (RFC 6890 Table 24, from
-/// RFC 5180).
-///
-/// The IPv6 counterpart of `198.18.0.0/15`, and there for the same reason: it is
-/// what a lab numbers a device under test with, so a request for it is either a
-/// misconfiguration or an attempt to reach that lab.
-fn is_ipv6_benchmarking(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0x0000
-}
-
-/// `2001:10::/28` and `2001:20::/28` are ORCHID and ORCHIDv2.
-///
-/// An ORCHID is a hash of a host identity, not a locator: nothing forwards one,
-/// so a tunnel to it can only ever hold a slot. The original block's registry
-/// entry carries a termination date of March 2014, and its successor is listed
-/// as ORCHIDv2. The IANA registry marks ORCHIDv2 globally reachable, but it is
-/// still an identifier rather than a location, so the second clause of this
-/// module's rule covers it: it is not a destination an internet-facing proxy has
-/// any business dialling.
-fn is_orchid(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    segments[0] == 0x2001 && matches!(segments[1] & 0xfff0, 0x0010 | 0x0020)
-}
-
-/// `2001:30::/28` is the Drone Remote ID Protocol Entity Tags (DETs) prefix.
-///
-/// The IANA registry lists the block as globally reachable, but its name says
-/// what it carries: entity tags, identifiers for a drone's remote identity. An
-/// entity tag is not a service to dial, so the second clause of this module's
-/// rule claims it. `allow_private_networks` opens it too, but only together
-/// with loopback and the rest of the private bucket.
-fn is_det(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    segments[0] == 0x2001 && segments[1] & 0xfff0 == 0x0030
-}
-
-/// `100::/64` is the discard-only prefix (RFC 6666).
-///
-/// Traffic to it is meant to be black-holed, which makes it a way to ask this
-/// proxy to open a tunnel that can only ever hold a slot.
-fn is_discard_only(v6: Ipv6Addr) -> bool {
-    let segments = v6.segments();
-    segments[0] == 0x0100 && segments[1..4].iter().all(|segment| *segment == 0)
-}
-
-/// `100:0:0:1::/64` is the Dummy IPv6 Prefix (RFC 9780).
-///
-/// The IANA registry marks it not globally reachable and not a destination.
-/// RFC 9780 Section 1 allocates it for the address written into the IP/UDP
-/// encapsulation of management, control and OAM packets, where it is meant to
-/// raise an exception and not to be delivered. Nothing answers there, so a
-/// tunnel to it can only hold a slot.
-fn is_dummy_prefix(v6: Ipv6Addr) -> bool {
-    matches!(v6.segments(), [0x0100, 0, 0, 1, ..])
-}
-
-/// `5f00::/16` is the Segment Routing (SRv6) SID block.
-///
-/// The IANA registry marks the block not globally reachable. A host with SRv6
-/// routes can still deliver it to an internal SID, which is the class
-/// `allow_private_networks` is meant to gate.
-fn is_srv6_sids(v6: Ipv6Addr) -> bool {
-    v6.segments()[0] == 0x5f00
-}
-
-/// `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215).
-///
-/// An address here is a translation of some IPv4 address, and the operator
-/// chooses where in the address that IPv4 address sits. RFC 8215 §5 says a
-/// reader must not guess: "they must not make any assumptions regarding the
-/// syntax or properties of those addresses (e.g., the existence and location of
-/// embedded IPv4 addresses)". So the whole prefix is private, and it is
-/// `allow_private_networks` that decides whether it may be dialled. See
-/// [`embedded_ipv4`] for what reading a layout would cost.
-fn is_local_use_nat64(v6: Ipv6Addr) -> bool {
-    v6.octets()[..6] == [0x00, 0x64, 0xff, 0x9b, 0x00, 0x01]
-}
+/// allocations are rows of their own: the three anycast service addresses, the
+/// AMT relay discovery prefix, the AS112 prefix `2001:4:112::/48`, the
+/// benchmarking range, ORCHID, ORCHIDv2 and DETs. Teredo, also inside the /23,
+/// is not a row. A Teredo address is judged by the IPv4 address it carries
+/// ([`embedded_ipv4`]). The rest of the /23 has no allocation in the registry
+/// and stays public.
+const PRIVATE_PREFIXES: &[Prefix] = &[
+    // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from RFC 1122).
+    // Only the all-zero address at the bottom of the block is
+    // `is_never_allowed`, and that check runs first; the rest of it is a source
+    // address a host uses before it has one, never a destination.
+    v4([0, 0, 0, 0], 8, "This host on this network", "RFC 1122"),
+    // Loopback. `::1` also lies inside the `::/96` row below.
+    v4([127, 0, 0, 0], 8, "Loopback", "RFC 1122"),
+    v6(
+        &[0, 0, 0, 0, 0, 0, 0, 1],
+        128,
+        "Loopback Address",
+        "RFC 4291",
+    ),
+    // Private-use space (RFC 1918) and its IPv6 counterpart, the unique local
+    // address range `fc00::/7` (RFC 4193).
+    v4([10, 0, 0, 0], 8, "Private-Use", "RFC 1918"),
+    v4([172, 16, 0, 0], 12, "Private-Use", "RFC 1918"),
+    v4([192, 168, 0, 0], 16, "Private-Use", "RFC 1918"),
+    v6(&[0xfc00], 7, "Unique-Local", "RFC 4193"),
+    // Link-local, `169.254.0.0/16` (RFC 3927) and `fe80::/10` (RFC 4291
+    // §2.5.6). `169.254.169.254` is the cloud metadata address.
+    v4([169, 254, 0, 0], 16, "Link Local", "RFC 3927"),
+    v6(&[0xfe80], 10, "Link-Local Unicast", "RFC 4291"),
+    // `fec0::/10`, the IPv6 site-local prefix RFC 3879 deprecated. It is here
+    // despite having left the registry. New stacks treat it as global unicast,
+    // which is exactly why it is worth denying: a network that numbered its
+    // interior with it before 2004 still routes it, and nothing on the public
+    // internet answers there, so a request for it is either a mistake or a way
+    // in. Adjacent to link-local and, on a network old enough to still use it,
+    // just as internal.
+    v6(&[0xfec0], 10, "Site-Local (deprecated)", "RFC 3879"),
+    // 100.64.0.0/10, shared address space (RFC 6598), the inside of a
+    // carrier-grade NAT.
+    v4([100, 64, 0, 0], 10, "Shared Address Space", "RFC 6598"),
+    // 192.0.0.0/24, IETF protocol assignments (RFC 6890), and the IPv6 anycast
+    // service addresses: Port Control Protocol (RFC 7723), TURN (RFC 8155) and
+    // DNS-SD Service Registration Protocol (RFC 9665).
+    //
+    // The IPv4 block is refused whole. Its PCP and TURN anycast addresses,
+    // 192.0.0.9 and 192.0.0.10, are not carved out. The IANA registry marks
+    // those two and the three IPv6 ones globally reachable. An anycast address
+    // reaches the instance nearest the sender, and through this proxy the
+    // sender is the proxy. The service a client reaches is therefore the one of
+    // the proxy's own network, which acts on the proxy's address: a PCP server
+    // opens a mapping for the host that asked. The IPv6 rows are one address
+    // each, so the rest of `2001:1::/32` stays public.
+    v4([192, 0, 0, 0], 24, "IETF Protocol Assignments", "RFC 6890"),
+    v6(
+        &[0x2001, 1, 0, 0, 0, 0, 0, 1],
+        128,
+        "Port Control Protocol Anycast",
+        "RFC 7723",
+    ),
+    v6(
+        &[0x2001, 1, 0, 0, 0, 0, 0, 2],
+        128,
+        "Traversal Using Relays around NAT Anycast",
+        "RFC 8155",
+    ),
+    v6(
+        &[0x2001, 1, 0, 0, 0, 0, 0, 3],
+        128,
+        "DNS-SD Service Registration Protocol Anycast",
+        "RFC 9665",
+    ),
+    // `192.52.193.0/24` and `2001:3::/32`, AMT relay discovery (RFC 7450).
+    //
+    // The IANA registry marks both globally reachable. RFC 7450 Section 4.1.4
+    // says how they are used: "a gateway sends a message to an anycast IP
+    // address within that prefix. This message is routed to the topologically
+    // nearest relay that has advertised the prefix." Through this proxy the
+    // sender is the proxy, so a client reaches the multicast relay of the
+    // proxy's own network. That is the same reason the PCP and TURN anycast
+    // addresses are refused.
+    v4([192, 52, 193, 0], 24, "AMT", "RFC 7450"),
+    v6(&[0x2001, 3], 32, "AMT", "RFC 7450"),
+    // The AS112 prefixes. `192.31.196.0/24` and `2001:4:112::/48` serve DNAME
+    // redirection (RFC 7535), and `192.175.48.0/24` and `2620:4f:8000::/48`
+    // serve Direct Delegation (RFC 7534 Section 2.3).
+    //
+    // The IANA registries mark all four globally reachable. RFC 7534 Section 1
+    // says how they are reached: "Each nameserver functions as a single node in
+    // an AS112 anycast cloud [RFC4786] and is configured to answer
+    // authoritatively for a particular set of nominated zones." Through this
+    // proxy the sender is the proxy, so a client reaches the AS112 node nearest
+    // the proxy. The same rule refuses the AMT relay discovery prefixes and the
+    // anycast service addresses (D111).
+    v4([192, 31, 196, 0], 24, "AS112-v4", "RFC 7535"),
+    v6(&[0x2001, 4, 0x112], 48, "AS112-v6", "RFC 7535"),
+    v4(
+        [192, 175, 48, 0],
+        24,
+        "Direct Delegation AS112 Service",
+        "RFC 7534",
+    ),
+    v6(
+        &[0x2620, 0x4f, 0x8000],
+        48,
+        "Direct Delegation AS112 Service",
+        "RFC 7534",
+    ),
+    // Benchmarking, `198.18.0.0/15` (RFC 2544) and `2001:2::/48` (RFC 6890
+    // Table 24, from RFC 5180). It is what a lab numbers a device under test
+    // with, and some networks number their own infrastructure with the IPv4
+    // range, so a request for it is either a misconfiguration or an attempt to
+    // reach that lab.
+    v4([198, 18, 0, 0], 15, "Benchmarking", "RFC 2544"),
+    v6(&[0x2001, 2, 0], 48, "Benchmarking", "RFC 5180"),
+    // The documentation ranges: three IPv4 blocks (RFC 5737), and
+    // `2001:db8::/32` (RFC 3849) and `3fff::/20` for IPv6. RFC 3849's block is
+    // the one in long use; the IANA registry added `3fff::/20` as a second
+    // documentation block in July 2024.
+    //
+    // Reachable nowhere by definition, and the ranges examples and test
+    // fixtures are written with, so a request for one is a misconfiguration
+    // rather than a destination, and it should not turn into a connection
+    // attempt against whoever happens to announce them.
+    v4([192, 0, 2, 0], 24, "Documentation (TEST-NET-1)", "RFC 5737"),
+    v4(
+        [198, 51, 100, 0],
+        24,
+        "Documentation (TEST-NET-2)",
+        "RFC 5737",
+    ),
+    v4(
+        [203, 0, 113, 0],
+        24,
+        "Documentation (TEST-NET-3)",
+        "RFC 5737",
+    ),
+    v6(&[0x2001, 0xdb8], 32, "Documentation", "RFC 3849"),
+    v6(&[0x3fff], 20, "Documentation", "RFC 9637"),
+    // 192.88.99.0/24, 6to4 relay anycast (RFC 6890 Table 10, from RFC 3068).
+    // RFC 7526 deprecated the relays and the registry kept the entry, so the
+    // prefix now reaches whoever still announces it rather than any relay this
+    // proxy meant to use.
+    v4(
+        [192, 88, 99, 0],
+        24,
+        "6to4 Relay Anycast (deprecated)",
+        "RFC 7526",
+    ),
+    // 240.0.0.0/4, reserved (RFC 1112 §4). The broadcast address at the top of
+    // it is already `is_never_allowed`, which runs first.
+    v4([240, 0, 0, 0], 4, "Reserved", "RFC 1112"),
+    // `2001:10::/28` and `2001:20::/28` are ORCHID and ORCHIDv2.
+    //
+    // An ORCHID is a hash of a host identity, not a locator: nothing forwards
+    // one, so a tunnel to it can only ever hold a slot. The original block's
+    // registry entry carries a termination date of March 2014, and its
+    // successor is listed as ORCHIDv2. The IANA registry marks ORCHIDv2
+    // globally reachable, but it is still an identifier rather than a location,
+    // so the second clause of this table's rule covers it: it is not a
+    // destination an internet-facing proxy has any business dialling.
+    v6(&[0x2001, 0x10], 28, "ORCHID (deprecated)", "RFC 4843"),
+    v6(&[0x2001, 0x20], 28, "ORCHIDv2", "RFC 7343"),
+    // `2001:30::/28` is the Drone Remote ID Protocol Entity Tags (DETs) prefix.
+    //
+    // The IANA registry lists the block as globally reachable, but its name
+    // says what it carries: entity tags, identifiers for a drone's remote
+    // identity. An entity tag is not a service to dial, so the second clause of
+    // this table's rule covers it. `allow_private_networks` opens it too, but
+    // only together with loopback and the rest of the private bucket.
+    v6(
+        &[0x2001, 0x30],
+        28,
+        "Drone Remote ID Protocol Entity Tags (DETs) Prefix",
+        "RFC 9374",
+    ),
+    // `100::/64` is the discard-only prefix (RFC 6666). Traffic to it is meant
+    // to be black-holed, which makes it a way to ask this proxy to open a
+    // tunnel that can only ever hold a slot.
+    v6(&[0x0100], 64, "Discard-Only Address Block", "RFC 6666"),
+    // `100:0:0:1::/64` is the Dummy IPv6 Prefix (RFC 9780). The IANA registry
+    // marks it not globally reachable and not a destination. RFC 9780 Section 1
+    // allocates it for the address written into the IP/UDP encapsulation of
+    // management, control and OAM packets, where it is meant to raise an
+    // exception and not to be delivered. Nothing answers there, so a tunnel to
+    // it can only hold a slot.
+    v6(&[0x0100, 0, 0, 1], 64, "Dummy IPv6 Prefix", "RFC 9780"),
+    // `5f00::/16` is the Segment Routing (SRv6) SID block. The IANA registry
+    // marks the block not globally reachable. A host with SRv6 routes can still
+    // deliver it to an internal SID, which is the class
+    // `allow_private_networks` is meant to gate.
+    v6(&[0x5f00], 16, "Segment Routing (SRv6) SIDs", "RFC 9602"),
+    // `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215), is here because
+    // its contents cannot be read. An address here is a translation of some
+    // IPv4 address, and the operator chooses where in the address that IPv4
+    // address sits. RFC 8215 §5 says a reader must not guess: "they must not
+    // make any assumptions regarding the syntax or properties of those
+    // addresses (e.g., the existence and location of embedded IPv4 addresses)".
+    // So the whole prefix is private, and it is `allow_private_networks` that
+    // decides whether it may be dialled. See `embedded_ipv4` for what reading a
+    // layout would cost.
+    v6(
+        &[0x64, 0xff9b, 1],
+        48,
+        "Local-Use IPv4/IPv6 Translation Prefix",
+        "RFC 8215",
+    ),
+    // `::/96` is the deprecated IPv4-compatible range (RFC 4291 §2.5.5.1), and
+    // `::1` with it. Refused rather than treated as ordinary IPv6: stacks that
+    // still honour the range route `::127.0.0.1` to loopback, which would
+    // otherwise be a second way around the IPv4 rules. It is not unwrapped like
+    // the transition forms, because that would turn `::1` into 0.0.0.1. The
+    // unspecified address is in here too, but `is_never_allowed` has already
+    // claimed it.
+    v6(&[], 96, "IPv4-compatible (deprecated)", "RFC 4291"),
+];
 
 /// The IPv4 address an IPv6 transition address carries, if it carries one.
 ///
@@ -470,7 +553,7 @@ fn is_local_use_nat64(v6: Ipv6Addr) -> bool {
 ///
 /// The deprecated `::/96` IPv4-compatible range is deliberately **not** here:
 /// unwrapping it would turn `::1` into 0.0.0.1 and lose the loopback meaning, so
-/// [`is_ipv4_compatible`] keeps claiming it wholesale instead.
+/// its row in [`PRIVATE_PREFIXES`] claims it whole instead.
 ///
 /// # The local-use prefix is refused whole rather than read
 ///
@@ -493,8 +576,8 @@ fn is_local_use_nat64(v6: Ipv6Addr) -> bool {
 /// refusing one: at the /64 layout the operator's subnet octets are read as the
 /// first half of the address, so a subnet that spells a public IPv4 prefix hides
 /// a private target from `allow_private_networks = false`. So this function
-/// reads no layout at all, and [`is_local_use_nat64`] puts the whole /48 in the
-/// private bucket instead.
+/// reads no layout at all, and the whole /48 is a row of [`PRIVATE_PREFIXES`]
+/// instead.
 fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     let IpAddr::V6(v6) = ip else {
         return None;
@@ -526,39 +609,6 @@ fn embedded_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
     None
 }
 
-/// `fc00::/7` is the unique local address range (RFC 4193).
-///
-/// Hand-rolled because `Ipv6Addr::is_unique_local` is still unstable.
-fn is_unique_local(v6: Ipv6Addr) -> bool {
-    v6.segments()[0] & 0xfe00 == 0xfc00
-}
-
-/// `fe80::/10` is link-local unicast (RFC 4291 §2.5.6).
-///
-/// Hand-rolled because `Ipv6Addr::is_unicast_link_local` is still unstable.
-fn is_unicast_link_local(v6: Ipv6Addr) -> bool {
-    v6.segments()[0] & 0xffc0 == 0xfe80
-}
-
-/// `fec0::/10` is the deprecated site-local unicast prefix (RFC 3879).
-///
-/// Adjacent to link-local and, on a network old enough to still use it, just as
-/// internal. Nothing routes it globally, so denying it costs no legitimate
-/// destination.
-fn is_site_local(v6: Ipv6Addr) -> bool {
-    v6.segments()[0] & 0xffc0 == 0xfec0
-}
-
-/// `::/96` is the deprecated IPv4-compatible range, and `::1` with it.
-///
-/// Treated as private rather than as ordinary IPv6: stacks that still honour the
-/// range route `::127.0.0.1` to loopback, which would otherwise be a second way
-/// around the IPv4 rules. The unspecified address is in here too, but
-/// [`is_never_allowed`] has already claimed it.
-fn is_ipv4_compatible(v6: Ipv6Addr) -> bool {
-    v6.octets()[..12].iter().all(|byte| *byte == 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,127 +625,251 @@ mod tests {
         text.parse().expect("address literal")
     }
 
-    /// Every range the spec names, in both address families.
-    const PRIVATE: &[&str] = &[
-        // IPv4
-        // RFC 6890 Table 1, "this host on this network". 0.0.0.0 itself is in
-        // NEVER, so the representative is the address above it.
-        "0.0.0.1",
-        "0.255.255.255",
-        "127.0.0.1",
-        "127.255.255.254",
-        "10.0.0.1",
-        "10.255.255.255",
-        "172.16.0.1",
-        "172.31.255.255",
-        "192.168.0.1",
-        "192.168.255.255",
-        "169.254.169.254", // the cloud metadata address, the classic prize
-        // RFC 6598 shared address space: the inside of a carrier-grade NAT.
-        "100.64.0.0",
-        "100.127.255.255",
-        // RFC 6890 IETF protocol assignments, including the DS-Lite link and
-        // the PCP and TURN anycast addresses.
-        "192.0.0.0",
-        "192.0.0.8",
-        "192.0.0.9",
-        "192.0.0.10",
-        "192.0.0.11",
-        "192.0.0.170",
-        "192.0.0.171",
-        "192.0.0.255",
-        // RFC 2544 benchmarking, which some networks number infrastructure with.
-        "198.18.0.0",
-        "198.19.255.255",
-        // RFC 6890 Table 10, 6to4 relay anycast, deprecated by RFC 7526.
-        "192.88.99.0",
-        "192.88.99.255",
-        // RFC 5737 documentation.
-        "192.0.2.1",
-        "198.51.100.1",
-        "203.0.113.1",
-        // RFC 1112 §4 reserved space, routed inside some large networks.
-        "240.0.0.0",
-        "255.255.255.254",
-        // IPv6
-        "::1",
-        "fc00::1",
-        "fdff::1",
-        "fe80::1",
-        "febf::1",
-        // RFC 3879 deprecated site-local, still routed on networks that predate
-        // the deprecation.
-        "fec0::1",
-        "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-        // RFC 3849 documentation and the RFC 6666 discard prefix.
-        "2001:db8::1",
-        "100::1",
-        "100:0:0:0:ffff::",
-        // RFC 6890 Table 24, IPv6 benchmarking (RFC 5180).
-        "2001:2::1",
-        "2001:2:0:ffff:ffff:ffff:ffff:ffff",
-        // RFC 6890 Table 26, ORCHID (RFC 4843).
-        "2001:10::1",
-        "2001:1f:ffff:ffff:ffff:ffff:ffff:ffff",
-        // ORCHIDv2, the successor prefix in the same 2001::/23 block.
-        "2001:20::1",
-        "2001:2f:ffff:ffff:ffff:ffff:ffff:ffff",
-        // The Drone Remote ID Protocol Entity Tags (DETs) prefix.
-        "2001:30::1",
-        "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
-        // The second IPv6 documentation block, 3fff::/20.
-        "3fff::1",
-        "3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff",
-        // Segment Routing (SRv6) SIDs, 5f00::/16.
-        "5f00::1",
-        "5f00:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-    ];
+    /// The first and last address of a prefix.
+    fn edges(net: Net) -> (IpAddr, IpAddr) {
+        match net {
+            Net::V4(base, len) => {
+                let first = base.to_bits();
+                let last = first | !v4_mask(len);
+                (
+                    IpAddr::V4(Ipv4Addr::from_bits(first)),
+                    IpAddr::V4(Ipv4Addr::from_bits(last)),
+                )
+            }
+            Net::V6(base, len) => {
+                let first = base.to_bits();
+                let last = first | !v6_mask(len);
+                (
+                    IpAddr::V6(Ipv6Addr::from_bits(first)),
+                    IpAddr::V6(Ipv6Addr::from_bits(last)),
+                )
+            }
+        }
+    }
 
+    /// The address one below `ip`, if there is one.
+    fn below(ip: IpAddr) -> Option<IpAddr> {
+        match ip {
+            IpAddr::V4(v4) => v4
+                .to_bits()
+                .checked_sub(1)
+                .map(|bits| Ipv4Addr::from_bits(bits).into()),
+            IpAddr::V6(v6) => v6
+                .to_bits()
+                .checked_sub(1)
+                .map(|bits| Ipv6Addr::from_bits(bits).into()),
+        }
+    }
+
+    /// The address one above `ip`, if there is one.
+    fn above(ip: IpAddr) -> Option<IpAddr> {
+        match ip {
+            IpAddr::V4(v4) => v4
+                .to_bits()
+                .checked_add(1)
+                .map(|bits| Ipv4Addr::from_bits(bits).into()),
+            IpAddr::V6(v6) => v6
+                .to_bits()
+                .checked_add(1)
+                .map(|bits| Ipv6Addr::from_bits(bits).into()),
+        }
+    }
+
+    /// The verdicts of the default and the permissive policy, in that order.
+    fn verdicts(address: IpAddr) -> (bool, bool) {
+        (
+            policy(false, &[]).allows_address(address),
+            policy(true, &[]).allows_address(address),
+        )
+    }
+
+    /// Every row of the table, at both of its edges and at the address just
+    /// outside each edge.
+    ///
+    /// Inside a row: refused by default and allowed once private networks are,
+    /// unless the address is one [`is_never_allowed`] claims first (`0.0.0.0` at
+    /// the bottom of `0.0.0.0/8`, `::` at the bottom of `::/96`, the broadcast
+    /// address at the top of `240.0.0.0/4`), in which case it is refused by both
+    /// and the next address inward is held to the row instead. An address that
+    /// carries an IPv4 address (Teredo, 6to4, NAT64) is judged as that address,
+    /// so for it the row is not the rule and the test asserts that instead.
+    ///
+    /// Just outside a row: outside the row itself, and then judged by what does
+    /// cover it, if anything: another row, `is_never_allowed`, an embedded IPv4
+    /// address, or nothing, in which case both policies allow it. That last case
+    /// is what catches a check outside the table that claims more than the
+    /// table says.
+    #[test]
+    fn every_row_is_refused_to_its_edges_and_no_further() {
+        let covered =
+            |address: IpAddr| PRIVATE_PREFIXES.iter().any(|row| row.net.contains(address));
+
+        for row in PRIVATE_PREFIXES {
+            let (first, last) = edges(row.net);
+            let label = format!("{} ({}, {:?})", row.name, row.source, row.net);
+
+            for (edge, inward) in [(first, above(first)), (last, below(last))] {
+                assert!(row.net.contains(edge), "{edge} is an edge of {label}");
+                let routed = routed_form(edge);
+                if routed != edge {
+                    assert_eq!(
+                        verdicts(edge),
+                        verdicts(routed),
+                        "{edge} in {label} carries {routed} and is judged as it"
+                    );
+                    continue;
+                }
+                let held = if is_never_allowed(edge) {
+                    assert_eq!(verdicts(edge), (false, false), "{edge} is never allowed");
+                    inward.expect("a row of more than one address")
+                } else {
+                    edge
+                };
+                assert!(row.net.contains(held), "{held} is inside {label}");
+                assert_eq!(
+                    verdicts(held),
+                    (false, true),
+                    "{held} is inside {label}: refused by default, allowed once private networks are"
+                );
+            }
+
+            for neighbour in [below(first), above(last)].into_iter().flatten() {
+                assert!(
+                    !row.net.contains(neighbour),
+                    "{neighbour} is outside {label}"
+                );
+                let routed = routed_form(neighbour);
+                let expected = if is_never_allowed(routed) {
+                    (false, false)
+                } else if routed != neighbour {
+                    verdicts(routed)
+                } else if covered(neighbour) {
+                    (false, true)
+                } else {
+                    (true, true)
+                };
+                assert_eq!(
+                    verdicts(neighbour),
+                    expected,
+                    "{neighbour} is just outside {label}"
+                );
+            }
+        }
+    }
+
+    /// How `docs/configuration.md` and `script/config.example.toml` write a row:
+    /// a bare address for a single-address row, `address/length` otherwise.
+    fn written(net: Net) -> String {
+        match net {
+            Net::V4(base, 32) => base.to_string(),
+            Net::V6(base, 128) => base.to_string(),
+            Net::V4(base, len) => format!("{base}/{len}"),
+            Net::V6(base, len) => format!("{base}/{len}"),
+        }
+    }
+
+    /// Whether `text` names `token` as a whole address or prefix.
+    ///
+    /// A match inside a longer literal does not count: `::1` inside
+    /// `::127.0.0.1`, or `::/96` inside `64:ff9b::/96`. A full stop after the
+    /// token ends a sentence unless a digit follows it.
+    fn names(text: &str, token: &str) -> bool {
+        let literal = |c: char| c.is_ascii_hexdigit() || c == ':' || c == '/';
+        text.match_indices(token).any(|(at, _)| {
+            let before = text[..at].chars().next_back();
+            let mut after = text[at + token.len()..].chars();
+            let next = after.next();
+            let continues = match next {
+                Some('.') => after.next().is_some_and(|c| c.is_ascii_digit()),
+                Some(c) => literal(c),
+                None => false,
+            };
+            !before.is_some_and(|c| literal(c) || c == '.') && !continues
+        })
+    }
+
+    /// The text that documents `allow_private_networks`, in both places.
+    ///
+    /// In `docs/configuration.md` that is the key's row of the `[security]`
+    /// table. In `script/config.example.toml` it is the comment block between
+    /// `[security]` and the commented key.
+    fn private_networks_documentation() -> [(&'static str, String); 2] {
+        let page = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/configuration.md"
+        ))
+        .expect("docs/configuration.md must exist");
+        let row = page
+            .lines()
+            .find(|line| line.starts_with("| `allow_private_networks` |"))
+            .expect("docs/configuration.md documents allow_private_networks in a table row")
+            .to_owned();
+
+        let example = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/script/config.example.toml"
+        ))
+        .expect("script/config.example.toml must exist");
+        let block: Vec<&str> = example
+            .lines()
+            .skip_while(|line| *line != "[security]")
+            .take_while(|line| !line.starts_with("#allow_private_networks"))
+            .collect();
+        assert!(
+            block.len() > 1,
+            "script/config.example.toml has a [security] comment block above allow_private_networks"
+        );
+
+        [
+            ("docs/configuration.md", row),
+            ("script/config.example.toml", block.join("\n")),
+        ]
+    }
+
+    /// Both places that list the refused ranges for the operator name every row
+    /// of the table.
+    #[test]
+    fn the_docs_name_every_refused_prefix() {
+        for (file, text) in private_networks_documentation() {
+            let missing: Vec<String> = PRIVATE_PREFIXES
+                .iter()
+                .map(|row| (written(row.net), row.name))
+                .filter(|(token, _)| !names(&text, token))
+                .map(|(token, name)| format!("{token} ({name})"))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{file} does not name these refused prefixes where it documents \
+                 allow_private_networks: {missing:?}"
+            );
+        }
+    }
+
+    /// The matcher [`the_docs_name_every_refused_prefix`] relies on.
+    #[test]
+    fn a_prefix_is_named_only_as_a_whole_literal() {
+        assert!(names("loopback (`::1`)", "::1"));
+        assert!(names("ends with 10.0.0.0/8.", "10.0.0.0/8"));
+        assert!(names("# 2001:db8::/32, 100::/64", "100::/64"));
+        assert!(!names("`::127.0.0.1`", "::1"));
+        assert!(!names("`64:ff9b::/96`", "::/96"));
+        assert!(!names("`2100::/64`", "100::/64"));
+        assert!(!names("`10.0.0.0/80`", "10.0.0.0/8"));
+        assert!(!names("`110.0.0.0/8`", "10.0.0.0/8"));
+    }
+
+    /// Ordinary public addresses, and the stated neighbours the table test does
+    /// not reach.
     const PUBLIC: &[&str] = &[
         "1.1.1.1",
         "8.8.8.8",
         "93.184.216.34",
-        "172.32.0.1",  // just outside 172.16/12
-        "172.15.0.1",  // just below it
-        "169.253.0.1", // just outside 169.254/16
-        "11.0.0.1",
-        "192.169.0.1",
-        // The neighbours of every range added for RFC 6890, on both sides.
-        "100.63.255.255", // just below 100.64/10
-        "100.128.0.0",    // just above it
-        "192.0.1.1",      // just above 192.0.0/24, and not 192.0.2/24
-        "198.17.255.255", // just below 198.18/15
-        "198.20.0.0",     // just above it
-        "1.0.0.0",        // just above 0.0.0.0/8, which has nothing below it
-        "192.88.98.255",  // just below 192.88.99/24
-        "192.88.100.0",   // just above it
-        "192.0.3.1",      // just above 192.0.2/24
-        "198.51.101.1",   // just above 198.51.100/24
-        "203.0.114.1",    // just above 203.0.113/24
         // 224/4 through 239/8 is multicast and sits in NEVER, so the last public
-        // address below the reserved block is the one at the top of 223/8.
+        // address below the reserved block 240.0.0.0/4 is the one at the top of
+        // 223/8. The table test sees only the multicast address just below it.
         "223.255.255.255",
         "2001:4860:4860::8888",
         "2606:4700::1111",
-        "fbff::1",      // just below fc00::/7
-        "fe7f::1",      // just below fe80::/10; above it fec0::/10 runs into ff00::/8
-        "2001:db9::1",  // just above 2001:db8::/32
-        "100:0:0:2::1", // just above 100::/64 and the dummy prefix 100:0:0:1::/64
-        // Teredo is 2001::/32 and is unwrapped before the rules run, so the
-        // address just below 2001:2::/48 is taken from 2001:1::/32.
-        "2001:1:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:2::/48
-        "2001:2:1::1",                          // just above it
-        "2001:f:ffff:ffff:ffff:ffff:ffff:ffff", // just below 2001:10::/28
-        // Just above the top of the claimed 2001::/23 span, which now runs
-        // through 2001:3f:ffff:... (ORCHID, ORCHIDv2 and the DETs prefix).
-        "2001:40::1",
-        // The neighbours of the second documentation block, 3fff::/20.
-        "3ffe:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
-        "3fff:1000::",                             // the first address above it
-        "4000::1",                                 // above the whole of 3fff::/16
-        // The neighbours of the SRv6 SID block, 5f00::/16.
-        "5eff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // just below it
-        "5f01::1",                                 // just above it
     ];
 
     const NEVER: &[&str] = &[
@@ -709,17 +883,6 @@ mod tests {
     ];
 
     #[test]
-    fn private_ranges_are_denied_by_default() {
-        let policy = policy(false, &[]);
-        for address in PRIVATE {
-            assert!(
-                !policy.allows_address(ip(address)),
-                "{address} must be denied by default"
-            );
-        }
-    }
-
-    #[test]
     fn public_addresses_are_allowed() {
         for allow_private in [false, true] {
             let policy = policy(allow_private, &[]);
@@ -729,17 +892,6 @@ mod tests {
                     "{address} must be allowed (allow_private={allow_private})"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn private_ranges_can_be_opened_up() {
-        let policy = policy(true, &[]);
-        for address in PRIVATE {
-            assert!(
-                policy.allows_address(ip(address)),
-                "{address} must be allowed once private networks are"
-            );
         }
     }
 
@@ -787,148 +939,8 @@ mod tests {
         assert!(permissive.allows_address(ip("::ffff:127.0.0.1")));
     }
 
-    /// Every added range at both of its edges, so a mask typo cannot pass.
-    ///
-    /// The `PRIVATE`/`PUBLIC` lists above already carry these; this states the
-    /// adjacency directly, because "first address in, neighbour out" is the
-    /// property a wrong mask breaks and a list of literals does not say out loud.
-    #[test]
-    fn the_special_purpose_ranges_stop_where_they_should() {
-        let strict = policy(false, &[]);
-
-        for (last_public, first_private, last_private, first_public) in [
-            // 0.0.0.0/8 starts at the bottom of the address space, so it has no
-            // public neighbour below it and the address above it stands in for
-            // both ends. Its first address is `is_never_allowed`, which runs
-            // first, hence 0.0.0.1 as the first private one.
-            ("1.0.0.0", "0.0.0.1", "0.255.255.255", "1.0.0.0"),
-            (
-                "100.63.255.255",
-                "100.64.0.0",
-                "100.127.255.255",
-                "100.128.0.0",
-            ),
-            ("191.255.255.255", "192.0.0.0", "192.0.0.255", "192.0.1.0"),
-            (
-                "198.17.255.255",
-                "198.18.0.0",
-                "198.19.255.255",
-                "198.20.0.0",
-            ),
-            (
-                "192.88.98.255",
-                "192.88.99.0",
-                "192.88.99.255",
-                "192.88.100.0",
-            ),
-            ("192.0.1.255", "192.0.2.0", "192.0.2.255", "192.0.3.0"),
-            (
-                "198.51.99.255",
-                "198.51.100.0",
-                "198.51.100.255",
-                "198.51.101.0",
-            ),
-            (
-                "203.0.112.255",
-                "203.0.113.0",
-                "203.0.113.255",
-                "203.0.114.0",
-            ),
-            // 240/4 runs to the broadcast address, which `is_never_allowed`
-            // claims first — so there is no "first public" above it. The address
-            // just below the range is multicast for the same reason, hence
-            // 223.255.255.255 as the public neighbour.
-            (
-                "223.255.255.255",
-                "240.0.0.0",
-                "255.255.255.254",
-                "223.255.255.255",
-            ),
-        ] {
-            for public in [last_public, first_public] {
-                assert!(
-                    strict.allows_address(ip(public)),
-                    "{public} is outside the range and must stay reachable"
-                );
-            }
-            for private in [first_private, last_private] {
-                assert!(
-                    !strict.allows_address(ip(private)),
-                    "{private} is inside the range and must be denied"
-                );
-            }
-        }
-
-        // The broadcast address is inside 240/4 but `is_never_allowed` wins, so
-        // opening private space does not open it. The unspecified address sits
-        // the same way inside 0.0.0.0/8.
-        assert!(!policy(true, &[]).allows_address(ip("255.255.255.255")));
-        assert!(policy(true, &[]).allows_address(ip("240.0.0.1")));
-        assert!(!policy(true, &[]).allows_address(ip("0.0.0.0")));
-        assert!(policy(true, &[]).allows_address(ip("0.0.0.1")));
-
-        // fec0::/10 has no public neighbour on either side: below it is fe80::/10
-        // (link-local, private) and above it ff00::/8 (multicast, never), so the
-        // edges are stated against those instead. The nearest public address is
-        // the one just below fe80::/10.
-        assert!(strict.allows_address(ip("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff")));
-        for private in [
-            "fe80::",
-            "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-            "fec0::",
-            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
-        ] {
-            assert!(
-                !strict.allows_address(ip(private)),
-                "{private} is inside a private range and must be denied"
-            );
-            assert!(
-                policy(true, &[]).allows_address(ip(private)),
-                "{private} must follow the switch"
-            );
-        }
-        assert!(!policy(true, &[]).allows_address(ip("ff00::")));
-
-        // The two IPv6 blocks carved out of 2001::/23. Their neighbours are
-        // picked to miss Teredo (2001::/32), which is unwrapped before any of
-        // these rules run. The second span covers ORCHID, ORCHIDv2 and the DETs
-        // prefix: 2001:10::/28 through 2001:30::/28 run together under the
-        // masks, so the first public address above them is 2001:40::.
-        for (last_public, first_private, last_private, first_public) in [
-            (
-                "2001:1:ffff:ffff:ffff:ffff:ffff:ffff",
-                "2001:2::",
-                "2001:2:0:ffff:ffff:ffff:ffff:ffff",
-                "2001:2:1::",
-            ),
-            (
-                "2001:f:ffff:ffff:ffff:ffff:ffff:ffff",
-                "2001:10::",
-                "2001:3f:ffff:ffff:ffff:ffff:ffff:ffff",
-                "2001:40::",
-            ),
-        ] {
-            for public in [last_public, first_public] {
-                assert!(
-                    strict.allows_address(ip(public)),
-                    "{public} is outside the range and must stay reachable"
-                );
-            }
-            for private in [first_private, last_private] {
-                assert!(
-                    !strict.allows_address(ip(private)),
-                    "{private} is inside the range and must be denied"
-                );
-                assert!(
-                    policy(true, &[]).allows_address(ip(private)),
-                    "{private} must follow the switch"
-                );
-            }
-        }
-    }
-
-    /// `192.0.0.0/24` is claimed whole, its two anycast service addresses
-    /// included.
+    /// `192.0.0.0/24` is refused whole, its two anycast service addresses
+    /// and the NAT64 discovery addresses included.
     ///
     /// The registry marks `192.0.0.9` (PCP anycast) and `192.0.0.10` (TURN
     /// anycast) globally reachable. Through this proxy an anycast address
@@ -939,7 +951,14 @@ mod tests {
     fn the_protocol_anycast_addresses_stay_inside_the_ietf_block() {
         let strict = policy(false, &[]);
         let permissive = policy(true, &[]);
-        for address in ["192.0.0.8", "192.0.0.9", "192.0.0.10", "192.0.0.11"] {
+        for address in [
+            "192.0.0.8",
+            "192.0.0.9",
+            "192.0.0.10",
+            "192.0.0.11",
+            "192.0.0.170",
+            "192.0.0.171",
+        ] {
             assert!(
                 !strict.allows_address(ip(address)),
                 "{address} is in 192.0.0.0/24 and must be denied by default"
@@ -949,160 +968,6 @@ mod tests {
                 "{address} must follow allow_private_networks"
             );
         }
-    }
-
-    /// The three IPv6 anycast service addresses in `2001:1::/32` are private,
-    /// and nothing else in that block is.
-    ///
-    /// They are the IPv6 counterparts of `192.0.0.9` and `192.0.0.10`, plus the
-    /// service registration address that has no IPv4 twin. The neighbours on
-    /// both sides stay public, because the block is claimed one allocation at a
-    /// time.
-    #[test]
-    fn the_ipv6_protocol_anycast_addresses_are_private() {
-        let strict = policy(false, &[]);
-        let permissive = policy(true, &[]);
-        for address in ["2001:1::1", "2001:1::2", "2001:1::3"] {
-            assert!(
-                !strict.allows_address(ip(address)),
-                "{address} is an anycast service address and must be denied by default"
-            );
-            assert!(
-                permissive.allows_address(ip(address)),
-                "{address} must follow allow_private_networks"
-            );
-        }
-        for address in ["2001:1::", "2001:1::4", "2001:1:0:0:1::1"] {
-            assert!(
-                strict.allows_address(ip(address)),
-                "{address} is not one of the three anycast addresses and stays public"
-            );
-        }
-    }
-
-    /// The AMT relay discovery prefixes are private in both families, and
-    /// their neighbours are not.
-    ///
-    /// A message to an address in an AMT prefix is routed to the relay nearest
-    /// the sender (RFC 7450), which through this proxy is the relay nearest the
-    /// proxy. The AS112 prefixes are claimed for the same reason and have their
-    /// own test, `the_as112_prefixes_are_private`.
-    #[test]
-    fn the_amt_relay_discovery_prefixes_are_private() {
-        let strict = policy(false, &[]);
-        let permissive = policy(true, &[]);
-        for address in [
-            "192.52.193.0",
-            "192.52.193.1",
-            "192.52.193.255",
-            "2001:3::1",
-            "2001:3:ffff:ffff:ffff:ffff:ffff:ffff",
-        ] {
-            assert!(
-                !strict.allows_address(ip(address)),
-                "{address} is an AMT relay discovery address and must be denied by default"
-            );
-            assert!(
-                permissive.allows_address(ip(address)),
-                "{address} must follow allow_private_networks"
-            );
-        }
-        for address in ["192.52.192.255", "192.52.194.0", "2001:4::1"] {
-            assert!(
-                strict.allows_address(ip(address)),
-                "{address} is outside the AMT prefixes and stays public"
-            );
-        }
-    }
-
-    /// The four AS112 prefixes are private in both families, and the address
-    /// just outside each end of each prefix is not.
-    ///
-    /// Each prefix is an anycast service prefix (RFC 7534 Section 2.3, RFC 7535
-    /// Section 2), so through this proxy a query reaches the AS112 node nearest
-    /// the proxy. They follow the rule of the AMT and anycast service addresses
-    /// (D111).
-    #[test]
-    fn the_as112_prefixes_are_private() {
-        let strict = policy(false, &[]);
-        let permissive = policy(true, &[]);
-        for (below, first, inside, last, above) in [
-            // AS112-v4, DNAME redirection (RFC 7535).
-            (
-                "192.31.195.255",
-                "192.31.196.0",
-                "192.31.196.1",
-                "192.31.196.255",
-                "192.31.197.0",
-            ),
-            // Direct Delegation AS112 Service (RFC 7534).
-            (
-                "192.175.47.255",
-                "192.175.48.0",
-                "192.175.48.1",
-                "192.175.48.255",
-                "192.175.49.0",
-            ),
-            // AS112-v6, DNAME redirection (RFC 7535).
-            (
-                "2001:4:111:ffff:ffff:ffff:ffff:ffff",
-                "2001:4:112::",
-                "2001:4:112::1",
-                "2001:4:112:ffff:ffff:ffff:ffff:ffff",
-                "2001:4:113::",
-            ),
-            // Direct Delegation AS112 Service over IPv6 (RFC 7534).
-            (
-                "2620:4f:7fff:ffff:ffff:ffff:ffff:ffff",
-                "2620:4f:8000::",
-                "2620:4f:8000::1",
-                "2620:4f:8000:ffff:ffff:ffff:ffff:ffff",
-                "2620:4f:8001::",
-            ),
-        ] {
-            for address in [first, inside, last] {
-                assert!(
-                    !strict.allows_address(ip(address)),
-                    "{address} is an AS112 address and must be denied by default"
-                );
-                assert!(
-                    permissive.allows_address(ip(address)),
-                    "{address} must follow allow_private_networks"
-                );
-            }
-            for address in [below, above] {
-                assert!(
-                    strict.allows_address(ip(address)),
-                    "{address} is outside the AS112 prefixes and stays public"
-                );
-            }
-        }
-    }
-
-    /// The Dummy IPv6 Prefix `100:0:0:1::/64` is private, and the /64 after it
-    /// is not.
-    #[test]
-    fn the_dummy_ipv6_prefix_is_private() {
-        let strict = policy(false, &[]);
-        let permissive = policy(true, &[]);
-        for address in [
-            "100:0:0:1::",
-            "100:0:0:1::1",
-            "100:0:0:1:ffff:ffff:ffff:ffff",
-        ] {
-            assert!(
-                !strict.allows_address(ip(address)),
-                "{address} is in the dummy prefix and must be denied by default"
-            );
-            assert!(
-                permissive.allows_address(ip(address)),
-                "{address} must follow allow_private_networks"
-            );
-        }
-        assert!(
-            strict.allows_address(ip("100:0:0:2::1")),
-            "the /64 after the dummy prefix is ordinary address space"
-        );
     }
 
     /// NAT64, 6to4 and Teredo addresses are routes to an IPv4 address, so they
