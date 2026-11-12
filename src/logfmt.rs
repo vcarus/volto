@@ -170,21 +170,22 @@ fn truncated(head: &str, whole: usize) -> String {
     format!("{head}... <truncated from {whole} bytes>")
 }
 
-/// How often a warning a peer can repeat at will is allowed to be loud.
+/// How often a production line a peer can repeat at will is written.
 ///
 /// The rules above bound what one line may carry. This bounds how many lines
 /// there are, which is the other half of the same problem and the one an
 /// operator feels first: `journald` rate limiting counts *lines*, per unit, so a
-/// peer that can buy one warning per request does not merely fill a disk. It
+/// peer that can buy one line per request does not merely fill a disk. It
 /// spends this service's whole allowance, and the genuine lines that follow are
 /// dropped. Suppressing the real signal is the more expensive half of the
 /// attack, and a peer needs no privilege to run it: a refusal is a request that
 /// went nowhere, so the refusals are the cheapest lines there are.
 ///
-/// Silencing the repeats is not the answer either. The two warnings this guards
-/// are read as evidence (a client probing the private side of the host, a
-/// client sitting on its tunnel limit), and evidence that reports "it happened"
-/// while hiding "it happened sixty thousand times" is misleading.
+/// Silencing the repeats is not the answer either. The two refusal lines this
+/// guards are read as evidence (a client probing the private side of the host,
+/// an INFO line, and a client sitting on its tunnel limit, a WARN line), and
+/// evidence that reports "it happened" while hiding "it happened sixty thousand
+/// times" is misleading.
 ///
 /// So the schedule doubles: occurrence 1 is reported, then 2, 4, 8, and so on,
 /// each carrying the running total. A scan of every port on a host is 17 lines

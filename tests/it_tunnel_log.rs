@@ -3,9 +3,10 @@
 //! Each of these lines is read by something other than a person debugging: the
 //! DNS-blackhole line was demoted to INFO so that `journalctl -p warning` means
 //! something again (D44, 89% of a day's warnings were that one line), the policy
-//! refusal was deliberately left at WARN because SSRF-shaped evidence must stay
-//! loud, and the oversized-datagram line is the only sentinel watching whether
-//! the peer has lowered `max_datagram_frame_size` under us (D48 §3).
+//! refusal is INFO since the 2026-11-12 user ruling (D111) because it is the
+//! intended answer to a client that names a private target, and the
+//! oversized-datagram line is the only sentinel watching whether the peer has
+//! lowered `max_datagram_frame_size` under us (D48 §3).
 //!
 //! None of that is visible to a test that only checks the response: the decision
 //! functions behind these lines (`policy::is_dns_blackhole`, `tunnel::udp::grade`)
@@ -40,7 +41,7 @@ async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {
     let buffer = SharedBuffer::install("volto=info");
 
     blackhole_is_information(&buffer).await;
-    policy_refusal_is_still_a_warning(&buffer).await;
+    policy_refusal_is_information(&buffer).await;
     the_oversize_sentinel_reports_on_a_doubling_schedule(&buffer).await;
 }
 
@@ -85,12 +86,15 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
     );
 }
 
-/// D44's explicit boundary: every *other* refusal keeps its warning.
+/// The policy refusal is INFO, and nothing about it may reach WARN.
 ///
-/// A client probing loopback through the proxy is what SSRF looks like from
-/// here, and the whole argument for demoting the blackhole line was that it
-/// buried evidence like this.
-async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
+/// D44 left this line at WARN when it demoted the blackhole line. The user
+/// ruling of 2026-11-12 (D111) moved it to INFO: the refusal is the intended
+/// answer to a client that names a private target, and a WARN for it failed the
+/// deploy acceptance window whenever a client inside the tunnel tried one. The
+/// line still names the target and still carries the running count, so a scan
+/// stays visible at the shipped `volto=info` filter.
+async fn policy_refusal_is_information(buffer: &SharedBuffer) {
     let server = TestServer::start_with("").await;
     let mut client = H3Client::connect(&server).await;
     let mark = buffer.mark();
@@ -102,7 +106,7 @@ async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
         .wait_for_line(
             mark,
             &[
-                " WARN ",
+                " INFO ",
                 "every address of the target is prohibited by policy",
             ],
         )
@@ -110,6 +114,15 @@ async fn policy_refusal_is_still_a_warning(buffer: &SharedBuffer) {
     assert!(
         line.contains(PROHIBITED),
         "the line must name the authority it is about: {line}"
+    );
+
+    // Matched on the authority so an unrelated warning from another scenario
+    // cannot satisfy it.
+    let warnings = buffer.lines_since(mark, &[" WARN ", PROHIBITED]);
+    assert!(
+        warnings.is_empty(),
+        "a policy refusal must produce no warning at all, got:\n{}",
+        warnings.join("\n")
     );
 }
 

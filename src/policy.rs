@@ -124,8 +124,10 @@ impl Policy {
 /// evidence of anything. On a host whose resolver filters, it is the bulk of
 /// all refusals.
 ///
-/// Callers use this to decide two things (decision D49). It picks the log level:
-/// a blackhole is an INFO, every other refusal a WARN. And it picks the answer:
+/// Callers use this to decide two things (decision D49). It picks the log line:
+/// a blackhole gets an unsampled INFO line of its own, and every other refusal
+/// gets the policy-refusal line, which is INFO on a doubling schedule. And it
+/// picks the answer:
 /// a blackholed name gets a 200 whose stream closes immediately, so the client
 /// sees a tunnel that opened and closed at once. That is what a transport
 /// without an in-band refusal channel shows it. Every other refusal keeps its
@@ -138,7 +140,7 @@ impl Policy {
 ///
 /// * **All**, because a name resolving to `0.0.0.0` *and* `10.0.0.1` is not a
 ///   blackhole. The private address is a real target that the policy just
-///   refused, which is exactly the SSRF-shaped evidence worth keeping loud.
+///   refused, which is exactly the SSRF-shaped evidence worth keeping.
 /// * **Unspecified only**, because loopback, RFC 1918 and the rest of the private
 ///   space are what an attacker aims at, and a probe of them must stay visible.
 ///   The unspecified address is the one entry in the deny list that reaches
@@ -152,7 +154,7 @@ impl Policy {
 ///
 /// An empty list is not a blackhole. It cannot arise on the paths that call this
 /// (resolution either fails or yields addresses), and "no addresses at all" is no
-/// reason to quieten a warning.
+/// reason to take the blackhole branch.
 pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
     !addresses.is_empty()
         && addresses
@@ -1346,13 +1348,14 @@ mod tests {
         }
     }
 
-    /// The half of the rule that keeps SSRF probes loud: anything that is not
-    /// *only* the unspecified address stays an ordinary policy refusal.
+    /// The half of the rule that keeps SSRF probes on the policy-refusal line:
+    /// anything that is not *only* the unspecified address stays an ordinary
+    /// policy refusal.
     #[test]
     fn private_and_mixed_answers_are_not_blackholes() {
         for literals in [
             // A private address alongside the blackhole is still a private
-            // address, and reaching for it is the thing worth warning about.
+            // address, and reaching for it is the thing worth reporting.
             &["0.0.0.0:443", "10.0.0.1:443"][..],
             &["[::]:443", "[::1]:443"][..],
             // Pure loopback / RFC 1918 / link-local: refused, never quietly.

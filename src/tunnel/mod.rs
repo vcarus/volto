@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::auth::Authenticator;
 use crate::config::{Config, IpFamilyPreference};
@@ -464,13 +464,15 @@ pub struct Context {
     /// How many destinations this connection's policy has refused, and when
     /// that is worth saying out loud again.
     ///
-    /// The warning is deliberately loud (D44 left it at WARN while demoting the
-    /// blackhole line beside it, because a client probing loopback through the
-    /// proxy is what SSRF looks like from here) and deliberately cheap for a
-    /// peer to provoke: an IP literal takes no resolver slot, opens no socket,
-    /// and holds its tunnel slot only for as long as the refusal takes. One
-    /// warning per request would let a peer decide how much of this host's
-    /// journal is left for anybody else. See [`crate::logfmt::Sampler`] for the
+    /// The line is INFO: the refusal is the intended answer, and a client
+    /// inside the tunnel that tries a private address is not a fault of this
+    /// host. It is still evidence, since a client probing loopback through the
+    /// proxy is what SSRF looks like from here, and the shipped `volto=info`
+    /// filter keeps it. It is also cheap for a peer to provoke: an IP literal
+    /// takes no resolver slot, opens no socket, and holds its tunnel slot only
+    /// for as long as the refusal takes. One line per request would let a peer
+    /// decide how much of this host's journal is left for anybody else. See
+    /// [`crate::logfmt::Sampler`] for the
     /// schedule and for why silencing the repeats was not the answer.
     pub policy_refusals: crate::logfmt::Sampler,
     /// The same, for requests refused because this connection is already
@@ -1024,14 +1026,14 @@ pub(crate) async fn admit_target(
             return None;
         }
 
-        // Loud on a doubling schedule rather than every time: this is the
+        // INFO on a doubling schedule rather than every time: this is the
         // evidence an operator has that somebody is probing the private side of
         // the host, and one line per request would let the peer decide how much
-        // of the journal is left to record it in. The first refusal warns at
-        // once, and the `refusals` count is what shows a scan. See
+        // of the journal is left to record it in. The first refusal is reported
+        // at once, and the `refusals` count is what shows a scan. See
         // [`Context::policy_refusals`].
         match ctx.policy_refusals.record() {
-            Some(refusals) => warn!(
+            Some(refusals) => info!(
                 log_id = "ucmaf4w6",
                 stream_id,
                 host,

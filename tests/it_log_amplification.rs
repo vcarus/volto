@@ -41,7 +41,7 @@ use rustls::{DigitallySignedStruct, SignatureScheme};
 use volto::h3api::Status;
 
 /// Loopback, which the default policy refuses: what an SSRF probe looks like
-/// from here, and the cheapest production-level warning a peer can buy.
+/// from here, and the cheapest production-level line a peer can buy.
 const PROHIBITED: &str = "127.0.0.1:443";
 
 /// Requests per storm.
@@ -69,18 +69,19 @@ async fn one_peer_cannot_buy_an_unbounded_number_of_production_log_lines() {
     a_udp_session_costs_exactly_one_line(&buffer).await;
 }
 
-/// The SSRF warning must stay loud without being one line per request.
+/// The policy refusal must stay visible without being one line per request.
 ///
 /// `admit_target`'s refusal is the cheapest production-level line in the server:
 /// an IP literal takes no resolver slot and holds no socket, so the whole cost to
-/// a peer is one HEADERS frame — under a hundred bytes for a `WARN` that reaches
+/// a peer is one HEADERS frame, under a hundred bytes for a line that reaches
 /// the journal. A port scan through the proxy is 65535 of them.
 ///
-/// D44 settled that this line stays at WARN, and it must: it is the evidence an
-/// operator is left with when somebody probes the private side of the host. What
-/// is bounded here is the *volume*, not the loudness — the first refusal warns
-/// exactly as before, and later ones warn again as the running count doubles, so
-/// a scan still announces itself and now says how large it was.
+/// The line is INFO (D111, user ruling 2026-11-12; D44 had left it at WARN).
+/// It is still the evidence an operator is left with when somebody probes the
+/// private side of the host, and the shipped `volto=info` filter keeps it. What
+/// is bounded here is the volume: the first refusal is reported at once, and
+/// later ones are reported again as the running count doubles, so a scan still
+/// shows up and says how large it was.
 async fn a_policy_refusal_storm_is_sampled(buffer: &SharedBuffer) {
     let server = TestServer::start_with("").await;
     let mut client = H3Client::connect(&server).await;
@@ -91,41 +92,41 @@ async fn a_policy_refusal_storm_is_sampled(buffer: &SharedBuffer) {
         assert_eq!(response.status, Status::FORBIDDEN);
     }
 
-    let warnings = buffer.lines_since(
+    let reports = buffer.lines_since(
         mark,
         &[
-            " WARN ",
+            " INFO ",
             "every address of the target is prohibited by policy",
         ],
     );
     assert!(
-        !warnings.is_empty(),
-        "the SSRF-shaped refusal must still be audible at WARN"
+        !reports.is_empty(),
+        "the SSRF-shaped refusal must still reach the journal at INFO"
     );
     assert!(
-        warnings.len() < STORM,
-        "{STORM} refusals bought {} production warnings; one per request means a peer \
+        reports.len() < STORM,
+        "{STORM} refusals bought {} production lines; one per request means a peer \
          decides how much of this journal is left for anybody else:\n{}",
-        warnings.len(),
-        warnings.join("\n")
+        reports.len(),
+        reports.join("\n")
     );
     assert!(
-        warnings
+        reports
             .last()
-            .expect("a warning")
+            .expect("a report")
             .contains(&format!("refusals={STORM}")),
-        "the last warning must carry the running total, or bounding the volume \
+        "the last report must carry the running total, or bounding the volume \
          throws away the size of the scan:\n{}",
-        warnings.join("\n")
+        reports.join("\n")
     );
 
     // Nothing was silenced: every refusal the peer made is still answered, and
-    // the ones that did not warn are on the debug channel an operator can turn
-    // on. What the sampler removes is repetition, not the record.
+    // the ones that were not reported are on the debug channel an operator can
+    // turn on. What the sampler removes is repetition, not the record.
     let refused = buffer.lines_since(mark, &["every address of the target is prohibited"]);
     assert_eq!(
         refused.len(),
-        warnings.len(),
+        reports.len(),
         "at `info` only the sampled lines may appear at all"
     );
 }

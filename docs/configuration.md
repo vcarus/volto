@@ -575,19 +575,21 @@ immediately — the client sees a tunnel that opened and died, which is what a
 blocked name looks like through a transport that has no way to explain itself.
 Answering 403 instead would invite the client to blame the proxy for an ad
 blocker's decision. A target that resolves to loopback, private or mixed
-addresses is a refusal volto really did make: it stays a WARN and a 403 with
-`Proxy-Status: …; error=destination_ip_prohibited`, because that is what a probe
-for internal services looks like from here.
+addresses is a refusal volto really did make: it is answered with a 403 and
+`Proxy-Status: …; error=destination_ip_prohibited`, and logged at INFO with the
+target and its addresses, because that is what a probe for internal services
+looks like from here. The line is INFO rather than WARN because the refusal is
+the configured behaviour working as intended, not a fault of this host.
 
-That warning, and the one a request refused for reaching `max_targets_per_conn`
-writes, are reported on a doubling schedule per connection: the 1st, 2nd, 4th,
-8th and so on, each carrying `refusals=` with the running total, and the ones in
-between at DEBUG. Both are refusals a client can repeat as fast as it can open
-request streams, and journald's rate limiting counts lines, so one line per
-request would let a peer decide how much of the journal is left to record
-anything else in — including the lines about it. A scan of every port on a host
-is 17 warnings rather than 65535, the first arrives as promptly as it ever did,
-and the last one says how large the scan was.
+That policy-refusal line, and the warning a request refused for reaching
+`max_targets_per_conn` writes, are reported on a doubling schedule per
+connection: the 1st, 2nd, 4th, 8th and so on, each carrying `refusals=` with the
+running total, and the ones in between at DEBUG. Both are refusals a client can
+repeat as fast as it can open request streams, and journald's rate limiting
+counts lines, so one line per request would let a peer decide how much of the
+journal is left to record anything else in, including the lines about it. A
+scan of every port on a host is 17 lines rather than 65535, the first arrives
+as promptly as it ever did, and the last one says how large the scan was.
 
 ## Checking a file without starting the server
 
