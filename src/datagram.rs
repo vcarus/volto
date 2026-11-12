@@ -14,7 +14,7 @@
 //! For CONNECT-UDP the Context ID is 0, meaning "the payload is a raw UDP
 //! datagram" (RFC 9298 §4).
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Context ID for an unmodified UDP payload (RFC 9298 §4).
 pub const CONTEXT_ID_UDP_PAYLOAD: u64 = 0;
@@ -224,7 +224,7 @@ pub fn put_varint(buf: &mut impl BufMut, value: u64) {
 /// depends on which field was being read, so the caller names it.
 pub fn take_varint(buf: &mut Bytes) -> Option<u64> {
     let (value, length) = peek_varint(buf)?;
-    let _ = buf.split_to(length);
+    buf.advance(length);
     Some(value)
 }
 
