@@ -28,7 +28,9 @@
 //!   loopback, RFC 1918, link-local, shared address space, IETF protocol
 //!   assignments (`192.0.0.0/24`), the IPv6 anycast service addresses
 //!   (`2001:1::1` to `2001:1::3`), the AMT relay discovery prefixes
-//!   (`192.52.193.0/24` and `2001:3::/32`), the benchmarking and documentation
+//!   (`192.52.193.0/24` and `2001:3::/32`), the AS112 prefixes
+//!   (`192.31.196.0/24`, `192.175.48.0/24`, `2001:4:112::/48` and
+//!   `2620:4f:8000::/48`), the benchmarking and documentation
 //!   ranges (`3fff::/20` among them), reserved space, 6to4 relay anycast, ULA,
 //!   ORCHID and ORCHIDv2, the DETs prefix, the discard-only and dummy prefixes, the SRv6 SID
 //!   block, the local-use NAT64 prefix and the deprecated IPv4-compatible and
@@ -224,13 +226,13 @@ fn is_never_allowed(ip: IpAddr) -> bool {
 /// Protocol Assignments (from RFC 2928), the IPv6 counterpart of
 /// `192.0.0.0/24`. Every one of its Source, Destination, Forwardable and Global
 /// attributes is "False\[1\]", and footnote \[1\] is "Unless allowed by a more
-/// specific allocation". Inside the /23 sit allocations that are public
-/// services rather than reserved space, such as `2001:4:112::/48` (AS112).
-/// Denying the whole block would take those with it. So it is left public, and
-/// the more-specific allocations worth denying are claimed one at a time: the
-/// three anycast service addresses, the AMT relay discovery prefix, the
-/// benchmarking range, ORCHID, ORCHIDv2 and DETs below. Teredo, also inside the /23, is not claimed. A Teredo
-/// address is judged by the IPv4 address it carries ([`embedded_ipv4`]).
+/// specific allocation". So the block is left public, and its more-specific
+/// allocations are claimed one at a time: the three anycast service addresses,
+/// the AMT relay discovery prefix, the AS112 prefix `2001:4:112::/48`, the
+/// benchmarking range, ORCHID, ORCHIDv2 and DETs below. Teredo, also inside the
+/// /23, is not claimed. A Teredo address is judged by the IPv4 address it
+/// carries ([`embedded_ipv4`]). The rest of the /23 has no allocation in the
+/// registry and stays public.
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -258,6 +260,11 @@ fn is_private(ip: IpAddr) -> bool {
                 // 192.52.193.0/24, AMT relay discovery (RFC 7450). See
                 // `is_amt_relay_discovery` for the IPv6 prefix and the reason.
                 || (octets[0] == 192 && octets[1] == 52 && octets[2] == 193)
+                // 192.31.196.0/24 and 192.175.48.0/24, AS112 (RFC 7535 and
+                // RFC 7534). See `is_as112` for the IPv6 prefixes and the
+                // reason.
+                || (octets[0] == 192 && octets[1] == 31 && octets[2] == 196)
+                || (octets[0] == 192 && octets[1] == 175 && octets[2] == 48)
                 // 198.18.0.0/15, benchmarking (RFC 2544).
                 || (octets[0] == 198 && octets[1] & 0xfe == 18)
                 // 192.88.99.0/24, 6to4 relay anycast (RFC 6890 Table 10, from
@@ -279,6 +286,7 @@ fn is_private(ip: IpAddr) -> bool {
                 || is_ipv6_documentation(v6)
                 || is_ipv6_protocol_anycast(v6)
                 || is_amt_relay_discovery(v6)
+                || is_as112(v6)
                 || is_ipv6_benchmarking(v6)
                 || is_orchid(v6)
                 || is_det(v6)
@@ -338,15 +346,30 @@ fn is_ipv6_protocol_anycast(v6: Ipv6Addr) -> bool {
 /// relay that has advertised the prefix." Through this proxy the sender is the
 /// proxy, so a client reaches the multicast relay of the proxy's own network.
 /// That is the same reason the PCP and TURN anycast addresses are claimed.
-///
-/// AS112 (`192.31.196.0/24`, `192.175.48.0/24`, `2001:4:112::/48` and
-/// `2620:4f:8000::/48`) is anycast too and is not claimed. It is a public DNS
-/// service that gives every sender the same answer and does nothing on the
-/// sender's behalf, so the instance nearest the proxy is an ordinary
-/// destination.
+/// The AS112 prefixes are claimed for the same reason ([`is_as112`]).
 fn is_amt_relay_discovery(v6: Ipv6Addr) -> bool {
     let segments = v6.segments();
     segments[0] == 0x2001 && segments[1] == 0x0003
+}
+
+/// `2001:4:112::/48` and `2620:4f:8000::/48` are the IPv6 AS112 prefixes. Their
+/// IPv4 counterparts `192.31.196.0/24` and `192.175.48.0/24` are claimed in
+/// [`is_private`].
+///
+/// The IANA registries mark all four globally reachable. `192.31.196.0/24` and
+/// `2001:4:112::/48` serve DNAME redirection (RFC 7535), and
+/// `192.175.48.0/24` and `2620:4f:8000::/48` serve Direct Delegation
+/// (RFC 7534 Section 2.3). RFC 7534 Section 1 says how they are reached: "Each
+/// nameserver functions as a single node in an AS112 anycast cloud \[RFC4786\]
+/// and is configured to answer authoritatively for a particular set of
+/// nominated zones." Through this proxy the sender is the proxy, so a client
+/// reaches the AS112 node nearest the proxy. The same rule claims the AMT
+/// relay discovery prefixes and the anycast service addresses (D111).
+fn is_as112(v6: Ipv6Addr) -> bool {
+    matches!(
+        v6.segments(),
+        [0x2001, 0x0004, 0x0112, ..] | [0x2620, 0x004f, 0x8000, ..]
+    )
 }
 
 /// `2001:2::/48` is the IPv6 benchmarking range (RFC 6890 Table 24, from
@@ -932,8 +955,7 @@ mod tests {
     /// They are the IPv6 counterparts of `192.0.0.9` and `192.0.0.10`, plus the
     /// service registration address that has no IPv4 twin. The neighbours on
     /// both sides stay public, because the block is claimed one allocation at a
-    /// time, and so does AS112, which is a public service rather than one of
-    /// the proxy's own network.
+    /// time.
     #[test]
     fn the_ipv6_protocol_anycast_addresses_are_private() {
         let strict = policy(false, &[]);
@@ -948,7 +970,7 @@ mod tests {
                 "{address} must follow allow_private_networks"
             );
         }
-        for address in ["2001:1::", "2001:1::4", "2001:1:0:0:1::1", "2001:4:112::1"] {
+        for address in ["2001:1::", "2001:1::4", "2001:1:0:0:1::1"] {
             assert!(
                 strict.allows_address(ip(address)),
                 "{address} is not one of the three anycast addresses and stays public"
@@ -957,12 +979,12 @@ mod tests {
     }
 
     /// The AMT relay discovery prefixes are private in both families, and
-    /// their neighbours and the AS112 prefixes are not.
+    /// their neighbours are not.
     ///
     /// A message to an address in an AMT prefix is routed to the relay nearest
     /// the sender (RFC 7450), which through this proxy is the relay nearest the
-    /// proxy. AS112 is anycast as well, but it is a public DNS service that
-    /// answers every sender alike, so it stays a destination.
+    /// proxy. The AS112 prefixes are claimed for the same reason and have their
+    /// own test, `the_as112_prefixes_are_private`.
     #[test]
     fn the_amt_relay_discovery_prefixes_are_private() {
         let strict = policy(false, &[]);
@@ -983,19 +1005,75 @@ mod tests {
                 "{address} must follow allow_private_networks"
             );
         }
-        for address in [
-            "192.52.192.255",
-            "192.52.194.0",
-            "2001:4::1",
-            "192.31.196.1",
-            "192.175.48.1",
-            "2001:4:112::1",
-            "2620:4f:8000::1",
-        ] {
+        for address in ["192.52.192.255", "192.52.194.0", "2001:4::1"] {
             assert!(
                 strict.allows_address(ip(address)),
                 "{address} is outside the AMT prefixes and stays public"
             );
+        }
+    }
+
+    /// The four AS112 prefixes are private in both families, and the address
+    /// just outside each end of each prefix is not.
+    ///
+    /// Each prefix is an anycast service prefix (RFC 7534 Section 2.3, RFC 7535
+    /// Section 2), so through this proxy a query reaches the AS112 node nearest
+    /// the proxy. They follow the rule of the AMT and anycast service addresses
+    /// (D111).
+    #[test]
+    fn the_as112_prefixes_are_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+        for (below, first, inside, last, above) in [
+            // AS112-v4, DNAME redirection (RFC 7535).
+            (
+                "192.31.195.255",
+                "192.31.196.0",
+                "192.31.196.1",
+                "192.31.196.255",
+                "192.31.197.0",
+            ),
+            // Direct Delegation AS112 Service (RFC 7534).
+            (
+                "192.175.47.255",
+                "192.175.48.0",
+                "192.175.48.1",
+                "192.175.48.255",
+                "192.175.49.0",
+            ),
+            // AS112-v6, DNAME redirection (RFC 7535).
+            (
+                "2001:4:111:ffff:ffff:ffff:ffff:ffff",
+                "2001:4:112::",
+                "2001:4:112::1",
+                "2001:4:112:ffff:ffff:ffff:ffff:ffff",
+                "2001:4:113::",
+            ),
+            // Direct Delegation AS112 Service over IPv6 (RFC 7534).
+            (
+                "2620:4f:7fff:ffff:ffff:ffff:ffff:ffff",
+                "2620:4f:8000::",
+                "2620:4f:8000::1",
+                "2620:4f:8000:ffff:ffff:ffff:ffff:ffff",
+                "2620:4f:8001::",
+            ),
+        ] {
+            for address in [first, inside, last] {
+                assert!(
+                    !strict.allows_address(ip(address)),
+                    "{address} is an AS112 address and must be denied by default"
+                );
+                assert!(
+                    permissive.allows_address(ip(address)),
+                    "{address} must follow allow_private_networks"
+                );
+            }
+            for address in [below, above] {
+                assert!(
+                    strict.allows_address(ip(address)),
+                    "{address} is outside the AS112 prefixes and stays public"
+                );
+            }
         }
     }
 
