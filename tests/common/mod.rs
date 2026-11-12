@@ -196,6 +196,21 @@ impl TestServer {
         Self::start_named(extra, "", names).await
     }
 
+    /// [`TestServer::start_with`], with the server bound and served on `runtime`.
+    ///
+    /// The endpoint, its driver task and the accept loop are all created while
+    /// `runtime` is the current runtime, and quinn's tokio runtime spawns with a
+    /// bare `tokio::spawn`, so the endpoint driver, every connection driver and
+    /// every task the server spawns run on `runtime`'s threads. The caller's
+    /// runtime keeps only the client and the targets. `it_bench` uses this to
+    /// count the proxy's CPU apart from theirs.
+    pub fn start_on(runtime: &tokio::runtime::Handle, extra: &str) -> Self {
+        let _entered = runtime.enter();
+        let mut server = Self::bind_named(extra, "", &[]);
+        server.serve();
+        server
+    }
+
     /// Binds the server and leaves its accept loop unstarted.
     ///
     /// The endpoint is live from here: quinn spawns its driver task when the

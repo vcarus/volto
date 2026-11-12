@@ -12,12 +12,37 @@
 //! # What the numbers mean, and what they do not
 //!
 //! The test harness runs the client, the proxy and the target **in one
-//! process**, which is what makes these benchmarks dependency-free and hermetic
-//! — and what makes every CPU figure here the sum of all three. They are
-//! comparable against each other and against a later run of the same harness;
-//! they are not a statement about what the proxy alone costs. Splitting the
-//! three apart is a profiler's job (`/usr/bin/sample` on macOS), not this
-//! harness's.
+//! process**, which is what makes these benchmarks dependency-free and hermetic.
+//! Two CPU figures come out of each measured window:
+//!
+//! * `cpu`, `cpu-s/GB`, `cpu-us/pkt` and `cpu-us/cycle` are the whole process:
+//!   user plus system time from `getrusage(RUSAGE_SELF)`, so the client, the
+//!   proxy and the targets added together. They count the same thing as the
+//!   fields of the same names in logs without the proxy-only fields, but
+//!   running the proxy on a runtime of its own costs the process more CPU for
+//!   the same transfer than running all three on one runtime. Compare their
+//!   values only with logs that carry the proxy-only fields.
+//! * `proxy cpu`, `proxy-cpu-s/GB`, `proxy-cpu-us/pkt` and `proxy-cpu-us/cycle`
+//!   are the proxy alone. Every benchmark here starts the proxy with
+//!   [`common::TestServer::start_on`] on a runtime of its own, whose threads
+//!   are named [`PROXY_THREAD`]; the test's runtime keeps the client and the
+//!   targets. On Linux the figure is the on-CPU time of those threads, user plus
+//!   system, read from `/proc/self/task/<tid>/schedstat` at the two ends of the
+//!   window. `proxy N% of cpu` is that figure over the whole-process one. On any
+//!   other system the proxy-only fields print `n/a`.
+//!
+//! The proxy threads are the proxy runtime's workers and its blocking pool. The
+//! workers poll the quinn endpoint driver, every quinn connection driver, the
+//! accept loop and every tunnel and session task, and they also service the
+//! proxy runtime's I/O and timer drivers, so the proxy's sockets are read and
+//! written on them. The blocking pool would run name resolution, but every
+//! target here is an IP literal, which resolves without it. Not counted as the
+//! proxy: the test runtime's workers (the client's quinn endpoint and
+//! connection, the targets) and the test's own thread. Kernel work is charged to
+//! whichever thread is running when it happens, and on loopback the receive
+//! path of a packet usually runs in the sending thread's system call, so part
+//! of what the proxy's receive costs is charged to the client or the target,
+//! and part of what their receive costs is charged to the proxy.
 //!
 //! Two more caveats worth carrying into any conclusion:
 //!
@@ -55,9 +80,10 @@ mod common;
 #[path = "common/alloc.rs"]
 mod alloc;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, Bytes};
@@ -113,9 +139,8 @@ static GLOBAL: alloc::PassThrough<Counting, volto::alloc::Global> =
 
 /// Process CPU time, user + system, from `getrusage(RUSAGE_SELF)`.
 ///
-/// Process-wide on purpose: the work under measurement is spread over the tokio
-/// worker threads, the quinn endpoint driver and the target tasks, and no
-/// per-thread accounting would add them up correctly.
+/// The whole process: the client, the proxy and the targets together. The
+/// proxy's own share comes from [`proxy_threads`].
 fn cpu_time() -> Duration {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: `getrusage` fills the `rusage` it is handed; the pointer is valid
@@ -153,21 +178,127 @@ fn max_rss_bytes() -> u64 {
     }
 }
 
+/// The name of every thread of [`proxy_runtime`], workers and blocking pool.
+///
+/// Linux keeps the first 15 bytes of a thread name, and this fits in them.
+const PROXY_THREAD: &str = "volto-proxy";
+
+/// The runtime every benchmark's proxy runs on, built once per process.
+///
+/// Built as `src/main.rs` builds the release binary's runtime (multi-thread,
+/// every driver enabled, one worker per CPU), with two additions: the thread
+/// name, and an hour of keep-alive for idle blocking threads. It lives in a
+/// static and is never shut down, so its workers exist before the first window
+/// opens and none of its threads exits inside a window. [`proxy_cpu_since`]
+/// relies on both. The release binary's `max_blocking_threads` is not copied:
+/// no benchmark target needs name resolution, so the blocking pool stays idle.
+fn proxy_runtime() -> &'static tokio::runtime::Handle {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name(PROXY_THREAD)
+                .thread_keep_alive(Duration::from_secs(3600))
+                .build()
+                .expect("build the proxy runtime")
+        })
+        .handle()
+}
+
+/// Starts the proxy for one repetition on [`proxy_runtime`].
+fn start_proxy(extra: &str) -> TestServer {
+    TestServer::start_on(proxy_runtime(), extra)
+}
+
+/// On-CPU time in nanoseconds of each live [`PROXY_THREAD`] thread, by thread id.
+///
+/// A thread is selected by its name in `/proc/self/task/<tid>/comm`. Its time
+/// is the first field of `/proc/self/task/<tid>/schedstat`, the scheduler's
+/// `sum_exec_runtime`: user plus system time in nanoseconds, the quantity
+/// `getrusage` splits into `ru_utime` and `ru_stime`. The `utime` and `stime`
+/// fields of `/proc/self/task/<tid>/stat` count clock ticks of 10 ms, which
+/// is too coarse for a window of under a second summed over a dozen threads.
+/// The kernel brings `sum_exec_runtime` up to date at a scheduler tick or a
+/// context switch, so a proxy thread that is running at the moment of a read
+/// can be short by up to one tick. At both ends of a window the proxy is
+/// normally idle.
+///
+/// `None` if a file cannot be read, which includes a kernel built without
+/// `CONFIG_SCHED_INFO`.
+#[cfg(target_os = "linux")]
+fn proxy_threads() -> Option<HashMap<u32, u64>> {
+    let mut threads = HashMap::new();
+    for entry in std::fs::read_dir("/proc/self/task").ok()? {
+        let entry = entry.ok()?;
+        let Some(tid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        // A thread that exited since the listing has no files left; it cannot
+        // be a proxy thread, because those do not exit.
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        if comm.trim_end() != PROXY_THREAD {
+            continue;
+        }
+        let schedstat = std::fs::read_to_string(entry.path().join("schedstat")).ok()?;
+        let nanos = schedstat.split_whitespace().next()?.parse().ok()?;
+        threads.insert(tid, nanos);
+    }
+    Some(threads)
+}
+
+/// No per-thread reading outside Linux, so the proxy-only fields print `n/a`.
+#[cfg(not(target_os = "linux"))]
+fn proxy_threads() -> Option<HashMap<u32, u64>> {
+    None
+}
+
+/// The proxy threads' CPU time since `open` was read.
+///
+/// A thread that is new since `open` counts in full, because all of its time
+/// falls in the window. `None` when there was no reading, when no proxy thread
+/// existed at `open` (no proxy runtime in this process), or when a thread seen
+/// at `open` is gone, because its time inside the window is then unknown.
+fn proxy_cpu_since(open: Option<&HashMap<u32, u64>>) -> Option<Duration> {
+    let open = open.filter(|open| !open.is_empty())?;
+    let close = proxy_threads()?;
+    let mut nanos = 0u64;
+    for (tid, before) in open {
+        nanos += close.get(tid)?.saturating_sub(*before);
+    }
+    for (tid, after) in &close {
+        if !open.contains_key(tid) {
+            nanos += after;
+        }
+    }
+    Some(Duration::from_nanos(nanos))
+}
+
 /// An open measurement window: wall clock, CPU time and allocations.
 struct Window {
     wall: Instant,
     cpu: Duration,
     rss: u64,
+    proxy: Option<HashMap<u32, u64>>,
 }
 
 impl Window {
+    /// Opens the window.
+    ///
+    /// The proxy threads are read first and, in [`Self::close_at`], last, so
+    /// the `/proc` reads and their allocations fall outside the whole-process
+    /// CPU and the allocation counts.
     fn open() -> Self {
+        let proxy = proxy_threads();
         ALLOC_COUNT.store(0, Ordering::Relaxed);
         ALLOC_BYTES.store(0, Ordering::Relaxed);
         Self {
             wall: Instant::now(),
             cpu: cpu_time(),
             rss: max_rss_bytes(),
+            proxy,
         }
     }
 
@@ -180,12 +311,15 @@ impl Window {
     /// Used where the last useful event and the moment the test notices it are
     /// not the same thing — a drain loop polling for the final packets, say.
     fn close_at(self, end: Instant) -> Totals {
+        // Field initialisers run in the order written, so the proxy threads
+        // are read after everything else.
         Totals {
             wall: end.saturating_duration_since(self.wall),
             cpu: cpu_time().saturating_sub(self.cpu),
             allocs: ALLOC_COUNT.load(Ordering::Relaxed),
             alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
             rss_delta: max_rss_bytes().saturating_sub(self.rss),
+            proxy_cpu: proxy_cpu_since(self.proxy.as_ref()),
         }
     }
 }
@@ -197,6 +331,8 @@ struct Totals {
     allocs: u64,
     alloc_bytes: u64,
     rss_delta: u64,
+    /// The proxy threads' share of `cpu`, where it could be read.
+    proxy_cpu: Option<Duration>,
 }
 
 /// One repetition's raw counts, from which every reported metric is derived.
@@ -204,6 +340,7 @@ struct Totals {
 struct Rep {
     wall_s: f64,
     cpu_s: f64,
+    proxy_cpu_s: Option<f64>,
     allocs: f64,
     alloc_bytes: f64,
     rss_delta: f64,
@@ -221,6 +358,7 @@ impl Rep {
         Self {
             wall_s: totals.wall.as_secs_f64(),
             cpu_s: totals.cpu.as_secs_f64(),
+            proxy_cpu_s: totals.proxy_cpu.map(|cpu| cpu.as_secs_f64()),
             allocs: totals.allocs as f64,
             alloc_bytes: totals.alloc_bytes as f64,
             rss_delta: totals.rss_delta as f64,
@@ -264,8 +402,65 @@ fn report(name: &str, kind: Kind, reps: &[Rep]) {
     }
 }
 
-fn line(kind: Kind, rep: &Rep) -> String {
+/// A CPU time in seconds as the per-unit figure `kind` reports: seconds per GB,
+/// microseconds per packet or microseconds per cycle.
+fn per_unit(kind: Kind, cpu_s: f64, units: f64) -> f64 {
     match kind {
+        Kind::Bytes => cpu_s / (units / 1e9),
+        Kind::Packets | Kind::Cycles => cpu_s * 1e6 / units,
+    }
+}
+
+/// The proxy-only per-unit figure, given its value: rendered with the same
+/// precision as the whole-process figure next to it, and with a unit that no
+/// pattern for the whole-process unit matches.
+fn proxy_per_unit(kind: Kind, value: f64) -> String {
+    match kind {
+        Kind::Bytes => format!("{value:.2} proxy-cpu-s/GB"),
+        Kind::Packets => format!("{value:.2} proxy-cpu-us/pkt"),
+        Kind::Cycles => format!("{value:.0} proxy-cpu-us/cycle"),
+    }
+}
+
+/// The proxy-only fields at the end of one repetition's line.
+fn proxy_fields(kind: Kind, rep: &Rep) -> String {
+    match rep.proxy_cpu_s {
+        Some(proxy) => format!(
+            ", proxy cpu {proxy:.3} s, {}, proxy {:.1}% of cpu",
+            proxy_per_unit(kind, per_unit(kind, proxy, rep.units)),
+            100.0 * proxy / rep.cpu_s,
+        ),
+        None => ", proxy cpu n/a".to_owned(),
+    }
+}
+
+/// The proxy-only fields at the end of a median line, or `n/a` unless every
+/// repetition has them.
+fn proxy_medians(kind: Kind, reps: &[Rep]) -> String {
+    let Some(proxy) = reps
+        .iter()
+        .map(|r| r.proxy_cpu_s.map(|proxy| (r, proxy)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return ", proxy cpu n/a".to_owned();
+    };
+    format!(
+        ", {}, proxy {:.1}% of cpu",
+        proxy_per_unit(
+            kind,
+            median(
+                proxy
+                    .iter()
+                    .map(|(r, p)| per_unit(kind, *p, r.units))
+                    .collect()
+            ),
+        ),
+        median(proxy.iter().map(|(r, p)| 100.0 * p / r.cpu_s).collect()),
+    )
+}
+
+fn line(kind: Kind, rep: &Rep) -> String {
+    let whole = match kind {
         Kind::Bytes => format!(
             "{:.1} MiB in {:.3} s -> {:.1} MB/s, cpu {:.3} s ({:.1}% of wall), {:.2} cpu-s/GB, \
              {:.0} allocs/MiB, {:.2} alloc-KiB/MiB",
@@ -303,7 +498,8 @@ fn line(kind: Kind, rep: &Rep) -> String {
             rep.alloc_bytes / 1024.0 / rep.units,
             rep.rss_delta / (1024.0 * 1024.0),
         ),
-    }
+    };
+    whole + &proxy_fields(kind, rep)
 }
 
 /// The median of each metric taken independently.
@@ -315,7 +511,7 @@ fn line(kind: Kind, rep: &Rep) -> String {
 fn medians(kind: Kind, reps: &[Rep]) -> String {
     let pick = |f: fn(&Rep) -> f64| median(reps.iter().map(f).collect());
 
-    match kind {
+    let whole = match kind {
         Kind::Bytes => format!(
             "{:.1} MB/s, {:.2} cpu-s/GB, {:.0} allocs/MiB",
             pick(|r| r.units / 1e6 / r.wall_s),
@@ -336,7 +532,8 @@ fn medians(kind: Kind, reps: &[Rep]) -> String {
             pick(|r| r.cpu_s * 1e6 / r.units),
             pick(|r| r.allocs / r.units),
         ),
-    }
+    };
+    whole + &proxy_medians(kind, reps)
 }
 
 // ---------------------------------------------------------------------------
@@ -386,9 +583,22 @@ fn header() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         println!(
-            "bench header: client, proxy and target share this process; every cpu figure is the \
-             sum of all three."
+            "bench header: client, proxy and target share this process; cpu, cpu-s/GB, \
+             cpu-us/pkt and cpu-us/cycle are the sum of all three."
         );
+        if cfg!(target_os = "linux") {
+            println!(
+                "bench header: the proxy runs on its own runtime, threads named {PROXY_THREAD}; \
+                 proxy cpu and the proxy-cpu figures are those threads' user plus system time \
+                 from /proc/self/task/<tid>/schedstat, client and target excluded."
+            );
+        } else {
+            println!(
+                "bench header: the proxy runs on its own runtime, threads named {PROXY_THREAD}; \
+                 proxy cpu is n/a on {}, which has no per-thread reading here.",
+                std::env::consts::OS
+            );
+        }
         // The platform caveat is the one line a captured log is read against
         // later, so it must describe the host it ran on rather than the host
         // it was written on.
@@ -549,7 +759,7 @@ const UNMETERED: &str = "[security]\nallow_private_networks = true\nunanswered_p
 // ---------------------------------------------------------------------------
 
 async fn tcp_download(total: usize) -> Rep {
-    let server = TestServer::start().await;
+    let server = start_proxy(ALLOW_PRIVATE);
     let target = spawn_tcp_source(total).await;
     let mut client = H3Client::connect(&server).await;
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
@@ -573,7 +783,7 @@ async fn tcp_download(total: usize) -> Rep {
 }
 
 async fn tcp_upload(total: usize) -> Rep {
-    let server = TestServer::start().await;
+    let server = start_proxy(ALLOW_PRIVATE);
     let (target, mut done) = spawn_tcp_sink().await;
     let mut client = H3Client::connect(&server).await;
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
@@ -628,7 +838,7 @@ const IN_FLIGHT: usize = 256;
 const UPLINK_IN_FLIGHT: usize = 48;
 
 async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
-    let server = TestServer::start_with(UNMETERED).await;
+    let server = start_proxy(UNMETERED);
     let permits = Arc::new(Semaphore::new(UPLINK_IN_FLIGHT));
     let (target, delivered) = spawn_udp_sink(permits.clone()).await;
     let mut client = H3Client::connect(&server).await;
@@ -713,7 +923,7 @@ async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
 const BURST: usize = 64;
 
 async fn udp_downlink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
-    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let server = start_proxy(ALLOW_PRIVATE);
     let (target, target_sent) = spawn_udp_burst_target(size, BURST).await;
     let mut client = H3Client::connect(&server).await;
     let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
@@ -806,10 +1016,9 @@ async fn udp_downlink(size: usize, count: u64, budget: Option<Duration>) -> Rep 
 // ---------------------------------------------------------------------------
 
 async fn tcp_churn(count: u64) -> Rep {
-    let server = TestServer::start_with(&format!(
+    let server = start_proxy(&format!(
         "[limits]\nmax_targets_per_conn = 64\n{ALLOW_PRIVATE}"
-    ))
-    .await;
+    ));
     let target = common::spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
     let authority = target.to_string();
@@ -828,10 +1037,9 @@ async fn tcp_churn(count: u64) -> Rep {
 }
 
 async fn udp_churn(count: u64) -> Rep {
-    let server = TestServer::start_with(&format!(
+    let server = start_proxy(&format!(
         "[limits]\nmax_targets_per_conn = 64\n{ALLOW_PRIVATE}"
-    ))
-    .await;
+    ));
     let target = common::spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -847,11 +1055,10 @@ async fn udp_churn(count: u64) -> Rep {
 
 /// Opens `count` tunnels on one connection, then closes them all.
 async fn concurrent_tunnels(count: usize) -> (Rep, Rep) {
-    let server = TestServer::start_with(&format!(
+    let server = start_proxy(&format!(
         "[limits]\nmax_targets_per_conn = {}\n{ALLOW_PRIVATE}",
         count + 8
-    ))
-    .await;
+    ));
     let target = common::spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
     let authority = target.to_string();
