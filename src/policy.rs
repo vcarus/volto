@@ -758,22 +758,31 @@ mod tests {
         })
     }
 
-    /// The text that documents `allow_private_networks`, in both places.
+    /// The heading in `docs/configuration.md` above the table of refused ranges.
+    const RANGES_HEADING: &str = "### Ranges refused unless `allow_private_networks` is on";
+
+    /// The text that lists the refused ranges, in both places.
     ///
-    /// In `docs/configuration.md` that is the key's row of the `[security]`
-    /// table. In `script/config.example.toml` it is the comment block between
-    /// `[security]` and the commented key.
+    /// In `docs/configuration.md` that is the section under [`RANGES_HEADING`],
+    /// up to the next heading. In `script/config.example.toml` it is the comment
+    /// block between `[security]` and the commented key.
     fn private_networks_documentation() -> [(&'static str, String); 2] {
         let page = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/docs/configuration.md"
         ))
         .expect("docs/configuration.md must exist");
-        let row = page
+        let section: Vec<&str> = page
             .lines()
-            .find(|line| line.starts_with("| `allow_private_networks` |"))
-            .expect("docs/configuration.md documents allow_private_networks in a table row")
-            .to_owned();
+            .skip_while(|line| !line.starts_with(RANGES_HEADING))
+            .skip(1)
+            .take_while(|line| !line.starts_with('#'))
+            .collect();
+        assert!(
+            section.iter().any(|line| line.starts_with("| `")),
+            "docs/configuration.md lists the refused ranges in a table under {RANGES_HEADING:?}"
+        );
+        let section = section.join("\n");
 
         let example = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -791,7 +800,7 @@ mod tests {
         );
 
         [
-            ("docs/configuration.md", row),
+            ("docs/configuration.md", section),
             ("script/config.example.toml", block.join("\n")),
         ]
     }

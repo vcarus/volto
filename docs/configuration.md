@@ -383,7 +383,7 @@ family, an IP literal above all, is unaffected by any of the three.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `allow_private_networks` | bool | `false` | Allow tunnels to the special-purpose address space listed in the IANA registries that RFC 6890 set up: "this host on this network" (`0.0.0.0/8`), loopback (`127.0.0.0/8` and `::1`), RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16`) and ULA (`fc00::/7`), link-local (`169.254.0.0/16` and `fe80::/10`), the deprecated site-local `fec0::/10`, shared address space (`100.64.0.0/10`), IETF protocol assignments in both families (`192.0.0.0/24`, its PCP and TURN anycast addresses `192.0.0.9` and `192.0.0.10` included, and the whole of `2001::/23`, which holds the IPv6 anycast service addresses `2001:1::1` to `2001:1::3`, AMT `2001:3::/32`, AS112 `2001:4:112::/48`, benchmarking `2001:2::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28` and the DETs prefix `2001:30::/28`; Teredo `2001::/32` inside it is judged by the IPv4 address it carries, as described below), AMT relay discovery (`192.52.193.0/24`), the AS112 DNS anycast prefixes (`192.31.196.0/24`, `192.175.48.0/24` and `2620:4f:8000::/48`), benchmarking (`198.18.0.0/15`), the documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32` and `3fff::/20`), 6to4 relay anycast (`192.88.99.0/24`), reserved (`240.0.0.0/4`), the discard-only prefix `100::/64` and the dummy prefix `100:0:0:1::/64`, the SRv6 SID block (`5f00::/16`), the local-use NAT64 prefix `64:ff9b:1::/48`, and the deprecated IPv4-compatible `::/96` (stacks that still honour it route `::127.0.0.1` to loopback, which would otherwise be a second way around the IPv4 rules). Keep it off on a public deployment |
+| `allow_private_networks` | bool | `false` | Allow tunnels to the special-purpose address space listed in the IANA registries that RFC 6890 set up: loopback, RFC 1918, link-local, shared address space, the IETF protocol assignment blocks and the rest of the table under [Ranges refused unless `allow_private_networks` is on](#ranges-refused-unless-allow_private_networks-is-on). Keep it off on a public deployment |
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
@@ -461,6 +461,33 @@ family, an IP literal above all, is unaffected by any of the three.
   because two is all that accepting both field names asks for. N is therefore a
   number of guesses whatever shape they arrive in. Pair it with fail2ban for
   actual banning — see [deployment.md](deployment.md#fail2ban).
+
+### Ranges refused unless `allow_private_networks` is on
+
+Each range is refused with a 403 while `allow_private_networks` is `false`. An IPv6 transition address (IPv4-mapped, the well-known NAT64 prefix, 6to4, Teredo) is first replaced by the IPv4 address it carries and then judged by these rows.
+
+| Range | What it is | Source | Note |
+|---|---|---|---|
+| `0.0.0.0/8` | "This host on this network" | RFC 1122 |  |
+| `127.0.0.0/8`, `::1` | Loopback | RFC 1122, RFC 4291 |  |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Private use | RFC 1918 |  |
+| `fc00::/7` | Unique local (ULA) | RFC 4193 |  |
+| `169.254.0.0/16`, `fe80::/10` | Link-local | RFC 3927, RFC 4291 | `169.254.169.254` is the cloud metadata address |
+| `fec0::/10` | Site-local, deprecated | RFC 3879 |  |
+| `100.64.0.0/10` | Shared address space | RFC 6598 | The inside of a carrier-grade NAT |
+| `192.0.0.0/24` | IETF protocol assignments | RFC 6890 | The PCP and TURN anycast addresses `192.0.0.9` and `192.0.0.10` included |
+| `2001::/23` | IETF protocol assignments | RFC 2928 | Refused whole. It holds the anycast service addresses `2001:1::1` to `2001:1::3`, benchmarking `2001:2::/48`, AMT `2001:3::/32`, AS112 `2001:4:112::/48`, ORCHID `2001:10::/28`, ORCHIDv2 `2001:20::/28` and the DETs prefix `2001:30::/28`. Teredo `2001::/32` inside it is judged by the IPv4 address it carries, as described above |
+| `192.52.193.0/24` | AMT relay discovery | RFC 7450 |  |
+| `192.31.196.0/24`, `192.175.48.0/24`, `2620:4f:8000::/48` | AS112 DNS anycast | RFC 7535, RFC 7534 |  |
+| `198.18.0.0/15` | Benchmarking | RFC 2544 |  |
+| `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `2001:db8::/32`, `3fff::/20` | Documentation | RFC 5737, RFC 3849, RFC 9637 |  |
+| `192.88.99.0/24` | 6to4 relay anycast, deprecated | RFC 7526 |  |
+| `240.0.0.0/4` | Reserved | RFC 1112 |  |
+| `100::/64` | Discard-only | RFC 6666 |  |
+| `100:0:0:1::/64` | Dummy IPv6 prefix | RFC 9780 |  |
+| `5f00::/16` | SRv6 SIDs | RFC 9602 |  |
+| `64:ff9b:1::/48` | Local-use NAT64 | RFC 8215 | Refused whole, because the position of the embedded IPv4 address is the operator's choice |
+| `::/96` | IPv4-compatible, deprecated | RFC 4291 | Stacks that still honour it route `::127.0.0.1` to loopback, which would otherwise be a second way around the IPv4 rules |
 
 ### The SNI gate
 
