@@ -130,7 +130,7 @@ impl Shutdown {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use super::*;
@@ -230,5 +230,44 @@ mod tests {
     #[test]
     fn the_blocking_grace_cannot_overflow() {
         assert!(blocking_grace(Duration::MAX) >= Duration::MAX - EXIT_SLACK);
+    }
+
+    /// The whole-number value `script/masque.service` sets for `directive`.
+    pub(crate) fn shipped_unit_value(directive: &str) -> u64 {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/script/masque.service"
+        ))
+        .expect("script/masque.service must exist");
+        let prefix = format!("{directive}=");
+        let value = text
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .unwrap_or_else(|| panic!("script/masque.service sets no {directive}"));
+        value.trim().parse().unwrap_or_else(|_| {
+            panic!("script/masque.service sets {directive}={value}, which is not a whole number")
+        })
+    }
+
+    /// The shipped unit lets the longest exit finish before systemd sends
+    /// SIGKILL.
+    ///
+    /// At the default grace, the exit is the drain (`shutdown_grace`), the close
+    /// flush (`CLOSE_FLUSH_TIMEOUT`) and then [`blocking_grace`] for a lookup
+    /// still running on the blocking pool. `TimeoutStopSec` has to be above that
+    /// sum, not above the grace alone.
+    #[test]
+    fn the_shipped_unit_waits_out_the_longest_exit() {
+        let grace = Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_GRACE);
+        let exit = grace + crate::quic::CLOSE_FLUSH_TIMEOUT + blocking_grace(grace);
+        let timeout = shipped_unit_value("TimeoutStopSec");
+        assert!(
+            Duration::from_secs(timeout) > exit,
+            "script/masque.service sets TimeoutStopSec={timeout}, which is not above \
+             the {}s the exit may take at the default shutdown_grace of {}s \
+             (2 * shutdown_grace + 2 * CLOSE_FLUSH_TIMEOUT + EXIT_SLACK)",
+            exit.as_secs(),
+            grace.as_secs()
+        );
     }
 }

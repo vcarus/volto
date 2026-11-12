@@ -307,6 +307,27 @@ mod tests {
         );
     }
 
+    /// The shipped unit's `LimitNOFILE` passes the startup check at the default
+    /// limits.
+    #[test]
+    fn the_shipped_unit_leaves_room_for_the_default_fd_budget() {
+        let limit = crate::shutdown::tests::shipped_unit_value("LimitNOFILE");
+        let defaults = crate::config::Limits::default();
+        assert!(
+            !fd_budget_is_tight(
+                limit,
+                defaults.max_connections,
+                defaults.max_targets_per_conn
+            ),
+            "script/masque.service sets LimitNOFILE={limit}, below the {} descriptors \
+             the startup check computes for the default max_connections ({}) x \
+             max_targets_per_conn ({}) + FD_HEADROOM ({FD_HEADROOM})",
+            fd_budget(defaults.max_connections, defaults.max_targets_per_conn),
+            defaults.max_connections,
+            defaults.max_targets_per_conn
+        );
+    }
+
     /// `max_connections = 0` is "no cap", which has no product to check, so the
     /// budget falls back to one connection's quota rather than to zero.
     #[test]
