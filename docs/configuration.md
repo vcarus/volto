@@ -162,8 +162,8 @@ when idle. A reload that raises `max_connections` takes effect for new
 connections but does not resize the pool, which needs a restart.
 
 **`max_streams_bidi`, `max_idle_timeout`, `keep_alive_interval`, `initial_mtu`,
-`mtu_discovery`, `congestion_control` and `initial_rtt_ms` are QUIC transport
-settings and apply to new connections only.** A reload carries them to
+`mtu_discovery`, `mtu_upper_bound`, `congestion_control` and `initial_rtt_ms`
+are QUIC transport settings and apply to new connections only.** A reload carries them to
 connections accepted from then on; connections already open keep what they
 negotiated at handshake time, because QUIC cannot renegotiate transport
 parameters. `ip_family_preference` is not a transport parameter, but it is

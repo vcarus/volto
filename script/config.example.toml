@@ -28,7 +28,8 @@ key = "/etc/volto/privkey.pem"
 # Short by default: a client that keeps using a connection after GOAWAY (Surge
 # does) has its new requests fail for the whole drain, so this is also how long
 # each restart looks broken from the client. Raise it if in-flight transfers
-# matter more. Keep systemd's TimeoutStopSec above this value.
+# matter more. The exit can take up to 2 * shutdown_grace + 3 seconds, so keep
+# systemd's TimeoutStopSec above that bound, not above this value alone.
 # Range: 0..3600, where 0 closes every tunnel at once.
 # Default: 5
 #shutdown_grace = 5
@@ -66,8 +67,10 @@ users = [
 
 # Simultaneously open QUIC connections; 0 removes the limit.
 #
-# Beyond this, new connections are refused during the handshake -- before any
-# per-connection state exists on this side. The default is sized against the rest
+# At the limit a new connection whose address QUIC has validated takes the slot
+# of the oldest connection that has never authenticated; an unvalidated one is
+# answered with a Retry, and when no connection can be evicted the newcomer is
+# refused before any per-connection state exists on this side. The default is sized against the rest
 # of the budget: what volto checks at startup is 256 connections x 256 tunnels plus
 # 64 descriptors of headroom = 65600, and the shipped systemd unit grants
 # LimitNOFILE=131072. Raising either limit past that means raising LimitNOFILE too.
@@ -118,7 +121,7 @@ users = [
 #ip_family_preference = "ipv4"
 
 # --- QUIC transport parameters ----------------------------------------------
-# All seven apply to connections accepted from now on. A reload (SIGHUP) carries
+# Every key in this section applies to connections accepted from now on. A reload (SIGHUP) carries
 # them to new connections; connections already open keep what they negotiated at
 # handshake time, because QUIC cannot renegotiate transport parameters.
 

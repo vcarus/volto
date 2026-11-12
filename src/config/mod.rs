@@ -500,8 +500,10 @@ pub struct Limits {
     pub max_targets_per_conn: u32,
     /// Simultaneously open QUIC connections. Zero means no limit.
     ///
-    /// Beyond this, new connections are refused at the QUIC layer, before a
-    /// handshake completes and before any per-connection state is built.
+    /// At the limit a newcomer whose address is validated evicts the oldest
+    /// connection that has never authenticated, an unvalidated one is answered
+    /// with a Retry, and when nothing can be evicted the newcomer is refused at
+    /// the QUIC layer, before any per-connection state is built (D80).
     pub max_connections: u32,
     /// Seconds allowed for reaching a target. Zero disables the budget.
     ///
