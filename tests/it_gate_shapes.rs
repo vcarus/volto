@@ -212,6 +212,8 @@ struct Shape {
     number_length: usize,
     /// How long the Initial packet itself is, before anything coalesced.
     packet_length: usize,
+    /// The packet number, below 256 so that it fits the last byte of the field.
+    number: u8,
 }
 
 impl Default for Shape {
@@ -223,6 +225,7 @@ impl Default for Shape {
             token: Vec::new(),
             number_length: 1,
             packet_length: MIN_INITIAL_DATAGRAM,
+            number: 0,
         }
     }
 }
@@ -264,14 +267,17 @@ fn shaped_initial(
         .expect("a length that fits two bytes");
     packet.extend_from_slice(&(0x4000 | length).to_be_bytes());
 
-    packet.resize(number_offset + shape.number_length, 0); // packet number 0
+    packet.resize(number_offset + shape.number_length, 0);
+    *packet.last_mut().expect("a packet number field") = shape.number;
     packet.extend_from_slice(frames);
     packet.resize(number_offset + shape.number_length + payload_len, 0); // PADDING
     packet.resize(shape.packet_length, 0); // room for the tag
 
-    keys.packet
-        .remote
-        .encrypt(0, &mut packet, number_offset + shape.number_length);
+    keys.packet.remote.encrypt(
+        u64::from(shape.number),
+        &mut packet,
+        number_offset + shape.number_length,
+    );
     keys.header.remote.encrypt(number_offset, &mut packet);
     packet
 }
@@ -816,6 +822,165 @@ fn a_packet_coalesced_behind_the_initial_is_not_what_is_judged() {
     }
 }
 
+/// The length of the ClientHello a Surge beta sent on 2026-11-13, once it
+/// offered an ML-KEM key share (D101 addendum of that day).
+const LARGE_HELLO: usize = 1468;
+
+/// The length of each Initial packet that client sent.
+const LARGE_FLIGHT_PACKET: usize = 1350;
+
+/// Where the CRYPTO stream of a large first flight is cut.
+///
+/// Modelled on that capture and not copied from it: small pieces across the
+/// start of the message, a few large ones, and small ones again near the end,
+/// about thirty in all.
+const LARGE_FLIGHT_CUTS: [usize; 31] = [
+    16, 32, 48, 56, 60, 64, 65, 67, 71, 78, 81, 82, 83, 84, 85, 92, 236, 381, 671, 961, 1251, 1278,
+    1306, 1333, 1361, 1388, 1395, 1402, 1416, 1430, 1444,
+];
+
+/// The stream offset at which the second packet of a large first flight begins.
+const SECOND_PACKET_FROM: usize = 961;
+
+/// A ClientHello naming `host`, `length` bytes long.
+///
+/// The length is made up by a `key_share` extension (51) of filler behind the
+/// `server_name`, which is where the size of a real one comes from.
+fn hello_of_length(host: &str, length: usize) -> Vec<u8> {
+    let with_share = |share: usize| {
+        let mut extensions = sni_extension(host);
+        extensions.extend_from_slice(&extension(51, &vec![0x5a; share]));
+        client_hello(&extensions)
+    };
+    let share = length
+        .checked_sub(with_share(0).len())
+        .expect("a length that holds the name");
+    let hello = with_share(share);
+    assert_eq!(hello.len(), length);
+    hello
+}
+
+/// The pieces of `hello` between consecutive `cuts`, as (offset, bytes).
+fn fragments<'a>(hello: &'a [u8], cuts: &[usize]) -> Vec<(usize, &'a [u8])> {
+    let mut bounds = vec![0];
+    bounds.extend(cuts.iter().copied().filter(|cut| *cut < hello.len()));
+    bounds.push(hello.len());
+    bounds
+        .windows(2)
+        .map(|pair| (pair[0], &hello[pair[0]..pair[1]]))
+        .collect()
+}
+
+/// CRYPTO frames for `pieces` in a fixed order that is not offset order, with
+/// a PING after every third and PADDING after every fifth.
+fn shuffled_frames(pieces: &[(usize, &[u8])]) -> Vec<u8> {
+    let mut order: Vec<usize> = (0..pieces.len()).collect();
+    order.sort_by_key(|index| (index * 11 + 5) % pieces.len().max(1));
+
+    let mut frames = Vec::new();
+    for (written, index) in order.into_iter().enumerate() {
+        let (offset, bytes) = pieces[index];
+        frames.extend_from_slice(&crypto_frame_at(offset, bytes));
+        if written % 3 == 2 {
+            frames.push(0x01);
+        }
+        if written % 5 == 4 {
+            frames.extend_from_slice(&[0x00; 2]);
+        }
+    }
+    frames
+}
+
+/// The two Initial packets of a first flight too large for one, naming `host`.
+///
+/// `held_back` is a range of stream offsets whose pieces travel in the second
+/// packet although they belong before [`SECOND_PACKET_FROM`]. An empty range
+/// leaves the first packet with one contiguous run from offset 0.
+fn large_first_flight(
+    crypto: &dyn quinn::crypto::ServerConfig,
+    host: &str,
+    held_back: std::ops::Range<usize>,
+) -> (Vec<u8>, Vec<u8>) {
+    let hello = hello_of_length(host, LARGE_HELLO);
+    let (first, second): (Vec<_>, Vec<_>) = fragments(&hello, &LARGE_FLIGHT_CUTS)
+        .into_iter()
+        .partition(|(offset, _)| *offset < SECOND_PACKET_FROM && !held_back.contains(offset));
+
+    let packet = |number: u8, pieces: &[(usize, &[u8])]| {
+        let shape = Shape {
+            packet_length: LARGE_FLIGHT_PACKET,
+            number,
+            ..Shape::default()
+        };
+        shaped_initial(crypto, &shape, &shuffled_frames(pieces))
+    };
+    (packet(0, &first), packet(1, &second))
+}
+
+/// A first flight that needs two Initial packets is passed whatever it names.
+///
+/// This is the shape every handshake of a Surge beta has had since it offered
+/// an ML-KEM key share: a ClientHello of 1468 bytes in two Initial packets of
+/// 1350, the CRYPTO stream cut into about thirty pieces and sent out of order
+/// with PING and PADDING between them. The gate keeps no state between
+/// datagrams, so it never holds the whole message, and a message that is not
+/// whole is not judged. The name is in the first packet in every case below
+/// and is still not judged. The TLS layer refuses the unlisted name
+/// (`it_sni_gate`).
+#[test]
+fn a_first_flight_over_two_packets_is_passed_whatever_it_names() {
+    let crypto = nameless_crypto();
+    let names = Names::new(&[LISTED.to_owned()]);
+
+    for host in [LISTED, UNLISTED] {
+        // Both packets in one datagram: only the first is read.
+        let (first, second) = large_first_flight(&*crypto, host, 0..0);
+        let mut coalesced = first.clone();
+        coalesced.extend_from_slice(&second);
+        assert_eq!(coalesced.len(), 2 * LARGE_FLIGHT_PACKET);
+
+        // The stretch at offsets 64 to 85 sent in the second packet, so the
+        // first has a hole in its stream.
+        let (holed, filling) = large_first_flight(&*crypto, host, 64..86);
+
+        for (shape, datagram) in [
+            ("two packets in one datagram", &coalesced),
+            ("the first packet by itself", &first),
+            ("the second packet by itself", &second),
+            ("a first packet with a hole in its stream", &holed),
+            ("the packet that fills the hole", &filling),
+        ] {
+            assert_eq!(
+                judgement(datagram, &names),
+                Verdict::Pass,
+                "{shape}, naming {host}"
+            );
+        }
+    }
+}
+
+/// The same cuts and the same order on a ClientHello that fits one packet.
+///
+/// The control for the test above: with the whole message in the packet, about
+/// twenty out-of-order pieces are joined and the name decides. So the passes
+/// above come from the message being unfinished and not from a frame walk that
+/// gave up.
+#[test]
+fn a_whole_client_hello_in_many_shuffled_pieces_is_judged_by_its_name() {
+    let crypto = nameless_crypto();
+    let shape = Shape {
+        packet_length: LARGE_FLIGHT_PACKET,
+        ..Shape::default()
+    };
+
+    judged_by_its_name_alone("one packet, many shuffled CRYPTO frames", |name| {
+        let hello = hello_of_length(name, 1200);
+        let pieces = fragments(&hello, &LARGE_FLIGHT_CUTS);
+        assert!(pieces.len() >= 20, "enough pieces to be the shape");
+        shaped_initial(&*crypto, &shape, &shuffled_frames(&pieces))
+    });
+}
+
 /// How the ClientHello itself is spelled, which is where a real stack's
 /// idiosyncrasies live: Chrome's 32-byte session id, the GREASE values RFC
 /// 8701 has clients scatter through it, and where in the extension list
@@ -1101,6 +1266,33 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
             shaped_initial(&*crypto, &later, &ack),
             Verdict::Pass,
         ),
+        (
+            "a-first-flight-over-two-packets",
+            {
+                let (mut first, second) = large_first_flight(&*crypto, "localhost", 0..0);
+                first.extend_from_slice(&second);
+                first
+            },
+            Verdict::Pass,
+        ),
+        (
+            "a-first-flight-over-two-packets-for-another-name",
+            large_first_flight(&*crypto, "other.example", 64..86).0,
+            Verdict::Pass,
+        ),
+        (
+            "many-shuffled-pieces-of-a-name-we-do-not",
+            {
+                let hello = hello_of_length("other.example", 1200);
+                let shape = Shape {
+                    packet_length: LARGE_FLIGHT_PACKET,
+                    ..Shape::default()
+                };
+                let pieces = fragments(&hello, &LARGE_FLIGHT_CUTS);
+                shaped_initial(&*crypto, &shape, &shuffled_frames(&pieces))
+            },
+            Verdict::Refuse(Refusal::OtherName(b"other.example".to_vec())),
+        ),
     ];
 
     let crypto_bytes = [
@@ -1112,6 +1304,11 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
         (
             "crypto-a-client-hello-cut-short",
             cut,
+            FirstFlight::Truncated,
+        ),
+        (
+            "crypto-the-first-packet-of-a-large-client-hello",
+            hello_of_length("localhost", LARGE_HELLO)[..SECOND_PACKET_FROM].to_vec(),
             FirstFlight::Truncated,
         ),
     ];
