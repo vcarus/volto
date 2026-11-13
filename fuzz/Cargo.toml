@@ -19,7 +19,7 @@ edition = "2024"
 # nightly. The `msrv` job in ci.yml builds the root crate and not this one, so
 # this is the resolver knob it is written as; `tests/it_release_assets.rs`
 # holds the value equal to the root's `rust-version`.
-rust-version = "1.95"
+rust-version = "1.100"
 
 [package.metadata]
 cargo-fuzz = true

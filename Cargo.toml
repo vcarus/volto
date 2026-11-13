@@ -2,7 +2,7 @@
 name = "volto"
 version = "1.3.7"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.100"
 description = "MASQUE proxy server (HTTP/3 CONNECT + CONNECT-UDP)"
 repository = "https://github.com/vcarus/volto"
 documentation = "https://vcarus.github.io/volto/"
@@ -301,3 +301,10 @@ unsafe_code = "deny"
 # stated fallback where the narrowing is real, and a per-site allow only where
 # the value is already proven in range by the code above it.
 as_conversions = "deny"
+
+# Cargo's own lints, read by cargo 1.100 and newer, which the MSRV guarantees.
+# `unused_dependencies` reports a `[dependencies]` entry that no target of the
+# package uses. A warning rather than an error, because cargo judges it for the
+# target being built and `mimalloc` is declared for musl alone.
+[lints.cargo]
+unused_dependencies = "warn"
