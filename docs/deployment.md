@@ -393,18 +393,23 @@ not expecting it: when the newly installed binary is not running a few seconds
 later, the previous binary and the previous unit are both restored, which on a
 rollback is the release you were trying to leave.
 
-**`--tag` is not a pin.** The script carries no version pin of its own; it
-converges on whatever the newest *published* release is, in either direction. So
-a rollback left alone is undone by the next timer tick, within a day. Hold it
+**`--tag` is not a pin.** The script carries no version pin of its own; a run
+without `--tag` moves the host forward to the newest *published* release. So a
+rollback left alone is undone by the next timer tick, within a day. Hold it
 with
 
 ```sh
 sudo systemctl disable --now volto-deploy.timer
 ```
 
-or, if the release itself is the problem for every host, delete it from the
-releases page — that rolls every host back on its own next tick and needs no
-per-host action at all.
+**A run without `--tag` never goes back.** When the release marked latest is
+older than the installed one, the run refuses and fails, and the timer's unit
+shows it. "Latest" is a mark on the release page that can be moved to any older
+release, and an older release still carries a valid signature, so without the
+refusal a host could be walked back to a release with a known defect. Deleting a
+bad release from the releases page therefore rolls no host back: it stops hosts
+that have not yet taken it from taking it, and each host that has is rolled back
+by hand with `--tag`.
 
 ## systemd
 

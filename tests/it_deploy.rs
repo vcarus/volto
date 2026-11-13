@@ -1442,6 +1442,83 @@ fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
     );
 }
 
+/// Runs the script's `refuse_automatic_downgrade` with its own
+/// `is_older_version`, for a run that did or did not look the release up.
+fn automatic_downgrade(resolved: bool, release: &str, installed: &str) -> Output {
+    let is_older_version = shell_function_body("script/deploy.sh", "is_older_version");
+    let prelude = format!(
+        "{is_older_version}\n}}\nTAG_WAS_RESOLVED={}\nTAG=v{release}\nVERSION={release}\nINSTALLED={installed}",
+        u8::from(resolved)
+    );
+    run_shell_function(
+        "script/deploy.sh",
+        "refuse_automatic_downgrade",
+        &scratch_tree("deploy", "downgrade-stubs", &[]),
+        &prelude,
+    )
+}
+
+/// The timer installs the release marked latest, and that mark can be moved to
+/// an older release, which still carries a valid signature. A run that was not
+/// told which release to install therefore never goes back; one that was told,
+/// with `--tag`, does.
+#[test]
+fn a_run_that_looked_up_the_latest_release_never_goes_back() {
+    let output = automatic_downgrade(true, "1.4.0", "1.4.1");
+    assert!(
+        !output.status.success(),
+        "an older latest release must be refused"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("refusing to go back") && stderr.contains("--tag v1.4.0"),
+        "the refusal must say how a rollback is done: {stderr}"
+    );
+
+    for (resolved, release, installed, what) in [
+        (true, "1.4.1", "1.4.0", "an upgrade"),
+        (true, "1.4.0", "1.4.0", "the same version"),
+        (true, "1.4.0", "", "a first install"),
+        (false, "1.4.0", "1.4.1", "a rollback named with --tag"),
+    ] {
+        let output = automatic_downgrade(resolved, release, installed);
+        assert!(
+            output.status.success(),
+            "{what} must not be refused: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+/// The refusal sits where the release has just been resolved and nothing has
+/// been downloaded, and the only assignment that arms it is the lookup of the
+/// latest release.
+#[test]
+fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alone() {
+    let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
+
+    let call = text
+        .find("\nrefuse_automatic_downgrade\n")
+        .expect("the script must call refuse_automatic_downgrade at top level");
+    let download = text
+        .find("--- download and verify ---")
+        .expect("the download section");
+    assert!(call < download, "the refusal must come before the download");
+
+    let armed: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| *line == "TAG_WAS_RESOLVED=1")
+        .collect();
+    assert_eq!(armed.len(), 1, "one place arms the refusal");
+    let lookup = text.find("releases/latest").expect("the latest lookup");
+    let arm = text.find("TAG_WAS_RESOLVED=1").expect("the arming line");
+    assert!(
+        lookup < arm && arm < call,
+        "the refusal is armed right after the latest release is looked up"
+    );
+}
+
 /// `--verify-signature` is a mode of its own. An empty file name once fell
 /// through to an ordinary run, which exited 0 having verified nothing.
 #[test]

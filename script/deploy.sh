@@ -113,6 +113,10 @@ FIRST_SIGNED_VERSION=1.4.0
 VERIFY_ONLY=0
 VERIFY_SUMS=""
 VERIFY_SIG=""
+# Set when no release was named and the latest one was looked up, which is what
+# the timer does. Such a run never installs a release older than the one that
+# is installed.
+TAG_WAS_RESOLVED=0
 # Set once the release being installed has had its signature verified. Only
 # then does this script replace its installed copy from the release.
 RELEASE_IS_SIGNED=0
@@ -141,7 +145,9 @@ that flag is not checked, only warned about.
 
 Options:
   -t, --tag vX.Y.Z     deploy this release instead of the latest one (this is
-                       also how you roll back)
+                       also how you roll back). Without it the latest release
+                       is installed, unless it is older than the installed
+                       one, which is refused
       --enable-timer   install and start a systemd timer that re-runs this
                        script daily, keeping the host on the newest release
       --dry-run        print the decision this run would act on and stop;
@@ -287,6 +293,22 @@ verify_release() {
     [ "${actual:0:64}" = "$expected" ] ||
         die "checksum mismatch for $NAME.tar.gz -- refusing to install it"
     note "checksum verified against SHA256SUMS"
+}
+
+# Ends the run when it was not told which release to install and the latest one
+# is older than the one installed.
+#
+# "Latest" is a mark on the release page, and whoever controls that page can
+# move it to an older release. Every older release from 1.4.0 on carries a valid
+# signature, so the signature does not stop this: without the refusal a host
+# could be walked back to a release with a known defect. Going back is a
+# decision made at the host, with --tag. The run fails rather than passing
+# quietly, so the timer's unit shows that the release page and the host
+# disagree.
+refuse_automatic_downgrade() {
+    [ "$TAG_WAS_RESOLVED" -eq 1 ] || return 0
+    is_older_version "$VERSION" "$INSTALLED" || return 0
+    die "the latest release is $TAG and this host runs $INSTALLED -- refusing to go back without being told to (a rollback is: $0 --tag $TAG)"
 }
 
 # True when version $1 is strictly older than version $2, comparing the dotted
@@ -457,6 +479,7 @@ else
         -w '%{url_effective}' "https://github.com/$REPO/releases/latest")" ||
         die "could not reach github.com to resolve the latest release"
     TAG="${location##*/}"
+    TAG_WAS_RESOLVED=1
     case "$TAG" in
         v[0-9]*) ;;
         *) die "$REPO has no release yet (the latest-release redirect went to $location)" ;;
@@ -472,6 +495,8 @@ INSTALLED=""
 if [ -x "$BIN" ]; then
     INSTALLED="$("$BIN" --version 2>/dev/null | awk '{print $2}')" || INSTALLED=""
 fi
+
+refuse_automatic_downgrade
 
 # A downgrade is the incident-response path, and it is the one path nobody
 # rehearses. Two of its hazards are invisible from the outside until they bite,
