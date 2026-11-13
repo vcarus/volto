@@ -19,8 +19,10 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Deployments queue rather than cancel: Pages serves whichever finished last,
-# and cancelling one midway would leave a stale site behind a newer commit.
+# A running deployment is never cancelled: Pages serves whichever finished
+# last, and cancelling one midway would leave a stale site behind a newer
+# commit. GitHub keeps one pending run per group, so a newer push replaces a
+# run that is still waiting, and the newest commit is always the one deployed.
 # A pull request gets a group of its own, so it never waits behind a
 # deployment, and a new push to it supersedes its running check.
 concurrency:
