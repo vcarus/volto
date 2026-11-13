@@ -58,10 +58,10 @@ pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
 
 /// Connection close code used when a peer exhausts its authentication attempts.
 ///
-/// A QUIC application error code rather than an HTTP/3 one, because it closes the
-/// whole connection rather than a stream. `H3_REQUEST_REJECTED`'s value is reused
-/// so the peer sees something meaningful in the CONNECTION_CLOSE frame.
-pub const AUTH_FAILURE_LIMIT_CODE: quinn::VarInt = quinn::VarInt::from_u32(0x10b);
+/// It closes the whole connection rather than a stream. The code is
+/// `H3_REQUEST_REJECTED` (0x10b), which is our own choice for this close, so
+/// the peer reads a registered HTTP/3 code in the CONNECTION_CLOSE frame.
+pub const AUTH_FAILURE_LIMIT_CODE: Code = Code::H3_REQUEST_REJECTED;
 
 /// The reset code the peer used, if this error is a peer-initiated reset.
 pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
@@ -191,10 +191,10 @@ mod tests {
         );
     }
 
-    /// The close code is a number the peer reads, so it is pinned rather than
-    /// left to whatever `quinn::VarInt::from_u32` was handed.
+    /// The close code is a number the peer reads, so its value on the wire is
+    /// pinned here rather than left to the name it is defined by.
     #[test]
     fn the_auth_failure_close_code_is_the_one_documented() {
-        assert_eq!(AUTH_FAILURE_LIMIT_CODE.into_inner(), 0x10b);
+        assert_eq!(AUTH_FAILURE_LIMIT_CODE.value(), 0x10b);
     }
 }

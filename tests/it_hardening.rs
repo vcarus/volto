@@ -395,7 +395,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     // budget rather than the D76 bound, and the two close with different codes.
     assert_closed_with(
         &client.quic,
-        volto::h3api::AUTH_FAILURE_LIMIT_CODE.into_inner(),
+        volto::h3api::AUTH_FAILURE_LIMIT_CODE.value(),
         TIMEOUT,
     )
     .await;

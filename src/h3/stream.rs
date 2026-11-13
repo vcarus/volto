@@ -715,12 +715,12 @@ impl Stream {
     /// Closes the whole connection with `code` and `reason`, for a reason of
     /// this server's own rather than a protocol violation by the peer.
     ///
-    /// The same CONNECTION_CLOSE as `quinn::Connection::close` with these
-    /// arguments, except that the close is also recorded as the connection's
+    /// The same CONNECTION_CLOSE as `quinn::Connection::close` with this code
+    /// and reason, except that the close is also recorded as the connection's
     /// reason. The connection's error then names this close, even if another
     /// task finds a violation afterwards in stream data buffered before it.
-    pub fn close_connection(&self, code: quinn::VarInt, reason: &'static str) {
-        let _ = self.handle.close_for(Code::new(code.into_inner()), reason);
+    pub fn close_connection(&self, code: Code, reason: &'static str) {
+        let _ = self.handle.close_for(code, reason);
     }
 
     /// Sends a response with `fields` and no body.
