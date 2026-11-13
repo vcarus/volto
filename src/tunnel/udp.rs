@@ -1078,7 +1078,7 @@ impl DatagramPath {
             if graded != Graded::Clear {
                 // Dropped before it is cut off the block, so its bytes go to
                 // the next packet.
-                self.report_oversize(graded, encoded_len);
+                self.report_oversize(ctx, graded, encoded_len);
                 return;
             }
 
@@ -1144,7 +1144,7 @@ impl DatagramPath {
             // block, which only this case does to a packet that is not sent.
             Err(quinn::SendDatagramError::TooLarge) => {
                 self.refresh_limit(ctx);
-                self.report_oversize(occurrence(&self.oversize_drops), encoded_len);
+                self.report_oversize(ctx, occurrence(&self.oversize_drops), encoded_len);
             }
             Err(error) => debug!(%error, "failed to send a QUIC datagram"),
         }
@@ -1162,14 +1162,22 @@ impl DatagramPath {
     /// loudly as `graded` says.
     ///
     /// A drop logged only at `debug!` is invisible in production, and the
-    /// condition is not hypothetical: Surge advertises
-    /// `max_datagram_frame_size = 1300`, which a large EDNS0 or DNSSEC answer
-    /// and any QUIC-in-QUIC flow through the tunnel exceed routinely. So the
+    /// condition is not hypothetical: a large EDNS0 or DNSSEC answer and any
+    /// QUIC-in-QUIC flow through the tunnel exceed the limit routinely. So the
     /// drops the schedule picks are raised to `info!`, one line naming the
-    /// length, the limit and how many drops there have been. The rest stay at
-    /// `debug!`, because these arrive per packet and a flood of one benign
-    /// message hides the warnings that matter.
-    fn report_oversize(&self, graded: Graded, encoded_len: usize) {
+    /// length, the limit, the path MTU and how many drops there have been. The
+    /// rest stay at `debug!`, because these arrive per packet and a flood of
+    /// one benign message hides the warnings that matter.
+    ///
+    /// The MTU is on the line because the limit is the smaller of two things:
+    /// what the peer's `max_datagram_frame_size` allows and what one packet at
+    /// the current path MTU holds. A Surge that advertises 1300 gives a limit
+    /// of 1291 at any MTU we use, and one that advertises 1500 gives 1398 at an
+    /// MTU of 1436 and 1204 at 1242 (D48 addendum 2026-11-13). Without the MTU
+    /// a low limit cannot be told from a path that shrank (D81). It is read
+    /// from the connection statistics on a reported drop only, never per
+    /// packet.
+    fn report_oversize(&self, ctx: &Context, graded: Graded, encoded_len: usize) {
         let limit = self.limit;
         match graded {
             Graded::Clear => {}
@@ -1178,6 +1186,7 @@ impl DatagramPath {
                 quarter_stream_id = self.quarter_stream_id,
                 encoded_len,
                 limit,
+                mtu = ctx.quic.stats().path.current_mtu,
                 drops,
                 "target packet too large for a QUIC datagram, dropping; further \
                  drops on this session are logged at debug level until the count \
@@ -2301,8 +2310,8 @@ mod tests {
         assert!(!is_per_packet_error(&std::io::Error::other("synthetic")));
     }
 
-    /// What Surge advertises as `max_datagram_frame_size`, and therefore the
-    /// limit the oversize path actually meets in production.
+    /// What Surge advertised as `max_datagram_frame_size` until a 2026-11 beta
+    /// raised it to 1500, and still the limit an older client gives.
     const SURGE_MAX_DATAGRAM_FRAME_SIZE: usize = 1300;
 
     /// An `info!` on the doubling schedule, and the running total in it.

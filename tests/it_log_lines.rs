@@ -443,10 +443,9 @@ const ACCOUNTED: &[Accounted] = &[
         message: "target packet too large for a QUIC datagram, dropping; further drops on this \
                   session are logged at debug level until the count doubles",
         bound: Bound::Sampled,
-        reason: "Surge advertises `max_datagram_frame_size = 1300`, which a large \
-                 DNS answer clears routinely, so these arrive per packet; the \
-                 session's `oversize_drops` sampler picks the 1st, 2nd, 4th and so \
-                 on.",
+        reason: "A large DNS answer or a QUIC-in-QUIC flow clears the datagram \
+                 limit routinely, so these arrive per packet; the session's \
+                 `oversize_drops` sampler picks the 1st, 2nd, 4th and so on.",
     },
     Accounted {
         id: "xc3zqhh7",

@@ -185,8 +185,8 @@ async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuf
             // been happening, which is the half the unsampled version never
             // told anybody.
             assert!(
-                line.contains("encoded_len=") && line.contains("limit="),
-                "the sentinel must carry the encoded length and the datagram limit: {line}"
+                line.contains("encoded_len=") && line.contains("limit=") && line.contains(" mtu="),
+                "the sentinel must carry the encoded length, the datagram limit and the path MTU: {line}"
             );
         } else {
             // A drop between reports goes to DEBUG, which a `volto=info`
