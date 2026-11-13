@@ -802,20 +802,20 @@ impl Server {
                 // that is left here is to stop. Graded with the idle endings
                 // rather than as an error, because nothing about this
                 // connection failed.
-                () = evicted.notified() => Ok("evicted"),
+                () = evicted.notified() => Ok(CloseReason::Evicted),
 
                 handled = conn::handle(quic, config, shutdown, &resolver, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
                     match handled {
                         // The accept loop ended on its own terms: the peer said it would
                         // send no further requests, or the GOAWAY drain completed.
-                        Ok(()) => Ok("drained"),
+                        Ok(()) => Ok(CloseReason::Drained),
                         Err(error) => match h3api::benign_close(&error) {
                             // Surge abandons connections without a CONNECTION_CLOSE
                             // (network switch, app exit), so letting one idle out is the
                             // everyday goodbye, not a failure.
-                            Some(h3api::BenignClose::Idle) => Ok("idle"),
+                            Some(h3api::BenignClose::Idle) => Ok(CloseReason::Idle),
                             // A peer that closed cleanly is equally routine.
-                            Some(h3api::BenignClose::PeerClosed) => Ok("peer_close"),
+                            Some(h3api::BenignClose::PeerClosed) => Ok(CloseReason::PeerClosed),
                             None => Err(error),
                         },
                     },
@@ -905,6 +905,35 @@ impl Server {
     }
 }
 
+/// Why a connection ended without an error, as the closing line reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReason {
+    /// A newcomer took this connection's slot on a full roster.
+    Evicted,
+    /// The accept loop ended on its own terms. The peer said it would send no
+    /// further requests, or the GOAWAY drain completed.
+    Drained,
+    /// The peer went silent and the idle timeout expired.
+    Idle,
+    /// The peer closed the connection cleanly, without an error code.
+    PeerClosed,
+}
+
+impl CloseReason {
+    /// The value of the `reason` field on log line `8ro19wv6`.
+    ///
+    /// Tests and operations scripts match these strings, so each one stays
+    /// exactly as it is.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Evicted => "evicted",
+            Self::Drained => "drained",
+            Self::Idle => "idle",
+            Self::PeerClosed => "peer_close",
+        }
+    }
+}
+
 /// The line one connection ends on: INFO with the reason it stopped, WARN with
 /// the error that stopped it.
 ///
@@ -961,7 +990,7 @@ impl Server {
 fn log_connection_closed(
     remote: SocketAddr,
     quic: &quinn::Connection,
-    closed: Result<&'static str, h3api::ConnectionError>,
+    closed: Result<CloseReason, h3api::ConnectionError>,
     tunnels: u64,
     dropped_datagrams: u64,
 ) {
@@ -977,7 +1006,7 @@ fn log_connection_closed(
                 log_id = "8ro19wv6",
                 remote = %remote,
                 remote_now = %quic.remote_address(),
-                reason,
+                reason = reason.as_str(),
                 rtt_ms = quic.rtt().as_millis(),
                 mtu = path.current_mtu,
                 mtu_black_holes = path.black_holes_detected,
