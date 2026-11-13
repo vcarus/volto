@@ -378,11 +378,13 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         decoder: CapsuleDecoder::new(),
         // Zero is the operator's way of switching the mitigation off, so it means
         // "uncapped" rather than "nothing may be sent".
-        unanswered_budget: match ctx.unanswered_packet_budget {
-            0 => None,
-            budget => Some(budget),
+        amplification: match ctx.unanswered_packet_budget {
+            0 => Amplification::Uncounted,
+            budget => Amplification::Unanswered {
+                remaining: budget,
+                charged: 0,
+            },
         },
-        charged_unanswered: 0,
         datagrams: ctx
             .quic
             .max_datagram_size()
@@ -394,6 +396,23 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     session.run().await;
 
     debug!(stream_id, quarter_stream_id, "udp session closed");
+}
+
+/// Where a UDP session stands against the RFC 9298 §7 amplification limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Amplification {
+    /// Packets towards the target are not counted. The operator set
+    /// `security.unanswered_packet_budget` to 0, or the target has answered.
+    Uncounted,
+    /// The target has not answered yet, so each packet towards it is counted.
+    Unanswered {
+        /// Packets this session may still send before the target answers.
+        remaining: u32,
+        /// Packets this session has charged to the connection's total so far.
+        /// [`Context::refund_unanswered`] returns them when the target first
+        /// answers, so an answered session has cost the connection nothing.
+        charged: u32,
+    },
 }
 
 /// A running UDP session.
@@ -413,24 +432,21 @@ struct Session<'a> {
     writer: Writer,
     /// The request stream body is a capsule sequence (RFC 9297 §3.2).
     decoder: CapsuleDecoder,
-    /// Packets still allowed towards a target that has never answered.
+    /// Whether packets towards the target are still counted, and how many.
     ///
     /// RFC 9298 §7: until the target says something, this session might be an
     /// attempt to use the proxy as a reflector or a port scanner, so what it can
-    /// emit is capped. `None` means uncapped: either the target has answered,
-    /// which lifts the cap for good because the target has consented to the
-    /// conversation, or the operator disabled the mitigation.
+    /// emit is capped. [`Amplification::Uncounted`] means uncapped: either the
+    /// target has answered, which lifts the cap for good because the target has
+    /// consented to the conversation, or the operator disabled the mitigation.
     ///
     /// This half is per session and is recreated by opening one, so it bounds a
     /// conversation and not a client. The connection's own total
     /// ([`Context::unanswered_connection_budget`]) is what a new session does
-    /// not restore; it is charged from here, and repaid only by this session's
-    /// own target answering (`charged_unanswered` below).
-    unanswered_budget: Option<u32>,
-    /// What this session has charged the connection's total so far, returned
-    /// by [`Context::refund_unanswered`] when the target first answers and
-    /// zero from then on: an answered session has cost the connection nothing.
-    charged_unanswered: u32,
+    /// not restore. It is charged from here, and repaid only by this session's
+    /// own target answering, through the `charged` count of
+    /// [`Amplification::Unanswered`].
+    amplification: Amplification,
     /// The QUIC datagram half of the target -> client direction, or `None`
     /// when the peer's transport parameters leave no QUIC datagram path.
     ///
@@ -794,7 +810,7 @@ impl Session<'_> {
         // RFC 9298 §7. The packet is dropped rather than the session closed: a
         // legitimate flow whose target is merely slow to answer must be able to
         // recover once a reply arrives, and UDP loss is not an error condition.
-        if let Some(remaining) = self.unanswered_budget.as_mut() {
+        if let Amplification::Unanswered { remaining, charged } = &mut self.amplification {
             if *remaining == 0 {
                 debug!(
                     quarter_stream_id = self.quarter_stream_id,
@@ -831,7 +847,7 @@ impl Session<'_> {
             }
 
             *remaining -= 1;
-            self.charged_unanswered += 1;
+            *charged += 1;
         }
 
         match self.socket.send(&payload).await {
@@ -864,11 +880,13 @@ impl Session<'_> {
         // target: the conversation is two-way and the amplification cap is done.
         // A target that is answering is also the other direction of progress,
         // whatever becomes of this particular packet below.
-        self.unanswered_budget = None;
         // And it was not a silent target, so what this session spent of the
         // connection's total on the way to its first answer goes back, once.
-        let charged = std::mem::take(&mut self.charged_unanswered);
-        self.ctx.refund_unanswered(charged);
+        if let Amplification::Unanswered { charged, .. } =
+            std::mem::replace(&mut self.amplification, Amplification::Uncounted)
+        {
+            self.ctx.refund_unanswered(charged);
+        }
         self.touch();
 
         // Both halves of the datagram path have to be there, and they are

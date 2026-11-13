@@ -433,13 +433,13 @@ pub struct Context {
     ///
     /// **A session whose target answers repays what that session spent**, and
     /// nothing else does (D84, the 2026-09-05 addendum). The repayment is that
-    /// session's own `charged_unanswered` count and it is capped at the total
-    /// the connection was created with, so no sequence of sessions can lift the
-    /// counter above where it started. A client cannot keep one consenting
-    /// target on the side to buy back, packet for packet, the allowance it
-    /// spends on a silent one: the refund is per session, so a silent session's
-    /// spend stays spent, and the bound on packets to targets that never answer
-    /// holds.
+    /// session's own `charged` count, kept while its target has not answered,
+    /// and it is capped at the total the connection was created with, so no
+    /// sequence of sessions can lift the counter above where it started. A
+    /// client cannot keep one consenting target on the side to buy back, packet
+    /// for packet, the allowance it spends on a silent one: the refund is per
+    /// session, so a silent session's spend stays spent, and the bound on
+    /// packets to targets that never answer holds.
     ///
     /// A connection that spends the total with nothing outstanding to repay it
     /// keeps it spent for its own life, and a client that wants another
