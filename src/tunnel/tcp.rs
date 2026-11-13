@@ -954,13 +954,10 @@ fn ensure_window(buf: &mut BytesMut) {
 /// mirror path never sent a FIN, sits in ESTABLISHED or CLOSE_WAIT, and resets
 /// on every stack.
 ///
-/// `set_linger` is deprecated in tokio because `SO_LINGER` can make a close block
-/// the thread while the send buffer drains. That is the *non-zero* timeout; at
-/// zero the close is by definition immediate, which is exactly why this is the
-/// one safe use of it.
+/// `set_zero_linger` is `SO_LINGER` with a zero timeout. A close under it never
+/// waits for the send buffer to drain, so it cannot block the thread.
 fn abort_target(tcp: &TcpStream) {
-    #[allow(deprecated)]
-    if let Err(error) = tcp.set_linger(Some(Duration::ZERO)) {
+    if let Err(error) = tcp.set_zero_linger() {
         // The connection still closes, just with a FIN: a SHOULD unmet, not a
         // tunnel broken.
         debug!(%error, "failed to arm a TCP reset on the target socket");

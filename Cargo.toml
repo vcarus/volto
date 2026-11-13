@@ -59,7 +59,9 @@ rustls = { version = "0.23", default-features = false, features = [
 # >= 1.9); `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134) and was only a
 # wrapper around the same code.
 
-tokio = { version = "1", features = [
+# 1.50 is the first release with `TcpStream::set_zero_linger`, which
+# `tunnel::tcp` uses to reset a target connection.
+tokio = { version = "1.50", features = [
     "rt-multi-thread",
     "net",
     "io-util",
@@ -95,17 +97,15 @@ anyhow = "1"
 #
 # `net` is the sockopt module and `process` is getrlimit/setrlimit; `std` is
 # rustix's own default and is spelled out because the default set is off.
+#
+# It also supplies the errno values `tunnel` matches on (`rustix::io::Errno`) to
+# tell a per-target failure from a process-wide one, so `src/` names `libc`
+# nowhere.
 rustix = { version = "1", default-features = false, features = [
     "net",
     "process",
     "std",
 ] }
-
-# Errno constants only -- `EMFILE`, `ENOBUFS` and their neighbours, which
-# `tunnel` matches on to tell a per-target failure from a process-wide one.
-# There are no `libc` calls left in `src/`; the one remaining call in the tree is
-# `getrusage` in `tests/it_bench.rs`, which rustix does not wrap.
-libc = "0.2"
 
 # SO_RCVBUF/SO_SNDBUF on the endpoint's UDP socket (D56). Already in the tree via
 # quinn-udp, so this is a direct dependency on a crate that was being compiled
@@ -227,7 +227,10 @@ rcgen = { version = "0.14", default-features = false, features = [
 # the clock for. So the paused-clock tests are unit tests over this crate's own
 # timers, and the on-wire deadlines stay pinned by the real-time integration
 # tests that already cover them (`it_hostile`, `it_handshake`, `it_tcp`).
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.50", features = ["test-util"] }
+# `getrusage` in `tests/it_bench.rs`, the one raw libc call in the tree: rustix
+# does not wrap it.
+libc = "0.2"
 # Property tests over the parsers that read untrusted bytes, and the CI-side
 # half of a two-part arrangement: `cargo fuzz` needs a nightly toolchain, and
 # the dev host has stable Rust only, so coverage-guided fuzzing lives in the

@@ -1362,11 +1362,8 @@ pub async fn spawn_reset_after_read_target() -> SocketAddr {
                 if socket.read(&mut buf).await.is_err() {
                     return;
                 }
-                // Deprecated because SO_LINGER can block the thread on drop
-                // while the send buffer drains. Nothing is ever written to this
-                // socket, so the buffer is empty and the close cannot block.
-                #[allow(deprecated)]
-                let _ = socket.set_linger(Some(Duration::ZERO));
+                // A zero linger turns the close into a reset.
+                let _ = socket.set_zero_linger();
                 drop(socket);
             });
         }
@@ -1415,11 +1412,8 @@ pub async fn spawn_flood_then_reset_target(flood: usize) -> SocketAddr {
                 })
                 .await;
 
-                // Deprecated because a non-zero linger can block the thread on
-                // drop; at zero the close is immediate by definition, which is
-                // what turns it into a reset.
-                #[allow(deprecated)]
-                let _ = socket.set_linger(Some(Duration::ZERO));
+                // A zero linger turns the close into a reset.
+                let _ = socket.set_zero_linger();
                 drop(socket);
             });
         }

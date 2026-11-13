@@ -162,7 +162,7 @@ impl FdClamp {
             .expect_err("the clamp must make a new socket impossible");
         assert_eq!(
             error.raw_os_error(),
-            Some(libc::EMFILE),
+            Some(rustix::io::Errno::MFILE.raw_os_error()),
             "the clamp produced {error} rather than EMFILE"
         );
 
