@@ -327,6 +327,23 @@ fn the_release_workflow_attests_its_tarballs_and_leaves_a_draft() {
             .any(|line| line.starts_with("- uses: actions/attest-build-provenance@")),
         "release.yml no longer attests the provenance of the tarballs"
     );
+
+    // `draft: true` has to belong to the step that creates the release, which
+    // is the last step of the file.
+    let release_step = code
+        .iter()
+        .position(|line| line.starts_with("- uses: softprops/action-gh-release@"))
+        .expect("release.yml creates the release with softprops/action-gh-release");
+    assert!(
+        code[release_step..].contains(&"draft: true"),
+        "the step that creates the release no longer leaves a draft"
+    );
+    assert!(
+        !code[release_step + 1..]
+            .iter()
+            .any(|line| line.starts_with("- ")),
+        "a step now follows the one that creates the release; check that it cannot publish"
+    );
 }
 
 /// And it is only evidence at all if editing release.yml runs it.

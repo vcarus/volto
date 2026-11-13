@@ -113,7 +113,10 @@ sudo script/install-selfsigned.sh --binary ./volto
 
 `--verify-signature` checks that `SHA256SUMS.sig` is the release key's
 signature over `SHA256SUMS` and does nothing else; it needs `ssh-keygen` and
-neither root nor the network. The checksum then ties the archive to that signed
+neither root nor the network. Releases before 1.4.0 carry no `SHA256SUMS.sig`,
+so for them only the checksum line applies. The copy of `deploy.sh` fetched
+here comes from the repository, so this check trusts the repository for the
+key; a host that already runs volto has the key in its installed script. The checksum then ties the archive to that signed
 list. See [the release signature](#the-release-signature) for what the key is.
 
 `--ignore-missing` is what lets that check pass at all: `SHA256SUMS` lists the
@@ -270,16 +273,24 @@ the repository or of the release page is therefore not enough to produce a
 release that a host installs.
 
 A release whose signature is missing or wrong is refused, and the running
-service is left alone. The daily timer has no way around that. Releases from
-before signing have no `SHA256SUMS.sig`; `--allow-unsigned` installs one, and
-needs `--tag`, so it applies to one named release:
+service is left alone. The daily timer has no way around that. The script reads
+`SHA256SUMS` itself and does not hand it to `sha256sum --check`: every line must
+be exactly a digest, two spaces and an archive name, and exactly one line must
+name the archive being installed.
+
+Releases before 1.4.0 have no `SHA256SUMS.sig`. `--allow-unsigned` installs one
+of them, and needs `--tag`, so it applies to one named release:
 
 ```sh
 sudo volto-deploy --tag v1.3.7 --allow-unsigned
 ```
 
-A signature that is present and does not verify is refused with or without the
-flag.
+The flag is refused for 1.4.0 and every later release, so removing a signature
+from the release page does not make a signed release installable. A signature
+that is present and does not verify is refused with or without the flag. After
+such an install the copy at `/usr/local/sbin/volto-deploy` is left as it was:
+the script a release from before signing carries verifies nothing, and
+installing it would end the check for every later release.
 
 What the signature does not cover is the first run. The one-line bootstrap
 pipes `deploy.sh` from the repository, so on a bare host the key is whatever
@@ -348,6 +359,9 @@ Rolling back is the same flow pinned to an older release:
 ```sh
 sudo volto-deploy --tag v0.1.0
 ```
+
+A release before 1.4.0 is not signed and needs `--allow-unsigned` beside
+`--tag` (see [the release signature](#the-release-signature)).
 
 Add `--force` when the host already reports the version being pinned to. The
 convergence check compares version strings, so without it that run is a no-op

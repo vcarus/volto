@@ -3,7 +3,7 @@
 # Deploy or update volto from a GitHub release.
 #
 # One script for both days. On a host with no existing install it downloads the
-# newest release, verifies it against SHA256SUMS and hands the bundled binary to
+# newest release, verifies its signature and checksum and hands the bundled binary to
 # install-selfsigned.sh, which does the full first-time setup. On a host that
 # already runs volto it swaps the binary, refreshes the systemd unit and
 # restarts the service -- after keeping the previous binary, so a release that
@@ -33,10 +33,14 @@
 # Releases older than the signature exist and stay reachable: --allow-unsigned
 # installs one whose SHA256SUMS.sig is absent, and needs --tag, so it is a
 # decision somebody makes for one named release and never what the timer does.
-# A signature that is present and wrong is refused either way.
+# It applies to releases before FIRST_SIGNED_VERSION and to no later one. A
+# signature that is present and wrong is refused either way. The installed copy
+# of this script is never replaced from an unsigned release, because the copy
+# such a release carries verifies nothing.
 #
 # Rolling back by hand is the same flow pinned to an older release:
-#   sudo volto-deploy --tag v0.1.0
+#   sudo volto-deploy --tag v1.4.0
+#   sudo volto-deploy --tag v1.3.7 --allow-unsigned   # from before signing
 #
 # Before the binary is swapped, the one that is about to replace it is asked
 # whether it can even read this host's /etc/volto/config.toml -- `volto
@@ -100,9 +104,18 @@ RELEASE_SIGNER='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIChpIMVExa8wenp/vVCQr8t/7Vt2
 # The sshsig namespace, which keeps a signature made for anything else (a git
 # commit, a login) from being presented as a release signature.
 SIGN_NAMESPACE=volto-release
+# The first release whose SHA256SUMS is signed. --allow-unsigned applies to the
+# releases before it and to no other, so a release that should carry a
+# signature cannot be installed without one by removing the signature and
+# naming the flag.
+FIRST_SIGNED_VERSION=1.4.0
 # Set by --verify-signature: the two files to check, instead of deploying.
+VERIFY_ONLY=0
 VERIFY_SUMS=""
 VERIFY_SIG=""
+# Set once the release being installed has had its signature verified. Only
+# then does this script replace its installed copy from the release.
+RELEASE_IS_SIGNED=0
 INSTALL_ARGS=()
 
 usage() {
@@ -138,9 +151,10 @@ Options:
                        guard, and rewrites neither the config nor the
                        certificate
       --allow-unsigned install a release that carries no SHA256SUMS.sig, which
-                       is every release from before releases were signed;
-                       needs --tag, and a signature that is present must
-                       still be valid
+                       is every release from before releases were signed and
+                       no later one; needs --tag, and a signature that is
+                       present must still be valid. The installed copy of
+                       this script is not replaced from such a release
       --verify-signature SUMS SIG
                        check that SIG is the release key's signature over the
                        file SUMS, then stop; needs neither root nor network
@@ -227,6 +241,54 @@ signature_is_valid() {
     return "$status"
 }
 
+# Verifies the downloaded release in $TMP: the signature over SHA256SUMS, then
+# the archive $NAME.tar.gz against the one line of that list that names it.
+# Ends the run on any failure. Sets RELEASE_IS_SIGNED when a signature was
+# verified.
+#
+# The signature comes first, because it is what makes the list worth reading.
+# SHA256SUMS.sig is in $TMP when its download succeeded. A download that failed
+# is treated as a signature that is absent: telling the two apart would mean
+# trusting an HTTP status, and both end the same way.
+#
+# The list is then read by this function and not by `sha256sum --check`. That
+# tool's idea of a valid line differs between implementations: GNU accepts a
+# line that starts with a backslash or a space, and another implementation
+# skips the same line and reports success. A list that one tool checked when it
+# was signed and another tool reads here could then name an archive nobody
+# checked. So every line must be exactly 64 lowercase hex digits, two spaces and
+# an archive name, exactly one line must name this archive, and the digest is
+# compared as text.
+verify_release() {
+    local line expected actual
+
+    if [ -f "$TMP/SHA256SUMS.sig" ]; then
+        signature_is_valid "$RELEASE_SIGNER" "$TMP/SHA256SUMS" "$TMP/SHA256SUMS.sig" ||
+            die "SHA256SUMS in $TAG is not signed by the release key -- refusing to install it"
+        RELEASE_IS_SIGNED=1
+        note "SHA256SUMS is signed by the release key"
+    elif [ "$ALLOW_UNSIGNED" -eq 1 ]; then
+        note "$TAG carries no SHA256SUMS.sig; continuing because --allow-unsigned was given"
+    else
+        die "$TAG carries no SHA256SUMS.sig -- refusing to install an unsigned release"
+    fi
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[0-9a-f]{64}\ \ volto-[0-9A-Za-z._-]+\.tar\.gz$ ]] ||
+            die "SHA256SUMS in $TAG has a line that is not a checksum and an archive name -- refusing to install it"
+    done <"$TMP/SHA256SUMS"
+
+    expected="$(awk -v file="$NAME.tar.gz" 'substr($0, 67) == file { print substr($0, 1, 64) }' "$TMP/SHA256SUMS")"
+    [ -n "$expected" ] || die "SHA256SUMS in $TAG does not list $NAME.tar.gz"
+    [ "${#expected}" -eq 64 ] ||
+        die "SHA256SUMS in $TAG lists $NAME.tar.gz more than once -- refusing to install it"
+
+    actual="$(sha256sum <"$TMP/$NAME.tar.gz")"
+    [ "${actual:0:64}" = "$expected" ] ||
+        die "checksum mismatch for $NAME.tar.gz -- refusing to install it"
+    note "checksum verified against SHA256SUMS"
+}
+
 # True when version $1 is strictly older than version $2, comparing the dotted
 # numeric fields left to right.
 #
@@ -264,8 +326,8 @@ is_older_version() {
 # operator was trying to leave.
 #
 # The candidate is run rather than inspected, which costs no trust that was not
-# already spent: its checksum has been verified against the release's
-# SHA256SUMS by the time we get here, and the next thing that happens to it
+# already spent: the release's signature and the archive's checksum have been
+# verified by the time we get here, and the next thing that happens to it
 # either way is being installed and started as root.
 #
 # Whether the candidate can be asked at all is settled by looking for the flag
@@ -322,7 +384,7 @@ while [ $# -gt 0 ]; do
         --allow-unsigned) ALLOW_UNSIGNED=1; shift ;;
         --verify-signature)
                         [ $# -ge 3 ] || die "$1 needs two values: SUMS and SIG"
-                        VERIFY_SUMS="$2"; VERIFY_SIG="$3"; shift 3 ;;
+                        VERIFY_ONLY=1; VERIFY_SUMS="$2"; VERIFY_SIG="$3"; shift 3 ;;
         -s|--sni|-p|--port|-u|--username|-w|--password)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
@@ -350,7 +412,7 @@ fi
 # replaces the key here and nowhere else: the install path below reads
 # RELEASE_SIGNER and no variable, so the environment cannot change which key a
 # host trusts.
-if [ -n "$VERIFY_SUMS" ]; then
+if [ "$VERIFY_ONLY" -eq 1 ]; then
     command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
     [ -f "$VERIFY_SUMS" ] || die "no such file: $VERIFY_SUMS"
     [ -f "$VERIFY_SIG" ] || die "no such file: $VERIFY_SIG"
@@ -401,6 +463,10 @@ else
     esac
 fi
 VERSION="${TAG#v}"
+
+if [ "$ALLOW_UNSIGNED" -eq 1 ] && ! is_older_version "$VERSION" "$FIRST_SIGNED_VERSION"; then
+    die "--allow-unsigned applies to releases before $FIRST_SIGNED_VERSION; $TAG must carry a signature"
+fi
 
 INSTALLED=""
 if [ -x "$BIN" ]; then
@@ -485,33 +551,26 @@ else
         -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
         die "download failed: $BASE/SHA256SUMS"
 
-    # The signature comes first, because it is what makes SHA256SUMS worth
-    # reading: the checksum below only says the tarball is the one that list
-    # names. A download that fails is treated as a signature that is absent.
-    # Telling the two apart would mean trusting an HTTP status, and both end
-    # the same way: nothing is installed unless --allow-unsigned named this
-    # release.
-    if curl -fsSL --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
-        -o "$TMP/SHA256SUMS.sig" "$BASE/SHA256SUMS.sig"; then
-        signature_is_valid "$RELEASE_SIGNER" "$TMP/SHA256SUMS" "$TMP/SHA256SUMS.sig" ||
-            die "SHA256SUMS in $TAG is not signed by the release key -- refusing to install it"
-        note "SHA256SUMS is signed by the release key"
-    elif [ "$ALLOW_UNSIGNED" -eq 1 ]; then
-        note "$TAG carries no SHA256SUMS.sig; continuing because --allow-unsigned was given"
-    else
-        die "$TAG carries no SHA256SUMS.sig -- refusing to install an unsigned release (a release from before signing needs --tag and --allow-unsigned)"
-    fi
+    # A failed download leaves no file, and verify_release reads that as a
+    # release without a signature.
+    curl -fsSL --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
+        -o "$TMP/SHA256SUMS.sig" "$BASE/SHA256SUMS.sig" ||
+        rm -f "$TMP/SHA256SUMS.sig"
 
-    grep -F "  $NAME.tar.gz" "$TMP/SHA256SUMS" >"$TMP/expected" ||
-        die "SHA256SUMS in $TAG does not list $NAME.tar.gz"
-    (cd "$TMP" && sha256sum --check --status expected) ||
-        die "checksum mismatch for $NAME.tar.gz -- refusing to install it"
-    note "checksum verified against SHA256SUMS"
+    verify_release
 
     tar -xzf "$TMP/$NAME.tar.gz" -C "$TMP"
     SRC="$TMP/$NAME"
     [ -x "$SRC/volto" ] || die "the archive did not contain a volto binary"
-    [ ! -f "$SRC/script/deploy.sh" ] || SELF_SOURCE="$SRC/script/deploy.sh"
+    # The installed copy of this script is replaced only from a release whose
+    # signature was verified. A release from before signing carries a script
+    # that verifies nothing, and installing that one would end the check for
+    # every later release.
+    if [ "$RELEASE_IS_SIGNED" -eq 1 ] && [ -f "$SRC/script/deploy.sh" ]; then
+        SELF_SOURCE="$SRC/script/deploy.sh"
+    elif [ "$RELEASE_IS_SIGNED" -eq 0 ]; then
+        note "keeping this script as it is: $TAG is not signed, so its copy is not installed"
+    fi
 
     # --- install -------------------------------------------------------------
 

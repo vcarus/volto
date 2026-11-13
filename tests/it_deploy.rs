@@ -1068,17 +1068,291 @@ fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
     );
 }
 
-/// The environment can replace the key for `--verify-signature` and for
-/// nothing else. The install path names `RELEASE_SIGNER` itself, so no variable
-/// decides which key a host trusts.
+/// A release directory as the download step leaves it, with the key that signs
+/// it, for [`verify_release`].
+struct Download {
+    dir: PathBuf,
+    /// The public key the function under test is told to trust.
+    trusted: String,
+}
+
+const ARCHIVE: &str = "volto-9.9.9-x86_64-unknown-linux-musl";
+
+fn sha256_hex(path: &Path) -> String {
+    let output = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .expect("shasum must be runnable");
+    stdout_of(&output)
+        .split_whitespace()
+        .next()
+        .expect("a digest")
+        .to_owned()
+}
+
+/// Lays out an archive and a key pair. `sums` receives the archive's real
+/// digest and returns the text of `SHA256SUMS`; `signer` names the key that
+/// signs it, or `None` for a release without a signature.
+fn download(name: &str, sums: impl Fn(&str) -> String, signer: Option<&str>) -> Download {
+    let dir = scratch_tree("deploy", name, &["stubs"]);
+    let trusted = generate_key(&dir, "trusted");
+    generate_key(&dir, "stranger");
+
+    let archive = dir.join(format!("{ARCHIVE}.tar.gz"));
+    fs::write(&archive, b"the bytes of a release archive\n").unwrap();
+    let list = dir.join("SHA256SUMS");
+    fs::write(&list, sums(&sha256_hex(&archive))).unwrap();
+    if let Some(signer) = signer {
+        sign(&dir, signer, SIGN_NAMESPACE, &list);
+    }
+
+    // The script asks for `sha256sum`, which a macOS host does not always have.
+    write_executable(
+        &dir.join("stubs/sha256sum"),
+        "#!/bin/sh\nexec shasum -a 256 \"$@\"\n",
+    );
+    Download { dir, trusted }
+}
+
+/// Runs the script's own `verify_release` over a [`Download`], with the
+/// script's own `signature_is_valid` beside it. The last line of standard
+/// output reports whether the function recorded a verified signature.
+fn verify_release(download: &Download, allow_unsigned: bool) -> Output {
+    let signature_is_valid = shell_function_body("script/deploy.sh", "signature_is_valid");
+    let prelude = format!(
+        "{signature_is_valid}\n}}\n\
+         RELEASE_SIGNER='{}'\nSIGN_NAMESPACE={SIGN_NAMESPACE}\n\
+         TMP='{}'\nNAME={ARCHIVE}\nTAG=v9.9.9\n\
+         ALLOW_UNSIGNED={}\nRELEASE_IS_SIGNED=0\n\
+         trap 'echo \"signed=$RELEASE_IS_SIGNED\"' EXIT",
+        download.trusted,
+        download.dir.display(),
+        u8::from(allow_unsigned),
+    );
+    run_shell_function(
+        "script/deploy.sh",
+        "verify_release",
+        &download.dir.join("stubs"),
+        &prelude,
+    )
+}
+
+/// The install path's verification, run as the script runs it: a signed list
+/// that names the archive once, with the archive's digest, is accepted.
 #[test]
-fn the_install_path_takes_its_key_from_the_script_and_not_the_environment() {
+fn a_signed_release_whose_archive_matches_its_list_is_accepted() {
+    let download = download(
+        "verify-good",
+        |digest| {
+            format!(
+                "{digest}  {ARCHIVE}.tar.gz\n{}  volto-9.9.9-aarch64-unknown-linux-musl.tar.gz\n",
+                "0".repeat(64)
+            )
+        },
+        Some("trusted"),
+    );
+    let output = verify_release(&download, false);
+
+    assert!(
+        output.status.success(),
+        "a correctly signed release must verify: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("SHA256SUMS is signed by the release key"));
+    assert!(stdout.contains("checksum verified against SHA256SUMS"));
+    assert!(
+        stdout.ends_with("signed=1\n"),
+        "a verified signature must be recorded: {stdout}"
+    );
+}
+
+/// A list signed by somebody else is refused, and so is a list with no
+/// signature. With `--allow-unsigned` the unsigned one passes on its checksum
+/// and is recorded as unsigned, which is what keeps the script from replacing
+/// itself out of such a release.
+#[test]
+fn a_release_is_refused_without_the_release_keys_signature() {
+    let honest = |digest: &str| format!("{digest}  {ARCHIVE}.tar.gz\n");
+
+    let by_stranger = download("verify-stranger", honest, Some("stranger"));
+    let output = verify_release(&by_stranger, false);
+    assert!(
+        !output.status.success(),
+        "another key's signature must be refused"
+    );
+    assert!(
+        stderr_of(&output).contains("is not signed by the release key"),
+        "{}",
+        stderr_of(&output)
+    );
+    // The flag covers a signature that is absent, never one that is wrong.
+    let output = verify_release(&by_stranger, true);
+    assert!(
+        !output.status.success(),
+        "--allow-unsigned must not excuse a signature that does not verify"
+    );
+
+    let unsigned = download("verify-unsigned", honest, None);
+    let output = verify_release(&unsigned, false);
+    assert!(
+        !output.status.success(),
+        "an unsigned release must be refused"
+    );
+    assert!(
+        stderr_of(&output).contains("carries no SHA256SUMS.sig"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    let output = verify_release(&unsigned, true);
+    assert!(
+        output.status.success(),
+        "--allow-unsigned must let an unsigned release through on its checksum: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).ends_with("signed=0\n"),
+        "an unsigned release must not be recorded as signed: {}",
+        stdout_of(&output)
+    );
+}
+
+/// The lists a checksum tool can be made to disagree about, each signed by the
+/// release key and each refused.
+///
+/// Found by review on 2026-11-13: one `sha256sum` skips a line that starts with
+/// a space or a backslash and reports success, while GNU's accepts it. A list
+/// checked by the first when it was signed and read by the second on a host
+/// could name an archive nobody checked. `verify_release` therefore reads the
+/// list itself and refuses any line that is not exactly a digest, two spaces
+/// and an archive name.
+#[test]
+fn a_signed_list_with_a_line_that_tools_read_differently_is_refused() {
+    // `{D}` stands for the archive's real digest and `{A}` for its name.
+    let cases = [
+        ("leading-space", " {D}  {A}\n", "has a line that is not"),
+        (
+            "leading-backslash",
+            "\\{D}  {A}\n",
+            "has a line that is not",
+        ),
+        ("binary-marker", "{D} *{A}\n", "has a line that is not"),
+        ("carriage-return", "{D}  {A}\r\n", "has a line that is not"),
+        (
+            "listed-twice",
+            "{D}  {A}\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  {A}\n",
+            "more than once",
+        ),
+        (
+            "not-listed",
+            "{D}  volto-9.9.9-other.tar.gz\n",
+            "does not list",
+        ),
+    ];
+    let archive = format!("{ARCHIVE}.tar.gz");
+
+    for (name, template, refusal) in cases {
+        let download = download(
+            &format!("verify-{name}"),
+            |digest| template.replace("{D}", digest).replace("{A}", &archive),
+            Some("trusted"),
+        );
+        let output = verify_release(&download, false);
+        assert!(
+            !output.status.success(),
+            "{name}: the list must be refused: {}",
+            stdout_of(&output)
+        );
+        assert!(
+            stderr_of(&output).contains(refusal),
+            "{name}: the refusal must say `{refusal}`: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+/// A signed list whose digest is not the archive's.
+#[test]
+fn an_archive_that_does_not_match_its_signed_digest_is_refused() {
+    let download = download(
+        "verify-mismatch",
+        |_| format!("{}  {ARCHIVE}.tar.gz\n", "a".repeat(64)),
+        Some("trusted"),
+    );
+    let output = verify_release(&download, false);
+
+    assert!(!output.status.success(), "a wrong digest must be refused");
+    assert!(
+        stderr_of(&output).contains("checksum mismatch"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
+/// The key the install path trusts comes from the script. `VOLTO_DEPLOY_SIGNER`
+/// names the key that really signed this release, and the release is refused
+/// all the same, because `verify_release` does not read the variable.
+#[test]
+fn the_install_path_ignores_a_key_named_in_the_environment() {
+    let download = download(
+        "verify-environment",
+        |digest| format!("{digest}  {ARCHIVE}.tar.gz\n"),
+        Some("stranger"),
+    );
+    let stranger = fs::read_to_string(download.dir.join("stranger.pub")).unwrap();
+    let stranger: Vec<&str> = stranger.split_whitespace().take(2).collect();
+
+    let signature_is_valid = shell_function_body("script/deploy.sh", "signature_is_valid");
+    let prelude = format!(
+        "{signature_is_valid}\n}}\n\
+         export VOLTO_DEPLOY_SIGNER='{}'\n\
+         RELEASE_SIGNER='{}'\nSIGN_NAMESPACE={SIGN_NAMESPACE}\n\
+         TMP='{}'\nNAME={ARCHIVE}\nTAG=v9.9.9\nALLOW_UNSIGNED=0\nRELEASE_IS_SIGNED=0",
+        stranger.join(" "),
+        download.trusted,
+        download.dir.display(),
+    );
+    let output = run_shell_function(
+        "script/deploy.sh",
+        "verify_release",
+        &download.dir.join("stubs"),
+        &prelude,
+    );
+
+    assert!(
+        !output.status.success(),
+        "the install path accepted a release signed by the key in VOLTO_DEPLOY_SIGNER"
+    );
+}
+
+/// The script itself sets the trusted key once, to a literal, and reads the
+/// override variable in the verify-only mode alone. The install path is one
+/// call of `verify_release`, which the tests above run.
+#[test]
+fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
     let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
     let code: Vec<&str> = text
         .lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#'))
         .collect();
+
+    let assignments: Vec<&&str> = code
+        .iter()
+        .filter(|line| line.starts_with("RELEASE_SIGNER="))
+        .collect();
+    assert_eq!(
+        assignments.len(),
+        1,
+        "RELEASE_SIGNER is assigned once: {assignments:?}"
+    );
+    assert!(
+        assignments[0].starts_with("RELEASE_SIGNER='ssh-ed25519 ") && !assignments[0].contains('$'),
+        "RELEASE_SIGNER is a literal key, not an expansion: {}",
+        assignments[0]
+    );
 
     let reads: Vec<&&str> = code
         .iter()
@@ -1094,10 +1368,97 @@ fn the_install_path_takes_its_key_from_the_script_and_not_the_environment() {
         "the one read of VOLTO_DEPLOY_SIGNER is the verify-only call: {}",
         reads[0]
     );
-    assert!(
-        code.iter().any(|line| line.starts_with(
-            "signature_is_valid \"$RELEASE_SIGNER\" \"$TMP/SHA256SUMS\" \"$TMP/SHA256SUMS.sig\""
-        )),
-        "the install path must verify the downloaded SHA256SUMS against RELEASE_SIGNER"
+
+    assert_eq!(
+        code.iter()
+            .filter(|line| **line == "verify_release")
+            .count(),
+        1,
+        "the install path verifies the download with one call of verify_release"
     );
+    let call = text.find("\n    verify_release\n").expect("the call");
+    let unpack = text.find("tar -xzf").expect("the unpack step");
+    assert!(
+        call < unpack,
+        "verify_release must run before the archive is unpacked"
+    );
+    assert_eq!(
+        text.matches("tar -xzf").count(),
+        1,
+        "the archive is unpacked in one place"
+    );
+
+    // The installed copy of the script is replaced from the release in one
+    // place, and only under a verified signature. A release from before signing
+    // carries a script that verifies nothing.
+    let takes: Vec<usize> = code
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| **line == "SELF_SOURCE=\"$SRC/script/deploy.sh\"")
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        takes.len(),
+        1,
+        "the script takes its own replacement from the release in one place"
+    );
+    assert_eq!(
+        code[takes[0] - 1],
+        "if [ \"$RELEASE_IS_SIGNED\" -eq 1 ] && [ -f \"$SRC/script/deploy.sh\" ]; then",
+        "the replacement must be conditional on a verified signature"
+    );
+}
+
+/// `--allow-unsigned` is for the releases from before signing. Naming it for a
+/// later one is refused before anything is downloaded, so removing a signature
+/// from the release page does not turn a signed release into an installable
+/// unsigned one.
+#[test]
+fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
+    let root = install_root("allow-unsigned-range");
+
+    let output = run_deploy_under(
+        Some(&root),
+        &["--dry-run", "--tag", "v1.4.0", "--allow-unsigned"],
+    );
+    assert!(
+        !output.status.success(),
+        "--allow-unsigned must not apply to the first signed release"
+    );
+    assert!(
+        stderr_of(&output).contains("--allow-unsigned applies to releases before 1.4.0"),
+        "{}",
+        stderr_of(&output)
+    );
+
+    let output = run_deploy_under(
+        Some(&root),
+        &["--dry-run", "--tag", "v1.3.7", "--allow-unsigned"],
+    );
+    assert!(
+        output.status.success(),
+        "--allow-unsigned must apply to a release from before signing: {}",
+        stderr_of(&output)
+    );
+}
+
+/// `--verify-signature` is a mode of its own. An empty file name once fell
+/// through to an ordinary run, which exited 0 having verified nothing.
+#[test]
+fn verifying_a_signature_with_an_empty_file_name_fails() {
+    let output = run_deploy(&[
+        "--verify-signature",
+        "",
+        "x",
+        "--dry-run",
+        "--tag",
+        "v1.0.0",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "an empty file name must not be taken for no request: {}",
+        stdout_of(&output)
+    );
+    assert!(stderr_of(&output).contains("no such file"));
 }

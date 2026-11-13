@@ -7,7 +7,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Only the job that publishes gets to write, and only to releases (see below).
+# Only the job that creates the release gets to write, and only to releases and
+# to attestations (see below). It leaves a draft; publishing is done off GitHub.
 # Actions are pinned to full commit SHAs, as in ci.yml, because this workflow
 # holds the token that could replace a published archive.
 permissions:
