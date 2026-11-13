@@ -681,13 +681,13 @@ impl Connection {
     /// Cancel-safe: [`quinn::Connection::accept_bi`] leaves an unaccepted stream
     /// queued, so a caller may poll this inside a `select!`.
     ///
-    /// `Ok(None)` would mean "the peer will send no further requests", and this
-    /// server never reports it. Only a GOAWAY from the client could mean that,
-    /// and it promises nothing about the requests already in flight. The caller
-    /// reads `Ok(None)` as permission to drop the connection, which would cut
-    /// those requests off mid-tunnel. A connection therefore ends when the peer
-    /// closes it or the idle timeout fires, both of which arrive here as `Err`.
-    pub async fn accept(&mut self) -> Result<Option<Resolver>, ConnectionError> {
+    /// There is no "the peer will send no further requests" outcome. Only a
+    /// GOAWAY from the client could mean that, and it promises nothing about
+    /// the requests already in flight, so reporting it would invite the caller
+    /// to drop the connection and cut those requests off mid-tunnel. A
+    /// connection therefore ends when the peer closes it or the idle timeout
+    /// fires, both of which arrive here as `Err`.
+    pub async fn accept(&mut self) -> Result<Resolver, ConnectionError> {
         loop {
             let (send, recv) = self
                 .handle
@@ -722,7 +722,7 @@ impl Connection {
             }
 
             self.last_accepted = Some(id);
-            return Ok(Some(Resolver::new(self.handle.clone(), send, recv)));
+            return Ok(Resolver::new(self.handle.clone(), send, recv));
         }
     }
 

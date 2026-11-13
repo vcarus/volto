@@ -471,7 +471,6 @@ async fn a_drained_stream_is_not_a_reset_to_the_watcher() {
         .accept()
         .await
         .expect("accept a request stream")
-        .expect("this server never reports the end of a connection as Ok(None)")
         .resolve()
         .await
         .expect("the request must be well formed");

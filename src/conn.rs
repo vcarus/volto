@@ -184,8 +184,6 @@ pub async fn handle(
                         handle_request(resolver, context).await;
                     });
                 }
-                // The peer will send no further requests.
-                NextRequest::Finished => break Ok(()),
                 NextRequest::Failed(error) => break Err(error),
 
                 // Nothing wrong happened here: a peer that has not
@@ -304,8 +302,6 @@ async fn announce_goaway(
 enum NextRequest {
     /// A request stream, ready to be resolved.
     Stream(h3api::Resolver),
-    /// The peer will send no further requests.
-    Finished,
     /// Nothing arrived within the bound, on a connection that has never
     /// authenticated (D76).
     Silent,
@@ -313,11 +309,10 @@ enum NextRequest {
     Failed(h3api::ConnectionError),
 }
 
-impl From<Result<Option<h3api::Resolver>, h3api::ConnectionError>> for NextRequest {
-    fn from(accepted: Result<Option<h3api::Resolver>, h3api::ConnectionError>) -> Self {
+impl From<Result<h3api::Resolver, h3api::ConnectionError>> for NextRequest {
+    fn from(accepted: Result<h3api::Resolver, h3api::ConnectionError>) -> Self {
         match accepted {
-            Ok(Some(resolver)) => Self::Stream(resolver),
-            Ok(None) => Self::Finished,
+            Ok(resolver) => Self::Stream(resolver),
             Err(error) => Self::Failed(error),
         }
     }
