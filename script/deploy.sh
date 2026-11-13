@@ -281,7 +281,7 @@ verify_release() {
 
     # A NUL byte is dropped by `read` and kept by awk, so the two readers below
     # would see different lines. No list this project signs contains one.
-    tr -d '\000' <"$TMP/SHA256SUMS" | cmp -s - "$TMP/SHA256SUMS" ||
+    [ "$(tr -d '\000' <"$TMP/SHA256SUMS" | wc -c)" -eq "$(wc -c <"$TMP/SHA256SUMS")" ] ||
         die "SHA256SUMS in $TAG contains a NUL byte -- refusing to install it"
 
     while IFS= read -r line || [ -n "$line" ]; do
