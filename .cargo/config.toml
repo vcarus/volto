@@ -1,0 +1,19 @@
+# A version published less than three days ago is not picked by the resolver.
+# A release that turns out to be broken or malicious is usually yanked within
+# that time, and the resolver runs build scripts on the machine that asks.
+#
+# A locked build is not affected: the rule applies when cargo resolves, which
+# here means `cargo update`. A version already in `Cargo.lock` that is younger
+# than this is moved back by a bare `cargo update`, and the lock diff shows it
+# as a downgrade.
+#
+# Dependabot holds its version updates back for the same three days by default,
+# and not its security updates. A fix that has to come in on the day it is
+# published is named explicitly:
+#
+#     CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow \
+#         cargo update -p <crate> --precise <version>
+#
+# This file sits at the repository root, so the `fuzz/` workspace reads it too.
+[registry]
+global-min-publish-age = "3 days"
