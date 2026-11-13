@@ -332,8 +332,9 @@ pub const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
 
 /// Ports no target may be reached on unless the operator says otherwise.
 ///
-/// 25 is the classic open-relay abuse vector. Note that 53 is deliberately *not*
-/// here: Surge's UDP availability test is a DNS query through the tunnel.
+/// 25 is the classic open-relay abuse vector. 53 and 123 are deliberately *not*
+/// here. Denying 53 refuses every DNS query a client sends through the tunnel.
+/// Surge's UDP availability test is an NTP query to port 123 through the tunnel.
 pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
 
 /// Default number of packets a UDP session may send before the target answers.
@@ -917,11 +918,13 @@ pub(crate) mod tests {
         assert_eq!(cfg.server.shutdown_grace, 5);
         assert_eq!(cfg.server.alpn_wire(), vec![b"h3".to_vec()]);
 
-        // Security defaults: private space closed, port 25 closed, port 53 open
-        // because Surge tests UDP with a DNS query.
+        // Security defaults: private space closed and port 25 closed. Port 53
+        // stays open for DNS through the tunnel, and port 123 stays open because
+        // Surge tests UDP with an NTP query.
         assert!(!cfg.security.allow_private_networks);
         assert_eq!(cfg.security.denied_ports, vec![25]);
         assert!(!cfg.security.denied_ports.contains(&53));
+        assert!(!cfg.security.denied_ports.contains(&123));
         assert_eq!(cfg.security.unanswered_packet_budget, 64);
         // The SNI gate is off, which is what makes an absent key change nothing.
         assert!(cfg.security.expected_sni.is_empty());

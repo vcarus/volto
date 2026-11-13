@@ -652,24 +652,27 @@ async fn a_denied_port_is_refused_on_both_paths() {
     assert_refused(&udp, Status::FORBIDDEN, "http_request_denied");
 }
 
-/// Surge's UDP availability test is a DNS query through the tunnel, so port 53
-/// has to be reachable with a stock configuration. Nothing needs to be listening:
-/// connecting a UDP socket is enough to answer.
+/// Surge's UDP availability test is an NTP query to port 123 through the tunnel,
+/// so port 123 has to be reachable with a stock configuration. Port 53 has to be
+/// reachable too, because a client that resolves names through the tunnel sends
+/// its DNS queries there. Nothing needs to be listening: connecting a UDP socket
+/// is enough to answer.
 #[tokio::test]
-async fn udp_port_53_is_reachable_by_default() {
+async fn udp_ports_123_and_53_are_reachable_by_default() {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let mut client = H3Client::connect(&server).await;
 
-    let response = respond_to(
-        &mut client,
-        connect_udp_request(server.addr, "127.0.0.1", 53),
-    )
-    .await;
-    assert_eq!(
-        response.status,
-        Status::OK,
-        "denying UDP/53 would fail Surge's UDP test"
-    );
+    for (port, consequence) in [
+        (123, "denying UDP/123 would fail Surge's UDP test"),
+        (53, "denying UDP/53 would refuse DNS through the tunnel"),
+    ] {
+        let response = respond_to(
+            &mut client,
+            connect_udp_request(server.addr, "127.0.0.1", port),
+        )
+        .await;
+        assert_eq!(response.status, Status::OK, "{consequence}");
+    }
 }
 
 /// A name that cannot be resolved is the proxy's problem to report, not the

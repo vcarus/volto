@@ -307,9 +307,12 @@ initial_rtt_ms = 150
 
 # Target ports refused regardless of address, answered with 403.
 #
-# 25 is the classic open-relay abuse vector. Note that 53 must stay reachable:
-# Surge's UDP availability test is a DNS query through the tunnel, so denying it
-# makes Surge report the policy as broken. volto warns if 53 is on this list.
+# 25 is the classic open-relay abuse vector. Ports 123 and 53 must stay
+# reachable. Surge's UDP availability test is an NTP query to port 123 through
+# the tunnel, so denying 123 makes Surge report the policy as broken. Denying 53
+# refuses every DNS query a client sends through the tunnel, which breaks name
+# resolution for a client that resolves names that way. volto warns if 53 or 123
+# is on this list.
 # Default: [25]
 #denied_ports = [25]
 

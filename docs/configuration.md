@@ -436,9 +436,11 @@ family, an IP literal above all, is unaffected by any of the three.
   proxy on is the relay's, not one any interface here carries, so a target naming
   that address is judged like any other public address and it is the relay rather
   than this rule that stands in the way.
-- **UDP/53 must stay reachable.** Surge's UDP availability test is a DNS query
-  through the tunnel, so denying port 53 makes Surge report the policy as broken.
-  volto warns if 53 appears in `denied_ports`.
+- **UDP/123 and UDP/53 must stay reachable.** Surge's UDP availability test is
+  an NTP query to port 123 through the tunnel, so denying port 123 makes Surge
+  report the policy as broken. Denying port 53 refuses every DNS query a client
+  sends through the tunnel, which breaks name resolution for a client that
+  resolves names that way. volto warns if 53 or 123 appears in `denied_ports`.
 - `unanswered_packet_budget` stops a client using the proxy as a reflector or a
   port scanner (RFC 9298 §7). The first reply from the target lifts the limit for
   the rest of the session, so it only bites on one-way floods. The default is

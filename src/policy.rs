@@ -1218,14 +1218,17 @@ mod tests {
         assert!(policy.allows_port(80));
     }
 
-    /// Surge's UDP availability test is a DNS query through the tunnel, so 53 has
-    /// to work with a stock configuration.
+    /// Surge's UDP availability test is an NTP query to port 123 through the
+    /// tunnel, so 123 has to work with a stock configuration. 53 has to work too,
+    /// because a client that resolves names through the tunnel sends its DNS
+    /// queries there.
     #[test]
-    fn port_53_is_allowed_with_the_default_deny_list() {
+    fn ports_53_and_123_are_allowed_with_the_default_deny_list() {
         let policy = Policy::new(&config::Security::default());
+        assert!(policy.allows_port(123), "Surge tests UDP with an NTP query");
         assert!(
             policy.allows_port(53),
-            "Surge tests UDP by resolving a name"
+            "DNS through the tunnel needs port 53"
         );
         assert!(!policy.allows_port(25));
     }

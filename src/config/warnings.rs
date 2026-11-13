@@ -1,5 +1,22 @@
 use super::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
+/// Ports that `security.denied_ports` may hold but that clients depend on.
+///
+/// Each row is a port and the reason the warning gives for it. A port on this
+/// list in `denied_ports` draws one warning with its own reason.
+const PORTS_CLIENTS_NEED: &[(u16, &str)] = &[
+    (
+        53,
+        "every DNS query a client sends through the proxy is refused, which breaks name \
+         resolution for a client that resolves names through the tunnel",
+    ),
+    (
+        123,
+        "Surge's UDP availability test is an NTP query to port 123 through the proxy, so \
+         Surge will report the policy as broken",
+    ),
+];
+
 impl Config {
     /// Settings that are legal but that an operator should be told about.
     ///
@@ -108,12 +125,10 @@ impl Config {
             );
         }
 
-        if self.security.denied_ports.contains(&53) {
-            warnings.push(
-                "security.denied_ports contains 53: Surge's UDP availability test is a DNS query \
-                 through the proxy, so it will report the policy as broken"
-                    .to_owned(),
-            );
+        for (port, reason) in PORTS_CLIENTS_NEED {
+            if self.security.denied_ports.contains(port) {
+                warnings.push(format!("security.denied_ports contains {port}: {reason}"));
+            }
         }
 
         if self.limits.max_connections == 0 {
@@ -467,6 +482,41 @@ mod tests {
                 "missing a warning about {expected}: {warnings:?}"
             );
         }
+    }
+
+    /// Each port in the table draws its own warning with its own reason, and a
+    /// port outside the table draws none of them.
+    #[test]
+    fn denying_a_port_clients_need_is_warned_about_by_port() {
+        let ntp = parse("[security]\ndenied_ports = [25, 123]").warnings();
+        assert!(
+            ntp.iter()
+                .any(|w| w.contains("denied_ports contains 123") && w.contains("NTP query")),
+            "{ntp:?}"
+        );
+        assert!(
+            !ntp.iter().any(|w| w.contains("denied_ports contains 53")),
+            "{ntp:?}"
+        );
+
+        let dns = parse("[security]\ndenied_ports = [53]").warnings();
+        assert!(
+            dns.iter()
+                .any(|w| w.contains("denied_ports contains 53") && w.contains("DNS query")),
+            "{dns:?}"
+        );
+        assert!(
+            !dns.iter().any(|w| w.contains("denied_ports contains 123")),
+            "{dns:?}"
+        );
+
+        let unrelated = parse("[security]\ndenied_ports = [25, 8080]").warnings();
+        assert!(
+            !unrelated
+                .iter()
+                .any(|w| w.contains("denied_ports contains")),
+            "{unrelated:?}"
+        );
     }
 
     /// RFC 9298 §3.1 recommends two minutes, and a configuration that meets the
