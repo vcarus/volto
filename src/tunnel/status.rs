@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use rustix::io::Errno;
 use tracing::debug;
 
 use crate::h3api::{self, FieldValue, Fields, RespondError, Status, Stream};
@@ -280,8 +281,8 @@ impl ProxyError {
 /// server builds for define every constant.
 fn is_local_exhaustion(error: &std::io::Error) -> bool {
     matches!(
-        error.raw_os_error(),
-        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::EADDRNOTAVAIL)
+        Errno::from_io_error(error),
+        Some(Errno::MFILE | Errno::NFILE | Errno::NOBUFS | Errno::NOMEM | Errno::ADDRNOTAVAIL)
     )
 }
 
@@ -581,13 +582,13 @@ mod tests {
     #[test]
     fn a_local_resource_failure_does_not_blame_the_target() {
         for code in [
-            libc::EMFILE,
-            libc::ENFILE,
-            libc::ENOBUFS,
-            libc::ENOMEM,
-            libc::EADDRNOTAVAIL,
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+            Errno::ADDRNOTAVAIL,
         ] {
-            let error = std::io::Error::from_raw_os_error(code);
+            let error = std::io::Error::from(code);
             assert_eq!(
                 ProxyError::from_connect_error(&error),
                 ProxyError::ProxyInternalError,
@@ -609,14 +610,14 @@ mod tests {
     #[test]
     fn a_failure_to_reach_the_target_still_blames_the_target() {
         for code in [
-            libc::ECONNREFUSED,
-            libc::ETIMEDOUT,
-            libc::EHOSTUNREACH,
-            libc::ENETUNREACH,
-            libc::EACCES,
-            libc::EPERM,
+            Errno::CONNREFUSED,
+            Errno::TIMEDOUT,
+            Errno::HOSTUNREACH,
+            Errno::NETUNREACH,
+            Errno::ACCESS,
+            Errno::PERM,
         ] {
-            let error = std::io::Error::from_raw_os_error(code);
+            let error = std::io::Error::from(code);
             assert_ne!(
                 ProxyError::from_connect_error(&error),
                 ProxyError::ProxyInternalError,

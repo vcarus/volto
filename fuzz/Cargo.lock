@@ -1021,7 +1021,6 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
- "libc",
  "mimalloc",
  "percent-encoding",
  "quinn",

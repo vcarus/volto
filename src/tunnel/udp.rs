@@ -38,6 +38,7 @@ use std::io::{IoSliceMut, Read};
 
 use bytes::{Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
+use rustix::io::Errno;
 use socket2::SockRef;
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
@@ -1329,8 +1330,8 @@ fn read_verdict(error: &std::io::Error) -> Step {
 /// these onto a stable `ErrorKind`.
 fn is_per_packet_error(error: &std::io::Error) -> bool {
     matches!(
-        error.raw_os_error(),
-        Some(libc::EMSGSIZE | libc::EPERM | libc::EACCES | libc::ENOBUFS)
+        Errno::from_io_error(error),
+        Some(Errno::MSGSIZE | Errno::PERM | Errno::ACCESS | Errno::NOBUFS)
     )
 }
 
@@ -2266,11 +2267,11 @@ mod tests {
     /// Tested as a pure function because the condition cannot be produced on
     /// loopback: `EMSGSIZE` needs the DF bit, which is a no-op on macOS, and a
     /// Linux loopback MTU is far larger than anything a test would send. The
-    /// three codes below are POSIX and present in `libc` on both hosts.
+    /// three codes below are POSIX and defined on both hosts.
     #[test]
     fn per_packet_send_errors_do_not_end_the_session() {
-        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES, libc::ENOBUFS] {
-            let error = std::io::Error::from_raw_os_error(code);
+        for code in [Errno::MSGSIZE, Errno::PERM, Errno::ACCESS, Errno::NOBUFS] {
+            let error = std::io::Error::from(code);
             assert!(
                 is_per_packet_error(&error),
                 "errno {code} ({error}) must only cost one packet"
@@ -2285,8 +2286,8 @@ mod tests {
     /// supposed; [`read_verdict`] records the run.
     #[test]
     fn a_per_packet_error_on_the_read_side_does_not_end_the_session() {
-        for code in [libc::EMSGSIZE, libc::EPERM, libc::EACCES, libc::ENOBUFS] {
-            let error = std::io::Error::from_raw_os_error(code);
+        for code in [Errno::MSGSIZE, Errno::PERM, Errno::ACCESS, Errno::NOBUFS] {
+            let error = std::io::Error::from(code);
             assert_eq!(
                 read_verdict(&error),
                 Step::Continue,
@@ -2295,8 +2296,8 @@ mod tests {
             );
         }
 
-        for code in [libc::ECONNREFUSED, libc::ENETUNREACH, libc::EHOSTUNREACH] {
-            let error = std::io::Error::from_raw_os_error(code);
+        for code in [Errno::CONNREFUSED, Errno::NETUNREACH, Errno::HOSTUNREACH] {
+            let error = std::io::Error::from(code);
             assert_eq!(
                 read_verdict(&error),
                 Step::Stop,
@@ -2316,8 +2317,8 @@ mod tests {
     /// `ECONNREFUSED` from an ICMP port-unreachable means.
     #[test]
     fn socket_failures_still_end_the_session() {
-        for code in [libc::ECONNREFUSED, libc::ENETUNREACH, libc::EHOSTUNREACH] {
-            let error = std::io::Error::from_raw_os_error(code);
+        for code in [Errno::CONNREFUSED, Errno::NETUNREACH, Errno::HOSTUNREACH] {
+            let error = std::io::Error::from(code);
             assert!(
                 !is_per_packet_error(&error),
                 "errno {code} ({error}) must end the session"
