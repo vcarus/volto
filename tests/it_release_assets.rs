@@ -338,43 +338,47 @@ fn editing_release_yml_triggers_the_cross_workflow() {
 }
 
 // ---------------------------------------------------------------------------
-// ci.yml gives every push to main its own concurrency group
+// ci.yml and cross.yml give every push to main its own concurrency group
 // ---------------------------------------------------------------------------
 
 /// A push to main keys its concurrency group on the commit, not on the branch.
 ///
 /// `release.yml` requires a successful `ci.yml` run for the exact commit a tag
-/// names. With one group for `refs/heads/main` and `cancel-in-progress: false`,
-/// GitHub keeps one pending run per group, so a newer push cancels the pending
-/// one and an earlier commit can end with only a cancelled run. A pull request
-/// keeps one group per ref, because cancelling its superseded run is the point
-/// there.
+/// names, and the release checklist waits for a green `cross.yml` run on that
+/// commit as well. With one group for `refs/heads/main` and
+/// `cancel-in-progress: false`, GitHub keeps one pending run per group, so a
+/// newer push cancels the pending one and an earlier commit can end with only a
+/// cancelled run. A pull request keeps one group per ref, because cancelling
+/// its superseded run is the point there.
 #[test]
 fn every_push_to_main_keys_its_concurrency_group_on_the_commit() {
-    let path = repo_root().join(".github/workflows/ci.yml");
-    let text = read_text(&path);
+    for (file, prefix) in [("ci.yml", "group: ci-"), ("cross.yml", "group: cross-")] {
+        let path = repo_root().join(".github/workflows").join(file);
+        let text = read_text(&path);
 
-    let group = text
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with("group: ci-"))
-        .unwrap_or_else(|| {
-            panic!(
-                "{} carries no `group: ci-` line under `concurrency:`; has the \
-                 block moved or been renamed?",
-                path.display()
-            )
-        });
+        let group = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} carries no `{prefix}` line under `concurrency:`; has the \
+                     block moved or been renamed?",
+                    path.display()
+                )
+            });
 
-    assert!(
-        group.contains("github.sha"),
-        "{} keys the concurrency group as {group:?}, which is one group for every \
-         push to main. release.yml requires a successful ci.yml run for the exact \
-         tagged commit, and with `cancel-in-progress: false` a newer push cancels \
-         the one pending run of that group, so a commit can end with only a \
-         cancelled run. Key a push on `github.sha`",
-        path.display()
-    );
+        assert!(
+            group.contains("github.sha"),
+            "{} keys the concurrency group as {group:?}, which is one group for \
+             every push to main. A release needs a successful run of this \
+             workflow for the exact tagged commit, and with \
+             `cancel-in-progress: false` a newer push cancels the one pending \
+             run of that group, so a commit can end with only a cancelled run. \
+             Key a push on `github.sha`",
+            path.display()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

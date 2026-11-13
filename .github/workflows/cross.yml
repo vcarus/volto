@@ -30,9 +30,11 @@ on:
       - .github/workflows/release.yml
 
 # As in ci.yml: a new push to a pull request supersedes its running check, and
-# on main every commit keeps its own run.
+# on main every commit keeps its own run. A push keys on its commit, because
+# with one group for the branch GitHub keeps one pending run per group and a
+# newer push cancels the pending one.
 concurrency:
-  group: cross-${{ github.ref }}
+  group: cross-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
