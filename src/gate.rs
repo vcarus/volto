@@ -262,7 +262,7 @@ impl Names {
 /// spelling of the root. `Config::validate` refuses those outright, so the four
 /// callers agree on every name that can reach them.
 pub(crate) fn root_relative(name: &str) -> &str {
-    name.strip_suffix('.').unwrap_or(name)
+    name.trim_suffix('.')
 }
 
 /// Lowercased, with one trailing root dot removed.
@@ -1160,6 +1160,7 @@ pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// A ClientHello body with the given extensions block appended.
     fn client_hello(extensions: &[u8]) -> Vec<u8> {
@@ -1350,10 +1351,7 @@ mod tests {
         let payload = [0x06, 0x00, 0x03, b'a', b'b', b'c'];
         // One fragment at offset 0, which is every first flight that fits in one
         // packet, is borrowed out of the frames rather than copied.
-        assert!(matches!(
-            crypto_stream_prefix(&payload),
-            Some(Cow::Borrowed(b"abc"))
-        ));
+        assert_matches!(crypto_stream_prefix(&payload), Some(Cow::Borrowed(b"abc")));
         assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"abc"[..]));
 
         // The same frame at offset 1 carries no beginning to judge.

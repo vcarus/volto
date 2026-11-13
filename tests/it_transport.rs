@@ -21,6 +21,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::time::{Duration, Instant};
 
 use common::rawstream::H3_REQUEST_CANCELLED;
@@ -49,8 +50,9 @@ async fn an_idle_connection_is_closed_after_the_configured_timeout() {
         elapsed >= Duration::from_millis(750),
         "closed after {elapsed:?}, which is too fast to be the 1s idle timeout: {error}"
     );
-    assert!(
-        matches!(error, quinn::ConnectionError::TimedOut),
+    assert_matches!(
+        error,
+        quinn::ConnectionError::TimedOut,
         "expected an idle timeout, got {error}"
     );
 }

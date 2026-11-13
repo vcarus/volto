@@ -20,6 +20,7 @@ use common::{
     connect_quic, echoes, numeric_field, open_tcp_tunnel, open_udp_session, recv_datagram,
     send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
 };
+use std::assert_matches;
 use volto::datagram;
 
 /// The seven ways a connection ends, each with the level and reason it earns.
@@ -41,8 +42,9 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         let error = tokio::time::timeout(TIMEOUT, client.quic.closed())
             .await
             .expect("a 1s idle timeout must close the connection well within 10s");
-        assert!(
-            matches!(error, quinn::ConnectionError::TimedOut),
+        assert_matches!(
+            error,
+            quinn::ConnectionError::TimedOut,
             "expected an idle timeout, got {error}"
         );
 

@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -461,26 +462,26 @@ fn the_own_address_latch_follows_the_address_list() {
         own_address_precondition(Some(own), Some(listed.clone()), true),
         Precondition::Test(own)
     );
-    assert!(matches!(
+    assert_matches!(
         own_address_precondition(None, Some(Vec::new()), false),
         Precondition::Skip(_)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         own_address_precondition(None, Some(Vec::new()), true),
         Precondition::Skip(_)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         own_address_precondition(None, Some(listed.clone()), false),
         Precondition::Missed(_)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         own_address_precondition(None, None, true),
         Precondition::Missed(_)
-    ));
-    assert!(matches!(
+    );
+    assert_matches!(
         own_address_precondition(None, None, false),
         Precondition::Skip(_)
-    ));
+    );
 }
 
 /// The two listing formats, and what is left out of them.

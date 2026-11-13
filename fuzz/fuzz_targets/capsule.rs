@@ -9,6 +9,7 @@
 
 #![no_main]
 
+use std::assert_matches;
 use libfuzzer_sys::fuzz_target;
 use volto::capsule::{self, Capsule, CapsuleDecoder};
 use volto::datagram::VARINT_MAX;
@@ -71,6 +72,6 @@ fuzz_target!(|data: &[u8]| {
         }
         other => panic!("round trip must yield the capsule, got {other:?}"),
     }
-    assert!(matches!(decoder.next_capsule(), Ok(None)));
+    assert_matches!(decoder.next_capsule(), Ok(None));
     assert!(decoder.at_capsule_boundary(), "nothing may be left over");
 });

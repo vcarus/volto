@@ -409,6 +409,7 @@ impl std::error::Error for StreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     #[test]
     fn registered_codes_print_their_names() {
@@ -515,37 +516,37 @@ mod tests {
 
     #[test]
     fn the_idle_timeout_is_its_own_variant() {
-        assert!(matches!(
+        assert_matches!(
             ConnectionError::from(quinn::ConnectionError::TimedOut),
             ConnectionError::Timeout
-        ));
+        );
     }
 
     /// Our own close must not be filed as the peer's goodbye.
     #[test]
     fn a_local_close_stays_a_transport_error() {
-        assert!(matches!(
+        assert_matches!(
             ConnectionError::from(quinn::ConnectionError::LocallyClosed),
             ConnectionError::Transport(quinn::ConnectionError::LocallyClosed)
-        ));
+        );
     }
 
     #[test]
     fn a_reset_carries_the_peers_code() {
         let error = StreamError::from(quinn::ReadError::Reset(quinn::VarInt::from_u32(0x10f)));
-        assert!(matches!(
+        assert_matches!(
             error,
             StreamError::RemoteTerminate { code } if code == Code::H3_CONNECT_ERROR
-        ));
+        );
     }
 
     #[test]
     fn a_stop_sending_carries_the_peers_code() {
         let error = StreamError::from(quinn::WriteError::Stopped(quinn::VarInt::from_u32(0x100)));
-        assert!(matches!(
+        assert_matches!(
             error,
             StreamError::RemoteTerminate { code } if code == Code::H3_NO_ERROR
-        ));
+        );
     }
 
     #[test]

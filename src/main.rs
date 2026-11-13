@@ -680,6 +680,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
     use std::sync::{Arc, Mutex};
 
     use tracing_subscriber::Registry;
@@ -788,10 +789,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            assert!(matches!(
+            assert_matches!(
                 filter_source(Some(OsStr::from_bytes(b"volto=\xff"))),
                 FilterSource::InvalidRustLog(_)
-            ));
+            );
         }
     }
 

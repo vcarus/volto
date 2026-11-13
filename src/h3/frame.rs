@@ -1546,6 +1546,7 @@ mod tests {
     #![allow(clippy::as_conversions)]
 
     use super::*;
+    use std::assert_matches;
 
     fn settings(pairs: &[(u64, u64)]) -> Vec<u8> {
         let mut payload = BytesMut::new();
@@ -1765,9 +1766,9 @@ mod tests {
             items.push(item);
         }
 
-        assert!(matches!(&items[0], Item::Data(chunk) if &chunk[..] == b"abc"));
-        assert!(matches!(&items[1], Item::Frame(Frame::Headers(block)) if &block[..] == b"block"));
-        assert!(matches!(&items[2], Item::Data(chunk) if &chunk[..] == b"de"));
+        assert_matches!(&items[0], Item::Data(chunk) if &chunk[..] == b"abc");
+        assert_matches!(&items[1], Item::Frame(Frame::Headers(block)) if &block[..] == b"block");
+        assert_matches!(&items[2], Item::Data(chunk) if &chunk[..] == b"de");
         assert_eq!(items.len(), 3);
     }
 
@@ -1783,10 +1784,8 @@ mod tests {
             let items = decode_bytewise(&wire).expect("decodes");
             let (skipped, body) = items.split_first().expect("at least the skipped frame");
 
-            assert!(
-                matches!(skipped, Item::Skipped { kind: skipped } if *skipped == kind),
-                "grease type {kind:#x} must be announced once, got {items:?}"
-            );
+            assert_matches!(skipped, Item::Skipped { kind: skipped } if *skipped == kind,
+                "grease type {kind:#x} must be announced once, got {items:?}");
             let payload: Vec<u8> = body
                 .iter()
                 .flat_map(|item| match item {
@@ -1911,10 +1910,10 @@ mod tests {
         assert!(!decoder.at_frame_boundary());
 
         decoder.push(Bytes::copy_from_slice(&wire[wire.len() - 1..]));
-        assert!(matches!(
+        assert_matches!(
             decoder.next_item().expect("decodes"),
             Some(Item::Skipped { kind: 0x21 })
-        ));
+        );
         assert!(decoder.at_frame_boundary());
     }
 
@@ -1928,17 +1927,15 @@ mod tests {
         wire.extend_from_slice(&frame(HEADERS, b""));
 
         let items = decode_bytewise(&wire).expect("decodes");
-        assert!(
-            matches!(
+        assert_matches!(
                 &items[..],
                 [
                     Item::Data(empty),
                     Item::Skipped { kind: 0x21 },
                     Item::Frame(Frame::Headers(block))
                 ] if empty.is_empty() && block.is_empty()
-            ),
-            "got {items:?}"
-        );
+            ,
+            "got {items:?}");
     }
 
     /// RFC 9114 §7.2.8: the types HTTP/2 used and HTTP/3 does not are a
@@ -2127,11 +2124,9 @@ mod tests {
         // only bound.
         for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
             for length in BUFFERED {
-                assert!(
-                    matches!(
-                        begin(StreamKind::ServerControl, true, kind, length),
-                        Ok(State::Buffering { .. })
-                    ),
+                assert_matches!(
+                    begin(StreamKind::ServerControl, true, kind, length),
+                    Ok(State::Buffering { .. }),
                     "{kind:#x} of {length} bytes after SETTINGS is parsed"
                 );
             }
@@ -2142,7 +2137,7 @@ mod tests {
         // is not type-refused: under the cap it is buffered and parsed, and a
         // malformed one keeps its payload verdict; over the cap it keeps the
         // load answer.
-        assert!(matches!(
+        assert_matches!(
             begin(
                 StreamKind::ServerControl,
                 false,
@@ -2150,7 +2145,7 @@ mod tests {
                 MAX_BUFFERED_FRAME
             ),
             Ok(State::Buffering { .. })
-        ));
+        );
         let Err(Error::Protocol(violation)) = begin(
             StreamKind::ServerControl,
             false,
@@ -2179,10 +2174,10 @@ mod tests {
     #[test]
     fn answering_the_connect_narrows_what_the_stream_may_carry() {
         let mut decoder = fresh_decoder();
-        assert!(matches!(
+        assert_matches!(
             begin(decoder.stream, false, HEADERS, 200),
             Ok(State::Buffering { .. })
-        ));
+        );
 
         decoder.connect_completed();
 
@@ -2224,10 +2219,10 @@ mod tests {
 
         // Completing it hands the payload on and returns every byte.
         decoder.push(Bytes::from(vec![0x5a; 600]));
-        assert!(matches!(
+        assert_matches!(
             decoder.next_item().expect("decodes"),
             Some(Item::Frame(Frame::Headers(block))) if block.len() == 1000
-        ));
+        );
         assert_eq!(budget.held(), 0);
 
         // A stream abandoned mid-frame returns its share as well, which is the
@@ -2263,10 +2258,7 @@ mod tests {
         let mut streams = Vec::new();
         for stream in 0..fits {
             let (decoder, outcome) = announce(&budget);
-            assert!(
-                matches!(outcome, Ok(None)),
-                "stream {stream} is within the budget"
-            );
+            assert_matches!(outcome, Ok(None), "stream {stream} is within the budget");
             streams.push(decoder);
         }
         assert_eq!(budget.held(), fits * MAX_BUFFERED_FRAME as usize);
@@ -2406,7 +2398,7 @@ mod tests {
             let mut wire = BytesMut::new();
             put_header(&mut wire, HEADERS, MAX_BUFFERED_FRAME);
             decoder.push(wire.freeze());
-            assert!(matches!(decoder.next_item(), Ok(None)));
+            assert_matches!(decoder.next_item(), Ok(None));
             pinned.push(decoder);
         }
 
@@ -2458,10 +2450,7 @@ mod tests {
         assert!(decoder.at_frame_boundary());
 
         decoder.push(Bytes::from(frame(DATA, b"abcd")));
-        assert!(matches!(
-            decoder.next_item().expect("decodes"),
-            Some(Item::Data(_))
-        ));
+        assert_matches!(decoder.next_item().expect("decodes"), Some(Item::Data(_)));
         assert!(decoder.at_frame_boundary());
 
         // Half a frame header, then half a payload: neither is a place to stop.
@@ -2566,13 +2555,11 @@ mod tests {
         let error = read_body(&mut reader, &mut delivered)
             .await
             .expect_err("the reset must be reported");
-        assert!(
-            matches!(
+        assert_matches!(
                 error,
                 Error::Stream(StreamError::RemoteTerminate { code }) if code.value() == 0x10c
-            ),
-            "expected the peer's reset, got {error:?}"
-        );
+            ,
+            "expected the peer's reset, got {error:?}");
 
         assert_eq!(
             delivered,
@@ -2727,10 +2714,10 @@ mod tests {
         let mut upload = loopback::Upload::start(&wire).await;
         let mut reader = tunnel_reader(upload.take_recv());
 
-        assert!(matches!(
+        assert_matches!(
             reader.next().await.expect("the first item"),
             Some(Item::Data(_))
-        ));
+        );
         reader.stop(Code::H3_REQUEST_CANCELLED);
 
         // What is left is at most the rest of the chunk the decoder holds.
