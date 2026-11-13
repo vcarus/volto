@@ -1310,7 +1310,7 @@ impl QpackStream {
 /// server's own rule is to end the stream there rather than read on forever.
 const MAX_INTEGER_CONTINUATION: usize = 9;
 
-/// How far the last accepted instruction's prefixed integer has run.
+/// Where the peer's QPACK stream stands between two bytes.
 ///
 /// The whole of [`serve_qpack`]'s per-byte state. The peer chooses where its
 /// stream is cut into `read_chunk` results, and the verdict may not depend on
@@ -1318,35 +1318,45 @@ const MAX_INTEGER_CONTINUATION: usize = 9;
 /// function of one byte and this state. That also lets the tests drive it
 /// without a live [`quinn::RecvStream`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct QpackProgress {
-    /// Whether the last accepted instruction's integer is still running.
-    continuing: bool,
-    /// How many continuation bytes of it have been read.
-    continuation: usize,
+enum QpackProgress {
+    /// The next byte is the first byte of an instruction.
+    #[default]
+    Instruction,
+    /// The next byte continues the prefixed integer that the last accepted
+    /// instruction started. `continuation` is how many continuation bytes of
+    /// that integer have been read so far.
+    Integer { continuation: usize },
 }
 
 impl QpackProgress {
     /// Judges one byte of the peer's QPACK stream and advances the state.
     ///
     /// A byte is either a continuation of the integer the last instruction
-    /// started, in which case only its top bit matters and [`Self::continuation`]
-    /// counts it, or the first byte of a new instruction, which
-    /// [`qpack_instruction`] judges.
+    /// started, in which case only its top bit matters and the `continuation`
+    /// count of [`Self::Integer`] counts it, or the first byte of a new
+    /// instruction, which [`qpack_instruction`] judges.
     fn take(&mut self, kind: QpackStream, byte: u8) -> Result<(), Violation> {
-        if self.continuing {
-            self.continuation += 1;
-            if self.continuation > MAX_INTEGER_CONTINUATION {
-                return Err(Violation::connection(
-                    kind.code(),
-                    "an integer past 62 bits",
-                ));
+        match *self {
+            Self::Integer { continuation } => {
+                let continuation = continuation + 1;
+                if continuation > MAX_INTEGER_CONTINUATION {
+                    return Err(Violation::connection(
+                        kind.code(),
+                        "an integer past 62 bits",
+                    ));
+                }
+                *self = if byte & 0b1000_0000 != 0 {
+                    Self::Integer { continuation }
+                } else {
+                    Self::Instruction
+                };
             }
-            self.continuing = byte & 0b1000_0000 != 0;
-            return Ok(());
+            Self::Instruction => {
+                if qpack_instruction(kind, byte)? {
+                    *self = Self::Integer { continuation: 0 };
+                }
+            }
         }
-
-        self.continuing = qpack_instruction(kind, byte)?;
-        self.continuation = 0;
         Ok(())
     }
 }
@@ -1904,21 +1914,40 @@ mod tests {
     /// limit is accepted, and leaves a stream ready for the next instruction.
     #[test]
     fn a_qpack_integer_that_ends_at_the_limit_is_accepted() {
-        // The same instruction, carried on by eight continuation bytes and
-        // ended by a ninth, which is `MAX_INTEGER_CONTINUATION` exactly.
-        let mut stream = vec![0x7f];
-        stream.extend_from_slice(&[0xff; MAX_INTEGER_CONTINUATION - 1]);
-        stream.push(0x00);
+        // The same instruction, carried on by nine continuation bytes that do
+        // not end it, which is `MAX_INTEGER_CONTINUATION` exactly.
+        let mut running = vec![0x7f];
+        running.extend_from_slice(&[0xff; MAX_INTEGER_CONTINUATION]);
 
-        let progress = judge_qpack(QpackStream::Decoder, &[&stream])
+        let progress = judge_qpack(QpackStream::Decoder, &[&running])
             .expect("an integer of nine continuation bytes is inside the limit");
-
         assert_eq!(
-            progress.continuation, MAX_INTEGER_CONTINUATION,
+            progress,
+            QpackProgress::Integer {
+                continuation: MAX_INTEGER_CONTINUATION
+            },
             "the ninth continuation byte is counted and allowed"
         );
-        assert!(
-            !progress.continuing,
+
+        // Carried on by eight continuation bytes and ended by a ninth.
+        let mut ended = vec![0x7f];
+        ended.extend_from_slice(&[0xff; MAX_INTEGER_CONTINUATION - 1]);
+        let progress = judge_qpack(QpackStream::Decoder, &[&ended])
+            .expect("an integer of eight continuation bytes is inside the limit");
+        assert_eq!(
+            progress,
+            QpackProgress::Integer {
+                continuation: MAX_INTEGER_CONTINUATION - 1
+            },
+            "eight continuation bytes are counted"
+        );
+        ended.push(0x00);
+
+        let progress = judge_qpack(QpackStream::Decoder, &[&ended])
+            .expect("an integer of nine continuation bytes is inside the limit");
+        assert_eq!(
+            progress,
+            QpackProgress::Instruction,
             "a continuation byte with its top bit clear ends the integer"
         );
     }
