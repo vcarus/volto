@@ -4,7 +4,7 @@ Target platform is a Linux host with systemd; the development host is macOS and
 the test suite is expected to pass on both.
 
 A stock Ubuntu 24.04 image already carries everything the release path needs:
-`curl`, `tar`, `sha256sum`, `openssl` and systemd itself. `ufw` is not among
+`curl`, `tar`, `sha256sum`, `ssh-keygen`, `openssl` and systemd itself. `ufw` is not among
 them and neither script requires it — the installer notices its absence and says
 so instead of failing. Building on the host instead of downloading a release is
 what adds requirements, and they are named under [building](#building).
@@ -263,8 +263,8 @@ reports that version keeps the bytes of the first upload until a run is forced.
 
 ### The release signature
 
-Every release carries `SHA256SUMS.sig`, a signature over `SHA256SUMS` made with
-the release key. `deploy.sh` carries the public half of that key in its
+Every release from 1.4.0 on carries `SHA256SUMS.sig`, a signature over
+`SHA256SUMS` made with the release key. `deploy.sh` carries the public half of that key in its
 `RELEASE_SIGNER` line and verifies the signature with `ssh-keygen -Y verify`
 before it reads a checksum. The private half is not stored on GitHub. The
 release workflow builds the tarballs, attests their provenance and leaves a
@@ -285,18 +285,24 @@ of them, and needs `--tag`, so it applies to one named release:
 sudo volto-deploy --tag v1.3.7 --allow-unsigned
 ```
 
-The flag is refused for 1.4.0 and every later release, so removing a signature
+With the flag nothing but the release page vouches for that release: the
+checksum list comes from the same page as the archive. The flag is refused for
+1.4.0 and every later release, so removing a signature
 from the release page does not make a signed release installable. A signature
 that is present and does not verify is refused with or without the flag. After
 such an install the copy at `/usr/local/sbin/volto-deploy` is left as it was:
 the script a release from before signing carries verifies nothing, and
-installing it would end the check for every later release.
+installing it would end the check for every later release. For the same reason
+`--enable-timer` is refused when there is no copy to install, which is the case
+for a piped run that installs an unsigned release.
 
 What the signature does not cover is the first run. The one-line bootstrap
 pipes `deploy.sh` from the repository, so on a bare host the key is whatever
 that copy says. From then on the installed copy at
-`/usr/local/sbin/volto-deploy` is owned by root and is replaced only from a
-release it has verified, which is also how a new key would reach a host.
+`/usr/local/sbin/volto-deploy` is owned by root. A run replaces it from a
+release whose signature it has verified, which is also how a new key would
+reach a host, or from the file the run itself was started from; a piped run has
+no such file and replaces nothing.
 
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of

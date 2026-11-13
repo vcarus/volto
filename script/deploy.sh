@@ -279,6 +279,11 @@ verify_release() {
         die "$TAG carries no SHA256SUMS.sig -- refusing to install an unsigned release"
     fi
 
+    # A NUL byte is dropped by `read` and kept by awk, so the two readers below
+    # would see different lines. No list this project signs contains one.
+    tr -d '\000' <"$TMP/SHA256SUMS" | cmp -s - "$TMP/SHA256SUMS" ||
+        die "SHA256SUMS in $TAG contains a NUL byte -- refusing to install it"
+
     while IFS= read -r line || [ -n "$line" ]; do
         [[ "$line" =~ ^[0-9a-f]{64}\ \ volto-[0-9A-Za-z._-]+\.tar\.gz$ ]] ||
             die "SHA256SUMS in $TAG has a line that is not a checksum and an archive name -- refusing to install it"
@@ -289,7 +294,7 @@ verify_release() {
     [ "${#expected}" -eq 64 ] ||
         die "SHA256SUMS in $TAG lists $NAME.tar.gz more than once -- refusing to install it"
 
-    actual="$(sha256sum <"$TMP/$NAME.tar.gz")"
+    actual="$(sha256sum <"$TMP/$NAME.tar.gz")" || die "could not compute the checksum of $NAME.tar.gz"
     [ "${actual:0:64}" = "$expected" ] ||
         die "checksum mismatch for $NAME.tar.gz -- refusing to install it"
     note "checksum verified against SHA256SUMS"
@@ -308,7 +313,7 @@ verify_release() {
 refuse_automatic_downgrade() {
     [ "$TAG_WAS_RESOLVED" -eq 1 ] || return 0
     is_older_version "$VERSION" "$INSTALLED" || return 0
-    die "the latest release is $TAG and this host runs $INSTALLED -- refusing to go back without being told to (a rollback is: $0 --tag $TAG)"
+    die "the latest release is $TAG and this host runs $INSTALLED -- refusing to go back without being told to; check the releases page before anything else, since a rollback is only ever made by naming the release with --tag"
 }
 
 # True when version $1 is strictly older than version $2, comparing the dotted
@@ -397,6 +402,8 @@ check_config_with() {
 
 # --- arguments ---------------------------------------------------------------
 
+ARGUMENT_COUNT=$#
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -t|--tag)       [ $# -ge 2 ] || die "$1 needs a value"; TAG="$2"; shift 2 ;;
@@ -435,6 +442,8 @@ fi
 # RELEASE_SIGNER and no variable, so the environment cannot change which key a
 # host trusts.
 if [ "$VERIFY_ONLY" -eq 1 ]; then
+    [ "$ARGUMENT_COUNT" -eq 3 ] ||
+        die "--verify-signature takes two files and no other option: it checks a signature and deploys nothing"
     command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
     [ -f "$VERIFY_SUMS" ] || die "no such file: $VERIFY_SUMS"
     [ -f "$VERIFY_SIG" ] || die "no such file: $VERIFY_SIG"
@@ -484,6 +493,11 @@ else
         v[0-9]*) ;;
         *) die "$REPO has no release yet (the latest-release redirect went to $location)" ;;
     esac
+    # A release this script installs without being told to is named by three
+    # numbers. The downgrade refusal below compares numbers and cannot order
+    # anything else, so a tag it cannot order is not installed on its own.
+    [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+        die "the latest release is tagged $TAG, which is not vX.Y.Z -- refusing to install it without --tag"
 fi
 VERSION="${TAG#v}"
 
@@ -516,8 +530,10 @@ fi
 # --- download and verify -----------------------------------------------------
 
 # The source this script re-installs itself from; a downloaded release carries a
-# fresher copy and overrides this below.
-SELF_SOURCE="$0"
+# fresher copy and overrides this below. BASH_SOURCE rather than $0: piped into
+# bash this script has no file, BASH_SOURCE is then empty, and $0 is the word
+# "bash", which names a file whenever the working directory happens to hold one.
+SELF_SOURCE="${BASH_SOURCE[0]:-}"
 
 # Converging means the whole install, not just the binary: a deleted config or
 # unit must be regenerated even when the version already matches, and doing so
@@ -689,6 +705,7 @@ fi
 # must never hit the file bash is currently reading, hence the copy-then-rename.
 refresh_self() {
     local resolved
+    [ -n "$SELF_SOURCE" ] || return 0
     resolved="$(readlink -f "$SELF_SOURCE" 2>/dev/null || echo "$SELF_SOURCE")"
     # Piped from curl, $0 is not a file; the release download normally overrides
     # SELF_SOURCE with the tarball copy, but on an already-current host there is
@@ -713,6 +730,13 @@ if [ "$ENABLE_TIMER" -eq 1 ] || [ -f "$TIMER_UNIT" ]; then
         echo "dry-run: would enable timer"
         exit 0
     fi
+
+    # The timer runs the installed copy. A piped run that installed a release
+    # from before signing has no copy to install: it has no file of its own, and
+    # the release's copy is not taken. A timer pointing at nothing would fail
+    # every day, so it is not enabled.
+    [ -f "$SELF_INSTALLED" ] ||
+        die "there is no copy of this script to install as $SELF_INSTALLED, so the timer was not enabled -- run this script from a file, or deploy a signed release"
 
     # systemd disables the start timeout for Type=oneshot, and this oneshot runs
     # a network download. Without a bound a stalled path holds the daily run

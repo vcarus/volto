@@ -888,6 +888,35 @@ fn a_piped_bootstrap_has_nothing_to_copy_and_says_so_by_succeeding() {
     );
 }
 
+/// A piped run has no file of its own, and `$0` is then the word `bash`. With a
+/// file of that name in the working directory, the script once installed that
+/// file as the copy the timer runs as root (second review, 2026-11-13).
+#[test]
+fn a_piped_run_does_not_install_a_file_named_bash_from_the_working_directory() {
+    let root = install_root("piped-bash");
+    let elsewhere = scratch_tree("deploy", "piped-bash-cwd", &[]);
+    write_executable(&elsewhere.join("bash"), "#!/bin/sh\necho planted\n");
+
+    let script = fs::File::open(deploy_script()).expect("the deploy script must be readable");
+    let output = Command::new("bash")
+        .args(["-s", "--", "--dry-run", "--enable-timer", "--tag", "v0.2.4"])
+        .current_dir(&elsewhere)
+        .env("VOLTO_DEPLOY_ROOT", &root)
+        .stdin(Stdio::from(script))
+        .output()
+        .expect("the deploy script must be runnable from stdin");
+
+    assert!(
+        output.status.success(),
+        "a piped run must not abort: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        !root.join("usr/local/sbin/volto-deploy").exists(),
+        "a file named `bash` in the working directory was installed as the timer's script"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The release signature
 // ---------------------------------------------------------------------------
@@ -1240,6 +1269,7 @@ fn a_signed_list_with_a_line_that_tools_read_differently_is_refused() {
         ),
         ("binary-marker", "{D} *{A}\n", "has a line that is not"),
         ("carriage-return", "{D}  {A}\r\n", "has a line that is not"),
+        ("nul-byte", "{D}  {A}\n\0", "contains a NUL byte"),
         (
             "listed-twice",
             "{D}  {A}\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff  {A}\n",
@@ -1341,7 +1371,7 @@ fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
 
     let assignments: Vec<&&str> = code
         .iter()
-        .filter(|line| line.starts_with("RELEASE_SIGNER="))
+        .filter(|line| line.contains("RELEASE_SIGNER="))
         .collect();
     assert_eq!(
         assignments.len(),
@@ -1391,6 +1421,18 @@ fn the_trusted_key_is_a_literal_and_the_install_path_is_one_call() {
     // The installed copy of the script is replaced from the release in one
     // place, and only under a verified signature. A release from before signing
     // carries a script that verifies nothing.
+    assert_eq!(
+        code.iter()
+            .filter(|line| line.contains("SELF_SOURCE="))
+            .count(),
+        2,
+        "SELF_SOURCE is set in two places: from this script's own file, and from a signed release"
+    );
+    assert!(
+        code.contains(&"SELF_SOURCE=\"${BASH_SOURCE[0]:-}\""),
+        "the script's own file comes from BASH_SOURCE, which is empty on a piped run"
+    );
+
     let takes: Vec<usize> = code
         .iter()
         .enumerate()
@@ -1429,6 +1471,16 @@ fn allowing_an_unsigned_release_is_refused_from_the_first_signed_version_on() {
         stderr_of(&output).contains("--allow-unsigned applies to releases before 1.4.0"),
         "{}",
         stderr_of(&output)
+    );
+
+    // Fields compare as numbers, so 1.10.0 is not before 1.4.0.
+    let output = run_deploy_under(
+        Some(&root),
+        &["--dry-run", "--tag", "v1.10.0", "--allow-unsigned"],
+    );
+    assert!(
+        !output.status.success(),
+        "--allow-unsigned must not apply to 1.10.0"
     );
 
     let output = run_deploy_under(
@@ -1471,12 +1523,29 @@ fn a_run_that_looked_up_the_latest_release_never_goes_back() {
     );
     let stderr = stderr_of(&output);
     assert!(
-        stderr.contains("refusing to go back") && stderr.contains("--tag v1.4.0"),
+        stderr.contains("refusing to go back") && stderr.contains("--tag"),
         "the refusal must say how a rollback is done: {stderr}"
+    );
+    assert!(
+        !stderr.contains("--tag v1.4.0"),
+        "the refusal must not hand over the command for the release the page points at: {stderr}"
+    );
+
+    // Fields compare as numbers: 1.9.0 is older than 1.10.0.
+    let output = automatic_downgrade(true, "1.9.0", "1.10.0");
+    assert!(
+        !output.status.success(),
+        "1.10.0 to 1.9.0 is a downgrade and must be refused"
     );
 
     for (resolved, release, installed, what) in [
         (true, "1.4.1", "1.4.0", "an upgrade"),
+        (
+            true,
+            "1.10.0",
+            "1.9.0",
+            "an upgrade across a two-digit field",
+        ),
         (true, "1.4.0", "1.4.0", "the same version"),
         (true, "1.4.0", "", "a first install"),
         (false, "1.4.0", "1.4.1", "a rollback named with --tag"),
@@ -1511,6 +1580,10 @@ fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alo
         .filter(|line| *line == "TAG_WAS_RESOLVED=1")
         .collect();
     assert_eq!(armed.len(), 1, "one place arms the refusal");
+    assert!(
+        text.contains("[[ \"$TAG\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]] ||"),
+        "a looked-up tag must be three numbers, or the refusal cannot order it"
+    );
     let lookup = text.find("releases/latest").expect("the latest lookup");
     let arm = text.find("TAG_WAS_RESOLVED=1").expect("the arming line");
     assert!(
@@ -1523,14 +1596,7 @@ fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alo
 /// through to an ordinary run, which exited 0 having verified nothing.
 #[test]
 fn verifying_a_signature_with_an_empty_file_name_fails() {
-    let output = run_deploy(&[
-        "--verify-signature",
-        "",
-        "x",
-        "--dry-run",
-        "--tag",
-        "v1.0.0",
-    ]);
+    let output = run_deploy(&["--verify-signature", "", "x"]);
 
     assert!(
         !output.status.success(),
@@ -1538,4 +1604,30 @@ fn verifying_a_signature_with_an_empty_file_name_fails() {
         stdout_of(&output)
     );
     assert!(stderr_of(&output).contains("no such file"));
+}
+
+/// The mode deploys nothing, so an option that asks for a deploy beside it is
+/// refused instead of being dropped without a word.
+#[test]
+fn verifying_a_signature_takes_no_other_option() {
+    let fixture = repo_root().join("tests/fixtures/release-signature");
+    let sums = fixture.join("SHA256SUMS");
+    let signature = fixture.join("SHA256SUMS.sig");
+    let output = run_deploy(&[
+        "--verify-signature",
+        sums.to_str().unwrap(),
+        signature.to_str().unwrap(),
+        "--tag",
+        "v1.4.0",
+    ]);
+
+    assert!(
+        !output.status.success(),
+        "another option beside --verify-signature must be refused"
+    );
+    assert!(
+        stderr_of(&output).contains("no other option"),
+        "{}",
+        stderr_of(&output)
+    );
 }
