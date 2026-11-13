@@ -28,11 +28,15 @@ publish = false
 # token lifetime being two weeks). It also starts as a hash set and becomes a
 # bloom filter only once that set grows, so an early profile shows far less than
 # the bound and a later one shows the bound. Neither is a leak.
+#
+# quinn's `log` feature is left out. It turns on `tracing/log` for the whole
+# build, which adds to every `tracing` call site, quinn's and ours, a branch
+# that writes a `log` record while no subscriber is installed. `main` installs
+# one before the endpoint exists, so that branch never runs here.
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
     "rustls-aws-lc-rs",
     "bloom",
-    "log",
 ] }
 # Named for one type: `quinn_proto::RttEstimator`, which `Controller::on_ack`
 # takes (src/congestion.rs) and quinn does not re-export. quinn-proto is already
@@ -78,7 +82,13 @@ percent-encoding = "2"
 # the only item used.
 subtle = "2"
 serde = { version = "1", features = ["derive"] }
-toml = "1.1"
+# Read only: the configuration is parsed and never written, so the default
+# `display` feature and its `toml_writer` crate are left out.
+toml = { version = "1.1", default-features = false, features = [
+    "std",
+    "serde",
+    "parse",
+] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
