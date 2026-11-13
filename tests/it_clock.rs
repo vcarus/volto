@@ -79,7 +79,7 @@ fn no_source_file_reads_the_wall_clock() {
             };
             for identifier in WALL_CLOCK {
                 if code.contains(identifier) {
-                    let relative = path.strip_prefix(&root).unwrap_or(&path);
+                    let relative = path.trim_prefix(&root);
                     offences.push(format!(
                         "src/{}:{}: {identifier}",
                         relative.display(),

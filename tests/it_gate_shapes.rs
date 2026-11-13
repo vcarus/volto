@@ -40,6 +40,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -618,8 +619,9 @@ fn judged_by_its_name_alone(shape: &str, build: impl Fn(&str) -> Vec<u8>) {
         "{shape}: a first flight naming {LISTED} must reach quinn"
     );
     let refusal = judgement(&build(UNLISTED), &names);
-    assert!(
-        matches!(refusal, Verdict::Refuse(Refusal::OtherName(_))),
+    assert_matches!(
+        refusal,
+        Verdict::Refuse(Refusal::OtherName(_)),
         "{shape}: a first flight naming {UNLISTED} must be refused for its name, not {refusal:?}"
     );
 }

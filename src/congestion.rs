@@ -377,7 +377,7 @@ impl BbrCapped {
             bbr_window_bytes = self.inner.window(),
             window_bytes = self.window(),
             in_flight_bytes = in_flight,
-            min_rtt_us = self.min_rtt.map_or(0, |(min, _)| min.as_micros()),
+            min_rtt_us = self.min_rtt.map_or_default(|(min, _)| min.as_micros()),
             srtt_us = self.srtt.as_micros(),
             ack_interval_us = sample.ack_elapsed.as_micros(),
             send_interval_us = sample.send_elapsed.as_micros(),

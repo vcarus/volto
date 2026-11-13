@@ -1454,7 +1454,7 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
     let rest = path
         .strip_prefix(WELL_KNOWN_PREFIX)
         .ok_or("path is not the connect-udp template")?;
-    let rest = rest.strip_suffix('/').unwrap_or(rest);
+    let rest = rest.trim_suffix('/');
 
     // Split before decoding: a percent-encoded slash inside a segment must not
     // create a segment boundary.

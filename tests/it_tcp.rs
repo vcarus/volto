@@ -2,6 +2,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;
@@ -915,11 +916,9 @@ async fn a_client_abort_closes_a_target_that_stopped_reading() {
         .await
         .expect("the target socket must be closed once the client aborts")
         .expect("close notification");
-    assert!(
-        matches!(
-            end,
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-        ),
+    assert_matches!(
+        end,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe,
         "the target must see the connection go away, got {end:?}"
     );
 }
@@ -956,11 +955,9 @@ async fn a_client_reset_closes_a_target_that_stopped_reading() {
         .await
         .expect("the target socket must be closed once the client resets the stream")
         .expect("close notification");
-    assert!(
-        matches!(
-            end,
-            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-        ),
+    assert_matches!(
+        end,
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe,
         "the target must see the connection go away, got {end:?}"
     );
 }

@@ -18,6 +18,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -1038,8 +1039,9 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
     };
 
     let (_, ended) = tokio::join!(storm, closed);
-    assert!(
-        matches!(ended, Ok(None)),
+    assert_matches!(
+        ended,
+        Ok(None),
         "an idled-out session must end its request stream cleanly, got {ended:?}"
     );
 }

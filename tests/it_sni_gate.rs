@@ -22,6 +22,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;
@@ -84,8 +85,9 @@ fn assert_silent<'a>(server: &'a TestServer, name: &'a str) -> impl Future<Outpu
             .await
             .expect_err("a name the gate does not know must not complete a handshake");
 
-        assert!(
-            matches!(error, quinn::ConnectionError::TimedOut),
+        assert_matches!(
+            error,
+            quinn::ConnectionError::TimedOut,
             "asking for {name:?} at {caller} must get silence, not a reply: {error:?}"
         );
     }
@@ -135,8 +137,9 @@ async fn a_handshake_carrying_no_server_name_is_dropped_without_a_reply() {
         .await
         .expect_err("a ClientHello with no server_name must not complete a handshake");
 
-    assert!(
-        matches!(error, quinn::ConnectionError::TimedOut),
+    assert_matches!(
+        error,
+        quinn::ConnectionError::TimedOut,
         "a nameless ClientHello must get silence, not a reply: {error:?}"
     );
 }

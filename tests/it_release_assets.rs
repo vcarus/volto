@@ -492,7 +492,7 @@ fn carries_a_line_number(line: &str) -> bool {
     let word_form = line.match_indices("line").any(|(at, _)| {
         let starts_a_word = at == 0 || !bytes[at - 1].is_ascii_alphanumeric();
         let rest = &line[at + "line".len()..];
-        let rest = rest.strip_prefix('s').unwrap_or(rest);
+        let rest = rest.trim_prefix('s');
         starts_a_word
             && rest
                 .strip_prefix(' ')

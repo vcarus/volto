@@ -20,6 +20,7 @@
 
 mod common;
 
+use std::assert_matches;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -552,11 +553,9 @@ async fn an_authenticated_connection_is_never_the_one_evicted() {
     let error = finish_connect(&refused, server.addr)
         .await
         .expect_err("an authenticated connection must not lose its slot to a newcomer");
-    assert!(
-        matches!(
-            error,
-            quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset
-        ),
+    assert_matches!(
+        error,
+        quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::Reset,
         "expected the connection to be refused, got {error}"
     );
 

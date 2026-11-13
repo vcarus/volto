@@ -743,7 +743,7 @@ fn scan() -> Vec<Statement> {
     let mut found = Vec::new();
     for path in rust_files(&root) {
         let text = read_text(&path);
-        let relative = path.strip_prefix(&root).unwrap_or(&path);
+        let relative = path.trim_prefix(&root);
         found.extend(log_statements(
             &relative.display().to_string(),
             &production_code(&text),
@@ -923,7 +923,7 @@ fn every_log_id_the_docs_quote_names_a_statement() {
                 .collect();
             quoted += 1;
             if !ids.contains(&id) {
-                let relative = page.strip_prefix(&root).unwrap_or(page);
+                let relative = page.trim_prefix(&root);
                 unknown.push(format!("{}: log_id={id}", relative.display()));
             }
         }

@@ -401,6 +401,7 @@ fn sextet(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     /// Standard base64, built without the decoder under test.
     fn encode_base64(input: &[u8]) -> String {
@@ -673,10 +674,7 @@ mod tests {
             let fields = fields(&[(PROXY_AUTHORIZATION, value(case))]);
             let denials = auth.authenticate(&fields).expect_err("must be rejected");
             let denied = denials.reported();
-            assert!(
-                matches!(denied, Denied::Malformed(_)),
-                "{case:?} gave {denied:?}"
-            );
+            assert_matches!(denied, Denied::Malformed(_), "{case:?} gave {denied:?}");
             // Whatever the reason, it must not quote the credentials back.
             assert!(!denied.reason().contains("dXNl"), "{denied:?}");
         }

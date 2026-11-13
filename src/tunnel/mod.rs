@@ -1063,6 +1063,7 @@ mod tests {
     use super::*;
     use crate::h3api::{FieldValue, Status};
     use crate::quic::tests::loopback_pair;
+    use std::assert_matches;
 
     fn connect_with_protocol(protocol: Option<&str>) -> Request {
         let mut req = Request::new(Method::Connect);
@@ -1543,7 +1544,7 @@ mod tests {
             .await
             .expect_err("a lookup that never answers must not succeed");
 
-        assert!(matches!(failure, ResolveFailure::TimedOut(_)), "{failure}");
+        assert_matches!(failure, ResolveFailure::TimedOut(_), "{failure}");
         assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
         assert_eq!(
             failure.proxy_error().recommended_status(),
@@ -1570,10 +1571,8 @@ mod tests {
         tokio::time::advance(Duration::from_secs(3 * 60 * 60)).await;
 
         let failure = waiting.await.expect_err("the budget is long gone");
-        assert!(
-            matches!(failure, ResolveFailure::TimedOut(reported) if reported == budget),
-            "{failure}"
-        );
+        assert_matches!(failure, ResolveFailure::TimedOut(reported) if reported == budget,
+            "{failure}");
         assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
     }
 

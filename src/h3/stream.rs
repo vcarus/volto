@@ -1294,6 +1294,7 @@ fn body_piece(item: Item) -> Result<Option<Bytes>, frame::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::assert_matches;
 
     fn field(name: &str, value: &str) -> Field {
         Field {
@@ -1806,8 +1807,9 @@ mod tests {
             .await
             .expect("the kept violation needs no read")
             .expect_err("the violation must be reported");
-        assert!(
-            matches!(error, StreamError::Connection(_)),
+        assert_matches!(
+            error,
+            StreamError::Connection(_),
             "expected a connection error, got {error}"
         );
         assert!(
@@ -1851,9 +1853,7 @@ mod tests {
 
         let error = poll_once(watcher.as_mut())
             .expect("the reset must complete the parked read without a timer");
-        assert!(
-            matches!(error, StreamError::RemoteTerminate { code } if code.value() == 0x10c),
-            "expected the peer's reset, got {error}"
-        );
+        assert_matches!(error, StreamError::RemoteTerminate { code } if code.value() == 0x10c,
+            "expected the peer's reset, got {error}");
     }
 }
