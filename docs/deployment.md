@@ -11,7 +11,7 @@ what adds requirements, and they are named under [building](#building).
 
 ## Building
 
-Rust 1.95 or newer. `Cargo.lock` is committed, so build with the lockfile to
+Rust 1.100 or newer. `Cargo.lock` is committed, so build with the lockfile to
 get the dependency graph the releases are built from:
 
 ```sh

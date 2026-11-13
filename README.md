@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/vcarus/volto/actions/workflows/ci.yml/badge.svg)](https://github.com/vcarus/volto/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/vcarus/volto?display_name=tag)](https://github.com/vcarus/volto/releases/latest)
-[![MSRV](https://img.shields.io/badge/rust-1.95%2B-blue)](docs/deployment.md#building)
+[![MSRV](https://img.shields.io/badge/rust-1.100%2B-blue)](docs/deployment.md#building)
 [![Docs](https://img.shields.io/badge/docs-manual-8da0cb)](https://vcarus.github.io/volto/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -60,7 +60,7 @@ sudo script/deploy.sh --enable-timer       # or: install + keep it updated
 
 ### 3. From source
 
-Rust 1.95 or newer. `Cargo.lock` is committed, so build `--locked` to get the dependency graph the releases are built from.
+Rust 1.100 or newer. `Cargo.lock` is committed, so build `--locked` to get the dependency graph the releases are built from.
 
 ```sh
 cargo build --release --locked             # target/release/volto
@@ -90,7 +90,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Client** | Surge (iOS / macOS) `masque` policy. Auth is HTTP Basic; add `sni=` and `server-cert-verify-name=` when the server sits behind a relay IP. |
 | **Server** | Linux (`x86_64`, `aarch64`); static musl binaries, no runtime dependencies. Listens on **UDP only**: open the QUIC port in your firewall, there is no TCP listener. |
 | **Behind a relay** | Works behind a plain L4 UDP DNAT relay; TLS terminates only on volto. See [Running behind a UDP relay](docs/deployment.md#running-behind-a-udp-relay). |
-| **Development** | macOS or Linux, Rust 1.95+. The test suite is green on both. |
+| **Development** | macOS or Linux, Rust 1.100+. The test suite is green on both. |
 
 From v1.0.0 on, configuration keys, their defaults and the command-line arguments are stable within 1.x, and a key is removed only after at least one minor release has warned about it. One exception so far: v1.3.0 removed the accepted value `congestion_control = "bbr-capped"` without a warning release, so a file that sets it no longer loads. Log line shapes and the `volto` library API are outside that promise; see [Version compatibility](docs/configuration.md#version-compatibility).
 
