@@ -37,7 +37,8 @@ A musl build also compiles mimalloc with the same C compiler and uses it as the 
 
 The release workflow builds both
 targets with [`cross`](https://github.com/cross-rs/cross); the resulting static
-binaries are attached to each tagged release together with a `SHA256SUMS` file.
+binaries are attached to each tagged release together with a `SHA256SUMS` file
+and `SHA256SUMS.sig`, the release key's signature over it.
 Each archive unpacks to the binary, `LICENSE`, `README.md`, `script/` and
 `docs/` -- so the installer runs straight out of it, and the pages both scripts
 name when they refuse to install are on the host rather than only on the web.
@@ -100,12 +101,20 @@ base="https://github.com/vcarus/volto/releases/download/v${version}"
 
 curl -fsSLO "$base/$name.tar.gz"
 curl -fsSLO "$base/SHA256SUMS"
+curl -fsSLO "$base/SHA256SUMS.sig"
+curl -fsSLO https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh
+bash deploy.sh --verify-signature SHA256SUMS SHA256SUMS.sig
 sha256sum --ignore-missing -c SHA256SUMS
 
 tar xzf "$name.tar.gz"
 cd "$name"
 sudo script/install-selfsigned.sh --binary ./volto
 ```
+
+`--verify-signature` checks that `SHA256SUMS.sig` is the release key's
+signature over `SHA256SUMS` and does nothing else; it needs `ssh-keygen` and
+neither root nor the network. The checksum then ties the archive to that signed
+list. See [the release signature](#the-release-signature) for what the key is.
 
 `--ignore-missing` is what lets that check pass at all: `SHA256SUMS` lists the
 archive for both architectures and you downloaded one, so without it the other
@@ -208,9 +217,10 @@ What pinning changes, and why each point matters:
 
 [`script/deploy.sh`](https://github.com/vcarus/volto/blob/main/script/deploy.sh) turns the release page into the
 deployment mechanism: it resolves the newest release (or the one given with
-`--tag`), downloads the tarball for the host's architecture, verifies it
-against the release's `SHA256SUMS`, and then does whichever of three things the
-host needs:
+`--tag`), downloads the tarball for the host's architecture, verifies the
+release's signature and the tarball's checksum (see
+[the release signature](#the-release-signature)), and then does whichever of
+three things the host needs:
 
 - **No install yet** (`/etc/volto/config.toml` absent): it runs the bundled
   `install-selfsigned.sh` for the full first-time setup, so the same flags and
@@ -248,9 +258,39 @@ v0.4.7`. The case it is for is a release deleted and published again under the
 same tag: the convergence check compares version strings, so a host that already
 reports that version keeps the bytes of the first upload until a run is forced.
 
+### The release signature
+
+Every release carries `SHA256SUMS.sig`, a signature over `SHA256SUMS` made with
+the release key. `deploy.sh` carries the public half of that key in its
+`RELEASE_SIGNER` line and verifies the signature with `ssh-keygen -Y verify`
+before it reads a checksum. The private half is not stored on GitHub. The
+release workflow builds the tarballs, attests their provenance and leaves a
+draft; the maintainer verifies the attestation, signs and publishes. Control of
+the repository or of the release page is therefore not enough to produce a
+release that a host installs.
+
+A release whose signature is missing or wrong is refused, and the running
+service is left alone. The daily timer has no way around that. Releases from
+before signing have no `SHA256SUMS.sig`; `--allow-unsigned` installs one, and
+needs `--tag`, so it applies to one named release:
+
+```sh
+sudo volto-deploy --tag v1.3.7 --allow-unsigned
+```
+
+A signature that is present and does not verify is refused with or without the
+flag.
+
+What the signature does not cover is the first run. The one-line bootstrap
+pipes `deploy.sh` from the repository, so on a bare host the key is whatever
+that copy says. From then on the installed copy at
+`/usr/local/sbin/volto-deploy` is owned by root and is replaced only from a
+release it has verified, which is also how a new key would reach a host.
+
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of
-the checksum-verified release tarball, the piped copy only steers. With stdin
+the release tarball, after its signature and checksum have been verified; the
+piped copy only steers. With stdin
 being a pipe it never prompts, so give `--sni` (and friends) explicitly or
 accept their defaults:
 

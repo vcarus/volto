@@ -31,7 +31,7 @@ The server terminates TLS, speaks HTTP/3 to the client and carries **TCP through
 
 ### 1. One line on a fresh Ubuntu host
 
-Downloads the newest release for the host's architecture, verifies it against `SHA256SUMS`, creates the system user, generates a self-signed certificate and a 144-bit password, writes `/etc/volto/config.toml`, installs the systemd unit and starts it. With `--enable-timer` the same script re-runs daily and upgrades in place, with automatic rollback if the new version fails to start.
+Downloads the newest release for the host's architecture, verifies the release key's signature and the checksum, creates the system user, generates a self-signed certificate and a 144-bit password, writes `/etc/volto/config.toml`, installs the systemd unit and starts it. With `--enable-timer` the same script re-runs daily and upgrades in place, with automatic rollback if the new version fails to start.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
@@ -46,7 +46,7 @@ volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-s
 
 > **The fingerprint is the trust anchor.** Carry it to the client over a channel you trust and never replace it with `skip-cert-verify`: Basic credentials travel on every request, so a man in the middle collects them at once. For a public-CA certificate instead, see [docs/deployment.md](docs/deployment.md#certificates).
 
-Everything the piped script installs comes out of the checksum-verified release tarball; the piped copy only steers. Details and every flag: [Deploying from releases](docs/deployment.md#deploying-from-releases).
+Everything the piped script installs comes out of the release tarball, after its signature and checksum have been verified; the piped copy only steers. Details and every flag: [Deploying from releases](docs/deployment.md#deploying-from-releases).
 
 ### 2. From a release tarball
 

@@ -22,6 +22,19 @@
 # the same reason --dry-run does: the point is to put one named release's bytes
 # on this host.
 #
+# A release is trusted for one reason: its SHA256SUMS carries a signature made
+# with the release key, whose public half is RELEASE_SIGNER below. The private
+# half is not on GitHub, so nobody who controls the repository or the release
+# page can produce a file this script accepts. The checksum only ties the
+# tarball to that signed list. The signature is checked with ssh-keygen, which
+# every host already has, and a release without a valid one is refused with the
+# running service left alone.
+#
+# Releases older than the signature exist and stay reachable: --allow-unsigned
+# installs one whose SHA256SUMS.sig is absent, and needs --tag, so it is a
+# decision somebody makes for one named release and never what the timer does.
+# A signature that is present and wrong is refused either way.
+#
 # Rolling back by hand is the same flow pinned to an older release:
 #   sudo volto-deploy --tag v0.1.0
 #
@@ -77,13 +90,28 @@ TIMER_UNIT="$ROOT/etc/systemd/system/$TIMER_NAME.timer"
 ENABLE_TIMER=0
 DRY_RUN=0
 FORCE=0
+ALLOW_UNSIGNED=0
+
+# The public half of the release key, in OpenSSH form. Every release's
+# SHA256SUMS is signed with the private half, under the namespace below. This
+# line is the only trust anchor: the installed copy of this script is owned by
+# root, and a new key reaches a host inside a release the old key signed.
+RELEASE_SIGNER='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIChpIMVExa8wenp/vVCQr8t/7Vt2vt00byMqvX9Csbee'
+# The sshsig namespace, which keeps a signature made for anything else (a git
+# commit, a login) from being presented as a release signature.
+SIGN_NAMESPACE=volto-release
+# Set by --verify-signature: the two files to check, instead of deploying.
+VERIFY_SUMS=""
+VERIFY_SIG=""
 INSTALL_ARGS=()
 
 usage() {
     cat <<'USAGE'
 Usage: sudo script/deploy.sh [options]
 
-Fetches a volto release from GitHub, verifies its checksum and installs it. On
+Fetches a volto release from GitHub, verifies its signature and checksum and
+installs it. The signature is over SHA256SUMS, made with the release key this
+script carries the public half of; a release without a valid one is refused. On
 a host without an existing install this runs the bundled self-signed installer
 (install-selfsigned.sh) for the full first-time setup; on a host that already
 runs volto only the binary and the systemd unit are refreshed and the service
@@ -109,6 +137,13 @@ Options:
                        already matches it; needs --tag, keeps the rollback
                        guard, and rewrites neither the config nor the
                        certificate
+      --allow-unsigned install a release that carries no SHA256SUMS.sig, which
+                       is every release from before releases were signed;
+                       needs --tag, and a signature that is present must
+                       still be valid
+      --verify-signature SUMS SIG
+                       check that SIG is the release key's signature over the
+                       file SUMS, then stop; needs neither root nor network
   -s, --sni NAME       first install only: passed to install-selfsigned.sh
   -p, --port PORT      first install only: passed to install-selfsigned.sh
   -u, --username NAME  first install only: passed to install-selfsigned.sh
@@ -172,6 +207,24 @@ restore_previous() {
     [ -n "$restored" ] ||
         die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
     die "installing volto $VERSION failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+}
+
+# True when the file $3 is a signature over the file $2 made by the key $1.
+#
+# `ssh-keygen -Y verify` reads the message on standard input and takes the
+# trusted keys from an allowed-signers file, so one is written for the single
+# key and removed again. The principal is a label that the file and the call
+# must agree on; it names nobody. Everything ssh-keygen prints is dropped: the
+# callers say what was being verified, which its own message does not.
+signature_is_valid() {
+    local signer="$1" sums="$2" sig="$3" allowed status=0
+
+    allowed="$(mktemp)"
+    printf 'release namespaces="%s" %s\n' "$SIGN_NAMESPACE" "$signer" >"$allowed"
+    ssh-keygen -Y verify -f "$allowed" -I release -n "$SIGN_NAMESPACE" \
+        -s "$sig" <"$sums" >/dev/null 2>&1 || status=$?
+    rm -f "$allowed"
+    return "$status"
 }
 
 # True when version $1 is strictly older than version $2, comparing the dotted
@@ -266,6 +319,10 @@ while [ $# -gt 0 ]; do
         --enable-timer) ENABLE_TIMER=1; shift ;;
         --dry-run)      DRY_RUN=1; shift ;;
         --force)        FORCE=1; shift ;;
+        --allow-unsigned) ALLOW_UNSIGNED=1; shift ;;
+        --verify-signature)
+                        [ $# -ge 3 ] || die "$1 needs two values: SUMS and SIG"
+                        VERIFY_SUMS="$2"; VERIFY_SIG="$3"; shift 3 ;;
         -s|--sni|-p|--port|-u|--username|-w|--password)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
@@ -281,6 +338,28 @@ if [ "$FORCE" -eq 1 ] && [ -z "$TAG" ]; then
     die "--force needs --tag: reinstalling means putting one named release's bytes on this host"
 fi
 
+if [ "$ALLOW_UNSIGNED" -eq 1 ] && [ -z "$TAG" ]; then
+    die "--allow-unsigned needs --tag: an unsigned release is installed by name, never as the latest one"
+fi
+
+# --- verify only -------------------------------------------------------------
+
+# The same function the install path calls, on two files somebody already has.
+# It is how the release is checked before it is published, and how a test
+# reaches the verification without root or the network. VOLTO_DEPLOY_SIGNER
+# replaces the key here and nowhere else: the install path below reads
+# RELEASE_SIGNER and no variable, so the environment cannot change which key a
+# host trusts.
+if [ -n "$VERIFY_SUMS" ]; then
+    command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required"
+    [ -f "$VERIFY_SUMS" ] || die "no such file: $VERIFY_SUMS"
+    [ -f "$VERIFY_SIG" ] || die "no such file: $VERIFY_SIG"
+    signature_is_valid "${VOLTO_DEPLOY_SIGNER:-$RELEASE_SIGNER}" "$VERIFY_SUMS" "$VERIFY_SIG" ||
+        die "$VERIFY_SIG is not the release key's signature over $VERIFY_SUMS"
+    echo "signature verified: $VERIFY_SIG over $VERIFY_SUMS"
+    exit 0
+fi
+
 # --- preflight ---------------------------------------------------------------
 
 # A dry run neither installs nor downloads, so none of this applies to it -- and
@@ -290,7 +369,7 @@ if [ "$DRY_RUN" -eq 0 ]; then
     [ "$(uname -s)" = Linux ] ||
         die "this script deploys releases to a Linux host; on a dev machine build with cargo instead"
     command -v systemctl >/dev/null 2>&1 || die "systemd is required"
-    for tool in curl tar sha256sum; do
+    for tool in curl tar sha256sum ssh-keygen; do
         command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
     done
 
@@ -394,9 +473,9 @@ else
     # below. curl starts no retry after --retry-max-time, and the longest
     # default backoff sleep before the third retry is 4 s, so one call takes at
     # most --retry-max-time + 4 + --max-time. The tarball takes at most
-    # 120 + 4 + 300 = 424 s and SHA256SUMS 60 + 4 + 60 = 124 s. With the 30 s
-    # latest-release request that is 578 s, which leaves 322 s for the rest of
-    # the run. --retry-max-time also stops a server's Retry-After header from
+    # 120 + 4 + 300 = 424 s, and SHA256SUMS and its signature 60 + 4 + 60 =
+    # 124 s each. With the 30 s latest-release request that is 702 s, which
+    # leaves 198 s for the rest of the run. --retry-max-time also stops a server's Retry-After header from
     # setting a longer sleep.
     echo "==> downloading $NAME.tar.gz ($TAG)"
     curl -fsSL --retry 3 --retry-max-time 120 --connect-timeout 10 --max-time 300 \
@@ -405,6 +484,23 @@ else
     curl -fsSL --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
         -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS" ||
         die "download failed: $BASE/SHA256SUMS"
+
+    # The signature comes first, because it is what makes SHA256SUMS worth
+    # reading: the checksum below only says the tarball is the one that list
+    # names. A download that fails is treated as a signature that is absent.
+    # Telling the two apart would mean trusting an HTTP status, and both end
+    # the same way: nothing is installed unless --allow-unsigned named this
+    # release.
+    if curl -fsSL --retry 3 --retry-max-time 60 --connect-timeout 10 --max-time 60 \
+        -o "$TMP/SHA256SUMS.sig" "$BASE/SHA256SUMS.sig"; then
+        signature_is_valid "$RELEASE_SIGNER" "$TMP/SHA256SUMS" "$TMP/SHA256SUMS.sig" ||
+            die "SHA256SUMS in $TAG is not signed by the release key -- refusing to install it"
+        note "SHA256SUMS is signed by the release key"
+    elif [ "$ALLOW_UNSIGNED" -eq 1 ]; then
+        note "$TAG carries no SHA256SUMS.sig; continuing because --allow-unsigned was given"
+    else
+        die "$TAG carries no SHA256SUMS.sig -- refusing to install an unsigned release (a release from before signing needs --tag and --allow-unsigned)"
+    fi
 
     grep -F "  $NAME.tar.gz" "$TMP/SHA256SUMS" >"$TMP/expected" ||
         die "SHA256SUMS in $TAG does not list $NAME.tar.gz"

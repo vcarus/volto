@@ -13,7 +13,7 @@ This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connec
 
 ## Install
 
-One line on a fresh Ubuntu host downloads the newest release for the architecture, verifies it against `SHA256SUMS`, creates the system user, generates a self-signed certificate and a password, writes `/etc/volto/config.toml`, installs the systemd unit and starts it:
+One line on a fresh Ubuntu host downloads the newest release for the architecture, verifies the release key's signature and the checksum, creates the system user, generates a self-signed certificate and a password, writes `/etc/volto/config.toml`, installs the systemd unit and starts it:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
@@ -32,5 +32,5 @@ It finishes by printing a ready-to-paste client policy line. Every flag, the cer
 
 - [API documentation](https://vcarus.github.io/volto/api/) — the crate's rustdoc, rebuilt from `main` on every push.
 - [Source repository](https://github.com/vcarus/volto) — the code, the issue tracker, and the tracked copy of these pages.
-- [Releases](https://github.com/vcarus/volto/releases) — static musl binaries for `x86_64` and `aarch64`, with `SHA256SUMS`.
+- [Releases](https://github.com/vcarus/volto/releases) — static musl binaries for `x86_64` and `aarch64`, with a signed `SHA256SUMS`.
 - [Security policy](https://github.com/vcarus/volto/blob/main/SECURITY.md) — how to report a vulnerability privately.

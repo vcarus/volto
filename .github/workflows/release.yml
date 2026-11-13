@@ -179,12 +179,22 @@ jobs:
           if-no-files-found: error
 
   release:
+    # The name is older than the last step: this job leaves a draft. A release
+    # becomes installable when its SHA256SUMS is signed with the release key,
+    # and that key is not on GitHub, so the maintainer verifies the provenance
+    # below, signs, uploads SHA256SUMS.sig and publishes. `script/deploy.sh`
+    # refuses a release without that signature, and a draft is invisible to its
+    # latest-release request, so no host sees the release before it is signed.
     name: publish release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: write
+      # The two the provenance attestation needs: an OIDC token to sign with,
+      # and the right to store the attestation with the repository.
+      id-token: write
+      attestations: write
     steps:
       # The changelog lives in the tag's annotation. Check the repository out
       # before anything else: checkout cleans the workspace, so the artifacts
@@ -203,6 +213,14 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
+      # A signed statement that these tarballs were built by this workflow from
+      # this tag's commit. The maintainer checks it before signing, with
+      # `gh attestation verify --signer-workflow ... --source-ref refs/tags/...`,
+      # so what gets signed is known to be what this run built.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: artifacts/*.tar.gz
+
       - name: Release notes
         run: |
           set -euo pipefail
@@ -215,7 +233,7 @@ jobs:
 
           ---
 
-          Static musl builds for x86_64 and aarch64. Verify with `SHA256SUMS`.
+          Static musl builds for x86_64 and aarch64. `SHA256SUMS` is signed with the release key, and `script/deploy.sh` verifies the signature and the checksum before it installs anything.
 
           Each archive carries the binary, `LICENSE`, `README.md` and the `script/` and `docs/` directories. Installing and updating is described in [docs/deployment.md](https://github.com/vcarus/volto/blob/main/docs/deployment.md).
           BOILERPLATE
@@ -228,3 +246,5 @@ jobs:
             artifacts/SHA256SUMS
           generate_release_notes: true
           body_path: notes.md
+          # Left as a draft for the signature; see the comment on this job.
+          draft: true

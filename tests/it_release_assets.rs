@@ -297,6 +297,38 @@ fn the_released_binary_is_executed_before_publishing() {
     }
 }
 
+/// The workflow must not publish. A published release without `SHA256SUMS.sig`
+/// is one every host refuses and the README's one-line install fails on, and
+/// the signature is made off GitHub, after the provenance of the tarballs has
+/// been checked. So the release step leaves a draft, and the job attests the
+/// tarballs it uploads.
+#[test]
+fn the_release_workflow_attests_its_tarballs_and_leaves_a_draft() {
+    let text = read_text(&repo_root().join(".github/workflows/release.yml"));
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+
+    for needle in [
+        "draft: true",
+        "id-token: write",
+        "attestations: write",
+        "subject-path: artifacts/*.tar.gz",
+    ] {
+        assert!(
+            code.contains(&needle),
+            "release.yml no longer carries `{needle}`"
+        );
+    }
+    assert!(
+        code.iter()
+            .any(|line| line.starts_with("- uses: actions/attest-build-provenance@")),
+        "release.yml no longer attests the provenance of the tarballs"
+    );
+}
+
 /// And it is only evidence at all if editing release.yml runs it.
 ///
 /// One occurrence on each side of the `pull_request:` key rather than two

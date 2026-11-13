@@ -145,6 +145,8 @@ fn the_script_documents_itself() {
         "--enable-timer",
         "--dry-run",
         "--force",
+        "--allow-unsigned",
+        "--verify-signature",
         "--sni",
         "Re-running is safe",
     ] {
@@ -222,6 +224,24 @@ fn forcing_a_reinstall_without_a_tag_is_rejected() {
     let stderr = stderr_of(&output);
     assert!(
         stderr.contains("--force needs --tag"),
+        "the error must say a tag is required: {stderr}"
+    );
+}
+
+/// An unsigned release is installed by name. Without a tag the run would
+/// resolve the latest release, which is the one path that must never accept a
+/// release without a signature, because it is the path the timer takes.
+#[test]
+fn allowing_an_unsigned_release_without_a_tag_is_rejected() {
+    let output = run_deploy(&["--allow-unsigned"]);
+
+    assert!(
+        !output.status.success(),
+        "--allow-unsigned without a tag must not run"
+    );
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("--allow-unsigned needs --tag"),
         "the error must say a tag is required: {stderr}"
     );
 }
@@ -865,5 +885,219 @@ fn a_piped_bootstrap_has_nothing_to_copy_and_says_so_by_succeeding() {
     assert!(
         stdout.ends_with("dry-run: would enable timer\n"),
         "the run must reach the timer decision: {stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The release signature
+// ---------------------------------------------------------------------------
+
+/// The sshsig namespace `script/deploy.sh` signs and verifies under.
+const SIGN_NAMESPACE: &str = "volto-release";
+
+/// Runs `ssh-keygen`, which the script itself requires on a host.
+fn ssh_keygen(args: &[&str]) -> Output {
+    Command::new("ssh-keygen")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("ssh-keygen must be runnable: script/deploy.sh verifies releases with it")
+}
+
+/// A fresh Ed25519 key pair in `dir`, returning the public key in the two-field
+/// form the script carries (`ssh-ed25519 AAAA…`, no comment).
+fn generate_key(dir: &Path, name: &str) -> String {
+    let path = dir.join(name);
+    let output = ssh_keygen(&[
+        "-q",
+        "-t",
+        "ed25519",
+        "-N",
+        "",
+        "-C",
+        "",
+        "-f",
+        path.to_str().expect("a UTF-8 scratch path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "generating a test key failed: {}",
+        stderr_of(&output)
+    );
+    let public = fs::read_to_string(path.with_extension("pub")).expect("the public key file");
+    let fields: Vec<&str> = public.split_whitespace().take(2).collect();
+    fields.join(" ")
+}
+
+/// Signs `file` with the private key `name` under `namespace`, leaving
+/// `<file>.sig` beside it.
+fn sign(dir: &Path, name: &str, namespace: &str, file: &Path) -> PathBuf {
+    let output = ssh_keygen(&[
+        "-Y",
+        "sign",
+        "-f",
+        dir.join(name).to_str().expect("a UTF-8 scratch path"),
+        "-n",
+        namespace,
+        file.to_str().expect("a UTF-8 scratch path"),
+    ]);
+    assert!(
+        output.status.success(),
+        "signing {} failed: {}",
+        file.display(),
+        stderr_of(&output)
+    );
+    let mut signature = file.as_os_str().to_owned();
+    signature.push(".sig");
+    PathBuf::from(signature)
+}
+
+/// Runs `--verify-signature`, with the trusted key replaced when one is given.
+fn verify_signature(signer: Option<&str>, sums: &Path, signature: &Path) -> Output {
+    let mut command = Command::new("bash");
+    command
+        .arg(deploy_script())
+        .arg("--verify-signature")
+        .arg(sums)
+        .arg(signature)
+        .current_dir(repo_root());
+    if let Some(signer) = signer {
+        command.env("VOLTO_DEPLOY_SIGNER", signer);
+    }
+    command
+        .output()
+        .expect("the deploy script must be runnable")
+}
+
+/// The key the script carries is the key that signs releases.
+///
+/// The fixture is a file signed on 2026-11-13 with the real release key, whose
+/// private half no test can reach. Changing `RELEASE_SIGNER` to any other key
+/// turns this red, which is the point: an edit to that line decides what every
+/// host will install.
+#[test]
+fn the_embedded_key_accepts_a_signature_made_with_the_release_key() {
+    let fixture = repo_root().join("tests/fixtures/release-signature");
+    let output = verify_signature(
+        None,
+        &fixture.join("SHA256SUMS"),
+        &fixture.join("SHA256SUMS.sig"),
+    );
+
+    assert!(
+        output.status.success(),
+        "the key in script/deploy.sh no longer verifies the fixture signed by \
+         the release key: {}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("signature verified"));
+}
+
+/// The four ways a signature can be wrong, each refused, beside the one way it
+/// is right. Run through `--verify-signature`, which calls the function the
+/// install path calls.
+#[test]
+fn a_signature_is_accepted_only_from_the_trusted_key_over_the_same_bytes() {
+    let dir = scratch_tree("deploy", "signature", &[]);
+    let trusted = generate_key(&dir, "trusted");
+    generate_key(&dir, "stranger");
+
+    let sums = dir.join("SHA256SUMS");
+    fs::write(
+        &sums,
+        "0123abcd  volto-9.9.9-x86_64-unknown-linux-musl.tar.gz\n",
+    )
+    .unwrap();
+    let signature = sign(&dir, "trusted", SIGN_NAMESPACE, &sums);
+
+    let good = verify_signature(Some(&trusted), &sums, &signature);
+    assert!(
+        good.status.success(),
+        "a signature by the trusted key over the same bytes must verify: {}",
+        stderr_of(&good)
+    );
+
+    // The same signature over a list that names a different checksum.
+    let tampered = dir.join("SHA256SUMS.tampered");
+    fs::write(
+        &tampered,
+        "0123abce  volto-9.9.9-x86_64-unknown-linux-musl.tar.gz\n",
+    )
+    .unwrap();
+    let output = verify_signature(Some(&trusted), &tampered, &signature);
+    assert!(!output.status.success(), "a changed list must be refused");
+    assert!(
+        stderr_of(&output).contains("is not the release key's signature"),
+        "the refusal must say what failed: {}",
+        stderr_of(&output)
+    );
+
+    // A valid signature by a key the script does not trust.
+    let by_stranger = dir.join("by-stranger");
+    fs::copy(&sums, &by_stranger).unwrap();
+    let stranger_signature = sign(&dir, "stranger", SIGN_NAMESPACE, &by_stranger);
+    let output = verify_signature(Some(&trusted), &by_stranger, &stranger_signature);
+    assert!(
+        !output.status.success(),
+        "a signature by another key must be refused"
+    );
+
+    // The trusted key's signature made for another purpose.
+    let other_purpose = dir.join("other-purpose");
+    fs::copy(&sums, &other_purpose).unwrap();
+    let git_signature = sign(&dir, "trusted", "git", &other_purpose);
+    let output = verify_signature(Some(&trusted), &other_purpose, &git_signature);
+    assert!(
+        !output.status.success(),
+        "a signature under another namespace must be refused"
+    );
+
+    // No signature at all.
+    let output = verify_signature(Some(&trusted), &sums, &dir.join("absent.sig"));
+    assert!(
+        !output.status.success(),
+        "a missing signature must be refused"
+    );
+
+    // And the key the script carries does not accept the test key's signature,
+    // so the override above is what made the first case pass.
+    let output = verify_signature(None, &sums, &signature);
+    assert!(
+        !output.status.success(),
+        "the embedded key accepted a signature made by a test key"
+    );
+}
+
+/// The environment can replace the key for `--verify-signature` and for
+/// nothing else. The install path names `RELEASE_SIGNER` itself, so no variable
+/// decides which key a host trusts.
+#[test]
+fn the_install_path_takes_its_key_from_the_script_and_not_the_environment() {
+    let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+
+    let reads: Vec<&&str> = code
+        .iter()
+        .filter(|line| line.contains("VOLTO_DEPLOY_SIGNER"))
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "VOLTO_DEPLOY_SIGNER is read in one place, the verify-only mode: {reads:?}"
+    );
+    assert!(
+        reads[0].contains("\"$VERIFY_SUMS\""),
+        "the one read of VOLTO_DEPLOY_SIGNER is the verify-only call: {}",
+        reads[0]
+    );
+    assert!(
+        code.iter().any(|line| line.starts_with(
+            "signature_is_valid \"$RELEASE_SIGNER\" \"$TMP/SHA256SUMS\" \"$TMP/SHA256SUMS.sig\""
+        )),
+        "the install path must verify the downloaded SHA256SUMS against RELEASE_SIGNER"
     );
 }
