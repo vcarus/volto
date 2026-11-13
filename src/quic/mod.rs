@@ -806,8 +806,8 @@ impl Server {
 
                 handled = conn::handle(quic, config, shutdown, &resolver, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
                     match handled {
-                        // The accept loop ended on its own terms: the peer said it would
-                        // send no further requests, or the GOAWAY drain completed.
+                        // The accept loop ended on its own terms: the GOAWAY drain
+                        // completed.
                         Ok(()) => Ok(CloseReason::Drained),
                         Err(error) => match h3api::benign_close(&error) {
                             // Surge abandons connections without a CONNECTION_CLOSE
@@ -910,8 +910,7 @@ impl Server {
 enum CloseReason {
     /// A newcomer took this connection's slot on a full roster.
     Evicted,
-    /// The accept loop ended on its own terms. The peer said it would send no
-    /// further requests, or the GOAWAY drain completed.
+    /// The accept loop ended on its own terms: the GOAWAY drain completed.
     Drained,
     /// The peer went silent and the idle timeout expired.
     Idle,

@@ -1155,6 +1155,15 @@ impl Control {
     /// Applies one item from the control stream.
     ///
     /// `seen` is whether a SETTINGS frame came before this item.
+    ///
+    /// Four arms below cannot be reached through [`serve_control`]: a second
+    /// SETTINGS, a HEADERS or a PUSH_PROMISE after SETTINGS, and any other
+    /// buffered frame type before SETTINGS. `frame::misplaced` refuses those
+    /// from the frame header, before the payload is buffered, so that such a
+    /// frame cannot hold the buffer budget. The arms stay because the `match`
+    /// has to cover every [`Frame`], and returning the same error is the safe
+    /// answer if the rules in `frame::misplaced` ever change. They must not
+    /// become a panic, because an unauthenticated peer writes this stream.
     fn accept(&mut self, item: Item, seen: bool, shared: &Shared) -> Result<(), Violation> {
         let frame = match item {
             Item::Frame(frame) => frame,
