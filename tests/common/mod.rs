@@ -5,7 +5,8 @@
 //! server -- `volto::h3` -- so the two ends of every test here share a reading
 //! of the framing and of QPACK. What that costs, and why the cross-implementation
 //! check now belongs entirely to the `interop` CI job (a real `volto` process
-//! driven by Go's masque-go), is spelled out in that module's documentation.
+//! driven by Go's masque-go for CONNECT-UDP and by aioquic for CONNECT-UDP and
+//! classic CONNECT), is spelled out in that module's documentation.
 
 #![allow(dead_code)]
 // Each integration test binary uses a subset of this.

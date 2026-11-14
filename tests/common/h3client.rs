@@ -13,10 +13,12 @@
 //! about the bytes: a mistake in the frame or QPACK layer is a mistake both
 //! sides make, and this suite would not see it. That check has one home, and it
 //! is the `interop` job in CI, which starts a real `volto` process and drives it
-//! with Go's [masque-go](https://github.com/quic-go/masque-go) on quic-go --
-//! an implementation that shares neither code nor a reading of the RFCs with
-//! this one. Removing the last independent client from `cargo test` makes that
-//! job more load-bearing than it was, not less.
+//! with two clients that share neither code nor a reading of the RFCs with this
+//! one. Go's [masque-go](https://github.com/quic-go/masque-go) on quic-go covers
+//! CONNECT-UDP. aioquic (`tests/interop/aioquic`) covers CONNECT-UDP as well and
+//! is the only independent client for classic CONNECT, since masque-go speaks
+//! only CONNECT-UDP. Removing the last independent client from `cargo test`
+//! makes that job more load-bearing than it was, not less.
 //!
 //! What the suite still asserts with full force is everything *above* the
 //! codec, which is where a proxy's behaviour lives: statuses, `Proxy-Status`,

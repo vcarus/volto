@@ -36,7 +36,8 @@
 //!
 //! Frames are written with the same varint/QPACK encoders the server reads
 //! with, like the rest of this suite; a bug shared by both sides of the codec
-//! is invisible here and belongs to the masque-go interop job. What this file
+//! is invisible here and belongs to the `interop` job, whose masque-go and
+//! aioquic clients share no codec with this server. What this file
 //! judges is on the *other* side of that boundary: which close code the server
 //! chose, read off quinn, against a model that never consults the server.
 //!
