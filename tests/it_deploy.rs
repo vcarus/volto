@@ -692,14 +692,21 @@ fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> 
         .expect("bash must be runnable")
 }
 
-/// The rollback starts the service and never restarts it.
+/// The rollback puts the previous files back, reloads systemd, and starts the
+/// service without restarting it.
 ///
-/// `restore_previous` runs when any step of the swap window fails. A failure
-/// before the restart, in the binary or unit `install` or in `daemon-reload`,
-/// leaves the old process running and serving its tunnels. A failure of the
-/// restart itself can leave the unit inactive. `systemctl start` covers both:
-/// it does nothing to an active unit and starts an inactive one. A `restart`
-/// here would drop every live tunnel for a failure that had cost nothing.
+/// `restore_previous` is the ERR trap of the swap window. A failure before the
+/// restart, in the binary or unit `install` or in `daemon-reload`, leaves the
+/// old process running and serving its tunnels. A failure of the restart itself
+/// can leave the unit inactive. `systemctl start` covers both: it does nothing
+/// to an active unit and starts an inactive one. A `restart` here would drop
+/// every live tunnel for a failure that had cost nothing. `daemon-reload` comes
+/// before the start, or systemd starts the service under the unit it parsed
+/// last, which is the one being rolled back.
+///
+/// The real `install` runs, so the files are read back afterwards: a copy in
+/// the wrong direction overwrites the only previous binary and still reports a
+/// restore.
 #[test]
 fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
     let dir = scratch_tree("deploy", "restore-previous", &["stubs", "bin", "unit"]);
@@ -710,12 +717,15 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
         &stubs.join("systemctl"),
         &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
     );
-    write_executable(&stubs.join("install"), "#!/bin/sh\nexit 0\n");
 
     let bin = dir.join("bin/volto");
     let unit = dir.join("unit/volto.service");
-    fs::write(bin.with_extension("prev"), "old binary").expect("plant the previous binary");
-    fs::write(unit.with_extension("service.prev"), "old unit").expect("plant the previous unit");
+    fs::write(&bin, "the failed binary\n").expect("plant the failed binary");
+    fs::write(bin.with_extension("prev"), "the previous binary\n")
+        .expect("plant the previous binary");
+    fs::write(&unit, "the failed unit\n").expect("plant the failed unit");
+    fs::write(unit.with_extension("service.prev"), "the previous unit\n")
+        .expect("plant the previous unit");
 
     let prelude = format!(
         "BIN='{}'; UNIT='{}'; SERVICE_NAME=volto; VERSION=9.9.9",
@@ -729,15 +739,21 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
         !output.status.success() && stderr.contains("restored the previous binary and unit"),
         "restore_previous must report what it restored and fail the run: {stderr}"
     );
-    let calls = fs::read_to_string(&log).unwrap_or_default();
-    assert!(
-        calls.lines().any(|line| line == "start volto"),
-        "restore_previous must start the service: systemctl saw\n{calls}"
+    assert_eq!(
+        fs::read_to_string(&bin).ok().as_deref(),
+        Some("the previous binary\n"),
+        "restore_previous must copy the previous binary over the failed one: {stderr}"
     );
-    assert!(
-        !calls.lines().any(|line| line.starts_with("restart")),
-        "restore_previous must not restart a service that may still be serving: \
-         systemctl saw\n{calls}"
+    assert_eq!(
+        fs::read_to_string(&unit).ok().as_deref(),
+        Some("the previous unit\n"),
+        "restore_previous must copy the previous unit over the failed one: {stderr}"
+    );
+    let calls = fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        calls, "daemon-reload\nstart volto\n",
+        "restore_previous must reload systemd and then start the service, never \
+         restart it: systemctl saw\n{calls}"
     );
 }
 
