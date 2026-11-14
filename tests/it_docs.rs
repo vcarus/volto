@@ -1183,6 +1183,21 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
              of /etc/volto/config.toml above all",
             source.display()
         );
+
+        // And nothing before it starts the service another way: `enable --now`,
+        // `restart` or `try-restart` start it as surely as `start` does.
+        let early: Vec<&String> = commands[..start]
+            .iter()
+            .filter(|line| {
+                line.split_whitespace()
+                    .any(|word| word == "--now" || word.ends_with("start"))
+            })
+            .collect();
+        assert!(
+            early.is_empty(),
+            "{} starts the service before the edit of /etc/volto/config.toml: {early:?}",
+            source.display()
+        );
     }
 }
 
