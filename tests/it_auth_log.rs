@@ -3,9 +3,9 @@
 //!
 //! Its own test binary because a capturing subscriber has to be installed
 //! globally and only once per process (`it_logging` does the same for the inbound
-//! request log). The two are complementary: that one proves credentials *are*
-//! logged verbatim by the request log until M6 redacts them, this one proves the
-//! authentication path never adds a second copy in plaintext.
+//! request log). The two are complementary: that one proves the request log
+//! names the credential header and redacts its value, this one proves the
+//! authentication path never adds a copy in plaintext.
 //!
 //! One test function, like every other binary that reads log lines, and for a
 //! reason this file needs more than most: the whole product here is a *negative*

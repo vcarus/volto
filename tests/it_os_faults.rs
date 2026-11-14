@@ -112,8 +112,13 @@ const QUIET_LINES: usize = 2;
 ///
 /// The same reasoning `it_soak` gives for its own slack: the runtime opens and
 /// closes descriptors of its own, and a sample is a directory listing rather
-/// than a barrier. A descriptor leaked per refusal would come to [`REFUSALS`]
-/// plus the burst, well clear of this.
+/// than a barrier.
+///
+/// The comparison says nothing about the refusals themselves. Under the clamp
+/// no descriptor can be allocated, so a refused request has nothing to leak;
+/// what pins the refusals is the slot accounting and the quiet window. What
+/// the comparison sees is a leak after the clamp is lifted: in the recovery
+/// tunnels and in the reload.
 const FD_SLACK: usize = 8;
 
 /// The process's descriptor budget, clamped for the length of a scope.

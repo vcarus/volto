@@ -47,12 +47,15 @@ const STREAM_WINDOW: u32 = 64 * 1024;
 /// Long enough for the server to have filled a window and parked in its write.
 ///
 /// Not a synchronisation point -- nothing on the wire says "the peer is now
-/// blocked in a write" -- so it is a wait rather than a wake-up. What makes it
-/// sound is which way it can be wrong: too short leaves the session or the pump
-/// still draining, which only makes the assertion that follows *easier* to pass,
-/// so a slow host cannot turn a real stall into a green test. The stall it
-/// produces lasts a whole `udp_session_timeout` (180 s by default), so there is
-/// no upper end to get wrong either.
+/// blocked in a write" -- so it is a wait rather than a wake-up. Too short is
+/// the direction in which it can be wrong, and that direction is not safe: a
+/// session or a pump still draining when the assertion runs makes it easier to
+/// pass, so a router that waited for queue room could still find room and the
+/// test would be green. What keeps that from happening is the margin: on
+/// loopback the server parks within milliseconds of the trigger, and this is
+/// hundreds of times that. The stall it produces lasts a whole
+/// `udp_session_timeout` (180 s by default), so there is no upper end to get
+/// wrong.
 const PARK: Duration = Duration::from_millis(750);
 
 /// Reads DATAGRAM capsules off a session's request stream until `payload`

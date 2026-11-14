@@ -116,11 +116,11 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             .await;
     }
 
-    // 4. H3_NO_ERROR (0x100), which RFC 9114 §8.1 defines as "no error [...] used
-    //    when the connection or stream needs to be closed, but there is no error
-    //    to signal". Surge does not send it — it uses 0x0, scenario 2 — so this
-    //    branch has no production traffic keeping it honest, and dropping it
-    //    would put every spec-following client back into the warning stream.
+    // 4. H3_NO_ERROR (0x100), which RFC 9114 §8.1 defines as "No error. This is
+    //    used when the connection or stream needs to be closed, but there is no
+    //    error to signal." Surge does not send it — it uses 0x0, scenario 2 — so
+    //    this branch has no production traffic keeping it honest, and dropping
+    //    it would put every spec-following client back into the warning stream.
     {
         let mark = buffer.mark();
         let client = H3Client::connect(&server).await;

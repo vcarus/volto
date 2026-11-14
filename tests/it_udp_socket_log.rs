@@ -8,9 +8,10 @@
 //! decides which of the two a failed send is, and its own unit tests pin the
 //! errno list — but they stay green if the call site stops asking it, because
 //! the session has a *second* reader of the same error. An ICMP error reaches
-//! both the send and the socket read, and the read ends the session
-//! unconditionally, so `it_udp` cannot tell a session that judged the send from
-//! one that never looked: both end the same way, a moment apart.
+//! both the send and the socket read. The read judges it with the same errno
+//! list and ends the session for ECONNREFUSED, which is the error this test
+//! provokes, so `it_udp` cannot tell a session that judged the send from one
+//! that never looked: both end the same way, a moment apart.
 //!
 //! The two branches write different lines, and that is the whole of the visible
 //! difference — one says a packet was dropped, the other that the socket is
