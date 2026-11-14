@@ -10,10 +10,13 @@
 //! Even inputs: arbitrary field values against an arbitrary set of configured
 //! users. Both field names are used, since either may carry credentials (D3).
 //!
-//! Odd inputs: a round trip. A user-id and password are cut from the input,
-//! configured, and offered back as `Basic <base64>` encoded here — so the
-//! accept path, and the constant-time comparison on it, is reached rather than
-//! left to a fuzzer that would have to spell valid base64 by luck.
+//! Odd inputs: a round trip. Up to two users are cut from the input and
+//! configured. The first user's own credentials are offered back as
+//! `Basic <base64>` encoded here, so the accept path, and the constant-time
+//! comparison on it, is reached rather than left to a fuzzer that would have
+//! to spell valid base64 by luck. When there are two, the first user's name is
+//! also offered with the second user's password, which must pass only if some
+//! configured user holds that exact pair.
 //!
 //! Both modes also feed the raw input to [`logfmt::bounded`] and
 //! [`logfmt::bounded_bytes`] directly. A rejected user-id reaches them on its
@@ -103,10 +106,18 @@ fuzz_target!(|data: &[u8]| {
 
     // A pass names a user that was configured, never one assembled out of the
     // request: mixing one user's name with another's password must not pass.
+    // So a pass needs an offered user-id and password that are, together, one
+    // configured user's pair, and that user's name is the one returned.
     if let Ok(Some(username)) = verdict {
+        let offered = offered_pairs(&fields);
         assert!(
-            users.iter().any(|user| user.username == username),
-            "{username:?} is nobody"
+            users.iter().any(|user| {
+                user.username == username
+                    && offered.iter().any(|(id, password)| {
+                        id == user.username.as_bytes() && password == user.password.as_bytes()
+                    })
+            }),
+            "{username:?} passed without any offered pair matching a configured one"
         );
     }
     if users.is_empty() {
@@ -144,9 +155,10 @@ fuzz_target!(|data: &[u8]| {
     );
 });
 
-/// The credentials a configured user offers must be accepted.
+/// The credentials a configured user offers must be accepted, and one user's
+/// name with another user's password must not be.
 fn round_trip(input: &[u8]) {
-    let (users, _) = cut_users(input, 1);
+    let (users, _) = cut_users(input, 2);
     let Some(user) = users.first() else {
         return;
     };
@@ -155,17 +167,90 @@ fn round_trip(input: &[u8]) {
     if user.username.contains(':') {
         return;
     }
-
-    let token = encode_base64(format!("{}:{}", user.username, user.password).as_bytes());
-    let value = FieldValue::parse(format!("Basic {token}").as_bytes()).expect("a field value");
-    let mut fields = Fields::new();
-    fields.append(CREDENTIAL_FIELDS[0], value);
+    let authenticator = authenticator(users.clone());
 
     assert_eq!(
-        authenticator(users.clone()).authenticate(&fields),
+        authenticator.authenticate(&basic(&user.username, &user.password)),
         Ok(Some(user.username.as_str())),
         "a configured user's own credentials must be accepted"
     );
+
+    let Some(other) = users.get(1) else {
+        return;
+    };
+    let mixed = authenticator.authenticate(&basic(&user.username, &other.password));
+    let configured = users.iter().any(|candidate| {
+        candidate.username == user.username && candidate.password == other.password
+    });
+    if configured {
+        assert_eq!(
+            mixed,
+            Ok(Some(user.username.as_str())),
+            "a pair some configured user holds must be accepted"
+        );
+    } else {
+        assert!(
+            mixed.is_err(),
+            "{:?} with another user's password must not pass, got {mixed:?}",
+            user.username
+        );
+    }
+}
+
+/// A request carrying one `Basic` credential for `username` and `password`.
+fn basic(username: &str, password: &str) -> Fields {
+    let token = encode_base64(format!("{username}:{password}").as_bytes());
+    let value = FieldValue::parse(format!("Basic {token}").as_bytes()).expect("a field value");
+    let mut fields = Fields::new();
+    fields.append(CREDENTIAL_FIELDS[0], value);
+    fields
+}
+
+/// Every user-id and password pair the credential fields of `fields` offer.
+///
+/// Decoded here rather than through `auth.rs`, so a pass is judged by a reader
+/// that is not the one under test. It is more lenient than the server's: it
+/// ignores the base64 framing rules the server enforces, and keeps every value
+/// whose scheme is `Basic`. For any value the server accepts it produces the
+/// same pair, so a pass the server grants always has its pair in this list.
+fn offered_pairs(fields: &Fields) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fields
+        .iter()
+        .filter(|(name, _)| CREDENTIAL_FIELDS.contains(name))
+        .filter_map(|(_, value)| {
+            let (scheme, token) = value.to_str()?.split_once(' ')?;
+            if !scheme.eq_ignore_ascii_case("basic") {
+                return None;
+            }
+            let decoded = decode_base64_leniently(token.trim_start_matches(' '));
+            let colon = decoded.iter().position(|byte| *byte == b':')?;
+            Some((decoded[..colon].to_vec(), decoded[colon + 1..].to_vec()))
+        })
+        .collect()
+}
+
+/// Standard base64 (RFC 4648 §4) without its framing rules: the alphabet is
+/// read up to the first `=` or the first byte outside it, and every whole
+/// octet of the bits read so far is kept.
+fn decode_base64_leniently(token: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    let mut out = Vec::new();
+    let mut bits: u32 = 0;
+    let mut held = 0;
+    for byte in token.bytes() {
+        let Some(sextet) = ALPHABET.iter().position(|letter| *letter == byte) else {
+            break;
+        };
+        bits = (bits << 6) | sextet as u32;
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            out.push((bits >> held) as u8);
+            bits &= (1 << held) - 1;
+        }
+    }
+    out
 }
 
 /// Cuts up to `count` users out of the input, each a user-id and a password.
