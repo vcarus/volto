@@ -69,7 +69,7 @@ use volto::h3::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use volto::h3::message;
 use volto::h3::qpack::{self, Field};
 use volto::h3::varint;
-use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
+use volto::h3api::{Code, FieldValue, Fields, Method, Request, Status, StreamError};
 
 use super::huffman;
 use super::rawstream::{
@@ -548,6 +548,7 @@ impl SendRequest {
         }
 
         let fields = request_fields(&request);
+        let connect = matches!(request.method, Method::Connect);
 
         let (mut send, recv) = self
             .quic
@@ -592,6 +593,8 @@ impl SendRequest {
             frames: FrameReader::new(recv, self.budget.clone()),
             id,
             header: BytesMut::new(),
+            connect,
+            tunnel: false,
             trailers: false,
             peer: self.peer.clone(),
         })
@@ -607,6 +610,12 @@ pub struct ClientStream {
     id: u64,
     /// Scratch for DATA frame headers, reused across frames.
     header: BytesMut,
+    /// Whether the request was a CONNECT, classic or extended.
+    connect: bool,
+    /// Whether a 2xx has answered that CONNECT, which RFC 9114 §4.4 calls the
+    /// CONNECT method having completed. From then on the stream carries only
+    /// DATA frames, and a HEADERS frame is a fault rather than a trailer.
+    tunnel: bool,
     /// Whether a trailer section has been received (RFC 9114 §4.1).
     trailers: bool,
     /// Shared with the connection task, so [`Self::recv_response`] can report a
@@ -648,7 +657,9 @@ impl ClientStream {
         // be too large for it. `MAX_FIELD_SECTION_SIZE` is the *server's* bound
         // and `it_settings` asserts it on the wire rather than through this.
         let fields = qpack::decode(&block, u64::MAX).map_err(StreamError::Local)?;
-        build_response(fields)
+        let response = build_response(fields)?;
+        self.tunnel = self.connect && response.status.as_str().starts_with('2');
+        Ok(response)
     }
 
     /// Reads the next chunk of the response body, or `None` at its end.
@@ -678,10 +689,21 @@ impl ClientStream {
                     return Err(unexpected("a DATA frame after the trailer section"));
                 }
 
-                // The trailer section. A tunnel has no use for its fields --
-                // there is no representation for them to describe -- so they are
-                // accepted and dropped, and only the end of the stream may
-                // follow.
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-4.4
+                //# Once the CONNECT method has completed, only DATA frames are
+                //# permitted to be sent on the stream. Extension frames MAY be
+                //# used if specifically permitted by the definition of the
+                //# extension. Receipt of any other known frame type MUST be
+                //# treated as a connection error of type H3_FRAME_UNEXPECTED.
+                Some(Item::Frame(Frame::Headers(_))) if self.tunnel => {
+                    return Err(unexpected(
+                        "a HEADERS frame on a tunnel whose CONNECT has completed",
+                    ));
+                }
+
+                // The trailer section of a response that is not a tunnel, which
+                // RFC 9114 §4.1 allows. Its fields are dropped, and only the end
+                // of the stream may follow.
                 Some(Item::Frame(Frame::Headers(_))) if !self.trailers => self.trailers = true,
                 Some(Item::Frame(Frame::Headers(_))) => {
                     return Err(unexpected("a second trailer section"));
