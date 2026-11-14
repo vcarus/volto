@@ -47,23 +47,28 @@ async fn inbound_requests_are_logged_with_every_header() {
 
     let logged = buffer.contents();
 
-    assert!(logged.contains("inbound request"), "log was:\n{logged}");
-    assert!(logged.contains("method=CONNECT"), "log was:\n{logged}");
+    // Every field is asserted on the request's own line. The target is a closed
+    // address, so the failed dial logs the same authority on lines of its own,
+    // and a check against the whole log would pass on those.
+    let line = logged
+        .lines()
+        .find(|line| line.contains("inbound request") && line.contains("method=CONNECT"))
+        .unwrap_or_else(|| panic!("no inbound request line for the CONNECT; log was:\n{logged}"));
     assert!(
-        logged.contains(&target.to_string()),
-        "the authority must be logged; log was:\n{logged}"
+        line.contains(&format!("authority=Some(\"{target}\")")),
+        "the authority must be logged; line was:\n{line}"
     );
     // `:protocol` is absent on a classic CONNECT, and that must be visible
     // rather than omitted: it is what distinguishes a TCP tunnel request.
-    assert!(logged.contains("protocol=None"), "log was:\n{logged}");
+    assert!(line.contains("protocol=None"), "line was:\n{line}");
 
     // M6 reversed this assertion. The credential header still has to *appear* --
     // establishing which header Surge uses is the whole point of this log, and
     // decision D3 is still open -- but its value must not.
     assert!(
-        logged.contains("authorization: Basic <redacted 16 bytes>"),
+        line.contains("authorization: Basic <redacted 16 bytes>"),
         "the credential header must be logged with its scheme and a redacted \
-         value; log was:\n{logged}"
+         value; line was:\n{line}"
     );
     assert!(
         !logged.contains("dXNlcjE6c2VjcmV0"),
@@ -72,8 +77,8 @@ async fn inbound_requests_are_logged_with_every_header() {
     // Non-credential headers are unaffected: they are the other half of what this
     // log exists for.
     assert!(
-        logged.contains("x-volto-probe: surge-behaviour"),
-        "arbitrary headers must be logged; log was:\n{logged}"
+        line.contains("x-volto-probe: surge-behaviour"),
+        "arbitrary headers must be logged; line was:\n{line}"
     );
 
     // A token carrying a newline reaches no log line at all: it is not an
@@ -120,13 +125,17 @@ async fn inbound_requests_are_logged_with_every_header() {
     unimplemented.protocol = Some("connect-ip".into());
     let _ = respond_to(&mut client, unimplemented).await;
 
+    // The request's own `inbound request` line names the token too, so the
+    // check is made on the refusal's line.
     let logged = buffer.contents();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("unsupported :protocol"))
+        .unwrap_or_else(|| {
+            panic!("an unimplemented :protocol must draw its own line; log was:\n{logged}")
+        });
     assert!(
-        logged.contains("unsupported :protocol"),
-        "an unimplemented :protocol must draw its own line; log was:\n{logged}"
-    );
-    assert!(
-        logged.contains("connect-ip"),
-        "and that line must name the token; log was:\n{logged}"
+        line.contains("protocol=\"connect-ip\""),
+        "and that line must name the token; line was:\n{line}"
     );
 }
