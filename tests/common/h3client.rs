@@ -143,7 +143,8 @@ struct Peer {
     /// every response and every data read checks this, and so does
     /// [`H3Client`] teardown, so a server that breaks a rule on its control or
     /// QPACK streams fails the test even when the fault arrives after the last
-    /// exchange.
+    /// exchange. Teardown sees only what has been read by then;
+    /// [`H3Client::closed_by_server`] waits for the rest.
     fault: Mutex<Option<String>>,
     /// Whether the server's first control stream has been seen.
     ///
@@ -196,10 +197,20 @@ impl Peer {
     /// Called at every request and response boundary, after every data read,
     /// and at [`H3Client`] teardown, which is the last place a fault recorded
     /// after the test's final exchange can fail the test.
+    /// [`H3Client::closed_by_server`] makes the same check once the server's
+    /// streams have been read to their end.
     #[track_caller]
     pub fn check(&self) {
         if let Some(rule) = self.fault.lock().expect("fault lock").as_deref() {
             panic!("{rule}");
+        }
+    }
+
+    /// [`Self::check`] for a caller inside a future, which names the test that
+    /// awaited it. See [`H3Client::closed_by_server`].
+    fn check_at(&self, caller: &Location<'_>) {
+        if let Some(rule) = self.fault.lock().expect("fault lock").as_deref() {
+            panic!("{rule}; judged at {caller}");
         }
     }
 }
@@ -355,6 +366,77 @@ impl H3Client {
         }
     }
 
+    /// Waits for the server to close the connection, then judges everything the
+    /// server sent on its unidirectional streams before the close.
+    ///
+    /// For a test whose subject is the server ending the connection, and whose
+    /// last observation is not the close itself. A log line, for example, says
+    /// that the server has closed. It does not say that this client has read
+    /// what arrived before the close. Dropping the client at that point runs
+    /// the teardown check while a fault may still sit unread in the socket or
+    /// in a stream task that has not been polled. This helper waits instead.
+    ///
+    /// The steps are these. The connection must end with an application
+    /// CONNECTION_CLOSE within [`TIMEOUT`]. That is what the server sends when
+    /// it ends a connection on purpose. A QUIC idle timeout on either side
+    /// sends nothing, so it fails the test, and so does a transport error. Then
+    /// the connection task must finish within [`TIMEOUT`], and it finishes only
+    /// after every stream task it spawned has read its stream to the end.
+    /// Then the first fault recorded is raised, with the caller's location.
+    ///
+    /// What it sees: every byte the server's unidirectional streams delivered
+    /// before the CONNECTION_CLOSE, including a stream opened just before it.
+    /// quinn hands out stream data and incoming streams that were received
+    /// before a close, so the stream tasks read them after the connection has
+    /// ended.
+    ///
+    /// What it cannot see. Data the server queued but had not sent when it
+    /// closed never leaves the server, because quinn discards unsent stream
+    /// data at a close. A unidirectional stream that ends in the same flight as
+    /// the close is not a fault, because [`read_control`] and [`read_qpack`]
+    /// excuse every stream ending once the connection has closed. Request
+    /// streams are the test's to read. A connection the client closes itself
+    /// discards whatever the server still had in flight, so there is no
+    /// client-side variant of this helper.
+    ///
+    /// Written as a synchronous function returning a future so that
+    /// `#[track_caller]` survives to the poll that panics (D66).
+    #[track_caller]
+    pub fn closed_by_server(mut self) -> impl Future<Output = quinn::ApplicationClose> {
+        let caller = Location::caller();
+        async move {
+            let ended = tokio::time::timeout(TIMEOUT, self.quic.closed())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the server did not close the connection within {TIMEOUT:?}; \
+                         awaited at {caller}"
+                    )
+                });
+            let quinn::ConnectionError::ApplicationClosed(close) = ended else {
+                panic!(
+                    "the connection must end with the server's CONNECTION_CLOSE, not \
+                     {ended:?}; awaited at {caller}"
+                );
+            };
+
+            // The connection task returns once `accept_uni` reports the close
+            // and every stream task has returned. `drive` itself never panics,
+            // so the join result carries nothing to report.
+            let _ = tokio::time::timeout(TIMEOUT, &mut self.driver)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the server's streams were still being read {TIMEOUT:?} after the close; \
+                         awaited at {caller}"
+                    )
+                });
+
+            self.send.peer.check_at(caller);
+            close
+        }
+    }
+
     /// Connects, tolerating a server that will not have this connection.
     ///
     /// [`H3Client::connect`] is the right call for a test whose subject is
@@ -507,8 +589,10 @@ impl Drop for H3Client {
     fn drop(&mut self) {
         // A control-stream fault recorded after the test's last request or
         // response has nothing left to re-raise it, so teardown is the last
-        // place it can fail the test. Skipped while unwinding: a second panic
-        // there would abort the process instead of reporting the first failure.
+        // place it can fail the test. It cannot await, so it judges only what
+        // the stream tasks have already read; `closed_by_server` is the form
+        // that waits. Skipped while unwinding: a second panic there would abort
+        // the process instead of reporting the first failure.
         if !std::thread::panicking() {
             self.send.peer.check();
         }
@@ -1117,6 +1201,11 @@ fn write_error_cause(
 /// RFC 9114 §6.2.1 forbids a receiver from asking the sender to close it, and a
 /// dropped [`quinn::RecvStream`] sends `STOP_SENDING`. It is also where the two
 /// pieces of server state this client acts on come from.
+///
+/// Returns only after every stream task has returned, which is what
+/// [`H3Client::closed_by_server`] waits for. That wait is bounded by the
+/// connection: once it has ended, each task reads what had arrived and then
+/// meets the connection error.
 async fn drive(quic: quinn::Connection, peer: Arc<Peer>) {
     let mut streams = JoinSet::new();
 
@@ -1124,6 +1213,8 @@ async fn drive(quic: quinn::Connection, peer: Arc<Peer>) {
         while streams.try_join_next().is_some() {}
         streams.spawn(serve_uni(recv, peer.clone(), quic.clone()));
     }
+
+    while streams.join_next().await.is_some() {}
 }
 
 /// Dispatches one of the server's unidirectional streams by its type.
@@ -1275,7 +1366,8 @@ async fn read_qpack(
 /// frame. A stream that ends because the connection itself has ended is not a
 /// fault, since every stream ends with its connection. [`Peer::check`]
 /// re-raises the first fault at the next request or response, after every data
-/// read, and at [`H3Client`] teardown.
+/// read, and at [`H3Client`] teardown, and [`H3Client::closed_by_server`] does
+/// so after the server's close.
 async fn read_control(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
     let mut settings_seen = false;
 
