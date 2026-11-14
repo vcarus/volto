@@ -1202,8 +1202,10 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
 ///
 /// A fuzzer cannot spell an Initial packet that authenticates, so without seeds
 /// the target would explore the header parser and nothing behind it. These are
-/// five datagrams — one per branch the judgement can end on — and two bare
-/// ClientHellos, written where `cargo fuzz run gate` looks for them.
+/// whole datagrams, covering every branch the judgement can end on and the
+/// first-flight shapes a ClientHello split across packets takes, and bare
+/// CRYPTO bytes for the ClientHello reader, written where `cargo fuzz run gate`
+/// looks for them.
 /// `fuzz/corpus/` is machine-local and gitignored (D83), so this runs with
 /// every `cargo test` rather than leaving the corpus to a step somebody has to
 /// remember; each file carries the target's mode byte in front of the bytes
@@ -1214,8 +1216,9 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
 /// quietly stops covering anything — and they pin the claim [`nameless_crypto`]
 /// rests on, since these packets are built under a real self-signed certificate
 /// and opened by the nameless configuration behind [`judgement`]. Initial keys
-/// do not depend on the certificate; if they ever did, both of the refusals
-/// below would fall through to [`Verdict::Pass`]. And each seed is judged twice,
+/// do not depend on the certificate; if they ever did, every refusal below
+/// that is decided behind the packet protection would fall through to
+/// [`Verdict::Pass`]. And each seed is judged twice,
 /// which is the fuzz target's "a verdict is a function of the bytes and the
 /// list alone" checked once here rather than on every fuzz iteration.
 #[test]
