@@ -461,10 +461,14 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
 /// writing QUIC packets by hand: the server accepts a well-formed Initial and
 /// answers into a void, while the client's retransmissions keep arriving.
 ///
-/// What the second client proves is the whole point: it connects *directly*,
-/// once the deadline has passed, and it can only be admitted if the slot came
-/// back. Refusal is immediate rather than a timeout, so this does not depend on
-/// how fast the machine running it is.
+/// What the second client proves is the whole point, and admission alone does
+/// not prove it: at the cap a newcomer is answered with a Retry and then evicts
+/// the oldest connection that has never authenticated, and a connection still in
+/// its handshake is one of those
+/// (`a_connection_still_handshaking_hears_about_its_eviction`). So the second
+/// client connects through a relay that counts Retries, once the deadline has
+/// passed, and must draw none. The server sends a Retry only when it is full, so
+/// zero Retries means the slot was already free when the newcomer arrived.
 #[tokio::test]
 async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
     let server = TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}")).await;
@@ -489,13 +493,19 @@ async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
     // idle timeout the retransmissions above keep pushing out.
     tokio::time::sleep(Duration::from_millis(1_600)).await;
 
+    let (counted, retries) = retry_counting_relay(server.addr).await;
     let admitted = client_endpoint(&server.ca, &["h3"]);
-    let connection = finish_connect(&admitted, server.addr)
+    let connection = finish_connect(&admitted, counted)
         .await
         .expect("the slot must come back once the stalled handshake is abandoned");
     assert!(
         connection.close_reason().is_none(),
         "the second client must be admitted, not refused"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "the second client must find the slot free rather than take it by eviction"
     );
 }
 
