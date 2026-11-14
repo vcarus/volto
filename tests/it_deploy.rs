@@ -63,8 +63,10 @@ fn run_deploy_under(root: Option<&Path>, args: &[&str]) -> Output {
 /// `VOLTO_DEPLOY_CANDIDATE` is the second test seam, alongside
 /// `VOLTO_DEPLOY_ROOT`: in a real run the candidate is the binary just unpacked
 /// from the verified tarball, which a dry run never downloads, so a dry run
-/// takes it from here instead. Everything after that — the capability probe and
-/// the check itself — is the same code path either way.
+/// takes it from here instead. The capability probe and the check itself are
+/// `check_config_with` either way. The call site is not: the dry run calls it
+/// from a branch of its own, and the real path's call is run by
+/// `the_real_update_path_refuses_a_release_that_cannot_load_the_config`.
 fn run_deploy_with_candidate(root: &Path, candidate: &Path, args: &[&str]) -> Output {
     Command::new("bash")
         .arg(deploy_script())
@@ -1663,6 +1665,7 @@ enum Service {
 #[derive(Clone, Copy)]
 enum Candidate {
     LoadsTheConfig,
+    RefusesTheConfig,
 }
 
 /// A host for a run of the real install path of `script/deploy.sh`.
@@ -1799,6 +1802,10 @@ impl Host {
 
         let verdict = match candidate {
             Candidate::LoadsTheConfig => "echo \"$3 loads\"; exit 0".to_owned(),
+            Candidate::RefusesTheConfig => {
+                "echo \"error: failed to parse config file $3: unknown field\" >&2; exit 1"
+                    .to_owned()
+            }
         };
         let binary = format!(
             "#!/bin/sh\n\
@@ -2017,5 +2024,103 @@ fn a_release_that_does_not_stay_up_is_rolled_back() {
     assert!(
         stderr.contains("volto 1.3.7 failed to start; rolled the binary and unit back to 1.3.6"),
         "the run must say what it rolled back and to which version: {stderr}"
+    );
+}
+
+/// The real update path asks the downloaded binary whether it can load this
+/// host's config, and a "no" stops the run before anything on the host moves.
+///
+/// The dry-run tests above reach the same check through the dry run's own call
+/// of `check_config_with`. This is the call the real path makes after the
+/// archive is unpacked and before the `.prev` copies, which is the D93 guard
+/// against a downgrade that cannot read the config it inherits.
+#[test]
+fn the_real_update_path_refuses_a_release_that_cannot_load_the_config() {
+    let host = Host::new("config-check", Service::ComesUp);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::RefusesTheConfig);
+    let previous_binary =
+        fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+    let previous_unit = fs::read_to_string(host.unit()).expect("the planted unit must be readable");
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success(),
+        "a release that cannot load the config must not be installed: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        stderr.contains("refusing to install volto 1.3.7 over a config it cannot load")
+            && stderr.contains("unknown field"),
+        "the run must pass on the release's own refusal and say what it did: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(previous_binary),
+        "the installed binary must be untouched: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.unit()).ok(),
+        Some(previous_unit),
+        "the installed unit must be untouched: {stderr}"
+    );
+    assert!(
+        !host.root.join("usr/local/bin/volto.prev").exists(),
+        "the refusal must come before the previous binary is copied aside: {stderr}"
+    );
+    assert_eq!(
+        host.calls("systemctl"),
+        "",
+        "the running service must be left alone: {stderr}"
+    );
+}
+
+/// A host with no config takes the first-install path on the real run, even
+/// with a binary in place: the config is what says an install exists. The
+/// bundled installer is run with the release's binary, the relocated root and
+/// the first-install arguments, and the update path's swap never happens.
+#[test]
+fn a_host_without_a_config_runs_the_bundled_installer() {
+    let host = Host::new("first-install", Service::ComesUp);
+    plant_binary(&host.root, INSTALLED_VERSION);
+    plant_unit(&host.root);
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let previous_binary =
+        fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+
+    let output = host.run(&[
+        "--allow-unsigned",
+        "--tag",
+        UNSIGNED_TAG,
+        "--sni",
+        "volto.test",
+    ]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        output.status.success(),
+        "a first install whose service comes up must succeed: {stderr}"
+    );
+    let installer = host.calls("installer");
+    let expected_start = format!("VOLTO_INSTALL_ROOT={} --binary ", host.root.display());
+    assert!(
+        installer.starts_with(&expected_start)
+            && installer
+                .ends_with("/volto-1.3.7-x86_64-unknown-linux-musl/volto --sni volto.test\n")
+            && installer.lines().count() == 1,
+        "the bundled installer must run once, under the relocated root, with the \
+         release's binary and the first-install arguments: {installer:?}\n{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(previous_binary),
+        "the update path's swap must not have run: {stderr}"
+    );
+    let calls = host.calls("systemctl");
+    assert!(
+        calls.starts_with("is-active --quiet volto\n") && !calls.contains("restart"),
+        "the first install must check the service once and restart nothing: {calls}"
     );
 }
