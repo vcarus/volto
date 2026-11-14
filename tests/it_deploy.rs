@@ -79,15 +79,15 @@ fn run_deploy_with_candidate(root: &Path, candidate: &Path, args: &[&str]) -> Ou
 }
 
 /// Runs the script the way the documented one-liner does: `curl … | bash -s --`,
-/// which leaves `$0` as `bash` instead of a path.
-fn run_deploy_piped(root: &Path, args: &[&str]) -> Output {
+/// which leaves `$0` as `bash` instead of a path, from the directory `cwd`.
+fn run_deploy_piped(root: &Path, cwd: &Path, args: &[&str]) -> Output {
     let script = fs::File::open(deploy_script()).expect("the deploy script must be readable");
 
     Command::new("bash")
         .arg("-s")
         .arg("--")
         .args(args)
-        .current_dir(repo_root())
+        .current_dir(cwd)
         .env("VOLTO_DEPLOY_ROOT", root)
         .stdin(Stdio::from(script))
         .output()
@@ -936,11 +936,22 @@ fn every_network_call_and_the_timer_service_are_bounded() {
 
 /// The bootstrap one-liner from the release notes: piped into `bash`, `$0` is
 /// not a file. This once aborted the whole run; it must be a quiet no-op.
+///
+/// `$0` is then the word `bash`. With a file of that name in the working
+/// directory, the script once installed that file as the copy the timer runs as
+/// root (second review, 2026-11-13), so the run is made from a directory that
+/// holds one.
 #[test]
-fn a_piped_bootstrap_has_nothing_to_copy_and_says_so_by_succeeding() {
-    let root = install_root("piped");
+fn a_piped_run_installs_nothing_even_beside_a_file_named_bash() {
+    let root = install_root("piped-bash");
+    let elsewhere = scratch_tree("deploy", "piped-bash-cwd", &[]);
+    write_executable(&elsewhere.join("bash"), "#!/bin/sh\necho planted\n");
 
-    let output = run_deploy_piped(&root, &["--dry-run", "--enable-timer", "--tag", "v0.2.4"]);
+    let output = run_deploy_piped(
+        &root,
+        &elsewhere,
+        &["--dry-run", "--enable-timer", "--tag", "v0.2.4"],
+    );
 
     assert!(
         output.status.success(),
@@ -949,41 +960,13 @@ fn a_piped_bootstrap_has_nothing_to_copy_and_says_so_by_succeeding() {
     );
     assert!(
         !root.join("usr/local/sbin/volto-deploy").exists(),
-        "there is no file to copy from, so nothing may be installed"
+        "a piped run has no file to copy from, and a file named `bash` in the \
+         working directory was installed as the timer's script"
     );
     let stdout = stdout_of(&output);
     assert!(
         stdout.ends_with("dry-run: would enable timer\n"),
         "the run must reach the timer decision: {stdout}"
-    );
-}
-
-/// A piped run has no file of its own, and `$0` is then the word `bash`. With a
-/// file of that name in the working directory, the script once installed that
-/// file as the copy the timer runs as root (second review, 2026-11-13).
-#[test]
-fn a_piped_run_does_not_install_a_file_named_bash_from_the_working_directory() {
-    let root = install_root("piped-bash");
-    let elsewhere = scratch_tree("deploy", "piped-bash-cwd", &[]);
-    write_executable(&elsewhere.join("bash"), "#!/bin/sh\necho planted\n");
-
-    let script = fs::File::open(deploy_script()).expect("the deploy script must be readable");
-    let output = Command::new("bash")
-        .args(["-s", "--", "--dry-run", "--enable-timer", "--tag", "v0.2.4"])
-        .current_dir(&elsewhere)
-        .env("VOLTO_DEPLOY_ROOT", &root)
-        .stdin(Stdio::from(script))
-        .output()
-        .expect("the deploy script must be runnable from stdin");
-
-    assert!(
-        output.status.success(),
-        "a piped run must not abort: {}",
-        stderr_of(&output)
-    );
-    assert!(
-        !root.join("usr/local/sbin/volto-deploy").exists(),
-        "a file named `bash` in the working directory was installed as the timer's script"
     );
 }
 
