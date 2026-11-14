@@ -682,7 +682,7 @@ async fn client_reset_aborts_the_target_connection() {
 /// direction finished with a clean FIN, because a dropped `quinn::SendStream`
 /// finishes rather than resets — so whatever the target had still to say read to
 /// the client as a complete response rather than as a cancelled one. It is now
-/// reset with H3_REQUEST_CANCELLED, RFC 9114 §8.1's "the request or its response
+/// reset with H3_REQUEST_CANCELLED, RFC 9114 §8.1's "The request or its response
 /// (including pushed response) is cancelled", and the target still sees the RST
 /// the same paragraph of §4.4 asks for.
 #[tokio::test]
@@ -1475,7 +1475,7 @@ async fn a_target_that_stops_reading_after_its_own_eof_is_cut() {
 /// client giving up are started by the line *after* this write, so a peer that
 /// grants no flow-control credit parks the request task with the target socket
 /// in its hand for as long as the connection lasts. RFC 9114 §8.1's
-/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
 /// response) is cancelled", and a reset is the only end that reaches a peer
 /// granting no window at all.
 #[tokio::test(flavor = "multi_thread")]

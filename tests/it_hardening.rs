@@ -416,7 +416,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 ///
 /// The request task ends either way; what is asserted here is the signal it
 /// leaves, because that is what returns the stream. RFC 9114 §8.1's
-/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
 /// response) is cancelled", and a reset is the only end that reaches a peer
 /// granting no window at all: a FIN would wait behind bytes that cannot be sent
 /// (review H1).

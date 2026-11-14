@@ -158,8 +158,9 @@ async fn concurrent_sessions_do_not_cross_talk() {
 
 /// A session must survive a datagram carrying an unknown context id.
 ///
-/// RFC 9298 §4 requires such datagrams to be dropped silently; killing the
-/// session instead would be a denial-of-service handed to the peer.
+/// RFC 9298 §5 says the receiver "SHALL either drop that datagram silently or
+/// buffer it temporarily", and this server drops it. Killing the session
+/// instead would be a denial-of-service handed to the peer.
 #[tokio::test]
 async fn unknown_context_ids_are_dropped_without_ending_the_session() {
     let server = TestServer::start().await;
@@ -1232,7 +1233,7 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
 /// client giving up is started by the line *after* this write, so a peer that
 /// grants no flow-control credit parks the request task with the target socket
 /// and the Quarter Stream ID claim in its hand. RFC 9114 §8.1's
-/// H3_REQUEST_CANCELLED covers "the request or its response (including pushed
+/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
 /// response) is cancelled", and a reset is the only end that reaches a peer
 /// granting no window at all.
 #[tokio::test(flavor = "multi_thread")]
@@ -1407,7 +1408,7 @@ async fn an_unreachable_target_closes_the_session() {
 
 /// RFC 9297 §3.2: the body of a CONNECT-UDP request stream is a capsule
 /// sequence, so a field that frames HTTP content describes something that cannot
-/// be there — "a receiver that observes a violation of these requirements MUST
+/// be there — "A receiver that observes a violation of these requirements MUST
 /// treat the HTTP message as malformed".
 ///
 /// The target is a working echo server and the same request without the offending

@@ -126,7 +126,7 @@ pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 // `quinn::VarInt::from_u32`; they used to keep a second `u32` copy of the
 // number instead, which is one of the drifts this block ends.
 
-/// H3_NO_ERROR, RFC 9114 §8.1: "no error. This is used when the connection or
+/// H3_NO_ERROR, RFC 9114 §8.1: "No error. This is used when the connection or
 /// stream needs to be closed, but there is no error to signal."
 pub const H3_NO_ERROR: u64 = 0x100;
 /// H3_GENERAL_PROTOCOL_ERROR (RFC 9114 §8.1), the violation with no more
