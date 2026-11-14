@@ -445,7 +445,10 @@ async fn a_udp_session_costs_exactly_one_line(buffer: &SharedBuffer) {
     buffer
         .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"drained\""])
         .await;
-    drop(client);
+    // The line says the server has closed, not that this client has read what
+    // the server sent before the close, so the client waits for the close
+    // rather than being dropped here.
+    client.closed_by_server().await;
     server.wait_until_stopped(STOP_TIMEOUT).await;
 
     // Every INFO line in the window, less the ones the connection and the

@@ -259,7 +259,10 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"drained\""])
             .await;
 
-        drop(client);
+        // The line says the server has closed, not that this client has read
+        // what the server sent before the close. Waiting for the close here
+        // holds the GOAWAY path to the control-stream rules as well.
+        client.closed_by_server().await;
         server.wait_until_stopped(STOP_TIMEOUT).await;
     }
 
