@@ -26,7 +26,8 @@ mod scripts;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use scripts::{
     loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree, stderr_of,
@@ -65,6 +66,41 @@ fn run(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("the volto binary must be runnable")
+}
+
+/// [`run`] for a command line that would start the server if it accepted the
+/// file: the process is killed, and the test fails, if it is still running
+/// after `limit`.
+#[track_caller]
+fn run_expecting_exit(args: &[&str], limit: Duration) -> Output {
+    let mut child = Command::new(real_binary())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the volto binary must be runnable");
+    let started = Instant::now();
+    while child
+        .try_wait()
+        .expect("the child must be waitable")
+        .is_none()
+    {
+        if started.elapsed() > limit {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("the killed child must be reaped");
+            panic!(
+                "volto {args:?} was still running after {limit:?}, so it started on a \
+                 file the check refuses: {}",
+                stderr_of(&output)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child
+        .wait_with_output()
+        .expect("the child's output must be readable")
 }
 
 /// The capability probe `script/deploy.sh` uses to tell a binary that can check
@@ -237,22 +273,34 @@ fn a_malformed_credential_line_is_refused_without_the_secret() {
 /// nothing: a file it accepts must start, and a file it refuses must not.
 ///
 /// The refusal direction is the one a test can take all the way, since it costs
-/// no socket — the configuration is loaded before anything is bound, so the
+/// no socket: the configuration is loaded before anything is bound, so the
 /// process is gone by the time a listener would exist. The acceptance direction
 /// is covered by every other integration test in this tree, which builds its
 /// server through the same `Config::load`.
+///
+/// If startup ever accepted the file, the server would run until killed, so the
+/// start is bounded by a timeout. The file listens on a port this test holds, so
+/// such a server fails to bind and says something other than the check.
 #[test]
 fn the_check_refuses_exactly_what_the_server_refuses_to_start_on() {
     let dir = config_dir("agreement");
+
+    // Held for the duration of the run, so a server that got as far as binding
+    // could not.
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("an ephemeral port must be free");
+    let listen = taken
+        .local_addr()
+        .expect("the bound address must be readable");
+
     let path = write_config(
         &dir,
-        "127.0.0.1:4433",
+        &listen.to_string(),
         "\n[limits]\na_key_a_later_release_added = 2\n",
     );
     let path = path.to_str().unwrap();
 
     let checked = run(&["--check-config", "--config", path]);
-    let started = run(&["--config", path]);
+    let started = run_expecting_exit(&["--config", path], Duration::from_secs(20));
 
     assert_eq!(
         checked.status.code(),
