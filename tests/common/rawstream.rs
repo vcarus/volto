@@ -8,16 +8,18 @@
 //! stream and naming its type, building a frame, reading one back, waiting for
 //! the connection to end.
 //!
-//! What is *not* here is any assertion about what the server chose. The six
+//! What is *not* here is any assertion about what the server chose. The ones
 //! this module does make are the ones that were written identically at every
 //! call site: a response carries `:status` ([`status_of`]), a response read
 //! whole off a stream is one HEADERS frame and nothing after it
 //! ([`status_of_response`]), a stream the server refuses to read is stopped
 //! ([`stopped_code`]), a connection the server ends is ended with a code the
-//! caller names ([`assert_closed_with`]), a connection that needs more than the
-//! pre-authentication stream allowance gets itself through the door first
-//! ([`authenticate`]), and a connection that survived whatever was done to it is
-//! still answering ([`still_serving`]).
+//! caller names ([`assert_closed_with`]), or with an application close at all,
+//! whose code or reason is handed back ([`application_close`],
+//! [`close_reason`]), a connection that needs more than the pre-authentication
+//! stream allowance gets itself through the door first ([`authenticate`]), and
+//! a connection that survived whatever was done to it is still answering
+//! ([`still_serving`]).
 //!
 //! D66 shape: helpers that assert are synchronous functions returning a future,
 //! so `#[track_caller]` survives to the poll that panics.
