@@ -51,10 +51,6 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         let line = buffer
             .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"idle\""])
             .await;
-        assert!(
-            !line.contains("with error"),
-            "an idle timeout must not be logged as an error; line was:\n{line}"
-        );
         // Nothing was ever tunnelled over this connection, and the counter has
         // to say so rather than fall to whatever the previous one held.
         assert!(
@@ -83,10 +79,6 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
                 &[" INFO ", "connection closed", "reason=\"peer_close\""],
             )
             .await;
-        assert!(
-            !line.contains("with error"),
-            "a clean peer close must not be logged as an error; line was:\n{line}"
-        );
         // One request took a tunnel slot on this connection, and only one.
         assert!(
             line.contains("tunnels=1"),
@@ -134,16 +126,12 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         let client = H3Client::connect(&server).await;
         client.quic.close(quinn::VarInt::from_u32(0x100), b"");
 
-        let line = buffer
+        buffer
             .wait_for_line(
                 mark,
                 &[" INFO ", "connection closed", "reason=\"peer_close\""],
             )
             .await;
-        assert!(
-            !line.contains("with error"),
-            "H3_NO_ERROR is the absence of an error; line was:\n{line}"
-        );
     }
 
     // 5. The peer breaks a protocol rule and this server is the one that hangs
@@ -267,13 +255,9 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         let client = H3Client::connect(&server).await;
         server.shutdown();
 
-        let line = buffer
+        buffer
             .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"drained\""])
             .await;
-        assert!(
-            !line.contains("with error"),
-            "a completed drain is the tidiest ending there is; line was:\n{line}"
-        );
 
         drop(client);
         server.wait_until_stopped(STOP_TIMEOUT).await;

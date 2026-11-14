@@ -251,6 +251,10 @@ proptest! {
 
         match datagram::decode(bytes) {
             Err(error) => {
+                // Only a Quarter Stream ID failure is a connection error. A
+                // Context ID that does not parse must stay droppable, or a
+                // peer could kill every session on the connection with one
+                // two-byte datagram.
                 let connection_error = matches!(
                     error,
                     DecodeError::MissingQuarterStreamId | DecodeError::QuarterStreamIdTooLarge(_)
@@ -261,12 +265,6 @@ proptest! {
                     "{:?} was classified against the rule",
                     error
                 );
-                // A Context ID that does not parse must stay droppable, or a
-                // peer could kill every session on the connection with one
-                // two-byte datagram.
-                if matches!(error, DecodeError::MissingContextId) {
-                    prop_assert!(!error.is_connection_error());
-                }
             }
             Ok(decoded) => {
                 let re_encoded = datagram::encode(
