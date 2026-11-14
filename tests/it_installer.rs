@@ -270,8 +270,8 @@ fn a_password_full_of_metacharacters_survives_verbatim() {
     }
 }
 
-/// The two characters the generator genuinely cannot carry must be refused, and
-/// refused with a message that names them.
+/// The two metacharacters of the substitution that builds the config must be
+/// refused, and refused with a message that names them.
 ///
 /// `|` is the delimiter of the substitutions that build the config, so it used
 /// to end the `s` command early and abort the run with `sed: bad flag in
@@ -291,6 +291,34 @@ fn credentials_with_a_pipe_or_an_ampersand_are_refused() {
                 "the refusal must name the characters, got: {stderr}"
             );
         }
+    }
+}
+
+/// The characters a double-quoted TOML string cannot carry as written, and the
+/// usernames HTTP Basic cannot carry, must be refused by name.
+///
+/// A `"` or a `\` in either value would write a config line that is not valid
+/// TOML, or one that means something else. A colon in a username cannot be told
+/// apart from the separator in an RFC 7617 credential, and an empty username
+/// names nobody. Each refusal must come from the check itself, on
+/// `--print-config` as on a real install.
+#[test]
+fn credentials_toml_or_http_basic_cannot_carry_are_refused() {
+    for (argument, value, refusal) in [
+        ("-w", "pass\"word", "must not contain quotes or backslashes"),
+        ("-u", "ali\"ce", "must not contain quotes or backslashes"),
+        ("-w", "pass\\word", "must not contain quotes or backslashes"),
+        ("-u", "ali\\ce", "must not contain quotes or backslashes"),
+        ("-u", "ali:ce", "username must not contain a colon"),
+        ("-u", "", "username must not be empty"),
+    ] {
+        let (ok, stdout, stderr) = print_config(&[argument, value]);
+
+        assert!(!ok, "{argument} {value:?} must be refused, got:\n{stdout}");
+        assert!(
+            stderr.contains(refusal),
+            "{argument} {value:?} must be refused with `{refusal}`, got: {stderr}"
+        );
     }
 }
 
