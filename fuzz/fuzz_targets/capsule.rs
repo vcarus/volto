@@ -54,12 +54,16 @@ fuzz_target!(|data: &[u8]| {
     let mut decoder = CapsuleDecoder::new();
     decoder.push(&encoded[..split]);
     // Feeding half a capsule must never error, only ask for more.
-    if let Ok(Some(_)) = decoder.next_capsule() {
+    match decoder.next_capsule() {
+        Ok(None) => {}
         // A capsule already? Only possible when the split covered the whole
-        // encoding; fall through and let the boundary check below judge it.
-        assert_eq!(split, encoded.len(), "a capsule appeared before its bytes");
-        assert!(decoder.at_capsule_boundary());
-        return;
+        // encoding, and then nothing may be left over.
+        Ok(Some(_)) => {
+            assert_eq!(split, encoded.len(), "a capsule appeared before its bytes");
+            assert!(decoder.at_capsule_boundary());
+            return;
+        }
+        Err(error) => panic!("{split} of {} bytes failed: {error:?}", encoded.len()),
     }
     decoder.push(&encoded[split..]);
     match decoder.next_capsule() {
