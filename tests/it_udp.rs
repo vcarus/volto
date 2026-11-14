@@ -734,8 +734,15 @@ async fn an_oversized_datagram_capsule_is_reset_as_a_parse_error() {
 /// size correctly is still there afterwards. The second capsule is what shows
 /// it: the stream is ordered, so it is forwarded only after the first was
 /// judged.
+///
+/// So what this pins is that the boundary value is not an abort. Whether it
+/// was forwarded is not observable here: the target socket refuses it either
+/// way, so a session that dropped it silently would pass too. Making the
+/// forward observable needs a target that can receive 65527 bytes in one
+/// datagram, which IPv4 cannot and the macOS default send buffer does not allow
+/// over IPv6.
 #[tokio::test]
-async fn a_payload_at_the_maximum_size_is_forwarded_and_keeps_the_session() {
+async fn a_payload_at_the_maximum_size_does_not_abort_the_session() {
     use volto::capsule;
 
     let server = TestServer::start().await;
@@ -767,7 +774,7 @@ async fn a_payload_at_the_maximum_size_is_forwarded_and_keeps_the_session() {
     assert_eq!(
         &echoed[..],
         b"still open",
-        "a payload of exactly the maximum size must be forwarded, not aborted"
+        "a payload of exactly the maximum size must not abort the session"
     );
 }
 
