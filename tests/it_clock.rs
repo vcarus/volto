@@ -54,8 +54,11 @@ use scripts::{code_lines, read_text, rust_files, source_root};
 /// access and creation times are `SystemTime` values, so comparing them, or
 /// asking one for its `elapsed()`, is a wall-clock decision. `clock_gettime`
 /// and `Realtime` are the system call and the clock id that `rustix`, already a
-/// dependency, would reach it through.
-const WALL_CLOCK: [&str; 9] = [
+/// dependency, would reach it through. `clock_gettime_dynamic`, `RealtimeCoarse`
+/// and `RealtimeAlarm` are the other `rustix` names for the same clock. They are
+/// listed on their own because an identifier entry matches only a whole
+/// identifier (see [`names`]).
+const WALL_CLOCK: [&str; 12] = [
     "SystemTime",
     "UNIX_EPOCH",
     "chrono",
@@ -64,8 +67,31 @@ const WALL_CLOCK: [&str; 9] = [
     ".accessed(",
     ".created(",
     "clock_gettime",
+    "clock_gettime_dynamic",
     "Realtime",
+    "RealtimeCoarse",
+    "RealtimeAlarm",
 ];
+
+/// Whether `code` names the [`WALL_CLOCK`] entry `entry`.
+///
+/// An entry that starts with `.` or ends with `(` is a method call or a call,
+/// and it matches wherever its text appears. Every other entry is an
+/// identifier. It matches only where the character before it and the
+/// character after it cannot be part of an identifier. So `chrono` is found in
+/// `use chrono;` and not in `synchronous`.
+fn names(code: &str, entry: &str) -> bool {
+    if entry.starts_with('.') || entry.ends_with('(') {
+        return code.contains(entry);
+    }
+
+    let identifier_char = |c: char| c.is_alphanumeric() || c == '_';
+    code.match_indices(entry).any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        let after = code[at + entry.len()..].chars().next();
+        !before.is_some_and(identifier_char) && !after.is_some_and(identifier_char)
+    })
+}
 
 #[test]
 fn no_source_file_reads_the_wall_clock() {
@@ -94,7 +120,7 @@ fn no_source_file_reads_the_wall_clock() {
                 continue;
             };
             for identifier in WALL_CLOCK {
-                if code.contains(identifier) {
+                if names(&code, identifier) {
                     let relative = path.trim_prefix(&root);
                     offences.push(format!(
                         "src/{}:{}: {identifier}",
@@ -142,7 +168,7 @@ fn the_scanner_tells_code_from_the_comment_about_it() {
         code_lines(line)
             .into_iter()
             .flatten()
-            .any(|code| WALL_CLOCK.iter().any(|name| code.contains(name)))
+            .any(|code| WALL_CLOCK.iter().any(|entry| names(&code, entry)))
     };
     assert!(banned("use std::time::SystemTime;"));
     assert!(banned("let since = now.duration_since(UNIX_EPOCH);"));
@@ -174,4 +200,15 @@ fn the_scanner_tells_code_from_the_comment_about_it() {
     // A character literal holding a quote opens no string, so the comment
     // after it is still a comment.
     assert!(!banned("let quote = '\"'; // SystemTime, in a comment"));
+
+    // An identifier entry matches a whole identifier only. A longer word that
+    // contains it, before or after, is a different word.
+    assert!(!banned("let mode = \"synchronous\";"));
+    assert!(!banned("let chronology = Vec::new();"));
+    assert!(banned("let now = chrono::Utc::now();"));
+    assert!(banned("use chrono;"));
+
+    // The longer `rustix` names for the same clock are entries of their own.
+    assert!(banned("let id = ClockId::RealtimeCoarse;"));
+    assert!(banned("let now = clock_gettime_dynamic(id)?;"));
 }
