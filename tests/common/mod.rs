@@ -736,26 +736,50 @@ pub fn connect_udp_request(proxy: SocketAddr, host: &str, port: u16) -> Request 
     request
 }
 
-/// Sends `request` and waits for the response headers, asserting nothing.
+/// Sends `request` and waits for the response headers, asserting nothing about
+/// the answer.
 ///
 /// For the tests whose subject *is* the answer: they assert on the status, or on
-/// a `Proxy-Status` field, themselves.
-pub async fn respond_to(client: &mut H3Client, request: Request) -> Response {
-    send_and_respond(client, request).await.0
+/// a `Proxy-Status` field, themselves. What is asserted here is only that an
+/// answer arrived within [`TIMEOUT`], and a failure names the caller (D66).
+#[track_caller]
+pub fn respond_to(client: &mut H3Client, request: Request) -> impl Future<Output = Response> + '_ {
+    let caller = Location::caller();
+    async move { exchange(client, request, caller).await.0 }
 }
 
 /// [`respond_to`], keeping the request stream for cases that then use it.
-pub async fn send_and_respond(client: &mut H3Client, request: Request) -> (Response, ClientStream) {
-    let mut stream = client
-        .send
-        .send_request(request)
+#[track_caller]
+pub fn send_and_respond(
+    client: &mut H3Client,
+    request: Request,
+) -> impl Future<Output = (Response, ClientStream)> + '_ {
+    exchange(client, request, Location::caller())
+}
+
+/// The body behind every helper that sends a request, with `caller` already
+/// captured.
+///
+/// Both halves are bounded: opening the stream waits for the server's stream
+/// credit, which a server can withhold, and the response waits for the server.
+async fn exchange(
+    client: &mut H3Client,
+    request: Request,
+    caller: &'static Location<'static>,
+) -> (Response, ClientStream) {
+    let mut stream = tokio::time::timeout(TIMEOUT, client.send.send_request(request))
         .await
-        .expect("send request");
+        .unwrap_or_else(|_| panic!("the request sent at {caller} was not sent within {TIMEOUT:?}"))
+        .unwrap_or_else(|error| panic!("the request sent at {caller} failed: {error:?}"));
 
     let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
         .await
-        .expect("response arrived")
-        .expect("response");
+        .unwrap_or_else(|_| {
+            panic!("no response to the request sent at {caller} within {TIMEOUT:?}")
+        })
+        .unwrap_or_else(|error| {
+            panic!("the response to the request sent at {caller} failed: {error:?}")
+        });
 
     (response, stream)
 }
@@ -790,7 +814,7 @@ pub fn open_tcp_tunnel<'a>(
 ) -> impl Future<Output = ClientStream> + 'a {
     let caller = Location::caller();
     async move {
-        let (response, stream) = send_and_respond(client, connect_request(authority)).await;
+        let (response, stream) = exchange(client, connect_request(authority), caller).await;
         assert_eq!(
             response.status,
             Status::OK,
@@ -821,7 +845,7 @@ pub fn open_tcp_tunnel_as<'a>(
     let caller = Location::caller();
     async move {
         let request = authorized_connect(authority, username, password);
-        let (response, stream) = send_and_respond(client, request).await;
+        let (response, stream) = exchange(client, request, caller).await;
         assert_eq!(
             response.status,
             Status::OK,
@@ -876,8 +900,12 @@ async fn udp_session(
     port: u16,
     caller: &'static Location<'static>,
 ) -> (u64, ClientStream) {
-    let (response, stream) =
-        send_and_respond(client, connect_udp_request(server.addr, &host, port)).await;
+    let (response, stream) = exchange(
+        client,
+        connect_udp_request(server.addr, &host, port),
+        caller,
+    )
+    .await;
 
     assert_eq!(
         response.status,
@@ -1208,9 +1236,12 @@ pub async fn spawn_bursting_udp_target(count: u32, size: usize) -> SocketAddr {
 /// the server finishes its sending side.
 ///
 /// Returns the bytes read and whether the stream ended before `enough` did.
+/// `caller` is the test's location, captured by the public helper that called
+/// this (D66).
 async fn read_while(
     stream: &mut ClientStream,
     mut enough: impl FnMut(usize) -> bool,
+    caller: &'static Location<'static>,
 ) -> (Vec<u8>, bool) {
     use bytes::Buf;
 
@@ -1218,8 +1249,18 @@ async fn read_while(
     while !enough(out.len()) {
         let chunk = tokio::time::timeout(TIMEOUT, stream.recv_data())
             .await
-            .expect("read did not time out")
-            .expect("read succeeded");
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the read at {caller} timed out after {} bytes and {TIMEOUT:?}",
+                    out.len()
+                )
+            })
+            .unwrap_or_else(|error| {
+                panic!(
+                    "the read at {caller} failed after {} bytes: {error:?}",
+                    out.len()
+                )
+            });
 
         match chunk {
             Some(mut buf) => out.extend_from_slice(buf.copy_to_bytes(buf.remaining()).as_ref()),
@@ -1231,15 +1272,32 @@ async fn read_while(
 }
 
 /// Reads from a client stream until at least `n` bytes have arrived.
-pub async fn read_at_least(stream: &mut ClientStream, n: usize) -> Vec<u8> {
-    let (out, ended) = read_while(stream, |read| read >= n).await;
-    assert!(!ended, "stream ended after {} of {n} bytes", out.len());
+#[track_caller]
+pub fn read_at_least(stream: &mut ClientStream, n: usize) -> impl Future<Output = Vec<u8>> + '_ {
+    at_least(stream, n, Location::caller())
+}
+
+/// The body behind [`read_at_least`] and [`echoes`], with `caller` already
+/// captured.
+async fn at_least(
+    stream: &mut ClientStream,
+    n: usize,
+    caller: &'static Location<'static>,
+) -> Vec<u8> {
+    let (out, ended) = read_while(stream, |read| read >= n, caller).await;
+    assert!(
+        !ended,
+        "the stream read at {caller} ended after {} of {n} bytes",
+        out.len()
+    );
     out
 }
 
 /// Reads from a client stream until the server finishes its sending side.
-pub async fn read_to_end(stream: &mut ClientStream) -> Vec<u8> {
-    read_while(stream, |_| false).await.0
+#[track_caller]
+pub fn read_to_end(stream: &mut ClientStream) -> impl Future<Output = Vec<u8>> + '_ {
+    let caller = Location::caller();
+    async move { read_while(stream, |_| false, caller).await.0 }
 }
 
 /// Sends `payload` through an open tunnel and asserts the target echoes it.
@@ -1267,7 +1325,7 @@ pub fn echoes<'a>(
                 panic!("the payload sent at {caller} did not reach the tunnel: {error}")
             });
 
-        let echoed = read_at_least(stream, payload.len()).await;
+        let echoed = at_least(stream, payload.len(), caller).await;
         assert_eq!(
             echoed, payload,
             "the tunnel used at {caller} echoed the wrong bytes"
@@ -1292,7 +1350,7 @@ pub fn close_and_drain(stream: &mut ClientStream) -> impl Future<Output = Vec<u8
         stream
             .finish()
             .unwrap_or_else(|error| panic!("the stream finished at {caller} was gone: {error}"));
-        read_to_end(stream).await
+        read_while(stream, |_| false, caller).await.0
     }
 }
 
