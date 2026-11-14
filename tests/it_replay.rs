@@ -137,7 +137,10 @@
 //!   was passing for the wrong reason. A client is therefore never let go until
 //!   its connection is over; `still live at hand-off` counts how many needed it.
 //! * **No dropped datagrams.** Every UDP session's datagrams must reach it. A
-//!   Quarter-Stream-ID mix-up under this much concurrency shows up here.
+//!   datagram for a Quarter Stream ID no session claims, or one a full queue
+//!   could not take, shows up here. A Quarter-Stream-ID mix-up does not: a
+//!   misrouted datagram is delivered to the wrong session rather than dropped,
+//!   and the cross-talk check below is what catches it.
 //!
 //!   This is the one assertion the path relaxes, and it is relaxed to the shape
 //!   the path can cause and no further. A session sends its next packet only
@@ -145,10 +148,9 @@
 //!   come back, so a lossy path can cost each session exactly one drop -- the
 //!   packet it gets away after the server's `udp_session_timeout` has reclaimed
 //!   the session. A shaped run is therefore held to one drop per session where
-//!   an unshaped one is still held to zero, and a mix-up, which misroutes in
-//!   proportion to the datagrams sent rather than to the sessions opened, is
-//!   caught either way. Production's own 0.038 drops per connection are this
-//!   phenomenon; the replay could not reproduce them until it had a path.
+//!   an unshaped one is still held to zero. Production's own 0.038 drops per
+//!   connection are this phenomenon; the replay could not reproduce them until
+//!   it had a path.
 //! * **No cross-talk.** Every tunnel's echo carries that tunnel's own tag.
 //!
 //! The first two are read off the server's own log, and both are satisfied by a
@@ -1156,7 +1158,8 @@ struct LabLog {
     established: u64,
     closed: u64,
     by_reason: HashMap<String, u64>,
-    /// Closes carrying H3_GENERAL_PROTOCOL_ERROR: the ones the plan injects.
+    /// The peer's application closes with H3_GENERAL_PROTOCOL_ERROR: the ones
+    /// the plan injects.
     violations: u64,
     /// Closes this server decided on: a protocol violation it detected, or the
     /// authentication budget. The only kind that would be news.
@@ -1254,12 +1257,16 @@ fn read_log(text: &str) -> LabLog {
                 .nth(1)
                 .map(|rest| rest.split(" rtt_ms=").next().unwrap_or(rest).to_owned())
                 .unwrap_or_default();
-            // Which end decided this, and on what. The three cases are kept
-            // apart because only the first is ever the server's fault.
-            if error.contains("H3_GENERAL_PROTOCOL_ERROR") {
-                log.violations += 1;
-            } else if error.starts_with("closed by this server:") {
+            // Which end decided this, and on what. The cases are kept apart
+            // because only a close this server decided on is ever its fault.
+            // That is tested first: such a close may carry
+            // H3_GENERAL_PROTOCOL_ERROR too, and it must not be counted with
+            // the closes the plan injects, which are the peer's application
+            // close with exactly that code.
+            if error.starts_with("closed by this server:") {
                 log.server_decided.push(error);
+            } else if error == "ApplicationClose: H3_GENERAL_PROTOCOL_ERROR" {
+                log.violations += 1;
             } else if error.starts_with("ApplicationClose:") {
                 log.unexpected_peer_codes.push(error);
             } else {
@@ -1670,10 +1677,10 @@ async fn production_shapes_are_replayed() {
     // back -- so a session gets at most one packet away after the server's own
     // `udp_session_timeout` has reclaimed it, and at most one of its datagrams
     // can arrive at a Quarter Stream ID nothing claims any more. One drop per
-    // session is therefore the whole of what a path can cause, and a
-    // Quarter-Stream-ID mix-up -- which is what this assertion exists for --
-    // would misroute in proportion to the datagrams sent rather than to the
-    // sessions opened, so it stays comfortably caught.
+    // session is therefore the whole of what a path can cause. A routing fault
+    // that drops datagrams in proportion to the datagrams sent rather than to
+    // the sessions opened stays caught. A Quarter-Stream-ID mix-up delivers
+    // rather than drops, and is the cross-talk check's to catch.
     //
     // The relaxation is the shaping and nothing else: an unshaped run is still
     // held to zero.
