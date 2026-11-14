@@ -178,9 +178,9 @@ fn unknown_options_are_rejected() {
     );
 }
 
-/// A tag that is not a tag must be caught before any download starts.
+/// A `--tag` with no value must be caught before any download starts.
 #[test]
-fn a_malformed_tag_is_rejected_in_argument_form() {
+fn a_tag_option_without_a_value_is_rejected() {
     let output = run_deploy(&["--tag"]);
 
     assert!(!output.status.success(), "--tag without a value must fail");
