@@ -99,24 +99,178 @@ pub fn read_text(path: &Path) -> String {
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
 }
 
-/// `line` with a trailing `//` comment removed, and `None` for a line that is
-/// nothing but a comment.
+/// Each line of `text` with its comments removed: one entry per line of
+/// `text.lines()`, and `None` for a line that holds a comment and no code.
 ///
-/// Deliberately crude: this crate has no `/* */` comments and no string literal
-/// carrying a `//`, so the only thing a cleverer parser would buy is the chance
-/// of a subtler bug in the gates that use it. What it must get right is the doc
-/// comments -- `it_clock`'s module names every banned identifier, and so does
-/// the prose beside the `bloom` feature in `Cargo.toml`; `it_log_lines`'s
-/// entries quote log messages that also appear in the comments explaining them.
-pub fn code_only(line: &str) -> Option<&str> {
-    let trimmed = line.trim_start();
-    if trimmed.starts_with("//") {
+/// What it must get right is the doc comments -- `it_clock`'s module names
+/// every banned identifier, and so does the prose beside the `bloom` feature in
+/// `Cargo.toml`; `it_log_lines`'s entries quote log messages that also appear in
+/// the comments explaining them.
+///
+/// A `//` starts a comment only outside a literal. `src/lib.rs` names its logo
+/// by an `https://` URL, and a cut at the first `//` of that line would hide the
+/// rest of the line from both gates. A cut inside a string that continues on
+/// later lines would also leave its closing quote behind, and every quote after
+/// it would then open a string where one closes. So literals are skipped whole
+/// with [`literal_len`], across lines, and only what remains is searched for
+/// comments. Line comments, doc comments and nested block comments are removed.
+/// A block comment leaves one space, so the code on either side of it stays
+/// apart.
+pub fn code_lines(text: &str) -> Vec<Option<String>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+
+    // Each line's code so far, and whether a comment was removed from it.
+    let mut lines = vec![(String::new(), false)];
+    let mut at = 0;
+
+    while at < text.len() {
+        let rest = &text[at..];
+        let (len, comment) = if rest.starts_with("//") {
+            (rest.find('\n').unwrap_or(rest.len()), true)
+        } else if rest.starts_with("/*") {
+            (block_comment_len(rest), true)
+        } else if let Some(len) = literal_len(text, at) {
+            (len, false)
+        } else {
+            (rest.chars().next().map_or(1, char::len_utf8), false)
+        };
+
+        for ch in rest[..len].chars() {
+            if ch == '\n' {
+                lines.push((String::new(), false));
+            } else if comment {
+                lines.last_mut().expect("there is always a line").1 = true;
+            } else {
+                lines.last_mut().expect("there is always a line").0.push(ch);
+            }
+        }
+        if comment && rest.starts_with("/*") {
+            lines
+                .last_mut()
+                .expect("there is always a line")
+                .0
+                .push(' ');
+        }
+        at += len;
+    }
+
+    // `lines()` does not report an empty line after a final newline.
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+
+    lines
+        .into_iter()
+        .map(|(code, comment)| (!comment || !code.trim().is_empty()).then_some(code))
+        .collect()
+}
+
+/// The length in bytes of the block comment at the start of `rest`, nested ones
+/// included, or the rest of the text when it never closes.
+fn block_comment_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at..].starts_with(b"/*") {
+            depth += 1;
+            at += 2;
+        } else if bytes[at..].starts_with(b"*/") {
+            depth -= 1;
+            at += 2;
+            if depth == 0 {
+                return at;
+            }
+        } else {
+            at += 1;
+        }
+    }
+    rest.len()
+}
+
+/// The length in bytes of the string, raw string or character literal that
+/// starts at byte `at` of `text`, or `None` when no literal starts there.
+///
+/// A byte string's `b` is read as code and its quote as the start of a string,
+/// which skips the same text. A lifetime or a label (`'a`, `'outer:`) is not a
+/// literal, and neither is the `r` that ends an identifier such as `for`, which
+/// is why the text before `at` is part of the input. A literal that never
+/// closes runs to the end of the text.
+pub fn literal_len(text: &str, at: usize) -> Option<usize> {
+    let rest = &text[at..];
+    match rest.chars().next()? {
+        '"' => Some(string_len(rest)),
+        '\'' => char_literal_len(rest),
+        'r' if starts_a_raw_string(&text[..at]) => raw_string_len(rest),
+        _ => None,
+    }
+}
+
+/// The length of the ordinary string literal at the start of `rest`.
+///
+/// Escapes are honoured, so a `\"` does not end it. Reading bytes is safe here:
+/// neither `"` nor `\` occurs inside a multi-byte character.
+fn string_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut at = 1;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return at + 1,
+            _ => at += 1,
+        }
+    }
+    rest.len()
+}
+
+/// The length of the character literal at the start of `rest`, or `None` when
+/// the quote opens a lifetime or a label instead.
+fn char_literal_len(rest: &str) -> Option<usize> {
+    let mut chars = rest.char_indices().skip(1);
+    match chars.next()?.1 {
+        // An escape: `'\n'`, `'\''`, `'\u{7f}'`. The escaped character may be a
+        // quote, so the search for the closing one starts after it.
+        '\\' => {
+            chars.next()?;
+            chars
+                .find(|(_, ch)| *ch == '\'')
+                .map(|(close, _)| close + 1)
+        }
+        '\'' | '\n' => None,
+        _ => {
+            let (close, ch) = chars.next()?;
+            (ch == '\'').then_some(close + 1)
+        }
+    }
+}
+
+/// Whether an `r` after `before` can open a raw string, which it cannot when it
+/// is the tail of an identifier. A `b` or `c` prefix (`br"…"`, `cr"…"`) is part
+/// of the literal and is looked past.
+fn starts_a_raw_string(before: &str) -> bool {
+    let before = before
+        .strip_suffix('b')
+        .or_else(|| before.strip_suffix('c'))
+        .unwrap_or(before);
+    !before.ends_with(|ch: char| ch.is_alphanumeric() || ch == '_')
+}
+
+/// The length of the raw string at the start of `rest`, or `None` when the `r`
+/// is followed by something other than `#`s and a quote, as in `r#type`.
+fn raw_string_len(rest: &str) -> Option<usize> {
+    let hashes = rest[1..].bytes().take_while(|byte| *byte == b'#').count();
+    let body = 1 + hashes;
+    if rest.as_bytes().get(body) != Some(&b'"') {
         return None;
     }
-    match line.split_once("//") {
-        Some((code, _)) => Some(code),
-        None => Some(line),
-    }
+    let close = format!("\"{}", "#".repeat(hashes));
+    Some(
+        rest[body + 1..]
+            .find(&close)
+            .map_or(rest.len(), |end| body + 1 + end + close.len()),
+    )
 }
 
 /// A process's standard output as text, with anything invalid replaced.

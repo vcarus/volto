@@ -42,7 +42,7 @@
 #[path = "common/scripts.rs"]
 mod scripts;
 
-use scripts::{code_only, read_text, rust_files, source_root};
+use scripts::{code_lines, read_text, rust_files, source_root};
 
 /// The identifiers that would put a wall-clock reading into this crate.
 ///
@@ -73,8 +73,8 @@ fn no_source_file_reads_the_wall_clock() {
     for path in files {
         let text = read_text(&path);
 
-        for (number, line) in text.lines().enumerate() {
-            let Some(code) = code_only(line) else {
+        for (number, code) in code_lines(&text).into_iter().enumerate() {
+            let Some(code) = code else {
                 continue;
             };
             for identifier in WALL_CLOCK {
@@ -108,19 +108,25 @@ fn no_source_file_reads_the_wall_clock() {
 /// unable to describe itself.
 #[test]
 fn the_scanner_tells_code_from_the_comment_about_it() {
+    // One line of source, as the gate sees it.
+    let code = |line: &str| code_lines(line).pop().flatten();
+
     assert_eq!(
-        code_only("    let now = SystemTime::now();"),
+        code("    let now = SystemTime::now();").as_deref(),
         Some("    let now = SystemTime::now();")
     );
-    assert_eq!(code_only("/// Never call SystemTime::now() here."), None);
-    assert_eq!(code_only("//! `UNIX_EPOCH` is not a deadline."), None);
+    assert_eq!(code("/// Never call SystemTime::now() here."), None);
+    assert_eq!(code("//! `UNIX_EPOCH` is not a deadline."), None);
     assert_eq!(
-        code_only("    let d = 1; // SystemTime is wrong here"),
+        code("    let d = 1; // SystemTime is wrong here").as_deref(),
         Some("    let d = 1; ")
     );
 
     let banned = |line: &str| {
-        code_only(line).is_some_and(|code| WALL_CLOCK.iter().any(|name| code.contains(name)))
+        code_lines(line)
+            .into_iter()
+            .flatten()
+            .any(|code| WALL_CLOCK.iter().any(|name| code.contains(name)))
     };
     assert!(banned("use std::time::SystemTime;"));
     assert!(banned("let since = now.duration_since(UNIX_EPOCH);"));
@@ -128,4 +134,23 @@ fn the_scanner_tells_code_from_the_comment_about_it() {
     assert!(!banned(
         "let deadline = tokio::time::Instant::now() + budget;"
     ));
+
+    // A `//` inside a string is text, so what follows it on the line is still
+    // code, and a comment after the string is still a comment.
+    assert!(banned(
+        "let stamp = (\"https://example.invalid\", std::time::SystemTime::now());"
+    ));
+    assert!(!banned(
+        "let home = \"https://example.invalid\"; // not SystemTime"
+    ));
+
+    // A string that continues onto the next line is still a string there, so
+    // a `//` at the start of that line is text, and the text is scanned.
+    assert!(banned(
+        "let long = \"first \\\n // SystemTime, quoted rather than commented\";"
+    ));
+
+    // A character literal holding a quote opens no string, so the comment
+    // after it is still a comment.
+    assert!(!banned("let quote = '\"'; // SystemTime, in a comment"));
 }

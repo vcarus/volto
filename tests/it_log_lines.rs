@@ -57,7 +57,7 @@ mod scripts;
 use std::collections::BTreeSet;
 use std::fs;
 
-use scripts::{code_only, read_text, repo_root, rust_files, source_root};
+use scripts::{code_lines, literal_len, read_text, repo_root, rust_files, source_root};
 
 /// What keeps one production log statement from becoming a flood.
 ///
@@ -543,45 +543,82 @@ fn well_formed(id: &str) -> bool {
 /// keeps the same line count as the file, so an offset into it still names a
 /// line an operator can open.
 ///
-/// A `#[cfg(test)]` item is skipped by brace balance rather than to the end of
-/// the file, because two of them in this crate are single functions inside an
-/// `impl` (`logfmt::Sampler::seen`, `h3::frame`'s test-only accessor) with
-/// production code after them. A miscount cannot pass silently either way: too
-/// much skipped leaves a table entry with nothing to match, and too little
-/// finds a statement that is not in the table.
+/// A `#[cfg(test)]` item is skipped to its own end rather than to the end of
+/// the file, because several of them in this crate are a single function, a
+/// single `impl` or a single `const` with production code after them
+/// (`logfmt::Sampler::seen`, `h3::frame`'s test-only accessor,
+/// `quic::transport`'s test-only window). See [`test_item_len`] for where an
+/// item ends.
 fn production_code(text: &str) -> String {
-    let mut out = String::new();
-    let mut skipping: Option<isize> = None;
+    let code: String = code_lines(text)
+        .into_iter()
+        .map(|line| line.unwrap_or_default() + "\n")
+        .collect();
 
-    for line in text.lines() {
-        let code = code_only(line).unwrap_or("");
-
-        if let Some(depth) = skipping.as_mut() {
-            *depth += brace_delta(code);
-            if *depth <= 0 && code.contains('}') {
-                skipping = None;
-            }
-        } else if code.trim() == "#[cfg(test)]" {
-            skipping = Some(0);
-        } else {
-            out.push_str(code);
+    let mut out = String::with_capacity(code.len());
+    let mut at = 0;
+    while at < code.len() {
+        let rest = &code[at..];
+        if rest.starts_with(TEST_ONLY) {
+            let len = test_item_len(&code, at);
+            out.extend(rest[..len].chars().filter(|ch| *ch == '\n'));
+            at += len;
+            continue;
         }
-
-        out.push('\n');
+        let len =
+            literal_len(&code, at).unwrap_or_else(|| rest.chars().next().map_or(1, char::len_utf8));
+        out.push_str(&rest[..len]);
+        at += len;
     }
 
     out
 }
 
-/// How far one line of code opens or closes braces.
-fn brace_delta(code: &str) -> isize {
-    code.chars()
-        .map(|ch| match ch {
-            '{' => 1,
-            '}' => -1,
-            _ => 0,
-        })
-        .sum()
+/// The attribute that marks an item as test code.
+const TEST_ONLY: &str = "#[cfg(test)]";
+
+/// The length in bytes of the `#[cfg(test)]` item that starts at byte `at` of
+/// `code`, the attribute included.
+///
+/// The item ends at the brace that closes its body, at a `;` or a `,` outside
+/// any bracket, or just before a bracket that closes one it is inside. Literals
+/// are skipped whole, so a `'{'` or a `"}"` does not count as a brace.
+///
+/// A `,` outside any bracket also occurs inside an item, in a generic list such
+/// as `<A, B>`, and then the item is taken to end early. That error is loud: the
+/// rest of the test item is read as production code, and a log statement there
+/// fails the gate. The opposite error, an end found too late, would blank
+/// production code and hide a statement nobody has accounted for. No rule here
+/// can produce it as long as the brackets in the item balance, which the Rust
+/// compiler already requires.
+fn test_item_len(code: &str, at: usize) -> usize {
+    let mut depth = 0isize;
+    let mut index = at + TEST_ONLY.len();
+
+    while index < code.len() {
+        if let Some(len) = literal_len(code, index) {
+            index += len;
+            continue;
+        }
+        let ch = code[index..].chars().next().expect("index is inside code");
+        match ch {
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return index - at;
+                }
+                if depth == 0 && ch == '}' {
+                    return index + 1 - at;
+                }
+            }
+            ';' | ',' if depth == 0 => return index + 1 - at,
+            _ => {}
+        }
+        index += ch.len_utf8();
+    }
+
+    code.len() - at
 }
 
 /// The line an offset into [`production_code`]'s output belongs to.
@@ -690,10 +727,12 @@ fn log_statements(file: &str, code: &str) -> Vec<Statement> {
     let mut index = 0;
 
     while index < chars.len() {
-        let (offset, ch) = chars[index];
+        let (offset, _) = chars[index];
 
-        if ch == '"' {
-            index = string_end(&chars, index);
+        // A literal is text, never a macro. Skipping a `'"'` as one character
+        // is what keeps its quote from being read as the start of a string.
+        if let Some(len) = literal_len(code, offset) {
+            index += code[offset..offset + len].chars().count();
             continue;
         }
 
@@ -1124,4 +1163,79 @@ fn the_scanner_finds_a_statement_and_leaves_the_prose_about_it_alone() {
         vec!["production", "production again"]
     );
     assert_eq!(statements[1].line, 6, "blanking must not renumber the file");
+
+    // A test-only item with no braces ends at its `;`, and the production
+    // code after it is still read.
+    let test_const = production_code(
+        "#[cfg(test)]\n\
+         const WINDOW: u64 = 1;\n\
+         fn f() { warn!(log_id = \"ee55ff66\", \"after a test-only const\"); }\n",
+    );
+    let statements = log_statements("x.rs", &test_const);
+    assert_eq!(statements.len(), 1, "{test_const:?}");
+    assert_eq!(statements[0].line, 3);
+    assert_eq!(statements[0].message, "after a test-only const");
+
+    // A test-only struct field or match arm ends at its `,`, and the next one
+    // is production code.
+    let test_arm = production_code(
+        "match x {\n\
+         \x20   #[cfg(test)]\n\
+         \x20   0 => (),\n\
+         \x20   _ => warn!(log_id = \"aa77bb88\", \"the next arm\"),\n\
+         }\n",
+    );
+    assert_eq!(
+        log_statements("x.rs", &test_arm)
+            .iter()
+            .map(|s| s.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["the next arm"]
+    );
+
+    // A character literal holding a quote is one character, not the start of
+    // a string; neither is a quote escaped inside one. A lifetime is not a
+    // literal at all. Read as a string, the first quote would hide everything
+    // after it.
+    let quoted = production_code(
+        "fn q(c: char) -> bool { c == '\"' || c == '\\'' }\n\
+         fn r<'a>(s: &'a str) -> &'a str { s }\n\
+         fn f() { warn!(log_id = \"cc00dd11\", \"after a quote character\"); }\n",
+    );
+    let statements = log_statements("x.rs", &quoted);
+    assert_eq!(statements.len(), 1, "{quoted:?}");
+    assert_eq!(statements[0].line, 3);
+    assert_eq!(statements[0].message, "after a quote character");
+
+    // A `//` inside a string is not a comment, whether the string is on one
+    // line or continues onto the next, and a raw string's inner quotes do not
+    // close it.
+    let url = production_code(
+        "const HOME: &str = \"https://example.invalid\"; fn f() { warn!(log_id = \"dd22ee33\", \"on the same line\"); }\n\
+         const LONG: &str = \"first line \\\n\
+         \x20   https://example.invalid/second\";\n\
+         const RAW: &str = r#\"a \"quoted\" // word\"#;\n\
+         fn g() { warn!(log_id = \"ff44aa55\", \"after the strings\"); }\n",
+    );
+    assert_eq!(
+        log_statements("x.rs", &url)
+            .iter()
+            .map(|s| (s.line, s.message.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(1, "on the same line"), (5, "after the strings")],
+        "{url:?}"
+    );
+
+    // A block comment is a comment, and a macro inside one is prose.
+    let block = production_code(
+        "/* warn!(\"in a block\"); /* nested */ still a comment */\n\
+         fn f() { /* inline */ warn!(log_id = \"bb66cc77\", \"after a block\"); }\n",
+    );
+    assert_eq!(
+        log_statements("x.rs", &block)
+            .iter()
+            .map(|s| s.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["after a block"]
+    );
 }
