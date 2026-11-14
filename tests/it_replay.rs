@@ -1623,6 +1623,27 @@ async fn production_shapes_are_replayed() {
             "netem was installed but carried no packets ({up:?} up, {down:?} down): \
              the filters did not match the connection's four-tuple."
         );
+
+        // Delay and delivery do not show that the loss was applied: a qdisc
+        // built without its `loss` argument still delays and delivers. A tier
+        // that asks for loss has to show netem deleting something. The loss
+        // model draws once per packet the qdisc holds, and one packet can be a
+        // whole GSO batch (see `netem::Counters`), so the deletions to expect
+        // are counted in batches. Taking every batch as 128 segments, twice the
+        // UDP GSO limit Linux long had, underestimates them. Below 20 expected
+        // deletions a run may lose nothing by chance, and the check is skipped
+        // there rather than made flaky.
+        let asked = shaper.spec().down.loss_percent;
+        let expected_deletions = summary.sent_packets as f64 / 128.0 * asked / 100.0;
+        if expected_deletions >= 20.0 {
+            assert!(
+                down.loss_draws > 0,
+                "netem was asked for {asked}% downlink loss and deleted nothing over \
+                 {} datagrams the server sent: this run carried no loss, and its \
+                 results are loopback results under a lossy heading.",
+                summary.sent_packets
+            );
+        }
     }
 
     // The assertions a replay is uniquely able to make. Everything above is a
