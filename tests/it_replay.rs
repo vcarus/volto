@@ -673,9 +673,10 @@ enum Transferred {
 
 /// Pushes `bytes` through an accepted TCP tunnel and checks what comes back.
 ///
-/// The first eight bytes of the payload are this tunnel's own tag, and the echo
-/// has to start with them. That is the whole cross-talk check: a tunnel handed
-/// another tunnel's data fails it, whatever else is true of the run.
+/// The payload is this tunnel's own eight-byte tag, repeated, and every byte of
+/// the echo has to match the payload byte at the same offset. That is the whole
+/// cross-talk check: a tunnel handed another tunnel's data at any point of the
+/// transfer fails it, whatever else is true of the run.
 async fn run_transfer(stream: &mut ClientStream, bytes: u32, tag: u64) -> Transferred {
     use bytes::Buf;
 
@@ -720,8 +721,10 @@ async fn run_transfer(stream: &mut ClientStream, bytes: u32, tag: u64) -> Transf
     }
 
     // Checked on whatever arrived, aborted or not: bytes that reached this
-    // tunnel from somewhere else are wrong however the tunnel then ended.
-    if echoed.len() >= 8 && echoed[..8] != tag.to_be_bytes() {
+    // tunnel from somewhere else are wrong however the tunnel then ended. The
+    // whole echo is compared, because a relay fault that mixes buffers after
+    // the first chunk leaves the first eight bytes intact.
+    if echoed.len() > payload.len() || echoed[..] != payload[..echoed.len()] {
         return Transferred::CrossTalk;
     }
     if ended_early {
@@ -802,7 +805,9 @@ async fn run_tunnel(
                 }
                 match timeout(Duration::from_secs(5), inbound.recv()).await {
                     Ok(Some(answer)) => {
-                        if answer.len() >= 8 && answer[..8] != tag.to_be_bytes() {
+                        // The target echoes, so the answer is the payload,
+                        // tag and index both.
+                        if answer[..] != payload[..] {
                             tally.bump(&tally.crosstalk);
                         } else {
                             tally.bump(&tally.udp_round_trips);
