@@ -343,6 +343,37 @@ fn mirrored_build_step(name: &str) -> String {
     mirrored_block(name, MIRROR_OPEN, MIRROR_CLOSE)
 }
 
+/// The `target:` list under `matrix:` in `.github/workflows/<name>`, in order.
+fn matrix_targets(name: &str) -> Vec<String> {
+    let path = repo_root().join(".github/workflows").join(name);
+    let text = read_text(&path);
+    let lines: Vec<&str> = text.lines().collect();
+
+    let matrix = lines
+        .iter()
+        .position(|line| line.trim() == "matrix:")
+        .unwrap_or_else(|| panic!("{} has no `matrix:`", path.display()));
+    let target = lines[matrix + 1..]
+        .iter()
+        .position(|line| line.trim() == "target:")
+        .map(|at| matrix + 1 + at)
+        .unwrap_or_else(|| panic!("the matrix of {} has no `target:` list", path.display()));
+    let targets: Vec<String> = lines[target + 1..]
+        .iter()
+        .map(|line| line.trim())
+        .map_while(|line| line.strip_prefix("- "))
+        .map(str::to_owned)
+        .collect();
+
+    assert!(
+        targets.len() >= 2,
+        "{} lists {targets:?} under `matrix.target`; the reader is broken, or a \
+         target was dropped",
+        path.display()
+    );
+    targets
+}
+
 /// The smoke step both workflow files run.
 fn mirrored_smoke_step(name: &str) -> String {
     mirrored_block(name, SMOKE_OPEN, SMOKE_CLOSE)
@@ -362,6 +393,16 @@ fn cross_yml_runs_the_release_build_step_verbatim() {
          musl cross-build fails on the pull request instead of at tag time; a \
          step that differs proves something about a build nobody ships.\n\n\
          release.yml:\n{release}\n\ncross.yml:\n{cross}"
+    );
+
+    // The step is the same for every target, so it is evidence about a target
+    // only while cross.yml builds that target too.
+    let release_targets = matrix_targets("release.yml");
+    let cross_targets = matrix_targets("cross.yml");
+    assert_eq!(
+        release_targets, cross_targets,
+        "cross.yml builds {cross_targets:?} and release.yml builds \
+         {release_targets:?}; a target only release.yml builds breaks at tag time"
     );
 }
 
