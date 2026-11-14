@@ -11,9 +11,15 @@
 //! `--dry-run` exists for this test, in the spirit of the installer's
 //! `--print-config`: it skips the preflight, prints the decision it would act on
 //! and stops. `VOLTO_DEPLOY_ROOT` prefixes every install path, so a temporary
-//! directory stands in for `/usr/local` and `/etc`. The privileged remainder
-//! (download, checksum, rollback, systemd) is still covered by shellcheck plus
-//! first-run review, the same deal as install-selfsigned.sh.
+//! directory stands in for `/usr/local` and `/etc`.
+//!
+//! The real install path runs as well, end to end and without root: `Host`
+//! below puts stand-ins for `id`, `uname`, `sleep`, `sha256sum`, `systemctl` and
+//! `curl` first on `PATH`, and serves a local archive in place of the release
+//! page. It installs a release from before signing with `--allow-unsigned`,
+//! because no test holds the release key. The signed half of `verify_release`
+//! therefore runs on its own, with a test key, as do `restore_previous` and
+//! `refuse_automatic_downgrade`.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -1627,5 +1633,291 @@ fn verifying_a_signature_takes_no_other_option() {
         stderr_of(&output).contains("no other option"),
         "{}",
         stderr_of(&output)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The install path, end to end
+// ---------------------------------------------------------------------------
+
+/// The release the end-to-end runs install by name. It is from before signing,
+/// so `--allow-unsigned` applies to it and no release key is needed.
+const UNSIGNED_TAG: &str = "v1.3.7";
+
+/// The version the planted install reports.
+const INSTALLED_VERSION: &str = "1.3.6";
+
+/// How the stand-in `systemctl` answers for the volto service.
+#[derive(Clone, Copy)]
+enum Service {
+    /// `restart` succeeds and the service is active afterwards.
+    ComesUp,
+}
+
+/// How the binary inside a published release answers `--check-config`.
+#[derive(Clone, Copy)]
+enum Candidate {
+    LoadsTheConfig,
+}
+
+/// A host for a run of the real install path of `script/deploy.sh`.
+///
+/// `root` is `VOLTO_DEPLOY_ROOT`. `stubs` holds the commands that need root, a
+/// Linux host, systemd or the network: `id` reports root, `uname` reports an
+/// x86_64 Linux host, `sleep` returns at once, `sha256sum` runs `shasum`, and
+/// `systemctl` and `curl` record their arguments in `logs`. `curl` serves the
+/// files under `release/<tag>/` by the last two parts of the URL it is asked
+/// for, and answers the latest-release lookup with the URL in `logs/latest`.
+/// Everything else the script runs is the host's own: `install`, `tar`,
+/// `mktemp`, `cmp`, `readlink`, `awk` and `bash`.
+struct Host {
+    root: PathBuf,
+    stubs: PathBuf,
+    release: PathBuf,
+    staging: PathBuf,
+    logs: PathBuf,
+}
+
+impl Host {
+    fn new(name: &str, service: Service) -> Host {
+        let base = scratch_tree(
+            "deploy",
+            &format!("e2e-{name}"),
+            &[
+                "root/usr/local/bin",
+                "root/usr/local/sbin",
+                "root/etc/volto",
+                "root/etc/systemd/system",
+                "stubs",
+                "release",
+                "staging",
+                "logs",
+            ],
+        );
+        let host = Host {
+            root: base.join("root"),
+            stubs: base.join("stubs"),
+            release: base.join("release"),
+            staging: base.join("staging"),
+            logs: base.join("logs"),
+        };
+
+        write_executable(&host.stubs.join("id"), "#!/bin/sh\necho 0\n");
+        write_executable(
+            &host.stubs.join("uname"),
+            "#!/bin/sh\ncase \"$1\" in -m) echo x86_64 ;; *) echo Linux ;; esac\n",
+        );
+        write_executable(&host.stubs.join("sleep"), "#!/bin/sh\nexit 0\n");
+        write_executable(
+            &host.stubs.join("sha256sum"),
+            "#!/bin/sh\nexec shasum -a 256 \"$@\"\n",
+        );
+
+        let (restart, active) = match service {
+            Service::ComesUp => (0, 0),
+        };
+        write_executable(
+            &host.stubs.join("systemctl"),
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 \x20 'restart volto') exit {restart} ;;\n\
+                 \x20 'is-active --quiet volto') exit {active} ;;\n\
+                 \x20 'is-active volto') [ {active} -eq 0 ] && echo active || echo failed; exit {active} ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log = host.logs.join("systemctl").display(),
+            ),
+        );
+        write_executable(
+            &host.stubs.join("curl"),
+            &format!(
+                "#!/bin/sh\n\
+                 out= write= url=\n\
+                 while [ $# -gt 0 ]; do\n\
+                 \x20 case \"$1\" in\n\
+                 \x20   -o) out=\"$2\"; shift 2 ;;\n\
+                 \x20   -w) write=\"$2\"; shift 2 ;;\n\
+                 \x20   --connect-timeout|--max-time|--retry|--retry-max-time) shift 2 ;;\n\
+                 \x20   -*) shift ;;\n\
+                 \x20   *) url=\"$1\"; shift ;;\n\
+                 \x20 esac\n\
+                 done\n\
+                 printf '%s\\n' \"$url\" >> '{log}'\n\
+                 if [ -n \"$write\" ]; then\n\
+                 \x20 [ -f '{latest}' ] || exit 22\n\
+                 \x20 cat '{latest}'\n\
+                 \x20 exit 0\n\
+                 fi\n\
+                 tag=\"${{url%/*}}\"\n\
+                 file='{release}'/\"${{tag##*/}}/${{url##*/}}\"\n\
+                 [ -f \"$file\" ] || exit 22\n\
+                 cp \"$file\" \"$out\"\n",
+                log = host.logs.join("curl").display(),
+                latest = host.logs.join("latest").display(),
+                release = host.release.display(),
+            ),
+        );
+        host
+    }
+
+    fn bin(&self) -> PathBuf {
+        self.root.join("usr/local/bin/volto")
+    }
+
+    fn unit(&self) -> PathBuf {
+        self.root.join("etc/systemd/system/volto.service")
+    }
+
+    fn installed_script(&self) -> PathBuf {
+        self.root.join("usr/local/sbin/volto-deploy")
+    }
+
+    /// Plants an install of [`INSTALLED_VERSION`] with its config and unit.
+    fn plant_install(&self) {
+        plant_binary(&self.root, INSTALLED_VERSION);
+        plant_config(&self.root);
+        plant_unit(&self.root);
+    }
+
+    /// Publishes `tag` for x86_64 without a signature: the archive, with a
+    /// binary that answers `--check-config` as `candidate` says, and the
+    /// `SHA256SUMS` that lists it. Returns the binary's bytes.
+    fn publish(&self, tag: &str, candidate: Candidate) -> Vec<u8> {
+        let version = tag.trim_start_matches('v');
+        let name = format!("volto-{version}-x86_64-unknown-linux-musl");
+        let unpacked = self.staging.join(&name);
+        fs::create_dir_all(unpacked.join("script")).expect("the staging tree must be creatable");
+
+        let verdict = match candidate {
+            Candidate::LoadsTheConfig => "echo \"$3 loads\"; exit 0".to_owned(),
+        };
+        let binary = format!(
+            "#!/bin/sh\n\
+             # the binary inside the {tag} archive\n\
+             case \"$1\" in\n\
+             \x20 --version) echo \"volto {version}\" ;;\n\
+             \x20 --help) echo '      --check-config  Load the configuration and exit' ;;\n\
+             \x20 --check-config) {verdict} ;;\n\
+             esac\n"
+        );
+        write_executable(&unpacked.join("volto"), &binary);
+        write_executable(
+            &unpacked.join("script/deploy.sh"),
+            "#!/bin/sh\n# the copy of deploy.sh inside the release archive\nexit 1\n",
+        );
+        fs::write(
+            unpacked.join("script/masque.service"),
+            "# the unit inside the release archive\n",
+        )
+        .expect("the unit must be writable");
+        write_executable(
+            &unpacked.join("script/install-selfsigned.sh"),
+            &format!(
+                "#!/bin/sh\nprintf 'VOLTO_INSTALL_ROOT=%s %s\\n' \"$VOLTO_INSTALL_ROOT\" \"$*\" >> '{}'\n",
+                self.logs.join("installer").display()
+            ),
+        );
+
+        let published = self.release.join(tag);
+        fs::create_dir_all(&published).expect("the release directory must be creatable");
+        let archive = published.join(format!("{name}.tar.gz"));
+        let tar = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&self.staging)
+            .arg(&name)
+            // macOS tar would otherwise add AppleDouble entries for extended
+            // attributes.
+            .env("COPYFILE_DISABLE", "1")
+            .output()
+            .expect("tar must be runnable");
+        assert!(tar.status.success(), "tar failed: {}", stderr_of(&tar));
+        fs::write(
+            published.join("SHA256SUMS"),
+            format!("{}  {name}.tar.gz\n", sha256_hex(&archive)),
+        )
+        .expect("the checksum list must be writable");
+
+        binary.into_bytes()
+    }
+
+    /// Runs `script/deploy.sh` with `args`, its paths under `root` and the stubs
+    /// first on `PATH`.
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new("bash")
+            .arg(deploy_script())
+            .args(args)
+            .current_dir(repo_root())
+            .env("PATH", path_with_stubs(&self.stubs))
+            .env("VOLTO_DEPLOY_ROOT", &self.root)
+            .env("REPO", "example/volto")
+            .env_remove("TAG")
+            .env_remove("VOLTO_DEPLOY_CANDIDATE")
+            .env_remove("VOLTO_DEPLOY_SIGNER")
+            .output()
+            .expect("the deploy script must be runnable")
+    }
+
+    /// What one stub recorded, one call per line.
+    fn calls(&self, stub: &str) -> String {
+        fs::read_to_string(self.logs.join(stub)).unwrap_or_default()
+    }
+}
+
+/// The end-to-end harness reaches the end of an update, and an unsigned
+/// release leaves the installed copy of this script as it was.
+///
+/// A release from before signing carries a copy of `deploy.sh` that verifies
+/// nothing. Installing that copy as the one the timer runs would end signature
+/// checking on this host for every later run. The decision rests on
+/// `RELEASE_IS_SIGNED`, which only a verified signature sets, so its default
+/// is what this run reads.
+#[test]
+fn an_unsigned_release_does_not_replace_the_installed_script() {
+    let host = Host::new("unsigned", Service::ComesUp);
+    host.plant_install();
+    let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let script = fs::read(deploy_script()).expect("the deploy script must be readable");
+    fs::write(host.installed_script(), &script).expect("the installed copy must be writable");
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG, "--enable-timer"]);
+
+    assert!(
+        output.status.success(),
+        "an unsigned release named with --allow-unsigned must install: {}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert_eq!(
+        fs::read(host.installed_script()).ok(),
+        Some(script),
+        "the installed copy of the script must stay the script under test, not \
+         the copy inside the unsigned archive: {stdout}"
+    );
+    assert!(
+        stdout.contains("keeping this script as it is"),
+        "the run must say it kept its own copy: {stdout}"
+    );
+
+    // The rest of the update happened, so the run above went through the
+    // download, the swap and the timer rather than stopping early.
+    assert_eq!(
+        fs::read(host.bin()).ok(),
+        Some(candidate),
+        "the release's binary must be installed: {stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.unit()).ok().as_deref(),
+        Some("# the unit inside the release archive\n"),
+        "the release's unit must be installed: {stdout}"
+    );
+    let calls = host.calls("systemctl");
+    assert!(
+        calls.starts_with("daemon-reload\nrestart volto\nis-active --quiet volto\n")
+            && calls.contains("enable --now volto-deploy.timer\n"),
+        "systemctl must see the update and the timer: {calls}"
     );
 }
