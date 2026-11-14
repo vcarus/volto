@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use scripts::{
-    loadable_config_text, plant_binary_without_the_flag, plant_placeholder_certificates,
-    real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
+    loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
+    plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
+    write_executable,
 };
 
 fn deploy_script() -> PathBuf {
@@ -102,11 +103,10 @@ fn install_root(name: &str) -> PathBuf {
 
 /// Plants an installed binary that answers `--version` like the real one.
 fn plant_binary(root: &Path, version: &str) {
-    let bin = root.join("usr/local/bin/volto");
-    fs::write(&bin, format!("#!/bin/sh\necho \"volto {version}\"\n"))
-        .expect("the stand-in binary must be writable");
-    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755))
-        .expect("the stand-in binary must be executable");
+    write_executable(
+        &root.join("usr/local/bin/volto"),
+        &format!("#!/bin/sh\necho \"volto {version}\"\n"),
+    );
 }
 
 fn plant_config(root: &Path) {
@@ -601,13 +601,6 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
     );
 }
 
-/// Writes `text` to `path` with mode 0755.
-fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).expect("the stub must be writable");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .expect("the stub must be executable");
-}
-
 /// A dry run must not rewrite the root-owned installed copy of this script.
 ///
 /// The timer branch used to call `refresh_self` before the dry-run exit, and
@@ -639,16 +632,11 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
         &format!("#!/bin/sh\necho '{}'\n", deploy_script().display()),
     );
 
-    let path = std::env::var_os("PATH").expect("PATH must be set");
-    let path =
-        std::env::join_paths(std::iter::once(stubs.clone()).chain(std::env::split_paths(&path)))
-            .expect("the stub directory must fit in PATH");
-
     let output = Command::new("bash")
         .arg(deploy_script())
         .args(["--dry-run", "--enable-timer", "--tag", "v0.2.4"])
         .current_dir(repo_root())
-        .env("PATH", path)
+        .env("PATH", path_with_stubs(&stubs))
         .output()
         .expect("the deploy script must be runnable");
 
@@ -697,15 +685,9 @@ fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> 
         "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name}\n"
     );
 
-    let path = std::env::var_os("PATH").expect("PATH must be set");
-    let path = std::env::join_paths(
-        std::iter::once(stubs.to_path_buf()).chain(std::env::split_paths(&path)),
-    )
-    .expect("the stub directory must fit in PATH");
-
     Command::new("bash")
         .args(["-c", &program])
-        .env("PATH", path)
+        .env("PATH", path_with_stubs(stubs))
         .output()
         .expect("bash must be runnable")
 }

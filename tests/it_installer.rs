@@ -25,13 +25,12 @@
 mod scripts;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scripts::{
-    plant_binary_without_the_flag, plant_placeholder_certificates, real_binary, repo_root,
-    scratch_tree, stderr_of, stdout_of,
+    path_with_stubs, plant_binary_without_the_flag, plant_placeholder_certificates, real_binary,
+    repo_root, scratch_tree, stderr_of, stdout_of, write_executable,
 };
 use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
@@ -546,13 +545,6 @@ fn real_tool(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("no {name} on PATH"))
 }
 
-/// Writes `text` to `path` with mode 0755.
-fn write_executable(path: &Path, text: &str) {
-    fs::write(path, text).expect("the stub must be writable");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .expect("the stub must be executable");
-}
-
 /// Writes stand-ins for the commands the install path needs root or a Debian
 /// host for, and an `mv` that fails on its `fail_at`-th call. Returns the
 /// directory to put in front of `PATH`.
@@ -654,11 +646,6 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
 
         let binary = plant_binary_without_the_flag(&root, "volto-stub");
         let stubs = plant_root_stubs(&root, fail_at, "active");
-        let path = std::env::var_os("PATH").expect("PATH must be set");
-        let path = std::env::join_paths(
-            std::iter::once(stubs.clone()).chain(std::env::split_paths(&path)),
-        )
-        .expect("the stub directory must fit in PATH");
 
         let output = Command::new("bash")
             .arg(&script)
@@ -675,7 +662,7 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
             ])
             .current_dir(repo_root())
             .env("VOLTO_INSTALL_ROOT", &root)
-            .env("PATH", path)
+            .env("PATH", path_with_stubs(&stubs))
             .output()
             .expect("the installer script must be runnable");
         let stderr = stderr_of(&output);
@@ -868,11 +855,6 @@ fn run_full_install_with_stubs(
     extra_args: &[&str],
 ) -> std::process::Output {
     let script = repo_root().join("script/install-selfsigned.sh");
-    let path = std::env::var_os("PATH").expect("PATH must be set");
-    let path = std::env::join_paths(
-        std::iter::once(stubs.to_path_buf()).chain(std::env::split_paths(&path)),
-    )
-    .expect("the stub directory must fit in PATH");
 
     Command::new("bash")
         .arg(&script)
@@ -887,7 +869,7 @@ fn run_full_install_with_stubs(
         .args(extra_args)
         .current_dir(repo_root())
         .env("VOLTO_INSTALL_ROOT", root)
-        .env("PATH", path)
+        .env("PATH", path_with_stubs(stubs))
         .output()
         .expect("the installer script must be runnable")
 }

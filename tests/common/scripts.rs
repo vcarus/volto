@@ -24,6 +24,7 @@
 
 #![allow(dead_code)] // Each of these binaries uses a subset of this.
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -325,6 +326,24 @@ pub fn scratch_tree(tag: &str, name: &str, dirs: &[&str]) -> PathBuf {
     root
 }
 
+/// Writes `text` to `path` with mode 0755.
+///
+/// The stand-ins `it_deploy` and `it_installer` put in front of `PATH` are
+/// written this way, and so are the binaries a script is handed.
+pub fn write_executable(path: &Path, text: &str) {
+    fs::write(path, text).expect("the stub must be writable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+        .expect("the stub must be executable");
+}
+
+/// The inherited `PATH` with `dir` in front of it, so a script run under it
+/// finds the stand-ins in `dir` before the host's own commands.
+pub fn path_with_stubs(dir: &Path) -> OsString {
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    std::env::join_paths(std::iter::once(dir.to_path_buf()).chain(std::env::split_paths(&path)))
+        .expect("the stub directory must fit in PATH")
+}
+
 /// Writes the certificate pair a loadable configuration has to point at.
 ///
 /// `Config::validate` insists both paths exist and are files; nothing in these
@@ -354,7 +373,7 @@ pub fn plant_placeholder_certificates(dir: &Path) -> (PathBuf, PathBuf) {
 /// the candidate it just unpacked.
 pub fn plant_binary_without_the_flag(root: &Path, name: &str) -> PathBuf {
     let path = root.join(name);
-    fs::write(
+    write_executable(
         &path,
         "#!/bin/sh\n\
          if [ \"$1\" = --help ]; then\n\
@@ -364,10 +383,7 @@ pub fn plant_binary_without_the_flag(root: &Path, name: &str) -> PathBuf {
          fi\n\
          echo \"error: unexpected argument '$1' found\" >&2\n\
          exit 2\n",
-    )
-    .expect("the stand-in binary must be writable");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
-        .expect("the stand-in binary must be executable");
+    );
     path
 }
 
