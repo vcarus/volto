@@ -458,11 +458,11 @@ def a_targeted_block(rng):
         )
     if pick == 6:
         # A Huffman literal in the name position, where the length prefix is
-        # three bits rather than seven.
+        # three bits rather than seven: §4.5.6's '001', N = 0, H = 1.
         literal = a_huffman_literal(rng)
         return (
             prefix()
-            + enc_int(3, 0b0011, len(literal))
+            + enc_int(3, 0b0101, len(literal))
             + literal
             + enc_str(7, 0, rng.choice(VALUES), False)
         )
@@ -483,6 +483,17 @@ def huffman_in_a_section(literal):
     output and only that.
     """
     return prefix() + enc_int(4, 0b0101, 0) + enc_int(7, 1, len(literal)) + literal
+
+
+def huffman_name_in_a_section(literal):
+    """Wraps a Huffman literal as the name of a field line with a plain value.
+
+    §4.5.6's Literal Field Line With Literal Name, N = 0 and H = 1, so the
+    name's length has a three-bit prefix. For the strictness table only: a judge
+    may refuse a name for its octets as well as for its coding, and every case
+    there has to be refused anyway.
+    """
+    return prefix() + enc_int(3, 0b0101, len(literal)) + literal + enc_str(7, 0, b"v", False)
 
 
 def transcription_cases():
@@ -557,28 +568,29 @@ def strictness_cases():
              prefix(sign=1, delta_base=delta) + indexed_static(23),
              "RFC 9204 4.5.1.2")
 
-    # RFC 7541 §5.2, the three Huffman rules.
-    case("huffman padding of eight ones",
-         huffman_in_a_section(huffman_encode(b"0") + b"\xff"), "RFC 7541 5.2")
-    case("huffman padding of zeros",
-         huffman_in_a_section(pack(huffman_bits(b"0"), pad_bit=0)), "RFC 7541 5.2")
-    case("huffman literal of one zero octet",
-         huffman_in_a_section(b"\x00"), "RFC 7541 5.2")
-    case("huffman EOS alone",
-         huffman_in_a_section(pack([1] * 30)), "RFC 7541 5.2")
-    case("huffman EOS after a symbol",
-         huffman_in_a_section(pack(huffman_bits(b"a") + [1] * 30)), "RFC 7541 5.2")
-    case("huffman padding of nine ones",
-         huffman_in_a_section(pack(huffman_bits(b"0") + [1] * 9)), "RFC 7541 5.2")
-    # The same rule where the padding is a whole octet on its own. "www" is
-    # 3 * 5 = 15 bits, so one pad bit finishes the octet and the next octet is
-    # eight further bits of padding: nine in total, two past the limit.
-    case("huffman padding spilling into a second octet",
-         huffman_in_a_section(huffman_encode(b"www") + b"\xff"), "RFC 7541 5.2")
-    # And where the codes stop exactly on an octet boundary, so the added octet
-    # is the whole of the padding: "1" and "0" are 5 bits each, "-" is 6.
-    case("huffman padding of exactly one octet",
-         huffman_in_a_section(huffman_encode(b"10-") + b"\xff"), "RFC 7541 5.2")
+    # RFC 7541 §5.2, the three Huffman rules, once in a value and once in a
+    # name: the two positions reach the Huffman decoder through different
+    # field line parsing.
+    huffman_errors = [
+        ("huffman padding of eight ones", huffman_encode(b"0") + b"\xff"),
+        ("huffman padding of zeros", pack(huffman_bits(b"0"), pad_bit=0)),
+        ("huffman literal of one zero octet", b"\x00"),
+        ("huffman EOS alone", pack([1] * 30)),
+        ("huffman EOS after a symbol", pack(huffman_bits(b"a") + [1] * 30)),
+        ("huffman padding of nine ones", pack(huffman_bits(b"0") + [1] * 9)),
+        # The same rule where the padding is a whole octet on its own. "w" is
+        # 7 bits, so "www" is 21: three pad bits finish the octet and the next
+        # octet is eight further bits of padding, eleven in total.
+        ("huffman padding spilling into a second octet",
+         huffman_encode(b"www") + b"\xff"),
+        # And where the codes stop exactly on an octet boundary, so the added
+        # octet is the whole of the padding: "1" and "0" are 5 bits each, "-"
+        # is 6.
+        ("huffman padding of exactly one octet", huffman_encode(b"10-") + b"\xff"),
+    ]
+    for what, literal in huffman_errors:
+        case(what, huffman_in_a_section(literal), "RFC 7541 5.2")
+        case(f"{what}, in the name", huffman_name_in_a_section(literal), "RFC 7541 5.2")
 
     # Truncation: a representation that ends before it is finished.
     case("prefix only, one octet", b"\x00", "truncated")
