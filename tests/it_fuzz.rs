@@ -1010,13 +1010,14 @@ proptest! {
     /// alone.
     ///
     /// This is the allocation bound, stated the only way a test can state one
-    /// without a heap profiler: nothing but the frame header is ever written --
-    /// nine bytes for a 2^62-1 length -- so a decoder that waited for the
-    /// payload before answering would hang here rather than fail, and one that
-    /// sized a buffer from the declared length would be asking for four
-    /// exabytes before it could. The refusal arrives instead, and it is a
-    /// stream error: the request is lost, the connection and its tunnels are
-    /// not.
+    /// without a heap profiler: nothing but the frame header is ever written,
+    /// nine bytes for a 2^62-1 length. `drive_with` finishes the stream after
+    /// it, so a decoder that waited for the payload before answering would see
+    /// the stream end inside a frame and answer H3_FRAME_ERROR, which the
+    /// equality below refuses. One that sized a buffer from the declared length
+    /// would be asking for four exabytes before it could answer at all. The
+    /// refusal arrives instead, and it is a stream error: the request is lost,
+    /// the connection and its tunnels are not.
     ///
     /// That the refusal also costs the *connection's* budget nothing is checked
     /// by [`refusing_frames_never_charges_the_connections_budget`], as one case
@@ -1053,9 +1054,9 @@ proptest! {
             );
         }
 
-        // Promptness, as a bound rather than a measurement: every refusal above
-        // is decided from a handful of bytes, so a run anywhere near the timeout
-        // was waiting for a payload nobody sent.
+        // Promptness, as a bound rather than a measurement. Each call above has
+        // its own timeout; this bounds the calls together, because every
+        // refusal is decided from a handful of bytes.
         prop_assert!(
             started.elapsed() < WIRE_TIMEOUT,
             "the refusals took {:?}",
@@ -2111,8 +2112,11 @@ proptest! {
     /// cannot state: this is a [`Request`] nobody validated. Every field of the
     /// type is `pub` and `Option<Box<str>>`, so a combination the validator
     /// would never have produced -- a classic CONNECT carrying a path, a
-    /// `:protocol` on a GET -- can be built directly here, which pins that
-    /// nothing downstream of the parse assumes the parse happened.
+    /// `:protocol` on a GET -- can be built directly here. What it pins is the
+    /// message type itself: its `Debug`, its field lookups and its `clone`
+    /// assume nothing about which pseudo-headers are set. The readers past the
+    /// message layer (authentication, the router, the tunnels) are not called
+    /// here.
     #[test]
     fn arbitrary_pseudo_headers_never_panic_the_message_layer(
         method in any_name_bytes(),
