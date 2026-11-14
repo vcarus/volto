@@ -798,11 +798,32 @@ proptest! {
         prop_assert!(parse_target(&path, Some("")).is_ok(), "an empty query is no query");
     }
 
-    /// Anything not under the well-known prefix is refused, however plausible.
+    /// Anything not under the well-known prefix is refused.
     #[test]
     fn a_path_outside_the_template_is_refused(path in "\\PC{0,64}") {
         prop_assume!(!path.starts_with(PREFIX));
         prop_assert!(parse_target(&path, None).is_err());
+    }
+
+    /// The prefix with one edit is refused, however plausible, in front of a
+    /// target that parses under the real prefix.
+    ///
+    /// Random text almost never starts with `/`, so the property above never
+    /// comes near the prefix. These are the near misses: a character deleted,
+    /// replaced or upper-cased, the trailing slash dropped, or another protocol
+    /// segment in place of `udp`.
+    #[test]
+    fn a_near_miss_of_the_template_is_refused(
+        prefix in near_miss_prefix(),
+        host in literal_host(),
+        port in 1u16..,
+    ) {
+        prop_assert!(
+            parse_target(&format!("{PREFIX}{host}/{port}/"), None).is_ok(),
+            "the target itself must parse under the real prefix"
+        );
+        let path = format!("{prefix}{host}/{port}/");
+        prop_assert!(parse_target(&path, None).is_err(), "{:?} was accepted", path);
     }
 
     /// Only 1..=65535 is a port. Zero is refused explicitly (it can never be a
@@ -886,6 +907,29 @@ fn the_template_accepts_more_spellings_than_it_advertises() {
     );
     // Except when the escapes do not spell UTF-8 at all.
     assert!(parse_target("/.well-known/masque/udp/%FF/53/", None).is_err());
+}
+
+/// The well-known prefix with one edit, and never the prefix itself.
+fn near_miss_prefix() -> impl Strategy<Value = String> {
+    let edited = |edit: fn(&mut String, usize, char)| {
+        (0..PREFIX.len(), prop::char::range(' ', '~')).prop_map(move |(at, ch)| {
+            let mut prefix = PREFIX.to_owned();
+            edit(&mut prefix, at, ch);
+            prefix
+        })
+    };
+
+    prop_oneof![
+        edited(|prefix, at, _| {
+            prefix.remove(at);
+        }),
+        edited(|prefix, at, ch| prefix.replace_range(at..=at, ch.encode_utf8(&mut [0; 4]))),
+        edited(|prefix, at, _| prefix[at..=at].make_ascii_uppercase()),
+        "[a-z]{0,6}".prop_map(|segment| format!("/.well-known/masque/{segment}/")),
+    ]
+    .prop_filter("an edit that leaves the prefix as it was", |prefix| {
+        prefix != PREFIX
+    })
 }
 
 /// Paths aimed at the template's edges: percent escapes (including sequences
