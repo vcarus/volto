@@ -44,34 +44,96 @@ use std::path::Path;
 
 use scripts::{read_text, repo_root, rust_files, source_root};
 
-/// Every `script/…` path the release workflow copies into the tarball.
-fn packaged_paths() -> BTreeSet<String> {
+/// The indentation of `line`, in spaces.
+fn indentation(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+/// The `cp` commands of the `Package` step of the `build` job in
+/// `release.yml`, each as its list of words with quotes removed.
+///
+/// A step ends at the next line indented no deeper than its `- name:` line,
+/// and the job ends at the next line indented no deeper than its key, so a
+/// `cp` in any other step or job is not read. A `cp` invocation may be spread
+/// over several lines with trailing backslashes; those are folded into one
+/// line first.
+fn package_copies() -> Vec<Vec<String>> {
     let workflow = repo_root().join(".github/workflows/release.yml");
-    let text = read_text(&workflow);
+    let text = read_text(&workflow).replace("\\\n", " ");
+    let lines: Vec<&str> = text.lines().collect();
 
-    // A `cp` invocation may be spread over several lines with trailing
-    // backslashes; fold those back into one line before looking at it.
-    let folded = text.replace("\\\n", " ");
+    let job = lines
+        .iter()
+        .position(|line| *line == "  build:")
+        .unwrap_or_else(|| panic!("{} has no `build` job", workflow.display()));
+    let job_end = lines[job + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) <= 2)
+        .map_or(lines.len(), |end| job + 1 + end);
+    let step = (job..job_end)
+        .find(|at| lines[*at].trim() == "- name: Package")
+        .unwrap_or_else(|| {
+            panic!(
+                "the `build` job of {} has no `Package` step",
+                workflow.display()
+            )
+        });
+    let depth = indentation(lines[step]);
+    let step_end = lines[step + 1..job_end]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) <= depth)
+        .map_or(job_end, |end| step + 1 + end);
 
+    let copies: Vec<Vec<String>> = lines[step + 1..step_end]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| line.starts_with("cp "))
+        .map(|line| {
+            line.split_whitespace()
+                .map(|word| word.trim_matches(|c| c == '"' || c == '\'').to_owned())
+                .collect()
+        })
+        .collect();
+    assert!(
+        !copies.is_empty(),
+        "the `Package` step of {} copies nothing; the reader is broken, or the \
+         step moved",
+        workflow.display()
+    );
+    copies
+}
+
+/// Where the `Package` step puts the deployment assets, relative to the
+/// archive's directory: `deploy.sh` runs them from `$SRC/script/`.
+const SCRIPT_DESTINATION: &str = "dist/${name}/script/";
+
+/// Every `script/…` path the release workflow copies into the tarball.
+///
+/// Each `cp` line that names one must copy into [`SCRIPT_DESTINATION`], so a
+/// path counts only where it lands in the archive's `script/` directory.
+fn packaged_paths() -> BTreeSet<String> {
     let mut packaged = BTreeSet::new();
-    for line in folded.lines() {
-        let line = line.trim();
-        if !line.starts_with("cp ") {
+    for copy in package_copies() {
+        let sources: Vec<&String> = copy[1..copy.len() - 1]
+            .iter()
+            .filter(|word| word.starts_with("script/"))
+            .collect();
+        if sources.is_empty() {
             continue;
         }
-        for token in line.split_whitespace() {
-            let token = token.trim_matches(|c| c == '"' || c == '\'');
-            // The destination is `dist/${name}/script/`; only sources count.
-            if token.starts_with("script/") {
-                packaged.insert(token.to_string());
-            }
-        }
+        let destination = copy.last().expect("a cp line has words");
+        assert_eq!(
+            destination, SCRIPT_DESTINATION,
+            "release.yml copies {sources:?} to {destination}, but deploy.sh runs the \
+             deployment assets from the archive's script/ directory"
+        );
+        packaged.extend(sources.into_iter().cloned());
     }
 
     assert!(
         !packaged.is_empty(),
-        "no `cp script/… ` line was found in {} — has the packaging step moved?",
-        workflow.display()
+        "no `cp script/… ` line was found in the Package step of release.yml; \
+         has the packaging step moved?"
     );
     packaged
 }
@@ -130,19 +192,22 @@ fn every_packaged_path_still_exists() {
 #[test]
 fn the_documentation_the_scripts_point_at_is_packaged() {
     let workflow = repo_root().join(".github/workflows/release.yml");
-    let folded = read_text(&workflow).replace("\\\n", " ");
 
-    let packages_docs = folded
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("cp "))
-        .any(|line| line.split_whitespace().any(|token| token == "docs"));
+    // The directory must land at the top of the archive, beside `script/`, which
+    // is where the scripts' relative `docs/…` pointers resolve.
+    let packages_docs = package_copies().iter().any(|copy| {
+        copy[1..copy.len() - 1].iter().any(|word| word == "docs")
+            && copy
+                .last()
+                .is_some_and(|destination| destination == "dist/${name}/")
+    });
 
     assert!(
         packages_docs,
-        "{} no longer copies `docs` into the tarball, but script/deploy.sh and \
-         script/install-selfsigned.sh still send the operator to \
-         docs/configuration.md and docs/deployment.md when they refuse to install",
+        "the Package step of {} no longer copies `docs` to the top of the \
+         tarball, but script/deploy.sh and script/install-selfsigned.sh still send \
+         the operator to docs/configuration.md and docs/deployment.md when they \
+         refuse to install",
         workflow.display()
     );
 
