@@ -216,8 +216,14 @@ async def start_tagged_udp_echo(tag):
     return transport, host, port
 
 
-async def start_tagged_tcp_echo(tag):
-    """A TCP target echoing each read back with tag prepended, closing on EOF."""
+async def start_tagged_tcp_echo(tag, after_eof=b""):
+    """A TCP target echoing each read back with tag prepended, closing on EOF.
+
+    With after_eof set, the target writes tag followed by after_eof once it
+    has read EOF, and only then closes. That reply can reach the client only
+    if the client's FIN reached the target as a write-shutdown and left the
+    target's own sending side open.
+    """
 
     async def serve(reader, writer):
         # A tunnel still open when its QUIC connection closes is aborted
@@ -228,6 +234,9 @@ async def start_tagged_tcp_echo(tag):
                 if not data:
                     break
                 writer.write(bytes([tag]) + data)
+                await writer.drain()
+            if after_eof:
+                writer.write(bytes([tag]) + after_eof)
                 await writer.drain()
         except ConnectionError:
             pass
@@ -247,10 +256,12 @@ async def test_tcp_tunnel_round_trips():
 
     Several round trips (a tunnel that is only right for the first write is a
     real failure mode), then the RFC 9114 §4.4 half-close: the client's FIN
-    must reach the target as a write-shutdown, the target's close must come
-    back as end of the response — and neither may tear the other down early.
+    must reach the target as a write-shutdown, the reply the target writes
+    after its EOF must still arrive, and the target's close must come back as
+    end of the response. Neither may tear the other down early.
     """
-    server, host, port = await start_tagged_tcp_echo(0xD0)
+    after_eof = b"volto-aioquic-tcp-after-eof"
+    server, host, port = await start_tagged_tcp_echo(0xD0, after_eof)
     try:
         async with proxy_connection() as client:
             stream_id = await client.connect_tcp(f"{host}:{port}")
@@ -266,13 +277,18 @@ async def test_tcp_tunnel_round_trips():
                     got += data
                 assert got == want, f"round {i}: {got!r} != {want!r}"
 
-            # Half-close: FIN towards the target, EOF back from it.
+            # Half-close: FIN towards the target, which answers its EOF with
+            # one reply and then closes. The reply has to arrive, and then
+            # the end of the response.
             client.send_stream(stream_id, b"", end_stream=True)
+            got = b""
             while True:
                 data, ended = await client.recv_stream(stream_id)
-                assert data == b"", f"unexpected data after FIN: {data!r}"
+                got += data
                 if ended:
                     break
+            want = bytes([0xD0]) + after_eof
+            assert got == want, f"after the FIN: {got!r} != {want!r}"
     finally:
         server.close()
 
