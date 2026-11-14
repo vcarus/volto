@@ -1644,6 +1644,19 @@ impl SharedBuffer {
 /// which produce the lines this parses.
 #[track_caller]
 pub fn numeric_field(line: &str, name: &str) -> u64 {
+    field_text(line, name)
+        .parse()
+        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
+}
+
+/// Reads a field's value off a formatted log line as text: everything after
+/// `name=` up to the next whitespace.
+///
+/// For a value written with `%`, such as an address, which the line carries
+/// without quotes. The field is found by its whole name, as in
+/// [`numeric_field`].
+#[track_caller]
+pub fn field_text<'a>(line: &'a str, name: &str) -> &'a str {
     let key = format!("{name}=");
     let rest = line
         .match_indices(&key)
@@ -1655,10 +1668,7 @@ pub fn numeric_field(line: &str, name: &str) -> u64 {
         })
         .map(|(at, _)| &line[at + key.len()..])
         .unwrap_or_else(|| panic!("no {name}= in:\n{line}"));
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits
-        .parse()
-        .unwrap_or_else(|_| panic!("{name}= is not a number in:\n{line}"))
+    rest.split(char::is_whitespace).next().unwrap_or("")
 }
 
 impl std::io::Write for SharedBuffer {

@@ -17,13 +17,13 @@ mod common;
 use common::rawstream::{STREAM_PUSH, open_uni_stream};
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
-    connect_quic, echoes, numeric_field, open_tcp_tunnel, open_udp_session, recv_datagram,
-    send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
+    connect_quic, echoes, field_text, numeric_field, open_tcp_tunnel, open_udp_session,
+    recv_datagram, send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
 };
 use std::assert_matches;
 use volto::datagram;
 
-/// The seven ways a connection ends, each with the level and reason it earns.
+/// The eight ways a connection ends, each with the level and reason it earns.
 ///
 /// One test function, because the subscriber is process-wide: splitting the
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
@@ -226,7 +226,40 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
     }
 
-    // 7. The server shuts down: GOAWAY goes out, there is nothing to drain, and
+    // 7. The peer moves to a new address mid-connection, and the closing line
+    //    reports both: `remote` is where the connection was accepted from and
+    //    `remote_now` is where it ended. A `remote_now` read from the accepted
+    //    address would look correct in every other scenario here, because no
+    //    other client moves. The echo after the move makes the server validate
+    //    the new path and send from it, which is when its peer address changes.
+    {
+        let mark = buffer.mark();
+        let mut client = H3Client::connect(&server).await;
+        let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
+        echoes(&mut tunnel, b"before the move").await;
+        let moved_to = client.rebind();
+        echoes(&mut tunnel, b"after the move").await;
+        client.quic.close(quinn::VarInt::from_u32(0), b"");
+
+        let line = buffer
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
+            .await;
+        assert_ne!(
+            field_text(&line, "remote"),
+            moved_to.to_string(),
+            "the connection was accepted before the move; line was:\n{line}"
+        );
+        assert_eq!(
+            field_text(&line, "remote_now"),
+            moved_to.to_string(),
+            "the connection ended at the address it moved to; line was:\n{line}"
+        );
+    }
+
+    // 8. The server shuts down: GOAWAY goes out, there is nothing to drain, and
     //    the accept loop returns `Ok(())` on its own terms rather than through an
     //    error. Last, because it stops the server.
     {
@@ -263,8 +296,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .collect();
     assert_eq!(
         closes.len(),
-        5,
-        "five of the seven closes are routine; log was:\n{logged}"
+        6,
+        "six of the eight closes are routine; log was:\n{logged}"
     );
     for line in &closes {
         assert!(
@@ -285,8 +318,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             line.contains("mtu_black_holes=0"),
             "a close log must carry the black-hole detector's count; line was:\n{line}"
         );
-        // The real address, not an empty or default one: this is what a
-        // migration would show up as having changed.
+        // The real address, not an empty or default one. Scenario 7 checks
+        // that it follows the peer when the peer moves.
         assert!(
             line.contains("remote_now=127.0.0.1:"),
             "a close log must carry the address the peer ended on; line was:\n{line}"
@@ -310,7 +343,7 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         }
     }
 
-    // The whole point of the grading: exactly two of the seven closes were worth a
+    // The whole point of the grading: exactly two of the eight closes were worth a
     // warning — the peer reporting a problem and the peer causing one — and
     // neither of them is a routine ending.
     let warnings: Vec<&str> = logged

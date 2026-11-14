@@ -56,6 +56,7 @@
 // allow: a client-side encoder, mirroring the server's own byte-level packing.
 #![allow(clippy::as_conversions)]
 
+use std::net::SocketAddr;
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -303,11 +304,17 @@ impl H3Client {
     /// Moves the client onto a fresh local socket while the connection lives
     /// on — the address change a phone produces when it hops networks. The
     /// server must treat it as a QUIC migration (RFC 9000 §9), not a new peer.
-    pub fn rebind(&self) {
+    ///
+    /// Returns the new local address, which is what the server sees the peer
+    /// move to.
+    pub fn rebind(&self) -> SocketAddr {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a fresh client socket");
         self.endpoint
             .rebind(socket)
             .expect("rebind the client endpoint");
+        self.endpoint
+            .local_addr()
+            .expect("the rebound endpoint has an address")
     }
 
     /// The identifier of the server's GOAWAY, if one has arrived.
