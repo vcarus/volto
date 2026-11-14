@@ -541,76 +541,116 @@ fn the_introduced_in_table_accounts_for_every_key() {
 /// Read in the other direction as well, by
 /// [`the_table_names_no_constant_the_pages_stopped_quoting`]: an entry no page
 /// quotes any more is guarding nothing, so it comes out.
-fn crate_constants() -> BTreeMap<&'static str, u64> {
+fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
     BTreeMap::from([
-        ("SEND_WINDOW", volto::quic::SEND_WINDOW),
-        ("FD_HEADROOM", volto::quic::FD_HEADROOM),
+        ("SEND_WINDOW", (volto::quic::SEND_WINDOW, Dimension::Bytes)),
+        ("FD_HEADROOM", (volto::quic::FD_HEADROOM, Dimension::Count)),
         (
             "MAX_PEER_UNI_STREAMS",
-            u64::from(volto::quic::MAX_PEER_UNI_STREAMS),
+            (
+                u64::from(volto::quic::MAX_PEER_UNI_STREAMS),
+                Dimension::Count,
+            ),
         ),
         (
             "INITIAL_BIDI_STREAMS",
-            u64::from(volto::quic::INITIAL_BIDI_STREAMS),
+            (
+                u64::from(volto::quic::INITIAL_BIDI_STREAMS),
+                Dimension::Count,
+            ),
         ),
         (
             "MAX_FIELD_SECTION_SIZE",
-            volto::h3api::MAX_FIELD_SECTION_SIZE,
+            (volto::h3api::MAX_FIELD_SECTION_SIZE, Dimension::Bytes),
         ),
         (
             "HEADERS_BUFFER_BUDGET",
-            volto::h3::HEADERS_BUFFER_BUDGET as u64,
+            (volto::h3::HEADERS_BUFFER_BUDGET as u64, Dimension::Bytes),
         ),
-        ("READ_AHEAD_CHUNKS", volto::h3api::READ_AHEAD_CHUNKS as u64),
+        (
+            "READ_AHEAD_CHUNKS",
+            (volto::h3api::READ_AHEAD_CHUNKS as u64, Dimension::Count),
+        ),
         (
             "CONNECTION_UNANSWERED_MULTIPLIER",
-            u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER),
+            (
+                u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER),
+                Dimension::Count,
+            ),
         ),
-        ("RELAY_BUF_SIZE", volto::tunnel::tcp::RELAY_BUF_SIZE as u64),
+        (
+            "RELAY_BUF_SIZE",
+            (volto::tunnel::tcp::RELAY_BUF_SIZE as u64, Dimension::Bytes),
+        ),
         (
             "RELAY_BLOCK_SIZE",
-            volto::tunnel::tcp::RELAY_BLOCK_SIZE as u64,
+            (
+                volto::tunnel::tcp::RELAY_BLOCK_SIZE as u64,
+                Dimension::Bytes,
+            ),
         ),
         (
             "RECV_BLOCK_SIZE",
-            volto::tunnel::udp::RECV_BLOCK_SIZE as u64,
+            (volto::tunnel::udp::RECV_BLOCK_SIZE as u64, Dimension::Bytes),
         ),
         (
             "DEFAULT_UDP_SESSION_TIMEOUT",
-            volto::config::DEFAULT_UDP_SESSION_TIMEOUT,
+            (
+                volto::config::DEFAULT_UDP_SESSION_TIMEOUT,
+                Dimension::Seconds,
+            ),
         ),
         (
             "DEFAULT_SOCKET_RECV_BUFFER",
-            volto::config::DEFAULT_SOCKET_RECV_BUFFER as u64,
+            (
+                volto::config::DEFAULT_SOCKET_RECV_BUFFER as u64,
+                Dimension::Bytes,
+            ),
         ),
         (
             "DEFAULT_SOCKET_SEND_BUFFER",
-            volto::config::DEFAULT_SOCKET_SEND_BUFFER as u64,
+            (
+                volto::config::DEFAULT_SOCKET_SEND_BUFFER as u64,
+                Dimension::Bytes,
+            ),
         ),
     ])
 }
 
-/// The units a quoted value may carry, and what each one multiplies by.
+/// What a constant counts, which decides the unit words a quote of it may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dimension {
+    Bytes,
+    Seconds,
+    /// Streams, chunks, descriptors or a multiplier: no unit at all.
+    Count,
+}
+
+/// The units a quoted value may carry, the dimension each belongs to, and what
+/// each one multiplies by to reach the constant's own unit.
 ///
-/// `s` and `ms` are here as units of the value's own dimension rather than as
-/// multipliers: a timeout in seconds is stored in seconds, and writing "180 s"
-/// beside it is what makes the sentence readable.
-const UNITS: [(&str, u64); 8] = [
-    ("B", 1),
-    ("KiB", 1024),
-    ("MiB", 1024 * 1024),
-    ("GiB", 1024 * 1024 * 1024),
-    ("kB", 1_000),
-    ("MB", 1_000_000),
-    ("s", 1),
-    ("ms", 1),
+/// The one time unit is `s`, because the one time constant is stored in
+/// seconds. A quote of it in `ms` or in minutes names another number, so those
+/// words are not units here and fail the gate.
+const UNITS: [(&str, Dimension, u64); 7] = [
+    ("B", Dimension::Bytes, 1),
+    ("KiB", Dimension::Bytes, 1024),
+    ("MiB", Dimension::Bytes, 1024 * 1024),
+    ("GiB", Dimension::Bytes, 1024 * 1024 * 1024),
+    ("kB", Dimension::Bytes, 1_000),
+    ("MB", Dimension::Bytes, 1_000_000),
+    ("s", Dimension::Seconds, 1),
 ];
 
-/// The value a quote carries, in the constant's own unit.
+/// The words the pages write after a unitless number, which are prose rather
+/// than a unit. Any other word after a number fails the gate.
+const NOUNS: [&str; 6] = ["of", "chunks", "descriptors", "times", "concurrent", "in"];
+
+/// The number a quote carries and the word after it, which may be empty.
 ///
 /// `None` when what follows ` = ` is not a number at all, which is how prose
 /// that happens to put an equals sign after a backticked word stays prose.
-fn quoted_value(rest: &str) -> Option<u64> {
+fn quoted_value(rest: &str) -> Option<(u64, String)> {
     let digits: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '_' || *c == ',')
@@ -622,12 +662,28 @@ fn quoted_value(rest: &str) -> Option<u64> {
         .chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .collect();
-    let multiplier = UNITS
-        .iter()
-        .find(|(unit, _)| *unit == word)
-        .map_or(1, |(_, multiplier)| *multiplier);
 
-    Some(number * multiplier)
+    Some((number, word))
+}
+
+/// The value a quote of `number` followed by `word` states for a constant of
+/// `dimension`, in the constant's own unit, or why the word does not fit it.
+fn value_in_own_unit(number: u64, word: &str, dimension: Dimension) -> Result<u64, String> {
+    match UNITS.iter().find(|(unit, _, _)| *unit == word) {
+        Some((_, unit_dimension, multiplier)) if *unit_dimension == dimension => {
+            Ok(number * multiplier)
+        }
+        Some((unit, unit_dimension, _)) => Err(format!(
+            "`{unit}` is a unit of {unit_dimension:?}, and the constant is in {dimension:?}"
+        )),
+        None if dimension == Dimension::Seconds => Err(format!(
+            "a time is quoted in `s`, and this quote is followed by {word:?}"
+        )),
+        None if word.is_empty() || NOUNS.contains(&word) => Ok(number),
+        None => Err(format!(
+            "`{word}` is neither a unit nor one of the words {NOUNS:?}"
+        )),
+    }
 }
 
 /// One `` `IDENT` = value `` quote, and where it was found.
@@ -636,7 +692,9 @@ struct Quote {
     source: String,
     line: usize,
     name: String,
-    value: Option<u64>,
+    number: u64,
+    /// The word after the number: a unit, a noun, or nothing.
+    word: String,
 }
 
 /// Every constant quote on the doc pages and in the example configuration.
@@ -682,16 +740,17 @@ fn quotes() -> Vec<Quote> {
                     && name
                         .chars()
                         .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-                if screaming && let Some(value) = tail.strip_prefix(" = ") {
-                    let parsed = quoted_value(value);
-                    if parsed.is_some() {
-                        found.push(Quote {
-                            source: named.clone(),
-                            line,
-                            name: name.to_owned(),
-                            value: parsed,
-                        });
-                    }
+                if screaming
+                    && let Some(value) = tail.strip_prefix(" = ")
+                    && let Some((number, word)) = quoted_value(value)
+                {
+                    found.push(Quote {
+                        source: named.clone(),
+                        line,
+                        name: name.to_owned(),
+                        number,
+                        word,
+                    });
                 }
 
                 rest = tail;
@@ -728,18 +787,22 @@ fn every_constant_quoted_in_the_docs_matches_the_crate() {
             source,
             line,
             name,
-            value,
+            number,
+            word,
         } = quote;
-        let actual = constants.get(name.as_str()).unwrap_or_else(|| {
+        let (actual, dimension) = constants.get(name.as_str()).unwrap_or_else(|| {
             panic!(
                 "{source}:{line} quotes `{name}`, which is not a constant this \
                  gate knows; add it to `crate_constants` or fix the name"
             )
         });
-        let value = value.expect("only parsed quotes are collected");
+        let value = value_in_own_unit(*number, word, *dimension).unwrap_or_else(|reason| {
+            panic!("{source}:{line} quotes `{name}` = {number} {word}: {reason}")
+        });
         assert_eq!(
             value, *actual,
-            "{source}:{line} says `{name}` = {value}, the crate says {actual}"
+            "{source}:{line} says `{name}` = {number} {word}, which is {value}, and \
+             the crate says {actual}"
         );
     }
 }
