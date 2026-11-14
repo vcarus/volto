@@ -886,7 +886,7 @@ async fn udp_session(
         proxy_status(&response)
     );
     // RFC 9297 §3.4: the response should announce the capsule protocol, and §3.2
-    // forbids it from describing a body. Protocol requirements rather than
+    // forbids Content-Length, Content-Type and Transfer-Encoding on it. Protocol requirements rather than
     // scaffolding, so they belong to every session this helper opens.
     assert_eq!(
         response
@@ -902,6 +902,10 @@ async fn udp_session(
     );
     assert!(
         !response.fields.contains("content-type"),
+        "a CONNECT-UDP response frames no content; session opened at {caller}"
+    );
+    assert!(
+        !response.fields.contains("transfer-encoding"),
         "a CONNECT-UDP response frames no content; session opened at {caller}"
     );
 
