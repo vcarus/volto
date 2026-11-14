@@ -442,6 +442,7 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     //
     // One datagram, and the run sends no other droppable one, so the closing
     // line has to say exactly one.
+    let orphan = log.mark();
     send_udp_payload(&client.quic, refused_qsid, b"orphan");
     // A fence: the round trip crosses the router after the datagram above, so
     // the drop has been counted by the time the connection closes.
@@ -449,6 +450,19 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
         udp_round_trip(&client, live_qsid, b"fence").await.as_ref(),
         b"fence"
     );
+    // The count alone cannot say why the datagram was dropped. An entry left
+    // behind by the refused session, whose receiver is gone, fails its send and
+    // is counted as a full queue, so the closing line would say one either way.
+    // This DEBUG line is written only for a Quarter Stream ID that has no entry
+    // at all.
+    log.wait_for_line(
+        orphan,
+        &[
+            "dropping datagrams for sessions that do not exist",
+            &format!("quarter_stream_id={refused_qsid} "),
+        ],
+    )
+    .await;
 
     let mark = log.mark();
     client.quic.close(quinn::VarInt::from_u32(0), b"");
