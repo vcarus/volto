@@ -1354,17 +1354,34 @@ async fn an_unreachable_target_closes_the_session() {
     send_udp_payload(&client.quic, qsid, b"knock knock");
 
     // The server finishes its side of the request stream, which the client sees
-    // as end-of-stream. Anything else — including nothing at all until the test
-    // times out — means the ICMP error was swallowed.
+    // as end-of-stream. Nothing at all until the test times out means the ICMP
+    // error was swallowed.
     let ended = tokio::time::timeout(TIMEOUT, stream.recv_data()).await;
     match ended {
         Ok(Ok(None)) => {}
         Ok(Ok(Some(_))) => panic!("an unreachable target must not produce data"),
-        // A reset instead of a clean finish also closes the session, which
-        // satisfies the requirement.
-        Ok(Err(_)) => {}
+        // A reset of the request stream instead of a clean finish also closes
+        // the session, which satisfies the requirement. Any other error is not
+        // the session closing: a lost connection is every other session on it
+        // closing too.
+        Ok(Err(error)) => assert!(
+            volto::h3api::peer_reset_code(&error).is_some(),
+            "the session must end on its own stream, not with {error:?}"
+        ),
         Err(_) => panic!("the request stream was left open after ECONNREFUSED"),
     }
+
+    // RFC 9298 §3.1 closes the request stream, and only that: the connection
+    // still serves another session.
+    assert!(
+        client.quic.close_reason().is_none(),
+        "an unreachable target must not close the connection: {:?}",
+        client.quic.close_reason()
+    );
+    let echo = spawn_udp_echo_target().await;
+    let (second, _second_stream) = open_udp_session(&mut client, &server, echo).await;
+    let echoed = udp_round_trip(&client, second, b"still here").await;
+    assert_eq!(&echoed[..], b"still here");
 }
 
 /// RFC 9297 §3.2: the body of a CONNECT-UDP request stream is a capsule
