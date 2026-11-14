@@ -53,15 +53,20 @@ use rustls::pki_types::{CertificateDer, ServerName};
 /// different one.
 const APPLICATION_ERROR: u64 = 0x0c;
 
-/// Room for two connections at a time, on top of the 1s idle timeout.
+/// Room for two connections at a time.
 ///
-/// Small enough that a peer holding a slot it never uses is visible from the
-/// outside: the third client is refused while the first two are alive.
+/// A newcomer at the cap is not refused: it is asked for a Retry and then
+/// evicts the oldest connection that has never authenticated. So a cap this
+/// small makes a held slot visible only as a Retry, or as an eviction, and the
+/// tests that use it say which of the two they read.
 const TWO_SLOTS: &str = "max_connections = 2\n";
 
-/// Room for one connection at a time, so a slot held is a slot everyone can see
-/// is gone: the second client is refused while the first holds it, and admitted
-/// once it does not.
+/// Room for one connection at a time.
+///
+/// As with [`TWO_SLOTS`], a newcomer is never refused at the cap. While the one
+/// slot is held, a newcomer draws a Retry and then evicts the holder if the
+/// holder never authenticated; once the slot is free, the newcomer draws no
+/// Retry.
 const ONE_SLOT: &str = "max_connections = 1\n";
 
 /// The credentials the tests that configure authentication use.
@@ -121,8 +126,8 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
 // D76: an unauthenticated connection may not sit on a slot for ever
 // ---------------------------------------------------------------------------
 
-/// A peer that completes the handshake and then never asks for anything must
-/// give the slot back.
+/// A peer that completes the handshake and then never asks for anything is
+/// closed by the bound.
 ///
 /// The two silent peers here are exactly the shape the v0.4.0 review found: a
 /// plain QUIC connection, no request stream ever opened, kept alive by its own
@@ -136,7 +141,7 @@ async fn an_ordinary_client_is_untouched_by_the_deadline() {
 /// file instead; what is under test here is the bound each connection is under
 /// on its own, with or without anyone waiting for its slot.
 #[tokio::test]
-async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
+async fn a_peer_that_never_sends_a_request_is_closed_by_the_bound() {
     let server = TestServer::start_with(&format!("{IMPATIENT}{TWO_SLOTS}")).await;
 
     let first = silent_peer(&server).await;
@@ -148,11 +153,12 @@ async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
     assert_closed_with(&second.1, H3_NO_ERROR, Duration::from_secs(8)).await;
 
     // And the server is serving afterwards rather than merely reporting the two
-    // as closed.
+    // as closed. This is not a slot check: at the cap a newcomer is admitted by
+    // eviction whether or not a slot is held.
     let (_endpoint, admitted) = common::connect_quic(&server).await;
     assert!(
         admitted.close_reason().is_none(),
-        "the third client must be admitted once the silent peers are gone"
+        "the server must still be serving once the silent peers are gone"
     );
 }
 
@@ -162,7 +168,7 @@ async fn a_peer_that_never_sends_a_request_gives_its_slot_back() {
 /// request on it, so the bound still applies. This is the other half of the
 /// review's C1 — a peer that answers the challenge by saying nothing at all.
 #[tokio::test]
-async fn a_peer_that_only_fails_authentication_gives_its_slot_back() {
+async fn a_peer_that_only_fails_authentication_is_closed_by_the_bound() {
     let server = TestServer::start_with(&format!(
         "{IMPATIENT}{}",
         auth_section(&[(USER.0, "the right password")])
@@ -328,7 +334,7 @@ async fn an_unbroken_churn_of_request_streams_does_not_extend_the_bound() {
         // kernel can drop the CONNECTION_CLOSE itself, after which the client
         // learns only from the stateless reset the endpoint sends for a
         // connection it no longer has. Which code the bound closes with is
-        // pinned by `a_peer_that_never_sends_a_request_gives_its_slot_back`,
+        // pinned by `a_peer_that_never_sends_a_request_is_closed_by_the_bound`,
         // where nothing is flooding; what this test is about is *when*.
         quinn::ConnectionError::Reset => {}
         // An idle timeout would mean the keep-alive stopped working and this
