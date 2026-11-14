@@ -1655,6 +1655,8 @@ enum Service {
     ComesUp,
     /// `restart` fails, which ends the run inside the swap window.
     RestartFails,
+    /// `restart` succeeds and the health check finds the service inactive.
+    DiesAfterRestart,
 }
 
 /// How the binary inside a published release answers `--check-config`.
@@ -1719,6 +1721,7 @@ impl Host {
         let (restart, active) = match service {
             Service::ComesUp => (0, 0),
             Service::RestartFails => (1, 0),
+            Service::DiesAfterRestart => (0, 1),
         };
         write_executable(
             &host.stubs.join("systemctl"),
@@ -1969,5 +1972,50 @@ fn a_failure_inside_the_swap_window_restores_both_files() {
     assert!(
         stderr.contains("installing volto 1.3.7 failed; restored the previous binary and unit"),
         "the run must say what it restored: {stderr}"
+    );
+}
+
+/// A release that is not running three seconds after its restart is rolled
+/// back: the previous binary and unit go back, systemd reloads, and the
+/// service restarts on them.
+///
+/// This is the branch after the health check, where the ERR trap is not what
+/// acts: `systemctl is-active` is the condition of an `if`, so its failure
+/// fires no trap.
+#[test]
+fn a_release_that_does_not_stay_up_is_rolled_back() {
+    let host = Host::new("health-check", Service::DiesAfterRestart);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let previous_binary =
+        fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+    let previous_unit = fs::read_to_string(host.unit()).expect("the planted unit must be readable");
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success(),
+        "a release that does not stay up must fail the run: {}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(previous_binary),
+        "the previous binary must be back in place: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.unit()).ok(),
+        Some(previous_unit),
+        "the previous unit must be back in place: {stderr}"
+    );
+    assert_eq!(
+        host.calls("systemctl"),
+        "daemon-reload\nrestart volto\nis-active --quiet volto\ndaemon-reload\nrestart volto\n",
+        "the rollback must reload systemd before it restarts the service: {stderr}"
+    );
+    assert!(
+        stderr.contains("volto 1.3.7 failed to start; rolled the binary and unit back to 1.3.6"),
+        "the run must say what it rolled back and to which version: {stderr}"
     );
 }
