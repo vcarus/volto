@@ -766,6 +766,68 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
     );
 }
 
+/// Whether the shell line `line` runs `curl` as a command.
+///
+/// `curl` counts as a command word at the start of the line, after a `$(`, a
+/// `(`, a backtick, a pipe, `&&`, `||`, `;` or `{`, after a keyword that
+/// precedes a command (`if`, `then`, `else`, `elif`, `do`, `while`, `until`,
+/// `!`, `exec`, `time`), and after a variable assignment. A `curl` in an
+/// argument list, such as the preflight's `for tool in curl tar ...`, is not
+/// a call.
+fn runs_curl(line: &str) -> bool {
+    const SEPARATORS: [&str; 7] = ["$(", "(", "`", "|", "&", ";", "{"];
+    const KEYWORDS: [&str; 10] = [
+        "if", "then", "else", "elif", "do", "while", "until", "!", "exec", "time",
+    ];
+
+    line.match_indices("curl").any(|(at, _)| {
+        let after = &line[at + "curl".len()..];
+        if !(after.is_empty() || after.starts_with(char::is_whitespace)) {
+            return false;
+        }
+        let before = &line[..at];
+        if !before.is_empty() && !before.ends_with(char::is_whitespace) {
+            // Something is glued to the word, as in `$(curl` or `libcurl`.
+            return SEPARATORS
+                .iter()
+                .any(|separator| before.ends_with(separator));
+        }
+        let Some(previous) = before.split_whitespace().last() else {
+            return true;
+        };
+        SEPARATORS
+            .iter()
+            .any(|separator| previous.ends_with(separator))
+            || KEYWORDS.contains(&previous)
+            || (previous.contains('=') && !previous.starts_with('-'))
+    })
+}
+
+#[test]
+fn runs_curl_finds_curl_in_every_command_position() {
+    for line in [
+        "curl -fsSL \"$URL\"",
+        "curl \"$BASE/NOTES\" -fsSL -o \"$TMP/notes\"",
+        "location=\"$(curl -fsSLI \"$URL\")\"",
+        "printf x | curl -d @- \"$URL\"",
+        "true && curl \"$URL\"",
+        "false || curl \"$URL\"",
+        "if curl \"$URL\"; then",
+        "X=1 curl \"$URL\"",
+        "exec curl \"$URL\"",
+    ] {
+        assert!(runs_curl(line), "a curl call was not seen: {line}");
+    }
+    for line in [
+        "for tool in curl tar sha256sum ssh-keygen; do",
+        "echo curl is required",
+        "command -v curl",
+        "libcurl --version",
+    ] {
+        assert!(!runs_curl(line), "this line runs no curl: {line}");
+    }
+}
+
 /// The value of `flag` on a curl command line, as whole seconds.
 fn curl_seconds(call: &str, flag: &str) -> Option<u64> {
     let mut words = call.split_whitespace();
@@ -796,8 +858,9 @@ fn curl_seconds(call: &str, flag: &str) -> Option<u64> {
 /// for that last attempt. A retrying call without `--retry-max-time` has no
 /// bound: a server's Retry-After header could set the sleep.
 ///
-/// Every logical line that runs `curl -` is read, continuation lines joined,
-/// including the one inside `location="$(curl`.
+/// Every logical line that runs `curl` as a command is read, continuation lines
+/// joined, wherever its options are. [`runs_curl`] says what a command position
+/// is; the one inside `location="$(curl` is one of them.
 #[test]
 fn every_network_call_and_the_timer_service_are_bounded() {
     let text = fs::read_to_string(repo_root().join("script/deploy.sh"))
@@ -807,7 +870,7 @@ fn every_network_call_and_the_timer_service_are_bounded() {
     let calls: Vec<&str> = joined
         .lines()
         .map(str::trim)
-        .filter(|line| !line.starts_with('#') && line.contains("curl -"))
+        .filter(|line| !line.starts_with('#') && runs_curl(line))
         .collect();
     assert!(
         calls.len() >= 3,
