@@ -712,7 +712,8 @@ fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> 
 ///
 /// The real `install` runs, so the files are read back afterwards: a copy in
 /// the wrong direction overwrites the only previous binary and still reports a
-/// restore.
+/// restore. The run that arms the trap over a whole update is
+/// `a_failure_inside_the_swap_window_restores_both_files`.
 #[test]
 fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
     let dir = scratch_tree("deploy", "restore-previous", &["stubs", "bin", "unit"]);
@@ -1652,6 +1653,8 @@ const INSTALLED_VERSION: &str = "1.3.6";
 enum Service {
     /// `restart` succeeds and the service is active afterwards.
     ComesUp,
+    /// `restart` fails, which ends the run inside the swap window.
+    RestartFails,
 }
 
 /// How the binary inside a published release answers `--check-config`.
@@ -1715,6 +1718,7 @@ impl Host {
 
         let (restart, active) = match service {
             Service::ComesUp => (0, 0),
+            Service::RestartFails => (1, 0),
         };
         write_executable(
             &host.stubs.join("systemctl"),
@@ -1783,8 +1787,8 @@ impl Host {
 
     /// Publishes `tag` for x86_64 without a signature: the archive, with a
     /// binary that answers `--check-config` as `candidate` says, and the
-    /// `SHA256SUMS` that lists it. Returns the binary's bytes.
-    fn publish(&self, tag: &str, candidate: Candidate) -> Vec<u8> {
+    /// `SHA256SUMS` that lists it. Returns the binary's text.
+    fn publish(&self, tag: &str, candidate: Candidate) -> String {
         let version = tag.trim_start_matches('v');
         let name = format!("volto-{version}-x86_64-unknown-linux-musl");
         let unpacked = self.staging.join(&name);
@@ -1841,7 +1845,7 @@ impl Host {
         )
         .expect("the checksum list must be writable");
 
-        binary.into_bytes()
+        binary
     }
 
     /// Runs `script/deploy.sh` with `args`, its paths under `root` and the stubs
@@ -1880,7 +1884,7 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
     let host = Host::new("unsigned", Service::ComesUp);
     host.plant_install();
     let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
-    let script = fs::read(deploy_script()).expect("the deploy script must be readable");
+    let script = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
     fs::write(host.installed_script(), &script).expect("the installed copy must be writable");
 
     let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG, "--enable-timer"]);
@@ -1892,7 +1896,7 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
     );
     let stdout = stdout_of(&output);
     assert_eq!(
-        fs::read(host.installed_script()).ok(),
+        fs::read_to_string(host.installed_script()).ok(),
         Some(script),
         "the installed copy of the script must stay the script under test, not \
          the copy inside the unsigned archive: {stdout}"
@@ -1905,7 +1909,7 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
     // The rest of the update happened, so the run above went through the
     // download, the swap and the timer rather than stopping early.
     assert_eq!(
-        fs::read(host.bin()).ok(),
+        fs::read_to_string(host.bin()).ok(),
         Some(candidate),
         "the release's binary must be installed: {stdout}"
     );
@@ -1919,5 +1923,51 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
         calls.starts_with("daemon-reload\nrestart volto\nis-active --quiet volto\n")
             && calls.contains("enable --now volto-deploy.timer\n"),
         "systemctl must see the update and the timer: {calls}"
+    );
+}
+
+/// A failure inside the swap window puts the previous binary and unit back,
+/// reloads systemd and starts the service.
+///
+/// `restore_previous` is armed as an ERR trap once both `.prev` copies exist.
+/// Here the restart fails after the new binary and unit are in place, which
+/// leaves the old files as the only ones that can serve. Without the trap,
+/// `set -e` ends the run with the new files installed and the service down.
+#[test]
+fn a_failure_inside_the_swap_window_restores_both_files() {
+    let host = Host::new("swap-window", Service::RestartFails);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let previous_binary =
+        fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+    let previous_unit = fs::read_to_string(host.unit()).expect("the planted unit must be readable");
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success(),
+        "a failed restart must fail the run: {}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(previous_binary),
+        "the previous binary must be back in place: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.unit()).ok(),
+        Some(previous_unit),
+        "the previous unit must be back in place: {stderr}"
+    );
+    assert_eq!(
+        host.calls("systemctl"),
+        "daemon-reload\nrestart volto\ndaemon-reload\nstart volto\n",
+        "after the failed restart, systemd must be reloaded and the service \
+         started, not restarted: {stderr}"
+    );
+    assert!(
+        stderr.contains("installing volto 1.3.7 failed; restored the previous binary and unit"),
+        "the run must say what it restored: {stderr}"
     );
 }
