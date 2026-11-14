@@ -82,11 +82,15 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    judge_a_datagram(rest, &LISTS[usize::from(mode >> 1) % LISTS.len()]);
+    let list = usize::from(mode >> 1) % LISTS.len();
+    judge_a_datagram(rest, &LISTS[list], NAMES[list]);
 });
 
 /// Every datagram whose verdict the gate's own documentation states.
-fn judge_a_datagram(datagram: &[u8], names: &Names) {
+///
+/// `list` is the plain text `names` was built from, so a refusal for a name can
+/// be judged against the list without going through [`Names::accepts`].
+fn judge_a_datagram(datagram: &[u8], names: &Names, list: &[&str]) {
     // A verdict is a function of the bytes and the list, and of nothing else:
     // the gate keeps no state between datagrams. Judged once here — the seed
     // corpus test judges each seed twice, which pins that without paying two
@@ -161,6 +165,7 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
                         volto::logfmt::escaped_bytes(name).len() < MAX_BOUNDED,
                         "an unbounded name reached a log"
                     );
+                    names_outside_the_list_are_refused(datagram, name, list);
                 }
                 // Decided on the header, ahead of the decryption: the length
                 // it names is the length byte the datagram carries, and it is
@@ -182,6 +187,32 @@ fn judge_a_datagram(datagram: &[u8], names: &Names) {
     }
 
     refusing_needs_the_keys_this_datagram_carries(datagram, names, &verdict);
+}
+
+/// The gate's purpose, in both directions: a name refused is not on the list,
+/// and the same datagram passes once its name is.
+///
+/// The first half reads the list as text, with the one normalisation the gate
+/// documents (ASCII case, one trailing root dot), so it does not rest on
+/// [`Names::accepts`]. The second half judges the datagram again against a list
+/// that holds exactly the refused name. A name that is not UTF-8 cannot be on
+/// any list, so only the bound above applies to it.
+fn names_outside_the_list_are_refused(datagram: &[u8], name: &[u8], list: &[&str]) {
+    let Ok(text) = std::str::from_utf8(name) else {
+        return;
+    };
+
+    let relative = text.strip_suffix('.').unwrap_or(text);
+    assert!(
+        !list.iter().any(|held| held.eq_ignore_ascii_case(relative)),
+        "{text:?} is on the list {list:?} and was refused"
+    );
+
+    assert_eq!(
+        gate::judgement(datagram, &Names::new(&[text.to_owned()])),
+        Verdict::Pass,
+        "{text:?} was refused by a list that holds it"
+    );
 }
 
 /// The v0.9.1 rule: only a packet the gate could open may be refused for what
