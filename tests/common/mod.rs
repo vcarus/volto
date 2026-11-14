@@ -1005,7 +1005,10 @@ pub fn recv_datagram(quic: &quinn::Connection) -> impl Future<Output = datagram:
 }
 
 /// The body behind both, with `caller` already captured.
-async fn read_datagram(
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// reads datagrams on its behalf (D66).
+pub async fn read_datagram(
     quic: &quinn::Connection,
     caller: &'static Location<'static>,
 ) -> datagram::Datagram {

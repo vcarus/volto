@@ -3,6 +3,7 @@
 mod common;
 
 use std::collections::HashMap;
+use std::panic::Location;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -22,8 +23,12 @@ use volto::h3api::{FieldValue, Method, Request, Status};
 ///
 /// Asserted on the wire rather than through server state: a CONNECTION_CLOSE
 /// frame carrying this code is exactly what the RFC requires the peer to see.
-async fn close_code(quic: &quinn::Connection) -> u64 {
-    common::rawstream::application_close(quic, TIMEOUT).await.0
+/// A synchronous `#[track_caller]` function, so a failure names the test that
+/// called it (D66).
+#[track_caller]
+fn close_code(quic: &quinn::Connection) -> impl Future<Output = u64> + '_ {
+    let close = common::rawstream::application_close(quic, TIMEOUT);
+    async move { close.await.0 }
 }
 
 /// Reads datagrams until one arrives for `quarter_stream_id`, returning its
@@ -34,28 +39,35 @@ async fn close_code(quic: &quinn::Connection) -> u64 {
 /// whole reason this exists: a test with one session in flight uses
 /// `common::udp_round_trip`, which reads one datagram and asserts it came back
 /// on the session it was sent on.
-async fn recv_payload_for(
-    quic: &quinn::Connection,
+///
+/// Shaped as D66 asks, so a datagram that never arrives names the test that
+/// waited for it.
+#[track_caller]
+fn recv_payload_for<'a>(
+    quic: &'a quinn::Connection,
     quarter_stream_id: u64,
-    pending: &mut HashMap<u64, Vec<Bytes>>,
-) -> Bytes {
-    if let Some(queued) = pending.get_mut(&quarter_stream_id)
-        && !queued.is_empty()
-    {
-        return queued.remove(0);
-    }
-
-    loop {
-        let decoded = common::recv_datagram(quic).await;
-
-        if decoded.quarter_stream_id == quarter_stream_id {
-            return decoded.payload;
+    pending: &'a mut HashMap<u64, Vec<Bytes>>,
+) -> impl Future<Output = Bytes> + 'a {
+    let caller = Location::caller();
+    async move {
+        if let Some(queued) = pending.get_mut(&quarter_stream_id)
+            && !queued.is_empty()
+        {
+            return queued.remove(0);
         }
 
-        pending
-            .entry(decoded.quarter_stream_id)
-            .or_default()
-            .push(decoded.payload);
+        loop {
+            let decoded = common::read_datagram(quic, caller).await;
+
+            if decoded.quarter_stream_id == quarter_stream_id {
+                return decoded.payload;
+            }
+
+            pending
+                .entry(decoded.quarter_stream_id)
+                .or_default()
+                .push(decoded.payload);
+        }
     }
 }
 
