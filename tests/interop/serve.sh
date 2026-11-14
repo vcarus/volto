@@ -144,8 +144,11 @@ check_log() {
 
     # Floor, in D100's shape. This configuration always draws the
     # private-networks warning at startup, so a reader that cannot see that one
-    # line is broken and must say so rather than report a clean log.
-    printf '%s\n' "$plain" | grep -q "allow_private_networks is on" || {
+    # line is broken and must say so rather than report a clean log. The floor
+    # requires the level token in the shape the filter below reads, " WARN ",
+    # because the colour codes surround the level and not the message: a floor
+    # on the message text alone matches whether or not the strip above worked.
+    printf '%s\n' "$plain" | grep -qE ' WARN .*allow_private_networks is on' || {
         echo "the private-networks warning this configuration always draws is not in $log:" >&2
         echo "this check cannot read the log, so it cannot judge it" >&2
         return 1
