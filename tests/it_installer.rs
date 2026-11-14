@@ -8,8 +8,11 @@
 //!
 //! The script's `--print-config` flag exists for this test: it runs the real
 //! generation path, touches nothing, and needs no root. The rest of the script
-//! needs root, a Debian host and systemd. One test reaches the certificate swap
-//! by putting stand-ins for those commands in front of `PATH`. The rest is
+//! needs root, a Debian host and systemd. Six tests, starting with
+//! `a_certificate_swap_that_fails_partway_puts_the_previous_pair_back`, run that
+//! install path by putting stand-ins for those commands in front of `PATH`
+//! (`plant_root_stubs`), with the real `install`, `mv` and `openssl`. What the
+//! stand-ins replace, the user creation and the package install among them, is
 //! covered by shellcheck plus review.
 //!
 //! `--check-config` is the second seam, and it closes the other half of the same
