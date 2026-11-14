@@ -417,7 +417,13 @@ const CHURNED_SESSIONS: usize = 64;
 /// which is why this is not zero.
 ///
 /// 8 KiB apiece is an order of magnitude under the ~108 KiB a live session
-/// costs, so a release path that stopped firing cannot pass this.
+/// costs, so a release path that leaves a buffer of the order of the 16 KiB
+/// packet block behind cannot pass this. A smaller leak can. A Quarter Stream
+/// ID registration left in the routing table keeps a map entry and the empty
+/// inbound channel it sends to, about 2 KiB a session on the dev host, and
+/// passes; the unit test
+/// `dropping_the_receiver_gives_up_the_quarter_stream_id` in
+/// `src/h3/connection.rs` is what catches that one.
 const KEPT_PER_CLOSED_SESSION: i64 = 8 * 1024;
 
 /// Closes a CONNECT-UDP session and waits for the server to close its half.
@@ -453,11 +459,12 @@ async fn close_session(session: &mut ClientStream) {
 /// # Measured
 ///
 /// On the dev host (macOS, debug build), 64 sessions opened, exercised and
-/// closed one after another leave about 39 KiB behind in total: roughly 630
-/// bytes a session, against the ~108 KiB each of them held while it was live.
-/// Left open instead of closed, the same run leaves 1.9 MiB behind (4.5 MiB
-/// while a session still read its target into a 64 KiB buffer), so the
-/// allowance below is thirteen times the measurement and a quarter of a leak.
+/// closed one after another leave 220 to 290 KiB behind in total when the tally
+/// is first read under the allowance: 3.5 to 4.6 KiB a session, against the
+/// ~108 KiB each of them held while it was live. Left open instead of closed,
+/// the same run leaves 1.9 MiB behind (4.5 MiB while a session still read its
+/// target into a 64 KiB buffer), so the allowance below is about twice the
+/// measurement and a quarter of a leak.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_connection_keeps_nothing_for_the_sessions_it_has_closed() {
     let _scales = SCALES.lock().await;
