@@ -26,6 +26,8 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -342,15 +344,24 @@ async fn a_connection_out_of_stream_credit_keeps_its_datagrams_and_downloads() {
 
     // Both opened while the connection is still healthy.
     let (qsid, _session) = open_udp_session(&mut client, &server, udp_echo).await;
-    let (pusher, pusher_addr) = pushing_target().await;
+    let (pusher, pusher_addr, offered) = pushing_target().await;
     let mut download = open_tcp_tunnel(&mut client, &pusher_addr.to_string()).await;
-    common::read_at_least(&mut download, PUSH_CHUNK).await;
+    let before = common::read_at_least(&mut download, PUSH_CHUNK).await.len();
 
     let _held = stall_the_connection(&mut client, deaf_addr).await;
 
-    // The download direction of a tunnel opened before the freeze.
-    let flowing =
-        tokio::time::timeout(TIMEOUT, common::read_at_least(&mut download, PUSH_CHUNK)).await;
+    // The download direction of a tunnel opened before the freeze. Setting up
+    // the freeze takes seconds, and the pusher's bytes from that time wait in
+    // the client's receive buffer, so reading some bytes now proves nothing.
+    // Reading past everything the pusher had offered when the freeze was in
+    // place does: only bytes it wrote afterwards can make up the difference.
+    let at_the_freeze = usize::try_from(offered.load(Ordering::SeqCst))
+        .expect("the pushed byte count fits in usize");
+    let flowing = tokio::time::timeout(
+        TIMEOUT,
+        common::read_at_least(&mut download, at_the_freeze + 1 - before),
+    )
+    .await;
     assert!(
         flowing.is_ok(),
         "a tunnel's download direction spends the client's credit, not the server's"
@@ -424,24 +435,36 @@ const PUSH_CHUNK: usize = 4096;
 
 /// A TCP target that sends without being asked, so a tunnel's download
 /// direction can be watched with nothing travelling the other way.
-async fn pushing_target() -> (tokio::task::JoinHandle<()>, SocketAddr) {
+///
+/// The counter is the number of bytes the target has offered to its sockets.
+/// It goes up before each write rather than after it, so it is never behind
+/// what the proxy may already have read.
+async fn pushing_target() -> (tokio::task::JoinHandle<()>, SocketAddr, Arc<AtomicU64>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a pushing target");
     let address = listener.local_addr().expect("target address");
+    let offered = Arc::new(AtomicU64::new(0));
+    let counter = offered.clone();
 
     let handle = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
+            let counter = counter.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
-                while socket.write_all(&[0x33u8; PUSH_CHUNK]).await.is_ok() {
+                let chunk = u64::try_from(PUSH_CHUNK).expect("a chunk size fits in u64");
+                loop {
+                    counter.fetch_add(chunk, Ordering::SeqCst);
+                    if socket.write_all(&[0x33u8; PUSH_CHUNK]).await.is_err() {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             });
         }
     });
 
-    (handle, address)
+    (handle, address, offered)
 }
 
 /// Writes into `tunnel` until the write parks, reporting how much it took.
