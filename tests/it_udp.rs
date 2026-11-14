@@ -1014,9 +1014,10 @@ async fn bytes_that_finish_no_capsule_do_not_postpone_the_session_timeout() {
 /// The stream is only half of it, though, and the quieter half: a chunk of
 /// skipped bytes is one pass of the session loop however many bytes it carries,
 /// so this flood asks the deadline one question per chunk. The datagram half
-/// asks it one per *payload*, and that is where the poll order really did win —
-/// see `it_udp_idle`, which pins it with the RFC 9298 §7 budget dropping every
-/// payload after the first. It could not be written until now: the client end of
+/// asks it one per *payload*, and that is where the poll order really did win.
+/// The `before_deadline` unit tests in `src/tunnel/udp.rs` pin that on a paused
+/// clock, and `it_udp_idle` drives the same flood end to end, with the RFC 9298
+/// §7 budget dropping every payload after the first. It could not be written until now: the client end of
 /// it used to trip an accounting bug in quinn-proto's drop-oldest branch
 /// (`Datagrams::send` subtracting `payload_bytes` twice), fixed upstream and in
 /// our pin since v0.5.2.

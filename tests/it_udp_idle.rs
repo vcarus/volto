@@ -1,4 +1,5 @@
-//! A flooded CONNECT-UDP session still closes on its idle deadline.
+//! A CONNECT-UDP session flooded with dropped HTTP Datagrams still closes on
+//! its idle timeout once the flood stops, and the flood crosses nothing.
 //!
 //! `it_udp` pins the deadline against the two shapes a peer can produce on the
 //! *request stream* — a drip of bytes that finish no capsule, and a flood of
@@ -8,11 +9,19 @@
 //! no packet across the proxy, and a peer can produce them as fast as its link
 //! allows.
 //!
-//! What that defeated is the poll order of `tokio::time::timeout_at`, which
-//! returns the wrapped future's value without ever consulting the clock (D92):
-//! while the queue never ran dry, the deadline was not measured at all. Pinned
-//! here rather than in `it_udp` for two reasons, both about being able to see
-//! the server's verdict at all:
+//! The regression this shape once exposed is D92: `tokio::time::timeout_at`
+//! returns the wrapped future's value without consulting the clock, so while the
+//! queue never ran dry, the deadline was not measured at all. This binary does
+//! not catch that regression. Under it the session is held only while the flood
+//! keeps its queue supplied. Once the flood stops, the queue drains, the next
+//! wait finds the deadline already past, and the close line appears well inside
+//! `SLACK`. The verdict on D92 belongs to the `before_deadline` unit tests in
+//! `src/tunnel/udp.rs`, which flood a paused clock and are exact. What this
+//! binary checks is the end-to-end shape: the session closes on its own, the
+//! flood really ran while the deadline did, and the budget forwarded one packet
+//! and no more.
+//!
+//! It is a test of its own, rather than part of `it_udp`, for two reasons:
 //!
 //! * The observation is the server's own DEBUG line, not the close arriving on
 //!   the client's stream. A client flooding hard enough to matter is also a
@@ -22,8 +31,7 @@
 //! * Installing that subscriber is also what makes the flood able to outrun the
 //!   session, which is what a loaded production host does for free: writing a
 //!   line per dropped payload slows the drain enough for the queue to stay
-//!   non-empty. Without it the same flood on an idle dev host is a coin toss,
-//!   which is exactly why this went unpinned when D92 first named it.
+//!   non-empty. Without it the same flood on an idle dev host is a coin toss.
 //!
 //! `tracing_subscriber::fmt().init()` may run once per process, so this is a
 //! binary of its own (the convention `it_udp_socket_log` and the other `*_log`
@@ -50,23 +58,22 @@ const NOMINAL: Duration = Duration::from_secs(1);
 /// open has passed.
 ///
 /// Long enough that the deadline is unambiguously behind the session while the
-/// queue is still being supplied — which is the situation the unfixed loop
-/// never came back from — and short enough not to stretch the test. Nothing is
-/// asserted at this boundary; it only has to lie past `NOMINAL`.
+/// queue is still being supplied, which is the situation in which the unfixed
+/// loop never measured its deadline, and short enough not to stretch the test.
+/// Nothing is asserted at this boundary; it only has to lie past `NOMINAL`.
 const FLOOD_OVERRUN: Duration = Duration::from_secs(1);
 
 /// How long after the flood stops the close may take before it is a bug.
 ///
-/// Not a timing probe: the deterministic verdict against the unfixed loop
-/// belongs to the `before_deadline` unit tests, which flood a paused clock and
-/// are exact, and this file's own doc has always said whether the integration
-/// run would catch that shape depends on scheduling. What forced the point was
-/// measuring it: under a parallel full-suite load the in-process flood task can
-/// starve the session task outright — one red run sat at 7 717 processed drops
-/// for nine seconds, then closed within 600 ms of `flood.abort()` — so *while
-/// the flood runs* there is no bound a loaded machine cannot cross, and a
-/// close-by deadline assertion was red 3/60 at four seconds and would still
-/// have been red at ten. The assertable moment is after the flood stops: the
+/// Not a timing probe: the module doc says why this binary cannot catch the
+/// unfixed loop, and the deterministic verdict on it belongs to the
+/// `before_deadline` unit tests, which flood a paused clock and are exact. What
+/// rules out a tighter bound is a measurement: under a parallel full-suite
+/// load the in-process flood task can starve the session task outright — one
+/// red run sat at 7 717 processed drops for nine seconds, then closed within
+/// 600 ms of `flood.abort()` — so *while the flood runs* there is no bound a
+/// loaded machine cannot cross, and a close-by deadline assertion was red 3/60
+/// at four seconds and would still have been red at ten. The assertable moment is after the flood stops: the
 /// deadline is long past, nothing re-arms it, and the only thing between the
 /// session and its close line is being scheduled once. Ten seconds is the
 /// suite's convention for a wait that exists to fail loudly rather than hang,
@@ -85,7 +92,7 @@ const SLACK: Duration = Duration::from_secs(10);
 const ONE_PACKET_BUDGET: &str = "unanswered_packet_budget = 1\n";
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_datagram_flood_does_not_hold_a_session_past_its_idle_timeout() {
+async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_nothing() {
     let buffer = SharedBuffer::install("volto=debug");
 
     let server = TestServer::start_with(&format!(
@@ -166,9 +173,9 @@ async fn a_datagram_flood_does_not_hold_a_session_past_its_idle_timeout() {
 
     assert!(
         closed,
-        "a flood of dropped payloads held the session open past its {NOMINAL:?} timeout: \
-         still no idle close {waited:?} after the last packet crossed, {SLACK:?} of it \
-         with the flood already stopped"
+        "the flooded session never reached its {NOMINAL:?} idle timeout: still no idle \
+         close {waited:?} after the last packet crossed, {SLACK:?} of it with the flood \
+         already stopped"
     );
 
     // The flood really did run while the deadline did, so the close above was
