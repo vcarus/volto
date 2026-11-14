@@ -31,9 +31,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, auth_section, authorize, authorized_connect,
-    basic_credentials, closed_udp_address, connect_request, connect_udp_request, open_tcp_tunnel,
-    respond_to, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, SharedBuffer, TestServer, auth_section, authorize,
+    authorized_connect, basic_credentials, close_and_drain, closed_udp_address, connect_request,
+    connect_udp_request, open_tcp_tunnel, respond_to, spawn_echo_target,
 };
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -416,7 +416,7 @@ impl ServerCertVerifier for RefuseWith {
 async fn a_udp_session_costs_exactly_one_line(buffer: &SharedBuffer) {
     const SESSIONS: usize = 8;
 
-    let server = TestServer::start_with(&format!(
+    let mut server = TestServer::start_with(&format!(
         "{}\n{ALLOW_PRIVATE}",
         auth_section(&[(USER, PASSWORD)])
     ))
@@ -430,13 +430,47 @@ async fn a_udp_session_costs_exactly_one_line(buffer: &SharedBuffer) {
         authorize(&mut request, &basic_credentials(USER, PASSWORD));
         let (response, mut stream) = common::send_and_respond(&mut client, request).await;
         assert_eq!(response.status, Status::OK);
-        stream.finish().expect("finish the session");
+        close_and_drain(&mut stream).await;
     }
 
-    let established = buffer.lines_since(mark, &[" INFO ", "udp session established"]);
+    // Every session has ended on the wire, but its task may still be writing
+    // its last lines. A shutdown closes this connection only once no request
+    // task is left on it, so its closing line is the fence after which every
+    // line a session writes, at its start or at its end, is in the buffer.
+    server.shutdown();
+    buffer
+        .wait_for_line(mark, &[" INFO ", "connection closed", "reason=\"drained\""])
+        .await;
+    drop(client);
+    server.wait_until_stopped(STOP_TIMEOUT).await;
+
+    // Every INFO line in the window, less the ones the connection and the
+    // server write for themselves, named by their permanent `log_id`s: the
+    // connection's opening and closing lines, and the shutdown's three. What
+    // is left is what the sessions cost.
+    const NOT_A_SESSION: [&str; 5] = [
+        "log_id=\"7l4svyo3\"",
+        "log_id=\"8ro19wv6\"",
+        "log_id=\"7x7xt92f\"",
+        "log_id=\"2rquy1sk\"",
+        "log_id=\"85kda9tt\"",
+    ];
+    let session_lines: Vec<String> = buffer
+        .lines_since(mark, &[" INFO "])
+        .into_iter()
+        .filter(|line| !NOT_A_SESSION.iter().any(|id| line.contains(id)))
+        .collect();
     assert_eq!(
-        established.len(),
+        session_lines.len(),
         SESSIONS,
-        "one line per session is the access log; more than one is amplification"
+        "one line per session is the access log; more than one is amplification:\n{}",
+        session_lines.join("\n")
+    );
+    assert!(
+        session_lines
+            .iter()
+            .all(|line| line.contains("udp session established")),
+        "the one line a session costs is its access-log line:\n{}",
+        session_lines.join("\n")
     );
 }

@@ -75,8 +75,9 @@ enum Bound {
     /// concurrency at once, which is what makes that price real.
     PerConnection,
     /// One per tunnel or session: the access log. Deliberately unsampled — an
-    /// access log that drops records is not an access log — and pinned to
-    /// exactly one line by `it_log_amplification`.
+    /// access log that drops records is not an access log. For a CONNECT-UDP
+    /// session, `it_log_amplification` pins the whole INFO cost to exactly this
+    /// one line.
     PerTunnel,
     /// Peer-repeatable, and bounded by [`volto::logfmt::Sampler`]'s doubling
     /// schedule.
