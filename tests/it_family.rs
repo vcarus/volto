@@ -10,6 +10,14 @@
 //! resolve to both families and `::1` must be bindable. Both hold on the macOS
 //! development host; some Linux CI images ship neither, so the tests skip with a
 //! reason instead of failing there.
+//!
+//! Only the default half of each test is discriminating everywhere. A resolver
+//! that follows RFC 6724 lists `::1` before `127.0.0.1`, as the macOS host's
+//! does, and on such a host the `ipv6` half reaches the IPv6 target whether the
+//! server moves IPv6 first or leaves the list as it arrived. There it shows
+//! that the IPv6 path works end to end, and the reordering itself is pinned by
+//! the `the_ipv6_preference_puts_ipv6_first` unit test in `src/net.rs`. On a
+//! resolver that lists IPv4 first, the `ipv6` half is discriminating too.
 
 mod common;
 
@@ -174,6 +182,8 @@ async fn connect_dials_the_preferred_family_first() {
     );
     drop(server);
 
+    // Discriminating only on a resolver that lists IPv4 first; see the module
+    // doc.
     let server = TestServer::start_with(&format!("{IPV6_FIRST}{ALLOW_PRIVATE}")).await;
     assert_eq!(
         tag_through_tcp_tunnel(&server, port).await,
@@ -213,6 +223,8 @@ async fn connect_udp_binds_a_socket_to_the_preferred_family() {
     );
     drop(server);
 
+    // Discriminating only on a resolver that lists IPv4 first; see the module
+    // doc.
     let server = TestServer::start_with(&format!("{IPV6_FIRST}{ALLOW_PRIVATE}")).await;
     assert_eq!(
         tag_through_udp_tunnel(&server, port).await,
