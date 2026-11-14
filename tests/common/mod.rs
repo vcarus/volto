@@ -1569,14 +1569,26 @@ impl SharedBuffer {
 /// to the wrong source is present and zero rather than absent, and presence
 /// alone would pass.
 ///
+/// The field is found by its whole name: `name=` at the start of the line or
+/// after whitespace, the rule `tests/replay/shape_extract.py` reads fields by.
+/// A field whose name merely ends with `name`, `udp_tx_bytes=` for
+/// `tx_bytes`, is not it.
+///
 /// Beside [`SharedBuffer::lines_since`] and [`SharedBuffer::wait_for_line`],
 /// which produce the lines this parses.
 #[track_caller]
 pub fn numeric_field(line: &str, name: &str) -> u64 {
+    let key = format!("{name}=");
     let rest = line
-        .split_once(&format!("{name}="))
-        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"))
-        .1;
+        .match_indices(&key)
+        .find(|(at, _)| {
+            line[..*at]
+                .chars()
+                .next_back()
+                .is_none_or(char::is_whitespace)
+        })
+        .map(|(at, _)| &line[at + key.len()..])
+        .unwrap_or_else(|| panic!("no {name}= in:\n{line}"));
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     digits
         .parse()
