@@ -370,9 +370,13 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     let failed = server
         .reload()
         .expect_err("a reload with no descriptor to open the file with must fail");
+    // It has to say why: the file it could not read, and the operating
+    // system's own words for the cause.
+    let emfile = std::io::Error::from_raw_os_error(rustix::io::Errno::MFILE.raw_os_error());
+    let said = format!("{failed:#}");
     assert!(
-        !failed.to_string().is_empty(),
-        "a failed reload must say why"
+        said.contains("failed to read config file") && said.contains(&emfile.to_string()),
+        "a failed reload must say that the file could not be read and why: {said}"
     );
     echoes(&mut live_tcp, b"reload").await;
 

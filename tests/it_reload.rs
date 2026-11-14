@@ -536,10 +536,24 @@ async fn a_broken_configuration_changes_nothing() {
         let error = server
             .reload()
             .expect_err(&format!("{label} must be rejected"));
-        // The error has to name what is wrong, since it is all the operator gets.
+        // The error has to name what is wrong, since it is all the operator
+        // gets. A key the file got wrong is named by its path; the parser's
+        // messages do not echo the file's text, so those two are named by the
+        // kind of mistake.
+        let names = match *label {
+            "malformed TOML" => "unclosed table",
+            "unknown key" => "unknown field",
+            "invalid user" => "auth.users[0].username",
+            "keep-alive past what its own check could double" => "limits.keep_alive_interval",
+            "unbounded shutdown grace" => "server.shutdown_grace",
+            "missing certificate" => "server.cert",
+            "truncated certificate" => "failed to parse server.cert",
+            "mismatched key" => "do not form a usable certificate/key pair",
+            other => panic!("no expected error text for the case {other:?}"),
+        };
         assert!(
-            !format!("{error:#}").is_empty(),
-            "{label} produced an empty error"
+            format!("{error:#}").contains(names),
+            "{label} produced an error that does not say {names:?}: {error:#}"
         );
 
         // The original credentials still work, on a brand new connection, after
@@ -632,10 +646,15 @@ async fn reloading_swaps_the_certificate() {
 //
 // Everything above is a single reload in a quiet moment. What an operator
 // actually produces is a stream of them -- a config-management run that reloads
-// on every convergence pass, a renewal hook that fires per certificate -- and
-// they land while tunnels are carrying data. These pin that shape: the reload
-// path and the teardown paths share the endpoint, the live configuration and
-// the per-connection quota, and none of them may disturb the others.
+// on every convergence pass, a renewal hook that fires per certificate -- while
+// tunnels are open. These pin that shape: the reload path and the teardown
+// paths share the endpoint, the live configuration and the per-connection
+// quota, and none of them may disturb the others.
+//
+// `TestServer::reload` is synchronous and these tests run on a current-thread
+// runtime, so a reload never runs at the same instant as server work. What
+// they interleave is the order of events: reloads between round trips, between
+// a client's departure and its reaping, or across a session's idle timeout.
 // ---------------------------------------------------------------------------
 
 /// How many reloads a storm fires. Even rounds re-apply the text already in
@@ -773,9 +792,16 @@ async fn a_storm_of_failed_reloads_changes_nothing_and_leaves_the_next_one_worki
             let error = server
                 .reload()
                 .expect_err(&format!("round {round} ({label}) must be refused"));
+            let names = match *label {
+                "malformed TOML" => "unclosed table",
+                "a keep-alive longer than the idle timeout allows" => "limits.keep_alive_interval",
+                "a certificate that is not there" => "server.cert",
+                other => panic!("no expected error text for the case {other:?}"),
+            };
             assert!(
-                !format!("{error:#}").is_empty(),
-                "round {round} ({label}) produced an empty error"
+                format!("{error:#}").contains(names),
+                "round {round} ({label}) produced an error that does not say {names:?}: \
+                 {error:#}"
             );
         } else {
             // A good one in between, so the failures are not merely being
@@ -1071,15 +1097,21 @@ async fn reloads_during_a_session_timeout_still_close_the_request_stream() {
     );
 }
 
-/// A client that vanishes mid-transfer is reaped even while reloads are landing.
+/// A client that leaves mid-transfer is reaped while reloads are landing.
 ///
-/// The connection goes away without finishing its stream and without a GOAWAY --
-/// the everyday shape of a phone changing networks -- and the target socket has
-/// to go with it (RFC 9114 §4.4: a proxy that detects an error on the QUIC
-/// connection MUST close the TCP connection). *How* the target learns is a
-/// property of the host's TCP stack rather than of this server, so what is
-/// asserted is that it learns at all: nothing arrives on the channel if the
-/// socket is leaked.
+/// The client drops its connection without finishing its stream and without a
+/// GOAWAY. Dropping the last handle sends a CONNECTION_CLOSE, so the server
+/// learns of the departure at once rather than at its idle timeout; a phone
+/// that changes networks sends nothing, and that slower case is not driven
+/// here. The target socket has to go with the connection (RFC 9114 §4.4: a
+/// proxy that detects an error on the QUIC connection MUST close the TCP
+/// connection). *How* the target learns is a property of the host's TCP stack
+/// rather than of this server, so what is asserted is that it learns at all:
+/// nothing arrives on the channel if the socket is leaked.
+///
+/// The test runs on a current-thread runtime and a reload is synchronous, so
+/// each reload yields afterwards. That lets the server's tasks handle the close
+/// between reloads instead of only after the last one.
 #[tokio::test]
 async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
     let server = TestServer::start().await;
@@ -1095,7 +1127,7 @@ async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
         .await
         .expect("send through the tunnel");
 
-    // The connection disappears with the tunnel still open, in the middle of a
+    // The connection goes away with the tunnel still open, in the middle of a
     // run of reloads.
     server.rewrite_config(&format!("[limits]\nmax_streams_bidi = 32\n{ALLOW_PRIVATE}"));
     server.reload().expect("the reload before the abandonment");
@@ -1105,6 +1137,7 @@ async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
         server
             .reload()
             .unwrap_or_else(|error| panic!("round {round} after the abandonment: {error:#}"));
+        tokio::task::yield_now().await;
     }
 
     tokio::time::timeout(TIMEOUT, ended.recv())
