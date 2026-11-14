@@ -310,9 +310,11 @@ impl H3Client {
 
     /// The identifier of the server's GOAWAY, if one has arrived.
     ///
-    /// RFC 9114 §5.2 makes this "the stream ID of the last request that might
-    /// have been processed", and a request stream opened at or past it is
-    /// rejected -- which is the property `it_shutdown` puts on the wire.
+    /// RFC 9114 §5.2: "Requests or pushes with the indicated identifier or
+    /// greater are rejected (Section 4.1.1) by the sender of the GOAWAY." So it
+    /// names the first request stream that will be rejected, and a request
+    /// stream opened at or past it is rejected -- which is the property
+    /// `it_shutdown` puts on the wire.
     pub fn goaway(&self) -> Option<u64> {
         match self.send.peer.goaway.load(Ordering::Relaxed) {
             NO_GOAWAY => None,
