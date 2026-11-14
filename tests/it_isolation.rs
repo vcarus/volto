@@ -26,6 +26,7 @@
 mod common;
 
 use std::net::SocketAddr;
+use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -66,31 +67,43 @@ const PARK: Duration = Duration::from_millis(750);
 /// §2.1.1 bars the server from answering in QUIC datagrams. What the client
 /// still does is *send* them, which is the half those tests are about -- the
 /// inbound router is the shared thing, and it routes whatever arrives.
-async fn capsule_reply_is(stream: &mut ClientStream, payload: &[u8]) {
-    let mut decoder = CapsuleDecoder::new();
+///
+/// A synchronous function returning a future, so that a failure names the
+/// calling test's line (D66).
+#[track_caller]
+fn capsule_reply_is<'a>(
+    stream: &'a mut ClientStream,
+    payload: &'a [u8],
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let mut decoder = CapsuleDecoder::new();
 
-    let found = tokio::time::timeout(TIMEOUT, async {
-        loop {
-            while let Some(got) = common::next_udp_payload(&mut decoder) {
-                if got == payload {
-                    return;
+        let found = tokio::time::timeout(TIMEOUT, async {
+            loop {
+                while let Some(got) = common::next_udp_payload(&mut decoder) {
+                    if got == payload {
+                        return;
+                    }
                 }
+
+                let chunk = stream
+                    .recv_data()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the session's stream read at {caller} failed: {error:?}")
+                    })
+                    .unwrap_or_else(|| panic!("the session's stream read at {caller} ended"));
+                decoder.push(&Bytes::copy_from_slice(chunk.chunk()));
             }
+        })
+        .await;
 
-            let chunk = stream
-                .recv_data()
-                .await
-                .expect("the session's stream must stay readable")
-                .expect("the session's stream must not end");
-            decoder.push(&Bytes::copy_from_slice(chunk.chunk()));
-        }
-    })
-    .await;
-
-    assert!(
-        found.is_ok(),
-        "no reply carrying {payload:?} arrived within {TIMEOUT:?}"
-    );
+        assert!(
+            found.is_ok(),
+            "no reply carrying {payload:?} reached {caller} within {TIMEOUT:?}"
+        );
+    }
 }
 
 /// A session whose task is parked, with its inbound queue full, must not stop

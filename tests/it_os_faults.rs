@@ -58,6 +58,7 @@ mod common;
 mod fds;
 
 use std::os::fd::AsRawFd;
+use std::panic::Location;
 use std::time::{Duration, Instant};
 
 use common::{
@@ -234,29 +235,50 @@ fn assert_local_failure(response: &Response, what: &str) {
 /// The concurrent shape of the quota: `count` request tasks are live on the
 /// server at once, each asking [`volto`]'s tunnel quota for a slot, where the
 /// sequential loop asks for one at a time.
-async fn burst(client: &mut H3Client, authority: &str, count: usize) -> Vec<Response> {
-    let mut streams: Vec<ClientStream> = Vec::with_capacity(count);
-    for _ in 0..count {
-        streams.push(
-            client
-                .send
-                .send_request(connect_request(authority))
+///
+/// A synchronous function returning a future, so that a failure names the
+/// calling test's line (D66).
+#[track_caller]
+fn burst<'a>(
+    client: &'a mut H3Client,
+    authority: &'a str,
+    count: usize,
+) -> impl Future<Output = Vec<Response>> + 'a {
+    let caller = Location::caller();
+    async move {
+        let mut streams: Vec<ClientStream> = Vec::with_capacity(count);
+        for index in 0..count {
+            streams.push(
+                tokio::time::timeout(
+                    TIMEOUT,
+                    client.send.send_request(connect_request(authority)),
+                )
                 .await
-                .expect("send request"),
-        );
-    }
+                .unwrap_or_else(|_| {
+                    panic!("burst request {index} sent at {caller} could not open a stream")
+                })
+                .unwrap_or_else(|error| {
+                    panic!("burst request {index} sent at {caller} failed: {error:?}")
+                }),
+            );
+        }
 
-    let mut responses = Vec::with_capacity(count);
-    for stream in &mut streams {
-        responses.push(
-            tokio::time::timeout(TIMEOUT, stream.recv_response())
-                .await
-                .expect("a burst response arrived")
-                .expect("response"),
-        );
-    }
+        let mut responses = Vec::with_capacity(count);
+        for (index, stream) in streams.iter_mut().enumerate() {
+            responses.push(
+                tokio::time::timeout(TIMEOUT, stream.recv_response())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("no answer to burst request {index} sent at {caller}")
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("burst request {index} sent at {caller} failed: {error:?}")
+                    }),
+            );
+        }
 
-    responses
+        responses
+    }
 }
 
 #[tokio::test]

@@ -67,7 +67,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{
-    ALLOW_PRIVATE, H3Client, TestServer, connect_request, echoes, respond_to, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, TestServer, connect_request, echoes, open_tcp_tunnel, respond_to,
+    spawn_echo_target,
 };
 use volto::h3api::Status;
 use volto::net::{BURST_LOOKUPS, SHARED_LOOKUPS, blocking_pool_size};
@@ -281,7 +282,7 @@ fn a_connection_keeps_its_lookup_slot_while_the_pool_is_parked() {
         println!("victim tunnel opened in {:?}", start.elapsed());
 
         // And it is a tunnel, not just a 200.
-        let (_, mut stream) = common::send_and_respond(&mut victim, connect_request(&target)).await;
+        let mut stream = open_tcp_tunnel(&mut victim, &target).await;
         echoes(&mut stream, b"still working").await;
 
         // Serial at worst, from the same victim: every one of these parks

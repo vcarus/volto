@@ -25,6 +25,7 @@ use volto::h3api::{FieldValue, Request, Status};
 const USER: (&str, &str) = ("user1", "s3cret");
 
 /// Asserts a refusal carries the RFC 9209 reason it should.
+#[track_caller]
 fn assert_refused(response: &Response, status: Status, error: &str) {
     assert_eq!(response.status, status);
     assert_eq!(

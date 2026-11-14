@@ -23,10 +23,11 @@ mod common;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::panic::Location;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, TestServer, open_tcp_tunnel, open_udp_session_to, read_at_least,
-    udp_round_trip,
+    ALLOW_PRIVATE, H3Client, TestServer, at_least, open_tcp_tunnel_at, udp_round_trip_at,
+    udp_session,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -119,22 +120,34 @@ fn announce_udp(socket: UdpSocket, tag: &'static [u8]) {
 }
 
 /// CONNECTs to `localhost:port` through `server` and returns the target's tag.
-async fn tag_through_tcp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
-    let mut client = H3Client::connect(server).await;
-    let mut stream = open_tcp_tunnel(&mut client, &format!("localhost:{port}")).await;
+///
+/// A synchronous function returning a future, so that a failure names the
+/// calling test's line (D66). So is the one below.
+#[track_caller]
+fn tag_through_tcp_tunnel(server: &TestServer, port: u16) -> impl Future<Output = Vec<u8>> + '_ {
+    let caller = Location::caller();
+    async move {
+        let mut client = H3Client::connect(server).await;
+        let mut stream =
+            open_tcp_tunnel_at(&mut client, &format!("localhost:{port}"), caller).await;
 
-    read_at_least(&mut stream, V4_TAG.len()).await
+        at_least(&mut stream, V4_TAG.len(), caller).await
+    }
 }
 
 /// Opens a CONNECT-UDP session to `localhost:port` and returns the target's tag.
-async fn tag_through_udp_tunnel(server: &TestServer, port: u16) -> Vec<u8> {
-    let mut client = H3Client::connect(server).await;
-    let (quarter_stream_id, _stream) =
-        open_udp_session_to(&mut client, server, "localhost", port).await;
+#[track_caller]
+fn tag_through_udp_tunnel(server: &TestServer, port: u16) -> impl Future<Output = Vec<u8>> + '_ {
+    let caller = Location::caller();
+    async move {
+        let mut client = H3Client::connect(server).await;
+        let (quarter_stream_id, _stream) =
+            udp_session(&mut client, server, "localhost".to_owned(), port, caller).await;
 
-    udp_round_trip(&client, quarter_stream_id, b"which?")
-        .await
-        .to_vec()
+        udp_round_trip_at(&client, quarter_stream_id, b"which?", caller)
+            .await
+            .to_vec()
+    }
 }
 
 /// Why the environment cannot run these tests.

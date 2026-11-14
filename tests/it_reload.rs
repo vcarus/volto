@@ -28,8 +28,8 @@ use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
     auth_section, authorized_connect, close_and_drain, connect_request, echoes,
-    is_version_negotiation, open_tcp_tunnel, open_udp_session, read_at_least, respond_to,
-    send_and_respond, spawn_echo_target, spawn_end_reporting_target, spawn_udp_echo_target,
+    is_version_negotiation, open_tcp_tunnel, open_tcp_tunnel_as, open_udp_session, read_at_least,
+    respond_to, spawn_echo_target, spawn_end_reporting_target, spawn_udp_echo_target,
     udp_round_trip, version_probe,
 };
 use tokio::sync::oneshot;
@@ -128,9 +128,8 @@ async fn existing_connections_keep_the_configuration_they_started_with() {
     let target = spawn_echo_target().await;
 
     let mut client = H3Client::connect(&server).await;
-    let request = authorized_connect(&target.to_string(), "user1", "old-password");
-    let (response, mut held) = send_and_respond(&mut client, request).await;
-    assert_eq!(response.status, Status::OK);
+    let mut held =
+        open_tcp_tunnel_as(&mut client, &target.to_string(), "user1", "old-password").await;
 
     server.rewrite_config(&format!(
         "{}{ALLOW_PRIVATE}",

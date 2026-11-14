@@ -813,17 +813,26 @@ pub fn open_tcp_tunnel<'a>(
     client: &'a mut H3Client,
     authority: &'a str,
 ) -> impl Future<Output = ClientStream> + 'a {
-    let caller = Location::caller();
-    async move {
-        let (response, stream) = exchange(client, connect_request(authority), caller).await;
-        assert_eq!(
-            response.status,
-            Status::OK,
-            "the tunnel to {authority} opened at {caller} was refused: proxy-status={:?}",
-            proxy_status(&response)
-        );
-        stream
-    }
+    open_tcp_tunnel_at(client, authority, Location::caller())
+}
+
+/// The body behind [`open_tcp_tunnel`], with `caller` already captured.
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn open_tcp_tunnel_at(
+    client: &mut H3Client,
+    authority: &str,
+    caller: &'static Location<'static>,
+) -> ClientStream {
+    let (response, stream) = exchange(client, connect_request(authority), caller).await;
+    assert_eq!(
+        response.status,
+        Status::OK,
+        "the tunnel to {authority} opened at {caller} was refused: proxy-status={:?}",
+        proxy_status(&response)
+    );
+    stream
 }
 
 /// [`open_tcp_tunnel`] against a server that requires credentials.
@@ -894,7 +903,10 @@ pub fn open_udp_session_to<'a>(
 }
 
 /// The body behind both session helpers, with `caller` already captured.
-async fn udp_session(
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn udp_session(
     client: &mut H3Client,
     server: &TestServer,
     host: String,
@@ -976,22 +988,30 @@ pub fn udp_round_trip<'a>(
     quarter_stream_id: u64,
     payload: &'a [u8],
 ) -> impl Future<Output = Bytes> + 'a {
-    let caller = Location::caller();
-    async move {
-        client
-            .quic
-            .send_datagram(datagram::encode_udp_payload(quarter_stream_id, payload))
-            .unwrap_or_else(|error| {
-                panic!("the datagram sent at {caller} was not queued: {error}")
-            });
+    udp_round_trip_at(client, quarter_stream_id, payload, Location::caller())
+}
 
-        let answer = read_datagram(&client.quic, caller).await;
-        assert_eq!(
-            answer.quarter_stream_id, quarter_stream_id,
-            "the answer to the datagram sent at {caller} arrived on another session"
-        );
-        answer.payload
-    }
+/// The body behind [`udp_round_trip`], with `caller` already captured.
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn udp_round_trip_at(
+    client: &H3Client,
+    quarter_stream_id: u64,
+    payload: &[u8],
+    caller: &'static Location<'static>,
+) -> Bytes {
+    client
+        .quic
+        .send_datagram(datagram::encode_udp_payload(quarter_stream_id, payload))
+        .unwrap_or_else(|error| panic!("the datagram sent at {caller} was not queued: {error}"));
+
+    let answer = read_datagram(&client.quic, caller).await;
+    assert_eq!(
+        answer.quarter_stream_id, quarter_stream_id,
+        "the answer to the datagram sent at {caller} arrived on another session"
+    );
+    answer.payload
 }
 
 /// Reads one HTTP/3 datagram off `quic` and decodes it.
@@ -1283,7 +1303,10 @@ pub fn read_at_least(stream: &mut ClientStream, n: usize) -> impl Future<Output 
 
 /// The body behind [`read_at_least`] and [`echoes`], with `caller` already
 /// captured.
-async fn at_least(
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn at_least(
     stream: &mut ClientStream,
     n: usize,
     caller: &'static Location<'static>,
@@ -1320,21 +1343,30 @@ pub fn echoes<'a>(
     stream: &'a mut ClientStream,
     payload: &'a [u8],
 ) -> impl Future<Output = ()> + 'a {
-    let caller = Location::caller();
-    async move {
-        stream
-            .send_data(Bytes::copy_from_slice(payload))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("the payload sent at {caller} did not reach the tunnel: {error}")
-            });
+    echoes_at(stream, payload, Location::caller())
+}
 
-        let echoed = at_least(stream, payload.len(), caller).await;
-        assert_eq!(
-            echoed, payload,
-            "the tunnel used at {caller} echoed the wrong bytes"
-        );
-    }
+/// The body behind [`echoes`], with `caller` already captured.
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn echoes_at(
+    stream: &mut ClientStream,
+    payload: &[u8],
+    caller: &'static Location<'static>,
+) {
+    stream
+        .send_data(Bytes::copy_from_slice(payload))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the payload sent at {caller} did not reach the tunnel: {error}")
+        });
+
+    let echoed = at_least(stream, payload.len(), caller).await;
+    assert_eq!(
+        echoed, payload,
+        "the tunnel used at {caller} echoed the wrong bytes"
+    );
 }
 
 /// Half-closes `stream` and reads until the server finishes its own side.
@@ -1349,13 +1381,21 @@ pub fn echoes<'a>(
 /// nothing did.
 #[track_caller]
 pub fn close_and_drain(stream: &mut ClientStream) -> impl Future<Output = Vec<u8>> + '_ {
-    let caller = Location::caller();
-    async move {
-        stream
-            .finish()
-            .unwrap_or_else(|error| panic!("the stream finished at {caller} was gone: {error}"));
-        read_while(stream, |_| false, caller).await.0
-    }
+    close_and_drain_at(stream, Location::caller())
+}
+
+/// The body behind [`close_and_drain`], with `caller` already captured.
+///
+/// Public for a test file's own assertion helper that captures its caller and
+/// does this on its behalf (D66).
+pub async fn close_and_drain_at(
+    stream: &mut ClientStream,
+    caller: &'static Location<'static>,
+) -> Vec<u8> {
+    stream
+        .finish()
+        .unwrap_or_else(|error| panic!("the stream finished at {caller} was gone: {error}"));
+    read_while(stream, |_| false, caller).await.0
 }
 
 /// A TCP target that echoes every chunk straight back.

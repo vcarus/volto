@@ -94,12 +94,13 @@ mod common;
 mod fds;
 
 use std::collections::HashMap;
+use std::panic::Location;
 use std::time::{Duration, Instant};
 
 use common::{
     ALLOW_PRIVATE, ClientStream, H3Client, SharedBuffer, TIMEOUT, TestServer, close_and_drain,
-    echoes, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end, recv_datagram,
-    send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
+    close_and_drain_at, echoes_at, numeric_field, open_tcp_tunnel, open_udp_session, read_to_end,
+    recv_datagram, send_udp_payload, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 use fds::settled_fds;
 use volto::datagram;
@@ -271,16 +272,26 @@ async fn opened<T>(what: &str, open: impl std::future::Future<Output = T>) -> T 
 /// its EOF by closing, and the server finishes its own sending side — so this
 /// returns only once the tunnel is over at both ends and its slot, socket and
 /// pump tasks are owed back.
-async fn use_and_close_tcp(tunnel: &mut ClientStream, payload: &str) {
-    // The payload names the tunnel it belongs to, so a mismatch here is a
-    // tunnel that received another tunnel's data.
-    echoes(tunnel, payload.as_bytes()).await;
+///
+/// A synchronous function returning a future, so that a failure names the
+/// calling test's line (D66).
+#[track_caller]
+fn use_and_close_tcp<'a>(
+    tunnel: &'a mut ClientStream,
+    payload: &'a str,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        // The payload names the tunnel it belongs to, so a mismatch here is a
+        // tunnel that received another tunnel's data.
+        echoes_at(tunnel, payload.as_bytes(), caller).await;
 
-    let trailing = close_and_drain(tunnel).await;
-    assert!(
-        trailing.is_empty(),
-        "an echo tunnel owes nothing past its echo, got {trailing:?}"
-    );
+        let trailing = close_and_drain_at(tunnel, caller).await;
+        assert!(
+            trailing.is_empty(),
+            "an echo tunnel used at {caller} owes nothing past its echo, got {trailing:?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
