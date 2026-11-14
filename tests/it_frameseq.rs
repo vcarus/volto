@@ -578,6 +578,11 @@ proptest! {
 /// prefix -- proptest's coverage of the rarer arms is probabilistic, and a
 /// wrong model arm should fail the suite deterministically, not one run in
 /// five.
+///
+/// An offence whose code is H3_ID_ERROR is not followed by the sentinel, whose
+/// CANCEL_PUSH draws the same code: a server that wrongly accepted the offence
+/// would then close on the sentinel and pass. Those rows end with a clean
+/// finish instead, whose H3_CLOSED_CRITICAL_STREAM differs.
 #[test]
 fn every_control_offence_draws_its_modelled_code() {
     let legal_prefix = vec![
@@ -624,8 +629,18 @@ fn every_control_offence_draws_its_modelled_code() {
             Some(expected),
             "the model must agree with this table for {offence:?}"
         );
+        let end = if expected == H3_ID_ERROR {
+            ControlEnd::FinishCleanly
+        } else {
+            ControlEnd::Sentinel
+        };
+        assert_eq!(
+            script_verdict(&events, end),
+            expected,
+            "the model must agree with this table for {offence:?} ending {end:?}"
+        );
         run_case(async {
-            let (code, reason) = drive_control_script(&events, ControlEnd::Sentinel).await;
+            let (code, reason) = drive_control_script(&events, end).await;
             assert_eq!(code, expected, "{offence:?}: the reason was {reason:?}");
         });
     }
