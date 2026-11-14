@@ -138,9 +138,42 @@ fn packaged_paths() -> BTreeSet<String> {
     packaged
 }
 
-/// Every file that actually sits in `script/`.
+/// The files under `script/` that git ignores, such as the `.DS_Store` Finder
+/// writes on the dev host. None of them can reach a commit or the tarball.
+///
+/// Empty when git cannot answer, which leaves the directory listing below as
+/// strict as it is without this.
+fn ignored_in_script_dir() -> BTreeSet<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--",
+            "script/",
+        ])
+        .current_dir(repo_root())
+        .output();
+    match output {
+        Ok(output) if output.status.success() => output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// Every file that sits in `script/`, apart from the ones git ignores.
+///
+/// The directory is listed rather than `git ls-files`, so a new asset fails
+/// this test before it is ever added to the index.
 fn assets_on_disk() -> BTreeSet<String> {
     let dir = repo_root().join("script");
+    let ignored = ignored_in_script_dir();
     let mut assets = BTreeSet::new();
     for entry in fs::read_dir(&dir).expect("script/ must exist") {
         let entry = entry.expect("script/ must be readable");
@@ -149,7 +182,10 @@ fn assets_on_disk() -> BTreeSet<String> {
         }
         let name = entry.file_name();
         let name = name.to_str().expect("asset names are UTF-8");
-        assets.insert(format!("script/{name}"));
+        let path = format!("script/{name}");
+        if !ignored.contains(&path) {
+            assets.insert(path);
+        }
     }
     assets
 }
