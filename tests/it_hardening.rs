@@ -462,9 +462,12 @@ async fn a_refusal_the_peer_will_not_take_is_reset() {
     );
 
     // One abandoned answer is not a reason to drop everything else.
+    // Waited for rather than read once: a close sent a moment after the reset
+    // would still be in flight when the reset arrived.
+    let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
     assert!(
-        connection.close_reason().is_none(),
-        "the connection must survive a stream it could not answer"
+        closed.is_err(),
+        "the connection must survive a stream it could not answer: {closed:?}"
     );
 }
 
@@ -538,9 +541,12 @@ async fn a_431_the_peer_will_not_take_is_reset() {
     );
 
     // One abandoned answer is not a reason to drop everything else.
+    // Waited for rather than read once: a close sent a moment after the reset
+    // would still be in flight when the reset arrived.
+    let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
     assert!(
-        connection.close_reason().is_none(),
-        "the connection must survive a stream it could not answer"
+        closed.is_err(),
+        "the connection must survive a stream it could not answer: {closed:?}"
     );
 }
 

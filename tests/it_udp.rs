@@ -1258,9 +1258,12 @@ async fn a_session_200_the_peer_will_not_take_is_reset() {
 
     // One session that could not be opened is not a reason to drop everything
     // else on the connection.
+    // Waited for rather than read once: a close sent a moment after the reset
+    // would still be in flight when the reset arrived.
+    let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
     assert!(
-        connection.close_reason().is_none(),
-        "the connection must survive a session whose 200 could not be delivered"
+        closed.is_err(),
+        "the connection must survive a session whose 200 could not be delivered: {closed:?}"
     );
 }
 

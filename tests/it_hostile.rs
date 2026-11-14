@@ -1635,8 +1635,5 @@ async fn the_shipped_write_deadline_ends_an_unread_refusal() {
         elapsed > Duration::from_secs(45) && elapsed < Duration::from_secs(90),
         "the shipped write deadline is one 60s idle timeout, and this took {elapsed:?}"
     );
-    assert!(
-        connection.close_reason().is_none(),
-        "one abandoned answer must not cost the connection"
-    );
+    stays_open(&connection, Duration::from_millis(300)).await;
 }
