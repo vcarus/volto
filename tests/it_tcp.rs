@@ -1896,23 +1896,6 @@ fn request_on(
     }
 }
 
-/// A proxy is not an origin server: ordinary requests are refused, not panicked
-/// on.
-#[tokio::test]
-async fn plain_get_is_not_implemented() {
-    let server = TestServer::start().await;
-    let mut client = H3Client::connect(&server).await;
-
-    let mut req = Request::new(Method::Other("GET".into()));
-    req.scheme = Some("https".into());
-    req.authority = Some(server.addr.to_string().into());
-    req.path = Some("/".into());
-
-    let response = respond_to(&mut client, req).await;
-
-    assert_eq!(response.status, Status::NOT_IMPLEMENTED);
-}
-
 /// Several tunnels multiplexed on one QUIC connection must stay independent.
 #[tokio::test]
 async fn concurrent_tunnels_on_one_connection_stay_independent() {

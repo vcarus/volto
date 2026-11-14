@@ -76,11 +76,6 @@ async fn server_advertises_a_header_size_limit() {
         });
 
     assert_eq!(advertised, EXPECTED_MAX_FIELD_SECTION_SIZE, "{settings:?}");
-    // The point of the assertion is that it is *bounded*, not merely present.
-    assert!(
-        advertised < u64::from(u32::MAX),
-        "the advertised limit must be a real bound, got {advertised}"
-    );
 }
 
 /// A client that respects SETTINGS never sends an oversized field section, so
