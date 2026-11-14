@@ -136,9 +136,12 @@ async fn a_session_that_never_drains_its_queue_does_not_stall_the_router() {
     send_udp_payload(&client.quic, live_qsid, b"neighbour");
     capsule_reply_is(&mut live, b"neighbour").await;
 
+    // Waited for rather than read once: a close sent a moment after the
+    // neighbour's reply would still be in flight when the reply arrived.
+    let closed = tokio::time::timeout(Duration::from_millis(300), client.quic.closed()).await;
     assert!(
-        client.quic.close_reason().is_none(),
-        "a full queue on one session is met with drops, never with a close"
+        closed.is_err(),
+        "a full queue on one session is met with drops, never with a close: {closed:?}"
     );
 }
 
