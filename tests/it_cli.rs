@@ -142,8 +142,13 @@ fn a_configuration_that_loads_is_reported_without_binding_anything() {
 /// The rollback case, which is the reason the flag exists.
 ///
 /// A key from a later release is refused whole, and the refusal has to carry the
-/// one thing the operator can act on — the position — without carrying the one
-/// thing it must never carry, which lives two lines above it in the same file.
+/// one thing the operator can act on, the position.
+///
+/// The password sits three lines above the offending key, and the parser's
+/// message names neither line's contents, so the assertion on the secret here
+/// cannot fail on its own. The redaction is tested where the error is on the
+/// credential line itself, by
+/// `a_malformed_credential_line_is_refused_without_the_secret`.
 #[test]
 fn a_key_from_the_future_is_refused_with_its_position_and_no_secret() {
     let dir = config_dir("future-key");
@@ -179,6 +184,48 @@ fn a_key_from_the_future_is_refused_with_its_position_and_no_secret() {
         stderr.contains(&format!("at line {offending},")),
         "the position is the operator's only thread back to the key, since the \
          name itself is redacted: {stderr}"
+    );
+    assert!(
+        !stderr.contains(SECRET) && !stdout_of(&output).contains(SECRET),
+        "a configuration error must never echo a credential: {stderr}"
+    );
+}
+
+/// A parse error on the line that holds the password is reported without the
+/// password.
+///
+/// The `users` entry is a string where a table belongs, so the error is on the
+/// credential line. The `toml` crate's own rendering of that error prints the
+/// line, and serde's message quotes the value it refused, so either route would
+/// put [`SECRET`] on stderr and into the journal on every restart.
+#[test]
+fn a_malformed_credential_line_is_refused_without_the_secret() {
+    let dir = config_dir("malformed-credential");
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"{}\"\nkey = \"{}\"\n\n\
+             [auth]\nusers = [\"user1:{SECRET}\"]\n",
+            dir.join("cert.pem").display(),
+            dir.join("key.pem").display(),
+        ),
+    )
+    .expect("the config must be writable");
+
+    let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
+
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    let credential_line = fs::read_to_string(&path)
+        .expect("the config must be readable")
+        .lines()
+        .position(|line| line.starts_with("users = "))
+        .expect("the fixture must contain the users line")
+        + 1;
+    assert!(
+        stderr.contains(&format!("at line {credential_line},")),
+        "the error must be the one on the credential line: {stderr}"
     );
     assert!(
         !stderr.contains(SECRET) && !stdout_of(&output).contains(SECRET),
