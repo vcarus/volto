@@ -73,7 +73,7 @@ use volto::h3api::{Code, FieldValue, Fields, Request, Status, StreamError};
 
 use super::huffman;
 use super::rawstream::{
-    RESERVED_HTTP2_TYPES, STREAM_CONTROL, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    RESERVED_HTTP2_TYPES, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
 };
 use super::{TIMEOUT, TestServer};
 use super::{client_endpoint_with_transport, connect_quic, connect_quic_with_ca, finish_connect};
@@ -131,14 +131,15 @@ struct Peer {
     /// rejected, and `it_shutdown` opens a stream past it to prove the server
     /// really rejects it rather than trusting this client's own bookkeeping.
     goaway: AtomicU64,
-    /// The first control-stream rule the server broke, if it broke one.
+    /// The first rule the server broke on its unidirectional streams, if it
+    /// broke one.
     ///
     /// Recorded as well as panicked with, because a panic inside a spawned task
     /// is caught by tokio and stored in a `JoinHandle` nobody awaits: the
     /// message would be printed and the test would still pass. Every request,
     /// every response and every data read checks this, and so does
-    /// [`H3Client`] teardown, so a server that breaks a rule on its control
-    /// stream fails the test even when the fault arrives after the last
+    /// [`H3Client`] teardown, so a server that breaks a rule on its control or
+    /// QPACK streams fails the test even when the fault arrives after the last
     /// exchange.
     fault: Mutex<Option<String>>,
     /// Whether the server's first control stream has been seen.
@@ -147,6 +148,13 @@ struct Peer {
     /// second one is a fault. The first stream sets this; every later one is
     /// recorded rather than read as if it were the first.
     control_seen: AtomicBool,
+    /// Whether the server's QPACK encoder stream has been seen.
+    ///
+    /// RFC 9204 §4.2 allows at most one of each QPACK stream type, so a second
+    /// one is a fault, as for [`Self::control_seen`].
+    encoder_seen: AtomicBool,
+    /// Whether the server's QPACK decoder stream has been seen.
+    decoder_seen: AtomicBool,
 }
 
 impl Default for Peer {
@@ -157,14 +165,16 @@ impl Default for Peer {
             goaway: AtomicU64::new(NO_GOAWAY),
             fault: Mutex::new(None),
             control_seen: AtomicBool::new(false),
+            encoder_seen: AtomicBool::new(false),
+            decoder_seen: AtomicBool::new(false),
         }
     }
 }
 
 impl Peer {
-    /// Records that the server broke `rule` on its control stream, and panics.
+    /// Records that the server broke `rule` on a unidirectional stream, and panics.
     ///
-    /// Only the first rule is kept: everything after a broken control stream is
+    /// Only the first rule is kept: everything after a broken critical stream is
     /// a consequence of it, and the first one is what a reader needs.
     fn broke(&self, rule: String) -> ! {
         // Released before panicking, so the panic does not poison the mutex and
@@ -178,7 +188,7 @@ impl Peer {
         panic!("{rule}");
     }
 
-    /// Panics if the server has already broken a control-stream rule.
+    /// Panics if the server has already broken a unidirectional-stream rule.
     ///
     /// Called at every request and response boundary, after every data read,
     /// and at [`H3Client`] teardown, which is the last place a fault recorded
@@ -1087,7 +1097,9 @@ async fn drive(quic: quinn::Connection, peer: Arc<Peer>) {
 ///
 /// A stream that ends before its type is not a fault, and is left alone. RFC
 /// 9114 §6.2.1 allows exactly one control stream, so a second one is recorded
-/// rather than read as if it were the first.
+/// rather than read as if it were the first. The two QPACK streams are held to
+/// RFC 9204 §4.2 by [`read_qpack`]. A push stream is a fault, because this
+/// client never sends MAX_PUSH_ID. Reserved and unknown types are drained.
 async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Connection) {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
     //# A sender can close or reset a unidirectional stream unless otherwise
@@ -1105,9 +1117,113 @@ async fn serve_uni(mut recv: quinn::RecvStream, peer: Arc<Peer>, quic: quinn::Co
             }
             read_control(recv, peer, quic).await
         }
-        // QPACK streams and anything else: drained rather than stopped, so the
+        STREAM_QPACK_ENCODER | STREAM_QPACK_DECODER => {
+            read_qpack(recv, stream_type, peer, quic).await;
+        }
+
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-4.6
+        //# A client MUST treat receipt of a push stream as a connection
+        //# error of type H3_ID_ERROR when no MAX_PUSH_ID frame has been sent or
+        //# when the stream references a push ID that is greater than the maximum
+        //# push ID.
+        STREAM_PUSH => {
+            peer.broke(
+                "the server opened a push stream, but this client never sent MAX_PUSH_ID, \
+                 which is H3_ID_ERROR"
+                    .into(),
+            );
+        }
+
+        // Reserved and unknown types: drained rather than stopped, so the
         // server never sees this client refuse a stream it opened.
         _ => drain(recv).await,
+    }
+}
+
+/// Reads one of the server's QPACK streams until the connection ends, holding
+/// it to the rules RFC 9204 states for one.
+///
+/// Recorded as faults: a second stream of the same type, the stream ending or
+/// being reset while the connection lives, and any instruction this client's
+/// settings make illegal. A stream that ends because the connection itself has
+/// ended is not a fault, as in [`read_control`].
+///
+/// Which instructions are legal follows from the zero table capacity both
+/// sides advertise. On the encoder stream only Set Dynamic Table Capacity with
+/// a capacity of 0 is legal, and its only encoding is the byte `0x20`: an
+/// insert needs room in the table, a duplicate needs an entry, and any other
+/// capacity exceeds the limit (RFC 9204 §3.2.3). On the decoder stream only
+/// Stream Cancellation is legal: this client never sends a field section with
+/// a non-zero Required Insert Count, so a Section Acknowledgment refers to
+/// nothing, and an Insert Count Increment counts inserts that never happened
+/// (RFC 9204 §4.4.1, §4.4.3).
+async fn read_qpack(
+    mut recv: quinn::RecvStream,
+    stream_type: u64,
+    peer: Arc<Peer>,
+    quic: quinn::Connection,
+) {
+    let (name, seen) = if stream_type == STREAM_QPACK_ENCODER {
+        ("encoder", &peer.encoder_seen)
+    } else {
+        ("decoder", &peer.decoder_seen)
+    };
+
+    //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+    //# Receipt of a second instance of either stream type MUST be
+    //# treated as a connection error of type H3_STREAM_CREATION_ERROR.
+    if seen.swap(true, Ordering::Relaxed) {
+        peer.broke(format!(
+            "the server opened a second QPACK {name} stream, which is H3_STREAM_CREATION_ERROR"
+        ));
+    }
+
+    // Whether the last decoder-stream byte left a prefix integer unfinished
+    // (RFC 9204 §4.1.1): a continuation byte has its top bit set.
+    let mut continuing = false;
+
+    loop {
+        let chunk = match recv.read_chunk(usize::MAX, true).await {
+            Ok(Some(chunk)) => chunk,
+
+            //= https://www.rfc-editor.org/rfc/rfc9204#section-4.2
+            //# Closure of either unidirectional stream type MUST be treated as a
+            //# connection error of type H3_CLOSED_CRITICAL_STREAM.
+            Ok(None) | Err(_) => {
+                if quic.close_reason().is_none() {
+                    peer.broke(format!(
+                        "the server closed or reset its QPACK {name} stream, which is \
+                         H3_CLOSED_CRITICAL_STREAM"
+                    ));
+                }
+                return;
+            }
+        };
+
+        for &byte in &chunk.bytes {
+            if stream_type == STREAM_QPACK_ENCODER {
+                //= https://www.rfc-editor.org/rfc/rfc9204#section-4.3.1
+                //# The decoder MUST treat a new dynamic table capacity
+                //# value that exceeds this limit as a connection error of type
+                //# QPACK_ENCODER_STREAM_ERROR.
+                if byte != 0x20 {
+                    peer.broke(format!(
+                        "the server wrote {byte:#04x} on its QPACK encoder stream, and with a \
+                         table capacity of 0 the only legal instruction is 0x20"
+                    ));
+                }
+            } else if continuing {
+                continuing = byte & 0x80 != 0;
+            } else if byte & 0xc0 == 0x40 {
+                // Stream Cancellation: '01' and a 6-bit prefix stream id.
+                continuing = byte & 0x3f == 0x3f;
+            } else {
+                peer.broke(format!(
+                    "the server wrote {byte:#04x} on its QPACK decoder stream, which is not a \
+                     Stream Cancellation and refers to a table this client never used"
+                ));
+            }
+        }
     }
 }
 
