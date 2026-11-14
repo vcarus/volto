@@ -866,8 +866,12 @@ async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
     let window = Window::open();
     let started = window.wall;
 
+    // Each datagram takes a permit that only its arrival at the target gives
+    // back, so every datagram lost on the way keeps one. Once all of them are
+    // kept the loop waits on the semaphore until this timeout, and a window
+    // that includes that wait is not a measurement.
     let send_budget = budget.unwrap_or(Duration::from_secs(120)) + Duration::from_secs(30);
-    let _ = tokio::time::timeout(send_budget, async {
+    let finished = tokio::time::timeout(send_budget, async {
         let mut n = 0u64;
         while n < count {
             let permit = permits.acquire().await.expect("the window stays open");
@@ -891,6 +895,14 @@ async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
     .await;
 
     let sent = sent.load(Ordering::Relaxed);
+    if finished.is_err() {
+        let kept = UPLINK_IN_FLIGHT.saturating_sub(permits.available_permits());
+        panic!(
+            "the uplink send loop stalled: {sent} of {count} datagrams were sent in \
+             {send_budget:?}, and {kept} of the {UPLINK_IN_FLIGHT} permits had not come \
+             back, one per datagram the target has not seen"
+        );
+    }
 
     // Drain: the last `IN_FLIGHT` packets are still in the pipeline. The end
     // instant is when the target stopped making progress, so a lossy run is not
