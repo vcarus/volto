@@ -1567,8 +1567,9 @@ fn a_run_that_looked_up_the_latest_release_never_goes_back() {
 }
 
 /// The refusal sits where the release has just been resolved and nothing has
-/// been downloaded, and the only assignment that arms it is the lookup of the
-/// latest release.
+/// been downloaded, the only assignment that arms it is the lookup of the
+/// latest release, and no other line sets the flag. The run itself is
+/// `a_looked_up_release_older_than_the_install_is_refused_before_the_download`.
 #[test]
 fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alone() {
     let text = fs::read_to_string(deploy_script()).expect("the deploy script must be readable");
@@ -1581,12 +1582,24 @@ fn the_downgrade_refusal_runs_before_any_download_and_is_armed_by_the_lookup_alo
         .expect("the download section");
     assert!(call < download, "the refusal must come before the download");
 
-    let armed: Vec<&str> = text
+    // Every line of code that names the flag is one of three: the default, the
+    // arming line after the lookup, and the read in the refusal. Anything else
+    // is a second assignment, and a second assignment can disarm it.
+    let named: Vec<&str> = text
         .lines()
         .map(str::trim)
-        .filter(|line| *line == "TAG_WAS_RESOLVED=1")
+        .filter(|line| !line.starts_with('#') && line.contains("TAG_WAS_RESOLVED"))
         .collect();
-    assert_eq!(armed.len(), 1, "one place arms the refusal");
+    assert_eq!(
+        named,
+        [
+            "TAG_WAS_RESOLVED=0",
+            "[ \"$TAG_WAS_RESOLVED\" -eq 1 ] || return 0",
+            "TAG_WAS_RESOLVED=1",
+        ],
+        "TAG_WAS_RESOLVED must be set once to its default, read once by the \
+         refusal and armed once by the lookup, and named nowhere else"
+    );
     assert!(
         text.contains("[[ \"$TAG\" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]] ||"),
         "a looked-up tag must be three numbers, or the refusal cannot order it"
@@ -1858,6 +1871,15 @@ impl Host {
         binary
     }
 
+    /// Makes the latest-release lookup answer `tag`.
+    fn mark_latest(&self, tag: &str) {
+        fs::write(
+            self.logs.join("latest"),
+            format!("https://github.com/example/volto/releases/tag/{tag}"),
+        )
+        .expect("the latest marker must be writable");
+    }
+
     /// Runs `script/deploy.sh` with `args`, its paths under `root` and the stubs
     /// first on `PATH`.
     fn run(&self, args: &[&str]) -> Output {
@@ -2122,5 +2144,75 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
     assert!(
         calls.starts_with("is-active --quiet volto\n") && !calls.contains("restart"),
         "the first install must check the service once and restart nothing: {calls}"
+    );
+}
+
+/// A run that looked the latest release up, the way the timer does, refuses a
+/// release older than the installed one before it downloads anything.
+///
+/// The run is the real one: the stand-in `curl` answers the lookup with an
+/// older tag, and the planted binary reports a newer version. A second host,
+/// whose latest release is newer, shows the same run going on to the download,
+/// so the refusal is what stopped the first one.
+#[test]
+fn a_looked_up_release_older_than_the_install_is_refused_before_the_download() {
+    let host = Host::new("latest-older", Service::ComesUp);
+    host.plant_install();
+    host.publish("v1.3.5", Candidate::LoadsTheConfig);
+    host.mark_latest("v1.3.5");
+    let previous_binary =
+        fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+
+    let output = host.run(&[]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success(),
+        "an older latest release must be refused: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        stderr.contains(
+            "the latest release is v1.3.5 and this host runs 1.3.6 -- refusing to go back"
+        ),
+        "the refusal must name both versions: {stderr}"
+    );
+    assert_eq!(
+        host.calls("curl"),
+        "https://github.com/example/volto/releases/latest\n",
+        "the lookup must be the only request: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(previous_binary),
+        "the installed binary must be untouched: {stderr}"
+    );
+    assert_eq!(
+        host.calls("systemctl"),
+        "",
+        "the service must be left alone"
+    );
+
+    let newer = Host::new("latest-newer", Service::ComesUp);
+    newer.plant_install();
+    newer.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    newer.mark_latest(UNSIGNED_TAG);
+
+    let output = newer.run(&[]);
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !stderr.contains("refusing to go back")
+            && stderr
+                .contains("carries no SHA256SUMS.sig -- refusing to install an unsigned release"),
+        "a newer latest release must pass the refusal and reach the download, \
+         where the missing signature stops it: {stderr}"
+    );
+    assert!(
+        newer
+            .calls("curl")
+            .contains("/releases/download/v1.3.7/volto-1.3.7-x86_64-unknown-linux-musl.tar.gz\n"),
+        "the run must have downloaded the release: {}",
+        newer.calls("curl")
     );
 }
