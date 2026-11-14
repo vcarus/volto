@@ -115,16 +115,7 @@ async fn the_connection_cap_refuses_further_connections() {
     }
 
     // And the ones already established are untouched by the refusal.
-    let mut stream = first
-        .send
-        .send_request(connect_request(&target.to_string()))
-        .await
-        .expect("the existing connection must still work");
-    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
-        .await
-        .expect("response arrived")
-        .expect("response");
-    assert_eq!(response.status, Status::OK);
+    let _stream = open_tcp_tunnel(&mut first, &target.to_string()).await;
 }
 
 /// A slot freed by a closed connection becomes available again.

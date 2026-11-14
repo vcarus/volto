@@ -16,7 +16,7 @@ use common::rawstream::{
 };
 use common::{
     ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
-    client_endpoint_with_transport, closed_address, connect_request, finish_connect,
+    client_endpoint_with_transport, closed_address, connect_request, echoes, finish_connect,
     open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to, send_and_respond,
     spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
     spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_transport,
@@ -34,21 +34,10 @@ async fn tunnels_bytes_to_an_echo_target() {
 
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
-    stream
-        .send_data(Bytes::from_static(b"hello volto"))
-        .await
-        .expect("send payload");
-
-    let echoed = read_at_least(&mut stream, b"hello volto".len()).await;
-    assert_eq!(&echoed, b"hello volto");
+    echoes(&mut stream, b"hello volto").await;
 
     // The tunnel stays usable for a second exchange on the same stream.
-    stream
-        .send_data(Bytes::from_static(b"again"))
-        .await
-        .expect("send again");
-    let echoed = read_at_least(&mut stream, b"again".len()).await;
-    assert_eq!(&echoed, b"again");
+    echoes(&mut stream, b"again").await;
 }
 
 /// The half-close case: the client finishes its sending side first and must
@@ -1729,12 +1718,7 @@ async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
     // that does answer.
     let target = spawn_echo_target().await;
     let mut good = open_tcp_tunnel(&mut client, &target.to_string()).await;
-
-    good.send_data(Bytes::from_static(b"after the timeout"))
-        .await
-        .expect("send payload");
-    let echoed = read_at_least(&mut good, b"after the timeout".len()).await;
-    assert_eq!(&echoed, b"after the timeout");
+    echoes(&mut good, b"after the timeout").await;
 }
 
 /// A request this proxy will not serve is answered and *finished*, never reset.
@@ -1967,12 +1951,7 @@ async fn a_trailer_section_on_a_live_tunnel_ends_the_connection() {
     // A working tunnel first, so what is refused is a frame on a stream that had
     // completed its CONNECT rather than one that never got that far.
     let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
-    stream
-        .send_data(Bytes::from_static(b"hello volto"))
-        .await
-        .expect("send payload");
-    let echoed = read_at_least(&mut stream, b"hello volto".len()).await;
-    assert_eq!(&echoed, b"hello volto");
+    echoes(&mut stream, b"hello volto").await;
 
     stream
         .send_trailers(&[(b"x-trailer", b"volto")])

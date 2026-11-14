@@ -27,10 +27,9 @@ use std::net::SocketAddr;
 use std::panic::Location;
 use std::time::Duration;
 
-use bytes::Bytes;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint_with_transport,
-    finish_connect_as, is_version_negotiation, open_tcp_tunnel, open_udp_session, read_at_least,
+    echoes, finish_connect_as, is_version_negotiation, open_tcp_tunnel, open_udp_session,
     spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_round_trip, version_probe,
 };
 use rustls::pki_types::CertificateDer;
@@ -157,14 +156,7 @@ async fn the_name_on_the_list_reaches_both_kinds_of_tunnel() {
     let mut client = H3Client::connect(&server).await;
 
     let mut tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
-    tunnel
-        .send_data(Bytes::from_static(b"through the gate"))
-        .await
-        .expect("send payload");
-    assert_eq!(
-        read_at_least(&mut tunnel, b"through the gate".len()).await,
-        b"through the gate"
-    );
+    echoes(&mut tunnel, b"through the gate").await;
 
     let (session, _stream) = open_udp_session(&mut client, &server, udp_target).await;
     assert_eq!(
