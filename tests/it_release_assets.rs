@@ -522,14 +522,21 @@ fn every_push_to_main_keys_its_concurrency_group_on_the_commit() {
                 )
             });
 
-        assert!(
-            group.contains("github.sha"),
-            "{} keys the concurrency group as {group:?}, which is one group for \
-             every push to main. A release needs a successful run of this \
-             workflow for the exact tagged commit, and with \
-             `cancel-in-progress: false` a newer push cancels the one pending \
-             run of that group, so a commit can end with only a cancelled run. \
-             Key a push on `github.sha`",
+        // The whole expression, because which operand follows the
+        // `pull_request` test is the property: swapped, the same two names key
+        // every push on the branch again.
+        let expected = format!(
+            "{prefix}${{{{ github.event_name == 'pull_request' && github.ref || github.sha }}}}"
+        );
+        assert_eq!(
+            group,
+            expected,
+            "{} keys the concurrency group as {group:?}. A pull request must key \
+             on its ref and a push on the commit. A release needs a successful run \
+             of this workflow for the exact tagged commit, and with \
+             `cancel-in-progress: false` a newer push cancels the one pending run \
+             of its group, so a push keyed on the branch can leave a commit with \
+             only a cancelled run",
             path.display()
         );
     }
