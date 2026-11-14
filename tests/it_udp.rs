@@ -12,8 +12,8 @@ use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
     closed_udp_address, connect_udp_request, open_udp_session, open_udp_session_to, respond_to,
     send_udp_payload, spawn_bursting_udp_target, spawn_flooding_udp_target,
-    spawn_large_reply_udp_target, spawn_pushing_udp_target, spawn_silent_udp_target,
-    spawn_tagged_udp_target, spawn_udp_echo_target, udp_round_trip, windowless_transport,
+    spawn_pushing_udp_target, spawn_silent_udp_target, spawn_tagged_udp_target,
+    spawn_udp_echo_target, spawn_udp_target, udp_round_trip, windowless_transport,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -847,12 +847,22 @@ async fn unknown_capsule_types_are_skipped() {
 ///
 /// RFC 9298 §6.1 says a proxy SHOULD NOT fall back to a capsule here: doing so
 /// would silently turn a lossy flow into a reliable, head-of-line blocked one.
-/// The session must survive the drop.
+/// The session must survive the drop: the same session carries the next reply.
 #[tokio::test]
 async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
     let server = TestServer::start().await;
-    // Comfortably above any QUIC datagram limit on a 1200-1500 byte path.
-    let big_target = spawn_large_reply_udp_target(8000).await;
+    // The first reply is comfortably above any QUIC datagram limit on a
+    // 1200-1500 byte path. Every later packet is echoed, so the session that
+    // dropped the first reply can show that it still relays.
+    let mut answered = false;
+    let big_target = spawn_udp_target(move |packet| {
+        if std::mem::replace(&mut answered, true) {
+            Some(packet.to_vec())
+        } else {
+            Some(vec![0x5a; 8000])
+        }
+    })
+    .await;
     let mut client = H3Client::connect(&server).await;
 
     let (qsid, mut stream) = open_udp_session(&mut client, &server, big_target).await;
@@ -876,13 +886,9 @@ async fn oversized_target_packets_are_dropped_not_sent_as_capsules() {
         "an oversized packet must not be downgraded to a capsule (RFC 9298 §6.1)"
     );
 
-    // The session is still alive: a small reply still gets through.
-    let small_target = spawn_udp_echo_target().await;
-    let (small_qsid, _small_stream) = open_udp_session(&mut client, &server, small_target).await;
-    assert_eq!(
-        &udp_round_trip(&client, small_qsid, b"small").await[..],
-        b"small"
-    );
+    // The session that dropped the packet is still alive: a small reply on it
+    // still gets through.
+    assert_eq!(&udp_round_trip(&client, qsid, b"small").await[..], b"small");
 }
 
 /// An idle session must close both its socket and its request stream.
