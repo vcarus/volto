@@ -286,8 +286,11 @@ const MAX_CAPSULE_VALUE: u64 = 8 + 65527;
 /// and the ~92 KiB inbound datagram queue.
 ///
 /// The ceiling is four times the value itself: room for `BytesMut` to have
-/// doubled its way there and for the reads that carried it, and a refusal of any
-/// decoder that started accumulating across capsules rather than within one.
+/// doubled its way there and for the reads that carried it. Each session is
+/// sent one complete capsule before the window and one unfinished capsule in
+/// it, so the ceiling bounds what one unfinished capsule costs. It does not
+/// test a decoder that accumulated across complete capsules, since none
+/// arrives inside the window.
 const HELD_PER_SESSION_CEILING: i64 = 4 * (MAX_CAPSULE_VALUE as i64);
 
 /// A DATAGRAM capsule header (RFC 9297 §3.5) declaring `length` bytes of value.
@@ -309,7 +312,11 @@ fn datagram_capsule_header(length: u64) -> Bytes {
 ///
 /// The window is armed only for the *stall*: the sessions are open and their two
 /// documented buffers already allocated before it opens, so what grows inside it
-/// is the capsule decoder and nothing else.
+/// is the capsule decoder, and quinn's buffer for stream bytes received and not
+/// yet read, which this process counts too. That second one is why each session
+/// first echoes a complete capsule: a session whose stream is not being read
+/// would fill quinn's buffer instead of the decoder's and still meet the floor
+/// below, but it cannot answer that capsule.
 ///
 /// # Measured
 ///
@@ -325,8 +332,23 @@ async fn a_session_holds_one_unfinished_capsule_and_no_more() {
     let mut client = H3Client::connect(&server).await;
 
     let mut sessions = Vec::with_capacity(SESSIONS);
-    for _ in 0..SESSIONS {
-        let (_quarter, stream) = open_udp_session(&mut client, &server, echo).await;
+    for index in 0..SESSIONS {
+        let (quarter, mut stream) = open_udp_session(&mut client, &server, echo).await;
+
+        // Proof that this session reads its capsule stream: a complete capsule
+        // is forwarded, and its echo comes back as a datagram.
+        let payload = format!("capsule {index}");
+        stream
+            .send_data(volto::capsule::encode_datagram(0, payload.as_bytes()))
+            .await
+            .unwrap_or_else(|error| panic!("session {index} would not take a capsule: {error}"));
+        let echoed = common::recv_datagram(&client.quic).await;
+        assert_eq!(
+            (echoed.quarter_stream_id, &echoed.payload[..]),
+            (quarter, payload.as_bytes()),
+            "session {index} must forward a complete capsule and carry its echo back"
+        );
+
         sessions.push(stream);
     }
 
