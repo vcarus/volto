@@ -1328,10 +1328,18 @@ proptest! {
 /// `#[cfg(test)]`-private, so instead a budget that has just refused sixty-four
 /// frames declaring 2^62-1 bytes each is handed a HEADERS frame of exactly the
 /// largest size it allows. That frame is 64 KiB of a 1 MiB budget and must be
-/// accepted -- which it cannot be if the refusals had charged, or leaked,
-/// anything like what they declared. Sixty-four of them is sixteen times the
-/// budget at the largest *allowed* length, so even a refusal that charged only
-/// the cap rather than the declared length would show up here.
+/// accepted, which it cannot be if the refusals had charged anything like what
+/// they declared. Sixty-four of them is sixteen times the budget at the largest
+/// *allowed* length, so even a refusal that charged only the cap rather than
+/// the declared length would show up here.
+///
+/// The refusals are made twice. Over the wire each reader is dropped before
+/// the next starts, and a dropped decoder gives back what it charged, so that
+/// half shows only that nothing outlives a refused stream. The second half
+/// keeps sixty-four refusing decoders alive while the full frame arrives on
+/// another, so a charge held for as long as the refused stream lives fails it
+/// too. Those decoders are of the kind `FrameReader::new` builds, so they
+/// refuse each frame the way the wire half does.
 ///
 /// One case rather than a property: it writes 64 KiB, which is not something to
 /// repeat twenty thousand times.
@@ -1359,8 +1367,49 @@ fn refusing_frames_never_charges_the_connections_budget() {
 
     assert_eq!(
         drive_with(&[full.to_vec()], &budget),
-        vec![Step::Headers(block), Step::End],
+        vec![Step::Headers(block.clone()), Step::End],
         "the refused frames must not have charged the connection's budget"
+    );
+
+    let refused: Vec<FrameDecoder> = BUFFERED_TYPES
+        .iter()
+        .cycle()
+        .take(64)
+        .map(|kind| {
+            let mut header = BytesMut::new();
+            frame::put_header(&mut header, *kind, VARINT_MAX);
+            let mut decoder = FrameDecoder::new(StreamKind::Control, Arc::clone(&budget));
+            let mut steps = Vec::new();
+            feed(&mut decoder, &[header.to_vec()], &mut steps);
+            assert_eq!(
+                steps,
+                vec![Step::Violation {
+                    code: Code::H3_EXCESSIVE_LOAD.value(),
+                    connection: false,
+                }],
+                "type {kind:#x}"
+            );
+            decoder
+        })
+        .collect();
+
+    let mut decoder = FrameDecoder::new(StreamKind::Control, Arc::clone(&budget));
+    let mut steps = Vec::new();
+    feed(&mut decoder, &[full.to_vec()], &mut steps);
+    let steps = normalise(steps);
+    // Summarised, because the block is 64 KiB.
+    let seen: Vec<String> = steps
+        .iter()
+        .map(|step| match step {
+            Step::Headers(bytes) => format!("Headers({} bytes)", bytes.len()),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        steps == [Step::Headers(block)],
+        "the {} refused decoders still alive must hold no charge on the \
+         connection's budget, and the full frame was answered with {seen:?}",
+        refused.len()
     );
 }
 
