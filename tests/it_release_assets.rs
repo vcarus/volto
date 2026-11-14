@@ -561,11 +561,24 @@ fn locked_package(lockfile: &Path, package: &str) -> String {
         .join("\n")
 }
 
+/// Whether a line of TOML opens a `patch` table or sets a dotted `patch.` key,
+/// in any of the spellings TOML allows: `[patch.crates-io]`,
+/// `[patch.crates-io.<crate>]`, `[ patch."crates-io" ]`, `patch.crates-io.x = …`.
+fn opens_a_patch_table(line: &str) -> bool {
+    let bare: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+        .collect();
+    bare.starts_with("[patch") || bare.starts_with("patch.")
+}
+
 /// quinn-proto is an ordinary registry dependency in both workspaces.
 ///
-/// Asserted: neither `Cargo.toml` nor `fuzz/Cargo.toml` carries a
-/// `[patch.crates-io]` table, and the `quinn-proto` entry in each lockfile names
-/// the crates.io registry as its source and carries a `checksum`. D60 pointed
+/// Asserted: no `patch` table, in any spelling [`opens_a_patch_table`] reads,
+/// in `Cargo.toml`, `fuzz/Cargo.toml` or a cargo configuration file either
+/// workspace reads; no lockfile entry in either workspace comes from git; and
+/// the `quinn-proto` entry in each lockfile names the crates.io registry as its
+/// source and carries a `checksum`. D60 pointed
 /// that crate at a git revision from 2026-08-18 until 0.11.18 shipped every fix
 /// it carried, and `fuzz/` held a second copy of the stanza because a patch does
 /// not cross a workspace boundary.
@@ -582,20 +595,43 @@ fn quinn_proto_is_an_unpatched_registry_dependency() {
 
     let root = repo_root();
 
-    for manifest in ["Cargo.toml", "fuzz/Cargo.toml"] {
-        let path = root.join(manifest);
+    // Cargo reads `[patch]` from a configuration file as well as from a
+    // manifest. The two manifests must exist; a configuration file is read when
+    // it is there.
+    let configs = [".cargo/config.toml", "fuzz/.cargo/config.toml"]
+        .into_iter()
+        .filter(|config| root.join(config).is_file());
+    for file in ["Cargo.toml", "fuzz/Cargo.toml"].into_iter().chain(configs) {
+        let path = root.join(file);
+        let patches: Vec<String> = read_text(&path)
+            .lines()
+            .filter(|line| opens_a_patch_table(line))
+            .map(str::to_owned)
+            .collect();
         assert!(
-            !read_text(&path).contains("[patch.crates-io]"),
-            "{} carries a [patch.crates-io] table. D60 removed the quinn-proto \
-             patch when 0.11.18 shipped its fixes; a patch here puts the crate \
-             back outside Dependabot and outside cargo-audit, and nothing else \
-             in this tree says so.",
+            patches.is_empty(),
+            "{} carries a patch table: {patches:?}. D60 removed the quinn-proto \
+             patch when 0.11.18 shipped its fixes; a patch here puts a crate \
+             outside Dependabot and outside cargo-audit, and nothing else in this \
+             tree says so.",
             path.display()
         );
     }
 
     for lockfile in ["Cargo.lock", "fuzz/Cargo.lock"] {
         let path = root.join(lockfile);
+        let from_git: Vec<String> = read_text(&path)
+            .lines()
+            .filter(|line| line.starts_with("source = \"git+"))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            from_git.is_empty(),
+            "{} takes crates from git, which cargo-audit does not check and \
+             Dependabot does not bump: {from_git:?}",
+            path.display()
+        );
+
         let entry = locked_package(&path, "quinn-proto");
 
         assert!(
@@ -956,5 +992,28 @@ fn every_copy_of_the_msrv_is_the_one_cargo_toml_declares() {
             wrong.is_empty(),
             "Cargo.toml declares rust-version {declared}, and {file} states {wrong:?}"
         );
+    }
+}
+
+#[test]
+fn opens_a_patch_table_reads_every_spelling() {
+    for line in [
+        "[patch.crates-io]",
+        "[patch.crates-io.rustls]",
+        "[ patch.\"crates-io\" ]",
+        "[patch.'https://github.com/example/crate']",
+        "patch.crates-io.rustls = { git = \"https://example.com/rustls\" }",
+    ] {
+        assert!(
+            opens_a_patch_table(line),
+            "a patch table was missed: {line}"
+        );
+    }
+    for line in [
+        "# [patch.crates-io] was removed by D60",
+        "[profile.release]",
+        "dispatch = 1",
+    ] {
+        assert!(!opens_a_patch_table(line), "not a patch table: {line}");
     }
 }
