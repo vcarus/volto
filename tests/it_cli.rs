@@ -340,10 +340,10 @@ fn a_missing_file_is_refused_by_name() {
     let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
 
     assert_eq!(output.status.code(), Some(1));
+    let stderr = stderr_of(&output);
     assert!(
-        stderr_of(&output).contains("failed to read config file"),
-        "{}",
-        stderr_of(&output)
+        stderr.contains(&format!("failed to read config file {}", path.display())),
+        "the refusal must name the file it could not read: {stderr}"
     );
 }
 
