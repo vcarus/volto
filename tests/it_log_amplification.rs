@@ -103,10 +103,14 @@ async fn a_policy_refusal_storm_is_sampled(buffer: &SharedBuffer) {
         !reports.is_empty(),
         "the SSRF-shaped refusal must still reach the journal at INFO"
     );
-    assert!(
-        reports.len() < STORM,
-        "{STORM} refusals bought {} production lines; one per request means a peer \
-         decides how much of this journal is left for anybody else:\n{}",
+    // One report at each power of two up to `STORM`: 1, 2, 4 and so on to 64.
+    let schedule = usize::try_from(STORM.ilog2()).expect("a small count") + 1;
+    assert_eq!(
+        reports.len(),
+        schedule,
+        "{STORM} refusals bought {} production lines, where the doubling schedule \
+         allows {schedule}; one per request means a peer decides how much of this \
+         journal is left for anybody else:\n{}",
         reports.len(),
         reports.join("\n")
     );

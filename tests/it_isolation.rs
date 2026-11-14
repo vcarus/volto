@@ -307,10 +307,16 @@ async fn a_tcp_tunnel_whose_target_stops_reading_does_not_stall_its_neighbours()
     let mut stalled = open_tcp_tunnel(&mut client, &deaf_addr.to_string()).await;
     let mut live = open_tcp_tunnel(&mut client, &echo.to_string()).await;
 
+    // The precondition is that the tunnel parked. `push_until_parked` stops
+    // at its ceiling without parking when nothing applies back-pressure.
     let pushed = push_until_parked(&mut stalled).await;
     assert!(
         pushed > 0,
         "the stalled tunnel took nothing at all, so nothing was proved about it"
+    );
+    assert!(
+        pushed < PUSH_CEILING,
+        "the stalled tunnel took {pushed} bytes without parking, so nothing was stalled"
     );
 
     // The neighbour, on the same connection, through the same server.
@@ -486,19 +492,20 @@ async fn pushing_target() -> (tokio::task::JoinHandle<()>, SocketAddr, Arc<Atomi
     (handle, address, offered)
 }
 
+/// Where [`push_until_parked`] gives up: comfortably past a stream window plus
+/// any loopback socket buffer.
+const PUSH_CEILING: usize = 8 * 1024 * 1024;
+
 /// Writes into `tunnel` until the write parks, reporting how much it took.
 ///
 /// The park is the state every test using this wants: the server's pump has
 /// stopped reading the request stream, so the bytes still on it are held against
 /// the connection's aggregate credit.
 async fn push_until_parked(tunnel: &mut ClientStream) -> usize {
-    /// Comfortably past a stream window plus any loopback socket buffer.
-    const CEILING: usize = 8 * 1024 * 1024;
-
     let block = Bytes::from(vec![0x7eu8; 64 * 1024]);
     let mut pushed = 0usize;
 
-    while pushed < CEILING {
+    while pushed < PUSH_CEILING {
         match tokio::time::timeout(PARK, tunnel.send_data(block.clone())).await {
             Ok(Ok(())) => pushed += block.len(),
             // Parked: what the caller is after.
