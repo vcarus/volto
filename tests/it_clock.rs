@@ -49,7 +49,23 @@ use scripts::{code_lines, read_text, rust_files, source_root};
 /// `SystemTime` and `UNIX_EPOCH` are `std`'s; `chrono` and `OffsetDateTime` are
 /// the two crates that would arrive with a date type of their own, named here
 /// so that adding one is a decision rather than an import.
-const WALL_CLOCK: [&str; 4] = ["SystemTime", "UNIX_EPOCH", "chrono", "OffsetDateTime"];
+///
+/// The rest read the wall clock without naming its type. A file's modification,
+/// access and creation times are `SystemTime` values, so comparing them, or
+/// asking one for its `elapsed()`, is a wall-clock decision. `clock_gettime`
+/// and `Realtime` are the system call and the clock id that `rustix`, already a
+/// dependency, would reach it through.
+const WALL_CLOCK: [&str; 9] = [
+    "SystemTime",
+    "UNIX_EPOCH",
+    "chrono",
+    "OffsetDateTime",
+    ".modified(",
+    ".accessed(",
+    ".created(",
+    "clock_gettime",
+    "Realtime",
+];
 
 #[test]
 fn no_source_file_reads_the_wall_clock() {
@@ -133,6 +149,11 @@ fn the_scanner_tells_code_from_the_comment_about_it() {
     assert!(!banned("/// See `SystemTime` for why this is not one."));
     assert!(!banned(
         "let deadline = tokio::time::Instant::now() + budget;"
+    ));
+
+    // A wall-clock reading that never names the type.
+    assert!(banned(
+        "let age = std::fs::metadata(&cert)?.modified()?.elapsed();"
     ));
 
     // A `//` inside a string is text, so what follows it on the line is still
