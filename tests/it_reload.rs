@@ -199,8 +199,33 @@ async fn reloading_replaces_the_connection_cap() {
         "the raised cap must apply to connections accepted after the reload"
     );
 
-    // Lowered again, below what is already open: the connections that exist are
-    // left alone, and the next one is refused.
+    // With `first` and `second` open and both authenticated, a newcomer is
+    // refused at a cap of 2 as much as at a cap of 1, so lowering the cap now
+    // would show nothing. `second` goes, and a newcomer admitted at a cap of 2
+    // proves that one live connection leaves room. Retried because the server
+    // gives the slot back a moment after the peer goes away. The newcomer is
+    // dropped at once and never authenticates, so whether or not its slot is
+    // back yet, the next arrival may evict it.
+    second
+        .quic
+        .close(quinn::VarInt::from_u32(0), b"leaving the cap test");
+    drop(second);
+    let mut admitted = false;
+    for _ in 0..40 {
+        if connect_attempt(&server).await {
+            admitted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        admitted,
+        "with one connection open, a cap of 2 must admit a newcomer"
+    );
+
+    // Lowered to what is already open: the connection that exists is left
+    // alone, and the next one is refused. Under a cap of 2 it would be
+    // admitted.
     server.rewrite_config(&format!("[limits]\nmax_connections = 1\n{ALLOW_PRIVATE}"));
     server.reload().expect("a valid configuration must apply");
 
