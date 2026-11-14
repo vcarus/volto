@@ -124,6 +124,24 @@ async fn concurrent_sessions_do_not_cross_talk() {
             "session {qsid} received another session's data"
         );
     }
+
+    // The twenty replies above must be the only ones. A routing mistake that
+    // copies a datagram into a second session, rather than moving it there,
+    // leaves the copy put aside in `pending` or still in flight once that
+    // session's own reply has been read.
+    let strays: Vec<_> = pending
+        .iter()
+        .filter(|(_, queued)| !queued.is_empty())
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "datagrams arrived beyond each session's one reply: {strays:?}"
+    );
+    let late = tokio::time::timeout(Duration::from_millis(300), client.quic.read_datagram()).await;
+    assert!(
+        late.is_err(),
+        "a datagram arrived after every session had its one reply: {late:?}"
+    );
 }
 
 /// A session must survive a datagram carrying an unknown context id.
