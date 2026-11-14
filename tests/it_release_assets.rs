@@ -214,17 +214,21 @@ fn the_documentation_the_scripts_point_at_is_packaged() {
     // The other half of that same sentence, which nothing checked: the copy is
     // only worth having while the scripts still point at those pages. Renaming
     // the directory in both scripts would leave the assertion above green.
-    // Each page is asserted where the pointer actually is -- `deploy.sh` names
-    // the configuration page when it refuses a config from the future,
+    // Each page is asserted in the script that prints it. `deploy.sh` names the
+    // configuration page when it refuses a config from the future, and
     // `install-selfsigned.sh` names the deployment page when it refuses the
-    // host it was run on -- so a check cannot pass on a mention somewhere else.
+    // host it was run on. Comment lines are skipped, because both scripts also
+    // name pages in their header comments, which no operator sees.
     for (script, page) in [
         ("script/deploy.sh", "docs/configuration.md"),
         ("script/install-selfsigned.sh", "docs/deployment.md"),
     ] {
         let path = repo_root().join(script);
         assert!(
-            read_text(&path).contains(page),
+            read_text(&path)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .any(|line| line.contains(page)),
             "{script} no longer sends the operator to {page}, which is half the \
              reason {} has to package `docs`",
             workflow.display()
