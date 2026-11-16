@@ -45,11 +45,14 @@
 //!   turning the [`gate`] on without knowing the name is a server nobody can
 //!   reach.
 
-// No `unsafe` in the server: the two raw syscalls it needs (`getrlimit` for
-// the startup fd check and `IP_MTU_DISCOVER` for the DF bit) go through
-// rustix's safe wrappers, so the property is pinned here. `forbid` rather than
-// `deny` so it cannot be opted out of module by module: a future need for
-// `unsafe` should be an argued change to this line, not a local `allow`.
+// No `unsafe` in the server: the raw socket and resource calls it needs go
+// through the safe wrappers of rustix and socket2. rustix carries `getrlimit`
+// for the startup fd check and `IP_MTU_DISCOVER` for the DF bit, and socket2
+// carries `SO_RCVBUF` and `SO_SNDBUF` on the endpoint socket and the vectored
+// read of a target socket in `tunnel::udp`. So the property is pinned here.
+// `forbid` rather than `deny` so it cannot be opted out of module by module: a
+// future need for `unsafe` should be an argued change to this line, not a local
+// `allow`.
 #![forbid(unsafe_code)]
 // Every public item carries a doc comment, and this lint enforces it.
 // `cargo doc` is published for this crate, so a `pub` item without a doc comment
