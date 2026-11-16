@@ -381,6 +381,41 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
     still_serving(&connection).await;
 }
 
+/// A request stream the client resets before its HEADERS is answered with an
+/// abort, not with a clean end.
+///
+/// RFC 9114 §4.1: "If a client-initiated stream terminates without enough of
+/// the HTTP message to provide a complete response, the server SHOULD abort its
+/// response stream with the error code H3_REQUEST_INCOMPLETE." A reset is such
+/// a termination as much as a FIN is, and the FIN case already takes the
+/// SHOULD.
+#[tokio::test]
+async fn a_request_reset_before_its_headers_draws_an_abort() {
+    let server = TestServer::start_with(IMPATIENT).await;
+    let (_endpoint, connection) = silent_peer(&server).await;
+
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&[0x01])
+        .await
+        .expect("send one byte of a request");
+    send.reset(quinn::VarInt::from_u32(0x10c))
+        .expect("reset the request stream");
+
+    let ended = tokio::time::timeout(TIMEOUT, recv.read_to_end(64))
+        .await
+        .expect("the server must answer a reset request stream");
+    match ended {
+        Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => assert_eq!(
+            code.into_inner(),
+            H3_REQUEST_INCOMPLETE,
+            "the peer must be told its request never arrived"
+        ),
+        other => panic!("expected the response stream to be reset, got {other:?}"),
+    }
+
+    still_serving(&connection).await;
+}
+
 /// A batch of stalled requests is reset stream by stream, on a connection
 /// nothing else bounds.
 ///

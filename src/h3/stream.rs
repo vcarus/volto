@@ -186,10 +186,14 @@ impl Resolver {
 /// while a [`Reader`] is only half a stream and the tunnels decide the other
 /// half differently for a client abort than for a target failure.
 ///
-/// The parameter governs the two protocol arms only. A `frame::Error::Stream`
-/// is the transport already having decided, so it is returned as it stands and
-/// the sending half is left to its drop: `quinn::SendStream::drop` finishes it
-/// cleanly, or resets it if the peer has also sent STOP_SENDING.
+/// A `frame::Error::Stream` is the transport already having decided: the peer
+/// reset the request stream, or the connection is gone. It is returned as it
+/// stands, and the receiving side needs no stop. A sending side passed in is
+/// reset with H3_REQUEST_INCOMPLETE, because a request that ended this way
+/// never arrived whole, and RFC 9114 §4.1 asks for that abort (quoted in
+/// `read_request`). Left to its drop, `quinn::SendStream::drop` would finish
+/// it cleanly, and the peer would read an empty response that ended normally.
+/// On a lost connection the reset fails, which needs no reporting.
 fn answer(
     handle: &Handle,
     frames: &mut FrameReader,
@@ -197,7 +201,12 @@ fn answer(
     error: frame::Error,
 ) -> StreamError {
     match error {
-        frame::Error::Stream(error) => error,
+        frame::Error::Stream(error) => {
+            if let Some(send) = send {
+                let _ = send.reset(varint(Code::H3_REQUEST_INCOMPLETE));
+            }
+            error
+        }
         frame::Error::Protocol(violation) if violation.is_connection_error() => {
             StreamError::Connection(handle.fail(violation))
         }
