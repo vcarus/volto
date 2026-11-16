@@ -598,6 +598,11 @@ parameters. Established connections keep the
 configuration they were accepted with — a tunnel's rules must not change
 mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
 
+A SIGHUP that arrives while volto is still starting is taken as a reload once
+the listener is bound. Only in the first milliseconds of the process, before the
+handler exists, does the signal end it; the shipped unit sets
+`RestartForceExitStatus=SIGHUP`, so systemd starts it again.
+
 That matters when the change is meant to revoke access: a client that still holds
 an established connection keeps working on the old credentials, and keep-alives
 routinely hold one open across long idle periods. Use `systemctl restart volto`

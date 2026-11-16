@@ -53,6 +53,12 @@ TimeoutStopSec=45
 
 Restart=on-failure
 RestartSec=5s
+# volto creates its SIGHUP handler before it binds the listener, but in the first
+# milliseconds of the process a SIGHUP still has its default action, which ends
+# it. A reload sent then, such as a renewal hook running during a restart, would
+# otherwise leave the service down: Restart=on-failure counts a death by SIGHUP
+# as a clean exit.
+RestartForceExitStatus=SIGHUP
 
 # --- File descriptors -------------------------------------------------------
 # Every tunnel costs one descriptor, and one client multiplexes many onto a single

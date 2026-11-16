@@ -402,6 +402,14 @@ fn uname() -> String {
 /// can move that key, and `Server::drain` reads the same live value, which is
 /// the invariant [`volto::shutdown::blocking_grace`] states.
 async fn run(cli: Cli, config: Config) -> Result<Duration> {
+    // First, and synchronously: a signal stream records a signal from the
+    // moment it is created, and until then `SIGHUP` and `SIGTERM` keep their
+    // default action, which ends the process. A stream created inside a spawned
+    // task would exist only from that task's first poll, after `Server::bind`
+    // has read and parsed the certificate.
+    #[cfg(unix)]
+    let signals = Signals::create();
+
     init_tracing(&config.log.level)?;
 
     // Only now that a subscriber exists: settings that are legal but risky
@@ -413,11 +421,23 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 
     let server = Server::bind(Arc::new(config))?;
 
-    // Both installed before the accept loop starts, so a signal arriving during
-    // startup is not missed.
-    tokio::spawn(watch_for_signals(server.shutdown_trigger()));
+    // The streams were created at the top, so a signal that arrived since then
+    // is waiting in them, and a `SIGTERM` that arrived during startup fires the
+    // trigger before the accept loop takes its first connection.
     #[cfg(unix)]
-    tokio::spawn(watch_for_reload(server.reload_handle(), cli.config.clone()));
+    {
+        tokio::spawn(watch_for_signals(
+            signals.terminate,
+            server.shutdown_trigger(),
+        ));
+        tokio::spawn(watch_for_reload(
+            signals.hangup,
+            server.reload_handle(),
+            cli.config.clone(),
+        ));
+    }
+    #[cfg(not(unix))]
+    tokio::spawn(watch_for_signals(server.shutdown_trigger()));
 
     server.run().await;
 
@@ -427,6 +447,32 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 
     info!(log_id = "fle471bm", "volto stopped");
     Ok(grace)
+}
+
+/// The signal streams [`run`] creates before it does anything else.
+///
+/// Each one is the result of creating it, because the reason a stream could not
+/// be created is logged by the task that would have used it, and no subscriber
+/// exists yet when they are created.
+#[cfg(unix)]
+struct Signals {
+    /// `SIGTERM`, for [`watch_for_signals`].
+    terminate: std::io::Result<tokio::signal::unix::Signal>,
+    /// `SIGHUP`, for [`watch_for_reload`].
+    hangup: std::io::Result<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl Signals {
+    /// Creates both streams. Must run inside the runtime.
+    fn create() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Self {
+            terminate: signal(SignalKind::terminate()),
+            hangup: signal(SignalKind::hangup()),
+        }
+    }
 }
 
 /// Reloads the configuration on every `SIGHUP`, for as long as the process runs.
@@ -450,10 +496,12 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 /// parse; `spawn_blocking` uses the pool `main` already sizes for this kind of
 /// work.
 #[cfg(unix)]
-async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut hangup = match signal(SignalKind::hangup()) {
+async fn watch_for_reload(
+    hangup: std::io::Result<tokio::signal::unix::Signal>,
+    handle: volto::quic::ReloadHandle,
+    path: PathBuf,
+) {
+    let mut hangup = match hangup {
         Ok(stream) => stream,
         Err(error) => {
             warn!(
@@ -510,12 +558,13 @@ async fn watch_for_reload(handle: volto::quic::ReloadHandle, path: PathBuf) {
 ///
 /// A second signal is not special-cased into an immediate exit: the grace period
 /// already bounds the wait, and an operator in a hurry has SIGKILL.
-async fn watch_for_signals(trigger: Trigger) {
+async fn watch_for_signals(
+    #[cfg(unix)] terminate: std::io::Result<tokio::signal::unix::Signal>,
+    trigger: Trigger,
+) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{SignalKind, signal};
-
-        let mut terminate = match signal(SignalKind::terminate()) {
+        let mut terminate = match terminate {
             Ok(stream) => stream,
             Err(error) => {
                 // Without this the process can still be stopped, just not

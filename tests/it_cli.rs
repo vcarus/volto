@@ -406,6 +406,108 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
     }
 }
 
+/// A `SIGHUP` that arrives while the server is still starting is a reload, not
+/// the end of the process.
+///
+/// `systemctl reload` sends the signal as soon as the unit is active, which for
+/// `Type=simple` is as soon as the process exists. Until a handler is installed
+/// the signal's default action ends the process, and systemd does not restart a
+/// service that died by `SIGHUP` unless the unit says so. The first stdout line
+/// is the startup warning about authentication, written before `Server::bind`.
+/// The handler has to exist by then, so the signal sent at that line must come
+/// back as a reload, and the process must still stop cleanly on `SIGTERM`.
+#[test]
+fn a_sighup_during_startup_is_taken_as_a_reload() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    let dir = scratch_tree("cli", "early-sighup", &[]);
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("a self-signed certificate must be generated");
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    fs::write(&cert, issued.cert.pem()).expect("the cert must be writable");
+    fs::write(&key, issued.signing_key.serialize_pem()).expect("the key must be writable");
+    // No `[auth]`, so the startup warning about it is the first line written.
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
+            cert.display(),
+            key.display(),
+        ),
+    )
+    .expect("the config must be writable");
+
+    let mut child = Command::new(real_binary())
+        .args(["--config", path.to_str().unwrap()])
+        .env_remove("JOURNAL_STREAM")
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the volto binary must be runnable");
+    let pid = Pid::from_child(&child);
+
+    let (lines, received) = mpsc::channel();
+    let stdout = child.stdout.take().expect("stdout is piped");
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut seen = Vec::new();
+    let mut wait_for = |needle: &str, child: &mut std::process::Child| loop {
+        if let Some(status) = child.try_wait().expect("the child must be waitable") {
+            panic!(
+                "volto exited with {status} while waiting for {needle:?}; stdout so far:\n{}",
+                seen.join("\n")
+            );
+        }
+        match received.recv_timeout(Duration::from_millis(20)) {
+            Ok(line) => {
+                let found = line.contains(needle);
+                seen.push(line);
+                if found {
+                    return;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {needle:?} within 20 s; stdout so far:\n{}",
+            seen.join("\n")
+        );
+    };
+
+    wait_for("authentication is DISABLED", &mut child);
+    kill_process(pid, Signal::HUP).expect("SIGHUP must be deliverable");
+    wait_for("received SIGHUP", &mut child);
+
+    kill_process(pid, Signal::TERM).expect("SIGTERM must be deliverable");
+    let output = child
+        .wait_with_output()
+        .expect("the child's output must be readable");
+    assert!(
+        output.status.success(),
+        "volto must stop cleanly on SIGTERM after the reload: {} {}",
+        output.status,
+        stderr_of(&output)
+    );
+}
+
 /// A legal configuration that deserves a word still passes.
 ///
 /// The warnings are the ones `Config::warnings` already produces at startup;
