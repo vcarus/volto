@@ -1148,10 +1148,10 @@ impl Reader {
     /// stopped taking bytes, the pump waits in a write instead, and nothing
     /// there watches the request stream. Such a write can select on this.
     ///
-    /// It reports *only* a reset, and never resolves for any other ending. A
-    /// clean FIN and a stream this endpoint stopped both belong to the reading
-    /// half, which is where a caller meets them; ending the wait here would
-    /// turn one of them into an abort.
+    /// It reports a reset and a lost connection, and never resolves for any
+    /// other ending. A clean FIN and a stream this endpoint stopped both belong
+    /// to the reading half, which is where a caller meets them; ending the wait
+    /// here would turn one of them into an abort.
     ///
     /// # Why not `quinn::RecvStream::received_reset`
     ///
@@ -1207,18 +1207,37 @@ impl Reader {
     /// with the rest of the stream. That matches quinn, which discards a reset
     /// stream's unread bytes.
     ///
+    /// # A lost connection
+    ///
+    /// The end of the connection is reported too, as
+    /// [`StreamError::Connection`], whatever state the stream is in. The
+    /// zero-length read cannot be relied on for it: quinn reports the
+    /// connection's error only to a read that finds nothing, so while bytes are
+    /// waiting it keeps answering that they are, after the connection is gone.
+    /// So every wait here also watches the connection's close. Without that, a
+    /// tunnel whose write to its target is stalled outlives its connection
+    /// until the tunnel's own stall bound, holding its target socket.
+    ///
     /// Cancel-safe, so a `select!` may poll it and drop it repeatedly.
     pub async fn reset_by_peer(&mut self) -> StreamError {
+        // Built once per call, so the connection's lock is taken for it once
+        // and not on every pass of the timer below.
+        let closed = self.handle.quic.closed();
+        tokio::pin!(closed);
+
         loop {
             match self.frames.readable().await {
                 // Bytes are waiting in quinn, so a read cannot wait on this
                 // stream and nothing will wake it. Look again shortly.
-                Ok(true) => tokio::time::sleep(Self::RESET_PEEK_INTERVAL).await,
+                Ok(true) => tokio::select! {
+                    () = tokio::time::sleep(Self::RESET_PEEK_INTERVAL) => {}
+                    error = &mut closed => return StreamError::Connection(error.into()),
+                },
 
                 // The peer finished and quinn has handed over everything it
                 // sent; the read-ahead may still hold the last of it. That is
                 // not a reset and can no longer become one.
-                Ok(false) => std::future::pending().await,
+                Ok(false) => return StreamError::Connection(closed.await.into()),
 
                 Err(quinn::ReadError::Reset(code)) => {
                     return StreamError::RemoteTerminate {
@@ -1234,8 +1253,8 @@ impl Reader {
 
                 // A stream this endpoint has already stopped or finished with,
                 // and the ordered/unordered mix-up that cannot happen here:
-                // nothing a tunnel acts on.
-                Err(_) => std::future::pending().await,
+                // nothing a tunnel acts on, short of the connection's end.
+                Err(_) => return StreamError::Connection(closed.await.into()),
             }
         }
     }
@@ -1855,5 +1874,39 @@ mod tests {
             .expect("the reset must complete the parked read without a timer");
         assert_matches!(error, StreamError::RemoteTerminate { code } if code.value() == 0x10c,
             "expected the peer's reset, got {error}");
+    }
+
+    /// The watcher reports a lost connection while quinn still holds bytes of
+    /// the stream that no read has taken.
+    ///
+    /// That is the state of a tunnel whose write to its target is stalled, and
+    /// there the zero-length read keeps answering that bytes are waiting after
+    /// the connection is gone, because quinn looks at the connection's error
+    /// only when a read finds nothing. A watcher that only asked again on its
+    /// timer never ended, and held the tunnel and its target socket until the
+    /// tunnel's own stall bound.
+    #[tokio::test]
+    async fn the_watcher_reports_a_lost_connection_while_quinn_holds_bytes() {
+        let (wire, _) = loopback::numbered_frames(10, 1000);
+        let mut upload = loopback::Upload::start(&wire).await;
+        let mut reader = tunnel_reader(&mut upload);
+
+        let watcher = reader.reset_by_peer();
+        tokio::pin!(watcher);
+        assert!(
+            poll_once(watcher.as_mut()).is_none(),
+            "nothing has ended yet"
+        );
+
+        upload.server.close(quinn::VarInt::from_u32(0), b"gone");
+
+        let error = tokio::time::timeout(loopback::TIMEOUT, watcher)
+            .await
+            .expect("the watcher must report the lost connection");
+        assert_matches!(
+            error,
+            StreamError::Connection(_),
+            "expected the lost connection, got {error}"
+        );
     }
 }
