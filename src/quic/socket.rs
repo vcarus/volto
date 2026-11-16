@@ -270,7 +270,16 @@ fn socket_buffer_was_capped_with(
 }
 
 /// Descriptors assumed to be needed beyond the tunnel quota: the endpoint
-/// socket, the request streams, stdio, and the certificate reads a reload does.
+/// socket, stdio, and the certificate reads a reload does. A QUIC stream holds
+/// no descriptor of its own.
+///
+/// Not counted here: the resolver sockets of name lookups whose request has
+/// given up. Such a lookup releases its tunnel slot when `connect_timeout`
+/// expires, while its blocking thread keeps a socket to the nameserver open
+/// until `getaddrinfo` returns. The lookup budget bounds those threads at
+/// `net::reserved_lookups(max_connections) + net::SHARED_LOOKUPS`, 384 at the
+/// defaults (D90), so the process can need that many descriptors more than
+/// this check counts.
 pub const FD_HEADROOM: u64 = 64;
 
 #[cfg(test)]
