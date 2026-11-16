@@ -135,6 +135,18 @@ pub async fn handle(
     // stream that claimed them (D79).
     let for_context = quic.clone();
 
+    // Every request task of this connection. Dropping the set aborts what is
+    // still running, so a request cannot outlive the connection it arrived on;
+    // see "# Request tasks" above.
+    //
+    // Declared before the connection on purpose. Locals are dropped in reverse
+    // order, so on every way out the connection is closed first and the tasks
+    // are ended after it. Ended first, a task would drop its half of a request
+    // stream while the connection was still open, and quinn finishes a dropped
+    // send stream: the client could read a DATA frame cut short and then a
+    // clean end, which RFC 9114 §7.1 makes a connection error on its side.
+    let mut requests = JoinSet::new();
+
     // One idle timeout for the whole HTTP/3 handshake, the same value
     // `quic/transport.rs` puts in this connection's transport parameters. Why a
     // handshake needs a deadline of its own is on
@@ -163,11 +175,6 @@ pub async fn handle(
     // Armed here and never again: the clock the peer is racing runs from the
     // moment it could first have sent a request.
     let deadline = tokio::time::Instant::now() + silence;
-
-    // Every request task of this connection. Dropping the set aborts what is
-    // still running, so a request cannot outlive the connection it arrived on;
-    // see "# Request tasks" above.
-    let mut requests = JoinSet::new();
 
     loop {
         // Reaped at the top of every pass, the way `quic::Server::run` reaps
