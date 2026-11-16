@@ -463,7 +463,11 @@ Environment=RUST_LOG=volto=debug,quinn=info
 ```
 
 A `RUST_LOG` value that does not parse is reported at startup, and `log.level`
-is used instead.
+is used instead. So are two kinds of value that the filter accepts. An empty
+value enables no line at all. A single word that is not a level is read as a
+target name, so a typo such as `warning` enables no line either; a real target
+name alone, such as `volto`, is refused by the same rule. Write a directive such
+as `volto=trace` to raise one target.
 
 Log lines carry a syslog priority when systemd is reading them, so journald's own
 severity filter works rather than needing a text search:

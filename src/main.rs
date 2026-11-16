@@ -526,10 +526,11 @@ const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
 /// Installs the tracing subscriber.
 ///
 /// `RUST_LOG` wins over `log.level` so verbosity can be raised without touching
-/// the config file. A `RUST_LOG` value that does not parse is not silently
-/// treated as absent: the subscriber is installed on `log.level` and the parse
-/// error is reported immediately after, so the operator can see that the
-/// variable did not do what they meant.
+/// the config file. A `RUST_LOG` value that does not parse, or that parses and
+/// is refused by [`refusal`], is not silently treated as absent:
+/// the subscriber is installed on `log.level` and the reason is reported
+/// immediately after, so the operator can see that the variable did not do what
+/// they meant.
 ///
 /// Under systemd each line additionally carries a syslog priority prefix; see
 /// [`JournalPriority`]. In a terminal the output is unchanged.
@@ -594,8 +595,9 @@ enum FilterSource {
     Config,
     /// `RUST_LOG` is set and parses: it applies, overriding `log.level`.
     RustLog,
-    /// `RUST_LOG` is set and does not parse: `log.level` applies, and this is
-    /// the parse error to report once the subscriber exists.
+    /// `RUST_LOG` is set and does not parse, or [`refusal`] refuses it:
+    /// `log.level` applies, and this is the reason to report once the
+    /// subscriber exists.
     InvalidRustLog(String),
 }
 
@@ -609,13 +611,43 @@ fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
     match rust_log {
         None => FilterSource::Config,
         Some(raw) => match raw.to_str() {
-            Some(text) => match tracing_subscriber::EnvFilter::try_new(text) {
-                Ok(_) => FilterSource::RustLog,
-                Err(error) => FilterSource::InvalidRustLog(error.to_string()),
+            Some(text) => match refusal(text) {
+                Some(reason) => FilterSource::InvalidRustLog(reason),
+                None => match tracing_subscriber::EnvFilter::try_new(text) {
+                    Ok(_) => FilterSource::RustLog,
+                    Err(error) => FilterSource::InvalidRustLog(error.to_string()),
+                },
             },
             None => FilterSource::InvalidRustLog("RUST_LOG is not valid UTF-8".to_owned()),
         },
     }
+}
+
+/// Why a `RUST_LOG` value that `EnvFilter` accepts is refused, if it is.
+///
+/// Two kinds of value are refused. An empty value is an empty directive set,
+/// whose maximum level is `OFF`, so it enables no log line. A single bare word
+/// that is not a level is read as a target name at `TRACE`, so a typo such as
+/// `warning` enables only a target that no event has. The filter cannot tell
+/// such a typo from a real target name, so a real one such as `volto` is
+/// refused as well, and `volto=trace` says the same thing without doubt.
+/// `log.level` has the same rule (`config::validate`). Everything else is left
+/// to the parser: a directive with `=`, `[` or `,` names its targets on
+/// purpose, which is what `RUST_LOG` is for, and `off` is a level that silences
+/// the process on purpose.
+fn refusal(text: &str) -> Option<String> {
+    let word = text.trim();
+    if word.is_empty() {
+        return Some("RUST_LOG is empty, which enables no log line".to_owned());
+    }
+    if word.contains([',', '=', '[']) || word.parse::<tracing::level_filters::LevelFilter>().is_ok()
+    {
+        return None;
+    }
+    Some(format!(
+        "{word:?} is not a level, so the filter would read it as a target name; \
+         name a level, or write a directive such as \"{word}=debug\""
+    ))
 }
 
 /// Whether this process's log output is being read by journald.
@@ -782,6 +814,40 @@ mod tests {
                 );
             }
             other => panic!("a set but unparseable RUST_LOG must be invalid: {other:?}"),
+        }
+
+        // `EnvFilter` accepts all of these. An empty value is an empty
+        // directive set and enables nothing. A bare word that is not a level is
+        // read as a target name, so `warning` means "the target named warning,
+        // at trace" and enables nothing either. `volto` is a real target, and
+        // is refused because the filter cannot tell it from such a typo.
+        for value in ["", "  ", "warning", "volto"] {
+            match filter_source(Some(OsStr::new(value))) {
+                FilterSource::InvalidRustLog(error) => assert!(
+                    !error.trim().is_empty(),
+                    "the reason has to be kept for the warning: {value:?}"
+                ),
+                other => panic!("RUST_LOG={value:?} must be reported and ignored: {other:?}"),
+            }
+        }
+
+        // A bare level is still a level, in any case and in tracing's numeric
+        // form, and so is `off`, which silences the process on purpose. A
+        // target directive is still accepted, which is the reason RUST_LOG is
+        // more than `log.level`.
+        for value in [
+            "warn",
+            "INFO",
+            "off",
+            "3",
+            "volto=debug",
+            "volto=trace,quinn=warn",
+        ] {
+            assert_eq!(
+                filter_source(Some(OsStr::new(value))),
+                FilterSource::RustLog,
+                "RUST_LOG={value:?} must still apply"
+            );
         }
 
         // Non-UTF-8 is set but unreadable, not unset: the filter parser needs a

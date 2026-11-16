@@ -223,7 +223,8 @@ const ACCOUNTED: &[Accounted] = &[
                   log.level is in force instead. Fix or unset RUST_LOG and restart.",
         bound: Bound::Lifecycle,
         reason: "Once at startup, before any peer exists, and only when the \
-                 operator's own environment sets a value that does not parse.",
+                 operator's own environment sets a value that does not parse \
+                 or that would enable no log line.",
     },
     Accounted {
         id: "kuce6ga8",
