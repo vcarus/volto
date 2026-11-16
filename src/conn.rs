@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::auth;
@@ -61,6 +62,26 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 ///
 /// Sending the GOAWAY is bounded, because it is a write and the peer decides
 /// when a write completes; see `announce_goaway`.
+///
+/// # Request tasks
+///
+/// Each request runs in a task of its own, held in a `JoinSet` that this
+/// function owns. When this returns, or when its future is dropped by an
+/// eviction or by the end of the shutdown grace, the set is dropped and every
+/// request task still running is aborted. That drops its target socket, which
+/// is the close RFC 9114 §4.4 asks for: "if a proxy detects an error with the
+/// stream or the QUIC connection, it MUST close the TCP connection." A request
+/// that is still resolving its target or connecting to it watches neither the
+/// stream nor the connection, so without this it would hold its socket, its
+/// tunnel slot and the connection's [`Context`] until the connect budget ran
+/// out. None of those would then count against `max_connections`, because the
+/// connection's slot is released when this returns.
+///
+/// Nothing needs a request task to outlive this function. Every return drops
+/// the HTTP/3 connection, which closes the QUIC connection. The drain returns
+/// `Ok` only once no request is pending, or once the GOAWAY write has failed on
+/// a connection that is gone. A lookup already on the blocking pool is not
+/// cut short by the abort: its slot travels with the thread (D90).
 ///
 /// # The unauthenticated bound
 ///
@@ -143,7 +164,18 @@ pub async fn handle(
     // moment it could first have sent a request.
     let deadline = tokio::time::Instant::now() + silence;
 
+    // Every request task of this connection. Dropping the set aborts what is
+    // still running, so a request cannot outlive the connection it arrived on;
+    // see "# Request tasks" above.
+    let mut requests = JoinSet::new();
+
     loop {
+        // Reaped at the top of every pass, the way `quic::Server::run` reaps
+        // connections, so the set holds the live requests rather than every
+        // request the connection has served. A task's output is `()`, and a
+        // panic has already been reported by the panic hook.
+        while requests.try_join_next().is_some() {}
+
         tokio::select! {
             biased;
 
@@ -179,7 +211,7 @@ pub async fn handle(
                     // nothing left to do (see [`crate::tunnel::Pending`]).
                     let pending = context.quota.enter();
                     let context = Arc::clone(&context);
-                    tokio::spawn(async move {
+                    requests.spawn(async move {
                         let _pending = pending;
                         handle_request(resolver, context).await;
                     });
@@ -203,6 +235,10 @@ pub async fn handle(
                 }
             },
 
+            // Cancel-safe, so losing this race costs nothing; the reaping at
+            // the top of the loop is what keeps the set trimmed while requests
+            // keep arriving.
+            Some(_) = requests.join_next(), if !requests.is_empty() => {}
         }
     }
 }

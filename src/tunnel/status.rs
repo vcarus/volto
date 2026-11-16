@@ -259,7 +259,9 @@ impl ProxyError {
 /// * `EMFILE` / `ENFILE`: no descriptor, per process or system-wide. This is
 ///   the one an operator meets: `max_connections` x `max_targets_per_conn`
 ///   sockets is what `crate::quic`'s startup check sizes `RLIMIT_NOFILE`
-///   against, and a host that is over it fails every `socket()` at once.
+///   against, and a host that is over it fails every `socket()` at once. The
+///   product counts only tunnels of live connections, which is all there are:
+///   `conn::handle` aborts a connection's request tasks when it returns.
 /// * `ENOBUFS` / `ENOMEM`: no kernel buffer or memory for another socket.
 /// * `EADDRNOTAVAIL`: no source address left to bind, which on a connect to a
 ///   remote address is the ephemeral port range exhausted. A target address

@@ -72,6 +72,9 @@
 //! half-closed tunnel with no traffic at all on it is deliberately left to run.
 //! What limits that is capacity rather than time: `max_connections` x
 //! `max_targets_per_conn` sockets, the product the fd budget is sized from.
+//! The product holds because a tunnel cannot outlive its connection: the
+//! connection's task owns every request task and aborts what is left when it
+//! returns (`conn::handle`), which drops the target socket.
 //!
 //! Such a tunnel is still watched (D87): it ends the moment the client says it
 //! wants no more of it, however quiet the target stays. Only a client that is

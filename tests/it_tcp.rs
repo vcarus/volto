@@ -1721,6 +1721,77 @@ async fn a_black_holed_target_is_refused_when_the_connect_budget_expires() {
     echoes(&mut good, b"after the timeout").await;
 }
 
+/// A request task belongs to its connection: when the connection ends, a
+/// request that is still connecting to its target ends with it.
+///
+/// RFC 9114 §4.4 has the proxy close the TCP connection when it "detects an
+/// error with the stream or the QUIC connection". A request that is still
+/// connecting has no tunnel yet, so nothing in it watches the connection, and
+/// only the connection's own task can end it. A detached request task outlived
+/// its connection by the whole connect budget. It held the half-open socket, the
+/// tunnel slot and the connection's state, and no per-connection bound counted
+/// any of them. The budget here is far longer than the test, so only the end of
+/// the connection can end the request.
+///
+/// The proxy runs on a runtime of its own, so that its live tasks are counted
+/// apart from the client's and the target's.
+#[tokio::test]
+async fn a_request_still_connecting_ends_with_its_connection() {
+    let Some((blackhole, _holding, _listener)) = arm_a_blackholed_address().await else {
+        eprintln!(
+            "skipping: this kernel does not drop SYNs for a full accept queue, so no \
+             black-holed address can be arranged"
+        );
+        return;
+    };
+
+    let proxy = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("build the proxy runtime");
+    let server = TestServer::start_on(
+        proxy.handle(),
+        &format!("[limits]\nconnect_timeout = 60\n{ALLOW_PRIVATE}"),
+    );
+    let idle = proxy.metrics().num_alive_tasks();
+
+    let mut client = H3Client::connect(&server).await;
+    let _request = client
+        .send
+        .send_request(connect_request(&blackhole.to_string()))
+        .await
+        .expect("send the request");
+
+    // An IP literal needs no resolution, so the connect starts as soon as the
+    // request arrives.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        proxy.metrics().num_alive_tasks() > idle,
+        "the proxy has no task for the connection at all"
+    );
+
+    client.quic.close(0u32.into(), b"done");
+
+    let patience = Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        let alive = proxy.metrics().num_alive_tasks();
+        if alive <= idle {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} of the proxy's tasks outlived their connection by {patience:?}",
+            alive - idle
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    drop(server);
+    proxy.shutdown_background();
+}
+
 /// A request this proxy will not serve is answered and *finished*, never reset.
 ///
 /// Decision D40, and the reason the second half of this test exists: a status
