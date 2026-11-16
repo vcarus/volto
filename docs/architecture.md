@@ -423,6 +423,7 @@ silent:
   still in flight — but a value that cannot be a stream ID at all (above 2⁶⁰-1,
   or a datagram too short to parse one) closes the whole QUIC connection with
   H3_DATAGRAM_ERROR (0x33), which RFC 9297 §2.1 states as a MUST.
+  A value above every Quarter Stream ID claimed so far on the connection is the exception to the drop: its request may still be on its way or still being authenticated, so the datagram is held for at most 333 ms, with at most `EARLY_DATAGRAMS` = 8 of them on the connection at once, and the session's claim moves what was held for it onto its queue ahead of anything later. The hold sits under the same lock as the routing table, so a claim and a hold cannot interleave.
 - **Context ID**, a varint at the head of the payload (RFC 9298 §5). `0` means a
   raw UDP payload; anything else is an extension. An unknown Context ID is
   dropped silently — never a connection error — and so is a truncated one, which

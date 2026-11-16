@@ -371,7 +371,9 @@ const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
 /// and every byte of it is reachable before a credential has been seen: quinn
 /// buffers whatever the peer sends, `serve_peer` drains the queue, and before
 /// authentication every datagram in it is routed to the `Unroutable` drop
-/// because the session table is empty. Small next to the 16 MiB of
+/// because the session table is empty, apart from the few the connection holds
+/// for a session about to claim them (`h3::connection::EARLY_DATAGRAMS`, about
+/// 11.5 KiB). Small next to the 16 MiB of
 /// [`CONNECTION_RECEIVE_WINDOW`] beside it, which is why the value is pinned
 /// rather than lowered.
 ///

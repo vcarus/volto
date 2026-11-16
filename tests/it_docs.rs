@@ -572,6 +572,13 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
             (volto::h3api::READ_AHEAD_CHUNKS as u64, Dimension::Count),
         ),
         (
+            "EARLY_DATAGRAMS",
+            (
+                volto::h3::connection::EARLY_DATAGRAMS as u64,
+                Dimension::Count,
+            ),
+        ),
+        (
             "CONNECTION_UNANSWERED_MULTIPLIER",
             (
                 u64::from(volto::tunnel::CONNECTION_UNANSWERED_MULTIPLIER),

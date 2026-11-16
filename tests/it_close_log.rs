@@ -195,7 +195,10 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
 
         // A round trip on the live session, sent after the four: the router
         // handles a connection's datagrams in arrival order, so the echo
-        // coming back proves the drops were counted before the close below.
+        // coming back proves all four were judged before the close below.
+        // The two for unclaimed ids are above every claimed one, so they are
+        // held for a session that never comes (D114) and counted when the
+        // connection drops its hold, which is before the closing line.
         send_udp_payload(&client.quic, qsid, b"fence");
         let fenced = recv_datagram(&client.quic).await;
         assert_eq!(&fenced.payload[..], b"fence");

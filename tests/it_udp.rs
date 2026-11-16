@@ -196,6 +196,75 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
     assert_eq!(&echoed[..], b"somewhere");
 }
 
+/// A datagram that reaches the server before the request stream it names is
+/// held and delivered once the session claims it (D114).
+///
+/// Sent once and never repeated, so the echo can only come from the held copy.
+/// The pause between the datagram and the request makes the order certain: the
+/// server has routed the datagram before the stream exists. It is well inside
+/// `EARLY_DATAGRAM_HOLD`, so the datagram is still held when the session claims
+/// its Quarter Stream ID.
+#[tokio::test]
+async fn a_datagram_sent_before_its_request_reaches_the_target() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    // The first request stream on a fresh connection is stream 0, and so
+    // Quarter Stream ID 0.
+    send_udp_payload(&client.quic, 0, b"early");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (qsid, _stream) = open_udp_session(&mut client, &server, target).await;
+    assert_eq!(qsid, 0, "the session is the connection's first request");
+
+    let answer = common::recv_datagram(&client.quic).await;
+    assert_eq!(answer.quarter_stream_id, qsid);
+    assert_eq!(
+        &answer.payload[..],
+        b"early",
+        "the datagram sent before the request must reach the target"
+    );
+
+    let echoed = udp_round_trip(&client, qsid, b"later").await;
+    assert_eq!(&echoed[..], b"later");
+}
+
+/// The order an Apple relay client uses: the request, then at once a datagram
+/// for it, before any answer has come back (D114).
+///
+/// The datagram can reach the router before the request has been decoded and
+/// authenticated, so it can arrive before the session has claimed its Quarter
+/// Stream ID even though it was sent after the request.
+#[tokio::test]
+async fn a_datagram_sent_right_after_its_request_reaches_the_target() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    let request = connect_udp_request(server.addr, &target.ip().to_string(), target.port());
+    let mut stream = tokio::time::timeout(TIMEOUT, client.send.send_request(request))
+        .await
+        .expect("the request is sent in time")
+        .expect("the request is sent");
+    let qsid = datagram::quarter_stream_id(stream.id());
+    send_udp_payload(&client.quic, qsid, b"with the request");
+
+    let response = tokio::time::timeout(TIMEOUT, stream.recv_response())
+        .await
+        .expect("the response arrives in time")
+        .expect("the response arrives");
+    assert_eq!(response.status, Status::OK);
+
+    let answer = common::recv_datagram(&client.quic).await;
+    assert_eq!(answer.quarter_stream_id, qsid);
+    assert_eq!(
+        &answer.payload[..],
+        b"with the request",
+        "the datagram sent with the request must reach the target"
+    );
+}
+
 /// A flood of datagrams at one live session costs datagrams, not the session.
 ///
 /// The session's inbound queue is bounded (`INBOUND_QUEUE_DEPTH` in
@@ -207,8 +276,9 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
 /// the session answers again once the flood stops, on the same connection,
 /// with no close of any kind. The unclaimed-id mirror of this flood (a peer
 /// filling its allowance with misses) has no queue to overflow -- those
-/// datagrams are dropped at the routing table -- which is why this test aims
-/// at a live session and the drop tests above aim past one.
+/// datagrams are dropped at the routing table, or held a few at a time for a
+/// session that may still claim them (D114) -- which is why this test aims at a
+/// live session and the drop tests above aim past one.
 #[tokio::test]
 async fn a_datagram_flood_at_a_live_session_is_survived() {
     /// Well past `INBOUND_QUEUE_DEPTH` (64), so the overflow path is really

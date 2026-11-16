@@ -30,6 +30,12 @@
 //! on any path, removes its routing entry, and no code has to deregister it
 //! (D79).
 //!
+//! A datagram can arrive before its session has claimed it: a client may send
+//! the first payload in the same flight as the request, and the request still
+//! has to be decoded and authenticated. Such a datagram is held, a few per
+//! connection and for a fraction of a second, and handed to the session when it
+//! claims its Quarter Stream ID ([`EARLY_DATAGRAMS`], D114).
+//!
 //! Only the receiving half is here. A datagram goes *out* on the
 //! [`quinn::Connection`] itself, which the UDP sessions hold anyway for the
 //! send-buffer and datagram-size questions they ask per packet, and which has
@@ -46,8 +52,8 @@
 //! [`Connection::accept`].
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -56,6 +62,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::Instant;
 use tracing::debug;
 
 use crate::datagram::{self, peek_varint, put_varint, varint_len};
@@ -97,14 +104,14 @@ pub(crate) struct Shared {
     /// stream separately. The peer's control stream is the one reader that
     /// does not: see [`BufferBudget::unshared`].
     buffered: Arc<BufferBudget>,
-    /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
+    /// Where an inbound HTTP Datagram goes, and the datagrams held for a
+    /// session that has not claimed its Quarter Stream ID yet.
     ///
-    /// The whole of the connection's datagram routing: an entry is a live
-    /// session's claim on one Quarter Stream ID, put there by
-    /// [`Self::register_datagrams`] and taken out again when the
-    /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
-    /// never asks, such as every TCP tunnel, never appears here.
-    sessions: Mutex<HashMap<u64, mpsc::Sender<Bytes>>>,
+    /// Both under one lock, so that "is this id claimed" and "hold this
+    /// datagram" are one decision: a claim cannot happen between the router's
+    /// lookup and its hold, which would leave the held datagram behind the
+    /// claim that should have taken it.
+    routes: Mutex<Routes>,
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
     /// Whether a control stream has already been accepted (RFC 9114 §6.2.1).
@@ -115,7 +122,8 @@ pub(crate) struct Shared {
     decoder_seen: AtomicBool,
     /// Inbound HTTP Datagrams dropped instead of delivered, all three ways at
     /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
-    /// a session whose inbound queue was full.
+    /// a session whose inbound queue was full. A datagram held for a session
+    /// that never claimed it counts with the second, when it is let go.
     ///
     /// RFC 9298 §5 and RFC 9297 §2.1 ask for silent drops, so this counter is
     /// the only trace they leave in production. It is read once, by the
@@ -154,7 +162,8 @@ pub(crate) struct Shared {
 enum DropKind {
     /// A Context ID this server has no extension for (RFC 9298 §5).
     UnknownContext,
-    /// A Quarter Stream ID no session claims.
+    /// A Quarter Stream ID no session claims, including a held datagram whose
+    /// session never claimed it in time.
     Unroutable,
     /// A session whose inbound queue was full.
     QueueFull,
@@ -181,13 +190,47 @@ impl Shared {
     /// one stream: the receiver was handed out once and a second one would
     /// deregister the first on drop. The map is the guard, so there is no
     /// separate flag to keep in step with it.
+    ///
+    /// The datagrams held for this Quarter Stream ID go into the new queue
+    /// here, in the order they arrived, before the lock is released. So they
+    /// are ahead of every datagram the router delivers after the claim.
     fn register_datagrams(self: &Arc<Self>, quarter_stream_id: u64) -> Option<DatagramReceiver> {
+        self.register_datagrams_at(quarter_stream_id, Instant::now)
+    }
+
+    /// [`Self::register_datagrams`] with the clock passed in, so a test can
+    /// step it. `now` is read only if something is held.
+    fn register_datagrams_at(
+        self: &Arc<Self>,
+        quarter_stream_id: u64,
+        now: impl FnOnce() -> Instant,
+    ) -> Option<DatagramReceiver> {
         let (sink, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
 
-        match self.lock().entry(quarter_stream_id) {
-            Entry::Occupied(_) => return None,
-            Entry::Vacant(slot) => slot.insert(sink),
+        let (expired, released) = {
+            let mut routes = self.lock();
+            match routes.sessions.entry(quarter_stream_id) {
+                Entry::Occupied(_) => return None,
+                Entry::Vacant(slot) => slot.insert(sink),
+            };
+            routes.claimed(quarter_stream_id);
+
+            if routes.early.is_empty() {
+                (Vec::new(), 0)
+            } else {
+                let expired = routes.expire(now());
+                let released = routes.release(quarter_stream_id);
+                (expired, released)
+            }
         };
+
+        self.count_expired(expired);
+        if released > 0 {
+            debug!(
+                quarter_stream_id,
+                released, "delivering datagrams that arrived before their session"
+            );
+        }
 
         Some(DatagramReceiver {
             shared: Arc::clone(self),
@@ -197,7 +240,8 @@ impl Shared {
     }
 
     /// Hands one decoded datagram to the session that claimed its Quarter
-    /// Stream ID, or drops it.
+    /// Stream ID, holds it for a session that may be about to claim it, or
+    /// drops it.
     ///
     /// Every outcome here is a drop rather than an error. RFC 9297 §2.1's two
     /// MUST-close conditions are about the Quarter Stream ID *field* and are
@@ -205,6 +249,12 @@ impl Shared {
     /// left is a well-formed datagram with nowhere to go, which happens
     /// routinely when a session closes with packets still in flight.
     fn deliver(&self, decoded: datagram::Datagram) {
+        self.deliver_at(decoded, Instant::now);
+    }
+
+    /// [`Self::deliver`] with the clock passed in, so a test can step it.
+    /// `now` is read only on the way into the hold.
+    fn deliver_at(&self, decoded: datagram::Datagram, now: impl FnOnce() -> Instant) {
         if decoded.context_id != datagram::CONTEXT_ID_UDP_PAYLOAD {
             //= https://www.rfc-editor.org/rfc/rfc9298#section-5
             //# If an HTTP/3 Datagram that carries an unknown Context ID is
@@ -229,29 +279,53 @@ impl Shared {
             return;
         }
 
-        // One map operation under the lock, `try_send` included: it never
-        // waits, and sending inside the guard saves a sender clone (two
-        // refcount bumps) on every datagram routed.
-        let delivered = self
-            .lock()
-            .get(&decoded.quarter_stream_id)
-            .map(|inbound| enqueue(inbound, decoded.payload));
+        let quarter_stream_id = decoded.quarter_stream_id;
 
-        match delivered {
-            Some(true) => {}
-            None => self.count_drop(DropKind::Unroutable, |drops| {
-                debug!(
-                    quarter_stream_id = decoded.quarter_stream_id,
-                    drops,
-                    "dropping datagrams for sessions that do not exist; further ones are \
-                     logged as the count doubles"
-                )
-            }),
+        // One lock for the lookup and, on a miss, the hold. `try_send` is
+        // inside it too: it never waits, and sending inside the guard saves a
+        // sender clone (two refcount bumps) on every datagram routed.
+        let (routed, expired) = {
+            let mut routes = self.lock();
+            match routes.sessions.get(&quarter_stream_id) {
+                Some(inbound) => {
+                    let routed = if enqueue(inbound, decoded.payload) {
+                        Routed::Queued
+                    } else {
+                        Routed::QueueFull
+                    };
+                    (routed, Vec::new())
+                }
+                None if routes.may_hold(quarter_stream_id) => {
+                    //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
+                    //# If an HTTP/3 Datagram is received and its Quarter Stream ID field
+                    //# maps to a stream that has not yet been created, the receiver SHALL
+                    //# either drop that datagram silently or buffer it temporarily (on the
+                    //# order of a round trip) while awaiting the creation of the
+                    //# corresponding stream.
+                    //
+                    // The second choice, bounded by `EARLY_DATAGRAMS` and
+                    // `EARLY_DATAGRAM_HOLD`. Expired entries go first, so a
+                    // full hold is full of datagrams that are still current.
+                    let now = now();
+                    let expired = routes.expire(now);
+                    (
+                        routes.hold(quarter_stream_id, &decoded.payload, now),
+                        expired,
+                    )
+                }
+                None => (Routed::Unroutable, Vec::new()),
+            }
+        };
+
+        self.count_expired(expired);
+        match routed {
+            Routed::Queued | Routed::Held => {}
+            Routed::Unroutable => self.count_unroutable(quarter_stream_id),
             // Never block the router on one slow session: dropping a UDP
             // packet is legitimate, stalling every other session is not.
-            Some(false) => self.count_drop(DropKind::QueueFull, |drops| {
+            Routed::QueueFull => self.count_drop(DropKind::QueueFull, |drops| {
                 debug!(
-                    quarter_stream_id = decoded.quarter_stream_id,
+                    quarter_stream_id,
                     drops,
                     "dropping datagrams a session's full queue cannot take; further ones \
                      are logged as the count doubles"
@@ -280,13 +354,245 @@ impl Shared {
         self.dropped_datagrams.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The routing table, with a poisoned lock treated as an ordinary one.
+    /// Counts one datagram for a Quarter Stream ID no session claims.
+    fn count_unroutable(&self, quarter_stream_id: u64) {
+        self.count_drop(DropKind::Unroutable, |drops| {
+            debug!(
+                quarter_stream_id,
+                drops,
+                "dropping datagrams for sessions that do not exist; further ones are \
+                 logged as the count doubles"
+            )
+        });
+    }
+
+    /// Counts the held datagrams that were let go unclaimed, after the lock
+    /// that took them out of the hold is released.
     ///
-    /// Nothing under it can be left half-updated: every use is a single map
-    /// operation, so a panic elsewhere in the process says nothing about the
-    /// state of this map.
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, mpsc::Sender<Bytes>>> {
-        self.sessions.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Each is a datagram whose session never claimed it, so each is the
+    /// unroutable drop it would have been without the hold, only later.
+    fn count_expired(&self, expired: Vec<Early>) {
+        for early in expired {
+            self.count_unroutable(early.quarter_stream_id);
+        }
+    }
+
+    /// Lets go of every held datagram, and holds no more from now on.
+    ///
+    /// Called when the connection is dropped, so that nothing held outlives
+    /// it and every held datagram is counted before the connection's closing
+    /// line reads the count. After this a datagram with no session is dropped
+    /// at once, as it was before the hold existed.
+    fn close_routes(&self) {
+        let held = {
+            let mut routes = self.lock();
+            routes.closed = true;
+            std::mem::take(&mut routes.early)
+        };
+        for early in held {
+            self.count_unroutable(early.quarter_stream_id);
+        }
+    }
+
+    /// The routing table and the hold, with a poisoned lock treated as an
+    /// ordinary one.
+    ///
+    /// A panic elsewhere in the process says nothing about the state behind
+    /// this lock. Each step under it leaves a state the next holder can use:
+    /// the claim is inserted before held datagrams are moved into it, so an
+    /// interruption between the two leaves a held datagram that waits out its
+    /// hold time like any other.
+    fn lock(&self) -> std::sync::MutexGuard<'_, Routes> {
+        self.routes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What [`Shared::deliver`] did with one datagram of Context ID 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Routed {
+    /// It is on its session's queue.
+    Queued,
+    /// Its session's queue was full.
+    QueueFull,
+    /// It is in the hold, waiting for its session to claim it.
+    Held,
+    /// No session claims it and none can still come to: dropped.
+    Unroutable,
+}
+
+/// HTTP Datagrams held per connection for sessions that have not claimed their
+/// Quarter Stream ID yet (D114).
+///
+/// A client may send the first payload of a tunnel in the same flight as the
+/// CONNECT-UDP request (RFC 9298 §5 allows it), and the payload can reach the
+/// router before the request has been decoded and authenticated. Without a
+/// hold that payload is lost, and when it is a tunnelled QUIC Initial the
+/// tunnelled handshake waits for its own retransmission, which is one second
+/// at the start of a QUIC connection.
+///
+/// A client's first flight is one tunnelled Initial per tunnel, two when a
+/// post-quantum key share does not fit in one, and a client may open a few
+/// tunnels at once. Eight covers four tunnels opened together with two
+/// Initials each. The hold is per connection and reachable before any request
+/// has authenticated, so it is kept small: a full hold drops the newcomer and
+/// never evicts a current entry, so a flood of datagrams cannot push out a
+/// real first flight that arrived before it.
+///
+/// Each held payload is a copy of at most `max_udp_payload_size` bytes (1472
+/// with quinn's default), never a slice of quinn's receive batch (see
+/// `enqueue`), so the hold is at most 8 x 1472 = 11776 bytes of payload per
+/// connection, about 11.5 KiB.
+pub const EARLY_DATAGRAMS: usize = 8;
+
+/// How long a datagram is held for a session that has not claimed it yet.
+///
+/// RFC 9297 §2.1 permits holding "on the order of a round trip". A connection
+/// that has just been set up has no better figure for a round trip than the
+/// one RFC 9002 §6.2.2 gives a QUIC handshake:
+///
+//= https://www.rfc-editor.org/rfc/rfc9002#section-6.2.2
+//# When no previous RTT is available, the initial RTT
+//# SHOULD be set to 333 milliseconds.  This results in handshakes
+//# starting with a PTO of 1 second, as recommended for TCP's initial
+//# RTO; see Section 2 of [RFC6298].
+///
+/// The wait it has to cover is short. A session claims its Quarter Stream ID
+/// as soon as its request is decoded, authenticated and known to be a
+/// well-formed CONNECT-UDP request, before its target name is resolved. The
+/// datagram and the request travel in the same flight, so the wait is that
+/// processing, which takes about a millisecond, or one retransmission of the
+/// request's packet if that packet was lost and the datagram's was not. 333 ms
+/// covers the first with a wide margin and the second on a path whose round
+/// trip is well below it. It is also well inside the 1 s after which a
+/// tunnelled QUIC client resends its Initial itself, so a longer hold would
+/// gain nothing.
+///
+/// A fixed figure rather than the connection's RTT estimate: the estimate is
+/// quinn's, read per datagram, and the bound has to hold for a peer that has
+/// not authenticated whatever its path does.
+pub const EARLY_DATAGRAM_HOLD: Duration = Duration::from_millis(333);
+
+// A session's queue takes everything held for it in one step.
+const _: () = assert!(EARLY_DATAGRAMS <= INBOUND_QUEUE_DEPTH);
+
+/// The connection's datagram routing table and its hold, which
+/// [`Shared::lock`] guards together.
+#[derive(Default)]
+struct Routes {
+    /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
+    ///
+    /// The whole of the connection's datagram routing: an entry is a live
+    /// session's claim on one Quarter Stream ID, put there by
+    /// [`Shared::register_datagrams`] and taken out again when the
+    /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
+    /// never asks, such as every TCP tunnel, never appears here.
+    sessions: HashMap<u64, mpsc::Sender<Bytes>>,
+    /// Datagrams waiting for a claim, oldest first, at most
+    /// [`EARLY_DATAGRAMS`].
+    ///
+    /// Arrival order is time order, because only the router adds to it and
+    /// reads the clock under this lock, so expiry only ever looks at the
+    /// front.
+    early: VecDeque<Early>,
+    /// The highest Quarter Stream ID any session on this connection has
+    /// claimed.
+    ///
+    /// A datagram at or below it is never held. Its stream has been accepted
+    /// already, because quinn hands out request streams in stream id order and
+    /// a stream is claimed only after it was accepted. So the stream has
+    /// claimed its id, and the datagram was routed, or it has closed, or it
+    /// will never claim (a TCP tunnel, a refused request), or it is a
+    /// CONNECT-UDP request still on its way to a claim that a later stream
+    /// overtook. The last case is the one this mark gives up: such a datagram
+    /// is dropped, as it was before the hold.
+    ///
+    /// The mark is the claimed one rather than the accepted one, because a
+    /// datagram sent with its request can reach the router after the request
+    /// was accepted and before it was claimed, and that is a case the hold is
+    /// for (D114). The price is that a datagram for a TCP tunnel or a refused
+    /// request above the mark is held, then dropped when its hold time ends,
+    /// rather than dropped at once.
+    highest_claimed: Option<u64>,
+    /// Set when the connection is dropped; nothing is held after that.
+    closed: bool,
+}
+
+/// One datagram in the hold.
+struct Early {
+    quarter_stream_id: u64,
+    arrived: Instant,
+    /// A copy, never a slice of quinn's receive batch.
+    payload: Bytes,
+}
+
+impl Routes {
+    /// Whether a datagram for `quarter_stream_id`, which no session claims,
+    /// may be held for a session that has yet to claim it.
+    fn may_hold(&self, quarter_stream_id: u64) -> bool {
+        !self.closed
+            && self
+                .highest_claimed
+                .is_none_or(|highest| quarter_stream_id > highest)
+    }
+
+    /// Records a claim, which moves the mark.
+    fn claimed(&mut self, quarter_stream_id: u64) {
+        self.highest_claimed = Some(
+            self.highest_claimed
+                .map_or(quarter_stream_id, |highest| highest.max(quarter_stream_id)),
+        );
+    }
+
+    /// Takes out every held datagram that has been held for
+    /// [`EARLY_DATAGRAM_HOLD`] or longer, for the caller to count once the
+    /// lock is released.
+    fn expire(&mut self, now: Instant) -> Vec<Early> {
+        let mut expired = Vec::new();
+        while self.early.front().is_some_and(|early| {
+            now.saturating_duration_since(early.arrived) >= EARLY_DATAGRAM_HOLD
+        }) {
+            expired.extend(self.early.pop_front());
+        }
+        expired
+    }
+
+    /// Holds a copy of `payload`, or reports that the hold is full.
+    fn hold(&mut self, quarter_stream_id: u64, payload: &Bytes, now: Instant) -> Routed {
+        if self.early.len() >= EARLY_DATAGRAMS {
+            return Routed::Unroutable;
+        }
+        self.early.push_back(Early {
+            quarter_stream_id,
+            arrived: now,
+            payload: Bytes::copy_from_slice(payload),
+        });
+        Routed::Held
+    }
+
+    /// Moves every datagram held for `quarter_stream_id` onto its session's
+    /// queue, oldest first, and says how many there were.
+    ///
+    /// The queue was created with the claim and holds [`INBOUND_QUEUE_DEPTH`]
+    /// payloads, more than the hold can, so every one fits. The payloads are
+    /// copies already and go on as they are.
+    fn release(&mut self, quarter_stream_id: u64) -> usize {
+        let Some(inbound) = self.sessions.get(&quarter_stream_id) else {
+            return 0;
+        };
+        let mut released = 0;
+        let mut index = 0;
+        while let Some(early) = self.early.get(index) {
+            if early.quarter_stream_id != quarter_stream_id {
+                index += 1;
+                continue;
+            }
+            if let Some(early) = self.early.remove(index)
+                && inbound.try_send(early.payload).is_ok()
+            {
+                released += 1;
+            }
+        }
+        released
     }
 }
 
@@ -371,6 +677,14 @@ fn enqueue(inbound: &mpsc::Sender<Bytes>, payload: Bytes) -> bool {
 /// forwards. It only changes how long a full queue can stay undrained: no longer
 /// than name resolution takes. After that the session either starts draining or
 /// is refused and the queue is discarded with it.
+///
+/// Beside the sessions, each connection has one hold for datagrams that arrive
+/// before their session has claimed them ([`EARLY_DATAGRAMS`]): at most 8
+/// copies of at most 1472 bytes, about 11.5 KiB, each for at most
+/// [`EARLY_DATAGRAM_HOLD`] and never past the connection. It does not grow
+/// with the number of sessions, and it is reachable before authentication, so
+/// it is part of what an unauthenticated peer can make a connection hold:
+/// about 2.9 MiB across the default `max_connections` of 256.
 pub const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// One session's inbound HTTP Datagrams, and its claim on a Quarter Stream ID.
@@ -418,7 +732,7 @@ impl DatagramReceiver {
 
 impl Drop for DatagramReceiver {
     fn drop(&mut self) {
-        self.shared.lock().remove(&self.quarter_stream_id);
+        self.shared.lock().sessions.remove(&self.quarter_stream_id);
     }
 }
 
@@ -833,12 +1147,18 @@ impl Drop for Connection {
     /// depends on this happening: it is why `quinn::Connection::close_reason()`
     /// cannot be used to grade a connection's closing log line, and why the
     /// error *value* returned by `conn::handle` is graded instead.
+    ///
+    /// It also lets go of the datagrams held for sessions that never claimed
+    /// them, and counts them, here rather than when the last handle goes:
+    /// `quic/mod.rs` writes the closing line, with the drop count, right after
+    /// this, while aborted request tasks may still hold a handle.
     fn drop(&mut self) {
         self.handle.quic.close(
             varint(Code::H3_NO_ERROR),
             b"connection closed by the server",
         );
         self.peer.abort();
+        self.handle.shared.close_routes();
     }
 }
 
@@ -913,9 +1233,11 @@ async fn serve_peer(handle: Handle) {
 /// * a Quarter Stream ID that cannot be parsed, or one above 2^60-1, is a
 ///   **connection error** of type H3_DATAGRAM_ERROR. Neither can name a QUIC
 ///   stream, so there is nothing to drop it *for*;
-/// * a Quarter Stream ID with no live session is **dropped**. The RFC permits
-///   discarding a datagram whose request stream does not exist, which happens
-///   routinely when a session closes with packets still in flight;
+/// * a Quarter Stream ID with no live session is **held** for a short time if
+///   its session may still claim it, and **dropped** otherwise. The RFC permits
+///   both for a datagram whose request stream does not exist yet, and permits
+///   the drop for one whose stream has closed, which happens routinely when a
+///   session closes with packets still in flight;
 /// * a datagram whose Context ID is truncated or unknown is likewise dropped.
 ///
 /// One SHOULD is deliberately not implemented: a Quarter Stream ID naming a
@@ -928,7 +1250,8 @@ async fn serve_peer(handle: Handle) {
 /// unknown to the HTTP/3 layer". It is unknown to this one. The limit is set by
 /// [`crate::quic`] from `[limits] max_streams_bidi` and nothing here reads it,
 /// so a Quarter Stream ID past it cannot be told apart from a session that has
-/// already closed.
+/// already closed. For the same reason the hold cannot refuse such an id: it
+/// is bounded by its count and its hold time instead ([`EARLY_DATAGRAMS`]).
 fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
     //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
     //# The largest legal QUIC stream ID value is 2^62-1, so the largest legal
@@ -2215,7 +2538,7 @@ mod tests {
         );
         drop(inbound);
 
-        assert!(shared.lock().is_empty(), "the entry must be gone");
+        assert!(shared.lock().sessions.is_empty(), "the entry must be gone");
 
         // Which is observable from the outside: the id is free again, and a
         // datagram that arrives in between is dropped instead of piling up in
@@ -2290,13 +2613,13 @@ mod tests {
         for id in 1..=CHURN {
             let inbound = shared.register_datagrams(id).expect("a free id");
             assert_eq!(
-                shared.lock().len(),
+                shared.lock().sessions.len(),
                 2,
                 "one held session and one live one, whatever id {id} we are on"
             );
             drop(inbound);
             assert_eq!(
-                shared.lock().len(),
+                shared.lock().sessions.len(),
                 1,
                 "session {id} took its entry with it"
             );
@@ -2304,7 +2627,7 @@ mod tests {
 
         drop(held);
         assert!(
-            shared.lock().is_empty(),
+            shared.lock().sessions.is_empty(),
             "nothing is left once the last session has gone"
         );
     }
@@ -2439,7 +2762,7 @@ mod tests {
         router.await.expect("router task");
 
         assert!(
-            shared.lock().is_empty(),
+            shared.lock().sessions.is_empty(),
             "an entry outlived the receiver that owned it"
         );
         assert!(
@@ -2457,11 +2780,13 @@ mod tests {
     #[tokio::test]
     async fn unknown_ids_are_dropped_and_the_session_survives() {
         let shared = Arc::new(Shared::default());
+        drop(shared.register_datagrams(0).expect("a free id"));
         let mut inbound = shared.register_datagrams(1).expect("a free id");
 
         // A Quarter Stream ID no session owns: legitimate whenever a session
-        // closes with packets still in flight.
-        shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, b"nowhere"));
+        // closes with packets still in flight. Session 0 has closed, so its
+        // id is below the highest claimed one and is not held (D114).
+        shared.deliver(datagram(0, datagram::CONTEXT_ID_UDP_PAYLOAD, b"nowhere"));
         // A context this server never registered (RFC 9298 §5).
         shared.deliver(datagram(1, 9, b"unknown context"));
 
@@ -2555,6 +2880,332 @@ mod tests {
             1,
             "the overflow is the one drop this connection saw, and it is counted"
         );
+    }
+
+    /// A datagram that arrives before its session claims its Quarter Stream ID
+    /// is held and handed to the session when it does, ahead of anything that
+    /// arrives after the claim (D114).
+    #[tokio::test]
+    async fn a_datagram_that_arrives_before_its_session_is_delivered_in_order() {
+        let shared = Arc::new(Shared::default());
+
+        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"early"));
+        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"second"));
+        let mut inbound = shared.register_datagrams(3).expect("a free id");
+        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"later"));
+
+        assert_eq!(
+            inbound.try_recv().as_deref(),
+            Some(b"early".as_slice()),
+            "a datagram held before the claim must be delivered by it"
+        );
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"second".as_slice()));
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"later".as_slice()));
+        assert_eq!(inbound.try_recv(), None, "each one once");
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            0,
+            "a delivered datagram is not a drop"
+        );
+        assert!(
+            shared.lock().early.is_empty(),
+            "the claim takes what was held for it"
+        );
+    }
+
+    /// The hold keeps [`EARLY_DATAGRAMS`] and drops the newcomer past that,
+    /// counted as unroutable, rather than evicting one it already has.
+    #[test]
+    fn the_hold_is_bounded_in_count_and_drops_the_newcomer() {
+        let shared = Arc::new(Shared::default());
+        let count = u8::try_from(EARLY_DATAGRAMS).expect("the count fits a byte");
+
+        for index in 0..count {
+            shared.deliver(datagram(5, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
+        }
+        shared.deliver(datagram(
+            5,
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            b"one too many",
+        ));
+
+        assert_eq!(shared.lock().early.len(), EARLY_DATAGRAMS);
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            1,
+            "the newcomer is dropped and counted"
+        );
+
+        let mut inbound = shared.register_datagrams(5).expect("a free id");
+        for index in 0..count {
+            assert_eq!(
+                inbound.try_recv().as_deref(),
+                Some([index].as_slice()),
+                "the first ones are kept, in order"
+            );
+        }
+        assert_eq!(inbound.try_recv(), None, "the newcomer was not kept");
+    }
+
+    /// A held datagram is let go once it has been held for
+    /// [`EARLY_DATAGRAM_HOLD`], when the hold is next touched, and counted.
+    #[test]
+    fn the_hold_is_bounded_in_time() {
+        let shared = Arc::new(Shared::default());
+        let start = Instant::now();
+        let just_inside = EARLY_DATAGRAM_HOLD - Duration::from_millis(1);
+
+        shared.deliver_at(datagram(5, 0, b"stale"), || start);
+        shared.deliver_at(datagram(5, 0, b"fresh"), || start + just_inside);
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            0,
+            "neither has been held for the whole hold time yet"
+        );
+
+        let mut inbound = shared
+            .register_datagrams_at(5, || start + EARLY_DATAGRAM_HOLD)
+            .expect("a free id");
+        assert_eq!(
+            inbound.try_recv().as_deref(),
+            Some(b"fresh".as_slice()),
+            "only the datagram still inside its hold time is delivered"
+        );
+        assert_eq!(inbound.try_recv(), None);
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            1,
+            "the expired one is counted as a drop"
+        );
+        assert!(shared.lock().early.is_empty(), "nothing is left behind");
+    }
+
+    /// A full hold first lets go of what has expired, so expired entries never
+    /// cost a current datagram its place.
+    #[test]
+    fn a_full_hold_makes_room_only_by_expiry() {
+        let shared = Arc::new(Shared::default());
+        let start = Instant::now();
+
+        for _ in 0..EARLY_DATAGRAMS {
+            shared.deliver_at(datagram(5, 0, b"old"), || start);
+        }
+        shared.deliver_at(datagram(6, 0, b"new"), || start + EARLY_DATAGRAM_HOLD);
+
+        let early = &shared.lock().early;
+        assert_eq!(
+            early.len(),
+            1,
+            "the expired ones went and the newcomer stayed"
+        );
+        assert_eq!(early[0].quarter_stream_id, 6);
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            u64::try_from(EARLY_DATAGRAMS).expect("small"),
+            "each expired datagram is counted"
+        );
+    }
+
+    /// Only a datagram whose stream may still claim it is held. A stream at or
+    /// below the highest claimed id has been accepted already: it is a closed
+    /// session, or a stream that never claimed (a TCP tunnel, a refused
+    /// request), and its datagrams are dropped at once as before the hold.
+    #[test]
+    fn a_datagram_for_a_stream_already_past_its_claim_is_not_held() {
+        let shared = Arc::new(Shared::default());
+        drop(shared.register_datagrams(4).expect("a free id"));
+
+        // The session that claimed 4 has closed.
+        shared.deliver(datagram(4, 0, b"after the close"));
+        // 2 was accepted before 4 and never claimed.
+        shared.deliver(datagram(2, 0, b"never claimed"));
+
+        assert!(shared.lock().early.is_empty(), "neither may be held");
+        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 2);
+
+        // Above the mark, the hold applies again.
+        shared.deliver(datagram(5, 0, b"next request"));
+        assert_eq!(shared.lock().early.len(), 1);
+    }
+
+    /// What is held for one session is handed to that session and no other.
+    #[test]
+    fn a_held_datagram_reaches_only_its_own_session() {
+        let shared = Arc::new(Shared::default());
+        shared.deliver(datagram(6, 0, b"for six"));
+        shared.deliver(datagram(7, 0, b"for seven"));
+        shared.deliver(datagram(6, 0, b"for six again"));
+
+        let mut seven = shared.register_datagrams(7).expect("a free id");
+        assert_eq!(seven.try_recv().as_deref(), Some(b"for seven".as_slice()));
+        assert_eq!(seven.try_recv(), None, "six's datagrams stay held");
+        assert_eq!(shared.lock().early.len(), 2);
+
+        // 6 is below the mark now, but what was held for it before 7 claimed
+        // is still its own.
+        let mut six = shared.register_datagrams(6).expect("a free id");
+        assert_eq!(six.try_recv().as_deref(), Some(b"for six".as_slice()));
+        assert_eq!(six.try_recv().as_deref(), Some(b"for six again".as_slice()));
+        assert_eq!(six.try_recv(), None);
+        assert_eq!(seven.try_recv(), None);
+        assert!(shared.lock().early.is_empty());
+        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 0);
+    }
+
+    /// A held datagram is a copy, so the hold never keeps quinn's receive
+    /// batch alive for the hold time.
+    #[test]
+    fn a_held_datagram_is_copied_out_of_its_batch() {
+        let packet = datagram::encode(5, datagram::CONTEXT_ID_UDP_PAYLOAD, b"held");
+        let mut batch = BytesMut::from(&packet[..]);
+        batch.put_bytes(0, 16 * 1024);
+        let batch = batch.freeze();
+        let decoded = datagram::decode(batch.slice(..packet.len())).expect("well formed");
+
+        let shared = Arc::new(Shared::default());
+        shared.deliver(decoded);
+
+        assert_eq!(shared.lock().early.len(), 1);
+        assert!(
+            batch.is_unique(),
+            "a held datagram must not keep its receive batch alive"
+        );
+    }
+
+    /// The hold does not outlive the connection: closing it lets go of and
+    /// counts what was held, and nothing is held after.
+    #[test]
+    fn closing_the_connection_empties_the_hold() {
+        let shared = Arc::new(Shared::default());
+        shared.deliver(datagram(5, 0, b"one"));
+        shared.deliver(datagram(6, 0, b"two"));
+
+        shared.close_routes();
+        assert!(shared.lock().early.is_empty());
+        assert_eq!(
+            shared.dropped_datagrams.load(Ordering::Relaxed),
+            2,
+            "what was held is counted before the closing line reads the count"
+        );
+
+        shared.deliver(datagram(7, 0, b"after the close"));
+        assert!(shared.lock().early.is_empty(), "nothing is held after");
+        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 3);
+    }
+
+    /// Arbitrary interleavings of datagrams, claims, releases and clock steps,
+    /// against the three bounds and the routing rule (D114).
+    ///
+    /// The standing check for code that runs before authentication. A
+    /// cargo-fuzz target cannot reach [`Shared`], which is private to the
+    /// crate, so the interleavings are generated here instead.
+    ///
+    /// Every payload names its Quarter Stream ID and its place in the sequence
+    /// sent, so a datagram delivered to the wrong session, or out of order,
+    /// is seen. At the end every datagram sent has been received or counted as
+    /// a drop, exactly once.
+    #[test]
+    fn any_interleaving_keeps_the_hold_bounded_and_routes_nothing_astray() {
+        use proptest::prelude::*;
+
+        /// quinn's default `max_udp_payload_size`, which no datagram payload
+        /// exceeds, so the byte bound is checked at its edge.
+        const MAX_PAYLOAD: usize = 1472;
+
+        #[derive(Debug, Clone)]
+        enum Step {
+            Datagram { id: u64, len: usize },
+            Claim { id: u64 },
+            Release { id: u64 },
+            Wait { millis: u64 },
+        }
+
+        let step = prop_oneof![
+            4 => (0u64..8, 9usize..=MAX_PAYLOAD).prop_map(|(id, len)| Step::Datagram { id, len }),
+            2 => (0u64..8).prop_map(|id| Step::Claim { id }),
+            1 => (0u64..8).prop_map(|id| Step::Release { id }),
+            1 => (0u64..400).prop_map(|millis| Step::Wait { millis }),
+        ];
+
+        proptest!(|(steps in proptest::collection::vec(step, 0..120))| {
+            let shared = Arc::new(Shared::default());
+            let start = Instant::now();
+            let mut now = start;
+            let mut receivers: HashMap<u64, DatagramReceiver> = HashMap::new();
+            let mut sent = 0u64;
+            let mut received = 0u64;
+            let mut last_seen: HashMap<u64, u64> = HashMap::new();
+
+            for step in steps {
+                let mut touched = false;
+                match step {
+                    Step::Datagram { id, len } => {
+                        let mut payload = vec![0u8; len];
+                        payload[..8].copy_from_slice(&sent.to_be_bytes());
+                        payload[8] = u8::try_from(id).expect("small");
+                        touched = {
+                            let routes = shared.lock();
+                            !routes.sessions.contains_key(&id) && routes.may_hold(id)
+                        };
+                        shared.deliver_at(datagram(id, 0, &payload), || now);
+                        sent += 1;
+                    }
+                    Step::Claim { id } => {
+                        if let Some(inbound) = shared.register_datagrams_at(id, || now) {
+                            receivers.insert(id, inbound);
+                            touched = true;
+                        }
+                    }
+                    Step::Release { id } => {
+                        receivers.remove(&id);
+                    }
+                    Step::Wait { millis } => now += Duration::from_millis(millis),
+                }
+
+                // Drain every live session, checking where each payload went.
+                for (id, inbound) in &mut receivers {
+                    while let Some(payload) = inbound.try_recv() {
+                        prop_assert_eq!(u64::from(payload[8]), *id, "a payload reached another session");
+                        let sequence = u64::from_be_bytes(payload[..8].try_into().expect("eight bytes"));
+                        if let Some(previous) = last_seen.insert(*id, sequence) {
+                            prop_assert!(previous < sequence, "session {} got its datagrams out of order", id);
+                        }
+                        received += 1;
+                    }
+                }
+
+                let routes = shared.lock();
+                prop_assert!(routes.early.len() <= EARLY_DATAGRAMS, "count bound");
+                let bytes: usize = routes.early.iter().map(|early| early.payload.len()).sum();
+                prop_assert!(bytes <= EARLY_DATAGRAMS * MAX_PAYLOAD, "byte bound");
+                for early in &routes.early {
+                    prop_assert!(
+                        !routes.sessions.contains_key(&early.quarter_stream_id),
+                        "a datagram is held for a session that has claimed it"
+                    );
+                }
+                // Expiry is lazy, so an entry may stay past its hold time
+                // until the hold is next touched, and no further. Every touch
+                // that added or handed out an entry was at `now`.
+                if touched {
+                    for early in &routes.early {
+                        prop_assert!(
+                            now.saturating_duration_since(early.arrived) < EARLY_DATAGRAM_HOLD,
+                            "an entry past its hold time survived a touch"
+                        );
+                    }
+                }
+            }
+
+            drop(receivers);
+            shared.close_routes();
+            prop_assert!(shared.lock().early.is_empty());
+            prop_assert_eq!(
+                received + shared.dropped_datagrams.load(Ordering::Relaxed),
+                sent,
+                "every datagram is delivered or counted, once"
+            );
+        });
     }
 
     /// A drop shape speaks on the doubling schedule; every drop counts.

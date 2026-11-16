@@ -361,7 +361,10 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // immediately does not lose its first packets to name resolution. The same
     // section says "Receivers that buffer datagrams SHOULD apply buffering
     // limits", and the limit here is the queue depth, `INBOUND_QUEUE_DEPTH` in
-    // `crate::h3::connection`.
+    // `crate::h3::connection`. Packets that arrived even before this claim,
+    // while the request was being decoded and authenticated, were held by the
+    // connection and are put in the queue by the claim, ahead of later ones
+    // (`EARLY_DATAGRAMS`, D114).
     //
     // Every refusal below returns, dropping the receiver and with it both the
     // queue and the claim, so the packets of a request that fails are not

@@ -345,8 +345,11 @@ async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
 
         // The fence. The router takes this connection's datagrams in arrival
         // order, so an answer to a datagram sent after the three proves all
-        // three have already been judged and counted — which is what makes the
-        // total at the end a total and not a snapshot of a race.
+        // three have already been judged. That is what makes the total at the
+        // end a total and not a snapshot of a race. The unclaimed one is
+        // held rather than dropped at once (D114); it is counted when its hold
+        // time ends or when the connection drops its hold, both before the
+        // closing line.
         let fenced = udp_round_trip(&client, qsid, b"fence").await;
         assert_eq!(&fenced[..], b"fence");
 
