@@ -814,11 +814,13 @@ impl Connection {
     /// the connection's closing line stays at the level an idle timeout gets.
     /// The error is returned rather than logged here to keep that grading in
     /// one place (D50).
+    ///
+    /// It is `Handle::close_for` with that code, so the close is recorded as
+    /// every other close of this endpoint is. If a violation was recorded
+    /// first, that violation closed the connection, and it is what goes on the
+    /// wire and what is returned.
     pub fn close_quietly(&self, reason: &'static str) -> ConnectionError {
-        self.handle
-            .quic
-            .close(varint(Code::H3_NO_ERROR), reason.as_bytes());
-        ConnectionError::Local(Violation::connection(Code::H3_NO_ERROR, reason))
+        self.handle.close_for(Code::H3_NO_ERROR, reason)
     }
 }
 
@@ -2065,6 +2067,40 @@ mod tests {
         let reported = shared.record(second);
         assert_eq!(reported, first);
         assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
+    }
+
+    /// A quiet close after a violation reports the violation, as every other
+    /// close for a reason of this endpoint's own does.
+    ///
+    /// The violation closed the connection first, and the quiet close graded
+    /// as routine would otherwise hide it from the closing log line.
+    #[tokio::test]
+    async fn a_quiet_close_does_not_hide_an_earlier_violation() {
+        let (_client, server) =
+            crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
+        let handle = Handle {
+            quic: server.clone(),
+            idle: Duration::from_secs(5),
+            shared: Arc::new(Shared::default()),
+        };
+        let uni = || async { server.open_uni().await.expect("open a stream") };
+        let connection = Connection {
+            handle,
+            control: uni().await,
+            _qpack: [uni().await, uni().await],
+            peer: tokio::spawn(async {}),
+            last_accepted: None,
+            going_away: None,
+        };
+
+        let _ = connection.handle.fail(Violation::connection(
+            Code::H3_FRAME_UNEXPECTED,
+            "a frame the peer may not send",
+        ));
+        let ConnectionError::Local(reported) = connection.close_quietly("idle") else {
+            panic!("the connection was closed by this endpoint");
+        };
+        assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED, "{reported}");
     }
 
     /// A close for a reason of this endpoint's own is the reason reported, even
