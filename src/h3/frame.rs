@@ -725,6 +725,13 @@ impl FrameDecoder {
 
                 State::Buffering { kind, remaining } => {
                     let take = remaining.min(self.chunk.len());
+                    // Allocated once, at the announced length, when the first
+                    // payload byte arrives: the allocation then equals what
+                    // the budget was charged, where growth by doubling could
+                    // reach nearly twice that.
+                    if self.payload.is_empty() && take > 0 {
+                        self.payload.reserve(remaining);
+                    }
                     self.payload.extend_from_slice(&self.chunk[..take]);
                     self.chunk.advance(take);
 
@@ -2200,6 +2207,36 @@ mod tests {
             decoder.budget.held(),
             0,
             "a refused frame must not have been charged for"
+        );
+    }
+
+    /// A buffered frame's payload is allocated once, at the length the frame
+    /// announced, so the allocation equals what the D77 budget is charged.
+    ///
+    /// Grown by doubling instead, a peer that announces a length just past a
+    /// doubling point and withholds the last byte makes each frame's
+    /// allocation close to twice its charge.
+    #[test]
+    fn a_buffered_frame_is_allocated_at_its_announced_length() {
+        let budget = Arc::new(BufferBudget::default());
+        let mut decoder = FrameDecoder::new(StreamKind::Request, budget);
+
+        let mut wire = BytesMut::new();
+        put_header(&mut wire, HEADERS, 38402);
+        wire.extend_from_slice(&[0x5a; 1200]);
+        decoder.push(wire.freeze());
+        assert!(decoder.next_item().expect("decodes").is_none());
+        assert_eq!(decoder.payload.capacity(), 38402);
+
+        for _ in 0..31 {
+            decoder.push(Bytes::from(vec![0x5a; 1200]));
+            assert!(decoder.next_item().expect("decodes").is_none());
+        }
+        assert_eq!(decoder.payload.len(), 38400);
+        assert_eq!(
+            decoder.payload.capacity(),
+            38402,
+            "the payload buffer grew past the announced length"
         );
     }
 
