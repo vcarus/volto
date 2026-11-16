@@ -72,9 +72,12 @@ pub fn stop_runtime(runtime: tokio::runtime::Runtime, grace: Duration) {
 }
 
 /// Fires the shutdown signal. Cheap to clone; any clone can fire it.
+///
+/// A `watch::Sender` is itself a handle that clones, and the receivers' wait
+/// fails only when every clone is gone, so no `Arc` is needed around it.
 #[derive(Clone)]
 pub struct Trigger {
-    sender: std::sync::Arc<watch::Sender<bool>>,
+    sender: watch::Sender<bool>,
 }
 
 /// Observes the shutdown signal.
@@ -86,12 +89,7 @@ pub struct Shutdown {
 /// Creates a fresh signal, unfired.
 pub fn channel() -> (Trigger, Shutdown) {
     let (sender, receiver) = watch::channel(false);
-    (
-        Trigger {
-            sender: std::sync::Arc::new(sender),
-        },
-        Shutdown { receiver },
-    )
+    (Trigger { sender }, Shutdown { receiver })
 }
 
 impl Trigger {
