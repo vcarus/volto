@@ -162,8 +162,10 @@ on the wire — the refusals are the same 504 `dns_timeout` they always were.
 **`max_connections` also sizes the blocking thread pool, at startup only.** The
 pool is given a thread for every reserved lookup slot the budget can hand out,
 plus the shared allowance and headroom; threads are created on demand and reaped
-when idle. A reload that raises `max_connections` takes effect for new
-connections but does not resize the pool, which needs a restart.
+when idle. The reserved slots are `max_connections` up to 1024, and 1024 when
+`max_connections = 0`. A reload that raises `max_connections` takes effect for new
+connections but resizes neither the pool nor the reserved slots, which needs a
+restart.
 
 **`max_streams_bidi`, `max_idle_timeout`, `keep_alive_interval`, `initial_mtu`,
 `mtu_discovery`, `mtu_upper_bound`, `congestion_control` and `initial_rtt_ms`

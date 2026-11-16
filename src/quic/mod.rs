@@ -237,6 +237,10 @@ impl Server {
 
         let (trigger, shutdown) = shutdown::channel();
 
+        // Sized from the same number `main` sized the blocking pool from,
+        // before the configuration moves into its lock.
+        let resolver = crate::net::ResolverBudget::new(config.limits.max_connections);
+
         Ok(Self {
             endpoint,
             socket_buffers,
@@ -249,7 +253,7 @@ impl Server {
             config: Arc::new(RwLock::new(config)),
             quic_config: Arc::new(RwLock::new(accepted_with)),
             roster: Roster::new(),
-            resolver: crate::net::ResolverBudget::new(),
+            resolver,
             expected,
             swap: ConfigSwap::new(),
             trigger,

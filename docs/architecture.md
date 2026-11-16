@@ -265,7 +265,12 @@ So the pool is rationed in two tiers, in `net.rs`:
 - **One reserved lookup slot per connection**, which nothing else can take. No
   number of hostile connections can starve a connection outright; at worst its
   lookups run one at a time — a lookup queued for the shared allowance keeps its
-  claim on the reserved slot too, and takes it the moment it frees.
+  claim on the reserved slot too, and takes it the moment it frees. A reserved
+  lookup also holds one permit of a server-wide reserved allowance, one per
+  connection the pool is sized for, until its thread returns. So a lookup whose
+  connection has closed keeps counting, and connection turnover cannot issue
+  more reserved slots than the pool has threads for. After heavy turnover a new
+  connection's reserved lookup may wait for one of those threads.
 - **A server-wide allowance on top of that**, capped per connection, so ordinary
   use resolves a page's worth of tunnels in parallel while no single connection
   can hold more than its share.

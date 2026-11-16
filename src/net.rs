@@ -154,9 +154,37 @@ pub const LOOKUP_FREE_THREADS: usize = 64;
 /// `max_connections` is an operator's number and may be raised without limit (or
 /// switched off entirely, which is what `0` means), while a thread is a real
 /// resource. Past this ceiling the reservation is best-effort: connections still
-/// get their slot, the pool just no longer has a thread standing by for every
-/// one of them at the same instant.
+/// have their slot, but the server-wide reserved allowance
+/// ([`reserved_lookups`]) has fewer permits than there are connections, so a
+/// reserved lookup may wait for another connection's to finish.
 pub const RESERVED_LOOKUP_CEILING: usize = 1024;
+
+/// Reserved-slot lookups the whole server may have in flight at once:
+/// `min(max_connections, 1024)`, and the ceiling when `max_connections` is `0`.
+///
+/// One per connection the pool is sized for. A reserved-slot lookup holds one
+/// of these as well as its connection's own slot, and gives it back where it
+/// gives back the slot, in the blocking thread. So a lookup whose connection
+/// has closed keeps counting until `getaddrinfo` returns, and connection
+/// turnover cannot hand out more reserved slots than the pool has threads for
+/// (D90).
+///
+/// Read from `max_connections` once, at startup, like [`blocking_pool_size`],
+/// because it is the pool's number. A `SIGHUP` that changes `max_connections`
+/// changes neither.
+// A `u32` is always a `usize` on both supported targets, and a `const fn` may
+// not call `TryFrom` to say so.
+#[allow(clippy::as_conversions)]
+pub const fn reserved_lookups(max_connections: u32) -> usize {
+    // `0` is "uncapped", so there is nothing to size against and the ceiling is
+    // the answer. Written out rather than as `min` because a `const fn` may not
+    // call `Ord::min`, and this is a constant in the tests that check it.
+    if max_connections == 0 || max_connections as usize > RESERVED_LOOKUP_CEILING {
+        RESERVED_LOOKUP_CEILING
+    } else {
+        max_connections as usize
+    }
+}
 
 /// The blocking pool the runtime is built with, in threads.
 ///
@@ -168,38 +196,32 @@ pub const RESERVED_LOOKUP_CEILING: usize = 1024;
 /// three clients holds three of them.
 ///
 /// Startup-only: a `SIGHUP` that raises `max_connections` does not resize the
-/// pool, so the reservation for the connections it adds is best-effort in the
-/// same way [`RESERVED_LOOKUP_CEILING`] describes.
-// A `u32` is always a `usize` on both supported targets, and a `const fn` may
-// not call `TryFrom` to say so.
-#[allow(clippy::as_conversions)]
+/// pool, and does not grow [`reserved_lookups`] either, so the reservation for
+/// the connections it adds is best-effort in the same way
+/// [`RESERVED_LOOKUP_CEILING`] describes.
 pub const fn blocking_pool_size(max_connections: u32) -> usize {
-    // `0` is "uncapped", so there is nothing to size against and the ceiling is
-    // the answer. Written out rather than as `min` because a `const fn` may not
-    // call `Ord::min`, and this is a constant in the tests that check it.
-    let reserved = if max_connections == 0 || max_connections as usize > RESERVED_LOOKUP_CEILING {
-        RESERVED_LOOKUP_CEILING
-    } else {
-        max_connections as usize
-    };
-
-    reserved + SHARED_LOOKUPS + LOOKUP_FREE_THREADS
+    reserved_lookups(max_connections) + SHARED_LOOKUPS + LOOKUP_FREE_THREADS
 }
 
 /// The server's share of the blocking pool, handed out one connection at a time.
 ///
 /// Cloned into every connection, which is the whole design: what one connection
-/// can take away from the others is bounded, and what it keeps for itself is
-/// not takeable at all. See [`ConnectionResolver`].
+/// can take away from the others is bounded, and what it keeps for itself
+/// cannot be taken by another connection. See [`ConnectionResolver`].
 #[derive(Clone, Debug)]
 pub struct ResolverBudget {
+    /// The reserved allowance, [`reserved_lookups`] permits.
+    reserved: Arc<Semaphore>,
+    /// The shared allowance, [`SHARED_LOOKUPS`] permits.
     shared: Arc<Semaphore>,
 }
 
 impl ResolverBudget {
-    /// The budget for one server.
-    pub fn new() -> Self {
+    /// The budget for one server whose blocking pool was sized from
+    /// `max_connections` by [`blocking_pool_size`].
+    pub fn new(max_connections: u32) -> Self {
         Self {
+            reserved: Arc::new(Semaphore::new(reserved_lookups(max_connections))),
             shared: Arc::new(Semaphore::new(SHARED_LOOKUPS)),
         }
     }
@@ -208,15 +230,10 @@ impl ResolverBudget {
     pub fn per_connection(&self) -> ConnectionResolver {
         ConnectionResolver {
             reserved: Arc::new(Semaphore::new(1)),
+            reserved_allowance: self.reserved.clone(),
             burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
             shared: self.shared.clone(),
         }
-    }
-}
-
-impl Default for ResolverBudget {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -229,6 +246,13 @@ impl Default for ResolverBudget {
 ///   No number of hostile connections can take it away, so a connection is never
 ///   starved outright: at worst its lookups run one at a time. This is the
 ///   guarantee; the shared allowance is only ever an optimisation on top of it.
+///   A reserved-slot lookup also holds one permit of the server's reserved
+///   allowance ([`reserved_lookups`]) until its thread returns. While the
+///   connections that hold those permits are live, there is one for each of
+///   them. Lookups of connections that have closed keep theirs until
+///   `getaddrinfo` returns, so after heavy connection turnover a reserved
+///   lookup may wait for one of them. That wait is bounded by the host
+///   resolver's timeout, and it is what keeps the pool from being oversubscribed.
 /// * **[`BURST_LOOKUPS`] from the shared allowance**, so ordinary use (a
 ///   client opening thirty tunnels at once) still resolves them in parallel,
 ///   while one connection can never hold more than its share of the pool.
@@ -239,15 +263,17 @@ impl Default for ResolverBudget {
 /// One of these per connection, made by [`ResolverBudget::per_connection`] and
 /// held for the connection's whole life by its [`crate::tunnel::Context`].
 /// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
-/// counting separately would be no bound at all. That is also why the three
+/// counting separately would be no bound at all. That is also why the four
 /// semaphores are held inline rather than behind an `Arc`: with one owner and no
 /// clone, an outer `Arc` would be an allocation for nothing. Each semaphore
-/// keeps its own, because `acquire_owned` needs an `Arc<Semaphore>` and one of
-/// them is the server-wide allowance every connection really does share.
+/// keeps its own, because `acquire_owned` needs an `Arc<Semaphore>` and two of
+/// them are server-wide allowances every connection really does share.
 #[derive(Debug)]
 pub struct ConnectionResolver {
     /// This connection's own slot. One permit, never shared.
     reserved: Arc<Semaphore>,
+    /// The server-wide reserved allowance, from [`ResolverBudget`].
+    reserved_allowance: Arc<Semaphore>,
     /// How much of the shared allowance this connection may hold at once.
     burst: Arc<Semaphore>,
     /// The server-wide allowance, from [`ResolverBudget`].
@@ -281,15 +307,35 @@ impl ConnectionResolver {
     /// burst of arrivals". `biased` puts the reserved slot first so a free one
     /// is taken before the shared allowance is touched.
     ///
-    /// Within the shared branch the order is not interchangeable: the per-
-    /// connection permit is taken *first*, so a connection already at
-    /// [`BURST_LOOKUPS`] queues on its own limit rather than on the server's,
-    /// and never sits in the shared queue holding a permit it is not using.
-    /// Losing the race drops that branch and gives back whatever it held.
+    /// Within each branch the order is not interchangeable: the per-connection
+    /// permit is taken *first*, so a connection already at its own limit
+    /// queues on that limit rather than on the server's, and never sits in a
+    /// server-wide queue holding a permit it is not using. Losing the race
+    /// drops that branch and gives back whatever it held.
     ///
-    /// Neither semaphore is ever closed, and a closed one is the only error
+    /// No semaphore is ever closed, and a closed one is the only error
     /// `acquire_owned` has.
     async fn acquire(&self) -> LookupSlot {
+        let from_reserved = async {
+            let own = self
+                .reserved
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the budget is never closed");
+            let allowance = self
+                .reserved_allowance
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("the budget is never closed");
+
+            LookupSlot::Reserved {
+                _slot: own,
+                _allowance: allowance,
+            }
+        };
+
         let from_shared = async {
             let burst = self
                 .burst
@@ -312,9 +358,7 @@ impl ConnectionResolver {
 
         tokio::select! {
             biased;
-            reserved = self.reserved.clone().acquire_owned() => LookupSlot::Reserved {
-                _slot: reserved.expect("the budget is never closed"),
-            },
+            slot = from_reserved => slot,
             slot = from_shared => slot,
         }
     }
@@ -327,11 +371,15 @@ impl ConnectionResolver {
 /// it whenever a `connect_timeout` expires first. See [`on_the_blocking_pool`].
 #[derive(Debug)]
 enum LookupSlot {
-    /// The connection's own slot.
+    /// The connection's own slot, and the server-wide reserved permit it
+    /// stands for.
     ///
     /// Named with a leading underscore because it is never read: a permit is
     /// held, not consulted, and releasing it is what dropping this does.
-    Reserved { _slot: OwnedSemaphorePermit },
+    Reserved {
+        _slot: OwnedSemaphorePermit,
+        _allowance: OwnedSemaphorePermit,
+    },
     /// One of the connection's burst permits, and the shared one it stands for.
     Shared {
         _burst: OwnedSemaphorePermit,
@@ -563,7 +611,7 @@ mod tests {
 
         #[test]
         fn a_connection_may_hold_its_reserved_slot_plus_a_burst() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
             let resolver = budget.per_connection();
 
             let held = hold(&resolver, BURST_LOOKUPS + 1);
@@ -583,7 +631,7 @@ mod tests {
         /// serially, on the slot that was never theirs to take.
         #[test]
         fn a_new_connection_still_has_a_slot_when_the_shared_allowance_is_gone() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
 
             let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
                 .map(|_| budget.per_connection())
@@ -621,7 +669,7 @@ mod tests {
         /// waits out `connect_timeout` beside an idle slot.
         #[test]
         fn a_parked_lookup_takes_the_reserved_slot_when_it_frees() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
             let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
                 .map(|_| budget.per_connection())
                 .collect();
@@ -654,7 +702,7 @@ mod tests {
 
         #[test]
         fn a_finished_lookup_gives_its_slot_back() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
             let resolver = budget.per_connection();
 
             let held = hold(&resolver, BURST_LOOKUPS + 1);
@@ -680,7 +728,7 @@ mod tests {
         /// thread — with every slot this connection has already held.
         #[test]
         fn an_ip_literal_needs_no_slot() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
             let resolver = budget.per_connection();
             let _held = hold(&resolver, BURST_LOOKUPS + 1);
 
@@ -713,7 +761,7 @@ mod tests {
         /// got a slot must not keep a claim on one.
         #[test]
         fn lookups_that_all_give_up_at_once_give_back_everything_they_held() {
-            let budget = ResolverBudget::new();
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
 
             // The shared allowance gone, the way an attack leaves it.
             let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
@@ -769,6 +817,43 @@ mod tests {
             );
         }
 
+        /// A lookup keeps counting after its connection is gone.
+        ///
+        /// A slot travels into the blocking thread and outlives the connection
+        /// that took it whenever `getaddrinfo` takes longer than the connection
+        /// lasts. So a peer that opens connections one after another, takes
+        /// every slot each one offers and closes it, must still find the
+        /// server's total bounded by the pool, however many connections it
+        /// goes through.
+        #[test]
+        fn slots_held_past_their_connection_never_exceed_the_pool() {
+            const MAX_CONNECTIONS: u32 = 4;
+            let budget = ResolverBudget::new(MAX_CONNECTIONS);
+
+            let mut held = Vec::new();
+            for _ in 0..2 * (reserved_lookups(MAX_CONNECTIONS) + SHARED_LOOKUPS) {
+                let connection = budget.per_connection();
+                while let Some(slot) = ready(connection.acquire()) {
+                    held.push(slot);
+                }
+                drop(connection);
+            }
+
+            let issuable = blocking_pool_size(MAX_CONNECTIONS) - LOOKUP_FREE_THREADS;
+            assert!(
+                held.len() <= issuable,
+                "closed connections hold {} lookup slots against a pool sized for {issuable}",
+                held.len()
+            );
+
+            // Once those threads return, a new connection resolves again.
+            drop(held);
+            assert!(
+                ready(budget.per_connection().acquire()).is_some(),
+                "the allowance did not come back when the lookups finished"
+            );
+        }
+
         /// The pool has a thread for every slot the budget can hand out.
         #[test]
         fn the_pool_covers_every_slot_the_budget_can_hand_out() {
@@ -786,6 +871,15 @@ mod tests {
                     LOOKUP_FREE_THREADS,
                     "max_connections = {max_connections}"
                 );
+
+                // And the budget built from the same number hands out exactly
+                // those slots, whatever connections they belong to.
+                let budget = ResolverBudget::new(max_connections);
+                assert_eq!(
+                    budget.reserved.available_permits() + budget.shared.available_permits(),
+                    reserved + SHARED_LOOKUPS,
+                    "max_connections = {max_connections}"
+                );
             }
 
             // `max_connections = 0` is "no cap", so there is nothing to size
@@ -794,6 +888,11 @@ mod tests {
                 blocking_pool_size(0),
                 blocking_pool_size(u32::MAX),
                 "an uncapped server is sized like one at the ceiling"
+            );
+            assert_eq!(
+                ResolverBudget::new(0).reserved.available_permits(),
+                RESERVED_LOOKUP_CEILING,
+                "an uncapped server reserves like one at the ceiling"
             );
         }
     }

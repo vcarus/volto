@@ -1357,7 +1357,7 @@ mod tests {
             &config,
             loopback_pair(quinn::TransportConfig::default()).await.0,
             Arc::new(AtomicBool::new(false)),
-            &crate::net::ResolverBudget::new(),
+            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
             Arc::new(AtomicU64::new(0)),
             AuthGate::closed(),
         )
@@ -1383,7 +1383,7 @@ mod tests {
             &config,
             loopback_pair(quinn::TransportConfig::default()).await.0,
             Arc::new(AtomicBool::new(false)),
-            &crate::net::ResolverBudget::new(),
+            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
             Arc::new(AtomicU64::new(0)),
             AuthGate::closed(),
         )

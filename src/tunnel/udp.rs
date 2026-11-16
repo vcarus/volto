@@ -1890,7 +1890,7 @@ mod tests {
             &config,
             ours,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            &crate::net::ResolverBudget::new(),
+            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             crate::quic::AuthGate::closed(),
         );
