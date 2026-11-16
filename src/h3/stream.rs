@@ -112,7 +112,6 @@ impl Resolver {
             handle,
             send,
             frames,
-            header: BytesMut::with_capacity(2 * VARINT_MAX_LEN),
         };
 
         match read {
@@ -674,13 +673,25 @@ fn malformed(detail: impl Into<Cow<'static, str>>) -> Violation {
     Violation::stream(Code::H3_MESSAGE_ERROR, detail)
 }
 
+/// A frame header on its own, the first chunk of a two-chunk write.
+///
+/// A fresh buffer per frame. quinn keeps a chunk until the peer acknowledges
+/// it, so a buffer kept for reuse would still be shared at the next frame and
+/// would allocate again on every frame anyway.
+fn frame_header(kind: u64, payload_len: usize) -> Bytes {
+    let mut header = BytesMut::with_capacity(2 * VARINT_MAX_LEN);
+    // A byte count is a `usize` and a frame length is a `u64`; the widening is
+    // exact on both supported targets and has no `From` to express it.
+    #[allow(clippy::as_conversions)]
+    frame::put_header(&mut header, kind, payload_len as u64);
+    header.freeze()
+}
+
 /// A bidirectional request stream.
 pub struct Stream {
     handle: Handle,
     send: quinn::SendStream,
     frames: FrameReader,
-    /// Scratch for frame headers, reused rather than allocated per frame.
-    header: BytesMut,
 }
 
 impl Stream {
@@ -752,11 +763,7 @@ impl Stream {
             ),
         );
 
-        // A byte count is a `usize` and a frame length is a `u64`; the widening
-        // is exact on both supported targets and has no `From` to express it.
-        #[allow(clippy::as_conversions)]
-        frame::put_header(&mut self.header, frame::HEADERS, block.len() as u64);
-        let mut chunks = [self.header.split().freeze(), block.freeze()];
+        let mut chunks = [frame_header(frame::HEADERS, block.len()), block.freeze()];
         self.send.write_all_chunks(&mut chunks).await?;
         Ok(())
     }
@@ -843,10 +850,7 @@ impl Stream {
         frames.connect_completed();
 
         (
-            Writer {
-                send: self.send,
-                header: self.header,
-            },
+            Writer { send: self.send },
             Reader {
                 handle: self.handle,
                 frames,
@@ -902,8 +906,6 @@ impl std::error::Error for RespondError {
 /// The sending half of a split request stream.
 pub struct Writer {
     send: quinn::SendStream,
-    /// Scratch for DATA frame headers, reused across frames.
-    header: BytesMut,
 }
 
 impl Writer {
@@ -916,9 +918,9 @@ impl Writer {
     /// [`Self::send_data_in_place`], which sends one chunk.
     ///
     /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
-    /// flow-control credit can block this indefinitely, so both tunnels do
-    /// abandon it, under a teardown signal or a timeout. They may not finish
-    /// the stream afterwards. Abandoning the write part-way leaves
+    /// flow-control credit can block this indefinitely, so the UDP tunnel's
+    /// capsule path, its one caller, abandons it on a timeout. A caller may not
+    /// finish the stream afterwards. Abandoning the write part-way leaves
     /// the header written and the payload not, which is a truncated DATA frame,
     /// and RFC 9114 §7.1 says what that costs: "When a stream terminates
     /// cleanly, if the last frame on the stream was truncated, this MUST be
@@ -927,10 +929,7 @@ impl Writer {
     /// behind an abandoned send is what makes the truncation legal, and a FIN
     /// in its place is the connection error that sentence names.
     pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
-        // The same widening the HEADERS length above states.
-        #[allow(clippy::as_conversions)]
-        frame::put_header(&mut self.header, frame::DATA, data.len() as u64);
-        let mut chunks = [self.header.split().freeze(), data];
+        let mut chunks = [frame_header(frame::DATA, data.len()), data];
         self.send.write_all_chunks(&mut chunks).await?;
         Ok(())
     }
