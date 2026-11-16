@@ -357,24 +357,55 @@ impl CapsuleDecoder {
     }
 }
 
-/// Encodes a DATAGRAM capsule (RFC 9297 §3.5).
+/// The length of the header of a DATAGRAM capsule (RFC 9297 §3.5) that
+/// carries `payload_len` bytes under `context_id`: the type, the length and
+/// the Context ID, each a varint.
+pub fn datagram_header_len(context_id: u64, payload_len: usize) -> usize {
+    datagram::varint_len(CAPSULE_TYPE_DATAGRAM)
+        + datagram::varint_len(datagram_value_len(context_id, payload_len))
+        + datagram::varint_len(context_id)
+}
+
+/// The longest header [`datagram_header_len`] gives for a UDP payload under
+/// Context ID 0: one byte of type, four of length and one of Context ID. The
+/// length is four bytes because a value of up to 65528 bytes is past the
+/// two-byte varint's 16383.
+pub const UDP_DATAGRAM_HEADER_MAX: usize = 6;
+
+/// Writes the header of a DATAGRAM capsule into `header`, which is exactly
+/// [`datagram_header_len`] bytes long. The payload is not touched: a caller
+/// that already holds it behind room of its own writes the header in front of
+/// it and copies nothing.
 ///
-/// Used only when the peer has not enabled QUIC datagrams; see
-/// `tunnel::udp::Session::forward_to_client`.
-pub fn encode_datagram(context_id: u64, payload: &[u8]) -> Bytes {
-    let value_len = datagram::varint_len(context_id) + payload.len();
+/// # Panics
+///
+/// If `header` is shorter than [`datagram_header_len`].
+pub fn put_datagram_header(mut header: &mut [u8], context_id: u64, payload_len: usize) {
+    datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+    datagram::put_varint(&mut header, datagram_value_len(context_id, payload_len));
+    datagram::put_varint(&mut header, context_id);
+}
+
+/// The Capsule Length of a DATAGRAM capsule: the Context ID and the payload.
+fn datagram_value_len(context_id: u64, payload_len: usize) -> u64 {
+    let value_len = datagram::varint_len(context_id) + payload_len;
 
     // A byte count is a `usize` and a varint is a `u64`; the widening is exact
     // on both supported targets and has no `From` to express it.
     #[allow(clippy::as_conversions)]
     let wire_len = value_len as u64;
+    wire_len
+}
 
-    let mut buf = BytesMut::with_capacity(
-        datagram::varint_len(CAPSULE_TYPE_DATAGRAM) + datagram::varint_len(wire_len) + value_len,
-    );
-    datagram::put_varint(&mut buf, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut buf, wire_len);
-    datagram::put_varint(&mut buf, context_id);
+/// Encodes a DATAGRAM capsule (RFC 9297 §3.5) into a buffer of its own.
+///
+/// The server does not use this: `tunnel::udp` writes the header in front of a
+/// packet it already holds, with [`put_datagram_header`]. This form is for the
+/// tests and the fuzz targets, which build the capsules a client sends.
+pub fn encode_datagram(context_id: u64, payload: &[u8]) -> Bytes {
+    let header = datagram_header_len(context_id, payload.len());
+    let mut buf = BytesMut::zeroed(header);
+    put_datagram_header(&mut buf, context_id, payload.len());
     buf.put_slice(payload);
 
     buf.freeze()
@@ -737,6 +768,40 @@ mod tests {
     fn encoding_matches_the_wire_layout() {
         // Type 0x00, length 6 (1 byte context + 5 byte payload), context 0.
         assert_eq!(&encode_datagram(0, b"hello")[..], b"\x00\x06\x00hello");
+    }
+
+    /// A header written in front of a payload decodes as the capsule it
+    /// stands for, at both edges of each length the Capsule Length varint can
+    /// take.
+    #[test]
+    fn a_header_written_in_front_of_a_payload_decodes() {
+        for (payload_len, expected) in [
+            (0, 3),
+            (62, 3),
+            (63, 4),
+            (16382, 4),
+            (16383, 6),
+            (MAX_UDP_PAYLOAD, UDP_DATAGRAM_HEADER_MAX),
+        ] {
+            assert_eq!(
+                datagram_header_len(0, payload_len),
+                expected,
+                "{payload_len}"
+            );
+
+            let payload = vec![0x5a; payload_len];
+            let mut wire = BytesMut::zeroed(expected);
+            put_datagram_header(&mut wire, 0, payload_len);
+            wire.put_slice(&payload);
+
+            let mut decoder = CapsuleDecoder::new();
+            decoder.push(wire.freeze());
+            assert_eq!(
+                drain(&mut decoder).unwrap(),
+                vec![datagram_capsule(0, &payload)],
+                "{payload_len}"
+            );
+        }
     }
 
     /// Encodes a capsule of a type the decoder does not know.

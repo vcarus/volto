@@ -123,7 +123,7 @@ fn capsule_reply_is<'a>(
 /// # How the queue is made to stay full
 ///
 /// A session is parked whenever it is inside `forward_to_client`, and the
-/// capsule fallback is where that can last: `send_data` applies the client's
+/// capsule fallback is where that can last: its write applies the client's
 /// flow control, so a client that stops reading its own session's stream parks
 /// the server there for a whole `udp_session_timeout`. That session's loop is
 /// then not at its `select!` at all, so nothing takes anything off its inbound

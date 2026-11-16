@@ -36,7 +36,7 @@
 use std::cell::RefCell;
 use std::io::{IoSliceMut, Read};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use percent_encoding::percent_decode_str;
 use rustix::io::Errno;
 use socket2::SockRef;
@@ -61,40 +61,46 @@ pub const WELL_KNOWN_PREFIX: &str = "/.well-known/masque/udp/";
 /// for the same request, and [`super::route`] is the one place that reads it.
 pub(super) const CONNECT_UDP: &str = "connect-udp";
 
-/// Bytes of block each receive from the target is offered behind the datagram
-/// prefix.
+/// Bytes of block each receive from the target is offered behind the room in
+/// front of it.
 ///
 /// Every packet the QUIC datagram path can carry fits in it: a QUIC datagram
 /// travels inside one QUIC packet, and this server never lets a path's MTU
 /// exceed `config::MAX_MTU_UPPER_BOUND`, 1472 bytes. A longer packet continues
 /// into the receiving thread's overflow buffer and is copied out of it, which
-/// costs one copy on a packet the datagram path drops anyway and the capsule
-/// path copies anyway.
+/// costs one copy on a packet the datagram path drops anyway. On the capsule
+/// path that copy is the only one the packet costs.
 pub const RECV_WINDOW: usize = 2 * 1024;
 
 /// The block a session receives its target's packets into.
 ///
 /// # Why a block
 ///
-/// Each packet is received straight behind its datagram prefix, and the
-/// prefix plus the packet are cut off the block and handed to quinn as one
-/// `Bytes`, with no copy and no allocation of their own. The pieces quinn
+/// Each packet is received behind room for what it will be sent with: its
+/// datagram prefix, or on the capsule path a DATA frame header and a DATAGRAM
+/// capsule header (`CAPSULE_ROOM`). What goes in front is written into that
+/// room, and it is cut off the block with the packet and handed to quinn as
+/// one chunk, with no copy and no allocation of its own. The pieces quinn
 /// holds share the block with the part the session goes on receiving into,
 /// so a block is freed only when the last piece cut from it has been sent or
 /// evicted.
 ///
 /// # The arithmetic
 ///
-/// A block is replaced only once fewer than the prefix plus [`RECV_WINDOW`]
-/// bytes are left in it, at most 9 + 2048 = 2057, so at least 14327 bytes of
-/// it have been used by then. A packet that is sent uses its encoded length
-/// of block; one that is dropped uses none, because the next packet is
-/// received over it. quinn counts each queued datagram as its encoded length
-/// plus 32 bytes of bookkeeping against `datagram_send_buffer_size`, 1 MiB by
-/// default, and sends and evicts in queue order. So the blocks a session's
-/// queued pieces keep alive are at most its counted bytes over 14327, plus the
-/// oldest block, partly released, plus the one being received into: at most
-/// 16384 / 14327 = 1.15 times what quinn counts, plus two blocks per session.
+/// A block is replaced only once fewer than the room plus [`RECV_WINDOW`]
+/// bytes are left in it, at most 11 + 2048 = 2059, so at least 14325 bytes of
+/// it have been used by then. A packet that is sent uses the room plus its
+/// length; one that is dropped uses none, because the next packet is received
+/// over it. On the datagram path that is its encoded length, plus up to 9
+/// bytes when the session left `CAPSULE_ROOM` in front of it. quinn counts
+/// each queued datagram as its encoded length plus 32 bytes of bookkeeping
+/// against `datagram_send_buffer_size`, 1 MiB by default, and sends and evicts
+/// in queue order. So the blocks a session's queued pieces keep alive are at
+/// most its counted bytes over 14325, plus the oldest block, partly released,
+/// plus the one being received into: at most 16384 / 14325 = 1.15 times what
+/// quinn counts, plus two blocks per session. On the capsule path a frame uses
+/// at most 6 bytes of block more than it puts on the stream, and quinn bounds
+/// what it holds of the stream by the connection's send window.
 ///
 /// # What it costs at rest
 ///
@@ -117,13 +123,23 @@ thread_local! {
         RefCell::new(vec![0; MAX_UDP_PAYLOAD - RECV_WINDOW].into_boxed_slice());
 }
 
-/// The receive side of a session's target socket: each packet lands behind
-/// its datagram prefix in a [`RECV_BLOCK_SIZE`] block.
+/// Room in front of a packet for what the capsule path sends it with: a DATA
+/// frame header and a DATAGRAM capsule header, 5 + 6 = 11 bytes.
 ///
-/// The prefix is the session's Quarter Stream ID and the Context ID 0, so it
-/// is the same for every packet. It is written once per piece cut from the
-/// block: a receive that finds nothing, and a packet that is dropped, leave
-/// the prefix and the window in place for the next receive.
+/// It also holds every datagram prefix, at most 9 bytes, so a session that
+/// starts on the capsule path and moves to QUIC datagrams once the peer's
+/// SETTINGS arrive keeps its block.
+const CAPSULE_ROOM: usize = h3api::DATA_HEADER_ROOM + capsule::UDP_DATAGRAM_HEADER_MAX;
+
+/// The receive side of a session's target socket: each packet lands behind
+/// room for its prefix in a [`RECV_BLOCK_SIZE`] block.
+///
+/// The datagram prefix is the session's Quarter Stream ID and the Context ID
+/// 0, so it is the same for every packet. It is written once per piece cut
+/// from the block, at the end of the room: a receive that finds nothing, and
+/// a packet that is dropped, leave the prefix and the window in place for the
+/// next receive. A packet sent as a capsule has its headers written over the
+/// prefix instead, and is cut off the block the same way.
 ///
 /// A receive needs initialised bytes to write into, because a safe
 /// `IoSliceMut` is a `&mut [u8]`. The block is zero-filled once, when it is
@@ -132,25 +148,41 @@ thread_local! {
 struct PacketBlock {
     quarter_stream_id: u64,
     prefix_len: usize,
+    /// Bytes in front of each packet: `prefix_len` on a session that only
+    /// sends QUIC datagrams, [`CAPSULE_ROOM`] on one that may send capsules.
+    room: usize,
     /// What is left of the current block, all of it initialised. A piece is
-    /// cut off its front by [`Self::take`].
+    /// cut off its front by [`Self::take`] or [`Self::take_capsule`].
     block: BytesMut,
-    /// Whether `block` starts with the prefix, so that a packet may land
-    /// behind it in the next [`RECV_WINDOW`] bytes.
+    /// Whether `block` starts with the room and the prefix, so that a packet
+    /// may land behind them in the next [`RECV_WINDOW`] bytes.
     prepared: bool,
-    /// The packet in hand with its prefix, copied out, when it was longer than
-    /// the window.
-    spilled: Option<Bytes>,
+    /// The packet in hand with its room and prefix, copied out, when it was
+    /// longer than the window.
+    spilled: Option<BytesMut>,
     /// The payload length of the packet in hand.
     len: usize,
 }
 
 impl PacketBlock {
-    /// An empty receiver for `quarter_stream_id`'s session. Allocates nothing.
+    /// An empty receiver for `quarter_stream_id`'s session, for a session that
+    /// only sends QUIC datagrams. Allocates nothing.
     fn new(quarter_stream_id: u64) -> Self {
+        let prefix_len = datagram::udp_payload_prefix_len(quarter_stream_id);
+        Self::with_room(quarter_stream_id, prefix_len)
+    }
+
+    /// [`Self::new`] for a session that may send capsules.
+    fn with_capsule_room(quarter_stream_id: u64) -> Self {
+        Self::with_room(quarter_stream_id, CAPSULE_ROOM)
+    }
+
+    fn with_room(quarter_stream_id: u64, room: usize) -> Self {
+        let prefix_len = datagram::udp_payload_prefix_len(quarter_stream_id);
         Self {
             quarter_stream_id,
-            prefix_len: datagram::udp_payload_prefix_len(quarter_stream_id),
+            prefix_len,
+            room: room.max(prefix_len),
             block: BytesMut::new(),
             prepared: false,
             spilled: None,
@@ -169,13 +201,13 @@ impl PacketBlock {
             self.prepare();
         }
 
-        let prefix_len = self.prefix_len;
-        let window = &mut self.block[..prefix_len + RECV_WINDOW];
+        let room = self.room;
+        let window = &mut self.block[..room + RECV_WINDOW];
         let (len, spilled) = OVERFLOW.with_borrow_mut(|overflow| {
             let len = {
                 let socket = SockRef::from(socket);
                 let mut parts = [
-                    IoSliceMut::new(&mut window[prefix_len..]),
+                    IoSliceMut::new(&mut window[room..]),
                     IoSliceMut::new(overflow),
                 ];
                 (&*socket).read_vectored(&mut parts)?
@@ -183,10 +215,10 @@ impl PacketBlock {
             // Copied out before the call returns, so the overflow is free for
             // the next session on this thread.
             let spilled = (len > RECV_WINDOW).then(|| {
-                let mut whole = BytesMut::with_capacity(prefix_len + len);
+                let mut whole = BytesMut::with_capacity(room + len);
                 whole.extend_from_slice(window);
                 whole.extend_from_slice(&overflow[..len - RECV_WINDOW]);
-                whole.freeze()
+                whole
             });
             Ok::<_, std::io::Error>((len, spilled))
         })?;
@@ -196,8 +228,9 @@ impl PacketBlock {
         Ok(len)
     }
 
-    /// Writes the prefix at the front of what is left of the block, replacing
-    /// the block first if the prefix and the window no longer fit.
+    /// Writes the prefix at the end of the room at the front of what is left
+    /// of the block, replacing the block first if the room and the window no
+    /// longer fit.
     ///
     /// Called only while no prefix is in place. The block is cleared before the
     /// `reserve`, so no bytes of the old one are copied. A `reserve` on an
@@ -207,13 +240,13 @@ impl PacketBlock {
     /// fill a block gets.
     fn prepare(&mut self) {
         debug_assert!(!self.prepared, "the prefix is written once");
-        if self.block.len() < self.prefix_len + RECV_WINDOW {
+        if self.block.len() < self.room + RECV_WINDOW {
             self.block.clear();
             self.block.reserve(RECV_BLOCK_SIZE);
             self.block.resize(RECV_BLOCK_SIZE, 0);
         }
         datagram::put_udp_payload_prefix(
-            &mut &mut self.block[..self.prefix_len],
+            &mut &mut self.block[self.room - self.prefix_len..self.room],
             self.quarter_stream_id,
         );
         self.prepared = true;
@@ -227,23 +260,70 @@ impl PacketBlock {
     /// The packet in hand, without its prefix.
     fn payload(&self) -> &[u8] {
         match &self.spilled {
-            Some(whole) => &whole[self.prefix_len..],
-            None => &self.block[self.prefix_len..self.prefix_len + self.len],
+            Some(whole) => &whole[self.room..],
+            None => &self.block[self.room..self.room + self.len],
         }
     }
 
-    /// The packet in hand as an HTTP Datagram, cut off the block.
+    /// The packet in hand with the room in front of it, cut off the block, or
+    /// the copy of it when it was longer than the window.
     ///
-    /// Byte for byte what [`datagram::encode_udp_payload`] makes of
-    /// [`Self::payload`]. Called at most once per packet, and only for a packet
-    /// that is sent: the next receive writes a fresh prefix behind it.
-    fn take(&mut self) -> Bytes {
+    /// Called at most once per packet, and only for a packet that is sent: the
+    /// next receive writes a fresh prefix behind it. A spilled packet leaves
+    /// the block as it was, prefix and all.
+    fn cut(&mut self) -> BytesMut {
         if let Some(whole) = self.spilled.take() {
             return whole;
         }
 
         self.prepared = false;
-        self.block.split_to(self.prefix_len + self.len).freeze()
+        self.block.split_to(self.room + self.len)
+    }
+
+    /// The packet in hand as an HTTP Datagram, cut off the block.
+    ///
+    /// Byte for byte what [`datagram::encode_udp_payload`] makes of
+    /// [`Self::payload`].
+    fn take(&mut self) -> Bytes {
+        let skip = self.room - self.prefix_len;
+        let mut piece = self.cut();
+        piece.advance(skip);
+        piece.freeze()
+    }
+
+    /// The packet in hand as the block [`Writer::send_data_in_place`] takes:
+    /// [`h3api::DATA_HEADER_ROOM`] bytes of room, then a DATAGRAM capsule with
+    /// Context ID 0 carrying the packet. The capsule header is written in
+    /// front of the packet, which is not copied.
+    ///
+    /// A session whose block has no capsule room never sends a capsule: see
+    /// [`Session::run`]. Should one ask, the frame is built in a buffer of its
+    /// own, which costs a copy and not the session.
+    fn take_capsule(&mut self) -> BytesMut {
+        let header = capsule::datagram_header_len(datagram::CONTEXT_ID_UDP_PAYLOAD, self.len);
+        let front = h3api::DATA_HEADER_ROOM + header;
+
+        let Some(skip) = self.room.checked_sub(front) else {
+            let mut frame = BytesMut::zeroed(front);
+            capsule::put_datagram_header(
+                &mut frame[h3api::DATA_HEADER_ROOM..],
+                datagram::CONTEXT_ID_UDP_PAYLOAD,
+                self.len,
+            );
+            frame.extend_from_slice(self.payload());
+            return frame;
+        };
+
+        let room = self.room;
+        let len = self.len;
+        let mut piece = self.cut();
+        capsule::put_datagram_header(
+            &mut piece[room - header..room],
+            datagram::CONTEXT_ID_UDP_PAYLOAD,
+            len,
+        );
+        piece.advance(skip);
+        piece
     }
 }
 
@@ -597,9 +677,13 @@ impl Session<'_> {
     async fn run(&mut self) {
         let stream_id = self.stream_id;
 
-        // Each target packet lands behind its datagram prefix in a block, so
-        // the datagram path hands quinn a piece of the block rather than a
-        // copy. Nothing is allocated until the target first sends; after that
+        // Each target packet lands behind room for its prefix in a block, so
+        // both paths hand quinn a piece of the block rather than a copy. A
+        // session leaves room for a capsule unless it can never send one: the
+        // peer's SETTINGS_H3_DATAGRAM is never withdrawn once it has arrived,
+        // and the transport parameter behind `datagrams` is fixed at the
+        // handshake, so a session that starts on the datagram path stays on it.
+        // Nothing is allocated until the target first sends; after that
         // the session holds one `RECV_BLOCK_SIZE` block, 16 KiB, across every
         // wait. That block is one of the per-session terms in the memory
         // product `docs/configuration.md` gives for `max_connections` x
@@ -607,7 +691,11 @@ impl Session<'_> {
         // `INBOUND_QUEUE_DEPTH` in `crate::h3::connection`, and the capsule
         // decoder. See [`RECV_BLOCK_SIZE`] for what pieces still in quinn's
         // queue can add to it.
-        let mut packets = PacketBlock::new(self.quarter_stream_id);
+        let mut packets = if self.datagrams.is_some() && self.ctx.datagrams_allowed() {
+            PacketBlock::new(self.quarter_stream_id)
+        } else {
+            PacketBlock::with_capsule_room(self.quarter_stream_id)
+        };
 
         loop {
             // The deadline covers *waiting for* one of the three sources and
@@ -918,20 +1006,23 @@ impl Session<'_> {
         // not the oversize case in `DatagramPath::send`: there a datagram path
         // exists and RFC 9298 §6.1 says not to bypass it, whereas here there is
         // none, so capsules are the correct channel rather than a downgrade.
-        let encoded = capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, packets.payload());
+        // The capsule header goes into the room in front of the packet, so the
+        // frame is a piece of the block and the packet is not copied.
+        let frame = packets.take_capsule();
 
         // The one write in this session that can block for as long as the peer
-        // likes: `send_data` applies the peer's flow control, so a client that
-        // stops reading the stream parks it indefinitely. A write that has not
-        // completed within a whole idle timeout is treated as that client. The
-        // bound is on the write finishing, not on progress inside it, as with
-        // the TCP half-close bound that uses the same knob.
+        // likes: `send_data_in_place` applies the peer's flow control, so a
+        // client that stops reading the stream parks it indefinitely. A write
+        // that has not completed within a whole idle timeout is treated as that
+        // client. The bound is on the write finishing, not on progress inside
+        // it, as with the TCP half-close bound that uses the same knob.
         //
-        // It cannot simply be abandoned: `send_data` is not cancel-safe, and
-        // its rustdoc carries the rule. The tidy `finish()` this session
-        // otherwise ends with would FIN a truncated capsule, malformed by RFC
-        // 9297 §3.3 as well. So the stream is reset instead.
-        match tokio::time::timeout(self.ctx.stall_budget, self.writer.send_data(encoded)).await {
+        // It cannot simply be abandoned: `send_data_in_place` is not
+        // cancel-safe, and its rustdoc carries the rule. The tidy `finish()`
+        // this session otherwise ends with would FIN a truncated capsule,
+        // malformed by RFC 9297 §3.3 as well. So the stream is reset instead.
+        let sent = self.writer.send_data_in_place(frame);
+        match tokio::time::timeout(self.ctx.stall_budget, sent).await {
             Ok(Ok(())) => Step::Continue,
             Ok(Err(error)) => {
                 debug!(%error, "failed to send a DATAGRAM capsule");
@@ -1805,6 +1896,80 @@ mod tests {
         deliver(&mut packets, &ours, &target, &short).await;
         assert!(packets.spilled.is_none(), "a short packet is not copied");
         assert_eq!(packets.take(), datagram::encode_udp_payload(5, &short));
+    }
+
+    /// A packet sent as a capsule is cut off the block with both headers
+    /// written in front of it, and is not copied.
+    ///
+    /// The frame is what `Writer::send_data_in_place` takes: the DATA header
+    /// room, then the capsule `capsule::encode_datagram` would build. The
+    /// lengths are the edges of the one- and two-byte Capsule Length, and one
+    /// packet longer than the window, which is copied once on its way in and
+    /// not again. A QUIC datagram after them comes out of the same block.
+    #[tokio::test]
+    async fn a_capsule_is_cut_from_the_block() {
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::with_capsule_room(0x40);
+
+        for len in [1, 62, 63, 1200, 8000] {
+            let sent = payload(len, len);
+            deliver(&mut packets, &ours, &target, &sent).await;
+            let at = packets.payload().as_ptr();
+            let spilled = packets.spilled.is_some();
+
+            let frame = packets.take_capsule();
+            let header = capsule::datagram_header_len(datagram::CONTEXT_ID_UDP_PAYLOAD, len);
+            assert_eq!(
+                &frame[h3api::DATA_HEADER_ROOM..],
+                &capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, &sent)[..],
+                "{len}"
+            );
+            assert_eq!(spilled, len > RECV_WINDOW, "{len}");
+            assert!(
+                std::ptr::eq(frame[h3api::DATA_HEADER_ROOM + header..].as_ptr(), at),
+                "the packet of {len} bytes was copied into the frame"
+            );
+        }
+
+        let last = packets.block.as_ptr();
+        let next = payload(9, 100);
+        deliver(&mut packets, &ours, &target, &next).await;
+        let piece = packets.take();
+        assert_eq!(piece, datagram::encode_udp_payload(0x40, &next));
+        assert!(
+            std::ptr::eq(
+                piece.as_ptr(),
+                last.wrapping_add(CAPSULE_ROOM - packets.prefix_len)
+            ),
+            "the datagram after the capsules did not come out of the same block"
+        );
+    }
+
+    /// A block with room for the datagram prefix only still sends a capsule
+    /// correctly, from a copy, and keeps the packet's bytes for the next one.
+    ///
+    /// No session asks this of such a block; see `Session::run`.
+    #[tokio::test]
+    async fn a_capsule_from_a_block_without_room_is_copied() {
+        let (ours, target) = socket_pair().await;
+        let mut packets = PacketBlock::new(0x40);
+
+        let sent = payload(3, 300);
+        deliver(&mut packets, &ours, &target, &sent).await;
+        let at = packets.payload().as_ptr();
+
+        let frame = packets.take_capsule();
+        assert_eq!(
+            &frame[h3api::DATA_HEADER_ROOM..],
+            &capsule::encode_datagram(datagram::CONTEXT_ID_UDP_PAYLOAD, &sent)[..]
+        );
+
+        let next = payload(4, 100);
+        deliver(&mut packets, &ours, &target, &next).await;
+        assert!(
+            std::ptr::eq(packets.payload().as_ptr(), at),
+            "the packet after the copied one landed somewhere other than where it was"
+        );
     }
 
     /// The window and the overflow together hold the largest UDP payload, and

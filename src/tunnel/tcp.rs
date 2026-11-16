@@ -851,7 +851,8 @@ async fn target_to_client(
                         // part-way, so the DATA frame on the wire is truncated
                         // and only a RESET_STREAM behind it stops that
                         // truncation reading as a complete response.
-                        // `Writer::send_data` quotes RFC 9114 §7.1 on this.
+                        // `Writer::send_data_in_place` quotes RFC 9114 §7.1 on
+                        // this.
                         writer.reset(h3api::REQUEST_CANCELLED);
                         abort_target(tcp_read.as_ref());
                         // Nobody reads this: the other pump returned when the

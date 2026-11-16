@@ -29,9 +29,8 @@
 //! is never copied to put a header in front of it. A relay block is read in
 //! behind [`frame::DATA_HEADER_ROOM`] bytes of room, the header is written into
 //! that room, and the frame reaches quinn as one chunk of the allocation it was
-//! read into ([`Writer::send_data_in_place`]). A payload that arrives as a
-//! ready `Bytes` goes out as two chunks, a header and the payload
-//! ([`Writer::send_data`]). The wire bytes are the same either way.
+//! read into ([`Writer::send_data_in_place`]). Both tunnels send their body
+//! this way: the TCP relay and the UDP capsule path.
 
 use std::borrow::Cow;
 
@@ -918,31 +917,6 @@ pub struct Writer {
 }
 
 impl Writer {
-    /// Sends body data, applying the peer's flow-control backpressure.
-    ///
-    /// The frame header and the payload go out as two chunks of one write, so
-    /// the payload is never copied: what arrives here as a `Bytes` is what
-    /// quinn queues. A caller that reads its payload into a buffer of its own
-    /// can leave room for the header in front of it and use
-    /// [`Self::send_data_in_place`], which sends one chunk.
-    ///
-    /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
-    /// flow-control credit can block this indefinitely, so the UDP tunnel's
-    /// capsule path, its one caller, abandons it on a timeout. A caller may not
-    /// finish the stream afterwards. Abandoning the write part-way leaves
-    /// the header written and the payload not, which is a truncated DATA frame,
-    /// and RFC 9114 §7.1 says what that costs: "When a stream terminates
-    /// cleanly, if the last frame on the stream was truncated, this MUST be
-    /// treated as a connection error of type H3_FRAME_ERROR. Streams that
-    /// terminate abruptly may be reset at any point in a frame." So a reset
-    /// behind an abandoned send is what makes the truncation legal, and a FIN
-    /// in its place is the connection error that sentence names.
-    pub async fn send_data(&mut self, data: Bytes) -> Result<(), StreamError> {
-        let mut chunks = [frame_header(frame::DATA, data.len()), data];
-        self.send.write_all_chunks(&mut chunks).await?;
-        Ok(())
-    }
-
     /// Sends `block` as one DATA frame, applying the peer's flow-control
     /// backpressure.
     ///
@@ -950,13 +924,20 @@ impl Writer {
     /// payload that is not empty; [`frame::seal_data`] writes the header into
     /// that room. The frame then reaches quinn as one chunk that shares the
     /// buffer the payload was read into: no second `Bytes`, no scratch block
-    /// for the header, and no copy. The wire bytes are the ones
-    /// [`Self::send_data`] would produce for the same payload.
+    /// for the header, and no copy.
     ///
-    /// Not cancel-safe, for the reason [`Self::send_data`] gives. The frame is
-    /// one chunk here, but quinn may take a prefix of it and wait on the rest,
-    /// so an abandoned call can still leave a truncated DATA frame, and only a
-    /// reset behind it makes that legal.
+    /// Not cancel-safe, unlike [`Reader::recv_data`]. A peer that grants no
+    /// flow-control credit can block this indefinitely, so both tunnels abandon
+    /// it on a timeout in the states where nothing else ends the wait. A caller
+    /// that does may not finish the stream afterwards. quinn may take a prefix
+    /// of the frame and wait on the rest, so an abandoned call can leave a
+    /// truncated DATA frame, and RFC 9114 §7.1 says what that costs: "When a
+    /// stream terminates cleanly, if the last frame on the stream was
+    /// truncated, this MUST be treated as a connection error of type
+    /// H3_FRAME_ERROR. Streams that terminate abruptly may be reset at any
+    /// point in a frame." So a reset behind an abandoned send is what makes the
+    /// truncation legal, and a FIN in its place is the connection error that
+    /// sentence names.
     ///
     /// # Panics
     ///
@@ -979,7 +960,7 @@ impl Writer {
     /// ends.
     ///
     /// The counterpart of [`Reader::reset_by_peer`] on the sending half.
-    /// [`Self::send_data`] already reports a `STOP_SENDING` as the error a
+    /// [`Self::send_data_in_place`] already reports a `STOP_SENDING` as the error a
     /// write fails with, but only to a caller that is writing. A CONNECT tunnel
     /// spends much of its life not writing: with the client's half of the
     /// tunnel finished and a target that has yet to send anything, the pump

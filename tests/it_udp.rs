@@ -1180,10 +1180,10 @@ async fn forwarded_packets_postpone_the_session_timeout() {
 /// Only the capsule fallback can reach this: with QUIC datagrams the target's
 /// packets bypass the request stream and its flow control entirely. On the
 /// fallback they do not, so a client that stops reading parks the server inside
-/// `send_data` with no way to make progress.
+/// its capsule write with no way to make progress.
 ///
 /// The idle timeout used to wrap that write along with the rest of the loop
-/// step, and `send_data` is not cancel-safe: the cancelled write left a partial
+/// step, and that write is not cancel-safe: the cancelled write left a partial
 /// DATA frame in the buffer, and the tidy `finish()` that followed FINned a
 /// truncated capsule — malformed by RFC 9297 §3.3. It took the whole connection
 /// down with it rather than just this stream, which is why a second session is
