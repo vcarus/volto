@@ -84,16 +84,17 @@ const VARINT_MAX_LEN: usize = 8;
 /// in that cost.
 ///
 /// A decoded section is a `message::Fields`: a vector of 32-byte entries with an
-/// allocation per name. The 32 bytes a field of §4.2.2 model that per-field
-/// cost, so a section at this limit costs about 65 KiB once decoded. The cost
-/// is about the same whichever way the peer spends the limit
+/// allocation per name and per non-empty value. The 32 bytes a field of §4.2.2
+/// model that per-field cost, so a section at this limit costs about 65 KiB
+/// once decoded. The cost is about the same whichever way the peer spends the
+/// limit
 /// (`tests/it_bounds.rs::a_tunnel_holds_its_requests_field_section_for_its_whole_life`).
 ///
 /// It is held for as long as the request is: `crate::conn::handle_request` keeps
 /// the decoded [`message::Request`] for the whole life of the tunnel it opened,
 /// not merely until the target has been named. So the multiplier is
-/// `max_targets_per_conn` times `max_connections`: about 19 MiB per connection
-/// and 4.8 GiB across a server at the shipped defaults. While requests are
+/// `max_targets_per_conn` times `max_connections`: about 16 MiB per connection
+/// and 4.1 GiB across a server at the shipped defaults. While requests are
 /// being refused rather than served, the multiplier is `max_streams_bidi`
 /// instead, and each refusal write is bounded by one `max_idle_timeout`.
 pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
@@ -103,19 +104,22 @@ pub const MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
 ///
 /// [`MAX_FIELD_SECTION_SIZE`] bounds one frame. This bounds their sum, and the
 /// two are reached by different peers. A client held to the per-frame bound may
-/// still open every request stream its transport parameters allow (1024 by
-/// default), announce a 64 KiB HEADERS frame on each and stop one byte short
-/// of finishing any of them. That breaks no rule on any single stream, and the
-/// frames must be held because they cannot be acted on piecewise. Without this
-/// bound that is 64 MiB of a connection's memory, from a peer that has not
-/// authenticated, for as long as the transport keeps the connection alive.
+/// still open every request stream its transport parameters allow, announce a
+/// 64 KiB HEADERS frame on each and stop one byte short of finishing any of
+/// them. That breaks no rule on any single stream, and the frames must be held
+/// because they cannot be acted on piecewise. Before its first request is
+/// authenticated a connection may open 16 request streams
+/// (`quic::INITIAL_BIDI_STREAMS`, D98), which is 1 MiB at that size. After it,
+/// `max_streams_bidi` allows 1024 by default, and without this bound that is
+/// 64 MiB of a connection's memory for as long as the transport keeps the
+/// connection alive.
 /// Multiplied by `limits.max_connections` it is the whole of the machine. D76
 /// bounds how long one stream may wait; this bounds how much waiting costs.
 ///
 /// A megabyte is sixteen frames of the largest size this server will buffer at
 /// all. A CONNECT request carrying Basic credentials is under 300 bytes, so all
 /// 1024 request streams the transport allows could be mid-HEADERS at once and
-/// still use a tenth of this.
+/// still use under 300 KiB, 29 percent of this.
 ///
 /// What is counted is the announced length of the frames being buffered *at one
 /// moment*. Sixteen concurrent field sections of the largest advertised size
