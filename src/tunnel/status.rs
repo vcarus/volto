@@ -20,7 +20,7 @@ use crate::h3api::{self, FieldValue, Fields, RespondError, Status, Stream};
 
 /// An RFC 9209 proxy error type, for the `Proxy-Status` field of a refusal.
 ///
-/// Only registered types (RFC 9209 §2.3.2) appear here. There is no registered
+/// Only registered types (RFC 9209 §2.3) appear here. There is no registered
 /// type for "that port is closed by policy", so a denied port is reported as
 /// `http_request_denied`, the registry's general "denied per policy" type,
 /// rather than stretching `destination_ip_prohibited` to cover something that is
@@ -213,7 +213,7 @@ impl ProxyError {
         }
     }
 
-    /// The HTTP status code RFC 9209 §2.3.2 recommends for this error type.
+    /// The HTTP status code RFC 9209 §2.3 recommends for this error type.
     ///
     /// The registry pairs each type with a status, and following it costs
     /// nothing while telling an operator reading a log which failure it was: a
@@ -541,7 +541,7 @@ mod tests {
         }
     }
 
-    /// RFC 9209 §2.3.2 pairs each registered type with a recommended status.
+    /// RFC 9209 §2.3 pairs each registered type with a recommended status.
     /// Every pairing here is the registry's, except the documented D11 choice of
     /// 403 for a destination the policy refuses.
     #[test]
