@@ -3028,6 +3028,22 @@ mod tests {
         assert_eq!(shared.lock().early.len(), 1);
     }
 
+    /// Only Context ID 0 is held. A datagram under any other Context ID is
+    /// dropped at once even for a stream that may still claim its id, because
+    /// no extension that could register that Context ID exists here (RFC 9298
+    /// §5, the comment in [`Shared::deliver_at`]).
+    #[test]
+    fn an_unknown_context_id_is_never_held() {
+        let shared = Arc::new(Shared::default());
+        shared.deliver(datagram(5, 9, b"unknown context"));
+
+        assert!(shared.lock().early.is_empty());
+        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 1);
+
+        let mut inbound = shared.register_datagrams(5).expect("a free id");
+        assert_eq!(inbound.try_recv(), None, "nothing was held for the claim");
+    }
+
     /// What is held for one session is handed to that session and no other.
     #[test]
     fn a_held_datagram_reaches_only_its_own_session() {
