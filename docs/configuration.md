@@ -84,9 +84,13 @@ allocated when the target first sends and kept from then on; an inbound datagram
 queue of 64 entries, each at most the 1472-byte `max_udp_payload_size` this
 server advertises, so about 92 KiB; and the capsule decoder on the request
 stream, which buffers one DATAGRAM capsule's value until all of it has arrived
-and so tops out at 64 KiB. That is roughly 172 KiB per session, 43 MiB per
-connection at `max_targets_per_conn = 256`, and about 10.75 GiB across a server
-saturated at both defaults. Lowering either limit lowers it proportionally. It
+and so tops out at 64 KiB. On Linux, where quinn receives packets in GRO
+batches of up to 64, the first datagram in an empty queue is not copied out of
+its batch and can keep that batch's buffer of up to 92 KiB alive, so the queue
+tops out around 183 KiB. That is roughly 263 KiB per session, 66 MiB per
+connection at `max_targets_per_conn = 256`, and about 16.4 GiB across a server
+saturated at both defaults; without GRO it is 172 KiB, 43 MiB and 10.75 GiB.
+Lowering either limit lowers it proportionally. It
 is a ceiling rather than a resting size: the queue is only full while a client
 sends faster than the proxy forwards, and the capsule buffer only fills for a
 client that leaves a capsule unfinished. A packet longer than 2 KiB is received
@@ -102,7 +106,7 @@ block once the tunnel has relayed anything: reads are cut from one block until
 too little of it is left to offer a full-sized window, and that is also why the
 first 16 KiB is let go after the first read. So the saturation product for TCP
 is `max_connections` × `max_targets_per_conn` × 64 KiB = 4 GiB at the defaults,
-beside the 10.75 GiB of the UDP one. What a tunnel holds beyond that one block is
+beside the 16.4 GiB of the UDP one. What a tunnel holds beyond that one block is
 bounded by quinn's per-connection send window (`SEND_WINDOW` = 10 MB). That
 window counts bytes retained from what this server writes rather than bytes
 still unacknowledged: the pieces cut from a block share it, and each goes on

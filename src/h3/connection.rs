@@ -235,7 +235,7 @@ impl Shared {
         let delivered = self
             .lock()
             .get(&decoded.quarter_stream_id)
-            .map(|inbound| inbound.try_send(decoded.payload).is_ok());
+            .map(|inbound| enqueue(inbound, decoded.payload));
 
         match delivered {
             Some(true) => {}
@@ -290,6 +290,25 @@ impl Shared {
     }
 }
 
+/// Puts one payload on a session's queue, and says whether it fit.
+///
+/// The payload is a slice of the buffer quinn received its whole batch into,
+/// up to 64 packets with GRO, and a slice keeps that buffer allocated. So a
+/// payload that will wait behind others is copied, at most
+/// `max_udp_payload_size` bytes. One that goes into an empty queue is passed on
+/// as it is: the copy would cost every datagram of a session that keeps up, and
+/// the queue then holds at most one slice. A full queue refuses the payload
+/// without a copy. The caller holds the routing lock, the only way into the
+/// queue, so the capacity read here is still true at the send, except that the
+/// session may take a payload in between, which only makes room.
+fn enqueue(inbound: &mpsc::Sender<Bytes>, payload: Bytes) -> bool {
+    match inbound.capacity() {
+        0 => false,
+        free if free == inbound.max_capacity() => inbound.try_send(payload).is_ok(),
+        _ => inbound.try_send(Bytes::copy_from_slice(&payload)).is_ok(),
+    }
+}
+
 /// Inbound datagrams buffered per session before packets start being dropped.
 ///
 /// Bounded on purpose: UDP allows loss, whereas an unbounded queue would let a
@@ -307,6 +326,13 @@ impl Shared {
 /// so a datagram never exceeds the `max_udp_payload_size` this server
 /// advertises (quinn's default, 1472 bytes), although RFC 9298 §5 permits a
 /// 65527-byte UDP payload. At `INBOUND_QUEUE_DEPTH` = 64 that is about 92 KiB.
+/// That holds because `enqueue` copies a payload that waits behind
+/// others: quinn hands out each one as a slice of the buffer its whole receive
+/// batch arrived in, which is up to 64 packets of 1472 bytes with GRO on Linux,
+/// and the slice keeps that buffer allocated. A payload that goes into an empty
+/// queue is not copied, so one queued payload can keep one batch buffer, at most
+/// 94208 bytes, alive. The worst case of the queue is therefore 63 copies and
+/// one batch, about 183 KiB.
 ///
 /// The second is the block a running session receives its *target's* packets
 /// into ([`crate::tunnel`]'s UDP path), 16 KiB per session. It is allocated
@@ -325,10 +351,12 @@ impl Shared {
 /// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`
 /// and `a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk`).
 ///
-/// A session therefore costs about 172 KiB, and the worst case is that times
-/// `max_targets_per_conn` times `max_connections`. With the shipped defaults
-/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is about 43 MiB
-/// per connection and 10.75 GiB across a server saturated at both limits.
+/// A session therefore costs about 263 KiB at worst, and the worst case of a
+/// server is that times `max_targets_per_conn` times `max_connections`. With the
+/// shipped defaults (`max_targets_per_conn` = 256, `max_connections` = 256) that
+/// is about 66 MiB per connection and 16.4 GiB across a server saturated at both
+/// limits. Without GRO, as on macOS, a batch is one packet and the session's
+/// figure is about 172 KiB.
 /// Lowering either limit lowers it proportionally.
 ///
 /// All three are released by dropping what owns them, on every path a session
@@ -1546,7 +1574,7 @@ fn missing_settings() -> Violation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
+    use bytes::{BufMut, Bytes, BytesMut};
 
     fn settings(datagrams: bool) -> Item {
         Item::Frame(Frame::Settings(frame::Settings { datagrams }))
@@ -2156,6 +2184,48 @@ mod tests {
             reopened.inbound.try_recv().is_err(),
             "a new session must not inherit a finished one's datagrams"
         );
+    }
+
+    /// A datagram that waits behind others in a session's queue is a copy, and
+    /// one that goes into an empty queue is passed on as it is.
+    ///
+    /// A datagram's payload is a slice of the buffer quinn received its whole
+    /// batch into, and a slice keeps that buffer allocated. With GRO on Linux a
+    /// batch is up to 64 packets, so a queue of slices could hold up to 64
+    /// batches. The copy is what keeps the queue at `INBOUND_QUEUE_DEPTH`
+    /// payloads, and passing the first one uncopied is what keeps the copy off
+    /// the path where the session keeps up.
+    #[tokio::test]
+    async fn a_datagram_that_waits_is_copied_out_of_its_batch() {
+        /// A receive batch whose first packet is a datagram for session 1, and
+        /// that datagram decoded as a slice of it.
+        fn batch(payload: &[u8]) -> (Bytes, datagram::Datagram) {
+            let packet = datagram::encode(1, datagram::CONTEXT_ID_UDP_PAYLOAD, payload);
+            let mut batch = BytesMut::from(&packet[..]);
+            batch.put_bytes(0, 16 * 1024);
+            let batch = batch.freeze();
+            let decoded = datagram::decode(batch.slice(..packet.len())).expect("well formed");
+            (batch, decoded)
+        }
+
+        let shared = Arc::new(Shared::default());
+        let mut inbound = shared.register_datagrams(1).expect("a free id");
+
+        let (first_batch, first) = batch(b"first");
+        let (second_batch, second) = batch(b"second");
+        shared.deliver(first);
+        shared.deliver(second);
+
+        assert!(
+            !first_batch.is_unique(),
+            "a datagram delivered to an empty queue must not be copied"
+        );
+        assert!(
+            second_batch.is_unique(),
+            "a datagram queued behind another keeps its whole receive batch alive"
+        );
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"first".as_slice()));
+        assert_eq!(inbound.try_recv().as_deref(), Some(b"second".as_slice()));
     }
 
     /// The same claim over a churn of sessions: the table returns to its
