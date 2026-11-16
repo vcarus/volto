@@ -183,6 +183,12 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
             code = (code << 1) | u32::from((byte >> shift) & 1);
             bits += 1;
 
+            // A guard that no input reaches. The code lengths in `CODES` meet
+            // the Kraft equality exactly, so the code is complete: every run
+            // of `MAX_CODE_BITS` bits starts with exactly one code, and `bits`
+            // goes back to 0 at each one. It stays because the tables below are
+            // indexed by `bits`, and an error is a better answer than a panic
+            // if `CODES` were ever edited.
             if bits > MAX_CODE_BITS {
                 return Err(failed("no Huffman code matches these bits"));
             }
@@ -246,6 +252,18 @@ mod tests {
             .chunks(2)
             .map(|pair| u8::from_str_radix(&pair.iter().collect::<String>(), 16).expect("hex byte"))
             .collect()
+    }
+
+    /// The code is complete: the code lengths meet the Kraft equality, so
+    /// the sum of 2^-length over every entry is exactly 1. That is what makes
+    /// the "no code matches" guard in `decode` unreachable.
+    #[test]
+    fn the_code_lengths_meet_the_kraft_equality() {
+        let sum: u64 = CODES
+            .iter()
+            .map(|(_, length)| 1u64 << (MAX_CODE_BITS - usize::from(*length)))
+            .sum();
+        assert_eq!(sum, 1u64 << MAX_CODE_BITS);
     }
 
     /// The table is only usable if it really is a canonical prefix code, and a
