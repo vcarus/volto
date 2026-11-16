@@ -221,12 +221,14 @@ impl fmt::Display for Violation {
 
 /// Error affecting the whole HTTP/3 connection.
 ///
-/// The variants are the four endings that need telling apart downstream: two of
-/// them are ordinary goodbyes ([`crate::h3api::benign_close`]), and two are
-/// faults. Everything the QUIC layer reports that is neither an application
-/// close nor the idle timeout stays in [`ConnectionError::Transport`] with
-/// quinn's own error inside it, so nothing is flattened away before an operator
-/// sees it.
+/// The variants are the four endings that need telling apart downstream.
+/// [`crate::h3api::benign_close`] grades them by variant and code, not by
+/// variant alone: an `ApplicationClose` with code 0 or `H3_NO_ERROR`, the
+/// `Timeout`, and a `Local` with `H3_NO_ERROR` are ordinary goodbyes, and every
+/// other case is a fault. Everything the QUIC layer reports that is neither an
+/// application close nor the idle timeout stays in
+/// [`ConnectionError::Transport`] with quinn's own error inside it, so nothing
+/// is flattened away before an operator sees it.
 #[derive(Debug, Clone)]
 pub enum ConnectionError {
     /// The peer closed the connection with an HTTP/3 error code.
@@ -236,7 +238,9 @@ pub enum ConnectionError {
     },
     /// The peer went silent and the QUIC idle timeout expired.
     Timeout,
-    /// This endpoint closed the connection because the peer broke a rule.
+    /// This endpoint closed the connection: because the peer broke a rule, for
+    /// a reason of this endpoint's own, or, with `H3_NO_ERROR`, quietly,
+    /// because a peer that never authenticated went silent (D76).
     Local(Violation),
     /// Anything else the QUIC layer reported, including our own local close.
     Transport(quinn::ConnectionError),
@@ -246,10 +250,11 @@ impl From<quinn::ConnectionError> for ConnectionError {
     /// Keeps exactly the two cases [`crate::h3api::benign_close`] grades on, and
     /// takes the peer's prose apart from its verdict on the way.
     ///
-    /// `LocallyClosed` deliberately stays in `Transport`: this server closes a
-    /// connection only for a reason worth reporting (a protocol violation, or
-    /// the authentication-failure budget), so it must not be filed alongside a
-    /// peer's clean goodbye.
+    /// `LocallyClosed` deliberately stays in `Transport`. Every close this
+    /// server makes on purpose, the quiet idle close included, is reported as
+    /// `Local` by the code that made it, with its own code. A `LocallyClosed`
+    /// that reaches this conversion carries no such record, so it must not be
+    /// filed alongside a peer's clean goodbye.
     ///
     /// # The reason phrase
     ///
