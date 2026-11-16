@@ -59,19 +59,21 @@ struct Slot {
 ///
 /// The lock is a `std::sync::Mutex` and is never held across an await, only
 /// long enough to walk a map that has at most `max_connections` entries.
-#[derive(Clone)]
+///
+/// One per server, and never cloned. `slots` is behind an `Arc` because every
+/// [`Registration`] holds it as well; the counter is read only here.
 pub(super) struct Roster {
     /// Keyed by accept sequence, so the first entry is the oldest connection.
     slots: Arc<Mutex<BTreeMap<u64, Slot>>>,
     /// The sequence number the next registration takes.
-    next: Arc<AtomicU64>,
+    next: AtomicU64,
 }
 
 impl Roster {
     pub(super) fn new() -> Self {
         Self {
             slots: Arc::new(Mutex::new(BTreeMap::new())),
-            next: Arc::new(AtomicU64::new(0)),
+            next: AtomicU64::new(0),
         }
     }
 
