@@ -287,12 +287,12 @@ const QUEUED_DATAGRAM_COST: usize = 2 * std::mem::size_of::<bytes::Bytes>();
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Built once per connection and held in an `Arc`, so sharing it with a request
-/// costs one refcount bump rather than a copy of eighteen fields. Deliberately
+/// costs one refcount bump rather than a copy of every field. Deliberately
 /// not [`Clone`]: a second whole `Context` would be a second view of the same
 /// connection and nothing else. That one `Arc` is also the only sharing the
-/// members need, so they are stored inline. The two that keep an `Arc` of their
-/// own, `peer_datagrams` and `tunnels`, do so because something outside this
-/// connection's request handling holds them as well.
+/// members need, so they are stored inline. The three that keep an `Arc` of
+/// their own, `peer_datagrams`, `tunnels` and `authenticated`, do so because
+/// something outside this connection's request handling holds them as well.
 ///
 /// The UDP-specific members are here rather than in [`udp`] because a connection
 /// owns them regardless of which tunnel type ends up using them: both are
