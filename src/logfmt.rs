@@ -188,9 +188,9 @@ fn truncated(head: &str, whole: usize) -> String {
 /// times" is misleading.
 ///
 /// So the schedule doubles: occurrence 1 is reported, then 2, 4, 8, and so on,
-/// each carrying the running total. A scan of every port on a host is 17 lines
+/// each carrying the running total. A scan of every port on a host is 16 lines
 /// instead of 65535, the first of them is written immediately, and the last one
-/// *says* it was 65536. That is more than an unsampled log tells anybody, since
+/// *says* it was 32768. That is more than an unsampled log tells anybody, since
 /// counting identical lines is left to whoever reads the journal. The cost is
 /// that the count between reports is only known to within a factor of two
 /// until the next one arrives.
@@ -210,11 +210,11 @@ impl Sampler {
     /// Records an occurrence: `Some(total)` when this one is to be reported.
     ///
     /// `Relaxed` because the only thing ordered against is the counter itself:
-    /// two threads racing here get two distinct totals and at most one of them
-    /// is a power of two, which is all the schedule asks. Wrapping is
-    /// unreachable (a `u64` of refusals is longer than the hardware lasts) and
-    /// harmless if it happened: zero is not a power of two, so the pass is
-    /// quiet rather than wrong.
+    /// two threads racing here get two distinct totals, and each is reported
+    /// exactly when it is a power of two, which is all the schedule asks.
+    /// Wrapping is unreachable (a `u64` of refusals is longer than the hardware
+    /// lasts) and harmless if it happened: zero is not a power of two, so the
+    /// pass is quiet rather than wrong.
     pub fn record(&self) -> Option<u64> {
         let total = self.0.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
         total.is_power_of_two().then_some(total)
@@ -520,6 +520,6 @@ mod tests {
         let sampler = Sampler::new();
         let reported = (0..65_536).filter(|_| sampler.record().is_some()).count();
 
-        assert_eq!(reported, 17, "every port on a host, in seventeen lines");
+        assert_eq!(reported, 17, "65536 occurrences, in seventeen lines");
     }
 }

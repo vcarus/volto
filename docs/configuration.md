@@ -625,8 +625,9 @@ running total, and the ones in between at DEBUG. Both are refusals a client can
 repeat as fast as it can open request streams, and journald's rate limiting
 counts lines, so one line per request would let a peer decide how much of the
 journal is left to record anything else in, including the lines about it. A
-scan of every port on a host is 17 lines rather than 65535, the first arrives
-as promptly as it ever did, and the last one says how large the scan was.
+scan of every port on a host is 16 lines rather than 65535, the first arrives
+as promptly as it ever did, and the last one says how large the scan was to
+within a factor of two.
 
 ## Checking a file without starting the server
 
