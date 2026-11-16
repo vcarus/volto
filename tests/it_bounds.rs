@@ -99,14 +99,56 @@ impl alloc::Record for Tallying {
 #[global_allocator]
 static GLOBAL: alloc::PassThrough<Tallying> = alloc::PassThrough::new();
 
-/// Serialises the measured windows.
+/// Serialises the tests of this binary.
 ///
 /// The tally is one counter for the whole process, so two measurements running
 /// at once would weigh each other. `cargo test` runs the tests of a binary
-/// concurrently, so this is the only thing keeping them apart. `tokio`'s mutex
-/// rather than the standard library's, because it is held across the awaits the
-/// measurement is made of.
-static SCALES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// concurrently, so this is the only thing keeping them apart. Every test in
+/// this file takes it, through [`on_the_scales`] or [`take_the_scales`].
+///
+/// A test holds it from before its runtime is built until after that runtime
+/// has been dropped. With `#[tokio::test]` the guard was dropped inside the
+/// async body, so the next test took the scales while the previous runtime was
+/// still dropping the server's tasks and ending its threads. On the dev host, a
+/// probe that read the tally for 200 ms right after a test took the scales saw
+/// it move in 62 of 90 readings over 30 runs, by as much as -6.8 MiB. With the
+/// runtime dropped first, the largest movement in 90 readings was 2 KiB, and
+/// never below zero. The three tests below that run a server measured the same
+/// figures both ways, because their server start and handshake took longer
+/// than the teardown; this arrangement removes the dependence on that timing.
+///
+/// The standard library's mutex rather than `tokio`'s, because it is held
+/// outside any runtime.
+static SCALES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`SCALES`], waiting for the test that holds them.
+///
+/// A test that panicked while holding them poisons the mutex. Its runtime was
+/// still dropped before the guard, during the unwind, so the scales are as
+/// quiet as after a test that passed, and the poison is ignored.
+fn take_the_scales() -> std::sync::MutexGuard<'static, ()> {
+    SCALES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs `test` on a multi-thread runtime of its own while holding [`SCALES`].
+///
+/// The scales are given up only after the runtime has been dropped. Dropping a
+/// `tokio` runtime drops every task still spawned on it, which includes the
+/// server's endpoint, connections and tunnels, and then joins its worker and
+/// blocking threads. So nothing this test started is still allocating or
+/// freeing when the next test's window opens. The guard is declared first, so a
+/// panic in `test` drops the runtime before the guard as well.
+fn on_the_scales(test: impl Future<Output = ()>) {
+    let _scales = take_the_scales();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("build the test's runtime");
+    runtime.block_on(test);
+    drop(runtime);
+}
 
 /// Runs `body` with the tally armed and reports what was still live at its end.
 ///
@@ -127,9 +169,9 @@ async fn while_holding<F: Future>(body: F) -> (F::Output, i64) {
 /// it left live.
 ///
 /// For a measurement with no runtime under it: allocations and frees on other
-/// threads are not counted, so a test still tearing down elsewhere does not move
-/// the figure. The caller still holds [`SCALES`], because the process-wide tally
-/// of [`while_holding`] would count this thread too.
+/// threads, such as the test harness's own, are not counted. The caller still
+/// holds [`SCALES`], because the process-wide tally of [`while_holding`] would
+/// count this thread too.
 fn while_holding_here<T>(body: impl FnOnce() -> T) -> (T, i64) {
     HERE_LIVE.store(0, Ordering::Relaxed);
     HERE_ARMED.set(true);
@@ -240,60 +282,60 @@ fn padded_connect_request(authority: &str) -> Request {
 /// which is about 65 KiB per tunnel for the field section alone, from a request
 /// of about 65 KB on the wire. The wire size is the second thing this weighs:
 /// see [`PADDING_VALUE`].
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tunnel_holds_its_requests_field_section_for_its_whole_life() {
-    let _scales = SCALES.lock().await;
+#[test]
+fn a_tunnel_holds_its_requests_field_section_for_its_whole_life() {
+    on_the_scales(async {
+        let server = TestServer::start().await;
+        let target = spawn_echo_target().await.to_string();
 
-    let server = TestServer::start().await;
-    let target = spawn_echo_target().await.to_string();
+        let mut plain_client = H3Client::connect(&server).await;
+        let (_plain_tunnels, plain_held) = while_holding(async {
+            let mut tunnels = Vec::with_capacity(TUNNELS);
+            for _ in 0..TUNNELS {
+                tunnels.push(open_tcp_tunnel(&mut plain_client, &target).await);
+            }
+            tunnels
+        })
+        .await;
 
-    let mut plain_client = H3Client::connect(&server).await;
-    let (_plain_tunnels, plain_held) = while_holding(async {
-        let mut tunnels = Vec::with_capacity(TUNNELS);
-        for _ in 0..TUNNELS {
-            tunnels.push(open_tcp_tunnel(&mut plain_client, &target).await);
-        }
-        tunnels
-    })
-    .await;
+        let mut padded_client = H3Client::connect(&server).await;
+        let (_padded_tunnels, padded_held) = while_holding(async {
+            let mut tunnels = Vec::with_capacity(TUNNELS);
+            for index in 0..TUNNELS {
+                let (response, stream) =
+                    send_and_respond(&mut padded_client, padded_connect_request(&target)).await;
+                assert_eq!(
+                    response.status,
+                    Status::OK,
+                    "tunnel {index} of the padded phase was refused"
+                );
+                tunnels.push(stream);
+            }
+            tunnels
+        })
+        .await;
 
-    let mut padded_client = H3Client::connect(&server).await;
-    let (_padded_tunnels, padded_held) = while_holding(async {
-        let mut tunnels = Vec::with_capacity(TUNNELS);
-        for index in 0..TUNNELS {
-            let (response, stream) =
-                send_and_respond(&mut padded_client, padded_connect_request(&target)).await;
-            assert_eq!(
-                response.status,
-                Status::OK,
-                "tunnel {index} of the padded phase was refused"
-            );
-            tunnels.push(stream);
-        }
-        tunnels
-    })
-    .await;
+        let per_tunnel = (padded_held - plain_held) / TUNNELS as i64;
 
-    let per_tunnel = (padded_held - plain_held) / TUNNELS as i64;
-
-    // The floor is what keeps this about anything at all: a server that did not
-    // keep the section would pass the ceiling trivially, and so would a phase
-    // that failed to open its tunnels. A quarter of the arithmetic -- 1900
-    // entries of 32 bytes is 59 KiB before a single name is allocated -- is
-    // clear of any noise between two otherwise identical phases.
-    assert!(
-        per_tunnel > 16 * 1024,
-        "padded tunnels held only {per_tunnel} bytes more each than bare ones \
+        // The floor is what keeps this about anything at all: a server that did not
+        // keep the section would pass the ceiling trivially, and so would a phase
+        // that failed to open its tunnels. A quarter of the arithmetic -- 1900
+        // entries of 32 bytes is 59 KiB before a single name is allocated -- is
+        // clear of any noise between two otherwise identical phases.
+        assert!(
+            per_tunnel > 16 * 1024,
+            "padded tunnels held only {per_tunnel} bytes more each than bare ones \
          ({padded_held} against {plain_held} for {TUNNELS} tunnels): the field \
          section is not reaching the tunnel at all, so this measures nothing"
-    );
+        );
 
-    assert!(
-        per_tunnel < HELD_PER_TUNNEL_CEILING,
-        "each tunnel holds {per_tunnel} bytes of decoded request for its whole \
+        assert!(
+            per_tunnel < HELD_PER_TUNNEL_CEILING,
+            "each tunnel holds {per_tunnel} bytes of decoded request for its whole \
          life, past the {HELD_PER_TUNNEL_CEILING} this server accounts for \
          ({padded_held} against {plain_held} for {TUNNELS} tunnels)"
-    );
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -355,78 +397,80 @@ fn datagram_capsule_header(length: u64) -> Bytes {
 /// 65 KiB apiece, which is the value buffer allocated once at the declared
 /// length. While the decoder grew its buffer by doubling, this was about
 /// 78 KiB apiece.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_session_holds_one_unfinished_capsule_and_no_more() {
-    let _scales = SCALES.lock().await;
+#[test]
+fn a_session_holds_one_unfinished_capsule_and_no_more() {
+    on_the_scales(async {
+        let server = TestServer::start().await;
+        let echo = spawn_udp_echo_target().await;
+        let mut client = H3Client::connect(&server).await;
 
-    let server = TestServer::start().await;
-    let echo = spawn_udp_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+        let mut sessions = Vec::with_capacity(SESSIONS);
+        for index in 0..SESSIONS {
+            let (quarter, mut stream) = open_udp_session(&mut client, &server, echo).await;
 
-    let mut sessions = Vec::with_capacity(SESSIONS);
-    for index in 0..SESSIONS {
-        let (quarter, mut stream) = open_udp_session(&mut client, &server, echo).await;
-
-        // Proof that this session reads its capsule stream: a complete capsule
-        // is forwarded, and its echo comes back as a datagram.
-        let payload = format!("capsule {index}");
-        stream
-            .send_data(volto::capsule::encode_datagram(0, payload.as_bytes()))
-            .await
-            .unwrap_or_else(|error| panic!("session {index} would not take a capsule: {error}"));
-        let echoed = common::recv_datagram(&client.quic).await;
-        assert_eq!(
-            (echoed.quarter_stream_id, &echoed.payload[..]),
-            (quarter, payload.as_bytes()),
-            "session {index} must forward a complete capsule and carry its echo back"
-        );
-
-        sessions.push(stream);
-    }
-
-    // One byte short of the whole value, on every session.
-    let stall: Bytes = {
-        let mut out = BytesMut::new();
-        out.put_slice(&datagram_capsule_header(MAX_CAPSULE_VALUE));
-        out.put_bytes(0x5a, MAX_CAPSULE_VALUE as usize - 1);
-        out.freeze()
-    };
-    let sent = SESSIONS as i64 * (MAX_CAPSULE_VALUE as i64 - 1);
-
-    let (sessions, held) = while_holding(async {
-        for (index, session) in sessions.iter_mut().enumerate() {
-            session
-                .send_data(stall.clone())
+            // Proof that this session reads its capsule stream: a complete capsule
+            // is forwarded, and its echo comes back as a datagram.
+            let payload = format!("capsule {index}");
+            stream
+                .send_data(volto::capsule::encode_datagram(0, payload.as_bytes()))
                 .await
                 .unwrap_or_else(|error| {
-                    panic!("session {index} would not take the stall: {error}")
+                    panic!("session {index} would not take a capsule: {error}")
                 });
+            let echoed = common::recv_datagram(&client.quic).await;
+            assert_eq!(
+                (echoed.quarter_stream_id, &echoed.payload[..]),
+                (quarter, payload.as_bytes()),
+                "session {index} must forward a complete capsule and carry its echo back"
+            );
+
+            sessions.push(stream);
         }
 
-        // `send_data` returns once quinn has the bytes, not once the server has
-        // read them, and an unfinished capsule produces no answer to wait for --
-        // that being the point of it. So the tally is the signal.
-        settle(|live| live >= sent).await;
-        sessions
-    })
-    .await;
+        // One byte short of the whole value, on every session.
+        let stall: Bytes = {
+            let mut out = BytesMut::new();
+            out.put_slice(&datagram_capsule_header(MAX_CAPSULE_VALUE));
+            out.put_bytes(0x5a, MAX_CAPSULE_VALUE as usize - 1);
+            out.freeze()
+        };
+        let sent = SESSIONS as i64 * (MAX_CAPSULE_VALUE as i64 - 1);
 
-    let per_session = held / SESSIONS as i64;
+        let (sessions, held) = while_holding(async {
+            for (index, session) in sessions.iter_mut().enumerate() {
+                session
+                    .send_data(stall.clone())
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("session {index} would not take the stall: {error}")
+                    });
+            }
 
-    assert!(
-        held >= sent,
-        "the sessions took only {held} bytes of the {sent} they were sent: the \
+            // `send_data` returns once quinn has the bytes, not once the server has
+            // read them, and an unfinished capsule produces no answer to wait for --
+            // that being the point of it. So the tally is the signal.
+            settle(|live| live >= sent).await;
+            sessions
+        })
+        .await;
+
+        let per_session = held / SESSIONS as i64;
+
+        assert!(
+            held >= sent,
+            "the sessions took only {held} bytes of the {sent} they were sent: the \
          capsule stream is not being read, so this measures nothing"
-    );
+        );
 
-    assert!(
-        per_session < HELD_PER_SESSION_CEILING,
-        "each session holds {per_session} bytes of unfinished capsule, past the \
+        assert!(
+            per_session < HELD_PER_SESSION_CEILING,
+            "each session holds {per_session} bytes of unfinished capsule, past the \
          {HELD_PER_SESSION_CEILING} that one maximal capsule can account for"
-    );
+        );
 
-    // Held to here, so the reading above was taken with every session alive.
-    drop(sessions);
+        // Held to here, so the reading above was taken with every session alive.
+        drop(sessions);
+    });
 }
 
 /// Bytes in the one stream chunk the next test feeds the decoder: about the
@@ -447,10 +491,12 @@ const LARGE_CHUNK: usize = 2 * 1024 * 1024;
 /// kept that whole buffer alive behind the unfinished tail, about 2 MiB, for the
 /// life of the session.
 ///
-/// The scales above count every thread, and a window of this binary can open
-/// while the runtime of the test before it is still being torn down, whose frees
-/// show up as negative growth. This test has no runtime and runs on one thread,
-/// so it weighs only that thread: see [`while_holding_here`].
+/// This test has no runtime and runs on one thread, so it weighs only that
+/// thread: see [`while_holding_here`]. It still takes [`SCALES`], because the
+/// process-wide tally of another test would count this thread too. Before
+/// [`on_the_scales`] it also needed the per-thread tally to keep out the frees
+/// of a runtime still being torn down, which measured between -0.6 and
+/// -1.06 MiB of growth here.
 ///
 /// # Measured
 ///
@@ -459,7 +505,7 @@ const LARGE_CHUNK: usize = 2 * 1024 * 1024;
 /// into its own buffer held about 2 MiB here.
 #[test]
 fn a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk() {
-    let _scales = SCALES.blocking_lock();
+    let _scales = take_the_scales();
 
     let (decoder, held) = while_holding_here(|| {
         let complete = volto::capsule::encode_datagram(0, &[0x5a; 1000]);
@@ -564,46 +610,46 @@ async fn close_session(session: &mut ClientStream) {
 /// the same run leaves 1.9 MiB behind (4.5 MiB while a session still read its
 /// target into a 64 KiB buffer), so the allowance below is about twice the
 /// measurement and a quarter of a leak.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_connection_keeps_nothing_for_the_sessions_it_has_closed() {
-    let _scales = SCALES.lock().await;
+#[test]
+fn a_connection_keeps_nothing_for_the_sessions_it_has_closed() {
+    on_the_scales(async {
+        let server = TestServer::start().await;
+        let echo = spawn_udp_echo_target().await;
+        let mut client = H3Client::connect(&server).await;
 
-    let server = TestServer::start().await;
-    let echo = spawn_udp_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
+        // One session before the window, so what the window weighs is the churn
+        // rather than whatever a connection allocates for its first session.
+        let (quarter, mut first) = open_udp_session(&mut client, &server, echo).await;
+        udp_round_trip(&client, quarter, b"warm-up").await;
+        close_session(&mut first).await;
+        drop(first);
 
-    // One session before the window, so what the window weighs is the churn
-    // rather than whatever a connection allocates for its first session.
-    let (quarter, mut first) = open_udp_session(&mut client, &server, echo).await;
-    udp_round_trip(&client, quarter, b"warm-up").await;
-    close_session(&mut first).await;
-    drop(first);
+        let allowed = CHURNED_SESSIONS as i64 * KEPT_PER_CLOSED_SESSION;
 
-    let allowed = CHURNED_SESSIONS as i64 * KEPT_PER_CLOSED_SESSION;
+        let ((), kept) = while_holding(async {
+            for index in 0..CHURNED_SESSIONS {
+                let (quarter, mut session) = open_udp_session(&mut client, &server, echo).await;
+                let answer = udp_round_trip(&client, quarter, b"round trip").await;
+                assert_eq!(
+                    &answer[..],
+                    b"round trip",
+                    "session {index} did not reach its target"
+                );
+                close_session(&mut session).await;
+            }
 
-    let ((), kept) = while_holding(async {
-        for index in 0..CHURNED_SESSIONS {
-            let (quarter, mut session) = open_udp_session(&mut client, &server, echo).await;
-            let answer = udp_round_trip(&client, quarter, b"round trip").await;
-            assert_eq!(
-                &answer[..],
-                b"round trip",
-                "session {index} did not reach its target"
-            );
-            close_session(&mut session).await;
-        }
+            // The last session's FIN reaches the client a few instructions before
+            // the drops that follow it, so the tally is given a moment to catch up
+            // rather than being read on the heels of the loop.
+            settle(|live| live < allowed).await;
+        })
+        .await;
 
-        // The last session's FIN reaches the client a few instructions before
-        // the drops that follow it, so the tally is given a moment to catch up
-        // rather than being read on the heels of the loop.
-        settle(|live| live < allowed).await;
-    })
-    .await;
-
-    assert!(
-        kept < allowed,
-        "{CHURNED_SESSIONS} sessions opened and closed left {kept} bytes behind, \
+        assert!(
+            kept < allowed,
+            "{CHURNED_SESSIONS} sessions opened and closed left {kept} bytes behind, \
          past the {allowed} a connection is allowed to keep for them: something \
          a session held is outliving it"
-    );
+        );
+    });
 }
