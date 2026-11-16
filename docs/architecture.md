@@ -262,9 +262,9 @@ need, including names that would have resolved from `/etc/hosts` without a query
 
 So the pool is rationed in two tiers, in `net.rs`:
 
-- **One reserved lookup slot per connection**, which nothing else can take. No
-  number of hostile connections can starve a connection outright; at worst its
-  lookups run one at a time — a lookup queued for the shared allowance keeps its
+- **One reserved lookup slot per connection**, which no other connection can use. While
+  the connections that hold reserved lookups are live, no number of hostile
+  ones can starve a connection outright; at worst its lookups run one at a time — a lookup queued for the shared allowance keeps its
   claim on the reserved slot too, and takes it the moment it frees. A reserved
   lookup also holds one permit of a server-wide reserved allowance, one per
   connection the pool is sized for, until its thread returns. So a lookup whose
@@ -423,7 +423,7 @@ silent:
   still in flight — but a value that cannot be a stream ID at all (above 2⁶⁰-1,
   or a datagram too short to parse one) closes the whole QUIC connection with
   H3_DATAGRAM_ERROR (0x33), which RFC 9297 §2.1 states as a MUST.
-  A value above every Quarter Stream ID claimed so far on the connection is the exception to the drop: its request may still be on its way or still being authenticated, so the datagram is held for at most 333 ms, with at most `EARLY_DATAGRAMS` = 8 of them on the connection at once, and the session's claim moves what was held for it onto its queue ahead of anything later. The hold sits under the same lock as the routing table, so a claim and a hold cannot interleave.
+  A value above every Quarter Stream ID claimed so far on the connection is the exception to the drop: its request may still be on its way or still being authenticated, so the datagram is held, with at most `EARLY_DATAGRAMS` = 8 of them on the connection at once. A claim within 333 ms takes it; after that it is discarded the next time the hold is used, or with the connection, and the session's claim moves what was held for it onto its queue ahead of anything later. The hold sits under the same lock as the routing table, so a claim and a hold cannot interleave.
 - **Context ID**, a varint at the head of the payload (RFC 9298 §5). `0` means a
   raw UDP payload; anything else is an extension. An unknown Context ID is
   dropped silently — never a connection error — and so is a truncated one, which

@@ -246,9 +246,10 @@ impl ResolverBudget {
 /// worth asking:
 ///
 /// * **One reserved slot**, held by this connection alone and by nothing else.
-///   No number of hostile connections can take it away, so a connection is never
-///   starved outright: at worst its lookups run one at a time. This is the
-///   guarantee; the shared allowance is only ever an optimisation on top of it.
+///   No other connection can use it, so among live connections none is starved
+///   outright: at worst its lookups run one at a time. This is the guarantee,
+///   with the one limit the next sentences state; the shared allowance is only
+///   ever an optimisation on top of it.
 ///   A reserved-slot lookup also holds one permit of the server's reserved
 ///   allowance ([`reserved_lookups`]) until its thread returns. While the
 ///   connections that hold those permits are live, there is one for each of

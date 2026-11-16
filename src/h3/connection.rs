@@ -33,8 +33,9 @@
 //! A datagram can arrive before its session has claimed it: a client may send
 //! the first payload in the same flight as the request, and the request still
 //! has to be decoded and authenticated. Such a datagram is held, a few per
-//! connection and for a fraction of a second, and handed to the session when it
-//! claims its Quarter Stream ID ([`EARLY_DATAGRAMS`], D114).
+//! connection, and handed to the session if it claims its Quarter Stream ID
+//! within a fraction of a second ([`EARLY_DATAGRAMS`], [`EARLY_DATAGRAM_HOLD`],
+//! D114).
 //!
 //! Only the receiving half is here. A datagram goes *out* on the
 //! [`quinn::Connection`] itself, which the UDP sessions hold anyway for the
@@ -467,6 +468,13 @@ pub const EARLY_DATAGRAMS: usize = 8;
 /// tunnelled QUIC client resends its Initial itself, so a longer hold would
 /// gain nothing.
 ///
+/// This is how long a held datagram stays deliverable, not how long its memory
+/// is kept. Expiry runs when the hold is touched, by another early datagram or
+/// by a claim, and never on a timer, so on a connection where neither happens
+/// an expired copy stays until the connection is dropped. What bounds the
+/// memory in time is therefore the connection's own life, which for a peer
+/// that has not authenticated is the bound `crate::conn` sets (D76).
+///
 /// A fixed figure rather than the connection's RTT estimate: the estimate is
 /// quinn's, read per datagram, and the bound has to hold for a peer that has
 /// not authenticated whatever its path does.
@@ -680,8 +688,11 @@ fn enqueue(inbound: &mpsc::Sender<Bytes>, payload: Bytes) -> bool {
 ///
 /// Beside the sessions, each connection has one hold for datagrams that arrive
 /// before their session has claimed them ([`EARLY_DATAGRAMS`]): at most 8
-/// copies of at most 1472 bytes, about 11.5 KiB, each for at most
-/// [`EARLY_DATAGRAM_HOLD`] and never past the connection. It does not grow
+/// copies of at most 1472 bytes, about 11.5 KiB. A copy is handed over only
+/// within [`EARLY_DATAGRAM_HOLD`] of its arrival; an unclaimed one is discarded
+/// when the hold is next touched after that, and at the latest with the
+/// connection, so the memory is bounded by the connection's life and not by
+/// the hold time. It does not grow
 /// with the number of sessions, and it is reachable before authentication, so
 /// it is part of what an unauthenticated peer can make a connection hold:
 /// about 2.9 MiB across the default `max_connections` of 256.

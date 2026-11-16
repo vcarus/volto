@@ -422,8 +422,9 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
     let server = Server::bind(Arc::new(config))?;
 
     // The streams were created at the top, so a signal that arrived since then
-    // is waiting in them, and a `SIGTERM` that arrived during startup fires the
-    // trigger before the accept loop takes its first connection.
+    // is waiting in them. A `SIGTERM` that arrived during startup fires the
+    // trigger as soon as its watcher task first runs, which may be shortly
+    // after the accept loop has started: the stop is graceful either way.
     #[cfg(unix)]
     {
         tokio::spawn(watch_for_signals(
