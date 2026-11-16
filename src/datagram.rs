@@ -151,7 +151,9 @@ pub fn encode(quarter_stream_id: u64, context_id: u64, payload: &[u8]) -> Bytes 
 
 /// The number of bytes [`encode`] will produce.
 ///
-/// Used to decide whether a packet fits in a QUIC datagram before copying it.
+/// Only tests call it, like [`encode`] itself: they size packets against
+/// quinn's datagram limit with it. The server's send path writes the prefix in
+/// place and measures the packet it built (`tunnel::udp`'s `PacketBlock`).
 pub fn encoded_len(quarter_stream_id: u64, context_id: u64, payload_len: usize) -> usize {
     varint_len(quarter_stream_id) + varint_len(context_id) + payload_len
 }
