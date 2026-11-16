@@ -9,6 +9,9 @@ for CONNECT-UDP, but it leaves two holes this suite covers:
 - masque-go owns the whole datagram encoding, so it cannot send a datagram
   with a non-zero Context ID and watch it being ignored; here the Context ID
   prefix is applied by hand, which is exactly what makes that test possible.
+- masque-go sends datagrams only on a session its Dial has already opened, so
+  it cannot send one before the request it belongs to; aioquic can name a
+  stream that does not exist yet.
 
 aioquic shares no code, no QUIC stack and no reading of the RFCs with either
 volto or quic-go, so agreement here is a third independent vote.
@@ -398,6 +401,42 @@ async def test_unknown_context_id_is_dropped_silently():
         transport.close()
 
 
+async def test_datagram_before_its_request_is_delivered():
+    """RFC 9297 §2.1 lets the receiver hold a datagram whose request stream
+    does not exist yet, and volto does: a datagram sent before the request's
+    HEADERS reaches the target once the session is open, sent once and never
+    repeated."""
+    transport, host, port = await start_tagged_udp_echo(0xE1)
+    try:
+        async with proxy_connection() as client:
+            # RFC 9297 §2.1.1: no DATAGRAM frame before the server's SETTINGS
+            # have arrived with SETTINGS_H3_DATAGRAM = 1.
+            for _ in range(int(EXCHANGE_TIMEOUT / 0.01)):
+                if client._h3.received_settings is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert client._h3.received_settings is not None, "no SETTINGS from the server"
+
+            # The stream the next request will open, named before it exists.
+            stream_id = client._quic.get_next_available_stream_id()
+            client.send_udp(stream_id, b"sent-before-the-request")
+            # Long enough that the datagram is routed before the stream
+            # exists, and well inside volto's hold time of 333 ms.
+            await asyncio.sleep(0.05)
+
+            opened = await client.connect_udp(host, port)
+            assert opened == stream_id, f"the request opened {opened}, not {stream_id}"
+
+            reply = await client.recv_udp(stream_id)
+            want = bytes([0xE1]) + b"sent-before-the-request"
+            assert reply == want, (
+                f"{reply!r} != {want!r} (a datagram sent before its request must "
+                "be held until the session is open, then forwarded)"
+            )
+    finally:
+        transport.close()
+
+
 async def test_missing_credentials_are_challenged():
     """Credentials are checked before routing; omitting them draws a 407."""
     if not os.environ.get("VOLTO_USER"):
@@ -433,7 +472,7 @@ async def test_denied_target_is_refused_with_proxy_status():
 
 
 # Written out rather than derived, because the order is the reading order: the
-# two tunnel kinds first, then the two isolation checks, then the three edge
+# two tunnel kinds first, then the two isolation checks, then the four edge
 # cases. `check_tests_are_accounted_for` is what makes the hand-written list
 # safe.
 TESTS = [
@@ -442,6 +481,7 @@ TESTS = [
     test_udp_session_round_trips,
     test_udp_sessions_do_not_cross_talk,
     test_unknown_context_id_is_dropped_silently,
+    test_datagram_before_its_request_is_delivered,
     test_missing_credentials_are_challenged,
     test_denied_target_is_refused_with_proxy_status,
 ]
