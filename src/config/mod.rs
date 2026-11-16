@@ -49,7 +49,9 @@
 //! unsafe deployment:
 //!
 //! * an absent or empty `[auth].users` **disables authentication**, and
-//! * `[security]` defaults deny private address space but nothing else.
+//! * `[security]` defaults deny private address space and port 25, end an
+//!   unanswered UDP session after 64 packets and close a connection at the
+//!   fifth authentication failure, but leave the SNI gate open.
 //!
 //! [`Config::warnings`] reports the first of those at startup.
 //!
@@ -1281,7 +1283,7 @@ pub(crate) mod tests {
     /// file is a promise to the operator reading it, and the value beside the key
     /// is what that operator uncomments and gets.
     ///
-    /// The file ships three keys uncommented. Two are its own deviations, for the
+    /// The file ships four keys uncommented. Two are its own deviations, for the
     /// reasons it gives beside them:
     ///
     /// * `initial_mtu = 1242`, which "keeps the handshake inside a 1270-byte IPv4
@@ -1299,10 +1301,13 @@ pub(crate) mod tests {
     /// default moved to 1436 together (D81). It stays a live key so that the
     /// installed file states the ceiling.
     ///
-    /// Listing them is what stops a fourth arriving quietly. Every other field is
+    /// The fourth, `level = "info"` in `[log]`, is live and equal to the default
+    /// as well.
+    ///
+    /// Listing them is what stops a fifth arriving quietly. Every other field is
     /// asserted equal to its default, each deviation is asserted to still *be* a
-    /// deviation, and the live key at its default is asserted to stay equal to
-    /// it. A default moved onto a deviation, or away from the live key, fails
+    /// deviation, and each live key at its default is asserted to stay equal to
+    /// it. A default moved onto a deviation, or away from a live key, fails
     /// here rather than silently making the paragraphs above untrue.
     #[test]
     fn the_example_documents_every_key_and_pins_every_default() {
@@ -1408,8 +1413,10 @@ pub(crate) mod tests {
     ///
     /// `0` is the escape hatch that hands the size back to the operating system,
     /// so it has to survive parsing untouched; every other value is judged by the
-    /// kernel at bind time and reported as a startup warning if it was capped,
-    /// which is why there is no range check here to test.
+    /// kernel at bind time and reported as a startup warning if it was capped.
+    /// The one range check, the 32-bit ceiling of the socket API, is tested by
+    /// `socket_buffer_sizes_above_the_32_bit_api_limit_are_rejected` in
+    /// `validate.rs`.
     #[test]
     fn socket_buffer_sizes_parse_and_zero_is_accepted() {
         let cfg = parse("[limits]\nsocket_recv_buffer = 4194304\nsocket_send_buffer = 1048576");
@@ -1764,7 +1771,7 @@ pub(crate) mod tests {
     ///
     /// [`any_limits`] folded into the accepted space rather than filtered down
     /// to it: a filter would reject essentially every case, since a value is
-    /// only legal when all ten of its independently generated fields are, while
+    /// only legal when all fifteen of its independently generated fields are, while
     /// clamping maps the whole invalid region onto the boundaries — which is
     /// where a transport parameter is most likely to be the one that cannot be
     /// built. The folding is a second statement of the ranges `validate`
