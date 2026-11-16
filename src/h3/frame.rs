@@ -265,6 +265,8 @@ const MAX_SKIPPED_FRAMES: u32 = 4096;
 /// on both, so the read-ahead adds nothing to what such a peer can make this
 /// server hold: a request stream becomes a tunnel only once its request has
 /// passed the credentials check (`crate::conn`) and been answered with a 2xx.
+/// A refused request is stopped first, and [`FrameReader::stop`] releases the
+/// one chunk its stream holds while the refusal is written.
 /// [`BufferBudget`] and `MAX_SKIPPED_FRAMES` apply only to streams that read one
 /// chunk at a time, since a tunnel buffers no frame and counts no skip.
 pub const READ_AHEAD_CHUNKS: usize = 32;
@@ -975,16 +977,20 @@ impl FrameReader {
 
     /// Asks the peer to stop sending on this stream.
     ///
-    /// The read-ahead is emptied as well. quinn discards a stopped stream's
-    /// unread bytes, and the chunks in the read-ahead are bytes this reader has
-    /// not decoded yet, so they go the same way: a stopped stream hands out
-    /// nothing it had not already decoded when it was stopped.
+    /// The read-ahead is emptied as well, and so is the rest of the chunk the
+    /// decoder is working through. quinn discards a stopped stream's unread
+    /// bytes, and those are bytes this reader has not decoded yet, so they go
+    /// the same way: a stopped stream hands out nothing it had not already
+    /// decoded when it was stopped. Dropping them also releases the chunk,
+    /// which can be as large as the stream receive window, while the stream
+    /// lives on to carry a refusal.
     pub fn stop(&mut self, code: Code) {
         // Fails only if the stream is already closed, which needs no reporting.
         let _ = self.recv.stop(super::varint(code));
         if let Some(ahead) = &mut self.ahead {
             ahead.clear();
         }
+        self.decoder.chunk = Bytes::new();
     }
 
     /// Whether quinn has more of this stream to give, without taking it.
@@ -2706,8 +2712,9 @@ mod tests {
         );
     }
 
-    /// `stop` drops what the read-ahead holds, as quinn drops a stopped
-    /// stream's unread bytes.
+    /// `stop` drops what the read-ahead holds and the rest of the chunk the
+    /// decoder is working through, as quinn drops a stopped stream's unread
+    /// bytes.
     #[tokio::test]
     async fn stopping_a_stream_empties_its_read_ahead() {
         let (wire, _) = loopback::numbered_frames(48, 1000);
@@ -2720,7 +2727,8 @@ mod tests {
         );
         reader.stop(Code::H3_REQUEST_CANCELLED);
 
-        // What is left is at most the rest of the chunk the decoder holds.
+        // Nothing is left: not the read-ahead, and not the rest of the chunk
+        // the first item was cut from.
         let mut left = 0;
         while let Some(item) = reader.try_next().expect("decodes") {
             let Item::Data(data) = item else {
@@ -2728,9 +2736,13 @@ mod tests {
             };
             left += data.len();
         }
-        assert!(
-            left < 2 * 1024,
+        assert_eq!(
+            left, 0,
             "{left} bytes were still handed out after the stream was stopped"
+        );
+        assert!(
+            reader.decoder.chunk.is_empty(),
+            "the decoder keeps its chunk"
         );
         let ahead = reader.ahead.as_ref().expect("a tunnel reads ahead");
         assert!(ahead.slots.iter().all(Bytes::is_empty));
