@@ -103,9 +103,10 @@ fn redact_quoted(message: &str) -> String {
 /// closing quote is `\\`'s second half, so the skip lands on that quote rather
 /// than over it.
 ///
-/// A backtick segment is `{}`-rendered and has no escapes at all, so it ends at
-/// the next backtick. Honouring escapes there would make a backslash in a value
-/// skip the character after it.
+/// A backtick segment is `{}`-rendered and has no escapes at all, so a backtick
+/// inside the value cannot be told from the closing one by its own bytes. It is
+/// told apart by what follows: see [`closing_backtick`]. Honouring escapes there
+/// would make a backslash in a value skip the character after it.
 ///
 /// Bytes rather than characters throughout. Neither the backslash nor either
 /// quote can appear inside a multi-byte UTF-8 character, so a skip that lands
@@ -113,7 +114,7 @@ fn redact_quoted(message: &str) -> String {
 /// always points at an ASCII quote.
 fn closing_quote(rest: &str, quote: char) -> Option<usize> {
     if quote != '"' {
-        return rest.find(quote);
+        return closing_backtick(rest);
     }
 
     // An iterator rather than a hand-stepped index: every pass consumes at
@@ -134,6 +135,31 @@ fn closing_quote(rest: &str, quote: char) -> Option<usize> {
     }
 
     None
+}
+
+/// What follows a closing backtick in the messages serde and `toml` write.
+///
+/// serde quotes a rejected value and then either ends the message or goes on
+/// with `, expected ...`, and its lists of names are `` `a`, `b` `` or
+/// `` `a` or `b` ``. A backtick followed by anything else is inside the value.
+const AFTER_A_BACKTICK: [&str; 4] = [", expected ", ", `", ", there are ", " or `"];
+
+/// The offset of the backtick that closes a backtick segment, counted like
+/// [`closing_quote`].
+///
+/// The first backtick that ends the message or is followed by one of
+/// [`AFTER_A_BACKTICK`]. A value can only end its own segment early by
+/// containing one of those phrases right after a backtick of its own. `None`
+/// when no backtick qualifies, which redacts to the end of the message: the
+/// lexer's own messages can end that way, and they quote no value, so the cost
+/// is the rest of a sentence and never a secret.
+fn closing_backtick(rest: &str) -> Option<usize> {
+    rest.match_indices('`')
+        .map(|(index, _)| index)
+        .find(|&index| {
+            let after = &rest[index + 1..];
+            after.is_empty() || AFTER_A_BACKTICK.iter().any(|next| after.starts_with(next))
+        })
 }
 
 /// Whether `character` is one of the two a parser message quotes with.
@@ -236,6 +262,12 @@ mod tests {
         )
     }
 
+    /// A secret written where an enum value belongs, on line 7, which serde
+    /// quotes in backticks: ``unknown variant `{value}`, expected one of ...``.
+    fn config_with_raw_congestion_control(value: &str) -> String {
+        config_with_raw_max_connections(value).replace("max_connections", "congestion_control")
+    }
+
     /// A parse error must name where it is, and must not quote what is there.
     ///
     /// The `toml` crate renders a parse error as the offending source line under
@@ -267,7 +299,7 @@ mod tests {
         // Tag, the broken config, what must not survive in the message, and
         // whether the parser quoted a value at all: the lexer's complaint names
         // none, so there is nothing there for the marker to replace.
-        let cases: [(&str, String, &[&str], bool); 9] = [
+        let cases: [(&str, String, &[&str], bool); 12] = [
             (
                 "bare",
                 config_with_raw_password("correct-horse-battery-staple"),
@@ -329,6 +361,29 @@ mod tests {
             (
                 "backslash-before-the-close",
                 config_with_raw_user("'user1:hunter2-TAILSECRET\\'"),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            // A backtick inside a value serde quotes in backticks. A segment
+            // that ended at the first backtick closed after `a` and put the
+            // rest of the value in the sentence. The three cases are the
+            // characters a closing backtick is followed by in a real message:
+            // a word, a space and a comma.
+            (
+                "backtick-in-enum-value",
+                config_with_raw_congestion_control("\"a`hunter2-TAILSECRET\""),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            (
+                "backtick-space-in-enum-value",
+                config_with_raw_congestion_control("\"a` hunter2-TAILSECRET\""),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            (
+                "backtick-comma-in-enum-value",
+                config_with_raw_congestion_control("\"a`, hunter2-TAILSECRET\""),
                 &["hunter2", "TAILSECRET"],
                 true,
             ),
@@ -394,9 +449,21 @@ mod tests {
     #[test]
     fn each_quote_kind_is_scanned_by_its_own_rules() {
         assert_eq!(
-            redact_quoted("expected `\\` at the start, kept `this` whole"),
-            format!("expected {REDACTED} at the start, kept {REDACTED} whole"),
+            redact_quoted("unknown variant `\\`, expected one of `this`, `that`"),
+            format!("unknown variant {REDACTED}, expected one of {REDACTED}, {REDACTED}"),
             "a backslash inside a backtick segment is a byte, not an escape"
+        );
+
+        // A backtick segment ends only where a real message goes on. A
+        // backtick followed by anything else is part of the value, and a
+        // segment that never meets a real end runs to the end of the message.
+        assert_eq!(
+            redact_quoted("unknown variant `a`b c`, expected `x` or `y`"),
+            format!("unknown variant {REDACTED}, expected {REDACTED} or {REDACTED}"),
+        );
+        assert_eq!(
+            redact_quoted("unknown variant `a` b"),
+            format!("unknown variant {REDACTED}"),
         );
 
         let file = TempConfig::write(
