@@ -144,9 +144,12 @@ pub const BURST_LOOKUPS: usize = 32;
 
 /// Blocking threads the pool keeps clear of name resolution.
 ///
-/// Nothing else in this process uses the blocking pool today. The headroom is
-/// for the day something does, and so that the arithmetic below never has to
-/// be exact.
+/// One other user of the blocking pool exists: the `SIGHUP` reload, which
+/// `main` runs through `spawn_blocking` because it reads and parses files.
+/// The headroom is what keeps a reload from queueing behind lookups when every
+/// lookup slot is taken, and one reload at a time needs one thread of it. The
+/// rest is for the day another user appears, and so that the arithmetic below
+/// never has to be exact. D90 says to recompute this when one does.
 pub const LOOKUP_FREE_THREADS: usize = 64;
 
 /// Connections the blocking pool is sized to reserve a lookup slot for.
