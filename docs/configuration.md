@@ -594,7 +594,9 @@ prefix, strips it, and files the record with the matching `PRIORITY`, so
 `journalctl -u volto -p warning` selects what it says it does instead of matching
 everything. The prefix appears only when systemd sets `JOURNAL_STREAM`, so
 running volto in a terminal prints the same lines it always did, and the shipped
-unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true).
+unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true). The
+reason a start failed is printed to stderr rather than logged, and under the same
+condition each of its lines carries `<3>`, so it is filed at `err` as well.
 
 Every line at `info` or above carries a `log_id` field, eight lowercase letters
 and digits. It names one statement in the source, is assigned once and is never

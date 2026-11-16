@@ -73,7 +73,20 @@ fn run(args: &[&str]) -> Output {
 /// after `limit`.
 #[track_caller]
 fn run_expecting_exit(args: &[&str], limit: Duration) -> Output {
-    let mut child = Command::new(real_binary())
+    run_expecting_exit_with(args, None, limit)
+}
+
+/// [`run_expecting_exit`] with `JOURNAL_STREAM` set to `journal_stream`, or
+/// removed when it is `None`, so the result does not depend on whether the test
+/// runner itself runs under systemd.
+#[track_caller]
+fn run_expecting_exit_with(args: &[&str], journal_stream: Option<&str>, limit: Duration) -> Output {
+    let mut command = Command::new(real_binary());
+    match journal_stream {
+        Some(value) => command.env("JOURNAL_STREAM", value),
+        None => command.env_remove("JOURNAL_STREAM"),
+    };
+    let mut child = command
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -345,6 +358,52 @@ fn a_missing_file_is_refused_by_name() {
         stderr.contains(&format!("failed to read config file {}", path.display())),
         "the refusal must name the file it could not read: {stderr}"
     );
+}
+
+/// The reason a start failed reaches the journal at priority err.
+///
+/// journald files a line without a `<N>` prefix at the unit's `SyslogLevel=`,
+/// which is info, so `journalctl -p warning` would show systemd's exit lines and
+/// not the cause. Two failures are run: a missing file, which fails before any
+/// subscriber exists, and a certificate that does not parse, which fails in
+/// `Server::bind` after the subscriber is installed. Outside the journal the
+/// output is what the standard library prints for an error returned from `main`.
+#[test]
+fn a_failed_start_is_filed_as_an_error_in_the_journal() {
+    let dir = config_dir("journal-priority");
+    // The planted certificate is not one, so this file loads and fails to bind.
+    let unparseable = write_config(&dir, "127.0.0.1:0", "");
+    let missing = dir.join("nowhere.toml");
+
+    for (case, path) in [
+        ("missing file", &missing),
+        ("certificate that does not parse", &unparseable),
+    ] {
+        let args = ["--config", path.to_str().unwrap()];
+
+        let journal = run_expecting_exit_with(&args, Some("8:12345"), Duration::from_secs(20));
+        let stderr = stderr_of(&journal);
+        assert_eq!(journal.status.code(), Some(1), "{case}: {stderr}");
+        assert!(
+            stderr.contains("Error: "),
+            "{case}: the reason must still be there: {stderr}"
+        );
+        for line in stderr.lines() {
+            assert!(
+                line.starts_with("<3>"),
+                "{case}: every line of the reason must be filed at err, or \
+                 `journalctl -p warning` does not show it: {line:?} in\n{stderr}"
+            );
+        }
+
+        let plain = run_expecting_exit_with(&args, None, Duration::from_secs(20));
+        let stderr = stderr_of(&plain);
+        assert_eq!(plain.status.code(), Some(1), "{case}: {stderr}");
+        assert!(
+            stderr.starts_with("Error: ") && !stderr.lines().any(|line| line.starts_with('<')),
+            "{case}: a terminal must see no priority prefix: {stderr}"
+        );
+    }
 }
 
 /// A legal configuration that deserves a word still passes.

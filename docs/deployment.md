@@ -470,7 +470,8 @@ name alone, such as `volto`, is refused by the same rule. Write a directive such
 as `volto=trace` to raise one target.
 
 Log lines carry a syslog priority when systemd is reading them, so journald's own
-severity filter works rather than needing a text search:
+severity filter works rather than needing a text search. The reason a start
+failed is filed at `err` the same way:
 
 ```sh
 journalctl -u volto -p warning --since -24h

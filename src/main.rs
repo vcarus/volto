@@ -9,6 +9,7 @@
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,11 +52,48 @@ struct Cli {
     diagnostics: bool,
 }
 
-fn main() -> Result<()> {
+/// Runs [`start`] and reports its error the way the standard library would,
+/// with a priority prefix on every line when journald reads stderr.
+///
+/// The standard library prints an error returned from `main` as `Error: {:?}`
+/// and exits 1. Under the shipped unit that line goes to the journal, which
+/// files a line without a prefix at `SyslogLevel=`, whose default is info, so
+/// `journalctl -p warning` would not show why a start failed. The subscriber's
+/// [`JournalPriority`] cannot help here: a configuration error happens before
+/// the subscriber exists, and nothing else on this path goes through it.
+fn main() -> ExitCode {
+    match start() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let journal = logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref());
+            eprint!("{}", failure_report(&error, journal));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The text `main` writes to stderr for an error, newline included.
+///
+/// The same text the standard library writes for an error returned from `main`.
+/// When `journal` is true each line starts with `<3>`, priority err, because
+/// journald reads the prefix per line and the `{:?}` of an `anyhow::Error`
+/// spans several lines when the error has causes.
+fn failure_report(error: &anyhow::Error, journal: bool) -> String {
+    let text = format!("Error: {error:?}");
+    if !journal {
+        return text + "\n";
+    }
+    text.lines()
+        .map(|line| format!("{}{line}\n", syslog_prefix(&Level::ERROR)))
+        .collect()
+}
+
+/// Everything `main` does, with its error returned for [`main`] to report.
+fn start() -> Result<()> {
     let cli = Cli::parse();
 
     // Loaded and validated before logging exists, so configuration errors are
-    // reported by returning them from main. It is also before the runtime
+    // reported by returning them to `main`. It is also before the runtime
     // exists, which the hand-built runtime below needs: the blocking pool is
     // sized from `max_connections` rather than left at tokio's 512, so that
     // every connection's reserved name-lookup slot has a thread to run on
@@ -104,12 +142,12 @@ fn main() -> Result<()> {
 /// Says that the file loaded, and repeats what starting on it would warn about.
 ///
 /// Reached only when [`Config::load`] has already succeeded, so the failure
-/// direction is not here: it is the `?` in `main`, which prints the same error
-/// the service would print at startup and exits non-zero. That symmetry is the
-/// whole value of the flag. `script/deploy.sh` asks the binary it is about to
-/// install whether it can read the configuration this host already has, and an
-/// answer that did not match what the service does on the same file would be
-/// worse than no answer (D93, D94).
+/// direction is not here: it is the `?` in `start`, after which `main` prints
+/// the same error the service would print at startup and exits non-zero. That
+/// symmetry is the whole value of the flag. `script/deploy.sh` asks the binary
+/// it is about to install whether it can read the configuration this host
+/// already has, and an answer that did not match what the service does on the
+/// same file would be worse than no answer (D93, D94).
 ///
 /// What it therefore covers is exactly what `Config::load` covers: the TOML
 /// itself, every table's refusal of a key it does not know, and every range and
@@ -794,6 +832,28 @@ mod tests {
         assert!(!logs_to_journal(None));
         // Set but empty is not a journal either.
         assert!(!logs_to_journal(Some(OsStr::new(""))));
+    }
+
+    /// An error with a cause spans several lines, and journald reads the
+    /// priority per line, so each one carries it. Off the journal the text is
+    /// the standard library's own `Error: {:?}`.
+    #[test]
+    fn a_start_failure_is_prefixed_on_every_line_in_the_journal() {
+        let error = anyhow::anyhow!("the root cause").context("failed to start");
+
+        let plain = failure_report(&error, false);
+        assert_eq!(plain, format!("Error: {error:?}\n"));
+        assert!(
+            plain.lines().count() > 1,
+            "the cause is on a line of its own"
+        );
+
+        let journal = failure_report(&error, true);
+        assert_eq!(journal.lines().count(), plain.lines().count());
+        for (prefixed, line) in journal.lines().zip(plain.lines()) {
+            assert_eq!(prefixed, format!("<3>{line}"));
+        }
+        assert!(journal.ends_with('\n'));
     }
 
     /// A `RUST_LOG` that is set but does not parse is not the same as one that
