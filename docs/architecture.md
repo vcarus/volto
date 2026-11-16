@@ -262,10 +262,11 @@ need, including names that would have resolved from `/etc/hosts` without a query
 
 So the pool is rationed in two tiers, in `net.rs`:
 
-- **One reserved lookup slot per connection**, which no other connection can use. While
-  the connections that hold reserved lookups are live, no number of hostile
-  ones can starve a connection outright; at worst its lookups run one at a time — a lookup queued for the shared allowance keeps its
-  claim on the reserved slot too, and takes it the moment it frees. A reserved
+- **One reserved lookup slot per connection**, which no other connection can
+  use. While the connections that hold reserved lookups are live, no number of
+  hostile ones can starve a connection outright; at worst its lookups run one at
+  a time. A lookup queued for the shared allowance keeps its claim on the
+  reserved slot too, and takes it the moment it frees. A reserved
   lookup also holds one permit of a server-wide reserved allowance, one per
   connection the pool is sized for, until its thread returns. So a lookup whose
   connection has closed keeps counting, and connection turnover cannot issue
