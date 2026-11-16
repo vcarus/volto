@@ -428,6 +428,7 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
     {
         tokio::spawn(watch_for_signals(
             signals.terminate,
+            signals.interrupt,
             server.shutdown_trigger(),
         ));
         tokio::spawn(watch_for_reload(
@@ -458,18 +459,21 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
 struct Signals {
     /// `SIGTERM`, for [`watch_for_signals`].
     terminate: std::io::Result<tokio::signal::unix::Signal>,
+    /// `SIGINT`, for [`watch_for_signals`].
+    interrupt: std::io::Result<tokio::signal::unix::Signal>,
     /// `SIGHUP`, for [`watch_for_reload`].
     hangup: std::io::Result<tokio::signal::unix::Signal>,
 }
 
 #[cfg(unix)]
 impl Signals {
-    /// Creates both streams. Must run inside the runtime.
+    /// Creates the three streams. Must run inside the runtime.
     fn create() -> Self {
         use tokio::signal::unix::{SignalKind, signal};
 
         Self {
             terminate: signal(SignalKind::terminate()),
+            interrupt: signal(SignalKind::interrupt()),
             hangup: signal(SignalKind::hangup()),
         }
     }
@@ -560,29 +564,28 @@ async fn watch_for_reload(
 /// already bounds the wait, and an operator in a hurry has SIGKILL.
 async fn watch_for_signals(
     #[cfg(unix)] terminate: std::io::Result<tokio::signal::unix::Signal>,
+    #[cfg(unix)] interrupt: std::io::Result<tokio::signal::unix::Signal>,
     trigger: Trigger,
 ) {
     #[cfg(unix)]
     {
-        let mut terminate = match terminate {
-            Ok(stream) => stream,
-            Err(error) => {
-                // Without this the process can still be stopped, just not
-                // gracefully, so it is not worth refusing to start over.
+        // A stream that could not be created is reported, and the watcher goes
+        // on with the other one. Giving up on both would leave a signal whose
+        // handler is installed waiting in a stream nobody reads, so the process
+        // could not be stopped gracefully at all.
+        let terminate = terminate
+            .inspect_err(|error| {
                 warn!(log_id = "kuce6ga8", %error, "could not install the SIGTERM handler");
-                return;
-            }
-        };
+            })
+            .ok();
+        let interrupt = interrupt
+            .inspect_err(|error| {
+                warn!(log_id = "mkf6oai0", %error, "could not wait for SIGINT");
+            })
+            .ok();
 
-        let signal_name = tokio::select! {
-            _ = terminate.recv() => "SIGTERM",
-            result = tokio::signal::ctrl_c() => match result {
-                Ok(()) => "SIGINT",
-                Err(error) => {
-                    warn!(log_id = "mkf6oai0", %error, "could not wait for SIGINT");
-                    return;
-                }
-            },
+        let Some(signal_name) = first_termination(terminate, interrupt).await else {
+            return;
         };
 
         info!(
@@ -602,6 +605,32 @@ async fn watch_for_signals(
     }
 
     trigger.fire();
+}
+
+/// The name of the first of `SIGTERM` and `SIGINT` to arrive, among the streams
+/// that exist, or `None` at once when neither does.
+#[cfg(unix)]
+async fn first_termination(
+    mut terminate: Option<tokio::signal::unix::Signal>,
+    mut interrupt: Option<tokio::signal::unix::Signal>,
+) -> Option<&'static str> {
+    /// The next signal on `stream`, or never when there is no stream.
+    async fn next(stream: &mut Option<tokio::signal::unix::Signal>) {
+        match stream {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    if terminate.is_none() && interrupt.is_none() {
+        return None;
+    }
+    tokio::select! {
+        () = next(&mut terminate) => Some("SIGTERM"),
+        () = next(&mut interrupt) => Some("SIGINT"),
+    }
 }
 
 /// The variable systemd sets when a service's standard streams go to the journal.
@@ -871,6 +900,29 @@ mod tests {
         assert_eq!(syslog_prefix(&Level::INFO), "<6>");
         assert_eq!(syslog_prefix(&Level::DEBUG), "<7>");
         assert_eq!(syslog_prefix(&Level::TRACE), "<7>");
+    }
+
+    /// A `SIGINT` stream that could not be created leaves `SIGTERM` watched.
+    ///
+    /// The signal is raised in this test process, which is safe because the
+    /// `SIGTERM` stream exists first, so tokio's handler takes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sigterm_is_still_awaited_without_a_sigint_stream() {
+        use rustix::process::{Signal, getpid, kill_process};
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let terminate = signal(SignalKind::terminate()).expect("a SIGTERM stream");
+        let waiting = tokio::spawn(first_termination(Some(terminate), None));
+        kill_process(getpid(), Signal::TERM).expect("SIGTERM must be deliverable");
+
+        let name = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("SIGTERM must end the wait")
+            .expect("the waiting task");
+        assert_eq!(name, Some("SIGTERM"));
+
+        assert_eq!(first_termination(None, None).await, None);
     }
 
     /// systemd sets the variable to `device:inode`; nothing else sets it.

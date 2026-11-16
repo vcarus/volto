@@ -231,14 +231,14 @@ const ACCOUNTED: &[Accounted] = &[
         file: "main.rs",
         message: "could not install the SIGTERM handler",
         bound: Bound::Lifecycle,
-        reason: "Once at startup; the watcher returns straight after it.",
+        reason: "Once at startup; the watcher then waits for SIGINT alone.",
     },
     Accounted {
         id: "mkf6oai0",
         file: "main.rs",
         message: "could not wait for SIGINT",
         bound: Bound::Lifecycle,
-        reason: "Once, and the signal watcher returns straight after it.",
+        reason: "Once at startup; the watcher then waits for SIGTERM alone.",
     },
     Accounted {
         id: "osdc324g",
