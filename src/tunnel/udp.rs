@@ -1075,16 +1075,17 @@ impl DatagramPath {
     /// Sends the packet in `packets` as a QUIC datagram, or drops it if it is
     /// too large for one.
     ///
-    /// A packet under the last limit read, for which
-    /// [`Context::claim_datagram_room`] shows room in quinn's queue, goes
-    /// straight to `send_datagram`. Any other packet takes both readings first:
-    /// the size is checked against a fresh limit, then the room is read and
-    /// graded.
+    /// The two readings are taken only when the cached answer does not cover
+    /// the packet. A packet over the last limit read is checked against a
+    /// fresh limit, and dropped if it is over that too. A packet for which
+    /// [`Context::claim_datagram_room`] shows no room has the room read and
+    /// graded. A packet under the limit with room goes straight to
+    /// `send_datagram`, and a limit that has fallen since the last reading is
+    /// caught there, as `TooLarge`.
     fn send(&mut self, ctx: &Context, packets: &mut PacketBlock) {
         let encoded_len = packets.encoded_len();
 
-        let known_to_fit = encoded_len <= self.limit && ctx.claim_datagram_room(encoded_len);
-        if !known_to_fit {
+        if encoded_len > self.limit {
             // The QUIC datagram path. If the packet does not fit, it is dropped:
             // RFC 9298 §6.1 says SHOULD NOT fall back to a capsule, because
             // doing so silently converts a lossy flow into a head-of-line
@@ -1100,7 +1101,9 @@ impl DatagramPath {
                 self.report_oversize(ctx, graded, encoded_len);
                 return;
             }
+        }
 
+        if !ctx.claim_datagram_room(encoded_len) {
             // quinn's `send_datagram` is `send(data, drop = true)`: when the
             // outgoing queue would grow past `datagram_send_buffer_size` it
             // silently drops the *oldest* queued datagrams to make room, saying
