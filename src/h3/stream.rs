@@ -989,8 +989,13 @@ impl Writer {
     ///
     /// This is safe where `quinn::RecvStream::received_reset` is not (see
     /// [`Reader::reset_by_peer`]): quinn keeps no single-slot waker for it, but
-    /// a `Notify` per stream that the connection wakes and removes when the
-    /// stream is stopped or finished.
+    /// a `Notify` per stream, created on the first poll that has to wait. The
+    /// connection wakes and removes it when the peer stops the stream, when a
+    /// finished stream's data is all acknowledged, and when the connection
+    /// ends. Nothing else removes it, so a stream this endpoint resets keeps its
+    /// entry, a map slot and an `Arc<Notify>`, until the connection closes.
+    /// That is quinn's bookkeeping and cannot be avoided here without giving up
+    /// the `STOP_SENDING` watch.
     ///
     /// Cancel-safe, so a `select!` may poll it and set it aside repeatedly.
     ///
@@ -998,10 +1003,11 @@ impl Writer {
     ///
     /// Only endings. `Ok(Some(code))` is the peer's `STOP_SENDING` and is the
     /// case this exists for. A lost connection is reported as such. Quinn's
-    /// `Ok(None)` means the stream is gone from the transport, which on a live
-    /// tunnel means this endpoint finished it and the peer acknowledged every
-    /// byte. It is reported as this endpoint's own clean ending. All three mean
-    /// the same thing to a caller: nothing more will be sent on this stream.
+    /// `Ok(None)` means the stream is gone from the transport: this endpoint
+    /// finished it and the peer acknowledged every byte, or this endpoint reset
+    /// it and the peer acknowledged the reset. It is reported as this
+    /// endpoint's own ending. All three mean the same thing to a caller:
+    /// nothing more will be sent on this stream.
     pub fn stopped(
         &self,
     ) -> impl std::future::Future<Output = StreamError> + Send + 'static + use<> {
