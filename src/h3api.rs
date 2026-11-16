@@ -63,7 +63,12 @@ pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
 /// the peer reads a registered HTTP/3 code in the CONNECTION_CLOSE frame.
 pub const AUTH_FAILURE_LIMIT_CODE: Code = Code::H3_REQUEST_REJECTED;
 
-/// The reset code the peer used, if this error is a peer-initiated reset.
+/// The code of the peer's RESET_STREAM or STOP_SENDING, if this error is one
+/// of the two.
+///
+/// Both arrive as the same `RemoteTerminate`: a read meets the reset, and a
+/// write or `Writer::stopped` meets the STOP_SENDING. The TCP tunnel relies on
+/// the second when it reports that the client stopped reading.
 pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
     match error {
         StreamError::RemoteTerminate { code, .. } => Some(code.value()),
