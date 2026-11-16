@@ -1558,8 +1558,8 @@ pub(crate) mod tests {
     ///
     /// The body is the complete key set as of v0.4.3, every key set explicitly
     /// so a rename cannot pass unnoticed, and it deliberately does *not*
-    /// mention `mtu_upper_bound` (v0.4.5) — the one key added inside the window
-    /// of releases that have been deployed. An upgrade never rewrites
+    /// mention the two keys added since: `mtu_upper_bound` (v0.4.5) and
+    /// `security.expected_sni` (v0.9.0). An upgrade never rewrites
     /// `/etc/volto/config.toml`, so this is the file the new binary actually
     /// gets handed.
     #[test]
@@ -1605,8 +1605,9 @@ pub(crate) mod tests {
         )
         .expect("a configuration file from v0.4.3 must still parse");
 
-        // The key added since is absent, so it takes its compiled-in default
-        // rather than leaving the file half-applied.
+        // The keys added since are absent, so they take their compiled-in
+        // defaults rather than leaving the file half-applied.
+        assert!(cfg.security.expected_sni.is_empty());
         assert_eq!(cfg.limits.mtu_upper_bound, None);
         assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(cfg.limits.mtu_upper_bound(), 1436);
