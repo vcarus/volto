@@ -1980,7 +1980,7 @@ proptest! {
         datagram::put_varint(&mut header, length);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&header);
+        decoder.push(header.freeze());
         prop_assert_eq!(decoder.next_capsule(), Ok(None), "an unknown type is not refused");
         prop_assert_eq!(
             decoder.buffered_len(),
@@ -1999,7 +1999,7 @@ proptest! {
 
         // However much of the value arrives, it is consumed and not held: the
         // decoder still wants more, and still is not at a boundary.
-        decoder.push(&arriving);
+        decoder.push(Bytes::from(arriving));
         prop_assert_eq!(decoder.next_capsule(), Ok(None));
         prop_assert_eq!(
             decoder.buffered_len(),

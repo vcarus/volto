@@ -320,14 +320,15 @@ impl Shared {
 /// which buffers a DATAGRAM capsule's value until all of it has arrived.
 /// [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`] bounds it, and a peer that
 /// declares that much and stops one byte short holds it for the session's idle
-/// timeout. It measures about 78 KiB, because the `BytesMut` behind it grows by
-/// doubling past 64 KiB
-/// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`).
+/// timeout. The buffer is allocated once at the declared length, so it is at
+/// most 64 KiB, and the decoder keeps no stream chunk alive behind it
+/// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`
+/// and `a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk`).
 ///
-/// A session therefore costs about 188 KiB, and the worst case is that times
+/// A session therefore costs about 172 KiB, and the worst case is that times
 /// `max_targets_per_conn` times `max_connections`. With the shipped defaults
-/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is about 47 MiB
-/// per connection and 11.8 GiB across a server saturated at both limits.
+/// (`max_targets_per_conn` = 256, `max_connections` = 256) that is about 43 MiB
+/// per connection and 10.75 GiB across a server saturated at both limits.
 /// Lowering either limit lowers it proportionally.
 ///
 /// All three are released by dropping what owns them, on every path a session

@@ -11,8 +11,8 @@
 //!
 //! * **Capsules do not align with stream chunks.** A capsule may be split across
 //!   any number of reads, and one read may contain many capsules. The decoder is
-//!   therefore a state machine fed arbitrary byte slices, and the tests below
-//!   feed it a byte at a time to prove it.
+//!   therefore a state machine fed arbitrary chunks, and the tests below feed it
+//!   a byte at a time to prove it.
 //! * **Unknown capsule types must be skipped, not rejected** (RFC 9297 §3.2),
 //!   which is what lets the protocol be extended. Skipping uses the declared
 //!   length, so a decoder that cannot skip cannot resynchronise.
@@ -23,7 +23,7 @@
 //! are never buffered at all. Without both rules a peer could name a huge length
 //! and make the proxy allocate for it.
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 use crate::datagram::{self, MAX_UDP_PAYLOAD};
 
@@ -53,8 +53,9 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// piecewise, and a peer that declares the largest one allowed and then stops
 /// one byte short is doing nothing RFC 9297 §3.2 forbids. So what is held is
 /// held until the session's idle timeout. One capsule's worth is all of it:
-/// bytes past a declared value belong to the next capsule and are cut out of the
-/// buffer as they are decoded, and an unknown type is discarded as it arrives
+/// the decoder copies a value only when it is split across chunks, into a
+/// buffer allocated once at the declared length, and keeps no handle on any
+/// chunk once it has been drained. An unknown type is discarded as it arrives
 /// without being buffered at all.
 // 65527 is exact in both types, and a `const` cannot reach `u64::try_from`.
 #[allow(clippy::as_conversions)]
@@ -111,9 +112,9 @@ pub enum Capsule {
 enum State {
     /// Between capsules, reading a Type and Length.
     Header,
-    /// Buffering the value of a capsule we intend to act on.
+    /// Collecting the value of a capsule we intend to act on.
     Value {
-        /// Total value length, still to be accumulated.
+        /// Total value length.
         length: usize,
     },
     /// Discarding the value of an unknown capsule type.
@@ -123,13 +124,29 @@ enum State {
     },
 }
 
+/// The longest capsule header: a Type and a Length, each a varint of at most 8
+/// bytes.
+const MAX_HEADER_LEN: usize = 16;
+
 /// An incremental capsule decoder.
 ///
-/// Feed it bytes with [`CapsuleDecoder::push`], then drain with
+/// Feed it chunks with [`CapsuleDecoder::push`], then drain with
 /// [`CapsuleDecoder::next_capsule`] until it yields `None`.
+///
+/// A capsule that lies whole inside one chunk is cut out of that chunk, so its
+/// payload is a slice of the chunk and no byte is copied. Only a capsule split
+/// across chunks is copied, into a buffer of the decoder's own: a header of at
+/// most 16 bytes, or a DATAGRAM value of at most [`MAX_DATAGRAM_CAPSULE_VALUE`]
+/// bytes, allocated once at the declared length. When `next_capsule` returns
+/// `Ok(None)` the decoder no longer refers to any chunk it was given, so what it
+/// holds between chunks is that buffer alone.
 #[derive(Debug)]
 pub struct CapsuleDecoder {
-    buffer: BytesMut,
+    /// The undecoded rest of the last chunk pushed.
+    chunk: Bytes,
+    /// The start of a header or a DATAGRAM value that an earlier chunk ended
+    /// inside.
+    partial: BytesMut,
     state: State,
 }
 
@@ -139,22 +156,39 @@ impl Default for CapsuleDecoder {
     }
 }
 
+/// Reads a whole capsule header off the front of `bytes`: the Type, the Length
+/// and the number of bytes the two took.
+fn peek_header(bytes: &[u8]) -> Option<(u64, u64, usize)> {
+    let (capsule_type, type_len) = datagram::peek_varint(bytes)?;
+    let (length, length_len) = datagram::peek_varint(&bytes[type_len..])?;
+    Some((capsule_type, length, type_len + length_len))
+}
+
 impl CapsuleDecoder {
     /// A decoder positioned at the start of a capsule sequence.
     pub fn new() -> Self {
         Self {
-            buffer: BytesMut::new(),
+            chunk: Bytes::new(),
+            partial: BytesMut::new(),
             state: State::Header,
         }
     }
 
-    /// Adds received bytes. Any number, split anywhere.
+    /// Adds a received chunk. Any number of bytes, split anywhere.
     ///
-    /// Taken by slice because that is all this does with them: the bytes are
-    /// copied into the decoder's own buffer, where the next capsule is cut out
-    /// of them, so nothing is gained by owning the chunk they arrived in.
-    pub fn push(&mut self, chunk: &[u8]) {
-        self.buffer.extend_from_slice(chunk);
+    /// Taken by value because capsules are cut out of it. The caller drains the
+    /// decoder before the next push. A push before that is still decoded
+    /// correctly, but the undecoded rest of the earlier chunk is copied in front
+    /// of the new one.
+    pub fn push(&mut self, chunk: Bytes) {
+        if self.chunk.is_empty() {
+            self.chunk = chunk;
+            return;
+        }
+        let mut joined = BytesMut::with_capacity(self.chunk.len() + chunk.len());
+        joined.extend_from_slice(&self.chunk);
+        joined.extend_from_slice(&chunk);
+        self.chunk = joined.freeze();
     }
 
     /// Whether the sequence is currently between capsules.
@@ -162,24 +196,22 @@ impl CapsuleDecoder {
     /// False at end of stream means the peer stopped mid-capsule, which
     /// RFC 9297 §3.3 makes a malformed message.
     pub fn at_capsule_boundary(&self) -> bool {
-        match self.state {
-            State::Header => self.buffer.is_empty(),
-            State::Skip { remaining: 0 } => self.buffer.is_empty(),
-            _ => false,
-        }
+        matches!(self.state, State::Header | State::Skip { remaining: 0 })
+            && self.partial.is_empty()
+            && self.chunk.is_empty()
     }
 
     /// The number of bytes the decoder is currently holding.
     ///
-    /// A capsule header is consumed as soon as both varints are present, and
-    /// the value of an unknown capsule type is discarded as it arrives, so
-    /// neither is held. The value of a DATAGRAM capsule is the exception: it is
-    /// held whole until its declared length has arrived, because a Context ID
-    /// has to be read off the front of it. This is what a test needs to tell a
-    /// decoder that skips an unknown capsule from one that buffers its value
-    /// and returns the same `Ok(None)` either way.
+    /// That is the undecoded rest of the last chunk, which is empty once
+    /// [`CapsuleDecoder::next_capsule`] has returned `Ok(None)`, plus the start
+    /// of a header or a DATAGRAM value that a chunk ended inside. A complete
+    /// header is consumed, and the value of an unknown capsule type is discarded
+    /// as it arrives, so neither is held. This is what a test needs to tell a
+    /// decoder that skips an unknown capsule from one that buffers its value and
+    /// returns the same `Ok(None)` either way.
     pub fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.partial.len() + self.chunk.len()
     }
 
     /// Decodes the next capsule of interest.
@@ -187,6 +219,16 @@ impl CapsuleDecoder {
     /// `Ok(None)` means more bytes are needed, not an error. Unknown capsule
     /// types are consumed internally and never returned.
     pub fn next_capsule(&mut self) -> Result<Option<Capsule>, Error> {
+        let next = self.decode();
+        // An empty slice still refers to the chunk it was cut from, and would
+        // keep that whole chunk allocated.
+        if self.chunk.is_empty() {
+            self.chunk = Bytes::new();
+        }
+        next
+    }
+
+    fn decode(&mut self) -> Result<Option<Capsule>, Error> {
         loop {
             match self.state {
                 State::Skip { remaining } => {
@@ -194,35 +236,27 @@ impl CapsuleDecoder {
                         self.state = State::Header;
                         continue;
                     }
-                    if self.buffer.is_empty() {
+                    if self.chunk.is_empty() {
                         return Ok(None);
                     }
                     // Discard as it arrives: an unknown capsule is never
                     // accumulated, however large it claims to be.
                     // Both directions are exact: the minimum is at most the
-                    // buffer's own length, so it is a `usize` value, and the
+                    // chunk's own length, so it is a `usize` value, and the
                     // widening back is the same number.
                     #[allow(clippy::as_conversions)]
-                    let discard = remaining.min(self.buffer.len() as u64);
+                    let discard = remaining.min(self.chunk.len() as u64);
                     #[allow(clippy::as_conversions)]
-                    let _ = self.buffer.split_to(discard as usize);
+                    self.chunk.advance(discard as usize);
                     self.state = State::Skip {
                         remaining: remaining - discard,
                     };
                 }
 
                 State::Header => {
-                    // Both varints must be present before either is consumed.
-                    let Some((capsule_type, type_len)) = datagram::peek_varint(&self.buffer) else {
+                    let Some((capsule_type, length)) = self.take_header() else {
                         return Ok(None);
                     };
-                    let Some((length, length_len)) =
-                        datagram::peek_varint(&self.buffer[type_len..])
-                    else {
-                        return Ok(None);
-                    };
-
-                    let _ = self.buffer.split_to(type_len + length_len);
 
                     if capsule_type == CAPSULE_TYPE_DATAGRAM {
                         if length > MAX_DATAGRAM_CAPSULE_VALUE {
@@ -241,11 +275,9 @@ impl CapsuleDecoder {
                 }
 
                 State::Value { length } => {
-                    if self.buffer.len() < length {
+                    let Some(mut value) = self.take_value(length) else {
                         return Ok(None);
-                    }
-
-                    let mut value = self.buffer.split_to(length).freeze();
+                    };
                     self.state = State::Header;
 
                     let context_id =
@@ -258,6 +290,69 @@ impl CapsuleDecoder {
                 }
             }
         }
+    }
+
+    /// Consumes a whole capsule header, or keeps what there is of one.
+    ///
+    /// Both varints must be present before either is consumed. A header that
+    /// the chunk ends inside is moved to `partial`, and the next chunk completes
+    /// it there.
+    fn take_header(&mut self) -> Option<(u64, u64)> {
+        if self.partial.is_empty() {
+            if let Some((capsule_type, length, header_len)) = peek_header(&self.chunk) {
+                self.chunk.advance(header_len);
+                return Some((capsule_type, length));
+            }
+            if !self.chunk.is_empty() {
+                self.partial = BytesMut::with_capacity(MAX_HEADER_LEN);
+                self.partial.extend_from_slice(&self.chunk);
+                self.chunk.clear();
+            }
+            return None;
+        }
+
+        // At most `MAX_HEADER_LEN` bytes are ever needed, and the bytes past
+        // the header are left in the chunk.
+        let held = self.partial.len();
+        let take = self.chunk.len().min(MAX_HEADER_LEN - held);
+        self.partial.extend_from_slice(&self.chunk[..take]);
+        match peek_header(&self.partial) {
+            Some((capsule_type, length, header_len)) => {
+                self.chunk.advance(header_len - held);
+                self.partial.clear();
+                Some((capsule_type, length))
+            }
+            None => {
+                // Two varints fit in `MAX_HEADER_LEN` bytes, so an incomplete
+                // header means the whole chunk was taken.
+                self.chunk.advance(take);
+                None
+            }
+        }
+    }
+
+    /// Takes a DATAGRAM value of `length` bytes once all of it is here.
+    ///
+    /// A value inside the chunk is cut out of it. A value the chunk ends inside
+    /// is collected in `partial`, which is allocated at the declared length
+    /// when its first byte arrives and handed over whole when its last does.
+    fn take_value(&mut self, length: usize) -> Option<Bytes> {
+        if self.partial.is_empty() && self.chunk.len() >= length {
+            return Some(self.chunk.split_to(length));
+        }
+        if self.chunk.is_empty() {
+            return None;
+        }
+        if self.partial.is_empty() {
+            self.partial = BytesMut::with_capacity(length);
+        }
+        let take = (length - self.partial.len()).min(self.chunk.len());
+        self.partial.extend_from_slice(&self.chunk[..take]);
+        self.chunk.advance(take);
+        if self.partial.len() < length {
+            return None;
+        }
+        Some(std::mem::take(&mut self.partial).freeze())
     }
 }
 
@@ -307,7 +402,7 @@ mod tests {
     #[test]
     fn decodes_a_single_datagram_capsule() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&encode_datagram(0, b"hello"));
+        decoder.push(encode_datagram(0, b"hello"));
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -324,7 +419,7 @@ mod tests {
         buf.extend_from_slice(&encode_datagram(0, b"three"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&buf.freeze());
+        decoder.push(buf.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -350,7 +445,7 @@ mod tests {
         let mut decoded = Vec::new();
 
         for index in 0..wire.len() {
-            decoder.push(&wire.slice(index..index + 1));
+            decoder.push(wire.slice(index..index + 1));
             decoded.extend(drain(&mut decoder).expect("decodes"));
         }
 
@@ -376,9 +471,9 @@ mod tests {
 
         for split in 0..=wire.len() {
             let mut decoder = CapsuleDecoder::new();
-            decoder.push(&wire.slice(..split));
+            decoder.push(wire.slice(..split));
             let mut decoded = drain(&mut decoder).expect("decodes");
-            decoder.push(&wire.slice(split..));
+            decoder.push(wire.slice(split..));
             decoded.extend(drain(&mut decoder).expect("decodes"));
 
             assert_eq!(decoded, expected, "split at {split}");
@@ -393,7 +488,7 @@ mod tests {
         wire.extend_from_slice(&encode_datagram(0, b"kept"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&wire.freeze());
+        decoder.push(wire.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -408,7 +503,7 @@ mod tests {
         wire.extend_from_slice(&encode_datagram(0, b"kept"));
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&wire.freeze());
+        decoder.push(wire.freeze());
 
         assert_eq!(
             drain(&mut decoder).unwrap(),
@@ -430,7 +525,7 @@ mod tests {
     #[test]
     fn a_fully_skipped_unknown_capsule_ends_at_a_boundary() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&encode_unknown(0x41, b"skipped whole"));
+        decoder.push(encode_unknown(0x41, b"skipped whole"));
         assert!(drain(&mut decoder).unwrap().is_empty());
 
         decoder.state = State::Skip { remaining: 0 };
@@ -438,7 +533,7 @@ mod tests {
 
         // Not a boundary while bytes are still waiting: this one is the first of
         // the next capsule's header, which has not arrived whole.
-        decoder.push(&[0x00]);
+        decoder.push(Bytes::from_static(&[0x00]));
         assert!(!decoder.at_capsule_boundary());
     }
 
@@ -448,7 +543,7 @@ mod tests {
     fn buffered_len_reports_the_bytes_still_held() {
         let mut decoder = CapsuleDecoder::new();
         let wire = encode_datagram(0, b"held");
-        decoder.push(&wire);
+        decoder.push(wire.clone());
         assert_eq!(
             decoder.buffered_len(),
             wire.len(),
@@ -464,19 +559,87 @@ mod tests {
         let mut header = BytesMut::new();
         datagram::put_varint(&mut header, 0x41);
         datagram::put_varint(&mut header, 1_000_000);
-        decoder.push(&header);
+        decoder.push(header.clone().freeze());
         assert_eq!(decoder.buffered_len(), header.len(), "the header is held");
 
         assert_eq!(decoder.next_capsule().unwrap(), None);
         assert_eq!(decoder.buffered_len(), 0, "the header is consumed");
 
-        decoder.push(b"a prefix of the value");
+        decoder.push(Bytes::from_static(b"a prefix of the value"));
         assert_eq!(decoder.next_capsule().unwrap(), None);
         assert_eq!(
             decoder.buffered_len(),
             0,
             "a skipped value is discarded as it arrives"
         );
+    }
+
+    /// A capsule inside one chunk is a slice of that chunk, and a drained
+    /// decoder refers to no chunk at all.
+    ///
+    /// The second half is the memory bound: a decoder that kept any handle on a
+    /// chunk would keep the whole chunk allocated, however little of it was
+    /// left undecoded. Only the start of the unfinished capsule at the end is
+    /// kept, as a copy.
+    #[test]
+    fn a_drained_decoder_keeps_no_chunk_alive() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&encode_datagram(0, b"whole"));
+        wire.extend_from_slice(&encode_unknown(0x41, &[0xff; 100]));
+        let mut header = BytesMut::new();
+        datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+        datagram::put_varint(&mut header, 1000);
+        wire.extend_from_slice(&header);
+        wire.extend_from_slice(&[0x00; 10]);
+        let chunk = wire.freeze();
+
+        let mut decoder = CapsuleDecoder::new();
+        decoder.push(chunk.clone());
+        let decoded = drain(&mut decoder).unwrap();
+        let Capsule::Datagram { payload, .. } = &decoded[0];
+        assert_eq!(&payload[..], b"whole");
+        assert!(
+            chunk.as_ptr_range().contains(&payload.as_ptr()),
+            "a capsule inside the chunk is not copied"
+        );
+        drop(decoded);
+
+        assert!(
+            chunk.is_unique(),
+            "the drained decoder still refers to the chunk"
+        );
+        assert_eq!(decoder.buffered_len(), 10, "the unfinished value is kept");
+        assert!(!decoder.at_capsule_boundary());
+
+        decoder.push(Bytes::from(vec![0x5a; 990]));
+        let Some(Capsule::Datagram { payload, .. }) = decoder.next_capsule().unwrap() else {
+            panic!("the value is complete");
+        };
+        assert_eq!(payload.len(), 999);
+        assert!(decoder.at_capsule_boundary());
+    }
+
+    /// A push before the decoder is drained still decodes the same sequence.
+    #[test]
+    fn a_push_before_the_drain_joins_the_chunks() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&encode_datagram(0, b"one"));
+        wire.extend_from_slice(&encode_datagram(0, b"two"));
+        let wire = wire.freeze();
+        let cut = wire.len() - 2;
+
+        let mut decoder = CapsuleDecoder::new();
+        decoder.push(wire.slice(..cut));
+        assert_eq!(
+            decoder.next_capsule().unwrap(),
+            Some(datagram_capsule(0, b"one"))
+        );
+        decoder.push(wire.slice(cut..));
+        assert_eq!(
+            drain(&mut decoder).unwrap(),
+            vec![datagram_capsule(0, b"two")]
+        );
+        assert!(decoder.at_capsule_boundary());
     }
 
     /// An unknown capsule's value must never be buffered, no matter how large it
@@ -488,16 +651,16 @@ mod tests {
         datagram::put_varint(&mut header, 10_000_000);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&header.freeze());
+        decoder.push(header.freeze());
         assert_eq!(decoder.next_capsule().unwrap(), None);
 
         for _ in 0..100 {
-            decoder.push(&Bytes::from_static(&[0u8; 1024]));
+            decoder.push(Bytes::from_static(&[0u8; 1024]));
             assert_eq!(decoder.next_capsule().unwrap(), None);
             assert!(
-                decoder.buffer.len() < 4096,
+                decoder.buffered_len() < 4096,
                 "buffered {} bytes of a skipped capsule",
-                decoder.buffer.len()
+                decoder.buffered_len()
             );
         }
     }
@@ -509,7 +672,7 @@ mod tests {
         // Every strict prefix leaves the decoder mid-capsule.
         for length in 0..wire.len() {
             let mut decoder = CapsuleDecoder::new();
-            decoder.push(&wire.slice(..length));
+            decoder.push(wire.slice(..length));
             drain(&mut decoder).expect("a prefix is not yet an error");
 
             if length == 0 {
@@ -524,7 +687,7 @@ mod tests {
 
         // The whole thing is complete.
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&wire);
+        decoder.push(wire.clone());
         drain(&mut decoder).expect("decodes");
         assert!(decoder.at_capsule_boundary());
     }
@@ -536,7 +699,7 @@ mod tests {
         datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&header.freeze());
+        decoder.push(header.freeze());
 
         assert_eq!(
             decoder.next_capsule(),
@@ -554,7 +717,7 @@ mod tests {
         datagram::put_varint(&mut wire, 0);
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&wire.freeze());
+        decoder.push(wire.freeze());
 
         assert_eq!(decoder.next_capsule(), Err(Error::MalformedDatagram));
     }
@@ -562,7 +725,7 @@ mod tests {
     #[test]
     fn an_empty_udp_payload_round_trips() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&encode_datagram(0, b""));
+        decoder.push(encode_datagram(0, b""));
 
         assert_eq!(drain(&mut decoder).unwrap(), vec![datagram_capsule(0, b"")]);
     }
@@ -570,7 +733,7 @@ mod tests {
     #[test]
     fn non_zero_context_ids_are_preserved_for_the_caller_to_drop() {
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&encode_datagram(42, b"other context"));
+        decoder.push(encode_datagram(42, b"other context"));
 
         assert_eq!(
             drain(&mut decoder).unwrap(),

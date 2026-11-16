@@ -84,8 +84,8 @@ allocated when the target first sends and kept from then on; an inbound datagram
 queue of 64 entries, each at most the 1472-byte `max_udp_payload_size` this
 server advertises, so about 92 KiB; and the capsule decoder on the request
 stream, which buffers one DATAGRAM capsule's value until all of it has arrived
-and so tops out around 78 KiB. That is roughly 188 KiB per session, 47 MiB per
-connection at `max_targets_per_conn = 256`, and about 11.8 GiB across a server
+and so tops out at 64 KiB. That is roughly 172 KiB per session, 43 MiB per
+connection at `max_targets_per_conn = 256`, and about 10.75 GiB across a server
 saturated at both defaults. Lowering either limit lowers it proportionally. It
 is a ceiling rather than a resting size: the queue is only full while a client
 sends faster than the proxy forwards, and the capsule buffer only fills for a
@@ -102,7 +102,7 @@ block once the tunnel has relayed anything: reads are cut from one block until
 too little of it is left to offer a full-sized window, and that is also why the
 first 16 KiB is let go after the first read. So the saturation product for TCP
 is `max_connections` × `max_targets_per_conn` × 64 KiB = 4 GiB at the defaults,
-beside the 11.8 GiB of the UDP one. What a tunnel holds beyond that one block is
+beside the 10.75 GiB of the UDP one. What a tunnel holds beyond that one block is
 bounded by quinn's per-connection send window (`SEND_WINDOW` = 10 MB). That
 window counts bytes retained from what this server writes rather than bytes
 still unacknowledged: the pieces cut from a block share it, and each goes on

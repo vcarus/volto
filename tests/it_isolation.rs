@@ -94,7 +94,7 @@ fn capsule_reply_is<'a>(
                         panic!("the session's stream read at {caller} failed: {error:?}")
                     })
                     .unwrap_or_else(|| panic!("the session's stream read at {caller} ended"));
-                decoder.push(&Bytes::copy_from_slice(chunk.chunk()));
+                decoder.push(Bytes::copy_from_slice(chunk.chunk()));
             }
         })
         .await;

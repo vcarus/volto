@@ -357,7 +357,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
         "the capsule stream travels in DATA frames"
     );
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(&Bytes::from(payload));
+    decoder.push(Bytes::from(payload));
     let capsule = common::next_udp_payload(&mut decoder).expect("a whole DATAGRAM capsule");
     assert_eq!(&capsule[..], b"before settings");
 
@@ -476,7 +476,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
         );
 
         let mut decoder = CapsuleDecoder::new();
-        decoder.push(&Bytes::from(payload));
+        decoder.push(Bytes::from(payload));
         let capsule = common::next_udp_payload(&mut decoder).expect("a whole DATAGRAM capsule");
         assert_eq!(&capsule[..], b"no frame size", "round {round}");
     }

@@ -29,7 +29,7 @@ fuzz_target!(|data: &[u8]| {
             input = tail;
             chunk_len = (chunk_len % 16) + 1;
 
-            decoder.push(chunk);
+            decoder.push(chunk.to_vec().into());
             loop {
                 match decoder.next_capsule() {
                     Ok(Some(Capsule::Datagram { .. })) => continue,
@@ -52,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
     let split = usize::from(mode >> 1) % (encoded.len() + 1);
 
     let mut decoder = CapsuleDecoder::new();
-    decoder.push(&encoded[..split]);
+    decoder.push(encoded.slice(..split));
     // Feeding half a capsule must never error, only ask for more.
     match decoder.next_capsule() {
         Ok(None) => {}
@@ -65,7 +65,7 @@ fuzz_target!(|data: &[u8]| {
         }
         Err(error) => panic!("{split} of {} bytes failed: {error:?}", encoded.len()),
     }
-    decoder.push(&encoded[split..]);
+    decoder.push(encoded.slice(split..));
     match decoder.next_capsule() {
         Ok(Some(Capsule::Datagram {
             context_id: decoded_id,

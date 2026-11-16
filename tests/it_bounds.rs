@@ -32,6 +32,7 @@ mod common;
 #[path = "common/alloc.rs"]
 mod alloc;
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -60,10 +61,24 @@ struct Tallying;
 static ARMED: AtomicBool = AtomicBool::new(false);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 
+thread_local! {
+    /// Whether this thread's own allocations go to [`HERE_LIVE`].
+    ///
+    /// A constant initialiser and no destructor, so reading it from inside the
+    /// allocator allocates nothing and never fails.
+    static HERE_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Live bytes of the one thread [`while_holding_here`] arms.
+static HERE_LIVE: AtomicI64 = AtomicI64::new(0);
+
 /// Records a change in live bytes, if counting is on.
 fn record(delta: i64) {
     if ARMED.load(Ordering::Relaxed) {
         LIVE.fetch_add(delta, Ordering::Relaxed);
+    }
+    if HERE_ARMED.try_with(Cell::get).unwrap_or(false) {
+        HERE_LIVE.fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -105,6 +120,22 @@ async fn while_holding<F: Future>(body: F) -> (F::Output, i64) {
     let out = body.await;
     let held = LIVE.load(Ordering::Relaxed);
     ARMED.store(false, Ordering::Relaxed);
+    (out, held)
+}
+
+/// Runs `body` on this thread with this thread's tally armed, and reports what
+/// it left live.
+///
+/// For a measurement with no runtime under it: allocations and frees on other
+/// threads are not counted, so a test still tearing down elsewhere does not move
+/// the figure. The caller still holds [`SCALES`], because the process-wide tally
+/// of [`while_holding`] would count this thread too.
+fn while_holding_here<T>(body: impl FnOnce() -> T) -> (T, i64) {
+    HERE_LIVE.store(0, Ordering::Relaxed);
+    HERE_ARMED.set(true);
+    let out = body();
+    let held = HERE_LIVE.load(Ordering::Relaxed);
+    HERE_ARMED.set(false);
     (out, held)
 }
 
@@ -285,10 +316,10 @@ const MAX_CAPSULE_VALUE: u64 = 8 + 65527;
 /// per-session buffer, beside the 16 KiB block target packets are received into
 /// and the ~92 KiB inbound datagram queue.
 ///
-/// The ceiling is four times the value itself: room for `BytesMut` to have
-/// doubled its way there and for the reads that carried it. Each session is
-/// sent one complete capsule before the window and one unfinished capsule in
-/// it, so the ceiling bounds what one unfinished capsule costs. It does not
+/// The ceiling is four times the value itself: room for the reads that carried
+/// it and for quinn's bookkeeping of the stream. Each session is sent one
+/// complete capsule before the window and one unfinished capsule in it, so the
+/// ceiling bounds what one unfinished capsule costs. It does not
 /// test a decoder that accumulated across complete capsules, since none
 /// arrives inside the window.
 const HELD_PER_SESSION_CEILING: i64 = 4 * (MAX_CAPSULE_VALUE as i64);
@@ -320,9 +351,10 @@ fn datagram_capsule_header(length: u64) -> Bytes {
 ///
 /// # Measured
 ///
-/// On the dev host (macOS, debug build), 16 sessions: 1.22 MiB of growth, about
-/// 78 KiB apiece -- a 64 KiB value inside a `BytesMut` that doubled its way
-/// there.
+/// On the dev host (macOS, debug build), 16 sessions: 1.02 MiB of growth, about
+/// 65 KiB apiece, which is the value buffer allocated once at the declared
+/// length. While the decoder grew its buffer by doubling, this was about
+/// 78 KiB apiece.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_holds_one_unfinished_capsule_and_no_more() {
     let _scales = SCALES.lock().await;
@@ -395,6 +427,73 @@ async fn a_session_holds_one_unfinished_capsule_and_no_more() {
 
     // Held to here, so the reading above was taken with every session alive.
     drop(sessions);
+}
+
+/// Bytes in the one stream chunk the next test feeds the decoder: about the
+/// 2 MiB stream receive window, which is as large as one chunk from quinn can be
+/// once it has merged a run of small stream frames into one buffer.
+const LARGE_CHUNK: usize = 2 * 1024 * 1024;
+
+/// The decoder holds one unfinished capsule however large the chunk that
+/// carried it was.
+///
+/// The session test above sends packet-sized chunks, which is what an ordinary
+/// client produces. A peer that orders its own stream frames can instead make
+/// quinn hand the server one chunk as large as the stream window. This drives the
+/// decoder with such a chunk directly: complete capsules up to about 2 MiB, then
+/// a maximal DATAGRAM capsule with only part of its value. The chunk is built
+/// inside the window and handed to the decoder, so what is left at its end is
+/// what the decoder kept. A decoder that copied the chunk into its own buffer
+/// kept that whole buffer alive behind the unfinished tail, about 2 MiB, for the
+/// life of the session.
+///
+/// The scales above count every thread, and a window of this binary can open
+/// while the runtime of the test before it is still being torn down, whose frees
+/// show up as negative growth. This test has no runtime and runs on one thread,
+/// so it weighs only that thread: see [`while_holding_here`].
+///
+/// # Measured
+///
+/// On the dev host (macOS, debug build): 65535 bytes, the value buffer
+/// allocated once at the declared length. The decoder that copied every chunk
+/// into its own buffer held about 2 MiB here.
+#[test]
+fn a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk() {
+    let _scales = SCALES.blocking_lock();
+
+    let (decoder, held) = while_holding_here(|| {
+        let complete = volto::capsule::encode_datagram(0, &[0x5a; 1000]);
+        let mut chunk = BytesMut::with_capacity(LARGE_CHUNK);
+        while chunk.len() + complete.len() < LARGE_CHUNK - 2048 {
+            chunk.put_slice(&complete);
+        }
+        chunk.put_slice(&datagram_capsule_header(MAX_CAPSULE_VALUE));
+        chunk.put_bytes(0x5a, 1000);
+        let chunk = chunk.freeze();
+
+        let mut decoder = volto::capsule::CapsuleDecoder::new();
+        decoder.push(chunk);
+        let mut decoded = 0;
+        while let Some(capsule) = decoder.next_capsule().expect("well-formed capsules") {
+            drop(capsule);
+            decoded += 1;
+        }
+        assert!(decoded > 2000, "only {decoded} capsules decoded");
+        decoder
+    });
+
+    assert!(
+        held >= MAX_CAPSULE_VALUE as i64 - 1000,
+        "the decoder holds only {held} bytes: the unfinished value is not being \
+         collected, so this measures nothing"
+    );
+    assert!(
+        held < HELD_PER_SESSION_CEILING,
+        "the decoder holds {held} bytes after a {LARGE_CHUNK}-byte chunk, past the \
+         {HELD_PER_SESSION_CEILING} that one maximal capsule can account for"
+    );
+
+    drop(decoder);
 }
 
 // ---------------------------------------------------------------------------
