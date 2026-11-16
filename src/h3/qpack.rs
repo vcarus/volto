@@ -265,8 +265,13 @@ pub fn decode(block: &[u8], max_section_size: u64) -> Result<Vec<Field>, Violati
 
 /// Encodes a field section: the prefix, then one line per field.
 ///
-/// The prefix is always `0x00 0x00`: Required Insert Count 0, Base 0. RFC 9204
-/// §4.5.1 requires that of a section that references no dynamic entry.
+/// The prefix is always `0x00 0x00`: Required Insert Count 0, then a sign bit
+/// of 0 and a Delta Base of 0, which make the Base 0. The first byte is
+/// required. RFC 9204 §2.1.2: "For a field section encoded with no references
+/// to the dynamic table, the Required Insert Count is zero." The second is this
+/// encoder's choice. §4.5.1.2: "A field section that was encoded without
+/// references to the dynamic table can use any value for the Base; setting
+/// Delta Base to zero is one of the most efficient encodings."
 pub fn encode<'a, I>(out: &mut BytesMut, fields: I)
 where
     I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
