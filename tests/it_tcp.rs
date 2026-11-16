@@ -663,6 +663,82 @@ async fn client_reset_aborts_the_target_connection() {
     );
 }
 
+/// A tunnel whose task is ended from outside still resets its target.
+///
+/// RFC 9114 §4.4: "if a proxy detects an error with the stream or the QUIC
+/// connection, it MUST close the TCP connection", with the same section's
+/// SHOULD for a segment with the RST bit set. When a connection ends, the
+/// server ends that connection's request tasks, and that can reach a tunnel
+/// task before the task has seen the lost connection itself. A task dropped
+/// there with a plain close would put a FIN on the wire, and the target would
+/// read a cut-off upload as a complete one.
+///
+/// The server runs on a multi-thread runtime of its own here, as it does in
+/// production: on the single thread of `#[tokio::test]` each tunnel task
+/// happens to run before it is ended, and the plain close never shows. With
+/// 48 tunnels on one connection and two workers, most tasks are ended before
+/// they run.
+#[test]
+fn a_tunnel_ended_with_its_connection_resets_its_target() {
+    const TUNNELS: usize = 48;
+    const ROUNDS: usize = 4;
+
+    let runtime = |workers| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    };
+    let server_runtime = runtime(2);
+    let client_runtime = runtime(2);
+    let server = TestServer::start_on(server_runtime.handle(), ALLOW_PRIVATE);
+
+    let clean_ends = client_runtime.block_on(async {
+        let mut clean_ends = 0;
+        for _ in 0..ROUNDS {
+            let mut client = H3Client::connect(&server).await;
+            let mut tunnels = Vec::new();
+            for _ in 0..TUNNELS {
+                let (target, ended) = spawn_end_reporting_target().await;
+                let mut stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
+                stream
+                    .send_data(Bytes::from_static(b"the first part of an upload"))
+                    .await
+                    .expect("the tunnel takes the upload");
+                tunnels.push((stream, ended));
+            }
+
+            // The server ends the connection itself, on a rule this client
+            // breaks: a second control stream (RFC 9114 §6.2.1).
+            let mut second_control = client.quic.open_uni().await.expect("a stream");
+            second_control
+                .write_all(&[0x00])
+                .await
+                .expect("the stream type goes out");
+
+            for (_stream, ended) in &mut tunnels {
+                let end = tokio::time::timeout(TIMEOUT, ended.recv())
+                    .await
+                    .expect("the target connection must be closed with the client's connection")
+                    .expect("close notification");
+                if end != ConnectionEnd::Failed(std::io::ErrorKind::ConnectionReset) {
+                    clean_ends += 1;
+                }
+            }
+        }
+        clean_ends
+    });
+
+    assert_eq!(
+        clean_ends,
+        0,
+        "{clean_ends} of {} targets saw something other than a reset when their tunnel's \
+         connection ended",
+        TUNNELS * ROUNDS
+    );
+}
+
 /// RFC 9114 §4.4: "If the stream is reset or reading is aborted by the client,
 /// a proxy SHOULD perform the same operation on the other direction in order to
 /// ensure that both directions of the stream are cancelled."

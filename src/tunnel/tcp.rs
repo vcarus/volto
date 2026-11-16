@@ -479,10 +479,15 @@ where
 /// Pumps client → target.
 async fn client_to_target(
     mut reader: Reader,
-    mut tcp_write: OwnedWriteHalf,
+    tcp_write: OwnedWriteHalf,
     state: &watch::Sender<State>,
     budget: Duration,
 ) {
+    // From here to each ending below, a drop of this future resets the target
+    // (see [`UploadHalf`]). Every ending takes the half back out and decides
+    // for itself.
+    let mut tcp_write = UploadHalf::new(tcp_write);
+
     // Two receivers of the one channel, because the teardown arm and the
     // half-close arm of one `select!` each need their own to wait on.
     let mut teardown_rx = state.subscribe();
@@ -554,9 +559,9 @@ async fn client_to_target(
                 let written = tokio::select! {
                     biased;
                     reason = torn_down(&mut teardown_rx) => break reason,
-                    written = write_batch(&mut tcp_write, &mut batch) => written,
+                    written = write_batch(tcp_write.half(), &mut batch) => written,
                     error = reader.reset_by_peer() => {
-                        client_aborted(&error, tcp_write, state);
+                        client_aborted(&error, tcp_write.release(), state);
                         return;
                     }
                     // The mirror of the arm in `target_to_client`: once the
@@ -575,6 +580,7 @@ async fn client_to_target(
                         // still open: the target must not read a polite FIN off
                         // a tunnel this server cut.
                         reader.stop_receiving(h3api::CONNECT_ERROR);
+                        let tcp_write = tcp_write.release();
                         abort_target(tcp_write.as_ref());
                         tcp_write.forget();
                         state.send_replace(State::TornDown(Teardown::TargetError));
@@ -585,6 +591,9 @@ async fn client_to_target(
                 if let Err(error) = written {
                     // The target is gone (RST, EPIPE): the tunnel is broken.
                     debug!(%error, "write to target failed");
+                    // Dropped as it always was: the target has already ended
+                    // this connection, so there is nothing to reset.
+                    drop(tcp_write.release());
                     reader.stop_receiving(h3api::CONNECT_ERROR);
                     state.send_replace(State::TornDown(Teardown::TargetError));
                     return;
@@ -598,13 +607,17 @@ async fn client_to_target(
                 // other direction's own bound is the only thing left to notice
                 // a client that stops reading what it asked for.
                 state.send_replace(State::ClientFinished);
+                // Taken out before the FIN: the upload is complete from here,
+                // so a tunnel ended during or after the shutdown has cut
+                // nothing short.
+                let mut tcp_write = tcp_write.release();
                 if let Err(error) = tcp_write.shutdown().await {
                     debug!(%error, "failed to shut down the target write side");
                 }
                 return;
             }
             Err(error) => {
-                client_aborted(&error, tcp_write, state);
+                client_aborted(&error, tcp_write.release(), state);
                 return;
             }
         }
@@ -627,7 +640,56 @@ async fn client_to_target(
     // Forgotten rather than dropped: shutting the write side down on the way out
     // would put a FIN on the wire, which is the wrong signal for every path that
     // gets here, and would overtake the reset when the other pump armed one.
-    tcp_write.forget();
+    tcp_write.release().forget();
+}
+
+/// The target's write half for as long as the upload pump runs, which resets
+/// the target if the pump is dropped before it has ended.
+///
+/// A tunnel's task can be ended from outside: `crate::conn` aborts a
+/// connection's request tasks when the connection ends, and the end of the
+/// shutdown grace drops them. Either can land while the client's upload is in
+/// progress, before the pump has seen the lost connection and armed the reset
+/// itself. A plain drop of the half would then shut the write side down, which
+/// puts a FIN on the wire, and the target would read a cut-off upload as a
+/// complete one. RFC 9114 §4.4 asks for the opposite: "if a proxy detects an
+/// error with the stream or the QUIC connection, it MUST close the TCP
+/// connection", and "the proxy SHOULD send a TCP segment with the RST bit
+/// set".
+///
+/// So a drop with the half still inside arms the reset and forgets the half,
+/// exactly as [`client_aborted`] does, and the socket closes abortively when
+/// the read half goes with the same task. Every ending the pump reaches itself
+/// takes the half out with [`Self::release`] first.
+struct UploadHalf(Option<OwnedWriteHalf>);
+
+impl UploadHalf {
+    fn new(half: OwnedWriteHalf) -> Self {
+        Self(Some(half))
+    }
+
+    /// The half, to write through.
+    fn half(&mut self) -> &mut OwnedWriteHalf {
+        self.0
+            .as_mut()
+            .expect("the half is taken out only by `release`, which consumes the wrapper")
+    }
+
+    /// Takes the half out, for an ending that decides what the target sees.
+    fn release(mut self) -> OwnedWriteHalf {
+        self.0
+            .take()
+            .expect("the half is taken out only here, and this consumes the wrapper")
+    }
+}
+
+impl Drop for UploadHalf {
+    fn drop(&mut self) {
+        if let Some(half) = self.0.take() {
+            abort_target(half.as_ref());
+            half.forget();
+        }
+    }
 }
 
 /// Most pieces of the client's body one write to the target carries.
