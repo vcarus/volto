@@ -763,8 +763,14 @@ impl Connection {
     /// elsewhere. Requests arriving past it are rejected in [`Self::accept`]
     /// with H3_REQUEST_REJECTED, the code a client may safely retry on.
     ///
-    /// This does not wait for anything, and the connection stays usable
-    /// afterwards. The caller decides when the existing tunnels are done.
+    /// It awaits the GOAWAY write, which the peer's flow control on the
+    /// control stream can hold, so a caller bounds it. It is not cancel-safe:
+    /// the identifier is recorded before the write, so a cancelled call still
+    /// rejects later requests the peer may never have been told about, and may
+    /// leave part of the frame on the control stream. Both are tolerable,
+    /// because H3_REQUEST_REJECTED is safe to retry and nothing writes to the
+    /// control stream again. The connection stays usable afterwards, and the
+    /// caller decides when the existing tunnels are done.
     pub async fn shutdown(&mut self) -> Result<(), ConnectionError> {
         let next = next_request_id(self.last_accepted);
 
