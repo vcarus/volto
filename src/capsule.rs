@@ -196,9 +196,9 @@ impl CapsuleDecoder {
     /// False at end of stream means the peer stopped mid-capsule, which
     /// RFC 9297 §3.3 makes a malformed message.
     pub fn at_capsule_boundary(&self) -> bool {
-        matches!(self.state, State::Header | State::Skip { remaining: 0 })
-            && self.partial.is_empty()
-            && self.chunk.is_empty()
+        // A spent `Skip` is never seen here: `next_capsule` turns it into
+        // `Header` before it returns.
+        matches!(self.state, State::Header) && self.partial.is_empty() && self.chunk.is_empty()
     }
 
     /// The number of bytes the decoder is currently holding.
@@ -513,22 +513,13 @@ mod tests {
     }
 
     /// A stream that ends on the last byte of a skipped capsule ended between
-    /// capsules, not inside one.
-    ///
-    /// The spent `Skip` is put back by hand: the drive above leaves exactly the
-    /// buffer that state comes with — empty — but no sequence of `push` and
-    /// `next_capsule` calls can leave the decoder *in* it, because the loop in
-    /// `next_capsule` turns it into `Header` before returning. The arm
-    /// classifying it is what keeps the answer right for any caller that does
-    /// see it: `false` there would fail a well-formed stream as the malformed
-    /// message RFC 9297 §3.3 makes a truncated one.
+    /// capsules, not inside one. `next_capsule` turns a spent `Skip` into
+    /// `Header` before it returns, so no caller sees the decoder in that state.
     #[test]
     fn a_fully_skipped_unknown_capsule_ends_at_a_boundary() {
         let mut decoder = CapsuleDecoder::new();
         decoder.push(encode_unknown(0x41, b"skipped whole"));
         assert!(drain(&mut decoder).unwrap().is_empty());
-
-        decoder.state = State::Skip { remaining: 0 };
         assert!(decoder.at_capsule_boundary());
 
         // Not a boundary while bytes are still waiting: this one is the first of
