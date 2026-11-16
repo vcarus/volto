@@ -272,16 +272,20 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // well-formed CONNECT-UDP one, before the resolver is asked anything.
     //
     // RFC 9298 §5: "A client MAY optimistically start sending UDP packets in
-    // HTTP Datagrams before receiving the response to its UDP proxying request",
-    // and a proxy receiving them early "SHALL either drop that HTTP Datagram
-    // silently or buffer it temporarily (on the order of a round trip)".
-    // Claiming here takes the second option: the packets land in the queue the
+    // HTTP Datagrams before receiving the response to its UDP proxying request.
+    // However, implementers should note that such proxied packets may not be
+    // processed by the UDP proxy if it responds to the request with a failure
+    // [...]". The RFC does not require these packets to be kept. Keeping them
+    // is this server's own choice: claiming here puts them in the queue the
     // session is about to read from, so a client that opens a tunnel and sends
-    // immediately does not lose its first packets to name resolution.
+    // immediately does not lose its first packets to name resolution. The same
+    // section says "Receivers that buffer datagrams SHOULD apply buffering
+    // limits", and the limit here is the queue depth, `INBOUND_QUEUE_DEPTH` in
+    // `crate::h3::connection`.
     //
     // Every refusal below returns, dropping the receiver and with it both the
-    // queue and the claim. That is the discard the same paragraph calls for
-    // when the request the datagrams were waiting on never succeeds.
+    // queue and the claim, so the packets of a request that fails are not
+    // processed, as the sentence above allows.
     let quarter_stream_id = datagram::quarter_stream_id(stream_id);
     let Some(inbound) = stream.datagrams() else {
         // Unreachable: a request stream reaches exactly one tunnel, and this is
