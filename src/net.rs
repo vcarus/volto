@@ -118,7 +118,7 @@ async fn on_the_blocking_pool(
 /// Name lookups the whole process may have in flight beyond the one every
 /// connection keeps in reserve.
 ///
-/// The number this bounds is threads, not queries: `tokio::net::lookup_host`
+/// The number this bounds is threads, not queries: `on_the_blocking_pool`
 /// hands a name to `getaddrinfo` on the runtime's *blocking* pool, and that call
 /// is not cancellable. A `connect_timeout` that expires drops the future and
 /// answers the client, but the thread stays in the resolver until the stub gives
@@ -725,8 +725,8 @@ mod tests {
 
         /// An IP literal costs nothing, because it blocks nothing.
         ///
-        /// Asserted without a runtime at all: `lookup_host` would reach the
-        /// blocking pool, and reaching it from here panics. So a literal
+        /// Asserted without a runtime at all: [`on_the_blocking_pool`] would
+        /// reach the blocking pool, and reaching it from here panics. So a literal
         /// answered by a single poll is a literal that never went near a
         /// thread — with every slot this connection has already held.
         #[test]
