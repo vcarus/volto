@@ -508,7 +508,15 @@ fn limit_column(column: &str) -> Option<Option<u64>> {
 ///
 /// Connecting the socket makes the kernel drop any packet that does not come
 /// from `target`, which is the source validation RFC 9298 §3.1 calls for.
+///
+/// An IPv4-mapped IPv6 target (`::ffff:a.b.c.d`) is connected as the IPv4
+/// address it stands for, which is also how [`crate::policy`] judged it. On an
+/// IPv6 socket its packets would leave as IPv4 without the IPv4 "don't
+/// fragment" setting, and a host with `net.ipv6.bindv6only = 1` would refuse
+/// the connect.
 pub async fn connected_udp_socket(target: SocketAddr) -> io::Result<UdpSocket> {
+    let target = SocketAddr::new(crate::policy::canonical(target.ip()), target.port());
+
     // Bind a wildcard address of the same family as the target.
     let bind: SocketAddr = if target.is_ipv4() {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
@@ -1180,5 +1188,23 @@ mod tests {
             .await
             .expect("connect udp");
         assert!(socket.local_addr().expect("local addr").is_ipv4());
+    }
+
+    /// A target written as an IPv4-mapped IPv6 address is an IPv4 target, as
+    /// the destination policy already judges it, and gets an IPv4 socket. On
+    /// an IPv6 socket the Linux "don't fragment" setting would be the IPv6
+    /// one, which the kernel does not apply to the IPv4 packets it sends.
+    #[tokio::test]
+    async fn a_mapped_target_gets_an_ipv4_socket() {
+        let socket = connected_udp_socket("[::ffff:127.0.0.1]:9".parse().unwrap())
+            .await
+            .expect("connect udp");
+
+        let local = socket.local_addr().expect("local addr");
+        assert!(local.is_ipv4(), "bound as {local}");
+        assert_eq!(
+            socket.peer_addr().expect("peer addr"),
+            "127.0.0.1:9".parse().unwrap()
+        );
     }
 }
