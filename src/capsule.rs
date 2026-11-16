@@ -63,12 +63,14 @@ pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + MAX_UDP_PAYLOAD as u64;
 
 /// Why a capsule sequence could not be decoded.
 ///
-/// All of these are malformed-message conditions and map onto
+/// The CONNECT-UDP tunnel answers each of these by resetting the stream with
+/// `H3_DATAGRAM_ERROR` (0x33), which RFC 9297 §5.2 registers for a "Datagram or
+/// Capsule Protocol parse error". A stream that ends part-way through a capsule
+/// is not one of these: every capsule on it parsed, and the tunnel learns of it
+/// from [`CapsuleDecoder::at_capsule_boundary`] and answers with
 /// `H3_MESSAGE_ERROR`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// The stream ended part-way through a capsule.
-    Truncated,
     /// A DATAGRAM capsule declared more bytes than a UDP payload can hold.
     DatagramTooLarge {
         /// The declared capsule length.
@@ -81,7 +83,6 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Truncated => write!(f, "stream ended mid-capsule"),
             Self::DatagramTooLarge { length } => {
                 write!(f, "DATAGRAM capsule of {length} bytes is too large")
             }

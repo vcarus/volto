@@ -1011,11 +1011,7 @@ impl Session<'_> {
                     // ended somewhere other than a capsule boundary. That is a
                     // fault of the message, so the code the RFC names for a
                     // malformed message is sent.
-                    debug!(
-                        stream_id,
-                        error = %capsule::Error::Truncated,
-                        "connect-udp stream ended mid-capsule"
-                    );
+                    debug!(stream_id, "connect-udp stream ended mid-capsule");
                     self.abort(h3api::MESSAGE_ERROR)
                 }
             }
