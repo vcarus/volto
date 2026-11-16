@@ -296,7 +296,7 @@ pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     for Field { name, value } in section {
         if !name.starts_with(b":") {
             regular_field_seen = true;
-            add_field(&mut fields, &name, &value)?;
+            add_field(&mut fields, name, value)?;
             continue;
         }
 
@@ -583,11 +583,19 @@ fn is_pchar(byte: u8) -> bool {
 }
 
 /// Adds one regular field, applying RFC 9114 §4.2's rules on the way.
-fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Violation> {
+///
+/// Takes the decoded name and value by value. A literal that `qpack::decode`
+/// allocated becomes the stored name or value with no copy; only a static-table
+/// entry, a few bytes, is copied.
+fn add_field(
+    fields: &mut Fields,
+    name: Cow<'static, [u8]>,
+    value: Cow<'static, [u8]>,
+) -> Result<(), Violation> {
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
     //# A request or response containing uppercase characters in field names
     //# MUST be treated as malformed.
-    let name = message::field_name(name)
+    let name = owned_field_name(name)
         .ok_or_else(|| malformed("a field name that is uppercase or not a token"))?;
 
     //= https://www.rfc-editor.org/rfc/rfc9110#section-5.5
@@ -610,7 +618,7 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //= https://www.rfc-editor.org/rfc/rfc9114#section-10.3
     //# Any request or response that contains a character not permitted in a
     //# field value MUST be treated as malformed.
-    let value = FieldValue::parse(trim_optional_whitespace(value))
+    let value = owned_field_value(value)
         .ok_or_else(|| malformed("a field value with a forbidden character"))?;
 
     //= https://www.rfc-editor.org/rfc/rfc9114#section-4.2
@@ -624,7 +632,7 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     // covers and why TE is not among them; the answer there can be a 400
     // (RFC 9114 §4.1.2 allows a response before the stream is closed), which
     // tells the client rather more than a bare reset would.
-    if name == "connection" {
+    if &*name == "connection" {
         return Err(malformed(
             "the Connection field, which HTTP/3 has no use for",
         ));
@@ -634,7 +642,7 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     //# The only exception to this is the TE header field, which MAY be
     //# present in an HTTP/3 request header; when it is, it MUST NOT contain
     //# any value other than "trailers".
-    if name == "te" && value.as_bytes() != b"trailers" {
+    if &*name == "te" && value.as_bytes() != b"trailers" {
         return Err(malformed("a TE field with a value other than \"trailers\""));
     }
 
@@ -648,7 +656,7 @@ fn add_field(fields: &mut Fields, name: &[u8], value: &[u8]) -> Result<(), Viola
     // agreement check in `build_request` reads only the first Host. A second
     // Host that disagrees would then go unchecked, which is a request-smuggling
     // pattern.
-    if name == "host" && fields.contains("host") {
+    if &*name == "host" && fields.contains("host") {
         return Err(malformed("more than one Host field"));
     }
 
@@ -674,6 +682,58 @@ fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
     }
 
     value
+}
+
+/// [`trim_optional_whitespace`] on an owned buffer, in place.
+///
+/// The tail is cut with `truncate`, which moves nothing. The remaining bytes
+/// are moved to the front only when a leading SP or HTAB is present, so a value
+/// without padding is left exactly as it arrived.
+fn trim_optional_whitespace_in_place(value: &mut Vec<u8>) {
+    let kept = trim_optional_whitespace(value).len();
+    let leading = value
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+
+    // For a value that is all whitespace, `leading` is its whole length and
+    // `kept` is 0, so the truncate keeps everything and the drain empties it.
+    value.truncate(leading + kept);
+    if leading > 0 {
+        value.drain(..leading);
+    }
+}
+
+/// The name of one decoded field line, if [`message::field_name`] accepts it.
+///
+/// An owned name becomes the stored name with no copy. A static-table name is
+/// copied, which is a few bytes.
+fn owned_field_name(name: Cow<'static, [u8]>) -> Option<Box<str>> {
+    match name {
+        Cow::Borrowed(name) => message::field_name(name).map(Box::from),
+        Cow::Owned(name) => {
+            message::field_name(&name)?;
+            // A token is ASCII, so this cannot fail once `field_name` has
+            // accepted the bytes. The error arm is still a refusal rather than
+            // a panic.
+            String::from_utf8(name).ok().map(String::into_boxed_str)
+        }
+    }
+}
+
+/// The value of one decoded field line with RFC 9110 §5.5's whitespace
+/// excluded, if [`FieldValue::parse`] accepts what is left.
+///
+/// An owned value is trimmed in place and becomes the stored value with no
+/// copy. A static-table value is copied, which is a few bytes.
+fn owned_field_value(value: Cow<'static, [u8]>) -> Option<FieldValue> {
+    match value {
+        Cow::Borrowed(value) => FieldValue::parse(trim_optional_whitespace(value)),
+        Cow::Owned(mut value) => {
+            trim_optional_whitespace_in_place(&mut value);
+            FieldValue::from_vec(value)
+        }
+    }
 }
 
 /// A message this server will not process (RFC 9114 §4.1.2).
@@ -1577,6 +1637,88 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    /// The owned path of a decoded value trims in place, and accepts and refuses
+    /// exactly what trimming a slice and parsing it does.
+    #[test]
+    fn an_owned_value_is_trimmed_and_checked_like_a_borrowed_one() {
+        for padded in [
+            &b"value"[..],
+            b" \tvalue",
+            b"value\t ",
+            b" \tvalue \t",
+            b"\t a b \t",
+            b" \t ",
+            b"",
+            b" \t\nvalue",
+            b"  value\0",
+            b"\tva\rlue ",
+        ] {
+            let expected = FieldValue::parse(trim_optional_whitespace(padded));
+            assert_eq!(
+                owned_field_value(Cow::Owned(padded.to_vec())),
+                expected,
+                "{padded:?}"
+            );
+            assert_eq!(
+                owned_field_value(Cow::Borrowed(padded)),
+                expected,
+                "{padded:?}"
+            );
+        }
+    }
+
+    /// The same equivalence over arbitrary bytes.
+    #[test]
+    fn an_owned_value_matches_a_borrowed_one_for_any_bytes() {
+        proptest::proptest!(|(value: Vec<u8>, leading in 0usize..4, trailing in 0usize..4)| {
+            let mut padded = vec![b' '; leading];
+            padded.extend_from_slice(&value);
+            padded.extend(std::iter::repeat_n(b'\t', trailing));
+            proptest::prop_assert_eq!(
+                owned_field_value(Cow::Owned(padded.clone())),
+                FieldValue::parse(trim_optional_whitespace(&padded))
+            );
+        });
+    }
+
+    /// A decoded literal name and value with no padding become the stored name
+    /// and value: the buffers `qpack::decode` allocated are kept, not copied.
+    #[test]
+    fn a_literal_field_keeps_the_buffers_it_was_decoded_into() {
+        let name = b"proxy-authorization".to_vec();
+        let value = b"Basic dXNlcjE6czNjcmV0".to_vec();
+        let (name_at, value_at) = (name.as_ptr(), value.as_ptr());
+
+        let mut section = connect();
+        section.push(Field {
+            name: Cow::Owned(name),
+            value: Cow::Owned(value),
+        });
+        let request = build_request(section).expect("accepted");
+
+        let (stored_name, stored_value) = request.fields.iter().next().expect("one field");
+        assert_eq!(stored_name.as_ptr(), name_at, "the name was copied");
+        assert_eq!(
+            stored_value.as_bytes().as_ptr(),
+            value_at,
+            "the value was copied"
+        );
+    }
+
+    /// An owned name is refused on the same grounds as a borrowed one.
+    #[test]
+    fn an_owned_name_is_checked_like_a_borrowed_one() {
+        for name in [&b"accept"[..], b"Accept", b"", b"a b", b"x:y", b"\xff"] {
+            let expected = message::field_name(name).map(Box::<str>::from);
+            assert_eq!(
+                owned_field_name(Cow::Owned(name.to_vec())),
+                expected,
+                "{name:?}"
+            );
+            assert_eq!(owned_field_name(Cow::Borrowed(name)), expected, "{name:?}");
+        }
     }
 
     /// The one exception §4.2 makes for TE.

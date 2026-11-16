@@ -182,6 +182,15 @@ impl FieldValue {
         is_field_value(value).then(|| Self(value.into()))
     }
 
+    /// [`Self::parse`] for a value that is already an owned buffer.
+    ///
+    /// The same octets are accepted and refused. The buffer becomes the value
+    /// itself, so nothing is copied. A buffer with spare capacity, such as a
+    /// Huffman decoder's output, is shrunk to its length on the way in.
+    pub fn from_vec(value: Vec<u8>) -> Option<Self> {
+        is_field_value(&value).then(|| Self(value.into_boxed_slice()))
+    }
+
     /// The value as it appears on the wire.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0

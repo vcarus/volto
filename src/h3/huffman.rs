@@ -171,7 +171,9 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
     let table = table();
 
     // A Huffman code is at least five bits, so this never under-reserves and
-    // the loop below never grows the vector.
+    // the loop below never grows the vector. The decoded length is not known
+    // without a second pass over the bits, so the spare capacity is left for
+    // `FieldValue::from_vec` and the field name conversion to shrink away.
     let mut out = Vec::with_capacity(encoded.len() * 8 / 5 + 1);
 
     // The bits seen since the last complete symbol, and how many there are.
