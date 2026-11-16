@@ -43,13 +43,14 @@ impl Status {
     pub const INTERNAL_SERVER_ERROR: Self = Self(*b"500");
     /// 501 Not Implemented: a method or `:protocol` this proxy does not serve.
     pub const NOT_IMPLEMENTED: Self = Self(*b"501");
-    /// 502 Bad Gateway: the target refused the connection or could not be looked
-    /// up (RFC 9209 §2.3.2).
+    /// 502 Bad Gateway: the target could not be looked up or refused the
+    /// connection (RFC 9209 §2.3.2 and §2.3.7).
     pub const BAD_GATEWAY: Self = Self(*b"502");
     /// 503 Service Unavailable: the target could not be reached at all, or this
-    /// proxy is at a limit (RFC 9209 §2.3.2).
+    /// proxy is at a limit (RFC 9209 §2.3.4 and §2.3.12).
     pub const SERVICE_UNAVAILABLE: Self = Self(*b"503");
-    /// 504 Gateway Timeout: the target never answered (RFC 9209 §2.3.2).
+    /// 504 Gateway Timeout: the lookup or the connection to the target timed out
+    /// (RFC 9209 §2.3.1 and §2.3.9).
     pub const GATEWAY_TIMEOUT: Self = Self(*b"504");
 
     /// Reads a `:status` value.
