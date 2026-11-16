@@ -86,7 +86,20 @@ exclude_re = [
     # D90: `max_connections as usize > RESERVED_LOOKUP_CEILING` -> `>=`. The two
     # branches agree at the boundary -- at exactly the ceiling both give the
     # ceiling -- so the mutant is equivalent, not uncovered.
-    'replace > with >= in blocking_pool_size',
+    'replace > with >= in reserved_lookups',
+
+    # The capsule decoder copies at most MAX_HEADER_LEN bytes of a split header
+    # into its private buffer. With `+` it may copy up to 15 more, which the
+    # header parse ignores and the next line discards: the same capsules come
+    # out, and nothing outside the function can see the longer copy.
+    'replace - with \+ in CapsuleDecoder::take_header',
+
+    # A full queue refuses the payload in the copying arm as well, because
+    # `try_send` fails there too. The `0` arm only spares the copy.
+    'delete match arm 0 in enqueue',
+
+    # `drain(..0)` removes nothing, so guarding it with `>= 0` changes nothing.
+    'replace > with >= in trim_optional_whitespace_in_place',
 
     # Surfacing an empty DATA frame as Some(empty) is absorbed by both
     # callers (a zero-byte relay write and a zero-byte decoder push), so the

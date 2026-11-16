@@ -2958,7 +2958,29 @@ mod tests {
         assert_eq!(inbound.try_recv(), None, "the newcomer was not kept");
     }
 
-    /// A held datagram is let go once it has been held for
+    /// A claim takes the datagrams held for its own Quarter Stream ID, in
+    /// order, leaves the others held, and reports the number it moved.
+    #[test]
+    fn a_release_moves_only_its_own_session_and_says_how_many() {
+        let shared = Arc::new(Shared::default());
+        let start = Instant::now();
+        shared.deliver_at(datagram(5, 0, b"one"), || start);
+        shared.deliver_at(datagram(6, 0, b"other"), || start);
+        shared.deliver_at(datagram(5, 0, b"two"), || start);
+
+        let (sink, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
+        let mut routes = shared.lock();
+        routes.sessions.insert(5, sink);
+        assert_eq!(routes.release(5), 2, "both datagrams held for session 5");
+        assert_eq!(routes.early.len(), 1, "the one for session 6 stays held");
+        assert_eq!(routes.release(5), 0, "nothing is left to release");
+        drop(routes);
+
+        assert_eq!(inbound.try_recv().ok().as_deref(), Some(b"one".as_slice()));
+        assert_eq!(inbound.try_recv().ok().as_deref(), Some(b"two".as_slice()));
+    }
+
+    /// An unclaimed datagram is let go once it has been held for
     /// [`EARLY_DATAGRAM_HOLD`], when the hold is next touched, and counted.
     #[test]
     fn the_hold_is_bounded_in_time() {

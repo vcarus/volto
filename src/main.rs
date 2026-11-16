@@ -915,6 +915,14 @@ mod tests {
 
         let terminate = signal(SignalKind::terminate()).expect("a SIGTERM stream");
         let waiting = tokio::spawn(first_termination(Some(terminate), None));
+        // Before any signal the wait is still on: a stream is waited on, not
+        // taken as having fired.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "the wait ended before any signal was sent"
+        );
+
         kill_process(getpid(), Signal::TERM).expect("SIGTERM must be deliverable");
 
         let name = tokio::time::timeout(Duration::from_secs(5), waiting)

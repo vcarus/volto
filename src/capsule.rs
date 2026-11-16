@@ -804,6 +804,40 @@ mod tests {
         }
     }
 
+    /// A chunk that ends inside a capsule header is not kept: the bytes of the
+    /// unfinished header are copied out, and the decoder lets go of the chunk.
+    ///
+    /// Otherwise one byte of header would keep a chunk of any size allocated
+    /// until the rest of the header arrived.
+    #[test]
+    fn a_chunk_that_ends_inside_a_header_is_let_go() {
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&encode_datagram(0, b"whole"));
+        // The Type of the next capsule, without its Length.
+        wire.put_u8(0x00);
+        let chunk = wire.freeze();
+
+        let mut decoder = CapsuleDecoder::new();
+        decoder.push(chunk.clone());
+        assert_eq!(
+            drain(&mut decoder).unwrap(),
+            vec![datagram_capsule(0, b"whole")]
+        );
+        assert_eq!(decoder.buffered_len(), 1, "the one header byte is held");
+        assert!(
+            chunk.is_unique(),
+            "the decoder still refers to the chunk the header began in"
+        );
+
+        // And the header is completed from the copy.
+        decoder.push(Bytes::from_static(b"\x03\x00ok"));
+        assert_eq!(
+            drain(&mut decoder).unwrap(),
+            vec![datagram_capsule(0, b"ok")]
+        );
+        assert!(decoder.at_capsule_boundary());
+    }
+
     /// Encodes a capsule of a type the decoder does not know.
     fn encode_unknown(capsule_type: u64, value: &[u8]) -> Bytes {
         let mut buf = BytesMut::new();
