@@ -61,8 +61,11 @@ fn write_config(dir: &Path, listen: &str, body: &str) -> PathBuf {
 /// A password distinctive enough that finding it in any output is proof.
 const SECRET: &str = "hunter2-TAILSECRET";
 
+/// Runs the binary to its end with `JOURNAL_STREAM` removed, so the text on
+/// stderr does not depend on whether the test runner itself runs under systemd.
 fn run(args: &[&str]) -> Output {
     Command::new(real_binary())
+        .env_remove("JOURNAL_STREAM")
         .args(args)
         .output()
         .expect("the volto binary must be runnable")
