@@ -698,6 +698,35 @@ cannot see the relay's, because no interface here carries it, so a target that
 names the relay is judged like any other public address. See
 [`[security]`](configuration.md#security).
 
+## Apple's relay client
+
+volto is built for Surge, and Apple's own relay client also works against it.
+The client is the one behind `NERelay` and the `com.apple.relay.managed`
+profile payload, and `Network.framework` exposes it to a single process as
+`ProxyConfiguration(relayHops:)`. What was tested is that last form, on macOS
+15: TCP through CONNECT, UDP through CONNECT-UDP, and an HTTP/3 fetch carried
+by a CONNECT-UDP session. A configuration profile on a device was not tested.
+
+- **Give it an HTTP/3 relay URL only.** volto has no HTTP/2 listener, so leave
+  the HTTP/2 URL unset.
+- **The host of the relay URL is both the address the client dials and the SNI
+  it sends.** There is no separate setting like Surge's `sni=`. Use a host
+  name, not an IP literal: a URL with an IP literal sends no SNI, and a
+  non-empty [`expected_sni`](configuration.md#security) drops that handshake.
+  The name must be in `expected_sni` when the list is non-empty, the
+  certificate must cover it, and the client must trust the certificate. Behind
+  a UDP relay, the name's DNS record points at the relay.
+- **Send the credentials as an additional header field** on the relay:
+  `Proxy-Authorization: Basic <base64 of user:password>`.
+- **The URI template needs no setting.** A relay URL without a path makes the
+  client use `/.well-known/masque/udp/{host}/{port}/`, which volto accepts.
+- **The client offers `proxy-quic-forwarding: ?1`.** volto does not implement
+  that extension and ignores the field, and the client carries on without it.
+
+This client sends the first UDP payload in the same flight as its CONNECT-UDP
+request. volto holds that datagram until the session exists; see
+[Notes that matter in practice](configuration.md#notes-that-matter-in-practice).
+
 ## fail2ban
 
 A failed authentication logs one stable `WARN` line carrying the source address:
