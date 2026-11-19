@@ -34,6 +34,8 @@
 //!   some line.
 //! * **One MSRV.** `fuzz/Cargo.toml`, the `msrv` job in `ci.yml`, `README.md`
 //!   and `docs/deployment.md` state the `rust-version` of `Cargo.toml`.
+//! * **The release binary checks integer overflow in this crate.** Debug
+//!   builds always do, so no other test notices when the release profile stops.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -1057,4 +1059,81 @@ fn opens_a_patch_table_reads_every_spelling() {
     ] {
         assert!(!opens_a_patch_table(line), "not a patch table: {line}");
     }
+}
+
+/// The value `key` is set to inside the TOML table `header` of `manifest`, with
+/// whitespace and quotes removed, or `None` when the table or the key is absent.
+///
+/// The table runs from its header line to the next line that opens a table.
+/// Comment lines are skipped, so a commented-out setting does not count.
+fn table_setting(manifest: &str, header: &str, key: &str) -> Option<String> {
+    let bare = |line: &str| -> String {
+        line.chars()
+            .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+            .collect()
+    };
+    let mut lines = manifest.lines().map(bare);
+    lines.find(|line| *line == header)?;
+    lines
+        .take_while(|line| !line.starts_with('['))
+        .filter(|line| !line.starts_with('#'))
+        .find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix('=')
+                .map(|value| value.split('#').next().unwrap_or_default().to_owned())
+        })
+}
+
+/// The released binary panics on integer overflow in volto's own code.
+///
+/// Debug builds check overflow already, so every test run passes whether or not
+/// the release profile does; only this assertion notices the setting going
+/// away. Without it, an unsigned subtraction that underflows in a release build
+/// wraps silently, and a bound computed from it turns into a very large number
+/// that lets its check pass. The reasoning is in the comment above the table in
+/// `Cargo.toml`.
+#[test]
+fn the_release_profile_checks_overflow_in_this_crate() {
+    let manifest = read_text(&repo_root().join("Cargo.toml"));
+    assert_eq!(
+        table_setting(
+            &manifest,
+            "[profile.release.package.volto]",
+            "overflow-checks"
+        )
+        .as_deref(),
+        Some("true"),
+        "Cargo.toml no longer sets `overflow-checks = true` under \
+         `[profile.release.package.volto]`, so an integer overflow in a release \
+         build wraps silently instead of panicking"
+    );
+}
+
+#[test]
+fn table_setting_reads_only_the_named_table() {
+    let manifest = "\
+[profile.release]
+overflow-checks = false
+
+[ profile.release.package.\"volto\" ]
+# overflow-checks = false
+overflow-checks = true # checked
+
+[profile.release.package.other]
+lto = true
+";
+    let read = |header, key| table_setting(manifest, header, key);
+    assert_eq!(
+        read("[profile.release.package.volto]", "overflow-checks").as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        read("[profile.release]", "overflow-checks").as_deref(),
+        Some("false")
+    );
+    assert_eq!(
+        read("[profile.release.package.other]", "overflow-checks"),
+        None
+    );
+    assert_eq!(read("[profile.bench]", "overflow-checks"), None);
 }

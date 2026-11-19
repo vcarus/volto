@@ -297,6 +297,26 @@ codegen-units = 1
 # `DEBUG=true` for build scripts, which made `cc` compile aws-lc with `-g`.
 strip = true
 
+# Integer overflow panics in volto's own code in release builds too, as it
+# already does in debug builds and so in every test run. Without this, an
+# unsigned subtraction that underflows wraps silently, and a bound computed
+# from it (a buffer budget, a remaining length) becomes a very large number
+# that lets the check it feeds pass. Safe Rust cannot turn that into memory
+# corruption, but it can turn a bounded buffer into an unbounded one. With the
+# check, the overflow panics, and with the default `panic = "unwind"` that ends
+# the one tokio task it happened in (a connection or a tunnel), not the
+# process. The 2026-11-18 NGINX HTTP/2 advisory CVE-2026-123007 began with
+# exactly such an underflow in a flow-control window check.
+#
+# Scoped to this package. The dependencies keep the profile default (off):
+# their hot paths (quinn-proto, rustls) are not ours to slow, and aws-lc is C,
+# which this setting does not reach. `as` casts are not checked by it either;
+# those are covered by `clippy::as_conversions`, which every cast in `src/`
+# allows explicitly with its own argument. Cost measured with `it_bench` on the
+# musl target before this was committed; see the commit message.
+[profile.release.package.volto]
+overflow-checks = true
+
 [lints.rust]
 # The default for every target in the package, tests and examples included: a
 # new file that wants `unsafe` must argue for a file-level `allow` (today there
