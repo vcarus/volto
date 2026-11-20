@@ -235,13 +235,9 @@ fn run_command(command: &Command) -> Result<()> {
 
 /// Says that the file loaded, and repeats what starting on it would warn about.
 ///
-/// Reached only when [`Config::load`] has already succeeded, so the failure
-/// direction is not here: it is the `?` in `start`, after which `main` prints
-/// the same error the service would print at startup and exits non-zero. That
-/// symmetry is the whole value of the flag. `script/deploy.sh` asks the binary
-/// it is about to install whether it can read the configuration this host
-/// already has, and an answer that did not match what the service does on the
-/// same file would be worse than no answer (D93, D94).
+/// Reached only when [`Config::load`] has already succeeded. The failure is
+/// the `?` in `start`, which prints the error the service would print at
+/// startup on the same file, the answer `script/deploy.sh` relies on (D93, D94).
 ///
 /// What it therefore covers is exactly what `Config::load` covers: the TOML
 /// itself, every table's refusal of a key it does not know, and every range and
@@ -287,12 +283,8 @@ fn report_config_check(path: &Path, config: &Config) {
 /// and every one of them is allowed to fail: a refused or missing file becomes
 /// a line saying so, never a non-zero exit.
 ///
-/// Secrets are redacted because `Config` is printed through the `Debug` that
-/// already does it: `impl Debug for config::User` renders the password as
-/// `<redacted>`, which is the same guard that keeps a password out of the error
-/// a malformed file produces. `conn::redact_credentials` is the other half of
-/// that rule and is not reachable here: it is for a header value, and no
-/// header exists in this process.
+/// Passwords are redacted because `Config` is printed through its `Debug`, and
+/// `impl Debug for config::User` renders the password as `<redacted>`.
 fn report_diagnostics(path: &Path, config: &Config) {
     println!("volto {} diagnostics", env!("CARGO_PKG_VERSION"));
     println!();
@@ -373,30 +365,20 @@ fn print_udp_buffer_sysctls() {
 
 /// The descriptor limits of the running volto service, if one is running.
 ///
-/// The two `getrlimit` lines above are this process's own, and this command is
-/// typed into an SSH shell far more often than it is run by the service. Such a
-/// shell can report 1024 or 1048576 on a host whose unit sets
-/// `LimitNOFILE=131072`. The figure an operator wants is in
-/// `/proc/<pid>/limits` of the service process, so it is read here rather than
-/// left to a second command nobody runs.
+/// The two `getrlimit` lines above are this process's own, usually an SSH
+/// shell's, which can differ from the unit's `LimitNOFILE`. The service's
+/// figure is in `/proc/<pid>/limits`, so it is read here.
 ///
-/// The pid is found by walking `/proc` rather than by asking `systemctl`, which
-/// keeps the bundle free of a process and of any assumption about the unit's
-/// name. A process counts as this service when its `comm` is `volto`, or when
-/// its `exe` link resolves to the same binary this process was started from.
-/// Both tests are needed. `comm` is readable without privilege but is only a
-/// name. The `exe` link is exact but is readable only by a process that could
-/// ptrace the target, so an unprivileged operator gets `Permission denied` for
-/// a service running as root; and it reads `/usr/local/bin/volto (deleted)`
-/// once the deploy script has replaced the file under the running service, and
-/// a different path when this command is run from a freshly unpacked tarball.
-/// Neither test is proof: a second volto started by hand matches the same way,
-/// which is why every match is printed with its pid rather than reduced to one
-/// answer.
+/// The pid is found by walking `/proc`, with no process run and no assumption
+/// about the unit's name. A process counts as this service when its `comm` is
+/// `volto`, or when its `exe` link resolves to this binary. Both tests are
+/// needed: `comm` is only a name, and the `exe` link is unreadable without
+/// ptrace rights over the target and reads `(deleted)` once the deploy script
+/// has replaced the file. Neither is proof, so every match is printed with its
+/// pid.
 ///
-/// Nothing here can fail the run. Every read is reported as a line of its own,
-/// because a bundle that exits non-zero over a file it could not read is worse
-/// than one that says it could not read it.
+/// Nothing here can fail the run: every read that fails is reported as a line
+/// of its own.
 #[cfg(target_os = "linux")]
 fn print_service_fd_limits() {
     let entries = match std::fs::read_dir("/proc") {
@@ -475,8 +457,8 @@ fn print_service_fd_limits() {
 
 /// `uname -srm`, or a line saying why there is none.
 ///
-/// A process rather than a crate, because a dependency for three words is not
-/// worth the supply chain, and this runs once in a command an operator typed.
+/// A process rather than `rustix::system::uname`, because rustix's `system`
+/// feature is not enabled, and this runs once in a command an operator typed.
 fn uname() -> String {
     match std::process::Command::new("uname")
         .args(["-s", "-r", "-m"])
