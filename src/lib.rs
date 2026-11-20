@@ -36,18 +36,10 @@
 //! # Security status
 //!
 //! Requests are authenticated ([`auth`]) and destinations are filtered
-//! ([`policy`]), but both are **configuration-dependent**, and the defaults are
-//! not the safe ones in the same way everywhere:
-//!
-//! * an empty `[auth].users` disables authentication, making this an open proxy.
-//!   [`config::Config::warnings`] says so at startup, and it is the intended
-//!   state only while debugging interop on a private network;
-//! * `[security]` defaults *are* the safe ones: private address space is out of
-//!   reach, port 25 is closed, and an unanswered UDP session cannot be used as an
-//!   amplifier. The one deliberate exception is `expected_sni`, whose default
-//!   empty list leaves the port answering anybody who speaks QUIC to it, because
-//!   turning the [`gate`] on without knowing the name is a server nobody can
-//!   reach.
+//! ([`policy`]), but both are **configuration-dependent**: an empty
+//! `[auth].users` is an open proxy, and the `[security]` defaults leave the SNI
+//! [`gate`] off, because turning it on without knowing the name is a server
+//! nobody can reach. The [`config`] module doc lists the defaults.
 
 // No `unsafe` in the server outside one module. The raw socket and resource
 // calls it needs go through the safe wrappers of rustix and socket2: rustix

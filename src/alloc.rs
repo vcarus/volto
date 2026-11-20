@@ -4,12 +4,10 @@
 //! allocator, [`std::alloc::System`].
 //!
 //! The release binaries are static musl builds (`.github/workflows/release.yml`).
-//! On the same Linux host, `tests/it_bench.rs` measured a higher CPU cost for
-//! the musl build than for the glibc build in every test, with the same
-//! allocation counts on both targets. The numbers are in the comment above the
-//! `mimalloc` dependency in `Cargo.toml`. The difference is libc, and musl's
-//! `malloc` is the part of it this module replaces. A glibc build keeps glibc's
-//! allocator, and so does every other platform.
+//! They cost more CPU than glibc builds at the same allocation counts (the
+//! measurement is above the `mimalloc` dependency in `Cargo.toml`), and the
+//! allocator is the part of libc this module replaces. A glibc build keeps
+//! glibc's allocator, and so does every other platform.
 //!
 //! The binary installs it with `#[global_allocator]` in `src/main.rs`. The
 //! library installs nothing, because the allocator is a choice for the final
