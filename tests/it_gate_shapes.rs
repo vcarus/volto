@@ -2276,11 +2276,8 @@ fn a_packet_whose_own_fragments_disagree_drops_its_flight_and_every_byte_of_it()
     disagree.extend_from_slice(&crypto_frame_at(0, b"Xbcd"));
     let mut past_the_limit = crypto_frame_at(15_000, &[0x5a; 64]);
     past_the_limit.push(0x06);
-    put_varint_into(
-        &mut past_the_limit,
-        u64::try_from(HOLD_HELLO_BYTES + 1).expect("small"),
-    );
-    put_varint_into(&mut past_the_limit, 0);
+    past_the_limit.extend_from_slice(&varint(HOLD_HELLO_BYTES + 1));
+    past_the_limit.extend_from_slice(&varint(0));
 
     for (what, frames, why) in [
         (
@@ -2435,10 +2432,9 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
         &Dropped::TooLong,
         "a length past libssl's",
     );
-    let past = u64::try_from(HOLD_HELLO_BYTES).expect("small");
     let mut frame = vec![0x06];
-    put_varint_into(&mut frame, past);
-    put_varint_into(&mut frame, 1);
+    frame.extend_from_slice(&varint(HOLD_HELLO_BYTES));
+    frame.extend_from_slice(&varint(1));
     frame.push(0x00);
     let datagram = initial(&*crypto, &[0x34; 8], &frame);
     dropped_whole(
@@ -2448,13 +2444,6 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
         &Dropped::TooLong,
         "an offset past libssl's",
     );
-}
-
-/// A QUIC varint appended to `out`.
-fn put_varint_into(out: &mut Vec<u8>, value: u64) {
-    let mut bytes = BytesMut::new();
-    put_varint(&mut bytes, value);
-    out.extend_from_slice(&bytes);
 }
 
 /// A reload that keeps the key keeps the replay record, a reload that changes
