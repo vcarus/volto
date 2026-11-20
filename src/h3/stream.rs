@@ -1212,11 +1212,13 @@ impl Reader {
     ///
     /// Because it takes a slot it never gives back, and quinn asserts on that
     /// slot being empty. quinn keeps **one** waker per stream for whoever is
-    /// waiting to read, and exactly three things take an entry out of it: a
-    /// `StreamEvent::Readable` for that stream, a `RecvStream::stop` while the
-    /// stream still exists at the protocol layer, and `RecvStream::drop` while
-    /// `all_data_read` is still false. A read that *succeeds* does not, so an
-    /// entry outlives every later read of the bytes it was waiting for. That
+    /// waiting to read, and on a live connection three things take an entry
+    /// out of it: a `StreamEvent::Readable` for that stream, a
+    /// `RecvStream::stop` while the stream still exists at the protocol layer,
+    /// and `RecvStream::drop` while `all_data_read` is still false. The end of
+    /// the connection empties every slot. A read that *succeeds* takes nothing
+    /// out, so an entry outlives every later read of the bytes it was waiting
+    /// for. That
     /// call writes into the slot on every poll that finds no reset, and a
     /// `select!` which drops the arm leaves it behind.
     ///
