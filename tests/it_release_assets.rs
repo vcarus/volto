@@ -1109,6 +1109,26 @@ fn the_release_profile_checks_overflow_in_this_crate() {
     );
 }
 
+/// The package table that turns overflow checks on also says `strip = true`.
+///
+/// With a `[profile.release.package.volto]` table, cargo passes volto's own
+/// units `-C strip=debuginfo` unless the table repeats the setting, and the
+/// binary is linked as one of those units, so it keeps its symbol table. No
+/// test run links a release binary; cross.yml's strip step is the only other
+/// thing that notices, and only on a pull request that touches `Cargo.toml`.
+#[test]
+fn the_package_table_repeats_the_strip_setting() {
+    let manifest = read_text(&repo_root().join("Cargo.toml"));
+    for table in ["[profile.release]", "[profile.release.package.volto]"] {
+        assert_eq!(
+            table_setting(&manifest, table, "strip").as_deref(),
+            Some("true"),
+            "Cargo.toml no longer sets `strip = true` under `{table}`, so the \
+             released binary would carry its symbol table"
+        );
+    }
+}
+
 #[test]
 fn table_setting_reads_only_the_named_table() {
     let manifest = "\

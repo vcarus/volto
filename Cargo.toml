@@ -354,8 +354,17 @@ strip = true
 # those are covered by `clippy::as_conversions`, which every cast in `src/`
 # allows explicitly with its own argument. Cost measured with `it_bench` on the
 # musl target before this was committed; see the commit message.
+#
+# `strip = true` is repeated here because this table needs it. With a package
+# table present, cargo 1.100 passes this package `-C strip=debuginfo`, the
+# default of a profile that sets no `strip`, and not the `strip = true` of
+# `[profile.release]`; the dependencies still get `-C strip=symbols`. The
+# binary is linked as this package's unit, so without the line below it keeps
+# its `.symtab`, which is what cross.yml's "The built binary is stripped" step
+# reported on the first pull request that carried this table.
 [profile.release.package.volto]
 overflow-checks = true
+strip = true
 
 [lints.rust]
 # The default for every target in the package, tests and examples included: a
