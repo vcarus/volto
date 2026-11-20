@@ -90,20 +90,12 @@ impl EchKey {
     /// steers how much a client pads its inner ClientHello. RFC 9849 §4: "If not
     /// known, this value can be set to zero."
     pub fn generate(public_name: &str, config_id: u8, max_name_length: u8) -> Result<Self> {
-        check_public_name(public_name)?;
-        // SAFETY: EVP_HPKE_KEY_new takes no arguments and returns a new key or
-        // null, which `from_ptr` turns into an error.
-        let hpke = HpkeKey::from_ptr(unsafe { sys::EVP_HPKE_KEY_new() }, "EVP_HPKE_KEY_new")?;
-        // SAFETY: `hpke` is a fresh key owned here; EVP_hpke_x25519_hkdf_sha256
-        // returns a pointer to a static KEM table. AWS-LC draws the key from its
-        // own random number generator.
-        ffi::check(
-            unsafe {
-                sys::EVP_HPKE_KEY_generate(hpke.as_ptr(), sys::EVP_hpke_x25519_hkdf_sha256())
-            },
-            "EVP_HPKE_KEY_generate",
-        )?;
-        let private = raw_private_key(&hpke)?;
+        // Any 32 bytes are an X25519 private key, because AWS-LC clamps the
+        // scalar where it is used (`x25519_public_from_private_nohw` and the
+        // s2n-bignum path alike). Its own `X25519_keypair` draws the 32 bytes
+        // from the same `RAND_bytes` and only sets bits that clamping discards.
+        let mut private = Zeroizing::new([0u8; X25519_KEY_LEN]);
+        crate::tls::random_bytes(&mut private[..])?;
         Self::from_private_bytes(&private, public_name, config_id, max_name_length)
     }
 
@@ -122,20 +114,7 @@ impl EchKey {
         max_name_length: u8,
     ) -> Result<Self> {
         check_public_name(public_name)?;
-        // SAFETY: as in `generate`.
-        let hpke = HpkeKey::from_ptr(unsafe { sys::EVP_HPKE_KEY_new() }, "EVP_HPKE_KEY_new")?;
-        // SAFETY: `hpke` is a fresh key owned here, the KEM table is static,
-        // and `private` holds the 32 bytes whose length is passed. AWS-LC
-        // copies them.
-        let rc = unsafe {
-            sys::EVP_HPKE_KEY_init(
-                hpke.as_ptr(),
-                sys::EVP_hpke_x25519_hkdf_sha256(),
-                private.as_ptr(),
-                private.len(),
-            )
-        };
-        ffi::check(rc, "EVP_HPKE_KEY_init")?;
+        let hpke = hpke_key(private)?;
         let config = marshal_config(&hpke, config_id, public_name, max_name_length)?;
         let fields = ConfigFields::parse(&config)?;
 
@@ -200,20 +179,7 @@ impl EchKey {
         check_public_name(&fields.public_name)?;
 
         let private = x25519_from_pkcs8(&key_der)?;
-        // SAFETY: as in `generate`.
-        let hpke = HpkeKey::from_ptr(unsafe { sys::EVP_HPKE_KEY_new() }, "EVP_HPKE_KEY_new")?;
-        // SAFETY: `hpke` is a fresh key owned here, the KEM table is static,
-        // and `private` holds the 32 bytes whose length is passed. AWS-LC
-        // copies them.
-        let rc = unsafe {
-            sys::EVP_HPKE_KEY_init(
-                hpke.as_ptr(),
-                sys::EVP_hpke_x25519_hkdf_sha256(),
-                private.as_ptr(),
-                private.len(),
-            )
-        };
-        ffi::check(rc, "EVP_HPKE_KEY_init")?;
+        let hpke = hpke_key(&private)?;
 
         let key = Self {
             hpke,
@@ -476,23 +442,25 @@ fn marshal_config(
     Ok(config.as_slice().to_vec())
 }
 
-/// The raw 32 bytes of an initialised X25519 HPKE key.
-fn raw_private_key(hpke: &HpkeKey) -> Result<Zeroizing<[u8; X25519_KEY_LEN]>> {
-    let mut private = Zeroizing::new([0u8; X25519_KEY_LEN]);
-    let mut len = 0usize;
-    // SAFETY: `hpke` is initialised, `private` is writable for the maximum
-    // length passed, and `len` is valid for a write.
+/// The DHKEM(X25519, HKDF-SHA256) HPKE key whose private key is `private`.
+fn hpke_key(private: &[u8; X25519_KEY_LEN]) -> Result<HpkeKey> {
+    // SAFETY: EVP_HPKE_KEY_new takes no arguments and returns a new key or
+    // null, which `from_ptr` turns into an error.
+    let hpke = HpkeKey::from_ptr(unsafe { sys::EVP_HPKE_KEY_new() }, "EVP_HPKE_KEY_new")?;
+    // SAFETY: `hpke` is a fresh key owned here, the KEM table is static, and
+    // `private` holds the 32 bytes whose length is passed. AWS-LC copies them.
+    // A failed init cleans the key up and leaves it zeroed (`hpke_key_init`),
+    // so dropping `hpke` then frees only the struct.
     let rc = unsafe {
-        sys::EVP_HPKE_KEY_private_key(
+        sys::EVP_HPKE_KEY_init(
             hpke.as_ptr(),
-            private.as_mut_ptr(),
-            &mut len,
-            X25519_KEY_LEN,
+            sys::EVP_hpke_x25519_hkdf_sha256(),
+            private.as_ptr(),
+            private.len(),
         )
     };
-    ffi::check(rc, "EVP_HPKE_KEY_private_key")?;
-    ensure!(len == X25519_KEY_LEN, "an X25519 key of {len} bytes");
-    Ok(private)
+    ffi::check(rc, "EVP_HPKE_KEY_init")?;
+    Ok(hpke)
 }
 
 /// The raw private key of a PKCS#8 X25519 key.

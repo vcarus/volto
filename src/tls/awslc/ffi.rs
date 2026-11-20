@@ -137,13 +137,12 @@ unsafe impl Send for SslCtx {}
 // SAFETY: as above.
 unsafe impl Sync for SslCtx {}
 
-// SAFETY: an `EVP_HPKE_KEY` is written only by `EVP_HPKE_KEY_init` and
-// `EVP_HPKE_KEY_generate`, which `ech.rs` calls on a key it has just created
-// and that nothing else can reach yet. Every function the provider passes it to
-// afterwards takes it as `const EVP_HPKE_KEY *` and only reads it
-// (`EVP_HPKE_KEY_private_key`, `SSL_marshal_ech_config`, `SSL_ECH_KEYS_add`,
-// which takes its own copy, and `EVP_HPKE_CTX_setup_recipient`), as `hpke.h`
-// and `ssl.h` declare them. What it holds (`struct evp_hpke_key_st` in `hpke.h`)
+// SAFETY: an `EVP_HPKE_KEY` is written only by `EVP_HPKE_KEY_init`, which
+// `ech.rs` calls on a key it has just created and that nothing else can reach
+// yet. Every function the provider passes it to afterwards takes it as
+// `const EVP_HPKE_KEY *` and only reads it (`SSL_marshal_ech_config`,
+// `SSL_ECH_KEYS_add`, which takes its own copy, and
+// `EVP_HPKE_CTX_setup_recipient`), as `hpke.h` and `ssl.h` declare them. What it holds (`struct evp_hpke_key_st` in `hpke.h`)
 // is a pointer to a static KEM table and key buffers it owns on the heap, none
 // of it per-thread. So it may move to another thread, and several threads may
 // read it at once.
