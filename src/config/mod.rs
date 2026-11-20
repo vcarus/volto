@@ -1,49 +1,8 @@
 //! Configuration file loading and validation.
 //!
 //! The configuration is TOML. Unknown keys are rejected so typos surface at
-//! startup instead of being silently ignored:
-//!
-//! ```toml
-//! [server]
-//! listen = "0.0.0.0:443"
-//! cert   = "/etc/volto/fullchain.pem"
-//! key    = "/etc/volto/privkey.pem"
-//! alpn   = ["h3"]      # optional, this is the default
-//! shutdown_grace = 5   # seconds to let tunnels finish after SIGTERM, 0..3600
-//! # ech_key = "/etc/volto/ech.pem"  # optional: an ECH key from `volto ech-keygen`
-//!
-//! [auth]
-//! users = [{ username = "user1", password = "..." }]
-//!
-//! [limits]
-//! udp_session_timeout  = 180   # seconds
-//! max_targets_per_conn = 256
-//! max_connections      = 256
-//! connect_timeout      = 10    # seconds, 0 disables the budget
-//! ip_family_preference = "ipv4" # ipv4 | ipv6 | system
-//! max_streams_bidi     = 1024  # 1..65536
-//! max_idle_timeout     = 60    # seconds
-//! keep_alive_interval  = 20    # seconds, must be < max_idle_timeout / 2
-//! initial_mtu          = 1200  # bytes, 1200..1452
-//! mtu_discovery        = true
-//! mtu_upper_bound      = 1436  # bytes, initial_mtu..1472
-//! congestion_control   = "bbr" # bbr | bbr-uncapped | cubic | newreno
-//! initial_rtt_ms       = 333   # milliseconds, 10..10000
-//! socket_recv_buffer   = 2097152 # bytes, 0 keeps the OS default
-//! socket_send_buffer   = 2097152 # bytes, 0 keeps the OS default
-//!
-//! [security]
-//! allow_private_networks   = false
-//! denied_ports             = [25]
-//! unanswered_packet_budget = 64
-//! max_auth_failures        = 5
-//! expected_sni             = []   # non-empty turns the SNI gate on
-//! require_ech              = false # true drops every handshake without ECH
-//!
-//! [log]
-//! level  = "info"      # optional, this is the default
-//! keylog = false       # write TLS secrets to $SSLKEYLOGFILE (debug only)
-//! ```
+//! startup instead of being silently ignored. `script/config.example.toml` is an
+//! annotated example of every key, and `docs/configuration.md` is the reference.
 //!
 //! Every section except `[server]` is optional, and every key within them has a
 //! default, so a minimal file is four lines. Two consequences of that are worth
@@ -184,8 +143,7 @@ pub const MIN_INITIAL_MTU: u16 = 1200;
 /// stays at the both-families value even though `mtu_upper_bound` may claim
 /// IPv4's extra 20 bytes. Discovery reaches a size only after a probe of it is
 /// acknowledged, and the black-hole detector takes the size back down when
-/// traffic at it is lost. This value is sent blind in the handshake, and the
-/// next paragraph says what a wrong value costs here.
+/// traffic at it is lost. This value is sent blind in the handshake.
 ///
 /// There is no floor to fall back to if this is wrong. quinn applies the value
 /// with a `max()` against the 1200-byte minimum and no `min()` above it, so the
@@ -201,38 +159,31 @@ pub const MAX_INITIAL_MTU: u16 = 1452;
 ///
 /// Below quinn's own default of 1452, which quinn-proto 0.11.x
 /// `src/config/transport.rs`, `MtuDiscoveryConfig::upper_bound`, chooses "to
-/// stay within Ethernet's MTU when using IPv4 and IPv6": 1500 minus IPv6's
-/// 40-byte header and UDP's 8. The same doc comment says "It is safe to use an
+/// stay within Ethernet's MTU when using IPv4 and IPv6" (the IPv6 figure of
+/// [`MAX_INITIAL_MTU`]). The same doc comment says "It is safe to use an
 /// arbitrarily high upper bound, regardless of the network path's MTU". That
 /// holds only on a path that drops a packet it cannot carry.
 ///
 /// A probe that is acknowledged does not show that the path carries that size
-/// under load. On a measured relay path, IPv4 packets above 1464 bytes (UDP
-/// payload above 1436) arrived with DF cleared. Single probes of those sizes got
-/// through, so discovery adopted them, and at bulk rate those packets were lost
-/// at 62 to 89 percent until the black-hole detector dropped the size to 1200.
-/// After the detector's cooldown the same probe succeeded again. 1436 is the
-/// largest UDP payload whose IPv4 packet (1464 bytes) crossed that path with DF
-/// set (D81).
-///
-/// Over IPv6 the 1452 reasoning still holds, and 1436 is below 1452, so the
-/// default is safe on either family.
+/// under load. On a measured relay path, packets with a UDP payload above 1436
+/// arrived with DF cleared: single probes got through, discovery adopted the
+/// size, and bulk traffic at it was lost until the black-hole detector dropped
+/// the size to 1200. 1436 is the largest UDP payload that crossed that path
+/// with DF set (D81). It is below 1452, so the default is safe on either
+/// family.
 pub const DEFAULT_MTU_UPPER_BOUND: u16 = 1436;
 
 /// The largest `mtu_upper_bound` this server accepts, in bytes.
 ///
-/// Ethernet's 1500 minus IPv4's 20-byte header and UDP's 8. Nothing on a
-/// standard internet path carries more than that, so a higher bound could only
-/// spend probes on sizes that cannot exist. The ceiling being *above*
-/// [`MAX_INITIAL_MTU`] is deliberate, not an inconsistency. Discovery only ever
-/// reaches a size by probing it. A lost probe is retried, then abandoned, and is
-/// never treated as congestion, and the black-hole detector takes an adopted
-/// size back down when traffic at it is lost. `initial_mtu` is sent blind in the
-/// handshake with no recovery path (see [`MAX_INITIAL_MTU`]). An upper bound the
-/// path cannot carry costs failed probes, or, on a path that delivers single
-/// probes at a size it cannot carry under load, lost traffic until the detector
-/// fires (see [`DEFAULT_MTU_UPPER_BOUND`]). An initial the path cannot carry
-/// makes the server unreachable.
+/// The IPv4 figure of [`MAX_INITIAL_MTU`]'s arithmetic. Nothing on a standard
+/// internet path carries more than that, so a higher bound could only spend
+/// probes on sizes that cannot exist. The ceiling being *above*
+/// [`MAX_INITIAL_MTU`] is deliberate: discovery reaches a size only by probing
+/// it, a lost probe is retried, then abandoned, and is never treated as
+/// congestion, and the black-hole detector takes an adopted size back down. An
+/// upper bound the path cannot carry costs failed probes or lost traffic until
+/// the detector fires (see [`DEFAULT_MTU_UPPER_BOUND`]); an `initial_mtu` the
+/// path cannot carry makes the server unreachable.
 pub const MAX_MTU_UPPER_BOUND: u16 = 1472;
 
 /// Default round-trip time assumed before the first measurement, in milliseconds.
@@ -600,20 +551,13 @@ pub struct Limits {
     /// per-packet overhead, so a satisfied 2 MiB request reads as 4194304 both
     /// here and in `ss -uanpm`. Either way the endpoint still comes up, and volto
     /// warns at startup when it got less than it asked for. See
-    /// [`DEFAULT_SOCKET_RECV_BUFFER`].
-    ///
-    /// The socket API takes a signed 32-bit integer, so this key is limited to
-    /// [`MAX_SOCKET_BUFFER`] = `i32::MAX`; a larger value is refused at load
-    /// time rather than truncated to a different number on its way to the
-    /// kernel. `0` still leaves the socket on the operating system's own value.
+    /// [`DEFAULT_SOCKET_RECV_BUFFER`]. At most [`MAX_SOCKET_BUFFER`].
     pub socket_recv_buffer: usize,
     /// UDP socket send buffer to request, in bytes. Zero keeps the OS default.
     ///
-    /// Startup-only, read back and warned about exactly like
+    /// Startup-only, read back, warned about and bounded exactly like
     /// [`Limits::socket_recv_buffer`]; the ceiling on this side is
-    /// `net.core.wmem_max`. Range-checked to `0..=`[`MAX_SOCKET_BUFFER`] for the
-    /// same reason as the receive side: the socket API's argument is a signed
-    /// 32-bit integer. See [`DEFAULT_SOCKET_SEND_BUFFER`].
+    /// `net.core.wmem_max`. See [`DEFAULT_SOCKET_SEND_BUFFER`].
     pub socket_send_buffer: usize,
 }
 
@@ -1282,11 +1226,8 @@ pub(crate) mod tests {
     ///   handshake stall from ~1 s to a few hundred ms", against RFC 9002's
     ///   conservative 333.
     ///
-    /// The third, `mtu_upper_bound = 1436`, is live and equal to the default. From
-    /// v0.4.5 to v1.1.1 the file shipped 1464 against a program default of 1452.
-    /// On a measured relay path, packets above 1436 bytes of UDP payload were
-    /// delivered with DF cleared and lost at bulk rate, so the example and the
-    /// default moved to 1436 together (D81). It stays a live key so that the
+    /// The third, `mtu_upper_bound = 1436`, is live and equal to the default
+    /// ([`DEFAULT_MTU_UPPER_BOUND`], D81). It stays a live key so that the
     /// installed file states the ceiling.
     ///
     /// The fourth, `level = "info"` in `[log]`, is live and equal to the default
