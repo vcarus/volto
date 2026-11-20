@@ -45,12 +45,9 @@
 //!   §14.1 has the server discard it and quinn does exactly that, silently.
 //! * **An Initial whose Destination Connection ID is shorter than eight
 //!   bytes**: refused, on the header alone and whether or not the packet
-//!   authenticates. RFC 9000 §7.2 gives a client's first Initial a floor of
-//!   eight bytes. Every later Initial of an admitted handshake is addressed by
-//!   the eight bytes this endpoint chose, and so is the one a Retry supplies,
-//!   so nothing legitimate is this shape. quinn's own rule is ahead of its
-//!   decryption as well, in `early_validate_first_packet`, and it answers this
-//!   shape with the CONNECTION_CLOSE named above before it reads a frame.
+//!   authenticates. Nothing legitimate is this shape (RFC 9000 §7.2, quoted at
+//!   `MIN_CLIENT_CONNECTION_ID`), and quinn answers it with the
+//!   CONNECTION_CLOSE named above before it reads a frame.
 //! * **An Initial this server cannot open**: passes. Only a client's *first*
 //!   Initial packets are keyed by their own Destination Connection ID: once the
 //!   server has answered, the client addresses it by the connection ID the
@@ -120,11 +117,7 @@
 //! The gate passes every short-header packet. Telling a live connection's
 //! packets from a stranger's needs the set of live connection IDs, which lives
 //! inside quinn, and filtering on the four-tuple instead would break the
-//! connection migration a mobile client behind a relay's NAT depends on. A
-//! short-header packet for a connection the endpoint does not hold draws no
-//! Stateless Reset (RFC 9000 §10.3) all the same, because the connection ID
-//! generator in `quic::cid` makes quinn drop it without a reply; that module
-//! says how, and what it costs a client.
+//! connection migration a mobile client behind a relay's NAT depends on.
 //!
 //! # The hold, with an ECH key
 //!
@@ -148,17 +141,12 @@
 //! is blinded, so quinn never sees it there. When the CRYPTO stream of a flight
 //! holds a whole ClientHello, the flight is judged, and either every datagram
 //! it held is released to quinn in the order they arrived, or all of them are
-//! dropped and nothing is sent. The judgement is `hold::judge`:
-//!
-//! * an ECH extension the key opens is admitted, unless the same HPKE `enc`
-//!   was admitted before from another address, which is a copy of somebody
-//!   else's flight. The name in the clear is not looked at;
-//! * an ECH extension the key does not open is dropped, whatever
-//!   `[security] require_ech` says. This is our own rule and a deviation from
-//!   RFC 9849 §7.1, which has a server go on with the outer ClientHello and so
-//!   send the ECHConfigList back as `retry_configs`;
-//! * no ECH extension is dropped under `require_ech`, and otherwise judged by
-//!   its name as above, against the whole ClientHello rather than one packet.
+//! dropped and nothing is sent. The judgement is `hold::judge`, whose rule
+//! table admits an ECH extension the key opens unless it is a replay, drops
+//! one the key does not open whatever `[security] require_ech` says (our own
+//! rule, a deviation from RFC 9849 §7.1), and judges a ClientHello without ECH
+//! by `require_ech` and by its name, against the whole ClientHello rather than
+//! one packet.
 //!
 //! An Initial that carries no ClientHello (a PING, a lone CRYPTO frame past
 //! offset 0, a ClientHello cut short) is held like any other and, when nothing
@@ -167,21 +155,17 @@
 //!
 //! **Bounds.** Everything held came from a peer that has not authenticated,
 //! so the hold is bounded in time, in number and in bytes at once, each by a
-//! constant in `hold` with its reason: a flight is held for at most
-//! `HOLD_LIFETIME`, at most `HOLD_FLIGHTS` flights are held at once, one
-//! flight holds at most `HOLD_FLIGHT_BYTES` and reassembles at most
-//! `HOLD_HELLO_BYTES` of CRYPTO stream, and the hold as a whole, released
-//! datagrams included, at most `HOLD_TOTAL_BYTES`. A full table, or a hold out
-//! of bytes, evicts its oldest flight. No timer runs: a flight past its
-//! lifetime is never released, and it is freed by the next first Initial that
-//! reaches the hold, which is when its room could be wanted.
+//! constant in `hold` with its reason (`HOLD_LIFETIME`, `HOLD_FLIGHTS`,
+//! `HOLD_FLIGHT_BYTES`, `HOLD_HELLO_BYTES`, `HOLD_TOTAL_BYTES`). A full table,
+//! or a hold out of bytes, evicts its oldest flight. No timer runs: a flight
+//! past its lifetime is never released, and it is freed by the next first
+//! Initial that reaches the hold, which is when its room could be wanted.
 //!
 //! **Release.** A released datagram has to come back in a later receive call,
 //! since the batch it arrived in has already been handed over with it blinded.
 //! `poll_recv` therefore hands out released datagrams first, one to a buffer
-//! with a stride of its own length, before it reads the socket again. A
-//! release only ever happens inside a call that returns `Ready`, and quinn
-//! calls again after every `Ready`, so a release needs no waker.
+//! with a stride of its own length, before it reads the socket again, and
+//! with no waker of its own (`poll_recv` says why).
 //!
 //! **The replay record** keeps every `enc` the key opened, with its address,
 //! for the life of the process up to `REPLAY_ENTRIES`, and does not expire by
@@ -266,11 +250,8 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 
 /// The shortest Destination Connection ID a client's first Initial may carry.
 ///
-/// The floor is applied to every Initial the gate parses rather than only to one
-/// it can open, because quinn applies its own the same way: its
-/// `early_validate_first_packet` refuses a shorter one before any decryption.
-/// Nothing legitimate arrives under it, because every Initial after a client's
-/// first is addressed by the eight bytes this endpoint's own generator chose.
+/// Applied to every Initial the gate parses, ahead of decryption;
+/// `Judge::classify` says why.
 ///
 //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
 //# When an Initial packet is sent by a client that has not previously
@@ -862,11 +843,9 @@ fn flight_fragments<'a>(frames: &'a [u8], more: &'a [BytesMut]) -> Option<Vec<(u
 struct Judge {
     /// The source of Initial keys.
     ///
-    /// Held from bind time and never reloaded, because the initial secrets do
-    /// not depend on the certificate: RFC 9001 §5.2 derives them from the
-    /// Destination Connection ID in the client's own packet and a salt fixed by
-    /// the version. What a `SIGHUP` can change (the certificate, the key) is not
-    /// an input to any of it.
+    /// Held from bind time and never reloaded: the keys depend on the client's
+    /// Destination Connection ID and the version alone (RFC 9001 §5.2, quoted
+    /// at `Judge::decrypt`), and nothing a `SIGHUP` changes is an input to them.
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
 }
 
@@ -925,9 +904,8 @@ impl Judge {
         //
         // A deliberate departure from that SHOULD, and the reason the gate
         // exists: a Version Negotiation packet is a reply, and a reply is what a
-        // scan is looking for. D106. For the six draft versions quinn's default
-        // `EndpointConfig` also supports, refusing removes the connection rather
-        // than the reply; the module documentation says so in full.
+        // scan is looking for. D106. The module documentation says what refusing
+        // does to the six draft versions quinn also supports.
         if version != QUIC_V1 {
             return Classified::Refuse(Refusal::Version(version));
         }
@@ -974,16 +952,12 @@ impl Judge {
         }
 
         let Some((keys, frames)) = self.decrypt(datagram, &header) else {
-            // Authentication failed under the keys this packet's own
-            // Destination Connection ID derives. That is every client Initial
-            // after the server has answered: the client has switched to the
-            // server's connection ID while its Initial keys stay those of its
-            // first packet, so such a packet is an acknowledgement or a later
-            // fragment of a first flight this gate already judged. The
-            // Handshake packet that carries the client's Finished is often
-            // coalesced behind it, so dropping the datagram would cost every
-            // admitted handshake a probe timeout. A packet that is none of that
-            // fails quinn's own decryption and is dropped there without a reply.
+            // A later Initial of a flight this gate already judged, as the
+            // module documentation says, or a forgery quinn drops without a
+            // reply. Passed rather than dropped, because the Handshake packet
+            // that carries the client's Finished is often coalesced behind it,
+            // and dropping the datagram would cost every admitted handshake a
+            // probe timeout.
             //
             //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
             //# Upon first receiving an Initial or Retry packet from the server, the
@@ -1040,11 +1014,8 @@ impl Judge {
     ///
     /// `None` is either a packet too short for the keys to be applied (one
     /// quinn could not read either) or an authentication failure under the
-    /// keys this packet's own Destination Connection ID derives: a later
-    /// Initial of a handshake in progress, keyed by the client's first packet
-    /// instead, or a packet that only says it is a QUIC v1 Initial. The caller
-    /// passes both through, because quinn tells them apart with the state this
-    /// gate lacks and drops the second kind without a reply.
+    /// keys this packet's own Destination Connection ID derives. The caller
+    /// passes both through ([`Judge::classify`] says why).
     fn decrypt(
         &self,
         datagram: &[u8],
@@ -1571,18 +1542,16 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 pub use crate::hello::{FirstFlight, first_flight};
 
 // The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
-// `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`] and
-// [`Screening`], [`first_flight`] above, and [`nameless_crypto`] for building
-// the packets they judge.
+// `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
+// [`Screening`] and [`held_fragments`], [`first_flight`] above, and
+// [`nameless_crypto`] and [`sealed_initial`] for building the packets they
+// judge.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
 // coverage-guided fuzzer is for. Each judging seam calls the functions the
-// socket path calls, with one difference: its `Judge` derives Initial keys
-// through rustls ([`nameless_crypto`]), while the server's derives them through
-// its own provider, `tls::awslc::keys`. Both implement RFC 9001 §5.2 and
-// derive the same keys, but the header and packet key code the fuzz targets
-// run is rustls's, so the server's key code is not what they explore.
+// socket path calls, except for the Initial key code, which [`judgement`]
+// describes.
 
 /// The hold's bounds, for the fuzz target and the tests that assert them.
 #[doc(hidden)]
@@ -1771,15 +1740,13 @@ pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
 
 /// A TLS configuration with no identity at all, as a source of Initial keys.
 ///
-/// Initial keys come from the client's Destination Connection ID and a salt
-/// fixed by the version (RFC 9001 §5.2, quoted at `Judge::decrypt`), never
-/// from the server's certificate, which is what `Judge::crypto` already relies
-/// on for `SIGHUP`. So a configuration carrying no certificate derives exactly
-/// the keys the running server derives, and [`judgement`], the fuzz target and
-/// the tests that spell Initial packets need no key material, no file and no
-/// clock to open or to build the packets the real gate opens. The resolver is
-/// never asked for anything: nothing here starts a TLS session. It derives
-/// them with rustls's code, where the server uses its own provider's
+/// Initial keys never depend on the server's certificate (`Judge::crypto`).
+/// So a configuration carrying no certificate derives exactly the keys the
+/// running server derives, and [`judgement`], the fuzz target and the tests
+/// that spell Initial packets need no key material, no file and no clock to
+/// open or to build the packets the real gate opens. The resolver is never
+/// asked for anything: nothing here starts a TLS session. It derives the keys
+/// with rustls's code, where the server uses its own provider's
 /// (`tls::awslc::keys`): the keys are the same, the code is not.
 ///
 /// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS

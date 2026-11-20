@@ -47,9 +47,6 @@ pub(super) fn warn_if_fd_budget_is_tight(limits: &crate::config::Limits) {
 
 /// Whether `limit` descriptors are too few for every connection at its full
 /// quota.
-///
-/// Split out from the warning so the arithmetic is testable without changing the
-/// process's actual limit.
 fn fd_budget_is_tight(limit: u64, max_connections: u32, max_targets_per_conn: u32) -> bool {
     limit < fd_budget(max_connections, max_targets_per_conn)
 }
@@ -158,9 +155,8 @@ impl SocketBuffers {
 
 /// Asks the kernel for `requested` bytes of buffer and reports what it granted.
 ///
-/// The socket half of the pair; [`socket_buffer_was_capped`] is the judgement,
-/// kept separate so both of its answers can be tested without a socket. Every
-/// fact that depends on the direction lives on [`SocketBuffer`], so this
+/// The socket half of the pair; [`socket_buffer_was_capped`] is the judgement.
+/// Every fact that depends on the direction lives on [`SocketBuffer`], so this
 /// function does not branch on the variant at all.
 ///
 /// Nothing here is fatal, and that is deliberate. A refused `setsockopt` leaves
@@ -238,7 +234,6 @@ fn request_socket_buffer(
 
 /// Whether the kernel granted less buffer than was asked for.
 ///
-/// Split out from the socket I/O so both answers can be asserted on without one.
 /// The read-back convention differs by platform: Linux reports back **twice**
 /// the size it granted, because `SO_RCVBUF`'s accounting includes per-packet
 /// overhead, while macOS reports the number unchanged. Comparing the two the
@@ -246,8 +241,9 @@ fn request_socket_buffer(
 /// to the sysctl and reports double the clamped value, so a request above the
 /// ceiling but below twice the ceiling satisfies a plain `<` although the
 /// kernel granted only the ceiling. For example, 300 000 bytes against a
-/// 212 992-byte ceiling reads back as 425 984. Halving the read-back before the comparison closes
-/// that band. Elsewhere the number is reported unchanged and compared directly.
+/// 212 992-byte ceiling reads back as 425 984. Halving the read-back before
+/// the comparison closes that band. Elsewhere the number is reported unchanged
+/// and compared directly.
 ///
 /// [`socket_buffer_was_capped_with`] is the same judgement with the convention
 /// passed in, so both branches are testable on either host.
@@ -399,7 +395,7 @@ mod tests {
     /// GitHub's runners ship `net.core.rmem_max` = 212992, so asserting that the
     /// default is obtained would fail on CI while saying nothing about this code.
     /// What is under test is that a request the host *can* satisfy comes back
-    /// classified as satisfied — on either platform's read-back convention.
+    /// classified as satisfied, on either platform's read-back convention.
     #[test]
     fn a_modest_socket_buffer_request_is_granted() {
         const MODEST: usize = 128 * 1024;
@@ -422,7 +418,7 @@ mod tests {
     ///
     /// A host may clamp the request (Linux at `net.core.rmem_max`, macOS at
     /// `kern.ipc.maxsockbuf`) or fail the `setsockopt` outright and leave the
-    /// default in place, and the assertion deliberately does not say which — that
+    /// default in place, and the assertion deliberately does not say which: that
     /// is a property of the host, not of this code. Both endings must arrive at
     /// "we did not get what we asked for", because that is the one condition the
     /// startup warning is built on.

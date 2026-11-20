@@ -5,7 +5,7 @@
 //! anything has authenticated, on bytes whose sender chose every one of them. A
 //! panic here is a packet that stops the server.
 //!
-//! Even inputs: a whole datagram through [`gate::judgement`] — the long header,
+//! Even inputs: a whole datagram through [`gate::judgement`]: the long header,
 //! the Initial packet protection under the keys the datagram's own Destination
 //! Connection ID derives, the frame walk that assembles the offset-0 CRYPTO
 //! stream, and the ClientHello reader on the far side of it.
@@ -92,7 +92,7 @@ fuzz_target!(|data: &[u8]| {
 /// be judged against the list without going through [`Names::accepts`].
 fn judge_a_datagram(datagram: &[u8], names: &Names, list: &[&str]) {
     // A verdict is a function of the bytes and the list, and of nothing else:
-    // the gate keeps no state between datagrams. Judged once here — the seed
+    // the gate keeps no state between datagrams. Judged once here. The seed
     // corpus test judges each seed twice, which pins that without paying two
     // decryptions per fuzz iteration.
     let verdict = gate::judgement(datagram, names);

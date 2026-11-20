@@ -295,12 +295,8 @@ impl Replay {
     /// address is a copy of somebody else's flight. Our own rule.
     ///
     /// It protects against a copy that arrives after the original, not one
-    /// that overtakes it: whichever copy completes its flight first is
-    /// admitted and recorded. A copy that reaches the server from another
-    /// address before the client's own last packet is admitted, and the
-    /// client's flight is then dropped as the replay. The two cannot be told
-    /// apart without a freshness field in the first flight, which this
-    /// ClientHello does not carry.
+    /// that overtakes it; the gate's module documentation says so under
+    /// *Limits*.
     fn admit(&mut self, enc: &[u8], from: SocketAddr) -> bool {
         let tag = self.keys.hash_one(enc);
         let place = self.keys.hash_one(from);
@@ -323,7 +319,6 @@ impl Replay {
         self.order = VecDeque::new();
     }
 
-    /// How many entries there are.
     pub(super) fn len(&self) -> usize {
         self.order.len()
     }
@@ -362,7 +357,6 @@ impl Hold {
         }
     }
 
-    /// How many flights are held.
     pub(super) fn flights(&self) -> usize {
         self.flights.len()
     }
