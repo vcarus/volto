@@ -2066,6 +2066,65 @@ fn every_row_of_the_rule_table_is_what_the_hold_does() {
     }
 }
 
+/// The two drops of the hold that are outside the rule table, each beside the
+/// same flight without its defect, which is released.
+///
+/// A packet carrying a frame no Initial may carry: a STREAM frame, which
+/// RFC 9000 §12.4 Table 3 marks `__01`, 0-RTT and 1-RTT only, beside the
+/// CRYPTO frame of a whole ClientHello. And a whole ClientHello whose
+/// extension block's length runs one byte past the end of the message.
+#[test]
+fn a_frame_no_initial_may_carry_or_an_unreadable_extension_block_drops_the_flight() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+
+    let ech = rustls_hello(&Offer::Ech(key.config_list()), &small_groups(), "localhost");
+    let mut with_stream = crypto_frame_at(0, &ech);
+    // STREAM with its LEN bit (0x0a): stream 0, one byte of data.
+    with_stream.extend_from_slice(&[0x0a, 0x00, 0x01, 0x5a]);
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    released_whole(
+        &mut screening,
+        from(1),
+        &[initial(&*crypto, &CLIENT_CID, &crypto_frame_at(0, &ech))],
+        "the CRYPTO frame alone",
+    );
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    dropped_whole(
+        &mut screening,
+        from(1),
+        &[initial(&*crypto, &CLIENT_CID, &with_stream)],
+        &Dropped::Frames,
+        "a STREAM frame beside it",
+    );
+
+    let extensions = sni_extension("localhost");
+    let named = client_hello(&extensions);
+    let mut overrun = named.clone();
+    let at = named.len() - extensions.len() - 2;
+    let length = u16::from_be_bytes([named[at], named[at + 1]]);
+    overrun[at..at + 2].copy_from_slice(&(length + 1).to_be_bytes());
+    let mut screening = Screening::new(hold_policy(&key, &["localhost"], false));
+    released_whole(
+        &mut screening,
+        from(1),
+        &[initial(&*crypto, &CLIENT_CID, &crypto_frame_at(0, &named))],
+        "the extension block as written",
+    );
+    let mut screening = Screening::new(hold_policy(&key, &["localhost"], false));
+    dropped_whole(
+        &mut screening,
+        from(1),
+        &[initial(
+            &*crypto,
+            &CLIENT_CID,
+            &crypto_frame_at(0, &overrun),
+        )],
+        &Dropped::UnreadableExtensions,
+        "an extension block one byte longer than the message",
+    );
+}
+
 /// A flight whose ClientHello never completes is held for its lifetime and
 /// then dropped, and nothing of it is ever released. That covers the first
 /// packet of a flight whose second is lost, and the three shapes that draw an
