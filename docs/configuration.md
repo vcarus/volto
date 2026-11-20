@@ -279,21 +279,13 @@ bound=0.0.0.0:443 configured=0.0.0.0:8443
 
 **The two socket buffer keys are startup-only, not reloadable at all.** They are
 applied to the UDP socket when it is created, and a reload does not rebind that
-socket — changing them needs a restart, the same as `[server].listen`. Each
-request is capped by the host: `net.core.rmem_max` / `net.core.wmem_max` on
-Linux, `kern.ipc.maxsockbuf` on macOS, and a host may fail the request outright
-rather than clamping it. volto warns at startup, naming the sysctl, whenever it
-got less than it asked for, and comes up on the operating system's default
-either way. `0` asks for nothing and leaves that default in place. Both keys are
-range-checked to `0..=2147483647`, the largest value the socket API's signed
-32-bit argument can carry: the value is converted to a `c_int` before
-`setsockopt`, so anything above that limit would reach the kernel truncated to a
-different number: `4294967296` becomes `0`, which is the operating system's
-minimum rather than a request. A larger value is refused at load time, naming
-the key, the value and the limit. The reason these keys exist at all is that
-quinn never calls `setsockopt` itself, so a server that does not ask gets
-`net.core.rmem_default`, around 208 KiB, however high `rmem_max` has been
-raised; see [UDP socket buffers](deployment.md#udp-socket-buffers).
+socket, so changing them needs a restart, the same as `[server].listen`. The
+range stops at `2147483647` because the value is converted to a `c_int` before
+`setsockopt`: anything larger would reach the kernel as a different number, and
+`4294967296` would become `0`, the operating system's minimum rather than a
+request. A larger value is refused at load time, naming the key, the value and
+the limit. What the host does with the request, and why the keys exist at all,
+is under [UDP socket buffers](deployment.md#udp-socket-buffers).
 
 **`[log].level` is startup-only.** The tracing subscriber that applies it is
 built once, before the server binds, and nothing rebuilds it. A reload carrying

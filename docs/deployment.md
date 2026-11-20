@@ -576,9 +576,10 @@ them is a ceiling:
 * `net.core.rmem_max` / `wmem_max` is the most an application may *request*.
   Raising it does nothing at all for a program that does not ask.
 
-volto asks. `limits.socket_recv_buffer` and `limits.socket_send_buffer` are
-requested when the socket is created — `DEFAULT_SOCKET_RECV_BUFFER` = 2 MiB and
-`DEFAULT_SOCKET_SEND_BUFFER` = 2 MiB by default — so on this server the ceiling
+quinn never calls `setsockopt` itself, so volto asks.
+`limits.socket_recv_buffer` and `limits.socket_send_buffer` are requested when
+the socket is created, `DEFAULT_SOCKET_RECV_BUFFER` = 2 MiB and
+`DEFAULT_SOCKET_SEND_BUFFER` = 2 MiB by default, so on this server the ceiling
 is the sysctl that matters:
 
 ```sh
@@ -587,9 +588,11 @@ sudo sysctl -w net.core.wmem_max=4194304
 ```
 
 Sized so the default request fits with room to spare; put the same lines in
-`/etc/sysctl.d/` to survive a reboot. When the kernel caps the request instead,
-volto warns at startup and names the sysctl to raise, so a host that never had
-these touched says so in its own log rather than dropping packets quietly.
+`/etc/sysctl.d/` to survive a reboot. On macOS the ceiling is
+`kern.ipc.maxsockbuf`. A host either caps the request at its ceiling or fails it
+outright. Either way volto warns at startup, names the sysctl to raise, and
+comes up on the operating system's default, so a host that never had these
+touched says so in its own log rather than dropping packets quietly.
 
 Two readings that look wrong and are not. Linux reports a granted buffer as
 double the size — the accounting includes per-packet overhead — so a satisfied

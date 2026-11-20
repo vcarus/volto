@@ -28,9 +28,9 @@ one of them that does not reach the handshake as itself; what an unauthenticated
 connection is worth is further down this section.
 
 The UDP socket underneath is bound here rather than by `quinn::Endpoint::server`,
-which is a bare `std::net::UdpSocket::bind` and never sets `SO_RCVBUF`/`SO_SNDBUF`
-— a server that does not ask keeps `net.core.rmem_default` whatever `rmem_max`
-says. `limits.socket_recv_buffer` / `socket_send_buffer` are requested at that
+which is a bare `std::net::UdpSocket::bind` and never sets `SO_RCVBUF`/`SO_SNDBUF`;
+[UDP socket buffers](deployment.md#udp-socket-buffers) says what that costs.
+`limits.socket_recv_buffer` / `socket_send_buffer` are requested at that
 moment and the granted sizes read back, so a capped request becomes a startup
 warning rather than silent packet loss. Being a property of the socket rather
 than of a connection, these two are the only `[limits]` keys a reload cannot
