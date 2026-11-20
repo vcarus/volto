@@ -16,6 +16,12 @@ description: Install cmake and libclang-dev on an Ubuntu runner, from the Action
 # another release's packages. A cache written by a run on `main` is readable
 # by every pull request; one written by a pull request is readable by that
 # pull request only.
+#
+# A later job installs the restored packages as root with `dpkg -i`, with no
+# apt signature or hash check. So the entry is saved in the step right after
+# apt wrote it, before the job that called this action runs anything else.
+# The combined `actions/cache` would save at the end of the job, after build
+# scripts and package installs that could have changed the files.
 
 runs:
   using: composite
@@ -25,7 +31,7 @@ runs:
       run: echo "key=cmake-libclang-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
     - id: packages
-      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ~/.cache/volto-debs
         key: ${{ steps.key.outputs.key }}
@@ -51,3 +57,11 @@ runs:
         mkdir -p "$debs"
         find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} "$debs"/ \;
         echo "kept $(ls "$debs" | wc -l) packages for the Actions cache"
+
+    # Only on a miss: a hit that failed to install keeps its entry, and an
+    # entry cannot be overwritten. A failed install skips this step too.
+    - if: steps.packages.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/volto-debs
+        key: ${{ steps.key.outputs.key }}

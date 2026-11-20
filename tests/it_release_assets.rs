@@ -604,6 +604,109 @@ fn the_release_gate_counts_only_a_push_run_on_main() {
     }
 }
 
+/// The steps of the composite action in `.github/actions/<name>/action.yml`,
+/// each as its lines.
+fn composite_steps(name: &str) -> Vec<Vec<String>> {
+    let path = repo_root()
+        .join(".github/actions")
+        .join(name)
+        .join("action.yml");
+    let text = read_text(&path);
+    let lines: Vec<&str> = text.lines().collect();
+
+    let start = lines
+        .iter()
+        .position(|line| line.trim() == "steps:")
+        .unwrap_or_else(|| panic!("{} has no `steps:`", path.display()));
+    let depth = lines[start + 1..]
+        .iter()
+        .find(|line| line.trim_start().starts_with("- "))
+        .map(|line| indentation(line))
+        .unwrap_or_else(|| panic!("the steps of {} are empty", path.display()));
+
+    let mut steps: Vec<Vec<String>> = Vec::new();
+    for line in &lines[start + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indentation(line) < depth {
+            break;
+        }
+        if indentation(line) == depth && line.trim_start().starts_with("- ") {
+            steps.push(Vec::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push(line.trim().to_owned());
+        }
+    }
+    steps
+}
+
+/// The `uses:` reference of `step`, if it has one.
+fn step_uses(step: &[String]) -> Option<&str> {
+    step.iter().find_map(|line| {
+        line.strip_prefix("- uses: ")
+            .or_else(|| line.strip_prefix("uses: "))
+    })
+}
+
+/// The cached packages are saved straight after apt wrote them (R8-L2).
+///
+/// A later job installs what the cache restores with `sudo dpkg -i`, with no
+/// signature or hash check. `actions/cache` saves in its post step, at the end
+/// of the job, so every step after the install (build scripts, `pip install`,
+/// Go modules) could change the files that are saved. The split actions save
+/// in the step right after the install, before the job runs anything else.
+#[test]
+fn the_cached_packages_are_saved_before_the_job_runs_anything_else() {
+    let steps = composite_steps("cmake-libclang");
+
+    assert!(
+        !steps
+            .iter()
+            .filter_map(|step| step_uses(step))
+            .any(|uses| uses.starts_with("actions/cache@")),
+        "the cmake-libclang action uses the combined `actions/cache`, which saves \
+         at the end of the job"
+    );
+
+    let position = |prefix: &str| {
+        steps
+            .iter()
+            .position(|step| step_uses(step).is_some_and(|uses| uses.starts_with(prefix)))
+            .unwrap_or_else(|| panic!("the cmake-libclang action has no `{prefix}` step"))
+    };
+    let restore = position("actions/cache/restore@");
+    let save = position("actions/cache/save@");
+    let install = steps
+        .iter()
+        .position(|step| step.iter().any(|line| line.contains("apt-get install")))
+        .expect("the cmake-libclang action no longer runs `apt-get install`");
+
+    assert!(
+        restore < install,
+        "the cmake-libclang action restores the cache after the install step"
+    );
+    assert_eq!(
+        save,
+        install + 1,
+        "the cmake-libclang action must save the cache in the step right after \
+         the install, so nothing but apt writes what is saved"
+    );
+
+    let pin = |at: usize| {
+        step_uses(&steps[at])
+            .and_then(|uses| uses.split_once('@'))
+            .map(|(_, pin)| pin.to_owned())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        pin(restore),
+        pin(save),
+        "the restore and save halves of actions/cache are pinned to different commits"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // ci.yml and cross.yml give every push to main its own concurrency group
 // ---------------------------------------------------------------------------
