@@ -252,6 +252,18 @@ so what it waits is the round trip it was already waiting for that first answer.
 An operator who configures fewer than 16 gets what they configured throughout:
 the clamp only ever lowers.
 
+The connection receive window is raised by the same request. The handshake
+advertises `INITIAL_CONNECTION_RECEIVE_WINDOW` = 1 MiB, the stream data a
+connection may have sent and not yet had read, summed over all its streams, and
+the first request to pass the credentials check raises it to
+`CONNECTION_RECEIVE_WINDOW` = 16 MiB. A peer that withholds one byte of a stream
+can make the server hold everything sent after it, so this window is what bounds
+the stream data unauthenticated peers can park: 1 MiB per connection, 256 MiB
+across the default `limits.max_connections`. A legitimate client is not slowed
+by it. Every byte its first request needs is read as it arrives, and the raise
+goes out before that request's name is resolved, so the MAX_DATA frame reaches
+the client no later than its first answer.
+
 That bound holds one connection; it does not bound how many of the
 `limits.max_connections` slots unauthenticated peers hold between them, and a
 peer that completes a handshake about once a second and never sends a credential

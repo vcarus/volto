@@ -560,6 +560,20 @@ fn crate_constants() -> BTreeMap<&'static str, (u64, Dimension)> {
             ),
         ),
         (
+            "INITIAL_CONNECTION_RECEIVE_WINDOW",
+            (
+                volto::quic::INITIAL_CONNECTION_RECEIVE_WINDOW.into_inner(),
+                Dimension::Bytes,
+            ),
+        ),
+        (
+            "CONNECTION_RECEIVE_WINDOW",
+            (
+                volto::quic::CONNECTION_RECEIVE_WINDOW.into_inner(),
+                Dimension::Bytes,
+            ),
+        ),
+        (
             "MAX_FIELD_SECTION_SIZE",
             (volto::h3api::MAX_FIELD_SECTION_SIZE, Dimension::Bytes),
         ),

@@ -11,9 +11,10 @@
 //! a reload really has to carry transport parameters to new connections, not just
 //! credentials and certificates.
 //!
-//! The last two are about the one transport parameter that is *not* simply the
+//! The next two are about a transport parameter that is *not* simply the
 //! configured value: the bidirectional stream allowance, which a connection
-//! starts below and is raised to by authenticating.
+//! starts below and is raised to by authenticating. The last two are about the
+//! other one raised the same way, the connection receive window.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the transport numbers are ones this file writes out itself.
@@ -26,8 +27,9 @@ use std::time::{Duration, Instant};
 
 use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
-    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, connect_quic,
-    open_tcp_tunnel, read_at_least, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section,
+    client_endpoint_with_transport, connect_quic, finish_connect, open_tcp_tunnel, read_at_least,
+    read_to_end, spawn_drain_then_reply_target, spawn_echo_target,
 };
 
 /// The configured idle timeout is the one that applies.
@@ -257,5 +259,140 @@ async fn authenticating_raises_the_stream_allowance_to_the_configured_one() {
         .await
         .is_err(),
         "authentication must raise the allowance to limits.max_streams_bidi, not past it"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The connection receive window
+// ---------------------------------------------------------------------------
+
+/// What a connection that has not authenticated may make the server hold in
+/// stream data that nothing reads, summed over all of its streams.
+///
+/// Spelled out rather than imported, for the reason [`INITIAL_STREAMS`] is.
+const INITIAL_RECEIVE_WINDOW: u64 = 1024 * 1024;
+
+/// How long a write may go without progress before the server's credit is
+/// taken to be spent.
+const NO_PROGRESS: Duration = Duration::from_millis(250);
+
+/// Writes on `streams`, opening more of them, until the server's connection
+/// credit is spent, and returns the bytes it accepted.
+///
+/// A fresh stream that takes nothing is the end: its own window is 2 MiB, so
+/// only the connection's can stop it.
+async fn fill_unread(connection: &quinn::Connection, streams: &mut Vec<quinn::SendStream>) -> u64 {
+    let chunk = vec![0u8; 64 * 1024];
+    let mut accepted = 0;
+    let mut index = 0;
+
+    loop {
+        let fresh = index == streams.len();
+        if fresh {
+            let (send, _recv) = tokio::time::timeout(TIMEOUT, connection.open_bi())
+                .await
+                .expect("the stream allowance must have room for another stream")
+                .expect("open a stream");
+            streams.push(send);
+        }
+
+        let mut took = 0;
+        while let Ok(written) =
+            tokio::time::timeout(NO_PROGRESS, streams[index].write(&chunk)).await
+        {
+            took += written.expect("the server must not refuse the stream") as u64;
+        }
+        accepted += took;
+
+        if fresh && took == 0 {
+            return accepted;
+        }
+        index += 1;
+    }
+}
+
+/// A peer that has proved nothing cannot make the server hold more than
+/// 1 MiB of stream data it cannot read (R6-M1).
+///
+/// The review's form of the attack withholds the first byte of each stream,
+/// so that quinn holds everything after the gap and the HTTP/3 layer can read
+/// none of it. quinn's client sends a stream in order and cannot leave a gap,
+/// so this peer reaches the same state another way: it grants the server no
+/// unidirectional streams, the server's HTTP/3 handshake waits to open its
+/// control stream, and no request stream is accepted while it waits. Every
+/// byte sent on a request stream in that time is held unread, which is the
+/// state the gap produces, for up to one idle timeout.
+///
+/// With the 16 MiB window applied from the handshake this peer was accepted
+/// 16 MiB, and 256 of it, the default `max_connections`, 4 GiB.
+#[tokio::test]
+async fn an_unauthenticated_peer_cannot_make_the_server_hold_more_than_the_initial_window() {
+    let server = TestServer::start_with(&auth_section(&[("user1", "s3cret")])).await;
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_concurrent_uni_streams(0u32.into());
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], transport);
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .expect("handshake");
+
+    let mut streams = Vec::new();
+    let held = fill_unread(&connection, &mut streams).await;
+    assert_eq!(
+        held, INITIAL_RECEIVE_WINDOW,
+        "an unauthenticated connection must be held to 1 MiB of unread stream data"
+    );
+    assert!(
+        connection.close_reason().is_none(),
+        "running out of credit is backpressure, not an error"
+    );
+}
+
+/// The raise reaches the client by the time the first answer does, and an
+/// upload larger than the initial window that starts on that answer completes.
+///
+/// The raise is made when the first request authenticates, before its name is
+/// resolved. quinn queues a MAX_DATA frame and wakes the connection, so the
+/// frame leaves on the next packet, no later than the one carrying the 200. A
+/// client that counts no MAX_DATA when it reads the 200 would be uploading on
+/// the 1 MiB window until the tunnel's reads returned credit.
+///
+/// No `[auth]` users, so the first completed request is what authenticates,
+/// the same moment as on a server that checks credentials.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upload_on_the_first_answer_is_not_held_to_the_initial_window() {
+    let server = TestServer::start_with(ALLOW_PRIVATE).await;
+    let target = spawn_drain_then_reply_target("").await;
+    let mut client = H3Client::connect(&server).await;
+    assert_eq!(
+        client.quic.stats().frame_rx.max_data,
+        0,
+        "nothing before the first request should have raised the window"
+    );
+
+    let mut tunnel = open_tcp_tunnel(&mut client, &target.to_string()).await;
+    assert!(
+        client.quic.stats().frame_rx.max_data >= 1,
+        "the raise must have reached the client by the time the 200 did"
+    );
+
+    let upload = vec![0x5a; 4 * INITIAL_RECEIVE_WINDOW as usize];
+    let started = Instant::now();
+    tunnel
+        .send_data(bytes::Bytes::from(upload.clone()))
+        .await
+        .expect("send the upload");
+    tunnel.finish().expect("finish the upload");
+    let returned = read_to_end(&mut tunnel).await;
+
+    assert_eq!(
+        returned.len(),
+        upload.len(),
+        "the target must have received the whole upload"
+    );
+    assert!(
+        started.elapsed() < TIMEOUT,
+        "a 4 MiB upload over loopback took {:?}",
+        started.elapsed()
     );
 }

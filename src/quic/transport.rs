@@ -32,10 +32,11 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
     // default allows a hundred; see [`MAX_PEER_UNI_STREAMS`].
     transport.max_concurrent_uni_streams(VarInt::from_u32(MAX_PEER_UNI_STREAMS));
 
-    // The bound on what an unauthenticated peer can make this process hold,
-    // where quinn's default is no aggregate bound at all; the arithmetic is in
-    // [`CONNECTION_RECEIVE_WINDOW`].
-    transport.receive_window(CONNECTION_RECEIVE_WINDOW);
+    // Deliberately *not* [`CONNECTION_RECEIVE_WINDOW`], for the same reason as
+    // the stream allowance above: what a peer that has proved nothing may make
+    // this process hold, raised by [`admit_configured_streams`]; see
+    // [`INITIAL_CONNECTION_RECEIVE_WINDOW`].
+    transport.receive_window(INITIAL_CONNECTION_RECEIVE_WINDOW);
 
     // A deliberate raise above quinn's own default, sized against the production
     // path's bandwidth-delay product; the case for the number, and why it is not
@@ -110,22 +111,26 @@ fn initial_bidi_streams(limits: &crate::config::Limits) -> u32 {
     limits.max_streams_bidi.min(INITIAL_BIDI_STREAMS)
 }
 
-/// Grants a connection the configured bidirectional stream allowance.
+/// Grants a connection the configured bidirectional stream allowance and the
+/// full connection receive window.
 ///
-/// The other half of [`INITIAL_BIDI_STREAMS`], called once per connection by
+/// The other half of [`INITIAL_BIDI_STREAMS`] and of
+/// [`INITIAL_CONNECTION_RECEIVE_WINDOW`], called once per connection by
 /// [`crate::tunnel::Context::mark_authenticated`], the one place both ways of
 /// authenticating reach. It lives here rather than there so that the two
-/// values a connection's stream allowance can take are stated in the same file
-/// as each other, next to the reasoning that pairs them.
+/// values each of these can take are stated in the same file as each other,
+/// next to the reasoning that pairs them.
 ///
 /// quinn spells the two directions differently (`max_concurrent_bidi_streams`
 /// on `TransportConfig`, `set_max_concurrent_bi_streams` on `Connection`), and
 /// they are the same parameter. Raising it allocates the new stream slots and
-/// queues a MAX_STREAMS frame, which reaches the peer on the next packet this
-/// connection sends: in practice the one carrying the response to the request
-/// that just authenticated.
+/// queues a MAX_STREAMS frame. Raising the window adds the difference to the
+/// connection's credit and queues a MAX_DATA frame. Both calls wake the
+/// connection, so both frames leave on its next packet, no later than the one
+/// carrying the response to the request that just authenticated.
 pub(crate) fn admit_configured_streams(quic: &quinn::Connection, max_streams_bidi: u32) {
     quic.set_max_concurrent_bi_streams(VarInt::from_u32(max_streams_bidi));
+    quic.set_receive_window(CONNECTION_RECEIVE_WINDOW);
 }
 
 /// Whether a request on a connection has passed the credentials check, shared
@@ -251,21 +256,15 @@ fn congestion_factory(
     }
 }
 
-/// Aggregate flow-control window for one connection, in bytes.
+/// Aggregate flow-control window for one authenticated connection, in bytes.
 ///
-/// The bound on what an *unauthenticated* peer can make this process hold.
-/// quinn's own default is `VarInt::MAX`, no aggregate limit at all. Before
-/// authentication a connection has 16 bidirectional streams
-/// ([`INITIAL_BIDI_STREAMS`], D98) and 16 unidirectional ones
-/// ([`MAX_PEER_UNI_STREAMS`]), so without this cap it could hold 32 x the
-/// 2 MiB [`STREAM_RECEIVE_WINDOW`], 64 MiB of receive buffer, before we ever
-/// see a request to authenticate: open the streams, fill each window, stop.
-/// After authentication the stream limit is `max_streams_bidi`, and the
-/// per-stream product grows with it.
-///
-/// This bounds one connection. Across the server it is credit of 16 MiB times
-/// `max_connections`, 4 GiB at the default 256, all of it reachable before a
-/// credential is checked; D99 records that row.
+/// quinn's own default is `VarInt::MAX`, no aggregate limit at all. After
+/// authentication the stream limit is `max_streams_bidi`, 1024 by default, so
+/// without this cap the per-stream product would grow with it to gigabytes of
+/// receive buffer on one connection. A connection is accepted on
+/// [`INITIAL_CONNECTION_RECEIVE_WINDOW`] and given this value by its first
+/// authenticated request (`admit_configured_streams`), so what a peer that
+/// has proved nothing can make this process hold is bounded there, not here.
 ///
 /// The cap only constrains data that has arrived and not yet been read, and both
 /// tunnel pumps read continuously, so it binds exactly when the target is slower
@@ -282,6 +281,44 @@ fn congestion_factory(
 /// tunnels still get their full stream windows, while the worst case stops being
 /// a function of `max_streams_bidi`.
 pub const CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(16 * 1024 * 1024);
+
+/// Aggregate flow-control window a connection is accepted with, in bytes,
+/// until a request on it authenticates (R6-M1, D99).
+///
+/// What it bounds. quinn counts against this window the highest offset
+/// received on each stream, minus what has been read, so bytes past a
+/// withheld byte count in full and cannot be read until the gap is filled.
+/// Before authentication a connection has 16 bidirectional streams
+/// ([`INITIAL_BIDI_STREAMS`], D98) and 16 unidirectional ones
+/// ([`MAX_PEER_UNI_STREAMS`]) of the 2 MiB [`STREAM_RECEIVE_WINDOW`], 64 MiB
+/// of per-stream credit, so this window is what binds. Across the server it is
+/// 1 MiB times `max_connections`, 256 MiB at the default 256, beside the
+/// 320 MB of `DATAGRAM_RECEIVE_BUFFER`; with the full window from the
+/// handshake it was 4 GiB. DATAGRAM frames do not count against it, and
+/// neither do CRYPTO frames: quinn holds those in their own buffers, the two
+/// pinned below.
+///
+/// Why it cannot hold up a client. The HTTP/3 layer reads every byte a request
+/// needs before it is judged as it arrives: the control stream, the QPACK
+/// stream types, and each request's HEADERS, which are cut at
+/// `h3api::MAX_FIELD_SECTION_SIZE` (64 KiB) per frame and at the 1 MiB HEADERS
+/// budget across streams, an overshoot being stopped and so returning its
+/// credit. Reading returns credit, so those bytes take room in this window only
+/// while they are in transit. The bytes that wait unread are those a client
+/// sends after a complete HEADERS and before the 200, an optimistic upload or
+/// capsules, and that complete HEADERS is all the first request needs to
+/// authenticate. So the largest request accepted before authentication is one
+/// 64 KiB field section, and it fits beside a full 64 KiB SETTINGS frame with
+/// most of the window to spare even if nothing were read. Data past it is held
+/// to 1 MiB until the raise, which goes out before the request's name is
+/// resolved.
+///
+/// Lowering an `initial_max_data` the peer may remember is safe because this
+/// server never accepts 0-RTT, which is the only case RFC 9000 §7.4.1 forbids
+/// it in: "If 0-RTT data is accepted by the server, the server MUST NOT reduce
+/// any limits or alter any values that might be violated by the client with
+/// its 0-RTT data."
+pub const INITIAL_CONNECTION_RECEIVE_WINDOW: VarInt = VarInt::from_u32(1024 * 1024);
 
 /// Per-stream flow-control window, in bytes.
 ///
@@ -363,6 +400,15 @@ const _: () =
 const _: () = assert!(STREAM_RECEIVE_WINDOW.into_inner() < 4 * 1024 * 1024);
 const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
 
+// The initial window only ever lowers, and it leaves room for one request's
+// largest field section and a SETTINGS frame of the same cap with nothing read.
+const _: () = assert!(
+    INITIAL_CONNECTION_RECEIVE_WINDOW.into_inner() <= CONNECTION_RECEIVE_WINDOW.into_inner()
+);
+const _: () = assert!(
+    INITIAL_CONNECTION_RECEIVE_WINDOW.into_inner() >= 2 * crate::h3api::MAX_FIELD_SECTION_SIZE
+);
+
 /// Inbound QUIC DATAGRAM bytes the transport buffers per connection.
 ///
 /// Exactly what quinn already defaults to, pinned for the reason given on
@@ -375,9 +421,11 @@ const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
 /// authentication every datagram in it is routed to the `Unroutable` drop
 /// because the session table is empty, apart from the few the connection holds
 /// for a session about to claim them (`h3::connection::EARLY_DATAGRAMS`, about
-/// 11.5 KiB). Small next to the 16 MiB of
-/// [`CONNECTION_RECEIVE_WINDOW`] beside it, which is why the value is pinned
-/// rather than lowered.
+/// 11.5 KiB). It is larger than the 1 MiB
+/// [`INITIAL_CONNECTION_RECEIVE_WINDOW`] beside it, and is still pinned rather
+/// than lowered: the HTTP/3 router drains it as it fills, so it holds what
+/// arrived since the last drain, and the same buffer carries an authenticated
+/// connection's CONNECT-UDP traffic.
 ///
 /// Not `None`, which would disable inbound datagrams altogether and with them
 /// CONNECT-UDP, and not a `[limits]` key, for D47's reason: three coupled
@@ -476,10 +524,14 @@ mod tests {
     }
 
     /// The bound that stops one unauthenticated connection from exhausting the
-    /// host's memory.
+    /// host's memory, and the value it is raised to.
     ///
     /// quinn's default is `receive_window: VarInt::MAX`, no aggregate limit;
-    /// [`CONNECTION_RECEIVE_WINDOW`] has the arithmetic this replaces.
+    /// [`INITIAL_CONNECTION_RECEIVE_WINDOW`] has the arithmetic this replaces.
+    /// The handshake advertises 1 MiB, and an authenticated connection is
+    /// raised to 16 MiB, which
+    /// `the_connection_window_is_raised_once_a_request_authenticates` measures
+    /// on a live connection.
     #[test]
     fn the_connection_receive_window_is_bounded() {
         let rendered = transport_debug(&crate::config::Limits::default());
@@ -488,8 +540,13 @@ mod tests {
         // characters, so the bare substring could pass on the wrong field should
         // the two ever hold the same value.
         assert!(
-            rendered.contains(", receive_window: 16777216"),
-            "the aggregate receive window must be capped at 16 MiB: {rendered}"
+            rendered.contains(", receive_window: 1048576"),
+            "the handshake must advertise a 1 MiB aggregate receive window: {rendered}"
+        );
+        assert_eq!(
+            CONNECTION_RECEIVE_WINDOW.into_inner(),
+            16 * 1024 * 1024,
+            "an authenticated connection must be raised to a 16 MiB window"
         );
         assert!(
             !rendered.contains(&format!("receive_window: {}", u64::from(VarInt::MAX))),
@@ -574,6 +631,80 @@ mod tests {
             rendered.contains(&format!("crypto_buffer_size: {CRYPTO_BUFFER_SIZE}")),
             "a quinn bump changed the default CRYPTO reassembly buffer: as above, \
              our pin holds and the reason for the number needs re-checking: {rendered}"
+        );
+    }
+
+    /// How long a write may go without progress before the peer's credit is
+    /// taken to be spent.
+    const NO_PROGRESS: std::time::Duration = std::time::Duration::from_millis(250);
+
+    /// Writes on `streams`, opening more of them, until the peer's connection
+    /// credit is spent, and returns the bytes the peer accepted.
+    ///
+    /// The receiving side reads nothing, so every byte counted here is held
+    /// unread by its quinn, which is what a connection receive window bounds.
+    /// A fresh stream that takes nothing is the end: its own window is the
+    /// 2 MiB [`STREAM_RECEIVE_WINDOW`], so only the connection's can stop it.
+    async fn fill_unread(client: &quinn::Connection, streams: &mut Vec<quinn::SendStream>) -> u64 {
+        let chunk = vec![0u8; 64 * 1024];
+        let mut accepted = 0;
+        let mut index = 0;
+
+        loop {
+            let fresh = index == streams.len();
+            if fresh {
+                let (send, _recv) = tokio::time::timeout(NO_PROGRESS * 4, client.open_bi())
+                    .await
+                    .expect("the stream allowance must have room for another stream")
+                    .expect("open a stream");
+                streams.push(send);
+            }
+
+            let mut took = 0;
+            while let Ok(written) =
+                tokio::time::timeout(NO_PROGRESS, streams[index].write(&chunk)).await
+            {
+                let written = written.expect("the peer must not refuse the stream");
+                took += u64::try_from(written).expect("a write length fits in u64");
+            }
+            accepted += took;
+
+            if fresh && took == 0 {
+                return accepted;
+            }
+            index += 1;
+        }
+    }
+
+    /// An unauthenticated connection is held to 1 MiB of unread stream data,
+    /// and the first authentication raises it to 16 MiB.
+    ///
+    /// The receiving side never reads, which is what a peer achieves on a live
+    /// server by withholding the first byte of a stream (R6-M1): everything
+    /// past the gap is held and cannot be read. The numbers are spelled out
+    /// rather than taken from the constants, so the test pins what reaches the
+    /// wire.
+    #[tokio::test]
+    async fn the_connection_window_is_raised_once_a_request_authenticates() {
+        let limits = crate::config::Limits::default();
+        let (client, server) =
+            loopback_pair(transport_config(&limits).expect("valid limits")).await;
+        let mut streams = Vec::new();
+
+        let before = fill_unread(&client, &mut streams).await;
+        assert_eq!(
+            before,
+            1024 * 1024,
+            "a connection that has not authenticated must be held to 1 MiB of unread \
+             stream data across all of its streams"
+        );
+
+        admit_configured_streams(&server, limits.max_streams_bidi);
+        let after = before + fill_unread(&client, &mut streams).await;
+        assert_eq!(
+            after,
+            16 * 1024 * 1024,
+            "the first authenticated request must raise the connection window to 16 MiB"
         );
     }
 
