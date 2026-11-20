@@ -1012,10 +1012,13 @@ fn ensure_window(buf: &mut BytesMut) {
 /// Setting the option has no effect until the socket is closed, so arming it on
 /// the way out cannot disturb anything still in flight.
 ///
-/// **This is only ever called on a path that cuts a live tunnel short**: the two
-/// client aborts, and the two bounds that fire when a half-closed tunnel's
-/// surviving direction stalls. A clean client FIN, a target EOF, and a target
-/// that resets or errors all keep their FIN semantics. The half-close table at
+/// **This is only ever called on a path that cuts a tunnel short**: the client
+/// aborts (a reset or a STOP_SENDING, met in `client_aborted` and in the two
+/// arms of `target_to_client` that see it), the two bounds that fire when a
+/// half-closed tunnel's surviving direction stalls, a 200 that did not land
+/// (`run`), and a task ended from outside (`UploadHalf`'s drop). A clean
+/// client FIN, a target EOF, and a target that resets or errors all keep
+/// their FIN semantics. The half-close table at
 /// the top of this module is the behaviour this proxy exists to get right, and
 /// a reset is not a substitute for any of it. The bounds are on the abortive
 /// side because they leave a transfer unfinished: a FIN would tell the target

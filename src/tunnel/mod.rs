@@ -209,7 +209,8 @@ const _: () = assert!(CONNECTION_UNANSWERED_MULTIPLIER >= 2);
 // The product is taken with `saturating_mul`, which is right for a value an
 // operator chose but would be silent for the shipped one: a default that
 // saturated would mean the connection budget is `u32::MAX` rather than eight
-// session budgets, and the ADR's arithmetic above would be wrong.
+// session budgets, and the arithmetic in the constant's doc above would be
+// wrong.
 const _: () = assert!(
     crate::config::DEFAULT_UNANSWERED_PACKET_BUDGET
         .checked_mul(CONNECTION_UNANSWERED_MULTIPLIER)
