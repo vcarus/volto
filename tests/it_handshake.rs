@@ -926,15 +926,7 @@ async fn the_server_does_not_permit_zero_rtt() {
     let first = finish_connect(&endpoint, server.addr)
         .await
         .expect("the first handshake must succeed");
-    let mut control = tokio::time::timeout(TIMEOUT, first.accept_uni())
-        .await
-        .expect("the server's control stream must arrive")
-        .expect("the server opens its control stream");
-    let mut byte = [0u8; 1];
-    tokio::time::timeout(TIMEOUT, control.read_exact(&mut byte))
-        .await
-        .expect("the control stream must carry its first byte")
-        .expect("the control stream is readable");
+    first_control_byte(&first).await;
     assert_eq!(
         tickets.load(Ordering::Relaxed),
         0,
@@ -958,11 +950,29 @@ async fn the_server_does_not_permit_zero_rtt() {
         second.close_reason().is_none(),
         "the second connection must be usable"
     );
+    // The same wait as on the first connection, so that a ticket sent with the
+    // end of this handshake would have reached the store before the count is
+    // read.
+    first_control_byte(&second).await;
     assert_eq!(
         tickets.load(Ordering::Relaxed),
         0,
         "no ticket on the second connection either"
     );
+}
+
+/// Waits for the first byte of the server's control stream on `connection`,
+/// which the server sends after its handshake and after any ticket.
+async fn first_control_byte(connection: &quinn::Connection) {
+    let mut control = tokio::time::timeout(TIMEOUT, connection.accept_uni())
+        .await
+        .expect("the server's control stream must arrive")
+        .expect("the server opens its control stream");
+    let mut byte = [0u8; 1];
+    tokio::time::timeout(TIMEOUT, control.read_exact(&mut byte))
+        .await
+        .expect("the control stream must carry its first byte")
+        .expect("the control stream is readable");
 }
 
 /// A client endpoint that keeps session tickets and is willing to use them for

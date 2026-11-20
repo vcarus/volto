@@ -10,6 +10,7 @@
 //! key    = "/etc/volto/privkey.pem"
 //! alpn   = ["h3"]      # optional, this is the default
 //! shutdown_grace = 5   # seconds to let tunnels finish after SIGTERM, 0..3600
+//! # ech_key = "/etc/volto/ech.pem"  # optional: an ECH key from `volto ech-keygen`
 //!
 //! [auth]
 //! users = [{ username = "user1", password = "..." }]
