@@ -33,6 +33,7 @@
 //! (RFC 7617 §2.1 leaves that partly open).
 
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::config;
 use crate::h3api::{FieldValue, Fields};
@@ -353,13 +354,17 @@ fn basic_token(value: &str) -> Result<&str, Denied> {
 /// framing (length a multiple of four, padding only at the very end), because
 /// the input is an authentication credential, and lenient only about the unused
 /// low bits of a padded quantum, which some encoders leave non-zero.
-fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
+///
+/// The output is a user-id and a password, right or wrong, so it is cleared
+/// when dropped, on the early returns as well. It is allocated once at its
+/// final size, so no reallocation leaves an uncleared copy behind.
+fn decode_base64(input: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     if input.is_empty() || !input.len().is_multiple_of(4) {
         return None;
     }
 
     let quanta = input.len() / 4;
-    let mut out = Vec::with_capacity(quanta * 3);
+    let mut out = Zeroizing::new(Vec::with_capacity(quanta * 3));
 
     // The length check above is what makes the remainder half of `as_chunks`
     // empty, so nothing is dropped by looking only at the quanta.
@@ -745,7 +750,9 @@ mod tests {
         ] {
             let encoded = encode_base64(plain);
             assert_eq!(
-                decode_base64(encoded.as_bytes()).as_deref(),
+                decode_base64(encoded.as_bytes())
+                    .as_deref()
+                    .map(Vec::as_slice),
                 Some(plain),
                 "{encoded:?}"
             );
@@ -756,7 +763,9 @@ mod tests {
     fn base64_matches_a_known_vector() {
         // RFC 7617 §2's own example.
         assert_eq!(
-            decode_base64(b"QWxhZGRpbjpvcGVuIHNlc2FtZQ==").as_deref(),
+            decode_base64(b"QWxhZGRpbjpvcGVuIHNlc2FtZQ==")
+                .as_deref()
+                .map(Vec::as_slice),
             Some(&b"Aladdin:open sesame"[..])
         );
     }
@@ -770,9 +779,18 @@ mod tests {
     /// to one.
     #[test]
     fn base64_reads_the_last_two_alphabet_characters() {
-        assert_eq!(decode_base64(b"dTo/YQ==").as_deref(), Some(&b"u:?a"[..]));
-        assert_eq!(decode_base64(b"dTo+YQ==").as_deref(), Some(&b"u:>a"[..]));
-        assert_eq!(decode_base64(b"//8=").as_deref(), Some(&[0xff, 0xff][..]));
+        assert_eq!(
+            decode_base64(b"dTo/YQ==").as_deref().map(Vec::as_slice),
+            Some(&b"u:?a"[..])
+        );
+        assert_eq!(
+            decode_base64(b"dTo+YQ==").as_deref().map(Vec::as_slice),
+            Some(&b"u:>a"[..])
+        );
+        assert_eq!(
+            decode_base64(b"//8=").as_deref().map(Vec::as_slice),
+            Some(&[0xff, 0xff][..])
+        );
     }
 
     #[test]
