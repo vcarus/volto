@@ -400,23 +400,16 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// Connects to the first address that accepts, reporting the last failure.
 ///
 /// Trying every address matters for dual-stack targets, where the AAAA record
-/// may be unreachable while the A record works. The address of the last attempt
-/// travels with the error, since that is the hop the client is told about.
+/// may be unreachable while the A record works. [`tunnel::first_reachable`]
+/// walks the list and shares `budget` out among the attempts.
 ///
-/// `budget` bounds the **whole** loop rather than each address, so a name with
-/// several unreachable addresses cannot multiply the wait by their number.
-/// Within it, each attempt gets an equal share of what is left for the
-/// addresses not yet tried, so an address that drops SYNs cannot spend the
-/// time of the ones after it, and an address that fails early leaves the rest
-/// of its share to them. The shares never add up to more than the budget. The
-/// attempts are still made one at a time, in the order resolution gave
-/// (D58): this is not address racing. Why the walk is bounded at all: the
-/// tunnel slot and the file descriptor behind it are
-/// held for the length of this call, and a target that silently drops SYNs
-/// otherwise holds them for as long as the operating system retries, around two
-/// minutes on Linux. No attacker is needed for that; a handful of black-holed
-/// addresses during ordinary browsing is enough to spend a connection's whole
-/// `max_targets_per_conn` on tunnels that will never open.
+/// Why the walk is bounded at all: the tunnel slot and the file descriptor
+/// behind it are held for the length of this call, and a target that silently
+/// drops SYNs otherwise holds them for as long as the operating system
+/// retries, around two minutes on Linux. No attacker is needed for that; a
+/// handful of black-holed addresses during ordinary browsing is enough to
+/// spend a connection's whole `max_targets_per_conn` on tunnels that will
+/// never open.
 ///
 /// One thing this deliberately does not do is notice the client giving up: a
 /// request stream reset mid-connect leaves the attempt running until it finishes
@@ -425,66 +418,11 @@ async fn connect_any(
     addresses: &[SocketAddr],
     budget: Option<Duration>,
 ) -> Result<TcpStream, Unreachable> {
-    connect_any_with(addresses, budget, TcpStream::connect).await
+    tunnel::first_reachable(addresses, budget, TcpStream::connect, CONNECT_FAILED).await
 }
 
-/// [`connect_any`] with the per-address connect step supplied by the caller.
-///
-/// Split out only so the budget can be tested against a connect that never
-/// completes; production always passes [`TcpStream::connect`].
-async fn connect_any_with<C, F>(
-    addresses: &[SocketAddr],
-    budget: Option<Duration>,
-    connect: C,
-) -> Result<TcpStream, Unreachable>
-where
-    C: Fn(SocketAddr) -> F,
-    F: std::future::Future<Output = io::Result<TcpStream>>,
-{
-    // Taken once, before the first attempt: every address draws on the same
-    // budget.
-    let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
-    let mut last = None;
-
-    for (tried, address) in addresses.iter().enumerate() {
-        let attempt = connect(*address);
-
-        let result = match deadline {
-            Some(deadline) => {
-                let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
-                let share =
-                    deadline.saturating_duration_since(tokio::time::Instant::now()) / untried;
-                match tokio::time::timeout(share, attempt).await {
-                    Ok(result) => result,
-                    Err(_) => Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "the connect budget expired before the target answered",
-                    )),
-                }
-            }
-            None => attempt.await,
-        };
-
-        match result {
-            Ok(tcp) => return Ok(tcp),
-            Err(error) => {
-                debug!(%address, %error, "target address unreachable, trying the next");
-                last = Some(Unreachable {
-                    next_hop: Some(*address),
-                    error,
-                });
-            }
-        }
-
-        // Nothing left to share: the failure just recorded is the answer, and
-        // no address is dialled on a budget that is already spent.
-        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            break;
-        }
-    }
-
-    Err(last.unwrap_or_else(Unreachable::no_addresses))
-}
+/// The debug line for one address that did not accept.
+const CONNECT_FAILED: &str = "target address unreachable, trying the next";
 
 /// Pumps client → target.
 async fn client_to_target(
@@ -1128,7 +1066,7 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, State, Teardown, WRITE_BATCH_PIECES, connect_any_with,
+        CONNECT_FAILED, RELAY_BLOCK_SIZE, RELAY_BUF_SIZE, State, Teardown, WRITE_BATCH_PIECES,
         ensure_window, split_authority, stalled, write_batch,
     };
     // The deadlines here and the resolver's are asserted the same way; the
@@ -1144,6 +1082,20 @@ mod tests {
 
     fn address(literal: &str) -> SocketAddr {
         literal.parse().expect("socket address")
+    }
+
+    /// The walk [`super::connect_any`] makes, with the connect step supplied
+    /// by the test so the budget can be held against one that never completes.
+    async fn connect_any_with<C, F>(
+        addresses: &[SocketAddr],
+        budget: Option<Duration>,
+        connect: C,
+    ) -> Result<TcpStream, crate::tunnel::Unreachable>
+    where
+        C: Fn(SocketAddr) -> F,
+        F: std::future::Future<Output = io::Result<TcpStream>>,
+    {
+        crate::tunnel::first_reachable(addresses, budget, connect, CONNECT_FAILED).await
     }
 
     /// A target that black-holes SYNs is the case the budget exists for: the

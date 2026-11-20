@@ -1461,22 +1461,13 @@ fn capsule_fields() -> Fields {
 /// later can correct the choice. The family ordering applied at resolution
 /// (decision D58) is therefore the whole of the decision here.
 async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unreachable> {
-    let mut last = None;
-
-    for address in addresses {
-        match net::connected_udp_socket(*address).await {
-            Ok(socket) => return Ok(socket),
-            Err(error) => {
-                debug!(%address, %error, "could not open a socket to the target");
-                last = Some(Unreachable {
-                    next_hop: Some(*address),
-                    error,
-                });
-            }
-        }
-    }
-
-    Err(last.unwrap_or_else(Unreachable::no_addresses))
+    tunnel::first_reachable(
+        addresses,
+        None,
+        net::connected_udp_socket,
+        "could not open a socket to the target",
+    )
+    .await
 }
 
 /// Checks a CONNECT-UDP request against the rules that are about the message

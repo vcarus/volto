@@ -825,6 +825,78 @@ where
     resolved.map_err(ResolveFailure::Failed)
 }
 
+/// Dials `addresses` in order, returning the first that answers or the last
+/// failure, with the address it happened on.
+///
+/// Both tunnel types walk their resolved list this way, so the address an
+/// RFC 9209 `next-hop` parameter names is chosen by one rule: the last one
+/// attempted. `failed` is the caller's debug line for an address that did not
+/// answer.
+///
+/// `budget` bounds the **whole** walk rather than each address, so a name
+/// with several unreachable addresses cannot multiply the wait by their
+/// number. Within it, each attempt gets an equal share of what is left for the
+/// addresses not yet tried, so an address that never answers cannot spend the
+/// time of the ones after it, and an address that fails early leaves the rest
+/// of its share to them. The shares never add up to more than the budget. The
+/// attempts are still made one at a time, in the order resolution gave (D58):
+/// this is not address racing. `None` waits on each dial for as long as it
+/// takes.
+pub(crate) async fn first_reachable<T, D, F>(
+    addresses: &[std::net::SocketAddr],
+    budget: Option<Duration>,
+    dial: D,
+    failed: &'static str,
+) -> Result<T, Unreachable>
+where
+    D: Fn(std::net::SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<T>>,
+{
+    // Taken once, before the first attempt: every address draws on the same
+    // budget.
+    let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
+    let mut last = None;
+
+    for (tried, address) in addresses.iter().enumerate() {
+        let attempt = dial(*address);
+
+        let result = match deadline {
+            Some(deadline) => {
+                let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
+                let share =
+                    deadline.saturating_duration_since(tokio::time::Instant::now()) / untried;
+                match tokio::time::timeout(share, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the connect budget expired before the target answered",
+                    )),
+                }
+            }
+            None => attempt.await,
+        };
+
+        match result {
+            Ok(reached) => return Ok(reached),
+            Err(error) => {
+                debug!(%address, %error, "{failed}");
+                last = Some(Unreachable {
+                    next_hop: Some(*address),
+                    error,
+                });
+            }
+        }
+
+        // Nothing left to share: the failure just recorded is the answer, and
+        // no address is dialled on a budget that is already spent.
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            break;
+        }
+    }
+
+    Err(last.unwrap_or_else(Unreachable::no_addresses))
+}
+
 /// Whether a resolved address is one of this proxy's own.
 ///
 /// RFC 9298 §7, on the software that trusts a request for having come from the
