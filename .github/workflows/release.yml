@@ -23,11 +23,17 @@ jobs:
     # purpose (ci.yml runs on pushes and pull requests, this one on tags), so the
     # link has to be made explicitly, which is what this job is.
     #
+    # Only a run triggered by a push to `main` counts. A pull-request run
+    # reports the pull request's head commit as its SHA, so the same commit can
+    # carry one, but that run tested the merge with the base rather than this
+    # commit, and it ran without the scrub secret (ci.yml, the `test` job).
+    #
     # It asks a question, it does not wait for an answer: a tag pushed in the
-    # same breath as the commit will find CI still running and fail here. That is
-    # the intended shape -- push the tag once the commit is green, or re-run this
-    # workflow from the Actions tab afterwards. Nothing has been published at
-    # this point, since every other job needs this one.
+    # same breath as the commit will find CI still running and fail here, with
+    # an error that says so. That is the intended shape -- push the tag once the
+    # commit is green, or re-run this workflow from the Actions tab afterwards.
+    # Nothing has been published at this point, since every other job needs
+    # this one.
     name: require CI on the tagged commit
     runs-on: ubuntu-latest
     # Every job here carries the same limit as ci.yml's: about five times the
@@ -52,19 +58,31 @@ jobs:
           # literally and answers an *empty list* for an abbreviated SHA,
           # without an error. The empty case is therefore failed explicitly
           # below rather than left to a `select` that finds nothing.
+          #
+          # `--event push --branch main` narrows the list on GitHub's side, so
+          # pull-request runs of the same commit cannot fill the 20 entries;
+          # the `jq` filter checks the event, the branch and the commit again,
+          # so the gate does not rest on the flags alone.
           runs="$(gh run list --commit "${{ github.sha }}" --workflow ci.yml \
-            --limit 20 --json databaseId,status,conclusion,event)"
+            --event push --branch main \
+            --limit 20 --json databaseId,status,conclusion,event,headBranch,headSha)"
           echo "$runs"
 
-          green="$(printf '%s' "$runs" |
-            jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length')"
+          green="$(printf '%s' "$runs" | jq --arg sha "${{ github.sha }}" \
+            '[.[] | select(.event == "push" and .headBranch == "main" and .headSha == $sha and .status == "completed" and .conclusion == "success")] | length')"
+          running="$(printf '%s' "$runs" | jq --arg sha "${{ github.sha }}" \
+            '[.[] | select(.event == "push" and .headBranch == "main" and .headSha == $sha and .status != "completed")] | length')"
 
+          if [ "$green" -eq 0 ] && [ "$running" -gt 0 ]; then
+            echo "::error::the ci.yml run of the push to main for ${{ github.sha }} has not finished; re-run this workflow once it is green to publish ${GITHUB_REF_NAME}"
+            exit 1
+          fi
           if [ "$green" -eq 0 ]; then
-            echo "::error::no successful ci.yml run for ${{ github.sha }} — refusing to publish ${GITHUB_REF_NAME}"
+            echo "::error::no successful ci.yml run of a push to main for ${{ github.sha }} (a pull-request run does not count); refusing to publish ${GITHUB_REF_NAME}"
             exit 1
           fi
 
-          echo "ci.yml is green for ${{ github.sha }} ($green successful run(s))"
+          echo "ci.yml is green for the push of ${{ github.sha }} to main ($green successful run(s))"
 
   build:
     name: build (${{ matrix.target }})

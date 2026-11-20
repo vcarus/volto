@@ -534,6 +534,76 @@ fn editing_release_yml_triggers_the_cross_workflow() {
     }
 }
 
+/// The code lines of `job` in `.github/workflows/<name>`: comments dropped,
+/// each trimmed, and a command spread over lines with trailing backslashes
+/// folded into one.
+fn job_code(name: &str, job: &str) -> Vec<String> {
+    let path = repo_root().join(".github/workflows").join(name);
+    let text = read_text(&path).replace("\\\n", " ");
+    let lines: Vec<&str> = text.lines().collect();
+
+    let header = format!("  {job}:");
+    let start = lines
+        .iter()
+        .position(|line| *line == header)
+        .unwrap_or_else(|| panic!("{} has no `{job}` job", path.display()));
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) <= 2)
+        .map_or(lines.len(), |end| start + 1 + end);
+
+    lines[start + 1..end]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The release gate counts only a push run on `main` (R8-L1).
+///
+/// A `pull_request` run reports the pull request's head commit as its SHA, so
+/// a query by commit alone also finds it. That run tested the merge with the
+/// base rather than the commit, and it ran without the scrub secret. The query
+/// asks GitHub for push runs on `main`, and the `jq` filter that counts green
+/// runs checks the same two fields again, so neither half alone decides.
+#[test]
+fn the_release_gate_counts_only_a_push_run_on_main() {
+    let code = job_code("release.yml", "ci-passed");
+
+    let query = code
+        .iter()
+        .find(|line| line.contains("gh run list"))
+        .expect("the `ci-passed` job of release.yml no longer runs `gh run list`");
+    for flag in [
+        "--commit \"${{ github.sha }}\"",
+        "--workflow ci.yml",
+        "--event push",
+        "--branch main",
+    ] {
+        assert!(
+            query.contains(flag),
+            "the release gate's query no longer passes `{flag}`: {query}"
+        );
+    }
+
+    let green = code
+        .iter()
+        .find(|line| line.contains("select(") && line.contains(".conclusion == \"success\""))
+        .expect("the `ci-passed` job of release.yml no longer counts successful runs");
+    for condition in [
+        ".event == \"push\"",
+        ".headBranch == \"main\"",
+        ".headSha == $sha",
+        ".status == \"completed\"",
+    ] {
+        assert!(
+            green.contains(condition),
+            "the release gate counts a run as green without `{condition}`: {green}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ci.yml and cross.yml give every push to main its own concurrency group
 // ---------------------------------------------------------------------------
