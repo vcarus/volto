@@ -357,10 +357,13 @@ fn dynamic_reference() -> Violation {
 
 /// A failure this decoder answers by closing the connection.
 ///
-/// RFC 9204 states three of them, and this decoder can reach all three: a
-/// reference to the dynamic table (§2.2.3), an invalid static table index
-/// (§3.1), and a Required Insert Count no conformant encoder could have
-/// produced (§4.5.1.1). A fourth, the field block §4.5.1.2 makes invalid
+/// Of the connection errors RFC 9204 makes a decoder answer, this decoder can
+/// reach three: a reference to the dynamic table (§2.2.3), an invalid static
+/// table index (§3.1), and a Required Insert Count no conformant encoder could
+/// have produced (§4.5.1.1). The other two, more blocked streams than promised
+/// (§2.1.2) and a Required Insert Count smaller than expected (§2.2.1), need a
+/// dynamic table, and a non-zero Required Insert Count is refused first under
+/// §4.5.1.1. A fourth reachable one, the field block §4.5.1.2 makes invalid
 /// through its Sign bit, is graded the same way by this server's own reading.
 /// The RFC leaves that one's class unstated. Each is quoted at the point it is
 /// raised.
@@ -374,13 +377,13 @@ fn connection_error(detail: &'static str) -> Violation {
 /// QPACK_DECOMPRESSION_FAILED code but ends only the request that carried it.
 /// Examples are a representation that ends early and a string literal that
 /// Huffman decoding rejects. That is this server's own reading, not a rule the
-/// RFC states. RFC 9204 mandates a connection error for the three cases in
-/// [`connection_error`] and for those only, while RFC 7541 §5.2 calls a bad
-/// literal a "decoding error" without naming a class at all. With a zero
-/// dynamic table capacity this decoder holds no state between field sections,
-/// so a section it could not read leaves nothing desynchronised, and the
-/// narrower answer costs one request rather than every tunnel on the
-/// connection. The one case the RFC does class is an integer too large to
+/// RFC states. Every connection error RFC 9204 mandates that this decoder
+/// can reach is one of the cases in [`connection_error`], while RFC 7541 §5.2
+/// calls a bad literal a "decoding error" without naming a class at all.
+/// With a zero dynamic table capacity this decoder holds no state between
+/// field sections, so a section it could not read leaves nothing
+/// desynchronised, and the narrower answer costs one request rather than
+/// every tunnel on the connection. The one case the RFC does class is an integer too large to
 /// decode, which §7.4 makes a stream error on a request stream. It is quoted
 /// where it is raised.
 fn stream_error(detail: &'static str) -> Violation {
