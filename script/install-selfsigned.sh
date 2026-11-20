@@ -98,11 +98,17 @@ into (/etc/volto, /etc/systemd/system, /usr/local/bin); it exists for the tests.
 The username must not contain a colon (RFC 7617) and must be at most 32 bytes.
 That bound is volto's, not this script's -- the binary refuses a longer user-id
 at startup, and repeating it here only moves the complaint earlier. Neither the
-username nor the password may contain " \ | or &: the first two cannot be
-written into the generated TOML, and the other two are metacharacters of the
-substitution that writes it. Neither may contain a comma or whitespace, because
-the Surge policy line carries the pair as `username=..., password=...`. Every
-other printable character is fine, and a generated password is never affected.
+username nor the password may contain " or \, which would need escaping in the
+generated TOML and in the Surge policy line, or a control character. Neither
+may contain a comma or whitespace, because the Surge policy line carries the
+pair as `username=..., password=...`. Every other printable character is fine,
+| and & included, and a generated password is never affected.
+
+A password given with -w is on this script's command line, which every local
+user can read while the run lasts (/proc/<pid>/cmdline). Leaving it out has one
+generated, and PASSWORD exported in a root shell reaches the script without
+being on any command line. The script itself never passes the password to
+another program as an argument.
 
 Before the generated config is installed, the volto binary is asked whether it
 can load it (volto --check-config); if it cannot, nothing is written and the
@@ -125,9 +131,8 @@ note() {
     echo "  $*"
 }
 
-# Rejects credentials the generated config could not express, that the
-# substitution writing it would rewrite into something else, or that the Surge
-# policy line cannot carry.
+# Rejects credentials that the generated config or the Surge policy line could
+# not carry as written.
 #
 # Called from the two flags that stop after generating a config as well as from
 # the preflight, because they run the same generator and --print-config used to
@@ -152,13 +157,13 @@ check_credentials() {
         die "username must be at most $MAX_USERNAME_BYTES bytes"
     fi
     case "$USERNAME$PASSWORD" in
-        # Neither survives being written into a double-quoted TOML string.
+        # Both would need an escape in the double-quoted TOML string and in the
+        # policy line printed at the end, and the report reads the pair back out
+        # of the config by its quotes. Refused rather than escaped, so what is
+        # installed and printed is exactly what was asked for.
         *'"'*|*\\*) die "username and password must not contain quotes or backslashes" ;;
-        # Both are metacharacters of the substitution in generate_config: `|` is
-        # its delimiter, and an unescaped `&` in a sed replacement expands to the
-        # whole matched line. Rejected rather than escaped so what is installed
-        # is always exactly what was asked for.
-        *'|'*|*'&'*) die "username and password must not contain a pipe or an ampersand" ;;
+        # A TOML basic string cannot carry them as written.
+        *[[:cntrl:]]*) die "username and password must not contain control characters" ;;
     esac
     # The Surge policy line carries the pair as `username=..., password=...` on
     # one line, so a comma or any whitespace cannot be expressed there.
@@ -195,31 +200,42 @@ UNIT_SRC="$SCRIPT_DIR/masque.service"
 EXAMPLE_SRC="$SCRIPT_DIR/config.example.toml"
 
 # Derives the installed config from the shipped example, so the generated file
-# keeps every comment explaining the keys it does not touch. Only four values are
-# substituted, each anchored to the start of its line so a value cannot match a
+# keeps every comment explaining the keys it does not touch. Only four lines are
+# replaced, each matched from the start of the line so a value cannot match a
 # comment or the commented-out second user.
+#
+# Shell builtins only, here and in verify_config: the password must never be
+# an argument of another program, because every local user can read a
+# process's arguments in /proc/<pid>/cmdline. `read` and `printf` run inside
+# this shell, and a value is written as data, so no character in it has a
+# meaning to the generator.
 generate_config() {
-    sed \
-        -e "s|^listen = .*|listen = \"0.0.0.0:$PORT\"|" \
-        -e "s|^cert = .*|cert = \"$CERT\"|" \
-        -e "s|^key = .*|key = \"$KEY\"|" \
-        -e "s|^  { username = .*|  { username = \"$USERNAME\", password = \"$PASSWORD\" },|" \
-        "$EXAMPLE_SRC"
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            'listen = '*) printf 'listen = "0.0.0.0:%s"\n' "$PORT" ;;
+            'cert = '*) printf 'cert = "%s"\n' "$CERT" ;;
+            'key = '*) printf 'key = "%s"\n' "$KEY" ;;
+            '  { username = '*)
+                printf '  { username = "%s", password = "%s" },\n' "$USERNAME" "$PASSWORD" ;;
+            *) printf '%s\n' "$line" ;;
+        esac
+    done <"$EXAMPLE_SRC"
 }
 
-# Every substitution must have taken: a silent miss would leave the example's
-# placeholder password in a live config.
+# Every replacement must have taken: a silent miss would leave the example's
+# placeholder password in a live config. The file is matched as text, with
+# every quoted part of a pattern taken literally.
 verify_config() {
-    grep -q "^listen = \"0.0.0.0:$PORT\"$" "$1" || die "failed to set listen in the config"
-    grep -q "^cert = \"$CERT\"$" "$1" || die "failed to set cert in the config"
-    grep -q "^key = \"$KEY\"$" "$1" || die "failed to set key in the config"
-    # Fixed-string, unlike the three above: a password is arbitrary text, and as
-    # a basic regular expression a perfectly ordinary one containing `*` or `.`
-    # would fail to match the line it had just been written into correctly.
-    grep -qF -- "password = \"$PASSWORD\"" "$1" || die "failed to set the user in the config"
-    if grep -q 'replace-me-with-something-long' "$1"; then
+    local text
+    text=$'\n'"$(<"$1")"$'\n'
+    [[ "$text" == *$'\n'"listen = \"0.0.0.0:$PORT\""$'\n'* ]] || die "failed to set listen in the config"
+    [[ "$text" == *$'\n'"cert = \"$CERT\""$'\n'* ]] || die "failed to set cert in the config"
+    [[ "$text" == *$'\n'"key = \"$KEY\""$'\n'* ]] || die "failed to set key in the config"
+    [[ "$text" == *$'\n'"  { username = \"$USERNAME\", password = \"$PASSWORD\" },"$'\n'* ]] ||
+        die "failed to set the user in the config"
+    [[ "$text" != *'replace-me-with-something-long'* ]] ||
         die "the example placeholder password survived; refusing to install this config"
-    fi
 }
 
 # Asks the volto binary whether it can load the config generated in $1, and ends
@@ -564,13 +580,22 @@ address="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 [ -n "$address" ] || address="<server-ip>"
 
 # The password is read back out of the config so a re-run prints the one actually
-# in force rather than a freshly generated one that was never installed. The grep
-# has no match on a config whose user line was hand-edited into another spelling,
-# or on one with `users = []`, and the documentation invites both; an unreadable
-# line prints as <unknown> and says so rather than ending the run.
-configured_user="$(grep -o '{ username = "[^"]*", password = "[^"]*" }' "$CONF" | head -n1 || true)"
-conf_username="$(echo "$configured_user" | sed -n 's/.*username = "\([^"]*\)".*/\1/p' || true)"
-conf_password="$(echo "$configured_user" | sed -n 's/.*password = "\([^"]*\)".*/\1/p' || true)"
+# in force rather than a freshly generated one that was never installed. Read
+# with builtins, for the reason generate_config gives. Nothing matches a config
+# whose user line was hand-edited into another spelling, or one with
+# `users = []`, and the documentation invites both; an unreadable line prints as
+# <unknown> and says so rather than ending the run.
+conf_username=""
+conf_password=""
+user_line='\{ username = "([^"]*)", password = "([^"]*)" \}'
+while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ $user_line ]]; then
+        conf_username="${BASH_REMATCH[1]}"
+        conf_password="${BASH_REMATCH[2]}"
+        break
+    fi
+done <"$CONF" || true
 if [ -z "$conf_username" ] || [ -z "$conf_password" ]; then
     note "no '{ username = ..., password = ... }' entry could be read out of $CONF;"
     note "the policy line below names the credential as <unknown>"

@@ -273,28 +273,139 @@ fn a_password_full_of_metacharacters_survives_verbatim() {
     }
 }
 
-/// The two metacharacters of the substitution that builds the config must be
-/// refused, and refused with a message that names them.
+/// `|` and `&` reach the config exactly as given, in the username and in the
+/// password (R8-M1, R8-D2).
 ///
-/// `|` is the delimiter of the substitutions that build the config, so it used
-/// to end the `s` command early and abort the run with `sed: bad flag in
-/// substitute command`. `&` expands to the whole matched line in a sed
-/// replacement, so it used to write a mangled credential line. Both now stop at
-/// the check, on `--print-config` as much as on a real install — that path used
-/// to skip the character check entirely.
+/// They were refused while the config was written by `sed`, where `|` was the
+/// delimiter of the substitution and `&` expanded to the matched line. The
+/// config is now written with `printf`, which takes a value as data, so both
+/// are ordinary characters.
 #[test]
-fn credentials_with_a_pipe_or_an_ampersand_are_refused() {
-    for argument in ["-w", "-u"] {
-        for value in ["a|b", "p&ssword"] {
-            let (ok, stdout, stderr) = print_config(&[argument, value]);
+fn credentials_with_a_pipe_or_an_ampersand_reach_the_config_verbatim() {
+    for (username, password) in [
+        ("a|b", "hunter2"),
+        ("p&ul", "hunter2"),
+        ("alice", "a|b|c"),
+        ("alice", "p&ss&&word"),
+        ("x|&y", "&|&"),
+    ] {
+        let text = generated_config(&["-u", username, "-w", password]);
+        let config: Config = toml::from_str(&text).unwrap_or_else(|error| {
+            panic!("{username:?} {password:?} produced a config volto cannot parse: {error}\n{text}")
+        });
 
-            assert!(!ok, "{argument} {value} must be refused, got:\n{stdout}");
-            assert!(
-                stderr.contains("must not contain a pipe or an ampersand"),
-                "the refusal must name the characters, got: {stderr}"
-            );
-        }
+        assert_eq!(config.auth.users.len(), 1, "{text}");
+        assert_eq!(config.auth.users[0].username, username, "{text}");
+        assert_eq!(config.auth.users[0].password, password, "{text}");
     }
+}
+
+/// Writes, in `dir`, a wrapper for each of `tools` that records its arguments
+/// in `dir/argv.log` and then runs the tool, and returns `dir` to put in front
+/// of `PATH`.
+///
+/// A wrapper runs the stand-in of the same name in `stubs` when there is one,
+/// and the host's tool otherwise. A tool the host does not have is skipped.
+fn plant_argv_recorders(dir: &Path, stubs: Option<&Path>, tools: &[&str]) -> PathBuf {
+    fs::create_dir_all(dir).expect("the recorder directory must be creatable");
+    let log = dir.join("argv.log");
+    for tool in tools {
+        let target = match stubs.map(|stubs| stubs.join(tool)) {
+            Some(stub) if stub.is_file() => stub,
+            _ => match try_real_tool(tool) {
+                Some(real) => real,
+                None => continue,
+            },
+        };
+        write_executable(
+            &dir.join(tool),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> '{}'\nexec '{}' \"$@\"\n",
+                log.display(),
+                target.display()
+            ),
+        );
+    }
+    dir.to_path_buf()
+}
+
+/// Every external command the installer runs, by name.
+const INSTALLER_TOOLS: &[&str] = &[
+    "sed", "grep", "awk", "head", "cut", "wc", "cat", "tr", "mktemp", "rm", "openssl", "install",
+    "mv", "chown", "chgrp", "chmod", "date", "hostname", "id", "systemctl", "sleep", "useradd",
+    "ufw", "dirname", "find", "cmp", "apt-get",
+];
+
+/// The password never appears on the argument vector of a program the
+/// installer runs (R8-M1).
+///
+/// `/proc/<pid>/cmdline` is readable by every local user. The config used to
+/// be written by `sed` with the password inside its script argument, and
+/// checked by `grep -F` with the password as its pattern. Every external
+/// command is wrapped here, on `--print-config` and on the full install path,
+/// and none of them may have been handed the password.
+#[test]
+fn the_password_is_on_no_command_line_the_installer_runs() {
+    const SECRET: &str = "argv-canary-4f1e9";
+    let script = repo_root().join("script/install-selfsigned.sh");
+
+    let print_root = scratch_tree("install", "argv-print", &[]);
+    let recorders = plant_argv_recorders(&print_root.join("recorders"), None, INSTALLER_TOOLS);
+    let output = Command::new("bash")
+        .arg(&script)
+        .args(["--print-config", "-u", "alice", "-w", SECRET])
+        .current_dir(repo_root())
+        .env("PATH", path_with_stubs(&recorders))
+        .output()
+        .expect("the installer script must be runnable");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(
+        stdout_of(&output).contains(SECRET),
+        "the generated config must carry the password"
+    );
+    let log = fs::read_to_string(recorders.join("argv.log")).unwrap_or_default();
+    assert!(
+        log.lines().all(|line| !line.contains(SECRET)),
+        "--print-config handed the password to another program:\n{log}"
+    );
+
+    let root = scratch_tree(
+        "install",
+        "argv-install",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let recorders = plant_argv_recorders(&root.join("recorders"), Some(&stubs), INSTALLER_TOOLS);
+    let output = Command::new("bash")
+        .arg(&script)
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+            "-u",
+            "alice",
+        ])
+        .current_dir(repo_root())
+        .env("VOLTO_INSTALL_ROOT", &root)
+        .env("PASSWORD", SECRET)
+        .env("PATH", path_with_stubs(&recorders))
+        .output()
+        .expect("the installer script must be runnable");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let config = fs::read_to_string(root.join("etc/volto/config.toml"))
+        .expect("the install must have written a config");
+    assert!(
+        config.contains(&format!("password = \"{SECRET}\"")),
+        "the installed config must carry the password from the environment:\n{config}"
+    );
+    let log = fs::read_to_string(recorders.join("argv.log")).unwrap_or_default();
+    assert!(
+        log.lines().any(|line| line.starts_with("openssl ")),
+        "the recorders must have seen the install run: {log}"
+    );
+    assert!(
+        log.lines().all(|line| !line.contains(SECRET)),
+        "the install path handed the password to another program:\n{log}"
+    );
 }
 
 /// The characters a double-quoted TOML string cannot carry as written, and the
@@ -314,6 +425,8 @@ fn credentials_toml_or_http_basic_cannot_carry_are_refused() {
         ("-u", "ali\\ce", "must not contain quotes or backslashes"),
         ("-u", "ali:ce", "username must not contain a colon"),
         ("-u", "", "username must not be empty"),
+        ("-w", "pass\u{1}word", "must not contain control characters"),
+        ("-u", "ali\u{7f}ce", "must not contain control characters"),
     ] {
         let (ok, stdout, stderr) = print_config(&[argument, value]);
 
@@ -569,11 +682,15 @@ fn server_accepts_username(name: &str) -> bool {
 /// Resolved before the stubs below go in front of it, so a wrapper can hand its
 /// arguments to the real tool by absolute path.
 fn real_tool(name: &str) -> PathBuf {
+    try_real_tool(name).unwrap_or_else(|| panic!("no {name} on PATH"))
+}
+
+/// [`real_tool`], or `None` when the host has no such tool.
+fn try_real_tool(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").expect("PATH must be set");
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
-        .unwrap_or_else(|| panic!("no {name} on PATH"))
 }
 
 /// Writes stand-ins for the commands the install path needs root or a Debian

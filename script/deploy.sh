@@ -121,6 +121,11 @@ TAG_WAS_RESOLVED=0
 # then does this script replace its installed copy from the release.
 RELEASE_IS_SIGNED=0
 INSTALL_ARGS=()
+# The first-install password, from -w or the environment. It reaches the
+# installer through that call's environment, never through its arguments:
+# /proc/<pid>/cmdline is readable by every local user, /proc/<pid>/environ only
+# by the process's owner.
+PASSWORD="${PASSWORD:-}"
 
 usage() {
     cat <<'USAGE'
@@ -167,7 +172,10 @@ Options:
   -s, --sni NAME       first install only: passed to install-selfsigned.sh
   -p, --port PORT      first install only: passed to install-selfsigned.sh
   -u, --username NAME  first install only: passed to install-selfsigned.sh
-  -w, --password PASS  first install only: passed to install-selfsigned.sh
+  -w, --password PASS  first install only: passed to install-selfsigned.sh in
+                       its environment. On this command line every local user
+                       can read it while the run lasts; leave it out to have
+                       one generated, or export PASSWORD in a root shell
   -h, --help           show this help
 
 REPO and TAG can also be given as environment variables, as can the
@@ -414,9 +422,10 @@ while [ $# -gt 0 ]; do
         --verify-signature)
                         [ $# -ge 3 ] || die "$1 needs two values: SUMS and SIG"
                         VERIFY_ONLY=1; VERIFY_SUMS="$2"; VERIFY_SIG="$3"; shift 3 ;;
-        -s|--sni|-p|--port|-u|--username|-w|--password)
+        -s|--sni|-p|--port|-u|--username)
                         [ $# -ge 2 ] || die "$1 needs a value"
                         INSTALL_ARGS+=("$1" "$2"); shift 2 ;;
+        -w|--password)  [ $# -ge 2 ] || die "$1 needs a value"; PASSWORD="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              usage >&2; die "unknown option: $1" ;;
     esac
@@ -623,8 +632,9 @@ else
         # the real /etc and /usr/local. Set on the call itself rather than
         # exported for the whole script, so the two seams compose and nothing
         # else inherits it. Empty in every real run, which is what the two
-        # variables mean.
-        VOLTO_INSTALL_ROOT="$ROOT" \
+        # variables mean. PASSWORD goes the same way, for the reason given
+        # where it is defaulted; an empty one makes the installer generate one.
+        PASSWORD="$PASSWORD" VOLTO_INSTALL_ROOT="$ROOT" \
             bash "$SRC/script/install-selfsigned.sh" --binary "$SRC/volto" \
             ${INSTALL_ARGS[@]+"${INSTALL_ARGS[@]}"}
 

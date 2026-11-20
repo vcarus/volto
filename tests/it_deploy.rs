@@ -1888,8 +1888,10 @@ impl Host {
         write_executable(
             &unpacked.join("script/install-selfsigned.sh"),
             &format!(
-                "#!/bin/sh\nprintf 'VOLTO_INSTALL_ROOT=%s %s\\n' \"$VOLTO_INSTALL_ROOT\" \"$*\" >> '{}'\n",
-                self.logs.join("installer").display()
+                "#!/bin/sh\nprintf 'VOLTO_INSTALL_ROOT=%s %s\\n' \"$VOLTO_INSTALL_ROOT\" \"$*\" >> '{}'\n\
+                 printf '%s\\n' \"$PASSWORD\" >> '{}'\n",
+                self.logs.join("installer").display(),
+                self.logs.join("installer-password").display()
             ),
         );
 
@@ -2190,6 +2192,42 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
     assert!(
         calls.starts_with("is-active --quiet volto\n") && !calls.contains("restart"),
         "the first install must check the service once and restart nothing: {calls}"
+    );
+}
+
+/// The first-install password reaches the bundled installer in its
+/// environment and not on its command line (R8-M1).
+///
+/// `deploy.sh` used to copy `-w PASS` into the installer's arguments, where it
+/// sat in `/proc/<pid>/cmdline`, readable by every local user, for the whole
+/// installer run.
+#[test]
+fn the_first_install_password_reaches_the_installer_outside_its_arguments() {
+    const SECRET: &str = "argv-canary-d3p|&";
+    let host = Host::new("first-install-password", Service::ComesUp);
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+
+    let output = host.run(&[
+        "--allow-unsigned",
+        "--tag",
+        UNSIGNED_TAG,
+        "--username",
+        "alice",
+        "--password",
+        SECRET,
+    ]);
+
+    let stderr = stderr_of(&output);
+    assert!(output.status.success(), "{stderr}");
+    let installer = host.calls("installer");
+    assert!(
+        installer.ends_with("/volto --username alice\n") && !installer.contains(SECRET),
+        "the installer's arguments must not carry the password: {installer:?}"
+    );
+    assert_eq!(
+        host.calls("installer-password"),
+        format!("{SECRET}\n"),
+        "the installer must get the password in its environment"
     );
 }
 

@@ -157,13 +157,21 @@ takes a value can come from the environment instead — `BINARY`, `SNI`, `PORT`,
 
 A username may not contain a colon (RFC 7617) and may not be longer than 32
 bytes (see [configuration.md](configuration.md#auth)), and neither a username
-nor a password may contain `"`, `\`, `|` or `&`: the first two cannot be
-written into the generated TOML string, and the other two are metacharacters of
-the substitution that writes it. Neither may contain a comma or whitespace,
-because the Surge policy line carries the pair as `username=..., password=...`.
-The installer refuses them up front rather than installing something other than
-what was asked for. Everything else printable is accepted, `*` and `.`
-included, and a generated password never runs into this.
+nor a password may contain `"`, `\` or a control character, which would need
+escaping in the generated TOML string and in the printed policy line. Neither
+may contain a comma or whitespace, because the Surge policy line carries the
+pair as `username=..., password=...`. The installer refuses them up front
+rather than installing something other than what was asked for. Everything
+else printable is accepted, `*`, `.`, `|` and `&` included, and a generated
+password never runs into this.
+
+A password given with `--password` is on the installer's command line, which
+every local user can read in `/proc/<pid>/cmdline` while the run lasts. Leave
+it out to have one generated, or set it in the environment of a root shell
+(`sudo -i`, then `read -rs PASSWORD && export PASSWORD`), which no other user
+can read. The installer writes the config with shell builtins and never hands
+the password to another program as an argument, and `deploy.sh` passes it to
+the installer in the environment.
 
 Before the generated `config.toml` is installed, the binary being installed is
 asked whether it can load it — the same `volto --check-config` question
@@ -319,7 +327,8 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
 
 Omitting `--password` is also fine, and usually better: the installer generates
 18 random bytes — 144 bits, 24 characters — and prints the result in the final
-Surge policy line. `--username` is independent, so naming the user still leaves
+Surge policy line, and no command line ever carries it. A `--password` on this
+command line is readable by every local user while the run lasts. `--username` is independent, so naming the user still leaves
 the password generated.
 
 The no-op path is what makes it safe to run on a schedule:
