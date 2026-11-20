@@ -31,7 +31,8 @@
 //!   *Short headers* below.
 //! * **Long header, version not 1**: refused, whatever the version is. What
 //!   that removes depends on the version. quinn's default `EndpointConfig`,
-//!   which [`crate::quic::Server::bind`] takes unchanged, supports seven:
+//!   which [`crate::quic::Server::bind`] takes with only its connection ID
+//!   generator replaced (`quic::cid`), supports seven:
 //!   version 1 and the six draft numbers `0xff00001d` to `0xff000022`
 //!   (quinn-proto 0.11.x `src/lib.rs`, `DEFAULT_SUPPORTED_VERSIONS`). For a
 //!   version outside that list quinn would send a Version Negotiation packet,
