@@ -1486,6 +1486,101 @@ fn the_generated_certificate_asserts_only_digital_signature() {
     );
 }
 
+/// Runs the full install path with no password given, so the installer
+/// generates one, with stdout a pipe as under the update timer.
+fn run_install_generating_the_password(root: &Path, stubs: &Path) -> std::process::Output {
+    Command::new("bash")
+        .arg(repo_root().join("script/install-selfsigned.sh"))
+        .args([
+            "--binary",
+            real_binary().to_str().expect("a UTF-8 path to the binary"),
+            "--sni",
+            "volto.test",
+        ])
+        .current_dir(repo_root())
+        .env("VOLTO_INSTALL_ROOT", root)
+        .env("PATH", path_with_stubs(stubs))
+        .env_remove("PASSWORD")
+        .output()
+        .expect("the installer script must be runnable")
+}
+
+/// A generated password is printed only to a terminal (R8-L10).
+///
+/// The update timer runs a first install when the config is missing, and its
+/// output goes to the journal of `volto-deploy.service`, which the `adm` and
+/// `systemd-journal` groups read. The policy line then names the config file
+/// in place of the password.
+#[test]
+fn a_generated_password_is_printed_only_to_a_terminal() {
+    let root = scratch_tree(
+        "install",
+        "password-pipe",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_install_generating_the_password(&root, &stubs);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let config: Config = toml::from_str(
+        &fs::read_to_string(root.join("etc/volto/config.toml")).expect("the installed config"),
+    )
+    .expect("the installed config parses");
+    let password = &config.auth.users[0].password;
+    let stdout = stdout_of(&output);
+    assert!(
+        !stdout.contains(password.as_str()),
+        "the generated password reached a stdout that is not a terminal:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("password=<as in "),
+        "the policy line must say where the password is: {stdout}"
+    );
+}
+
+/// A run without a terminal does not replace the password of a host that
+/// already has an install (R8-L10).
+///
+/// Deleting `config.toml` and re-running regenerates the config. When the
+/// re-run was the timer's, the installer generated a new password, every
+/// client's credential stopped working, and the new one was only in the
+/// journal. Such a run now stops before anything changes; with the password
+/// given it goes ahead.
+#[test]
+fn a_run_without_a_terminal_does_not_replace_the_password_silently() {
+    let root = scratch_tree(
+        "install",
+        "password-silent",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    write_executable(&root.join("usr/local/bin/volto"), OLD_BINARY);
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_install_generating_the_password(&root, &stubs);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("would replace the one the clients use"),
+        "the refusal must say why: {stderr}"
+    );
+    assert!(!root.join("etc/volto/config.toml").exists(), "no config may be written");
+    assert!(!root.join("etc/volto/cert.pem").exists(), "no certificate may be written");
+    assert_eq!(
+        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        Some(OLD_BINARY),
+        "the binary must be left alone"
+    );
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+    assert!(
+        output.status.success(),
+        "with the password given the run goes ahead: {}",
+        stderr_of(&output)
+    );
+}
+
 /// The report must survive a certificate that openssl cannot read.
 ///
 /// Under `set -euo pipefail` the plain assignments that read the fingerprint and

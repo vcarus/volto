@@ -267,7 +267,10 @@ three things the host needs:
   without touching anything. The presence checks are part of the deal —
   deleting `/etc/volto/config.toml` and re-running is the supported way to
   regenerate it (the certificate and the system user survive, so the
-  fingerprint does not change). What decides this is the version string and
+  fingerprint does not change). That re-run has to be made from a terminal or
+  with `PASSWORD` set: the new config gets a new password, and a run without a
+  terminal, such as the timer's, refuses to generate one on a host that
+  already has an install, since nobody would see it. What decides this is the version string and
   nothing else, so a binary that reports the wanted version is left in place
   whatever its bytes are; `--force` below is how it gets replaced.
 
@@ -343,7 +346,9 @@ curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh 
 
 Omitting `--password` is also fine, and usually better: the installer generates
 18 random bytes — 144 bits, 24 characters — and prints the result in the final
-Surge policy line, and no command line ever carries it. A `--password` on this
+Surge policy line when its output is a terminal, and no command line ever
+carries it. Without a terminal (a log file, the journal) the policy line names
+`/etc/volto/config.toml` in place of the password. A `--password` on this
 command line is readable by every local user while the run lasts. `--username` is independent, so naming the user still leaves
 the password generated.
 

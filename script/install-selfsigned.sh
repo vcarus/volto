@@ -416,6 +416,16 @@ if [ "$HAD_CONFIG" -eq 1 ] && [ "$PLACE_BINARY" -eq 1 ]; then
     check_existing_config
 fi
 
+# A run with no terminal on stdout is the update timer's (its output goes to
+# the journal) or another program's. Where the config is missing on a host that
+# already has a binary or a unit, generating a password would replace the one
+# every client uses, and the new one would be printed nowhere (see the report).
+# So such a run is refused unless the password is given.
+if [ "$HAD_CONFIG" -eq 0 ] && [ -z "$PASSWORD" ] && [ ! -t 1 ] &&
+    { [ -e "$BIN" ] || [ -e "$UNIT" ]; }; then
+    die "$CONF is missing on a host that already has $BIN or $UNIT, and this run has no terminal: a generated password would replace the one the clients use without anybody seeing it -- run this from a terminal, or set PASSWORD"
+fi
+
 # --- certificate name -------------------------------------------------------
 
 # The name goes into the certificate (CN and SAN) and has to match what the
@@ -802,7 +812,14 @@ echo "expires:     $expiry"
 echo
 echo "Surge policy line (replace the address if this host is behind a relay):"
 echo
-echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, username=$conf_username, password=$conf_password"
+# The password is printed only to a terminal. Without one, stdout is the
+# journal of the timer's service or a log file, which other users can read.
+if [ -t 1 ]; then
+    shown_password="$conf_password"
+else
+    shown_password="<as in $CONF>"
+fi
+echo "  volto = masque, $address, $PORT, sni=$SNI, server-cert-fingerprint-sha256=${fingerprint#*=}, username=$conf_username, password=$shown_password"
 echo
 echo "Security notes:"
 echo "  * The fingerprint above IS the trust anchor. Carry it to your device over a"
