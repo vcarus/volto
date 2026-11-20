@@ -1100,13 +1100,9 @@ fn coalesced_frames(
     first: &InitialHeader,
 ) -> Vec<BytesMut> {
     let mut frames = Vec::new();
-    if first.packet_end >= datagram.len() {
-        return frames;
-    }
     let dcid = &datagram[first.dcid.clone()];
     let mut at = first.packet_end;
-    while let Some(packet) = datagram.get(at..).filter(|rest| !rest.is_empty()) {
-        let Some(&byte) = packet.first() else { break };
+    while let Some(packet @ [byte, ..]) = datagram.get(at..) {
         if byte & LONG_HEADER_FORM == 0
             || byte & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE
             || packet.get(1..5) != Some(&QUIC_V1.to_be_bytes()[..])
@@ -1342,15 +1338,11 @@ pub enum Refusal {
 /// holding datagrams `stride` bytes apart, the last one possibly shorter. A
 /// datagram the gate holds or refuses is blinded where it lies rather than cut
 /// out, so the strides stay as they were; see the module documentation.
-fn each_datagram(meta: &RecvMeta, buf: &mut [u8], mut screen: impl FnMut(&mut [u8])) {
+fn each_datagram(meta: &RecvMeta, buf: &mut [u8], screen: impl FnMut(&mut [u8])) {
+    // `len` is at most the buffer's length, so the slice is in range, and a
+    // zero stride, which `chunks_mut` would panic on, is read as one.
     let len = meta.len.min(buf.len());
-    let stride = meta.stride.max(1);
-    let mut at = 0;
-    while at < len {
-        let end = at.saturating_add(stride).min(len);
-        screen(&mut buf[at..end]);
-        at = end;
-    }
+    buf[..len].chunks_mut(meta.stride.max(1)).for_each(screen);
 }
 
 /// Whether the first packet of `datagram` is an Initial, read off its first
