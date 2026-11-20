@@ -75,10 +75,11 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 /// Default budget for reaching a target, in seconds.
 ///
 /// Applied twice per request and separately: once to name resolution, once to
-/// the whole list of addresses the name resolved to. A tunnel slot and the file
-/// descriptor behind it are held for the length of both, so without a budget an
-/// unreachable target holds them for as long as the operating system waits on a
-/// SYN that draws no answer. On Linux that is roughly two minutes, long enough
+/// the whole list of addresses the name resolved to, which is shared out over
+/// the addresses with a floor per attempt (`tunnel::MIN_CONNECT_SHARE`). A
+/// tunnel slot and the file descriptor behind it are held for the length of
+/// both, so without a budget an unreachable target holds them for as long as
+/// the operating system waits on a SYN that draws no answer. On Linux that is roughly two minutes, long enough
 /// for ordinary browsing to a black-holed address to exhaust
 /// `max_targets_per_conn` on its own.
 ///

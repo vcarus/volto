@@ -1161,6 +1161,76 @@ mod tests {
         );
     }
 
+    /// A target that answers every address slower than an equal share of a
+    /// small budget is still reached on its first address.
+    ///
+    /// Eight addresses, a two-second budget and a path whose handshake takes
+    /// 300 ms. An equal share would be 250 ms, so every attempt would time out
+    /// and a reachable target would be answered 504. With the floor the first
+    /// attempt gets the whole budget, since less than
+    /// [`crate::tunnel::MIN_CONNECT_SHARE`] is left, and connects.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_handshake_is_not_cut_short_by_a_long_address_list() {
+        let addresses: Vec<SocketAddr> = (1..=8)
+            .map(|host| address(&format!("192.0.2.{host}:443")))
+            .collect();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let local = listener.local_addr().expect("address");
+        let attempted = std::cell::RefCell::new(Vec::new());
+
+        let connected = connect_any_with(&addresses, Some(Duration::from_secs(2)), |address| {
+            attempted.borrow_mut().push(address);
+            async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let client = std::net::TcpStream::connect(local)?;
+                client.set_nonblocking(true)?;
+                TcpStream::from_std(client)
+            }
+        })
+        .await;
+
+        assert!(connected.is_ok(), "the first address answers in 300 ms");
+        assert_eq!(attempted.into_inner(), vec![addresses[0]]);
+    }
+
+    /// The floor on each share never stretches the walk past the budget: it
+    /// means fewer addresses are tried, and the walk still ends on the budget.
+    ///
+    /// Eight addresses that never answer. At two seconds, less than the floor,
+    /// the first address gets the whole budget, as it did before the budget
+    /// was shared. At the default ten seconds the shares are 3, 3, 3 and the
+    /// last second, so four addresses are tried. The paused clock moves only
+    /// to the next timer, so the time the walk took is exact: the budget, to
+    /// the nanosecond.
+    #[tokio::test(start_paused = true)]
+    async fn the_floor_on_each_share_never_extends_the_budget() {
+        let addresses: Vec<SocketAddr> = (1..=8)
+            .map(|host| address(&format!("192.0.2.{host}:443")))
+            .collect();
+
+        for (seconds, tried) in [(2, 1), (10, 4)] {
+            let budget = Duration::from_secs(seconds);
+            let attempted = std::cell::RefCell::new(Vec::new());
+            let start = tokio::time::Instant::now();
+
+            let failure = connect_any_with(&addresses, Some(budget), |address| {
+                attempted.borrow_mut().push(address);
+                std::future::pending::<io::Result<TcpStream>>()
+            })
+            .await
+            .expect_err("no address answers");
+
+            assert_eq!(start.elapsed(), budget, "a {seconds} s walk overran");
+            assert_eq!(failure.error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(failure.next_hop, Some(addresses[tried - 1]));
+            assert_eq!(
+                attempted.into_inner(),
+                addresses[..tried],
+                "a {seconds} s budget tried the wrong number of addresses"
+            );
+        }
+    }
+
     /// The budget is a deadline, so a clock that jumps clean past it lands on
     /// the same answer as a clock that walked there.
     ///

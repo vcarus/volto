@@ -645,6 +645,16 @@ where
     resolved.map_err(ResolveFailure::Failed)
 }
 
+/// The least time one connect attempt is given out of the budget, unless less
+/// than this is left.
+///
+/// Our own rule, not a protocol number: three seconds is one SYN
+/// retransmission at the one-second initial retransmission timeout plus the
+/// handshake that follows it. A share below that ends an attempt before a lost
+/// first SYN has been sent again, so a reachable target behind a slow path or a
+/// long address list could time out on every address.
+pub(crate) const MIN_CONNECT_SHARE: Duration = Duration::from_secs(3);
+
 /// Dials `addresses` in order, returning the first that answers or the last
 /// failure, with the address it happened on.
 ///
@@ -658,10 +668,13 @@ where
 /// number. Within it, each attempt gets an equal share of what is left for the
 /// addresses not yet tried, so an address that never answers cannot spend the
 /// time of the ones after it, and an address that fails early leaves the rest
-/// of its share to them. The shares never add up to more than the budget. The
-/// attempts are still made one at a time, in the order resolution gave (D58):
-/// this is not address racing. `None` waits on each dial for as long as it
-/// takes.
+/// of its share to them. The share is never less than [`MIN_CONNECT_SHARE`],
+/// or what is left when that is less, so a long list or a small budget does not
+/// cut every attempt shorter than a handshake takes. The shares never add up to
+/// more than the budget, and the walk stops when nothing is left, so the floor
+/// means fewer addresses are tried, not a longer wait. The attempts are still
+/// made one at a time, in the order resolution gave (D58): this is not address
+/// racing. `None` waits on each dial for as long as it takes.
 pub(crate) async fn first_reachable<T, D, F>(
     addresses: &[std::net::SocketAddr],
     budget: Option<Duration>,
@@ -683,8 +696,8 @@ where
         let result = match deadline {
             Some(deadline) => {
                 let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
-                let share =
-                    deadline.saturating_duration_since(tokio::time::Instant::now()) / untried;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let share = (remaining / untried).max(MIN_CONNECT_SHARE).min(remaining);
                 tokio::time::timeout(share, attempt)
                     .await
                     .unwrap_or_else(|_| {
