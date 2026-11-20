@@ -45,10 +45,9 @@
 //! server's own rule, not anything RFC 9114 asks for: once a request stream
 //! carries a tunnel, [`FrameReader`] takes up to [`READ_AHEAD_CHUNKS`] chunks
 //! from quinn in one read and feeds them to the decoder one at a time. The
-//! chunks are the same `Bytes` quinn delivered, so nothing is copied. The
-//! reason is cost: each read takes the connection's lock, and a bulk upload
-//! arrives as one chunk of about 1.4 KB per QUIC packet. [`READ_AHEAD_CHUNKS`]
-//! states what the read-ahead holds and why it is limited to tunnels.
+//! chunks are the same `Bytes` quinn delivered, so nothing is copied.
+//! [`READ_AHEAD_CHUNKS`] states why it exists, what it holds and why it is
+//! limited to tunnels.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -308,16 +307,13 @@ impl BufferBudget {
     /// Takes `bytes` from the budget, or reports that the connection is past
     /// it.
     ///
-    /// A *stream* error, on the stream whose frame is arriving. That stream is
-    /// not singled out for a fault: the bound is a connection's, every stream
-    /// holding a share of it may be within [`MAX_BUFFERED_FRAME`], and the one
-    /// that arrives last has done nothing the others did not. The alternative
-    /// is to close a connection and its tunnels over a request that is merely
-    /// the seventeenth largest one allowed at once, which a client breaking no
-    /// rule can reach. RFC 9114 §4.2.2 says what to do with a field section
-    /// this server is unwilling to handle, and it concerns the one request:
-    /// `stream::Resolver` answers this with the same 431 the per-frame bound
-    /// gets, and the connection carries on.
+    /// A *stream* error, on the stream whose frame is arriving: the bound is
+    /// the connection's, every stream holding a share of it may be within
+    /// [`MAX_BUFFERED_FRAME`], and the one that arrives last has done nothing
+    /// the others did not. RFC 9114 §4.2.2 says what to do with a field
+    /// section this server is unwilling to handle, and it concerns the one
+    /// request: `stream::Resolver` answers this with the same 431 the
+    /// per-frame bound gets, and the connection and its tunnels carry on.
     ///
     /// RFC 9114 §8.1 defines H3_EXCESSIVE_LOAD for a peer "exhibiting a
     /// behavior that might be generating excessive load". Holding a
@@ -368,12 +364,7 @@ impl BufferBudget {
         }
     }
 
-    /// Bytes currently charged to this connection.
-    ///
-    /// For the unit tests that assert the accounting, and nothing else: what is
-    /// charged and released is not visible on the wire until the budget is
-    /// spent, and a share that is never returned would show up only as a
-    /// connection that eventually refuses a request it should have served.
+    /// Bytes currently charged to this connection, for the unit tests.
     #[cfg(test)]
     fn held(&self) -> usize {
         self.held.load(Ordering::Relaxed)
@@ -659,9 +650,8 @@ impl FrameDecoder {
     ///
     /// Called once the 2xx answering a CONNECT has gone out, which is what
     /// "completed" means in that section. From here a HEADERS frame is a
-    /// connection error like every other known type but DATA. It is refused
-    /// from its header rather than after its payload, so a peer cannot hold
-    /// the connection's buffering budget with field sections it may not send.
+    /// connection error like every other known type but DATA, refused from its
+    /// header.
     pub fn connect_completed(&mut self) {
         self.stream = StreamKind::Tunnel;
     }
@@ -687,11 +677,9 @@ impl FrameDecoder {
                         begin(self.stream, self.settings_seen, kind, length, &self.budget)?;
                 }
 
-                // An empty DATA frame is legal and carries nothing; the two
-                // arms are separate so it cannot be mistaken for "no bytes have
-                // arrived yet", which is the same `take == 0` below. It still
-                // produces an item, because a caller applying RFC 9114's rules
-                // about frame *order* has to be told a DATA frame arrived.
+                // A separate arm, so an empty DATA frame cannot be mistaken for
+                // "no bytes have arrived yet", the same `take == 0` below. It
+                // still produces an item (`Item::Data` says why).
                 State::Data { remaining: 0 } => {
                     self.state = State::Header;
                     return Ok(Some(Item::Data(Bytes::new())));
@@ -772,10 +760,9 @@ impl FrameDecoder {
     /// Counts one skipped frame against [`MAX_SKIPPED_FRAMES`], reporting a
     /// stream error once a request stream is past it (RFC 9114 §10.5).
     ///
-    /// Only a request stream is counted. A tunnel's grease (DATA's equal under
-    /// §4.4) and the control stream's cost nothing here. Called as each skip
-    /// *completes*, which is reached whatever the payload length, so a frame
-    /// that declares no payload still advances the count.
+    /// Only a request stream is counted (the `skipped` field says why). Called
+    /// as each skip *completes*, which is reached whatever the payload length,
+    /// so a frame that declares no payload still advances the count.
     ///
     /// The verdict is the plain `Violation::stream(H3_EXCESSIVE_LOAD, ..)`, not
     /// the `Violation::field_section_too_large` the field-section bounds use:
@@ -1451,10 +1438,8 @@ pub fn seal_data(mut block: BytesMut) -> Bytes {
 ///
 /// Surge validates `SETTINGS_ENABLE_CONNECT_PROTOCOL` and `SETTINGS_H3_DATAGRAM`
 /// and disconnects without them. The two QPACK settings are sent as zeroes on
-/// purpose: they make a static-table-only decoder correct (see
-/// [`super::qpack`]), because they bind the peer's encoder: RFC 9204 §3.2.3 for
-/// the dynamic table capacity, §2.1.2 for the number of streams it may let
-/// block.
+/// purpose: [`super::qpack`] says why they make a static-table-only decoder
+/// correct.
 ///
 /// Not public: [`super::connection`] is the one caller.
 pub(super) fn settings_payload() -> BytesMut {
