@@ -11,6 +11,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, VecDeque};
 use std::hash::BuildHasher;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quinn::ConnectionId;
@@ -552,22 +553,26 @@ fn crypto_end(fragments: &[(u64, &[u8])]) -> Option<usize> {
     Some(end)
 }
 
-/// The hold and the replay record, behind one lock in the gate.
+/// The policy in force, the hold and the replay record, behind one lock in
+/// the gate, so that whatever reads the policy holds the lock that guards the
+/// hold.
 pub(super) struct Memory {
+    pub(super) policy: Arc<Policy>,
     pub(super) hold: Hold,
     pub(super) replay: Replay,
 }
 
 impl Memory {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(policy: Arc<Policy>) -> Self {
         Self {
+            policy,
             hold: Hold::new(),
             replay: Replay::new(),
         }
     }
 
     /// Holds one opened first Initial and, if it completes its flight, judges
-    /// the flight.
+    /// the flight under [`Memory::policy`].
     ///
     /// `fragments` are the CRYPTO frames of every Initial packet of the flight
     /// in the datagram, the first one and those coalesced behind it, or `None`
@@ -585,7 +590,6 @@ impl Memory {
         &mut self,
         arrival: &Arrival<'_>,
         fragments: Option<&[(u64, &[u8])]>,
-        policy: &Policy,
         report: &mut dyn FnMut(SocketAddr, Dropped),
     ) -> Screened {
         let from = arrival.meta.addr;
@@ -621,7 +625,7 @@ impl Memory {
 
         match judge(
             self.hold.flights[index].stream.contiguous(),
-            policy,
+            &self.policy,
             from,
             &mut self.replay,
         ) {
@@ -835,7 +839,6 @@ mod tests {
         datagram: &[u8],
         fragments: Option<&[(u64, &[u8])]>,
     ) -> (bool, Vec<(SocketAddr, Dropped)>) {
-        let policy = Policy::new(super::super::Names::new(&[]), None, false);
         let mut drops = Vec::new();
         let arrival = Arrival {
             now: Instant::now(),
@@ -846,7 +849,7 @@ mod tests {
             datagram,
             dcid: ConnectionId::new(&[dcid; 8]),
         };
-        let screened = memory.take(&arrival, fragments, &policy, &mut |from, why| {
+        let screened = memory.take(&arrival, fragments, &mut |from, why| {
             drops.push((from, why));
         });
         (screened != Screened::Dropped, drops)
@@ -857,7 +860,11 @@ mod tests {
     /// before the table makes room.
     #[test]
     fn a_new_flight_the_hold_drops_evicts_nothing() {
-        let mut memory = Memory::new();
+        let mut memory = Memory::new(Arc::new(Policy::new(
+            super::super::Names::new(&[]),
+            None,
+            false,
+        )));
         let datagram = vec![0u8; 1200];
         // The start of a ClientHello whose declared length has not arrived.
         let start: &[(u64, &[u8])] = &[(0, &[1, 0, 0, 10])];

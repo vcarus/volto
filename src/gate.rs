@@ -193,7 +193,7 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -343,16 +343,17 @@ fn same_key(a: Option<&EchKey>, b: Option<&EchKey>) -> bool {
     }
 }
 
-/// What a change of policy from `old` to `new` does to the hold and the
-/// replay record: a new ECH key empties the record, and no key empties the
-/// hold. [`Expected::set`] says why.
-fn follow(memory: &mut Memory, old: &Policy, new: &Policy) {
-    if !same_key(old.ech.as_deref(), new.ech.as_deref()) {
+/// Puts `new` in force, with what the change does to the hold and the replay
+/// record: a new ECH key empties the record, and no key empties the hold.
+/// [`Expected::set`] says why.
+fn follow(memory: &mut Memory, new: Arc<Policy>) {
+    if !same_key(memory.policy.ech.as_deref(), new.ech.as_deref()) {
         memory.replay.clear();
     }
     if new.ech.is_none() {
         memory.hold.clear();
     }
+    memory.policy = new;
 }
 
 /// The policy the gate is enforcing right now, and the state it keeps.
@@ -361,27 +362,24 @@ fn follow(memory: &mut Memory, old: &Policy, new: &Policy) {
 /// the socket wrapper is built once at bind time and has to see a reload
 /// without being rebuilt, since rebuilding it would mean rebinding the port.
 ///
-/// Read once per receive batch rather than once per datagram, and written once
-/// per reload, so a plain `RwLock` around an `Arc` is all the sharing this needs.
+/// The policy sits under one lock with the hold and the replay record, which
+/// live here rather than in [`Gate`] because a reload has to reach them: a new
+/// ECH key clears the replay record, and a policy without a key clears the
+/// hold. A receive batch takes the lock once and reads the policy under it.
 ///
 /// The flag beside it answers "is the gate on at all" without taking the lock,
 /// because a gate that is off is the shipped default. A gate that is off then
-/// costs a receive batch one atomic load rather than a read guard, an `Arc`
-/// clone and its drop.
-///
-/// The hold and the replay record live here too, rather than in [`Gate`],
-/// because a reload has to reach them: a new ECH key clears the replay record,
-/// and a policy without a key clears the hold.
+/// costs a receive batch one atomic load.
 #[derive(Clone)]
 pub struct Expected(Arc<Held>);
 
-/// The policy, the flag that says whether it is on, and the hold.
+/// The policy with the hold, and the flag that says whether it is on.
 struct Held {
-    policy: RwLock<Arc<Policy>>,
-    /// Whether `policy` is on. Written after `policy`, read before it.
-    any: AtomicBool,
-    /// The hold and the replay record, which only a policy with a key uses.
+    /// The policy, the hold and the replay record, which only a policy with a
+    /// key uses.
     memory: Mutex<Memory>,
+    /// Whether the policy is on. Written after it, read before it.
+    any: AtomicBool,
     /// Whether `memory` has released datagrams waiting for the next receive
     /// call. Written under the `memory` lock.
     releasing: AtomicBool,
@@ -403,9 +401,8 @@ impl Expected {
         let policy = policy.into();
         let any = AtomicBool::new(policy.is_on());
         Self(Arc::new(Held {
-            policy: RwLock::new(Arc::new(policy)),
+            memory: Mutex::new(Memory::new(Arc::new(policy))),
             any,
-            memory: Mutex::new(Memory::new()),
             releasing: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         }))
@@ -430,27 +427,16 @@ impl Expected {
     /// `enc` values one key opened. A policy without a key empties the hold,
     /// because nothing would judge what it holds; the clients of those
     /// flights send them again and the gate passes them as it now does. Both
-    /// happen under the hold's lock, with the policy swapped inside it, and
-    /// `Gate::screen_holding` reads the policy again once it holds that lock.
-    /// So no flight is held, judged or recorded under a policy that is no
-    /// longer in force, however a receive call and a reload interleave: a
-    /// flight held just before the reload is in the hold the reload clears,
-    /// and one that arrives just after is judged by the new policy. Without
-    /// that second read, a receive call that had read the old policy before a
-    /// reload removed the key could hold flights after the reload had cleared
-    /// the hold, and with no key nothing would ever expire them.
+    /// happen under the lock the policy itself sits under, and a receive batch
+    /// reads the policy only under that lock. So no flight is held, judged or
+    /// recorded under a policy that is no longer in force, however a receive
+    /// call and a reload interleave (D115): a flight held just before the
+    /// reload is in the hold the reload clears, and one that arrives just
+    /// after is judged by the new policy.
     pub fn set(&self, policy: impl Into<Policy>) {
         let policy = Arc::new(policy.into());
         let any = policy.is_on();
-        {
-            let mut memory = self.memory();
-            follow(&mut memory, &self.current(), &policy);
-            *self
-                .0
-                .policy
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = policy;
-        }
+        follow(&mut self.memory(), policy);
         self.0.any.store(any, Ordering::Release);
     }
 
@@ -500,18 +486,11 @@ impl Expected {
     }
 
     /// The policy in force.
-    ///
-    /// Poisoning would mean a panic while swapping an `Arc`; the value itself is
-    /// immutable, so there is nothing to observe half-written.
     pub fn current(&self) -> Arc<Policy> {
-        self.0
-            .policy
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        Arc::clone(&self.memory().policy)
     }
 
-    /// The hold and the replay record.
+    /// The policy, the hold and the replay record.
     ///
     /// Nothing that runs under this lock may panic on any input, because a
     /// panic under `poll_recv` is not recovered anywhere. `poll_recv` runs
@@ -548,54 +527,44 @@ impl Gate {
         Self { inner, expected }
     }
 
-    /// Judges one datagram without the hold and blinds it if it is refused.
-    fn screen(&self, remote: SocketAddr, datagram: &mut [u8], expected: &Names) {
-        let Verdict::Refuse(refusal) = judge(datagram, expected) else {
-            return;
-        };
-        log_refusal(remote, &refusal);
-        blind(datagram);
-    }
-
-    /// Judges one datagram with the hold, which an ECH key turns on, and blinds
-    /// it unless it passes.
+    /// Judges one datagram under the policy in force, with the hold when the
+    /// policy has an ECH key, and blinds it unless it passes.
     ///
-    /// A first Initial is copied into the hold before it is blinded in the
-    /// batch, so quinn never sees it there; if its flight is admitted, the copy
-    /// is what quinn receives, from the next receive call. The hold's lock and
-    /// the clock are taken the first time a batch has a first Initial in it,
-    /// and not at all for a batch of short headers, which is the data path.
+    /// `held` is the lock on the policy and the hold, taken at the first
+    /// datagram of a batch and kept for the rest of it, so the batch reads the
+    /// policy only under the lock a reload swaps it under ([`Expected::set`]
+    /// says why). A policy that is off passes the datagram untouched.
     ///
-    /// The policy the hold judges by is read again once the lock is held,
-    /// rather than taken from the batch: [`Expected::set`] says why. When the
-    /// policy read then has no key, a reload removed it after this batch began,
-    /// and the datagram is judged as the stateless gate judges it.
+    /// Under a key, a first Initial is copied into the hold before it is
+    /// blinded in the batch, so quinn never sees it there; if its flight is
+    /// admitted, the copy is what quinn receives, from the next receive call.
+    /// The clock is read the first time a batch has a first Initial in it.
     fn screen_holding<'a>(
         &'a self,
         meta: &RecvMeta,
         datagram: &mut [u8],
-        held: &mut Option<(MutexGuard<'a, Memory>, Arc<Policy>)>,
+        held: &mut Option<MutexGuard<'a, Memory>>,
         now: &mut Option<Instant>,
     ) {
-        let (dcid, frames) = match classify(datagram, true) {
+        let memory = held.get_or_insert_with(|| self.expected.memory());
+        if memory.policy.ech.is_none() {
+            if memory.policy.is_on()
+                && let Verdict::Refuse(refusal) = judge(datagram, &memory.policy.names)
+            {
+                log_refusal(meta.addr, &refusal);
+                blind(datagram);
+            }
+            return;
+        }
+        let (dcid, frames, more) = match classify(datagram, true) {
             Classified::Pass => return,
             Classified::Refuse(refusal) => {
                 log_refusal(meta.addr, &refusal);
                 blind(datagram);
                 return;
             }
-            Classified::Opened { dcid, frames, more } => (dcid, (frames, more)),
+            Classified::Opened { dcid, frames, more } => (dcid, frames, more),
         };
-        let (memory, policy) = held.get_or_insert_with(|| {
-            let memory = self.expected.memory();
-            (memory, self.expected.current())
-        });
-        if policy.ech.is_none() {
-            if policy.is_on() {
-                self.screen(meta.addr, datagram, &policy.names);
-            }
-            return;
-        }
         let now = *now.get_or_insert_with(Instant::now);
         let arrival = Arrival {
             now,
@@ -603,15 +572,7 @@ impl Gate {
             datagram,
             dcid,
         };
-        if hold_opened(
-            memory,
-            &arrival,
-            &frames.0,
-            &frames.1,
-            policy,
-            &mut log_drop,
-        ) == Screened::Released
-        {
+        if hold_opened(memory, &arrival, &frames, &more, &mut log_drop) == Screened::Released {
             self.expected.0.releasing.store(true, Ordering::Release);
         }
         blind(datagram);
@@ -725,11 +686,10 @@ fn hold_opened(
     arrival: &Arrival<'_>,
     frames: &[u8],
     more: &[BytesMut],
-    policy: &Policy,
     report: &mut dyn FnMut(SocketAddr, Dropped),
 ) -> Screened {
     let fragments = flight_fragments(frames, more);
-    memory.take(arrival, fragments.as_deref(), policy, report)
+    memory.take(arrival, fragments.as_deref(), report)
 }
 
 /// The CRYPTO frames the hold reads from one datagram: those of its first
@@ -1110,13 +1070,8 @@ impl AsyncUdpSocket for Gate {
         };
 
         // The flag first, so a gate that is off pays one atomic load per batch
-        // and takes neither the lock nor a clone of the policy.
+        // and takes no lock.
         if !self.expected.any() {
-            return Poll::Ready(Ok(count));
-        }
-
-        let policy = self.expected.current();
-        if !policy.is_on() {
             return Poll::Ready(Ok(count));
         }
 
@@ -1124,11 +1079,7 @@ impl AsyncUdpSocket for Gate {
         let mut now = None;
         for (meta, buf) in metas.iter().zip(bufs.iter_mut()).take(count) {
             each_datagram(meta, buf, |datagram| {
-                if policy.ech.is_some() {
-                    self.screen_holding(meta, datagram, &mut held, &mut now);
-                } else {
-                    self.screen(meta.addr, datagram, &policy.names);
-                }
+                self.screen_holding(meta, datagram, &mut held, &mut now);
             });
         }
 
@@ -1488,7 +1439,6 @@ pub enum Screened {
 /// the delivery into quinn's buffers are what is left out.
 #[doc(hidden)]
 pub struct Screening {
-    policy: Policy,
     memory: Memory,
     epoch: Instant,
 }
@@ -1497,8 +1447,7 @@ impl Screening {
     /// A gate under `policy` with an empty hold.
     pub fn new(policy: impl Into<Policy>) -> Self {
         Self {
-            policy: policy.into(),
-            memory: Memory::new(),
+            memory: Memory::new(Arc::new(policy.into())),
             epoch: Instant::now(),
         }
     }
@@ -1515,8 +1464,8 @@ impl Screening {
         datagram: &[u8],
     ) -> (Screened, Vec<(SocketAddr, Dropped)>) {
         let mut drops = Vec::new();
-        if self.policy.ech.is_none() {
-            let screened = match judge(datagram, &self.policy.names) {
+        if self.memory.policy.ech.is_none() {
+            let screened = match judge(datagram, &self.memory.policy.names) {
                 Verdict::Pass => Screened::Passed,
                 Verdict::Refuse(refusal) => Screened::Refused(refusal),
             };
@@ -1543,7 +1492,6 @@ impl Screening {
                     &arrival,
                     &frames,
                     &more,
-                    &self.policy,
                     &mut |from, why| drops.push((from, why)),
                 )
             }
@@ -1584,9 +1532,7 @@ impl Screening {
     /// Replaces the policy as a reload does, with the same effect on the
     /// replay record and the hold as [`Expected::set`].
     pub fn set(&mut self, policy: impl Into<Policy>) {
-        let policy = policy.into();
-        follow(&mut self.memory, &self.policy, &policy);
-        self.policy = policy;
+        follow(&mut self.memory, Arc::new(policy.into()));
     }
 }
 
