@@ -1180,12 +1180,17 @@ impl DatagramPath {
         let encoded_len = packets.encoded_len();
 
         if encoded_len > self.limit {
-            // The QUIC datagram path. If the packet does not fit, it is dropped:
-            // RFC 9298 §6.1 says SHOULD NOT fall back to a capsule, because
-            // doing so silently converts a lossy flow into a head-of-line
-            // blocked one. The drop is therefore not negotiable, and an
-            // oversized packet is lost the way a UDP packet on a too-small link
-            // would be. What is negotiable is how loudly it is said; see
+            // The QUIC datagram path. If the packet does not fit, it is dropped.
+            // RFC 9298 §6.1: "the UDP proxy SHOULD NOT send the UDP payload in
+            // a DATAGRAM capsule, as that defeats the end-to-end unreliability
+            // characteristic that methods such as Datagram Packetization Layer
+            // PMTU Discovery (DPLPMTUD) depend on". The same paragraph goes on:
+            // "the UDP proxy SHOULD drop the UDP payload and send an ICMP Packet
+            // Too Big message to the target". The drop is done. The ICMP
+            // message is not sent, because sending one needs a raw socket, so
+            // that half of the SHOULD is unmet by our choice. An oversized
+            // packet is lost the way a UDP packet on a too-small link would be.
+            // What is negotiable is how loudly it is said; see
             // [`Self::report_oversize`].
             self.refresh_limit(ctx);
             let graded = grade(encoded_len, self.limit, &self.oversize_drops);
