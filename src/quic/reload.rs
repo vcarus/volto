@@ -254,11 +254,17 @@ impl ReloadHandle {
         // other order would have the endpoint present the new certificate to a
         // name the socket still drops, which is the same refusal without the
         // reply. The gate exists so that a name it does not know gets no reply
-        // at all. The same holds for a new ECH key: in between, the socket
-        // admits a flight that opens under the new key while libssl still holds
-        // the old one, which does not accept it, and the TLS layer's second line
-        // refuses a ClientHello whose ECH it did not accept before it sends
-        // anything that carries the ECHConfigList.
+        // at all. A new ECH key is answered in between as well, and the answer
+        // never carries an ECHConfigList. When the old configuration had a
+        // key, the socket admits a flight that opens under the new key while
+        // libssl still holds the old one, which does not accept it, and the TLS
+        // layer's second line refuses a ClientHello whose ECH it did not accept
+        // before it sends anything. When the old configuration had no key, that
+        // second line is off and libssl has no ECH keys, so it goes on with the
+        // outer ClientHello: the outer name is judged by the old name list, and
+        // a name it admits gets an ordinary handshake with the certificate.
+        // libssl sends retry configs only when it holds ECH keys, so that
+        // handshake carries no ECHConfigList either.
         //
         // No connection depends on the order of the live `Config` and the slot:
         // `Server::accept_under_the_swap` takes this lock across both of the

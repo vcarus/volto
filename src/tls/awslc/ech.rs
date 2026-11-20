@@ -377,11 +377,16 @@ impl EchKey {
     /// same: "If the server is configured with any ECHConfigs, it MUST include
     /// the "encrypted_client_hello" extension in its EncryptedExtensions with
     /// the "retry_configs" field set to one or more ECHConfig structures with
-    /// up-to-date keys." So a ClientHello that carries an ECH extension this
-    /// key does not open (GREASE, another key, a damaged payload) is answered
-    /// on the outer ClientHello with this ECHConfigList in its
-    /// EncryptedExtensions, which the client reads once it has the handshake
-    /// keys. A ClientHello with no ECH extension gets no ECH extension back.
+    /// up-to-date keys." So libssl on its own would answer a ClientHello that
+    /// carries an ECH extension this key does not open (GREASE, another key, a
+    /// damaged payload) on the outer ClientHello, with this ECHConfigList in
+    /// its EncryptedExtensions. The server does not let that happen: the socket
+    /// gate drops such a first flight before libssl sees it, and if one reached
+    /// libssl, the ClientHello callback (`judge_client_hello`) refuses it with
+    /// `handshake_failure` before any EncryptedExtensions is written. Only the
+    /// tests' `libssl_alone` configuration, which turns that callback's ECH
+    /// check off, sees the answer. A ClientHello with no ECH extension gets no
+    /// ECH extension back.
     pub(super) fn keys(&self) -> Result<EchKeys> {
         // SAFETY: SSL_ECH_KEYS_new takes no arguments and returns a new set or
         // null, which `from_ptr` turns into an error.

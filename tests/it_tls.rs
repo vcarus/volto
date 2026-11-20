@@ -5,8 +5,9 @@
 //! client-side ECH. On the server side, "ECH accepted" comes from the
 //! provider's debug line, read back through `SharedBuffer`. On the client side
 //! it is the handshake itself: rustls in `EchMode::Enable` never completes a
-//! handshake that the server answered on the outer ClientHello; it fails with
-//! `ServerRejectedEncryptedClientHello`, which the reload scenario shows.
+//! handshake that the server answered on the outer ClientHello, and a list the
+//! server no longer holds gets no answer at all, which the reload scenario
+//! shows.
 //!
 //! One test function, because the log subscriber is process-wide (see
 //! `SharedBuffer`).
