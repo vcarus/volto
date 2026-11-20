@@ -699,6 +699,53 @@ fn an_unknown_argument_fails_differently_from_an_unknown_key() {
     );
 }
 
+/// Standard padded base64 (RFC 4648 §4), decoded by hand: this binary links
+/// the standard library and nothing of volto's.
+fn base64_decode(text: &str) -> Vec<u8> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bytes = Vec::new();
+    let (mut bits, mut held) = (0u32, 0u32);
+    for character in text.bytes().filter(|character| *character != b'=') {
+        let value = ALPHABET
+            .iter()
+            .position(|letter| *letter == character)
+            .expect("a base64 character");
+        bits = (bits << 6) | u32::try_from(value).expect("six bits");
+        held += 6;
+        if held >= 8 {
+            held -= 8;
+            bytes.push(u8::try_from(bits >> held).expect("one byte"));
+            bits &= (1 << held) - 1;
+        }
+    }
+    bytes
+}
+
+/// Asserts that `list` is an ECHConfigList holding one ECHConfig of version
+/// 0xfe0d with `config_id` and `public_name`, read field by field from the
+/// structures of RFC 9849 §4: `ECHConfig ECHConfigList<4..2^16-1>`, then
+/// `uint16 version; uint16 length;` and the contents, whose `HpkeKeyConfig`
+/// is `uint8 config_id; HpkeKemId kem_id; HpkePublicKey public_key;
+/// HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>;`, followed by
+/// `uint8 maximum_name_length; opaque public_name<1..255>;`.
+#[track_caller]
+fn assert_echconfig_list(list: &[u8], config_id: u8, public_name: &str) {
+    let u16_at = |at: usize| usize::from(u16::from_be_bytes([list[at], list[at + 1]]));
+    assert_eq!(u16_at(0), list.len() - 2, "the list's length: {list:02x?}");
+    assert_eq!(list[2..4], [0xfe, 0x0d], "the version: {list:02x?}");
+    assert_eq!(u16_at(4), list.len() - 6, "one ECHConfig: {list:02x?}");
+    assert_eq!(list[6], config_id, "the config_id: {list:02x?}");
+    // config_id (1), kem_id (2), then the public key's own length.
+    let suites = 9 + 2 + u16_at(9);
+    let name = suites + 2 + u16_at(suites) + 1;
+    let length = usize::from(list[name]);
+    assert_eq!(
+        &list[name + 1..name + 1 + length],
+        public_name.as_bytes(),
+        "the public name: {list:02x?}"
+    );
+}
+
 /// `ech-keygen` writes a key file and prints its ECHConfigList, `ech-config`
 /// prints the same list from the file, and an existing file is not replaced.
 #[test]
@@ -726,6 +773,7 @@ fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
                 .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
         "stdout is one base64 ECHConfigList: {list:?}"
     );
+    assert_echconfig_list(&base64_decode(list), 5, "public.example");
     let text = fs::read_to_string(&key).expect("the key file was written");
     assert!(text.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{text}");
     assert!(text.contains("-----BEGIN ECHCONFIG-----\n"));
