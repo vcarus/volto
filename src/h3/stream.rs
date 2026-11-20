@@ -926,12 +926,6 @@ impl Stream {
 /// The two leave the stream in different states: a failed write is a stream
 /// that has already ended, while a lapsed deadline is a peer that is still
 /// there and will not read what it asked for.
-///
-/// Its [`Display`](std::fmt::Display) and [`std::error::Error`] impls have no
-/// caller in this tree. They make a public error type usable (`?` into a
-/// `Box<dyn Error>` or an `anyhow::Error`, and a `source()` chain that reaches
-/// the [`StreamError`] underneath), and a caller outside the crate cannot add
-/// them.
 #[derive(Debug)]
 pub enum RespondError {
     /// The write failed: the peer reset or stopped the stream, or the
@@ -942,26 +936,6 @@ pub enum RespondError {
     /// The stream has already been reset with H3_REQUEST_CANCELLED, so there is
     /// nothing left to send or finish on it.
     Expired,
-}
-
-impl std::fmt::Display for RespondError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Failed(error) => write!(f, "{error}"),
-            Self::Expired => {
-                f.write_str("the peer did not take the response within one idle timeout")
-            }
-        }
-    }
-}
-
-impl std::error::Error for RespondError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Failed(error) => Some(error),
-            Self::Expired => None,
-        }
-    }
 }
 
 /// The sending half of a split request stream.
