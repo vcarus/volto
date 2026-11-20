@@ -421,7 +421,7 @@ async fn next_request(
             // authenticated while this waited, and then the clock, which has
             // just reached the deadline. Deciding in this arm as well would be
             // a second copy of that judgement to keep in step.
-            Err(_elapsed) => continue,
+            Err(_elapsed) => {}
         }
     }
 }
