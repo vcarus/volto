@@ -133,13 +133,11 @@ fn validate_limits(limits: &Limits) -> Result<()> {
     //
     // Written as `interval >= ceil(idle / 2)` rather than the more obvious
     // `interval * 2 >= idle`: the two reject exactly the same pairs of
-    // integers, and this one cannot overflow. The doubling could, and a `u64`
-    // above `u64::MAX / 2` is reachable straight from the file, since TOML
-    // integers deserialize across the whole target type's range. A debug
-    // build would panic inside this function. A release build would wrap the
-    // product to something small, accept the interval and hand it to quinn,
-    // where `Instant::now() + interval` panics the connection driver once a
-    // connection is established (D86).
+    // integers, and this one cannot overflow. The doubling overflows above
+    // `u64::MAX / 2`, a value the file can hold, since TOML integers
+    // deserialize across the whole target type's range, and the overflow would
+    // panic inside this function in every build: the release profile keeps
+    // overflow checks on for this crate (D86).
     if limits.keep_alive_interval > 0
         && limits.keep_alive_interval >= limits.max_idle_timeout.div_ceil(2)
     {
