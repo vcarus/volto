@@ -25,13 +25,38 @@ pub use awslc::{
     probe_server_config, server_config,
 };
 
+/// What an operator is told when the two configured files do not pair up.
+///
+/// The wording the rustls server used, kept so that a reload log reads the
+/// same as before the provider changed.
+pub(crate) const UNUSABLE_PAIR: &str =
+    "server.cert and server.key do not form a usable certificate/key pair";
+
+/// Refuses a leaf certificate webpki cannot parse, as the rustls server did.
+///
+/// That server parsed the leaf with webpki when it took the pair
+/// (`with_single_cert`, through `CertifiedKey::from_der` and
+/// `ParsedCertificate::try_from` in rustls 0.23) and refused one it could not
+/// parse. AWS-LC's `d2i_X509` reads certificates webpki refuses, an X.509
+/// version 1 certificate for one, so without this such a certificate would
+/// bind, [`names_not_covered`] would report nothing for it, and a client that
+/// verifies it would refuse every handshake. Called where the provider is
+/// built and where the configuration is checked, so startup, a reload and
+/// `--check-config` refuse the same leaf with the same words.
+pub(crate) fn check_leaf(leaf: &CertificateDer<'_>) -> Result<()> {
+    rustls::server::ParsedCertificate::try_from(leaf)
+        .map(drop)
+        .context(UNUSABLE_PAIR)
+}
+
 /// The names in `names` that the leaf certificate `cert` is not valid for.
 ///
 /// Judged the way a client judges it, with rustls's own name check over the
 /// certificate's Subject Alternative Names, so what is reported here is what a
 /// client verifying the certificate by that name would refuse. A certificate
-/// webpki cannot parse reports nothing: the server refuses that one at bind,
-/// with the reason, and a second complaint would only bury it.
+/// webpki cannot parse reports nothing: [`check_leaf`] refuses that one at
+/// startup and on reload, with the reason, and a second complaint would only
+/// bury it.
 pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> Vec<String> {
     let Ok(parsed) = rustls::server::ParsedCertificate::try_from(cert) else {
         return Vec::new();

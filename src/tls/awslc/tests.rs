@@ -1396,6 +1396,65 @@ fn every_promised_key_type_and_format_signs_a_handshake() {
     }
 }
 
+/// An X.509 version 1 certificate for `localhost` (no extensions, so no
+/// subjectAltName either) and its P-256 key, made once with LibreSSL 3.3.6:
+/// `openssl x509 -req -sha256 -in req.csr -signkey key.pem -days 36500`.
+/// webpki refuses a version 1 certificate (`UnsupportedCertVersion`) and
+/// AWS-LC's `d2i_X509` reads it. The key protects nothing.
+const V1_CERT: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBGjCBwAIJALKFNYcyBwe7MAoGCCqGSM49BAMCMBQxEjAQBgNVBAMMCWxvY2Fs
+aG9zdDAgFw0yNjExMjAwODM5NDJaGA8yMTI2MTAyNzA4Mzk0MlowFDESMBAGA1UE
+AwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEd7BPf1SU7GG7
+dAQRZRjFZsj/C///uZeAv/6dllF2WSOg0jx3a541t309Kry8QDHHGyjrPD5rYAMI
+z29KVavRaDAKBggqhkjOPQQDAgNJADBGAiEApJ4xsVnqSsULDQU0wPoviHYfBitq
+6gQhlG7+L/OETTICIQDgqTmvSvGJzQnKePJ8SYZzY3x0uWrIqAE2NcuIKjbeeQ==
+-----END CERTIFICATE-----
+";
+const V1_KEY: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7FpxDT+FSsvFUCih
+yShn4Z4G7F1ocW9wTR/1r9ZRugOhRANCAAR3sE9/VJTsYbt0BBFlGMVmyP8L//+5
+l4C//p2WUXZZI6DSPHdrnjW3fT0qvLxAMccbKOs8PmtgAwjPb0pVq9Fo
+-----END PRIVATE KEY-----
+";
+
+/// A leaf webpki cannot parse is refused at build, in the wording the rustls
+/// server used: that server parsed the leaf with webpki in `with_single_cert`,
+/// and without the refusal the certificate binds while the `expected_sni`
+/// coverage warning, which parses it the same way, says nothing.
+#[test]
+fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
+    use rustls::pki_types::PrivatePkcs8KeyDer;
+    use rustls::pki_types::pem::PemObject as _;
+    let cert = CertificateDer::from_pem_slice(V1_CERT.as_bytes()).expect("the certificate");
+    let key = PrivatePkcs8KeyDer::from_pem_slice(V1_KEY.as_bytes()).expect("the key");
+    assert!(
+        rustls::server::ParsedCertificate::try_from(&cert).is_err(),
+        "webpki refuses a version 1 certificate"
+    );
+    let x509 = ffi::x509_from_der(&cert).expect("AWS-LC reads it");
+    drop(x509);
+    let error = Builder {
+        certs: vec![cert.to_vec()],
+        key: Zeroizing::new(key.secret_pkcs8_der().to_vec()),
+        alpn: vec![b"h3".to_vec()],
+        names: Names::new(&[]),
+        ech: None,
+        refuse_unaccepted_ech: false,
+        require_ech: false,
+        groups: &GROUPS,
+        keylog: None,
+    }
+    .build()
+    .expect_err("a leaf webpki cannot parse");
+    assert!(
+        format!("{error:#}")
+            .contains("server.cert and server.key do not form a usable certificate/key pair"),
+        "{error:#}"
+    );
+}
+
 /// A key that is not the certificate's is refused at build, in the wording the
 /// rustls server used.
 #[test]

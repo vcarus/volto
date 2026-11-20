@@ -71,6 +71,7 @@ use quinn_proto::{ConnectionId, Side, TransportError, TransportErrorCode};
 use tracing::debug;
 use zeroize::Zeroizing;
 
+use super::UNUSABLE_PAIR;
 use crate::config;
 use crate::gate::Names;
 use crate::hello;
@@ -78,12 +79,6 @@ use crate::hello;
 pub use ech::{EchKey, check_public_name};
 use ffi::{Ssl, SslCtx};
 use keys::{Secret, Suite, Version};
-
-/// What an operator is told when the two configured files do not pair up.
-///
-/// The wording the rustls server used, kept so that a reload log reads the
-/// same as before the provider changed.
-const UNUSABLE_PAIR: &str = "server.cert and server.key do not form a usable certificate/key pair";
 
 /// The groups this server accepts.
 ///
@@ -235,6 +230,10 @@ struct Builder<'a> {
 impl Builder<'_> {
     fn build(self) -> Result<ServerConfig> {
         ensure!(!self.certs.is_empty(), "no certificate to present");
+        // Before libssl reads it, because libssl reads leaves webpki does not.
+        super::check_leaf(&rustls::pki_types::CertificateDer::from(
+            self.certs[0].as_slice(),
+        ))?;
         ffi::clear_errors();
         // SAFETY: TLS_method returns a static method table; SSL_CTX_new returns
         // a new context or null, which `from_ptr` turns into an error.

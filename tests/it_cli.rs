@@ -836,6 +836,45 @@ fn the_check_refuses_a_bad_ech_key_file_by_the_name_of_its_key() {
     assert!(stderr.contains("do not form a usable ECH key"), "{stderr}");
 }
 
+/// An X.509 version 1 certificate for `localhost` and its key, the same pair
+/// as `V1_CERT` and `V1_KEY` in `src/tls/awslc/tests.rs`, where the comment
+/// says how it was made. webpki refuses a version 1 certificate.
+const V1_CERT: &str = "\
+-----BEGIN CERTIFICATE-----
+MIIBGjCBwAIJALKFNYcyBwe7MAoGCCqGSM49BAMCMBQxEjAQBgNVBAMMCWxvY2Fs
+aG9zdDAgFw0yNjExMjAwODM5NDJaGA8yMTI2MTAyNzA4Mzk0MlowFDESMBAGA1UE
+AwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEd7BPf1SU7GG7
+dAQRZRjFZsj/C///uZeAv/6dllF2WSOg0jx3a541t309Kry8QDHHGyjrPD5rYAMI
+z29KVavRaDAKBggqhkjOPQQDAgNJADBGAiEApJ4xsVnqSsULDQU0wPoviHYfBitq
+6gQhlG7+L/OETTICIQDgqTmvSvGJzQnKePJ8SYZzY3x0uWrIqAE2NcuIKjbeeQ==
+-----END CERTIFICATE-----
+";
+const V1_KEY: &str = "\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg7FpxDT+FSsvFUCih
+yShn4Z4G7F1ocW9wTR/1r9ZRugOhRANCAAR3sE9/VJTsYbt0BBFlGMVmyP8L//+5
+l4C//p2WUXZZI6DSPHdrnjW3fT0qvLxAMccbKOs8PmtgAwjPb0pVq9Fo
+-----END PRIVATE KEY-----
+";
+
+/// `--check-config` refuses a leaf certificate webpki cannot parse, in the
+/// words the server refuses it with at startup, because the server's TLS
+/// would bind it and the `expected_sni` coverage warning cannot read it.
+#[test]
+fn the_check_refuses_a_leaf_webpki_cannot_parse() {
+    let dir = config_dir("v1-leaf");
+    fs::write(dir.join("cert.pem"), V1_CERT).expect("write the certificate");
+    fs::write(dir.join("key.pem"), V1_KEY).expect("write the key");
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    let refused = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stdout_of(&refused));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("server.cert and server.key do not form a usable certificate/key pair"),
+        "{stderr}"
+    );
+}
+
 /// `--check-config` refuses `security.require_ech` without `server.ech_key`,
 /// naming both keys, because no client could reach such a server; with a key
 /// it accepts it.
