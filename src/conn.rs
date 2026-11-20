@@ -87,25 +87,20 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 ///
 /// A connection has `SILENCE_FACTOR` idle timeouts *from the handshake* to get
 /// one request past the credentials check, after which it is closed with
-/// H3_NO_ERROR. Without a bound of some kind a peer that completes the QUIC
-/// handshake and then says nothing holds a `max_connections` slot for as long
-/// as it keeps its socket open, since the keep-alive PINGs `quic/transport.rs`
-/// configures are answered by its QUIC stack with no application involved and
-/// so keep the transport's idle timeout from ever firing (D76). Once a request
+/// H3_NO_ERROR. Without it a peer that completes the QUIC handshake and then
+/// says nothing holds a `max_connections` slot for as long as it keeps its
+/// socket open, since its QUIC stack answers our keep-alive PINGs and so keeps
+/// the transport's idle timeout from ever firing (D76). Once a request
 /// authenticates the bound is gone for the life of the connection.
 ///
-/// The deadline is absolute rather than rearmed on each wait, which is the
-/// difference between bounding a connection and bounding a pause in it. A
-/// request stream is accepted the moment the peer opens it, so with a rearmed
-/// timer a peer that opened one every other idle timeout (a byte apiece, never
-/// a request, never a credential) would hold the slot for ever. Nothing
-/// legitimate is near the deadline: a client that has just completed two
-/// handshakes sends its first request within a round trip.
-///
-/// The deadline bounds how long such a connection may last. How much of this
-/// server it may occupy meanwhile is bounded by a second, transport-level clamp
-/// on its request streams (`quic::INITIAL_BIDI_STREAMS`), lifted by the same
-/// request that lifts this one.
+/// The deadline is absolute rather than rearmed on each wait. A request stream
+/// is accepted the moment the peer opens it, so with a rearmed timer a peer
+/// that opened one every other idle timeout (a byte apiece, never a credential)
+/// would hold the slot for ever. Nothing legitimate is near the deadline: a
+/// client that has just completed two handshakes sends its first request within
+/// a round trip. How much of this server such a connection may occupy meanwhile
+/// is bounded by the stream clamp `quic::INITIAL_BIDI_STREAMS`, lifted by the
+/// same request.
 ///
 /// `resolver` is the server's blocking-pool allowance; the connection takes its
 /// own view of it here, which is what bounds the threads its name lookups can
@@ -130,9 +125,7 @@ pub async fn handle(
     // context needs the connection itself, not only its datagram half: a UDP
     // session sends datagrams on it and asks it per packet how large one may be
     // and how far behind the send queue is, and the first authenticated
-    // request raises its stream allowance (D98). Inbound datagrams are not
-    // among those uses: they are routed by the HTTP/3 connection to the request
-    // stream that claimed them (D79).
+    // request raises its stream allowance (D98).
     let for_context = quic.clone();
 
     // Every request task of this connection. Dropping the set aborts what is
@@ -383,9 +376,8 @@ impl From<Result<h3api::Resolver, h3api::ConnectionError>> for NextRequest {
 /// queued. With `max_streams_bidi` raised, a peer that opens request streams
 /// and finishes each one empty (a stream error apiece, so the connection
 /// survives every one and the allowance comes straight back) can keep the loop
-/// supplied indefinitely, and the deadline is then never measured. D76 made the
-/// deadline absolute so that it could not be *rearmed*; this stops it being
-/// skipped.
+/// supplied indefinitely, and the deadline is then never measured. Reading the
+/// clock stops it being skipped, as being absolute stops it being rearmed (D92).
 ///
 /// A peer under the pre-authentication clamp (`quic::INITIAL_BIDI_STREAMS`)
 /// cannot keep a supply of that depth: the configured allowance does not reach
@@ -517,12 +509,9 @@ fn refused_as_a_message(req: &Request) -> Option<MessageRefusal> {
         return Some(MessageRefusal::ConnectionSpecificField(field));
     }
 
-    // Before any credential is tried, and so before any of them is charged: D3
-    // accepts credentials under either of two field names, and one value per
-    // name is every value that answers for. A request carrying more is asking
-    // this server to run the constant-time comparison once per value and to
-    // answer one 407 for all of them, which is a batch of guesses at the price
-    // of a single failure (D76 addendum of 2026-09-04).
+    // Before any credential is tried, and so before any of them is charged: a
+    // request carrying more values than `auth::MAX_CREDENTIAL_VALUES` is a batch
+    // of guesses answered by one 407.
     let offered = auth::credential_values(&req.fields);
     if offered > auth::MAX_CREDENTIAL_VALUES {
         return Some(MessageRefusal::TooManyCredentials(offered));
@@ -598,12 +587,9 @@ async fn authenticate(req: &Request, context: &Context, stream: &mut h3api::Stre
             // not take the answer cannot keep the connection for another idle
             // timeout while the write waits on it.
             //
-            // One charge per credential value that was tried and refused, each
-            // to the user-id that value claimed: a guess is a guess whether it
-            // arrived alone or beside another one, and charging per request
-            // would let a batch of them cost a single failure (D76 addendum of
-            // 2026-09-04). Every value is charged before the answer is decided,
-            // so `|` rather than `||`.
+            // One charge per refused value, each to the user-id that value
+            // claimed (`auth::MAX_CREDENTIAL_VALUES`). Every value is charged
+            // before the answer is decided, so `|` rather than `||`.
             let mut spent = false;
             for claim in denials.claims() {
                 spent |= context.record_auth_failure(claim);
@@ -702,12 +688,8 @@ async fn route(req: &Request, mut stream: h3api::Stream, context: &Context) {
         Route::UnsupportedProtocol(protocol) => {
             debug!(
                 stream_id,
-                // As a `str` rather than through `%`: `bounded` cuts the length
-                // and nothing else. A `:protocol` is an RFC 9110 §5.6.2 token
-                // by the time it gets here, so it carries no control character
-                // to forge a journal line with. The escaping a `str` field gets
-                // is kept as well, so that neither the token check nor the
-                // escaping is relied on alone. See `logfmt`.
+                // A token, cut by `bounded` and still escaped as a `str`, so
+                // neither the token check nor the escaping is relied on alone.
                 protocol = bounded(protocol).as_ref(),
                 "unsupported :protocol"
             );
@@ -756,12 +738,7 @@ fn log_request(req: &Request, stream_id: u64) {
         })
         .collect();
 
-    // Every `:protocol` token alike, through `bounded`, which cuts the length
-    // and nothing else: a token may be a whole field section's worth of bytes.
-    // A newline cannot reach here, because a `:protocol` is an RFC 9110 §5.6.2
-    // token and a request carrying anything else is malformed. The `?` it is
-    // recorded with escapes control characters anyway, as the 501 path in
-    // `handle_request` states for the `str` it logs. See `logfmt`.
+    // Cut by `bounded` and escaped by `?`, as the 501 line in `route` does.
     let protocol = req.protocol.as_deref().map(bounded);
 
     // `:method` is a token and `:path` is pchar, `/` and `?` only, so `%`
