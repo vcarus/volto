@@ -30,7 +30,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::pki_types::CertificateDer;
+use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
+use rustls::crypto::SupportedKxGroup;
+use rustls::crypto::aws_lc_rs::hpke;
+use rustls::pki_types::{CertificateDer, EchConfigListBytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
@@ -632,17 +635,84 @@ fn client_endpoint_with(
     alpn: &[&str],
     transport: Option<quinn::TransportConfig>,
 ) -> quinn::Endpoint {
+    endpoint_from(
+        rustls_client(&Offer::Plain, None, roots_of(ca), alpn),
+        transport,
+    )
+}
+
+/// How a test client offers ECH.
+#[derive(Clone, Debug)]
+pub enum Offer {
+    /// No ECH extension.
+    Plain,
+    /// ECH under this ECHConfigList.
+    Ech(Vec<u8>),
+    /// A GREASE ECH extension, which no key opens.
+    Grease,
+}
+
+/// The rustls `EchMode` for `offer`, or none.
+pub fn ech_mode(offer: &Offer) -> Option<EchMode> {
+    match offer {
+        Offer::Plain => None,
+        Offer::Ech(list) => Some(EchMode::from(
+            EchConfig::new(
+                EchConfigListBytes::from(list.clone()),
+                hpke::ALL_SUPPORTED_SUITES,
+            )
+            .expect("rustls reads the list"),
+        )),
+        Offer::Grease => {
+            let suite = hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
+            let (placeholder, _) =
+                rustls::crypto::hpke::Hpke::generate_key_pair(suite).expect("a GREASE key");
+            Some(EchMode::from(EchGreaseConfig::new(suite, placeholder)))
+        }
+    }
+}
+
+/// A store of trust roots holding `ca` alone.
+pub fn roots_of(ca: &CertificateDer<'static>) -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.clone()).expect("trust the test CA");
+    roots
+}
 
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    crypto.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+/// A rustls client configuration on aws-lc-rs: TLS 1.3, offering `offer`,
+/// with the key exchange `groups` in that order (the provider's own list when
+/// `None`), trusting `roots` and offering `alpn`.
+///
+/// rustls, not the server's TLS (AWS-LC's libssl), so the client end of every
+/// handshake is an independent implementation.
+pub fn rustls_client(
+    offer: &Offer,
+    groups: Option<&[&'static dyn SupportedKxGroup]>,
+    roots: rustls::RootCertStore,
+    alpn: &[&str],
+) -> rustls::ClientConfig {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    if let Some(groups) = groups {
+        provider.kx_groups = groups.to_vec();
+    }
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider));
+    let builder = match ech_mode(offer) {
+        Some(mode) => builder.with_ech(mode).expect("ECH with TLS 1.3"),
+        None => builder
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3"),
+    };
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.as_bytes().to_vec()).collect();
+    config
+}
 
+/// A quinn client endpoint on loopback using `crypto`, with `transport` when
+/// given and quinn's defaults otherwise.
+pub fn endpoint_from(
+    crypto: rustls::ClientConfig,
+    transport: Option<quinn::TransportConfig>,
+) -> quinn::Endpoint {
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("quic tls"),
     ));

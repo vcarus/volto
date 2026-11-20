@@ -47,14 +47,13 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, SharedBuffer, TempDir, TestServer, bulk_alpn, client_endpoint,
-    is_version_negotiation, udp_answer, udp_answers, udp_answers_on,
+    ALLOW_PRIVATE, GATE_LOCALHOST, Offer, SharedBuffer, TempDir, TestServer, bulk_alpn,
+    client_endpoint, endpoint_from, is_version_negotiation, roots_of, rustls_client, udp_answer,
+    udp_answers, udp_answers_on,
 };
 use quinn::ConnectionId;
-use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
 use rustls::crypto::SupportedKxGroup;
-use rustls::crypto::aws_lc_rs::{hpke, kx_group};
-use rustls::pki_types::EchConfigListBytes;
+use rustls::crypto::aws_lc_rs::kx_group;
 use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
@@ -1597,60 +1596,6 @@ fn hold_policy(key: &Arc<EchKey>, names: &[&str], require_ech: bool) -> Policy {
     Policy::new(Names::new(&names), Some(key.clone()), require_ech)
 }
 
-/// How a test client offers ECH.
-#[derive(Clone, Debug)]
-enum Offer {
-    /// No ECH extension.
-    Plain,
-    /// ECH under this ECHConfigList.
-    Ech(Vec<u8>),
-    /// A GREASE ECH extension, which no key opens.
-    Grease,
-}
-
-/// The rustls `EchMode` for `offer`, or none.
-fn ech_mode(offer: &Offer) -> Option<EchMode> {
-    match offer {
-        Offer::Plain => None,
-        Offer::Ech(list) => Some(EchMode::from(
-            EchConfig::new(
-                EchConfigListBytes::from(list.clone()),
-                hpke::ALL_SUPPORTED_SUITES,
-            )
-            .expect("rustls reads the list"),
-        )),
-        Offer::Grease => {
-            let suite = hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
-            let (placeholder, _) =
-                rustls::crypto::hpke::Hpke::generate_key_pair(suite).expect("a GREASE key");
-            Some(EchMode::from(EchGreaseConfig::new(suite, placeholder)))
-        }
-    }
-}
-
-/// A rustls client configuration offering `offer`, with `groups` in that
-/// order, trusting `roots`.
-fn rustls_client(
-    offer: &Offer,
-    groups: &[&'static dyn SupportedKxGroup],
-    roots: rustls::RootCertStore,
-) -> rustls::ClientConfig {
-    let provider = Arc::new(rustls::crypto::CryptoProvider {
-        kx_groups: groups.to_vec(),
-        ..rustls::crypto::aws_lc_rs::default_provider()
-    });
-    let builder = rustls::ClientConfig::builder_with_provider(provider);
-    let builder = match ech_mode(offer) {
-        Some(mode) => builder.with_ech(mode).expect("ECH with TLS 1.3"),
-        None => builder
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3"),
-    };
-    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
-    config.alpn_protocols = vec![b"h3".to_vec()];
-    config
-}
-
 /// X25519MLKEM768 first, as Surge orders its groups. An ECH ClientHello with
 /// this share does not fit one Initial packet.
 fn surge_groups() -> Vec<&'static dyn SupportedKxGroup> {
@@ -1679,7 +1624,7 @@ fn client_parameters(scid: &[u8]) -> Vec<u8> {
 /// The first CRYPTO bytes a rustls QUIC client writes, which is its
 /// ClientHello, asking for `name`.
 fn rustls_hello(offer: &Offer, groups: &[&'static dyn SupportedKxGroup], name: &str) -> Vec<u8> {
-    let config = rustls_client(offer, groups, rustls::RootCertStore::empty());
+    let config = rustls_client(offer, Some(groups), rustls::RootCertStore::empty(), &["h3"]);
     let mut client = rustls::quic::ClientConnection::new(
         Arc::new(config),
         rustls::quic::Version::V1,
@@ -2759,20 +2704,13 @@ fn quick_client(
     offer: &Offer,
     groups: &[&'static dyn SupportedKxGroup],
 ) -> quinn::Endpoint {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca.clone()).expect("trust the test CA");
-    let crypto = rustls_client(offer, groups, roots);
-    let mut config = quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic tls"),
-    ));
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(PATIENCE.try_into().expect("a legal idle timeout")));
     transport.keep_alive_interval(None);
-    config.transport_config(Arc::new(transport));
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("an address")).expect("a client");
-    endpoint.set_default_client_config(config);
-    endpoint
+    endpoint_from(
+        rustls_client(offer, Some(groups), roots_of(ca), &["h3"]),
+        Some(transport),
+    )
 }
 
 /// What one quinn handshake with `offer` came to.

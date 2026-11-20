@@ -1344,33 +1344,11 @@ fn rustls_quic_client(
     groups: &[&'static dyn rustls::crypto::SupportedKxGroup],
     root: Option<&rustls::pki_types::CertificateDer<'static>>,
 ) -> Arc<rustls::ClientConfig> {
-    use rustls::client::{EchConfig, EchMode};
-    let provider = Arc::new(rustls::crypto::CryptoProvider {
-        kx_groups: groups.to_vec(),
-        ..rustls::crypto::aws_lc_rs::default_provider()
+    let offer = ech.map_or(common::Offer::Plain, |list| {
+        common::Offer::Ech(list.to_vec())
     });
-    let builder = rustls::ClientConfig::builder_with_provider(provider);
-    let builder = match ech {
-        Some(list) => builder
-            .with_ech(EchMode::from(
-                EchConfig::new(
-                    rustls::pki_types::EchConfigListBytes::from(list.to_vec()),
-                    rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
-                )
-                .expect("rustls reads the list"),
-            ))
-            .expect("ECH"),
-        None => builder
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .expect("TLS 1.3"),
-    };
-    let mut roots = rustls::RootCertStore::empty();
-    if let Some(root) = root {
-        roots.add(root.clone()).expect("trust the certificate");
-    }
-    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
-    config.alpn_protocols = vec![b"h3".to_vec()];
-    Arc::new(config)
+    let roots = root.map_or_else(rustls::RootCertStore::empty, common::roots_of);
+    Arc::new(common::rustls_client(&offer, Some(groups), roots, &["h3"]))
 }
 
 /// A rustls QUIC client session asking for `localhost`.

@@ -14,15 +14,12 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TempDir, TestServer, finish_connect, open_tcp_tunnel,
-    open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
+    ALLOW_PRIVATE, H3Client, Offer, SharedBuffer, TempDir, TestServer, endpoint_from,
+    finish_connect, open_tcp_tunnel, open_udp_session, roots_of, rustls_client, spawn_echo_target,
+    spawn_udp_echo_target, udp_round_trip,
 };
-use quinn::crypto::rustls::QuicClientConfig;
-use rustls::client::{EchConfig, EchMode};
-use rustls::pki_types::{CertificateDer, EchConfigListBytes};
+use rustls::pki_types::CertificateDer;
 use volto::tls::EchKey;
 
 const PUBLIC_NAME: &str = "public.example";
@@ -45,41 +42,27 @@ fn ech_endpoint_idle(
 ) -> quinn::Endpoint {
     use rustls::crypto::aws_lc_rs::kx_group;
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca.clone()).expect("trust the test CA");
-    let provider = Arc::new(rustls::crypto::CryptoProvider {
-        kx_groups: vec![
-            kx_group::X25519MLKEM768,
-            kx_group::X25519,
-            kx_group::SECP256R1,
-            kx_group::SECP384R1,
-        ],
-        ..rustls::crypto::aws_lc_rs::default_provider()
-    });
-    let ech = EchConfig::new(
-        EchConfigListBytes::from(list.to_vec()),
-        rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
-    )
-    .expect("rustls accepts the server's ECHConfigList");
-    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
-        .with_ech(EchMode::from(ech))
-        .expect("ECH with TLS 1.3")
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(crypto).expect("quic tls"),
-    ));
-    if let Some(idle) = idle {
+    let groups = [
+        kx_group::X25519MLKEM768,
+        kx_group::X25519,
+        kx_group::SECP256R1,
+        kx_group::SECP384R1,
+    ];
+    let transport = idle.map(|idle| {
         let mut transport = quinn::TransportConfig::default();
         transport.max_idle_timeout(Some(idle.try_into().expect("a legal idle timeout")));
         transport.keep_alive_interval(None);
-        client_config.transport_config(Arc::new(transport));
-    }
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
-    endpoint.set_default_client_config(client_config);
-    endpoint
+        transport
+    });
+    endpoint_from(
+        rustls_client(
+            &Offer::Ech(list.to_vec()),
+            Some(&groups),
+            roots_of(ca),
+            &["h3"],
+        ),
+        transport,
+    )
 }
 
 /// One TCP CONNECT and one CONNECT-UDP echo through `client`.
