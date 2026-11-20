@@ -509,41 +509,19 @@ impl Server {
         // cap this branch is not entered at all, so an ordinary Surge
         // handshake is untouched.
         //
-        // Deliberately not given the slot `accept_under_the_swap` reads, because
-        // quinn has no `retry_with`. quinn-proto seals the Retry token with the
-        // `token_key` of the configuration it pinned to this `Incoming` when the
-        // Initial arrived, and validates the returning token against the
-        // configuration the endpoint holds when that token arrives. Neither read
-        // can be reached from here.
-        //
-        // The two keys differ when a `SIGHUP` lands between the Retry and the
-        // returning Initial, because `server_config` builds every configuration
-        // with `ServerConfig::with_crypto`, which draws a fresh `token_key`
-        // each time (quinn-proto 0.11.x `src/config/mod.rs`,
-        // `ServerConfig::with_crypto`). A Retry token that crosses a `SIGHUP`
-        // then fails to decode under the new key, and quinn-proto treats the
-        // returning Initial as carrying no token. That connection attempt
-        // fails; it does not cost one more round trip the way a NEW_TOKEN token
-        // does in the paragraph above. If the server is still full, `admit`
-        // sends a second Retry, and the client discards it:
+        // quinn has no `retry_with`, so the Retry token is sealed with the
+        // `token_key` of the configuration quinn-proto pinned to this
+        // `Incoming`, and `with_crypto` draws a fresh key on every `SIGHUP`. A
+        // Retry that crosses a reload therefore fails to decode, and if the
+        // server is still full the second Retry is discarded by the client:
         //
         //= https://www.rfc-editor.org/rfc/rfc9000#section-17.2.5.2
         //# A client MUST accept and process at most one Retry packet for each
         //# connection attempt.
         //
-        // The client keeps resending its Initial, each one draws another
-        // Retry, and the attempt ends at the client's idle timeout. If the
-        // server is no longer full, the connection is accepted with the Retry's
-        // source connection ID as its original destination connection ID and
-        // with no retry source connection ID, and the client closes it with
-        // TRANSPORT_PARAMETER_ERROR. Either way the client has to start a new
-        // attempt. This needs the server to be full and a reload to land inside
-        // one round trip. Keeping one key across reloads would remove it: a key
-        // drawn once and set with `ServerConfig::token_key` (quinn-proto 0.11.x
-        // `src/config/mod.rs`) on every build, with one `ValidationTokenConfig`
-        // shared across builds so that its log of used NEW_TOKEN tokens
-        // survives too. That is not done, because D31 records key rotation on
-        // reload as the current behaviour.
+        // That attempt fails and the client starts a new one. It needs a full
+        // server and a reload inside one round trip, and D31 records key
+        // rotation on reload as the current behaviour.
         if !incoming.remote_address_validated() {
             match incoming.retry() {
                 Ok(()) => {
@@ -648,8 +626,7 @@ impl Server {
     /// `incoming_buffer.server_config` (quinn-proto 0.11.x `src/endpoint.rs`,
     /// `Endpoint::accept`, `server_config.unwrap_or_else(..)`). That window
     /// opens in the endpoint driver, where no lock in this file reaches, so it
-    /// is closed by stating the value rather than by ordering the read (D22,
-    /// addendum of 2026-09-17).
+    /// is closed by stating the value rather than by ordering the read (D22).
     ///
     /// The guard covers two synchronous reads and the synchronous half of the
     /// accept, and no await. `Incoming::accept_with` answers the client's
@@ -1195,9 +1172,8 @@ pub(crate) mod tests {
     ///
     /// `Server::drain` and `main` both ask for it, and `shutdown::blocking_grace`
     /// states that the blocking pool gets the whole allowance the connections
-    /// got. That is only true while both read the live configuration: `main`
-    /// read the startup value until 2026-09-07, so a `SIGHUP` that raised the
-    /// key raised the drain and not the exit bound.
+    /// got. That is only true while both read the live configuration, so that a
+    /// `SIGHUP` raising the key raises the exit bound as well as the drain.
     #[tokio::test]
     async fn a_reload_moves_the_grace_the_exit_is_bounded_by() {
         let bound = bound_server("");
@@ -1300,10 +1276,8 @@ pub(crate) mod tests {
 
     /// A `quinn::Incoming` stand-in that needs no peer on the other end.
     ///
-    /// Records the `quinn::ServerConfig` it was accepted with, which is the
-    /// half of `accept_under_the_swap` that `std::future::ready(())` could not
-    /// observe: until the accept took a configuration of its own there was no
-    /// argument to look at.
+    /// Records the `quinn::ServerConfig` it was accepted with, the argument
+    /// `accept_under_the_swap` states.
     struct Arriving(Arc<Mutex<Option<Arc<quinn::ServerConfig>>>>);
 
     impl Arriving {
@@ -1326,21 +1300,12 @@ pub(crate) mod tests {
     /// A connection is not accepted between two of a reload's writes, and it is
     /// accepted with the server configuration the reload installed.
     ///
-    /// The mirror of the test above, from the accept side. `Server::serve` takes
-    /// two reads that decide what one connection runs on, the live `Config` and
-    /// the `quinn::ServerConfig`, and until the 2026-09-05 batch it took neither
-    /// under the swap. A reload landing between them gave that connection one
-    /// generation's users beside another's transport parameters for its whole
-    /// life, which is the tear D22's 2026-09-04 addendum recorded as narrowed
-    /// rather than closed.
-    ///
-    /// The `Arc::ptr_eq` pair at the end is the 2026-09-17 half. The swap
-    /// orders the two reads, and that alone stopped deciding the transport
-    /// parameters when quinn-proto 0.11.18 began pinning a pending `Incoming`
-    /// to the configuration the endpoint held as its first Initial arrived. So
-    /// the accept states the configuration rather than letting quinn pick one,
-    /// and what this pins is that the value stated is the one the reload wrote
-    /// and not the one it replaced.
+    /// The mirror of the test above, from the accept side. A reload landing
+    /// between the two reads would give a connection one generation's users
+    /// beside another's transport parameters for its whole life (D22). The
+    /// `Arc::ptr_eq` pair at the end pins that the configuration the accept
+    /// states is the one the reload wrote, not the one quinn-proto pinned to
+    /// the `Incoming`.
     ///
     /// Deterministic because the test holds the swap the reload holds, in place
     /// of racing one. The accept is stood in for by [`Arriving`]: what is under
