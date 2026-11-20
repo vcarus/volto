@@ -281,10 +281,8 @@ pub struct Context {
     /// gate reads closed, so the connection stays under every
     /// pre-authentication bound for the moment it has left.
     ///
-    /// Its transition matters as well as its value: the
-    /// unknown-to-authenticated edge is what raises this connection's
-    /// bidirectional stream allowance to the configured one, exactly once. That
-    /// is why it is an [`AuthGate`] and not the bare atomic it wraps. See
+    /// Its transition matters as well as its value, which is why it is an
+    /// [`AuthGate`] and not the bare atomic it wraps; see
     /// `Context::mark_authenticated`.
     ///
     /// Owned by [`crate::quic`] rather than allocated here, because it is read
@@ -374,8 +372,8 @@ pub struct Context {
     /// takes no resolver slot, opens no socket, and holds its tunnel slot only
     /// for as long as the refusal takes. One line per request would let a peer
     /// decide how much of this host's journal is left for anybody else. See
-    /// [`crate::logfmt::Sampler`] for the
-    /// schedule and for why silencing the repeats was not the answer.
+    /// [`crate::logfmt::Sampler`] for the schedule and for why silencing the
+    /// repeats was not the answer.
     pub policy_refusals: crate::logfmt::Sampler,
     /// The same, for requests refused because this connection is already
     /// holding every tunnel it may.
@@ -471,13 +469,8 @@ impl Context {
     /// would otherwise spend the budget a failure at a time over hours and then
     /// lose every live tunnel to a cap meant for an attacker.
     ///
-    /// Exactly two buckets are cleared: `username`'s own, and the one for
-    /// failures that named nobody. Nothing else, because a guesser *can* arrive
-    /// here: `auth.users` is a list, and one valid credential is enough to
-    /// interleave a success between guesses at a second user's password. See
-    /// [`AuthFailures`]. `None` means there was nothing to check because no
-    /// users are configured, so there is no user's bucket to clear, and no
-    /// failure can have been recorded either.
+    /// Exactly two buckets are cleared ([`AuthFailures::clear_for`]), because a
+    /// guesser *can* arrive here; [`AuthFailures`] says how.
     ///
     /// # The stream allowance
     ///
@@ -759,21 +752,13 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// * The port rule needs no address, so it is applied before the resolver is
 ///   asked anything: a denied port cannot be used to make the proxy run lookups.
 /// * Resolution is explicit, rather than left to the connect call, so the
-///   addresses are visible to the policy below. It is bounded, because the
-///   tunnel slot and the file descriptor it stands for are already held. A
-///   resolver failure is not the client's fault (decision D9), so it is a 502
-///   with the RFC 9209 reason rather than a 400. A resolver that never answered
-///   is a 504 `dns_timeout` instead, because those are different things to an
-///   operator reading the log. The list comes back ordered by `[limits]
-///   ip_family_preference` (decision D58) and the callers dial it in that order,
-///   so on a dual-stack target the non-preferred family is only reached after
-///   the preferred one fails.
+///   addresses are visible to the policy below. [`resolve_within`] bounds it and
+///   orders the answer by family. A resolver failure is not the client's fault
+///   (decision D9), so it is a 502 with the RFC 9209 reason rather than a 400,
+///   and a resolver that never answered is a 504 `dns_timeout` instead.
 /// * A name resolving to a mix of public and private addresses keeps only the
 ///   public ones, so DNS rebinding onto loopback gains nothing. What survives
-///   that filter is then asked one more question, [`is_the_proxys_own`]: an
-///   address this host holds is refused whatever the policy says about its
-///   address space, because reaching it means borrowing the proxy's own source
-///   address against the proxy's own services (RFC 9298 §7).
+///   that filter is then asked [`is_the_proxys_own`].
 ///
 /// Nothing left after that filter splits two ways (decision D49). A name whose
 /// every address is the unspecified one was blocked by a filtering resolver
@@ -852,12 +837,8 @@ pub(crate) async fn admit_target(
             return None;
         }
 
-        // INFO on a doubling schedule rather than every time: this is the
-        // evidence an operator has that somebody is probing the private side of
-        // the host, and one line per request would let the peer decide how much
-        // of the journal is left to record it in. The first refusal is reported
-        // at once, and the `refusals` count is what shows a scan. See
-        // [`Context::policy_refusals`].
+        // INFO on a doubling schedule rather than every time, for the reason
+        // [`Context::policy_refusals`] gives.
         match ctx.policy_refusals.record() {
             Some(refusals) => info!(
                 log_id = "ucmaf4w6",
