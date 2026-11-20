@@ -954,24 +954,13 @@ mod tests {
     #[test]
     fn an_unbounded_shutdown_grace_is_rejected() {
         for grace in [u64::MAX, MAX_SHUTDOWN_GRACE + 1] {
-            let err = toml::from_str::<Config>(&format!(
-                "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"/tmp/c.pem\"\n\
-                 key = \"/tmp/k.pem\"\nshutdown_grace = {grace}\n"
-            ))
-            .expect("parses")
-            .validate()
-            .expect_err("a grace period past the ceiling must be rejected");
-            assert!(err.to_string().contains("shutdown_grace"), "{err}");
+            rejected(&format!("shutdown_grace = {grace}"), "shutdown_grace");
         }
 
         // Both ends of the accepted range stay accepted: zero closes everything
         // at once, and the ceiling itself is a legal drain.
         for grace in [0, MAX_SHUTDOWN_GRACE] {
-            let cfg: Config = toml::from_str(&format!(
-                "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"/tmp/c.pem\"\n\
-                 key = \"/tmp/k.pem\"\nshutdown_grace = {grace}\n"
-            ))
-            .expect("parses");
+            let cfg = parse(&format!("shutdown_grace = {grace}"));
             assert_valid_apart_from_certs(&cfg, &format!("shutdown_grace = {grace}"));
             assert_eq!(
                 cfg.server.shutdown_grace(),
@@ -1131,18 +1120,7 @@ mod tests {
 
     #[test]
     fn empty_alpn_is_rejected() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            alpn = []
-            "#,
-        )
-        .expect("parses");
-        let err = cfg.validate().expect_err("empty alpn must be rejected");
-        assert!(err.to_string().contains("server.alpn"), "{err}");
+        rejected("alpn = []", "server.alpn");
     }
 
     /// An ALPN identifier is length-prefixed with a single byte, so 255 bytes is

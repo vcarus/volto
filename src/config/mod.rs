@@ -892,15 +892,7 @@ pub(crate) mod tests {
 
     #[test]
     fn defaults_are_applied() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            "#,
-        )
-        .expect("parses");
+        let cfg = parse("");
         assert_eq!(cfg.server.alpn, vec!["h3".to_string()]);
         assert_eq!(cfg.log.level, "info");
         assert!(!cfg.log.keylog, "keylog must be opt-in");
@@ -964,19 +956,27 @@ pub(crate) mod tests {
         assert!(cfg.auth.users.is_empty());
     }
 
-    /// A minimal helper: the parsed config for `body`, with cert paths that exist
-    /// left out (so only `body` is under test).
+    /// `body` after the smallest `[server]` table, whose certificate paths do
+    /// not exist (so only `body` is under test). A bare key in `body` lands
+    /// inside `[server]`.
+    fn with_server(body: &str) -> String {
+        format!(
+            "[server]\n\
+             listen = \"127.0.0.1:4433\"\n\
+             cert = \"/tmp/c.pem\"\n\
+             key = \"/tmp/k.pem\"\n\
+             {body}\n"
+        )
+    }
+
+    /// The parsed config for `body`; see [`with_server`].
     pub(super) fn parse(body: &str) -> Config {
-        toml::from_str(&format!(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            {body}
-            "#
-        ))
-        .expect("parses")
+        toml::from_str(&with_server(body)).expect("parses")
+    }
+
+    /// The error the parser refuses `body` with; see [`with_server`].
+    fn parse_err(body: &str) -> toml::de::Error {
+        toml::from_str::<Config>(&with_server(body)).expect_err("must be refused")
     }
 
     /// Asserts that everything about `cfg` is valid *except* its certificate paths,
@@ -1035,17 +1035,7 @@ pub(crate) mod tests {
     #[test]
     fn a_malformed_connect_timeout_is_rejected() {
         for value in ["-1", "\"10\"", "1.5", "true"] {
-            let err = toml::from_str::<Config>(&format!(
-                r#"
-                [server]
-                listen = "127.0.0.1:4433"
-                cert = "/tmp/c.pem"
-                key = "/tmp/k.pem"
-                [limits]
-                connect_timeout = {value}
-                "#
-            ))
-            .expect_err("{value} must be rejected");
+            let err = parse_err(&format!("[limits]\nconnect_timeout = {value}"));
             assert!(err.to_string().contains("connect_timeout"), "{err}");
         }
     }
@@ -1075,18 +1065,7 @@ pub(crate) mod tests {
     /// for a 1.1.x file is in the message.
     #[test]
     fn bbr_capped_is_no_longer_accepted() {
-        let err = toml::from_str::<Config>(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            [limits]
-            congestion_control = "bbr-capped"
-            "#,
-        )
-        .expect_err("the 1.1.x alias must be refused")
-        .to_string();
+        let err = parse_err("[limits]\ncongestion_control = \"bbr-capped\"").to_string();
         assert!(err.contains("bbr-capped"), "{err}");
         assert!(err.contains("`bbr`"), "{err}");
         assert!(err.contains("bbr-uncapped"), "{err}");
@@ -1094,17 +1073,7 @@ pub(crate) mod tests {
 
     #[test]
     fn an_unknown_congestion_controller_is_rejected() {
-        let err = toml::from_str::<Config>(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            [limits]
-            congestion_control = "reno"
-            "#,
-        )
-        .expect_err("an unknown controller must be rejected");
+        let err = parse_err("[limits]\ncongestion_control = \"reno\"");
         assert!(err.to_string().contains("congestion_control"), "{err}");
     }
 
@@ -1130,17 +1099,7 @@ pub(crate) mod tests {
     /// reading a failed startup has to go on.
     #[test]
     fn an_unknown_ip_family_preference_is_rejected() {
-        let err = toml::from_str::<Config>(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            [limits]
-            ip_family_preference = "v4"
-            "#,
-        )
-        .expect_err("an unknown preference must be rejected");
+        let err = parse_err("[limits]\nip_family_preference = \"v4\"");
         assert!(err.to_string().contains("ip_family_preference"), "{err}");
     }
 
@@ -1471,16 +1430,7 @@ pub(crate) mod tests {
 
     #[test]
     fn unknown_key_is_rejected() {
-        let err = toml::from_str::<Config>(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-            lisen = "typo"
-            "#,
-        )
-        .expect_err("must reject unknown keys");
+        let err = parse_err("lisen = \"typo\"");
         assert!(err.to_string().contains("lisen"), "{err}");
     }
 
@@ -1563,19 +1513,7 @@ pub(crate) mod tests {
     fn a_config_that_names_a_key_from_the_future_is_refused_whole() {
         // The whole file is refused, not the one key: nothing else in it takes
         // effect, which is why this is a startup failure rather than a warning.
-        let err = toml::from_str::<Config>(
-            r#"
-            [server]
-            listen = "127.0.0.1:4433"
-            cert = "/tmp/c.pem"
-            key = "/tmp/k.pem"
-
-            [limits]
-            initial_mtu = 1242
-            a_key_a_later_release_added = 2
-            "#,
-        )
-        .expect_err("a key this version does not know must refuse the file");
+        let err = parse_err("[limits]\ninitial_mtu = 1242\na_key_a_later_release_added = 2");
         assert!(
             err.to_string().contains("unknown field"),
             "the refusal must name the shape of the problem: {err}"
