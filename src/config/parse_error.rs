@@ -137,28 +137,39 @@ fn closing_quote(rest: &str, quote: char) -> Option<usize> {
     None
 }
 
-/// What follows a closing backtick in the messages serde and `toml` write.
+/// The clauses serde writes after a value it quotes in backticks.
 ///
-/// serde quotes a rejected value and then either ends the message or goes on
-/// with `, expected ...`, and its lists of names are `` `a`, `b` `` or
-/// `` `a` or `b` ``. A backtick followed by anything else is inside the value.
-const AFTER_A_BACKTICK: [&str; 4] = [", expected ", ", `", ", there are ", " or `"];
+/// serde writes the value, then one of these, once, and nothing it quotes from
+/// the file comes after it.
+const CLAUSES: [&str; 2] = [", expected ", ", there are "];
+
+/// What follows a closing backtick in a list of names serde writes, such as
+/// `` `a`, `b` `` or `` `a` or `b` ``.
+const LIST_SEPARATORS: [&str; 2] = [", `", " or `"];
 
 /// The offset of the backtick that closes a backtick segment, counted like
 /// [`closing_quote`].
 ///
-/// The first backtick that ends the message or is followed by one of
-/// [`AFTER_A_BACKTICK`]. A value can only end its own segment early by
-/// containing one of those phrases right after a backtick of its own. `None`
-/// when no backtick qualifies, which redacts to the end of the message: the
-/// lexer's own messages can end that way, and they quote no value, so the cost
-/// is the rest of a sentence and never a secret.
+/// The last backtick followed by one of [`CLAUSES`], if there is one: the value
+/// comes before serde's own clause, so a value that holds a clause of its own
+/// cannot close its segment before serde's. Otherwise the first backtick that
+/// ends the message or is followed by one of [`LIST_SEPARATORS`], which is how
+/// the names after a clause are closed. A backtick followed by anything else is
+/// inside the value. `None` when no backtick qualifies, which redacts to the
+/// end of the message: the lexer's own messages can end that way, and they
+/// quote no value, so the cost is the rest of a sentence and never a secret.
 fn closing_backtick(rest: &str) -> Option<usize> {
-    rest.match_indices('`')
+    let followed_by = |index: usize, phrases: &[&str]| {
+        let after = &rest[index + 1..];
+        phrases.iter().any(|phrase| after.starts_with(phrase))
+    };
+    rest.rmatch_indices('`')
         .map(|(index, _)| index)
-        .find(|&index| {
-            let after = &rest[index + 1..];
-            after.is_empty() || AFTER_A_BACKTICK.iter().any(|next| after.starts_with(next))
+        .find(|&index| followed_by(index, &CLAUSES))
+        .or_else(|| {
+            rest.match_indices('`')
+                .map(|(index, _)| index)
+                .find(|&index| index + 1 == rest.len() || followed_by(index, &LIST_SEPARATORS))
         })
 }
 
@@ -299,7 +310,7 @@ mod tests {
         // Tag, the broken config, what must not survive in the message, and
         // whether the parser quoted a value at all: the lexer's complaint names
         // none, so there is nothing there for the marker to replace.
-        let cases: [(&str, String, &[&str], bool); 12] = [
+        let cases: [(&str, String, &[&str], bool); 14] = [
             (
                 "bare",
                 config_with_raw_password("correct-horse-battery-staple"),
@@ -387,6 +398,21 @@ mod tests {
                 &["hunter2", "TAILSECRET"],
                 true,
             ),
+            // The two clauses serde writes after the value, inside the value.
+            // A segment that ended at the first backtick followed by one of
+            // them closed after `x` and printed the rest (R7-L4).
+            (
+                "expected-clause-in-enum-value",
+                config_with_raw_congestion_control("\"x`, expected hunter2-TAILSECRET\""),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
+            (
+                "there-are-clause-in-enum-value",
+                config_with_raw_congestion_control("\"x`, there are hunter2-TAILSECRET\""),
+                &["hunter2", "TAILSECRET"],
+                true,
+            ),
         ];
 
         for (tag, body, secrets, marked) in cases {
@@ -464,6 +490,12 @@ mod tests {
         assert_eq!(
             redact_quoted("unknown variant `a` b"),
             format!("unknown variant {REDACTED}"),
+        );
+        // A value that holds serde's own clause closes at the clause serde
+        // wrote, the last one, and the list after it is still read as a list.
+        assert_eq!(
+            redact_quoted("unknown variant `x`, expected y`, expected one of `a`, `b`"),
+            format!("unknown variant {REDACTED}, expected one of {REDACTED}, {REDACTED}"),
         );
 
         let file = TempConfig::write(
