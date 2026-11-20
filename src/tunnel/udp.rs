@@ -525,11 +525,9 @@ struct Session<'a> {
     /// target has answered, which lifts the cap for good because the target has
     /// consented to the conversation, or the operator disabled the mitigation.
     ///
-    /// This half is per session and is recreated by opening one, so it bounds a
-    /// conversation and not a client. The connection's own total
-    /// ([`super::quota::Unanswered`]) is what a new session does
-    /// not restore. It is charged from here, and repaid only by this session's
-    /// own target answering, through the `charged` count of
+    /// This half is per session; the connection's total, which a new session
+    /// does not restore, is [`super::quota::Unanswered`]. It is charged from
+    /// here and repaid through the `charged` count of
     /// [`Amplification::Unanswered`].
     amplification: Amplification,
     /// The QUIC datagram half of the target -> client direction, or `None`
@@ -645,10 +643,9 @@ enum Event {
 /// sources are things a peer can keep ready for as long as it likes without a
 /// single packet crossing the proxy: bytes that finish no capsule, and payloads
 /// the unanswered-packet budget drops. The second of those, sent fast enough,
-/// keeps the loop supplied so that the deadline is never measured. On a dev
-/// host a 1 s timeout under four flooding senders ran 9.3 s late, and in one run
-/// had not closed after 30 s. This is the only bound an authenticated peer's
-/// session is under, since D76's covers connections that never authenticated.
+/// keeps the loop supplied so that the deadline is never measured (D92 records
+/// how late it ran). This is the only bound an authenticated peer's session is
+/// under, since D76's covers connections that never authenticated.
 ///
 /// So the clock is read before each wait, which is D92's rule for the
 /// connection's own silence deadline applied to the other absolute deadline in
@@ -707,12 +704,9 @@ impl Session<'_> {
             // ERROR` interest `UdpSocket::recv` waits on is what wakes the
             // session for an ICMP error queued on the socket.
             //
-            // Handling the event is deliberately outside it. `forward_to_client`
-            // writes to the request stream on the capsule path, and a write in
-            // flight must not be cancelled: the stream keeps a partial DATA
-            // frame, which the tidy `finish()` below would then FIN in the
-            // middle of a capsule. That branch bounds its own write instead,
-            // and ends the session by resetting rather than finishing.
+            // Handling the event is deliberately outside it: the capsule write
+            // in `forward_to_client` must not be cancelled, and bounds itself
+            // (see there).
             //
             // A deadline rather than a per-wait timeout, because "idle" has to
             // mean "no packet crossed the proxy", not "no bytes arrived":
@@ -721,8 +715,7 @@ impl Session<'_> {
             // arrival alone would let a peer hold this session's socket,
             // buffers and tunnel slot for ever by sending bytes that complete
             // nothing, such as one byte a second into a capsule that never
-            // finishes. An authenticated peer is under no other bound: D76's
-            // deadline covers only connections that never authenticated.
+            // finishes.
             //
             // Waited on through [`before_deadline`] rather than `timeout_at`
             // alone; see that function for why the clock has to be read as
@@ -912,13 +905,8 @@ impl Session<'_> {
                 return Step::Continue;
             }
 
-            // The connection's own total, which a new session does not restore
-            // (`quota::Unanswered`). Exhausting it ends this
-            // session rather than muting it: a client that has spent the whole
-            // connection's allowance on targets that never answered has said
-            // what it is doing, and a muted session would hold a socket, a
-            // routing entry and a stream until the idle timeout while the next
-            // one costs it nothing to open.
+            // The connection's own total. Exhausting it ends this session
+            // rather than muting it; `quota::Unanswered::charge` says why.
             if !self.ctx.unanswered.charge() {
                 match self.ctx.unanswered_closures.record() {
                     Some(closures) => warn!(
@@ -1214,21 +1202,16 @@ impl DatagramPath {
             // only decides what is logged.
             //
             // The reading is taken only here, when the connection's lower bound
-            // of the room ([`super::quota::DatagramRoom::claim`]) does not cover the
-            // packet. A packet the bound covers fits, so it is graded clear with
-            // no reading, and with a queue that keeps up the bound covers about
-            // 1 MiB of datagrams per reading.
+            // of the room ([`super::quota::DatagramRoom::claim`]) does not
+            // cover the packet.
             //
-            // Exactly-enough space is room, not an eviction.
-            // `datagram_send_buffer_space()` is the limit minus what is queued
-            // minus one datagram's own overhead, which makes `len <= space`
-            // quinn's own "this one fits" predicate written the other way
-            // round. It is the same comparison that would return `Blocked` if
-            // the caller had asked not to drop. A datagram larger than that puts
-            // the queue over its limit, and quinn brings it back under by
-            // discarding from the front, on this send or the next one. Either
-            // way the loss is already decided by the time anything here could
-            // react to it, which is why only how loudly to say so is graded.
+            // Exactly-enough space is room, not an eviction:
+            // `datagram_send_buffer_space()` already has one datagram's own
+            // overhead taken off, so `len <= space` is quinn's own "this one
+            // fits" predicate. A larger datagram puts the queue over its limit,
+            // and quinn discards from the front, on this send or the next. The
+            // loss is decided before anything here could react, which is why
+            // only how loudly to say so is graded.
             let space = ctx.quic.datagram_send_buffer_space();
             ctx.datagram_room.reset(space, encoded_len);
             let len = encoded_len;
@@ -1377,14 +1360,13 @@ fn occurrence(sampler: &crate::logfmt::Sampler) -> Graded {
 /// syscall comes next, which is `recv` whenever the session is waiting for the
 /// target rather than forwarding to it.
 ///
-/// Measured on Linux 7.0.14, across a router with a 1280-byte link: a UDP
-/// socket with `IP_PMTUDISC_DO`, which [`crate::net`] sets on Linux, sent a
-/// 1400-byte payload, the router answered ICMP type 3 code 4, and the following
-/// `recv` returned **`EMSGSIZE`**, one of the errnos the send side forgives. An
-/// ICMP port-unreachable arrives as `ECONNREFUSED`, admin-prohibited as
-/// `EHOSTUNREACH` and net-prohibited as `ENETUNREACH`, all verdicts on the
-/// socket that end the session. `EPERM` from a local firewall rule is returned
-/// by `send` itself and never reaches a read.
+/// On Linux, with the `IP_PMTUDISC_DO` that [`crate::net`] sets, an ICMP
+/// fragmentation-needed answer to an oversized send makes the following `recv`
+/// return **`EMSGSIZE`**, one of the errnos the send side forgives (D89
+/// records the run). An ICMP port-unreachable arrives as `ECONNREFUSED`,
+/// admin-prohibited as `EHOSTUNREACH` and net-prohibited as `ENETUNREACH`, all
+/// verdicts on the socket that end the session. `EPERM` from a local firewall
+/// rule is returned by `send` itself and never reaches a read.
 ///
 /// So the two directions grade errors the same way, with
 /// [`is_per_packet_error`] as the one rule. A read that is forgiven does **not**
@@ -2461,8 +2443,7 @@ mod tests {
         );
     }
 
-    /// What Surge advertised as `max_datagram_frame_size` until a 2026-11 beta
-    /// raised it to 1500, and still the limit an older client gives.
+    /// The `max_datagram_frame_size` an older Surge advertises (D48).
     const SURGE_MAX_DATAGRAM_FRAME_SIZE: usize = 1300;
 
     /// An `info!` on the doubling schedule, and the running total in it, for
