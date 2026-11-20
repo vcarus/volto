@@ -63,8 +63,9 @@ jobs:
       # Default severity, which is `style`: all five scripts are clean at it
       # today, including the info-level checks, and a finding that is wrong for
       # a particular line is turned off in place with a
-      # `# shellcheck disable=SCxxxx` carrying its reason (there is one, on the
-      # `trap` in install-selfsigned.sh).
+      # `# shellcheck disable=SCxxxx` carrying its reason (there are four: two
+      # on word splitting in deploy.sh and two on a `trap` in
+      # install-selfsigned.sh).
       #
       # Every tracked script, not `script/*.sh`, which was two of the five. The
       # three it used to miss are tests/interop/run-local.sh, the fixture
@@ -344,9 +345,10 @@ jobs:
     # built on the server's own codec, so the two agree by construction even
     # where both are wrong. Here a real volto process is driven by two clients
     # that share no code, no QUIC stack and no reading of the RFCs with it or
-    # with each other: Go's quic-go/masque-go for CONNECT-UDP, and Python's
-    # aioquic -- the only one of the two that can speak plain CONNECT, so the
-    # TCP tunnel's independent coverage lives entirely in its half.
+    # with each other: Go's quic-go/masque-go for CONNECT-UDP and ECH, and
+    # Python's aioquic for CONNECT-UDP and plain CONNECT. aioquic is the only
+    # one of the two that can speak plain CONNECT, so the TCP tunnel's
+    # independent coverage lives entirely in its half.
     #
     # Linux only: this is about the protocol on the wire, not about the host, and
     # the platform matrix is already covered by the `test` job above.

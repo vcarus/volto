@@ -245,7 +245,7 @@ required-features = ["operator-runs"]
 [dev-dependencies]
 # Pinned to the same crypto backend as the server (D102). rcgen's default
 # feature set is `crypto` + `pem` + `ring`, so the backend has to be selected by
-# hand or ring comes back into the lockfile through the test certificates alone.
+# hand or ring is compiled into the test build for the test certificates alone.
 # `aws_lc_rs` implies `crypto`; `pem` is what `cert.pem()` and
 # `signing_key.serialize_pem()` need. The generated key is unchanged either way:
 # `KeyPair::generate` is ECDSA P-256 on both backends.

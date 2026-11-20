@@ -492,8 +492,8 @@ since the drops themselves are required to be silent.
 
 Get either wrong and the symptom is "the handshake succeeds, the tunnel is
 established, and not one packet gets through", with no error anywhere. The
-encoder and decoder are hand-rolled in `src/datagram.rs` — about thirty lines,
-which is why no dependency is carried for them.
+encoder and decoder are hand-rolled in `src/datagram.rs`, about 120 lines of
+code, and no dependency is carried for them.
 
 Routing uses a bounded channel and `try_send`: a session that is not draining
 its queue loses packets, which is correct UDP behaviour, instead of blocking the
@@ -659,7 +659,7 @@ stream makes for the same race.
 HTTP Datagrams are hand-rolled in `src/datagram.rs`. That started as a way around
 `h3-datagram` 0.0.2, which tagged every datagram with Quarter Stream ID 0 and so
 misrouted every session after the first on a connection; it is simply ours now —
-about thirty lines of varint work with no dependency behind them.
+about 120 lines of varint and Context ID work with no dependency behind them.
 
 ## The h3api facade
 
@@ -691,7 +691,7 @@ underneath changes.
 Two tests are load-bearing beyond their names:
 
 - The multi-session concurrent CONNECT-UDP test is the regression baseline for
-  Quarter-Stream-ID-class bugs. Three sessions on one connection, each verified
+  Quarter-Stream-ID-class bugs. Twenty sessions on one connection, each verified
   to receive its own traffic. Never weaken it.
 - `it_migration` rebinds the client endpoint mid-tunnel and asserts that existing
   tunnels survive the address change and that new ones can still be opened, which
@@ -705,14 +705,18 @@ Two tests are load-bearing beyond their names:
 setup/teardown rounds) and a light tier in the default run that catches slot
 leaks by shrinking the quota until a leak turns into an observable 503.
 
-These pages are checked too. `it_docs` reads `docs/` as text and asserts three
-things a machine can settle: that the configuration keys documented here and the
-ones `script/config.example.toml` ships are one set, and that the documented set
-still parses as a `Config`; that every constant a page quotes in the
-`` `IDENT` = value `` notation holds the value the crate compiles; and that every
+These pages are checked too. `it_docs` reads `docs/` as text and asserts what a
+machine can settle: that the configuration keys documented here and the ones
+`script/config.example.toml` ships are one set, that the documented set still
+parses as a `Config`, and that each default the example states is the default
+the page prints; that the introduced-in table in `configuration.md` accounts
+for every key; that every constant a page quotes in the `` `IDENT` = value ``
+notation holds the value the crate compiles; that every
 `docs/<page>.md#<anchor>` reference in `src/`, in `tests/` and in these pages
-themselves names a heading that exists. What no gate can check is whether a
-sentence is *true*, so that half stays a review question.
+themselves names a heading that exists; that the manual installation commands
+are the same in `deployment.md` and in `script/masque.service`; and that every
+page under `docs/` is read by these checks or exempted by name. What no gate can
+check is whether a sentence is *true*, so that half stays a review question.
 
 Test infrastructure lives in `tests/common/`: an in-process server plus
 self-signed certificates from `rcgen`, so no test needs a fixture on disk, and
@@ -728,13 +732,19 @@ over the RFC 9298 default URI template, with authentication on and the server's
 certificate trusted rather than skipped; it asserts multi-round echo on one
 session, three concurrent sessions on a single QUIC connection receiving only
 their own traffic, `Proxy-Status` on a refusal, and a 407 when credentials are
-omitted. Python's [aioquic](https://github.com/aiortc/aioquic) covers what
-masque-go cannot: the plain CONNECT (TCP) tunnel — round trips, two concurrent
-tunnels, and the RFC 9114 §4.4 half-close — plus a datagram carrying an unknown
-Context ID, which RFC 9298 requires to be dropped silently and which only a
-client that writes its own Context ID prefix can send. The clients live in
-`tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python script),
-so `cargo test` neither sees nor needs them.
+omitted. Against a second server that holds an ECH key and runs with
+`require_ech`, it also asserts that a handshake with the server's ECHConfigList
+is accepted and carries a session, and that one with another key gets no reply.
+Python's [aioquic](https://github.com/aiortc/aioquic) covers what masque-go
+cannot: the plain CONNECT (TCP) tunnel (round trips, two concurrent tunnels,
+and the RFC 9114 §4.4 half-close), plus a datagram carrying an unknown Context
+ID, which RFC 9298 requires to be dropped silently and which only a client that
+writes its own Context ID prefix can send. It also runs CONNECT-UDP cases of
+its own: a round trip, three concurrent sessions on one connection (the same
+baseline), a datagram sent before its request that must still be delivered, a
+407 when credentials are omitted and `Proxy-Status` on a refusal. The clients
+live in `tests/interop/` (a Go module) and `tests/interop/aioquic/` (a Python
+script), so `cargo test` neither sees nor needs them.
 
 A third independent implementation judges the field-section encoding in
 particular, and its verdicts are checked in rather than re-run: the differential
@@ -756,11 +766,17 @@ in a Linux container rather than in CI -- which only type-checks them, since
 `fuzz/` is a workspace of its own and its targets reach items that are public
 only because they ask for them, so a rename in `src/` would otherwise break the
 fuzzers silently between runs. `fuzz/README.md` maps each target to the parser
-it covers and has the invocation. Beside the five codecs — the frame
-state machine, QPACK, Huffman, the capsule parser and the datagram codec — that
-means the request validator that reaches RFC 9114 §4.1.2's malformed verdict,
-the two parsers that turn a client-named target into a host and a port, and the
-credentials field, which is the one attacker-shaped byte string read before
-anything has authenticated. The property tests in `tests/it_props.rs` and
+it covers and has the invocation. There are eleven. Beside the five codecs
+(the frame state machine, QPACK, Huffman, the capsule parser and the datagram
+codec), they cover the request validator that reaches RFC 9114 §4.1.2's
+malformed verdict, the two parsers that turn a client-named target into a host
+and a port, the credentials field, the SNI gate's reading of a whole datagram,
+the gate's hold of first flights under an ECH key, and the server's TLS on
+AWS-LC's libssl. Nine of them read bytes a peer can send before anything has
+authenticated: `gate`, `hold` and `tls` on the first flight; `frame`, `qpack`,
+`huffman` and `request` on the HTTP/3 streams before the first request is
+judged; `datagram` on a datagram that arrives before its request; and
+`auth` on the credentials field itself. Only `capsule` and `authority` read
+bytes that need an authenticated request first. The property tests in `tests/it_props.rs` and
 `tests/it_fuzz.rs` state the same kinds of invariants on stable Rust, so they
 are what CI runs on every push.

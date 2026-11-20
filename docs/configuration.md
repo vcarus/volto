@@ -153,10 +153,13 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 descriptor, so `max_targets_per_conn` and systemd's `LimitNOFILE` are two halves
 of the same budget. What volto compares against `RLIMIT_NOFILE` at startup is
 `max_connections` × `max_targets_per_conn` **plus `FD_HEADROOM` = 64 descriptors
-of headroom** for the listening socket, the request streams and a certificate
-reload — 65600 for the defaults, which the shipped unit's `LimitNOFILE=131072`
-has room for. Raise either limit past that point and `LimitNOFILE` has to go up
-with it, or the startup warning fires.
+of headroom** for the listening socket, stdio and a certificate reload — 65600
+for the defaults, which the shipped unit's `LimitNOFILE=131072` has room for. A
+QUIC stream holds no descriptor of its own. The check does not count the
+resolver sockets of lookups whose request has already given up, up to 384 at
+the defaults (see [File-descriptor budget](deployment.md#file-descriptor-budget)).
+Raise either limit past that point and `LimitNOFILE` has to go up with it, or
+the startup warning fires.
 
 **A CONNECT-UDP session costs memory as well as a descriptor**, and only the
 descriptors are checked at startup. Each session holds three buffers: a

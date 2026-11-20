@@ -307,8 +307,9 @@ no such file and replaces nothing.
 
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of
-the release tarball, after its signature and checksum have been verified; the
-piped copy only steers. With stdin
+the release tarball, after its signature and checksum have been verified. The
+piped copy still decides which key counts as the release key and writes the
+timer units from its own text, as the paragraph above says. With stdin
 being a pipe it never prompts, so give `--sni` (and friends) explicitly or
 accept their defaults:
 
@@ -334,8 +335,8 @@ re-runs it daily (`OnCalendar=daily`, randomized by up to an hour, `Persistent=`
 so a powered-off day is caught up). Every later deploy refreshes the installed
 copy of the script from the release it just verified, so the timer keeps pace
 with the repository. `journalctl -u volto-deploy.service` shows what each run
-did; a failed update leaves the timer unit in a failed state, which is the
-signal to go look.
+did; a failed update leaves `volto-deploy.service` in a failed state while the
+timer stays active, which is the signal to go look.
 
 ### Before the swap
 
@@ -364,7 +365,7 @@ the advisory below instead.
 Rolling back is the same flow pinned to an older release:
 
 ```sh
-sudo volto-deploy --tag v0.1.0
+sudo volto-deploy --tag v1.4.0
 ```
 
 A release before 1.4.0 is not signed and needs `--allow-unsigned` beside
@@ -523,8 +524,11 @@ A cloud provider's security group needs the same rule, on UDP.
 Each tunnel — TCP or UDP — costs one descriptor, and one client multiplexes many
 onto a single QUIC connection. The quota is per connection, so the number the
 process has to have descriptors for is the **product**, plus a fixed 64 for the
-listening socket, the request streams, stdio and the certificate a `SIGHUP`
-re-reads:
+listening socket, stdio and the certificate a `SIGHUP` re-reads. A QUIC stream
+holds no descriptor of its own. Not counted are the resolver sockets of lookups
+whose request has already given up: such a lookup keeps its socket to the
+nameserver open until `getaddrinfo` returns, and the lookup budget allows up to
+384 of them at the defaults, so the process can need that many more:
 
 ```
 limits.max_connections × limits.max_targets_per_conn + 64

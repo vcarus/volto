@@ -4,9 +4,11 @@
 # is no ban list.
 
 [graph]
-# Every target, so a dependency that only a Windows or wasm build pulls is
-# judged as well. Both lock files hold those entries whether or not they are
-# ever built here.
+# Every feature of the workspace members, so a dependency that a feature turns
+# on is judged even when no build here turns it on. No `targets` list is given,
+# so every target is judged, which is cargo-deny's default: a dependency that
+# only a Windows or wasm build pulls is judged too. Both lock files hold those
+# entries whether or not they are ever built here.
 all-features = true
 
 [sources]

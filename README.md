@@ -46,7 +46,7 @@ volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-s
 
 > **The fingerprint is the trust anchor.** Carry it to the client over a channel you trust and never replace it with `skip-cert-verify`: Basic credentials travel on every request, so a man in the middle collects them at once. For a public-CA certificate instead, see [docs/deployment.md](docs/deployment.md#certificates).
 
-Everything the piped script installs comes out of the release tarball, after its signature and checksum have been verified; the piped copy only steers. Details and every flag: [Deploying from releases](docs/deployment.md#deploying-from-releases).
+Everything the piped script installs comes out of the release tarball, after its signature and checksum have been verified. The piped copy itself holds the release key it verifies against and writes the timer units, so on a bare host it is trusted as far as the repository is; see [The release signature](docs/deployment.md#the-release-signature). Details and every flag: [Deploying from releases](docs/deployment.md#deploying-from-releases).
 
 ### 2. From a release tarball
 
@@ -54,8 +54,8 @@ Static musl builds for `x86_64` and `aarch64` are on the [releases page](https:/
 
 ```sh
 tar xzf volto-*-x86_64-unknown-linux-musl.tar.gz && cd volto-*/
-sudo script/install-selfsigned.sh          # first install
-sudo script/deploy.sh --enable-timer       # or: install + keep it updated
+sudo script/install-selfsigned.sh --binary ./volto  # first install
+sudo script/deploy.sh --enable-timer                # or: install + keep it updated
 ```
 
 ### 3. From source
@@ -115,7 +115,7 @@ cargo test --locked --test it_policy               # authentication / ACL / quot
 cargo test --locked --test it_stress -- --ignored  # heavy load tier
 ```
 
-Integration tests assert on-wire behaviour — status codes, response headers, the actual bytes on the control stream — rather than internal state. Because that suite has volto on both ends, CI also runs a cross-implementation job against two independent clients, Go's [masque-go](https://github.com/quic-go/masque-go) (CONNECT-UDP) and Python's [aioquic](https://github.com/aiortc/aioquic) (CONNECT); see [tests/interop](tests/interop) and [Testing](docs/architecture.md#testing).
+Integration tests assert on-wire behaviour — status codes, response headers, the actual bytes on the control stream — rather than internal state. Because that suite has volto on both ends, CI also runs a cross-implementation job against two independent clients, Go's [masque-go](https://github.com/quic-go/masque-go) (CONNECT-UDP, with and without ECH) and Python's [aioquic](https://github.com/aiortc/aioquic) (CONNECT and CONNECT-UDP); see [tests/interop](tests/interop) and [Testing](docs/architecture.md#testing).
 
 ## License
 
