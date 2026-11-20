@@ -66,7 +66,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::debug;
 
-use crate::datagram::{self, peek_varint, put_varint, varint_len};
+use crate::datagram::{self, len_u64, peek_varint, put_varint, varint_len, varint_len_of_first};
 
 use super::error::{Code, ConnectionError, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
@@ -909,10 +909,7 @@ impl Handle {
         let settings = frame::settings_payload();
         let mut preface = BytesMut::with_capacity(settings.len() + 2 * VARINT_MAX_LEN);
         put_varint(&mut preface, STREAM_CONTROL);
-        // A byte count is a `usize` and a frame length is a `u64`; the widening
-        // is exact on both supported targets and has no `From` to express it.
-        #[allow(clippy::as_conversions)]
-        frame::put_header(&mut preface, frame::SETTINGS, settings.len() as u64);
+        frame::put_header(&mut preface, frame::SETTINGS, len_u64(settings.len()));
         preface.extend_from_slice(&settings);
 
         let mut control = self.quic.open_uni().await?;
@@ -1116,10 +1113,7 @@ impl Connection {
         self.going_away = Some(identifier);
 
         let mut goaway = BytesMut::with_capacity(2 * VARINT_MAX_LEN + varint_len(identifier));
-        // `varint_len` answers in bytes and a frame length is a `u64`; the
-        // widening is exact and has no `From` to express it.
-        #[allow(clippy::as_conversions)]
-        frame::put_header(&mut goaway, frame::GOAWAY, varint_len(identifier) as u64);
+        frame::put_header(&mut goaway, frame::GOAWAY, len_u64(varint_len(identifier)));
         put_varint(&mut goaway, identifier);
 
         // Written before the answer is judged, so the borrow of `self.control`
@@ -1908,9 +1902,7 @@ async fn read_stream_type(recv: &mut quinn::RecvStream) -> Result<Option<u64>, S
         Err(quinn::ReadExactError::ReadError(error)) => return Err(error.into()),
     }
 
-    // RFC 9000 §16: the two most significant bits give the length as a power
-    // of two.
-    let length = 1usize << (buf[0] >> 6);
+    let length = varint_len_of_first(buf[0]);
     if length > 1 {
         match recv.read_exact(&mut buf[1..length]).await {
             Ok(()) => {}

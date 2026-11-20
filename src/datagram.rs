@@ -179,6 +179,37 @@ pub fn decode(mut datagram: Bytes) -> Result<Datagram, DecodeError> {
     })
 }
 
+/// A byte count as the `u64` a varint carries.
+///
+/// The one place a `usize` length is widened to a varint's type. It is exact
+/// because no target this crate builds for has a `usize` wider than 64 bits,
+/// which the assertion below checks, and std has no `From<usize> for u64` to
+/// say so.
+#[allow(clippy::as_conversions)]
+pub const fn len_u64(len: usize) -> u64 {
+    len as u64
+}
+
+const _: () = assert!(usize::BITS <= u64::BITS);
+
+/// How much of a `remaining`-byte field the chunk in hand settles, and what is
+/// left of the field after it.
+///
+/// The frame decoder's DATA and skipped frames and the capsule decoder's
+/// skipped capsules each run a declared length down chunk by chunk, and none
+/// may read past its end. A `remaining` too large for a `usize` is larger than
+/// any chunk, so the whole chunk is taken.
+pub fn take_from(remaining: u64, chunk_len: usize) -> (usize, u64) {
+    let take = usize::try_from(remaining).map_or(chunk_len, |remaining| remaining.min(chunk_len));
+    (take, remaining - len_u64(take))
+}
+
+/// The length of the varint whose first byte is `first`: RFC 9000 §16 puts it
+/// in the two most significant bits, as a power of two.
+pub fn varint_len_of_first(first: u8) -> usize {
+    1 << (first >> 6)
+}
+
 /// Encoded length of `value` as a QUIC varint.
 #[inline]
 pub fn varint_len(value: u64) -> usize {
@@ -236,8 +267,7 @@ pub fn take_varint(buf: &mut Bytes) -> Option<u64> {
 /// "need more bytes" signal for incremental parsers, not an error.
 pub fn peek_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let first = *buf.first()?;
-    // The two most significant bits give the length as a power of two.
-    let length = 1usize << (first >> 6);
+    let length = varint_len_of_first(first);
     if buf.len() < length {
         return None;
     }

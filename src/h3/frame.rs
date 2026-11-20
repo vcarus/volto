@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::datagram::{peek_varint, put_varint};
+use crate::datagram::{len_u64, peek_varint, put_varint, take_from};
 
 use super::error::{Code, StreamError, Violation};
 use super::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
@@ -180,13 +180,9 @@ const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 // encoded-octet cap the budget is measured in, and deliberately not against
 // `quic::INITIAL_BIDI_STREAMS`, which is also sixteen by coincidence and which
 // D98 says must not be tied to it.
-//
-// A `usize` byte count against a `u64` one; both are literals of this crate and
-// far inside either type.
-#[allow(clippy::as_conversions)]
 const _: () = assert!(
-    (super::HEADERS_BUFFER_BUDGET as u64).is_multiple_of(MAX_BUFFERED_FRAME)
-        && super::HEADERS_BUFFER_BUDGET as u64 / MAX_BUFFERED_FRAME >= 16
+    len_u64(super::HEADERS_BUFFER_BUDGET).is_multiple_of(MAX_BUFFERED_FRAME)
+        && len_u64(super::HEADERS_BUFFER_BUDGET) / MAX_BUFFERED_FRAME >= 16
 );
 
 /// Longest frame header there can be: a type and a length, both varints.
@@ -1129,19 +1125,19 @@ fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Res
         });
     };
 
-    if length > MAX_BUFFERED_FRAME {
+    let Some(remaining) = usize::try_from(length)
+        .ok()
+        .filter(|_| length <= MAX_BUFFERED_FRAME)
+    else {
         return Err(Violation::field_section_too_large(format!(
             "a {length}-byte frame is past what this server buffers"
         ))
         .into());
-    }
+    };
 
     Ok(State::Buffering {
         kind: buffered,
-        // The refusal above leaves nothing above `MAX_BUFFERED_FRAME` here, so
-        // the length is far inside a `usize`.
-        #[allow(clippy::as_conversions)]
-        remaining: length as usize,
+        remaining,
     })
 }
 
@@ -1303,22 +1299,6 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64) -> Option<Viola
             _ => None,
         },
     }
-}
-
-/// How much of a `remaining`-byte frame the chunk in hand settles, and what is
-/// left of the frame after it.
-///
-/// One function for the DATA arm and the Skipping arm of [`FrameDecoder::next_item`],
-/// which compute the same thing: DATA hands the bytes out and Skipping throws
-/// them away, and neither may run past the frame it is in.
-///
-/// Both directions of the conversion are exact: the minimum is at most the
-/// chunk's own length, so it is a `usize` value, and it goes back to `u64` as
-/// the same number. The subtraction cannot underflow for the same reason.
-#[allow(clippy::as_conversions)]
-fn take_from(remaining: u64, chunk_len: usize) -> (usize, u64) {
-    let take = remaining.min(chunk_len as u64);
-    (take as usize, remaining - take)
 }
 
 /// Parses a buffered frame payload.
@@ -1490,7 +1470,7 @@ pub fn seal_data(mut block: BytesMut) -> Bytes {
         .checked_sub(DATA_HEADER_ROOM)
         .filter(|&payload| payload > 0)
         .expect("a block to seal holds a payload: an empty DATA frame is never sent");
-    let length = u64::try_from(payload).expect("a buffer length fits a u64");
+    let length = len_u64(payload);
     let header = crate::datagram::varint_len(DATA) + crate::datagram::varint_len(length);
     let start = DATA_HEADER_ROOM
         .checked_sub(header)
@@ -2996,9 +2976,7 @@ pub(super) mod loopback {
         let mut payload = Vec::new();
         for index in 0..count {
             let body = vec![index; size];
-            // A test size, far inside a `u64`.
-            #[allow(clippy::as_conversions)]
-            put_header(&mut wire, DATA, size as u64);
+            put_header(&mut wire, DATA, crate::datagram::len_u64(size));
             wire.extend_from_slice(&body);
             payload.extend_from_slice(&body);
         }

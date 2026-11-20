@@ -17,6 +17,8 @@ use std::borrow::Cow;
 
 use bytes::{BufMut, BytesMut};
 
+use crate::datagram::len_u64;
+
 use super::error::{Code, Violation};
 use super::huffman;
 
@@ -47,12 +49,8 @@ pub struct Field {
 
 impl Field {
     /// The field's contribution to the field section size (RFC 9114 §4.2.2).
-    // A byte count is a `usize` and a field section size is a `u64`; both
-    // supported targets are 64 bit, so this widening is exact, and the language
-    // has no `From` between the two to say so.
-    #[allow(clippy::as_conversions)]
     fn size(&self) -> u64 {
-        self.name.len() as u64 + self.value.len() as u64 + FIELD_OVERHEAD
+        len_u64(self.name.len()) + len_u64(self.value.len()) + FIELD_OVERHEAD
     }
 }
 
@@ -516,10 +514,7 @@ fn put_int(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: u64) {
 /// `flags` are the bits above the `H` bit, which this encoder always leaves
 /// clear. [`super::huffman`] says why nothing is Huffman-encoded.
 fn put_string(out: &mut BytesMut, prefix_bits: u32, flags: u8, value: &[u8]) {
-    // A byte count is a `usize` and a prefixed integer is a `u64`; the widening
-    // is exact on both supported targets and has no `From` to express it.
-    #[allow(clippy::as_conversions)]
-    put_int(out, prefix_bits, flags << 1, value.len() as u64);
+    put_int(out, prefix_bits, flags << 1, len_u64(value.len()));
     out.put_slice(value);
 }
 

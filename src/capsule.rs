@@ -57,9 +57,7 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// buffer allocated once at the declared length, and keeps no handle on any
 /// chunk once it has been drained. An unknown type is discarded as it arrives
 /// without being buffered at all.
-// 65527 is exact in both types, and a `const` cannot reach `u64::try_from`.
-#[allow(clippy::as_conversions)]
-pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + MAX_UDP_PAYLOAD as u64;
+pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + datagram::len_u64(MAX_UDP_PAYLOAD);
 
 /// Why a capsule sequence could not be decoded.
 ///
@@ -242,16 +240,9 @@ impl CapsuleDecoder {
                     }
                     // Discard as it arrives: an unknown capsule is never
                     // accumulated, however large it claims to be.
-                    // Both directions are exact: the minimum is at most the
-                    // chunk's own length, so it is a `usize` value, and the
-                    // widening back is the same number.
-                    #[allow(clippy::as_conversions)]
-                    let discard = remaining.min(self.chunk.len() as u64);
-                    #[allow(clippy::as_conversions)]
-                    self.chunk.advance(discard as usize);
-                    self.state = State::Skip {
-                        remaining: remaining - discard,
-                    };
+                    let (discard, left) = datagram::take_from(remaining, self.chunk.len());
+                    self.chunk.advance(discard);
+                    self.state = State::Skip { remaining: left };
                 }
 
                 State::Header => {
@@ -260,16 +251,13 @@ impl CapsuleDecoder {
                     };
 
                     if capsule_type == CAPSULE_TYPE_DATAGRAM {
-                        if length > MAX_DATAGRAM_CAPSULE_VALUE {
+                        let Some(value) = usize::try_from(length)
+                            .ok()
+                            .filter(|_| length <= MAX_DATAGRAM_CAPSULE_VALUE)
+                        else {
                             return Err(Error::DatagramTooLarge { length });
-                        }
-                        self.state = State::Value {
-                            // The refusal above leaves nothing past
-                            // `MAX_DATAGRAM_CAPSULE_VALUE` here, so the length
-                            // is far inside a `usize`.
-                            #[allow(clippy::as_conversions)]
-                            length: length as usize,
                         };
+                        self.state = State::Value { length: value };
                     } else {
                         self.state = State::Skip { remaining: length };
                     }
@@ -388,13 +376,7 @@ pub fn put_datagram_header(mut header: &mut [u8], context_id: u64, payload_len: 
 
 /// The Capsule Length of a DATAGRAM capsule: the Context ID and the payload.
 fn datagram_value_len(context_id: u64, payload_len: usize) -> u64 {
-    let value_len = datagram::varint_len(context_id) + payload_len;
-
-    // A byte count is a `usize` and a varint is a `u64`; the widening is exact
-    // on both supported targets and has no `From` to express it.
-    #[allow(clippy::as_conversions)]
-    let wire_len = value_len as u64;
-    wire_len
+    datagram::len_u64(datagram::varint_len(context_id) + payload_len)
 }
 
 /// Encodes a DATAGRAM capsule (RFC 9297 §3.5) into a buffer of its own.
@@ -842,9 +824,7 @@ mod tests {
     fn encode_unknown(capsule_type: u64, value: &[u8]) -> Bytes {
         let mut buf = BytesMut::new();
         datagram::put_varint(&mut buf, capsule_type);
-        // The same exact widening the encoder above states.
-        #[allow(clippy::as_conversions)]
-        datagram::put_varint(&mut buf, value.len() as u64);
+        datagram::put_varint(&mut buf, datagram::len_u64(value.len()));
         buf.put_slice(value);
         buf.freeze()
     }

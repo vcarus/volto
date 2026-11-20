@@ -748,10 +748,7 @@ fn malformed(detail: impl Into<Cow<'static, str>>) -> Violation {
 /// would allocate again on every frame anyway.
 fn frame_header(kind: u64, payload_len: usize) -> Bytes {
     let mut header = BytesMut::with_capacity(2 * VARINT_MAX_LEN);
-    // A byte count is a `usize` and a frame length is a `u64`; the widening is
-    // exact on both supported targets and has no `From` to express it.
-    #[allow(clippy::as_conversions)]
-    frame::put_header(&mut header, kind, payload_len as u64);
+    frame::put_header(&mut header, kind, crate::datagram::len_u64(payload_len));
     header.freeze()
 }
 
