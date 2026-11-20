@@ -805,16 +805,6 @@ impl Server {
                     );
                     established = Some((peer.remote, quic.clone()));
 
-                    // Which of the two log levels this connection deserves is
-                    // decided from the error value `conn::handle` returned, and
-                    // never from `close_reason()` on the kept handle. Returning
-                    // from `conn::handle` drops the HTTP/3 connection, whose
-                    // `Drop` closes the QUIC connection with H3_NO_ERROR; quinn's
-                    // close path then unconditionally overwrites the stored
-                    // reason with `LocallyClosed`. So by the time control is back
-                    // here, `close_reason()` reports that drop rather than
-                    // whatever actually ended the connection, and an idle timeout
-                    // would be logged as an error.
                     let handled = conn::handle(
                         quic,
                         generation,
@@ -829,16 +819,7 @@ impl Server {
                         // The accept loop ended on its own terms: the GOAWAY
                         // drain completed.
                         Ok(()) => Ok(CloseReason::Drained),
-                        Err(error) => match h3api::benign_close(&error) {
-                            // Surge abandons connections without a
-                            // CONNECTION_CLOSE (network switch, app exit), so
-                            // letting one idle out is the everyday goodbye, not a
-                            // failure.
-                            Some(h3api::BenignClose::Idle) => Ok(CloseReason::Idle),
-                            // A peer that closed cleanly is equally routine.
-                            Some(h3api::BenignClose::PeerClosed) => Ok(CloseReason::PeerClosed),
-                            None => Err(error),
-                        },
+                        Err(error) => graded(error),
                     })
                 } => closed,
             };
@@ -958,6 +939,48 @@ enum CloseReason {
     PeerClosed,
 }
 
+/// How a connection that `conn::handle` ended with `error` is reported: an
+/// ordinary goodbye as the [`CloseReason`] the INFO line names, anything else
+/// as the error the WARN line carries.
+///
+/// The judgement is made on the error *value* on purpose. Asking
+/// `quinn::Connection::close_reason()` afterwards cannot work: returning from
+/// `conn::handle` drops the HTTP/3 connection, whose `Drop` closes the QUIC
+/// connection with H3_NO_ERROR, and quinn's close path unconditionally
+/// overwrites whatever reason was stored with `LocallyClosed`. An idle timeout
+/// would then be logged as an error. An error value is immutable and
+/// independent of drop order.
+fn graded(error: h3api::ConnectionError) -> Result<CloseReason, h3api::ConnectionError> {
+    use h3api::{Code, ConnectionError};
+    match error {
+        // The QUIC idle timeout, and nothing else. Clients that abandon a
+        // connection without a CONNECTION_CLOSE, as Surge does on a network
+        // switch or app exit, all end up here.
+        ConnectionError::Timeout => Ok(CloseReason::Idle),
+
+        // 0x0 is the application error code Surge actually sends when it closes
+        // a connection cleanly; H3_NO_ERROR (0x100) is what RFC 9114 §8.1
+        // defines for the same intent. Both mean the peer simply left. Any other
+        // code is the peer reporting a problem and stays a warning.
+        ConnectionError::ApplicationClose { code }
+            if code.value() == 0 || code == Code::H3_NO_ERROR =>
+        {
+            Ok(CloseReason::PeerClosed)
+        }
+
+        // This endpoint closed the connection with nothing to report, which is
+        // what `Connection::close_quietly` does when a peer that never
+        // authenticated has gone silent for too long (D76). The peer was idle;
+        // that an application timer rather than the transport's own noticed it
+        // does not make it a fault.
+        ConnectionError::Local(ref violation) if violation.code() == Code::H3_NO_ERROR => {
+            Ok(CloseReason::Idle)
+        }
+
+        error => Err(error),
+    }
+}
+
 impl CloseReason {
     /// The value of the `reason` field on log line `8ro19wv6`.
     ///
@@ -983,8 +1006,7 @@ impl CloseReason {
 /// as D72's traffic counters could land on only one of them.
 ///
 /// `closed` is graded from the error *value* rather than from
-/// `Connection::close_reason()`, for the reason [`Server::serve`] gives where it
-/// is decided.
+/// `Connection::close_reason()`, for the reason [`graded`] gives.
 ///
 /// # What the fields report
 ///
@@ -1183,6 +1205,54 @@ pub(crate) mod tests {
         has_started.recv().expect("the reload thread started");
         std::thread::sleep(SETTLE);
         reloading
+    }
+
+    /// The grading the closing line logs by: three endings are routine, the
+    /// rest warn.
+    #[test]
+    fn routine_endings_are_graded_as_such() {
+        use h3api::{Code, ConnectionError, Violation};
+        assert_eq!(
+            graded(ConnectionError::Timeout).ok(),
+            Some(CloseReason::Idle)
+        );
+        for code in [Code::new(0), Code::H3_NO_ERROR] {
+            assert_eq!(
+                graded(ConnectionError::ApplicationClose { code }).ok(),
+                Some(CloseReason::PeerClosed),
+                "{code}"
+            );
+        }
+        // A close this endpoint makes with nothing to report is graded with
+        // the idle timeout it stands in for, not with the violations (D76).
+        let quiet = Violation::connection(Code::H3_NO_ERROR, "no request within the timeout");
+        assert_eq!(
+            graded(ConnectionError::Local(quiet)).ok(),
+            Some(CloseReason::Idle)
+        );
+    }
+
+    #[test]
+    fn a_reported_problem_still_warns() {
+        use h3api::{Code, ConnectionError, Violation};
+        assert!(
+            graded(ConnectionError::ApplicationClose {
+                code: Code::new(42)
+            })
+            .is_err()
+        );
+        // A violation is still a violation, whatever its code says about us.
+        let violation = Violation::connection(
+            Code::H3_FRAME_UNEXPECTED,
+            "a frame that may not appear here",
+        );
+        assert!(graded(ConnectionError::Local(violation)).is_err());
+        assert!(
+            graded(ConnectionError::Transport(
+                quinn::ConnectionError::LocallyClosed
+            ))
+            .is_err()
+        );
     }
 
     /// Connections accepted under one configuration generation share its

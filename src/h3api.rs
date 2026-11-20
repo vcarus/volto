@@ -53,59 +53,14 @@ pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
     }
 }
 
-/// How a connection ended, when it ended with an error not worth a warning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BenignClose {
-    /// The peer went silent and the idle timeout expired.
-    Idle,
-    /// The peer closed the connection cleanly, without an error code.
-    PeerClosed,
-}
-
-/// Classifies a connection-level error that is an ordinary goodbye rather than a
-/// failure, or `None` if it deserves a warning.
-///
-/// The judgement is made on the error *value* on purpose. Asking
-/// `quinn::Connection::close_reason()` afterwards cannot work: dropping the
-/// HTTP/3 connection closes the QUIC connection with
-/// H3_NO_ERROR, and quinn's close path unconditionally overwrites whatever
-/// reason was stored with `LocallyClosed`. By the time a caller could ask, the
-/// real reason is gone. An error value, by contrast, is immutable and independent
-/// of drop order.
-pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
-    match error {
-        // The QUIC idle timeout, and nothing else. Clients that abandon a
-        // connection without a CONNECTION_CLOSE, as Surge does on a network
-        // switch or app exit, all end up here.
-        ConnectionError::Timeout => Some(BenignClose::Idle),
-
-        // 0x0 is the application error code Surge actually sends when it closes
-        // a connection cleanly; H3_NO_ERROR (0x100) is what RFC 9114 §8.1
-        // defines for the same intent. Both mean the peer simply left. Any other
-        // code is the peer reporting a problem and stays a warning.
-        ConnectionError::ApplicationClose { code }
-            if code.value() == 0 || *code == Code::H3_NO_ERROR =>
-        {
-            Some(BenignClose::PeerClosed)
-        }
-
-        // This endpoint closed the connection with nothing to report, which is
-        // what `Connection::close_quietly` does when a peer that never
-        // authenticated has gone silent for too long (D76). The peer was idle;
-        // that an application timer rather than the transport's own noticed it
-        // does not make it a fault.
-        ConnectionError::Local(violation) if violation.code() == Code::H3_NO_ERROR => {
-            Some(BenignClose::Idle)
-        }
-
-        _ => None,
-    }
-}
+/// For `quic`'s tests of how a connection's end is graded, which build a
+/// local close.
+#[cfg(test)]
+pub(crate) use crate::h3::error::Violation;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::h3::error::Violation;
 
     #[test]
     fn a_peer_reset_is_told_apart_from_every_other_failure() {
@@ -117,60 +72,6 @@ mod tests {
         );
         assert_eq!(
             peer_reset_code(&StreamError::Connection(ConnectionError::Timeout)),
-            None
-        );
-    }
-
-    /// The grading `quic/mod.rs` logs by: two endings are routine, the rest
-    /// warn.
-    #[test]
-    fn routine_endings_are_graded_as_such() {
-        assert_eq!(
-            benign_close(&ConnectionError::Timeout),
-            Some(BenignClose::Idle)
-        );
-        for code in [Code::new(0), Code::H3_NO_ERROR] {
-            assert_eq!(
-                benign_close(&ConnectionError::ApplicationClose { code }),
-                Some(BenignClose::PeerClosed),
-                "{code}"
-            );
-        }
-    }
-
-    /// A close this endpoint makes with nothing to report is graded with the
-    /// idle timeout it stands in for, not with the violations (D76).
-    #[test]
-    fn our_own_quiet_close_is_routine() {
-        assert_eq!(
-            benign_close(&ConnectionError::Local(Violation::connection(
-                Code::H3_NO_ERROR,
-                "no request within the timeout"
-            ))),
-            Some(BenignClose::Idle)
-        );
-    }
-
-    #[test]
-    fn a_reported_problem_still_warns() {
-        assert_eq!(
-            benign_close(&ConnectionError::ApplicationClose {
-                code: Code::new(42)
-            }),
-            None
-        );
-        // A violation is still a violation, whatever its code says about us.
-        assert_eq!(
-            benign_close(&ConnectionError::Local(Violation::connection(
-                Code::H3_FRAME_UNEXPECTED,
-                "a frame that may not appear here"
-            ))),
-            None
-        );
-        assert_eq!(
-            benign_close(&ConnectionError::Transport(
-                quinn::ConnectionError::LocallyClosed
-            )),
             None
         );
     }

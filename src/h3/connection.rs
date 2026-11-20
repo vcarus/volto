@@ -1093,9 +1093,9 @@ impl Connection {
     //# stream needs to be closed, but there is no error to signal.
     ///
     /// `reason` reaches the peer in the CONNECTION_CLOSE frame and comes back
-    /// in the returned error, which [`crate::h3api::benign_close`] grades as a
-    /// routine ending rather than a fault. So the caller can `break` on it and
-    /// the connection's closing line stays at the level an idle timeout gets.
+    /// in the returned error, which `quic::graded` grades as a routine ending
+    /// rather than a fault. So the caller can `break` on it and the
+    /// connection's closing line stays at the level an idle timeout gets.
     /// The error is returned rather than logged here to keep that grading in
     /// one place (D50).
     ///

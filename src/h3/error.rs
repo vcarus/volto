@@ -227,10 +227,10 @@ impl fmt::Display for Violation {
 /// Error affecting the whole HTTP/3 connection.
 ///
 /// The variants are the four endings that need telling apart downstream.
-/// [`crate::h3api::benign_close`] grades them by variant and code, not by
-/// variant alone: an `ApplicationClose` with code 0 or `H3_NO_ERROR`, the
-/// `Timeout`, and a `Local` with `H3_NO_ERROR` are ordinary goodbyes, and every
-/// other case is a fault. Everything the QUIC layer reports that is neither an
+/// `quic::graded` grades them by variant and code, not by variant alone: an
+/// `ApplicationClose` with code 0 or `H3_NO_ERROR`, the `Timeout`, and a
+/// `Local` with `H3_NO_ERROR` are ordinary goodbyes, and every other case is a
+/// fault. Everything the QUIC layer reports that is neither an
 /// application close nor the idle timeout stays in
 /// [`ConnectionError::Transport`] with quinn's own error inside it, so nothing
 /// is flattened away before an operator sees it.
@@ -252,8 +252,8 @@ pub enum ConnectionError {
 }
 
 impl From<quinn::ConnectionError> for ConnectionError {
-    /// Keeps exactly the two cases [`crate::h3api::benign_close`] grades on, and
-    /// takes the peer's prose apart from its verdict on the way.
+    /// Keeps exactly the two cases `quic::graded` grades on, and takes the
+    /// peer's prose apart from its verdict on the way.
     ///
     /// `LocallyClosed` deliberately stays in `Transport`. Every close this
     /// server makes on purpose, the quiet idle close included, is reported as
@@ -268,8 +268,8 @@ impl From<quinn::ConnectionError> for ConnectionError {
     /// ended badly; [`crate::logfmt::peer_error`] says what that would cost.
     ///
     /// For an application close only the code survives the conversion, because
-    /// [`crate::h3api::benign_close`] grades on the code and nothing downstream
-    /// reads the text. The transport case keeps quinn's error whole, because a
+    /// `quic::graded` grades on the code and nothing downstream reads the
+    /// text. The transport case keeps quinn's error whole, because a
     /// peer's QUIC stack reports useful detail there. Its phrase is bounded and
     /// escaped here by [`crate::logfmt::peer_error`], where the peer's bytes
     /// enter this type, rather than where they are logged.
