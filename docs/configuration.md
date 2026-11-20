@@ -864,7 +864,7 @@ because the same message can quote a password, and a key is quoted the same way:
 Error: failed to parse config file /etc/volto/config.toml at line 181, column 1: unknown field `<redacted>`
 ```
 
-The line number is the thread to pull: comment that key out and start the
+The line number is what to act on: comment that key out and start the
 service. To find out before the restart instead of after it, ask the binary you
 are about to install:
 
@@ -887,7 +887,7 @@ with the table below and the line number in the journal.
 | `[security].require_ech` | the release after v1.5.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
-bites in practice, because the shipped example sets it and every install made by
+matters in practice, because the shipped example sets it and every install made by
 `install-selfsigned.sh` is derived from that example — so a host first installed
 at v0.4.5 or later carries it whether or not anyone chose it.
 

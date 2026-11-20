@@ -375,26 +375,20 @@ Add `--force` when the host already reports the version being pinned to. The
 convergence check compares version strings, so without it that run is a no-op
 and the binary on the host stays where it is.
 
-Before pinning anything older than v0.4.5, comment `mtu_upper_bound` out of
-`/etc/volto/config.toml`: every install carries that key, no earlier release
-knows it, and a volto refuses the whole file rather than the one key it cannot
-read.
-
-It is also the one flow nobody rehearses, so the script says the two things
-that bite on the way back before it does anything about them.
+It is also the one flow nobody rehearses, so the script states the two things
+that go wrong on the way back before it does anything about them.
 
 **The config file goes back with nothing.** The script never rewrites
 `/etc/volto/config.toml` or the certificate — both belong to
 `install-selfsigned.sh`'s first run and to you afterwards — and an older volto
 refuses a key it does not know, refusing the *whole* file rather than the key,
-so the service does not start at all. `mtu_upper_bound` is the one that bites in
-practice: it reached the shipped example in v0.4.5, and every install is derived
-from that example. The startup error names the file, the line and the column;
-comment that key out and start the service, or comment out everything
-introduced after the target release beforehand. See
-[version compatibility](configuration.md#version-compatibility) for which key
-arrived when. On a rollback the check above catches this first, when the target
-release is new enough to be asked.
+so the service does not start at all. Before pinning, comment out every key
+introduced after the target release; for anything older than v0.4.5 that
+includes `mtu_upper_bound`, which every install carries. On a rollback the
+check above catches this first, when the target release is new enough to be
+asked. [Version compatibility](configuration.md#version-compatibility) says
+which key arrived when, why every install carries `mtu_upper_bound`, and what
+the startup error looks like and how to act on it.
 
 The script's own guardrail does not help here, and reads backwards if you are
 not expecting it: when the newly installed binary is not running a few seconds
