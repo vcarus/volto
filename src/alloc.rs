@@ -18,7 +18,7 @@
 //!
 //! [`Global`] is a type alias, not a wrapper type. Both possible types already
 //! implement [`std::alloc::GlobalAlloc`], so nothing here needs `unsafe`, and
-//! the crate keeps `#![forbid(unsafe_code)]`.
+//! this module stays under the crate's `#![deny(unsafe_code)]`.
 
 /// The allocator type: `mimalloc::MiMalloc` on musl, [`std::alloc::System`]
 /// otherwise.

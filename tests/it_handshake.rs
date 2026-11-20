@@ -897,29 +897,49 @@ async fn a_connection_still_handshaking_hears_about_its_eviction() {
 // 0-RTT is off, and pinned off rather than inherited
 // ---------------------------------------------------------------------------
 
-/// The server must not let a returning client send early data.
+/// The server must not let a returning client send early data, and it issues
+/// no session ticket to return with.
 ///
-/// `src/tls.rs` builds the rustls `ServerConfig` by hand, so
-/// `max_early_data_size` is whatever is set there — quinn's own
-/// `with_single_cert` sets `u32::MAX`, and rustls' default is 0. The value is
-/// pinned to 0 for the reason RFC 9001 §9.2 gives, and this is what says so from
-/// the wire.
+/// RFC 9001 §9.2 has the application protocol justify 0-RTT, and this one does
+/// not use it; D115 item 3 turns resumption off as well, because without 0-RTT
+/// it saves no round trip and a ticket links one connection to the next. The
+/// server's TLS (`src/tls/awslc/`) therefore issues no ticket, and a returning
+/// client has nothing to offer early data on.
 ///
-/// The client is as willing as a client can be: `enable_early_data`, a session
-/// store it keeps, and a first connection whose ticket has demonstrably arrived
-/// before the second one starts. Without that wait the assertion would hold for
-/// the wrong reason — a client with nothing to resume cannot offer 0-RTT
-/// whatever the server permits.
+/// The client is as willing as a client can be: `enable_early_data` and a
+/// session store it keeps. Before rustls stopped being the server, this test
+/// waited for a ticket and then saw 0-RTT refused on it; there is no ticket now,
+/// so it waits instead for the server's first stream after the handshake. A
+/// TLS 1.3 server sends its tickets with the end of its handshake, before any
+/// application data, so a ticket would have reached the store by then. The
+/// assertion that a ticket, if one were forced on, would still carry no
+/// `early_data` extension is a unit test beside the provider
+/// (`a_ticket_would_not_offer_early_data_either`), because only the in-memory
+/// harness can force tickets on.
 #[tokio::test]
 async fn the_server_does_not_permit_zero_rtt() {
     let server = TestServer::start().await;
     let (endpoint, tickets) = resuming_client_endpoint(&server.ca);
 
-    // Held open: the ticket arrives on this connection, after its handshake.
-    let _first = finish_connect(&endpoint, server.addr)
+    // Held open: anything the server sends after its handshake arrives on this
+    // connection.
+    let first = finish_connect(&endpoint, server.addr)
         .await
         .expect("the first handshake must succeed");
-    await_ticket(&tickets).await;
+    let mut control = tokio::time::timeout(TIMEOUT, first.accept_uni())
+        .await
+        .expect("the server's control stream must arrive")
+        .expect("the server opens its control stream");
+    let mut byte = [0u8; 1];
+    tokio::time::timeout(TIMEOUT, control.read_exact(&mut byte))
+        .await
+        .expect("the control stream must carry its first byte")
+        .expect("the control stream is readable");
+    assert_eq!(
+        tickets.load(Ordering::Relaxed),
+        0,
+        "the server issued a session ticket; D115 item 3 turns resumption off"
+    );
 
     let second = endpoint
         .connect(server.addr, "localhost")
@@ -929,36 +949,24 @@ async fn the_server_does_not_permit_zero_rtt() {
     };
 
     // What was refused is the early data and not the connection: the ordinary
-    // handshake still completes on the ticket the client kept.
+    // handshake still completes.
     let second = tokio::time::timeout(TIMEOUT, second)
         .await
         .expect("the second handshake must not hang")
         .expect("the second handshake must succeed without 0-RTT");
     assert!(
         second.close_reason().is_none(),
-        "the resumed connection must be usable"
+        "the second connection must be usable"
+    );
+    assert_eq!(
+        tickets.load(Ordering::Relaxed),
+        0,
+        "no ticket on the second connection either"
     );
 }
 
-/// Waits until the server has sent a TLS 1.3 session ticket, or gives up.
-///
-/// The ticket is what a resumption is built on and it arrives after the
-/// handshake, so this is the difference between asserting that 0-RTT was refused
-/// and asserting that there was nothing to offer.
-async fn await_ticket(tickets: &AtomicUsize) {
-    let deadline = std::time::Instant::now() + TIMEOUT;
-    while tickets.load(Ordering::Relaxed) == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the server sent no session ticket within {TIMEOUT:?}, so there was never \
-             anything to resume"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 /// A client endpoint that keeps session tickets and is willing to use them for
-/// early data.
+/// early data, with a count of the tickets that reach its store.
 ///
 /// Built here rather than through `common::client_endpoint` because it differs
 /// from every other client in this suite in exactly the way this one test needs.
@@ -1004,7 +1012,7 @@ fn resuming_client_endpoint(ca: &CertificateDer<'static>) -> (quinn::Endpoint, A
 /// it.
 ///
 /// Every method delegates; the count is the only thing added, and it is what
-/// [`await_ticket`] waits on.
+/// the zero-RTT test reads.
 #[derive(Debug)]
 struct CountingSessionStore {
     inner: ClientSessionMemoryCache,

@@ -11,7 +11,8 @@
 //! * [`auth`]: HTTP Basic authentication of CONNECT requests.
 //! * [`config`]: TOML configuration and its validation.
 //! * [`policy`]: the destination ACL: which targets may be reached.
-//! * [`tls`]: certificate/key loading and the rustls server configuration.
+//! * [`tls`]: certificate/key loading and the server's TLS, volto's own quinn
+//!   provider on AWS-LC's libssl with optional ECH.
 //! * [`gate`]: the SNI gate: which handshakes reach quinn at all.
 //! * [`quic`]: the QUIC endpoint, transport parameters and the accept loop.
 //! * [`congestion`]: the default `bbr` controller, quinn's BBR with its window
@@ -45,15 +46,21 @@
 //!   turning the [`gate`] on without knowing the name is a server nobody can
 //!   reach.
 
-// No `unsafe` in the server: the raw socket and resource calls it needs go
-// through the safe wrappers of rustix and socket2. rustix carries `getrlimit`
-// for the startup fd check and `IP_MTU_DISCOVER` for the DF bit, and socket2
-// carries `SO_RCVBUF` and `SO_SNDBUF` on the endpoint socket and the vectored
-// read of a target socket in `tunnel::udp`. So the property is pinned here.
-// `forbid` rather than `deny` so it cannot be opted out of module by module: a
-// future need for `unsafe` should be an argued change to this line, not a local
-// `allow`.
-#![forbid(unsafe_code)]
+// No `unsafe` in the server outside one module. The raw socket and resource
+// calls it needs go through the safe wrappers of rustix and socket2: rustix
+// carries `getrlimit` for the startup fd check and `IP_MTU_DISCOVER` for the DF
+// bit, and socket2 carries `SO_RCVBUF` and `SO_SNDBUF` on the endpoint socket
+// and the vectored read of a target socket in `tunnel::udp`.
+//
+// The exception is `tls::awslc`, the binding to AWS-LC's libssl that runs the
+// server's TLS (D115). rustls has no server-side ECH, and no safe Rust crate
+// wraps libssl's QUIC and ECH interfaces, so the provider calls them through
+// `aws-lc-sys` and carries `#[allow(unsafe_code)]`, which `tls.rs` declares on
+// that one module. That is why this is `deny` and not `forbid`: `forbid`
+// cannot be lifted for one module. Any other `allow(unsafe_code)` in `src/` is
+// a change to this paragraph, and `tests/it_release_assets.rs` holds the crate
+// to it. `main.rs` keeps `forbid`, since the binary calls the library only.
+#![deny(unsafe_code)]
 // Every public item carries a doc comment, and this lint enforces it.
 // `cargo doc` is published for this crate, so a `pub` item without a doc comment
 // leaves the published page incomplete. `warn` here rather than `deny`,

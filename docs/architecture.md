@@ -36,6 +36,25 @@ warning rather than silent packet loss. Being a property of the socket rather
 than of a connection, these two are the only `[limits]` keys a reload cannot
 change.
 
+### TLS
+
+The handshake runs on AWS-LC's libssl, the TLS library of the same AWS-LC build
+that rustls uses for its cryptography. `tls/awslc/` is volto's own quinn crypto
+provider over it: libssl runs the TLS 1.3 state machine and hands over the
+traffic secrets of each encryption level, and the provider turns them into
+quinn's packet and header protection keys with aws-lc-rs. rustls has no
+server-side Encrypted Client Hello, which is why the server does not use it;
+every client in the test suite is still rustls, so the two ends of each test run
+on different TLS implementations.
+
+The server offers TLS 1.3 only, with the three TLS 1.3 cipher suites, the key
+exchange groups X25519MLKEM768, X25519, P-256 and P-384 in the client's order of
+preference, and the ALPN identifiers of `server.alpn`. A client that shares no
+ALPN identifier with the server is refused with `no_application_protocol`. It
+issues no session tickets and accepts no 0-RTT data, so every connection is a
+full handshake. The provider is the one module of the crate that uses
+`unsafe`, and the reason is stated where the crate denies it, in `lib.rs`.
+
 ### The SNI gate
 
 `gate.rs` sits between that socket and quinn. It is an `AsyncUdpSocket` wrapper,
@@ -87,16 +106,18 @@ large enough packet naming an unsupported version; with the gate open it sends
 nothing. RFC 6066 §3 says a server that does not recognise the name "SHOULD take
 one of two actions: either abort the handshake by sending a fatal-level
 `unrecognized_name(112)` alert or continue the handshake"; the socket-level check
-does neither, and the second check below aborts with a different alert.
+does neither, and the second check below takes the first of the two actions.
 
-That second check is in `tls.rs`. The gate reads only what arrives in the first
-Initial packet, and a ClientHello large enough to be split across several of them
-is passed through on purpose — refusing a first flight whose extensions have not
-arrived would make a large ClientHello unreachable. Such a handshake is stopped
-by a `ResolvesServerCert` that declines to present a certificate for a name that
-is not on the list, which rustls turns into a fatal `access_denied` alert. It is
-not a certificate selector: there is still one certificate and one key, and
-naming several hosts means answering to all of them with the same certificate.
+That second check is in the server's TLS (`tls/awslc/`). The gate reads only
+what arrives in the first Initial packet, and a ClientHello large enough to be
+split across several of them is passed through on purpose: refusing a first
+flight whose extensions have not arrived would make a large ClientHello
+unreachable. Such a handshake is stopped by a ClientHello callback that refuses
+a name that is not on the list with a fatal `unrecognized_name(112)` alert,
+before the server sends anything. It is not a certificate selector: there is
+still one certificate and one key, and naming several hosts means answering to
+all of them with the same certificate. With ECH accepted, the name it judges is
+the one inside the encrypted ClientHello; otherwise it is the one in the clear.
 
 Stateless resets are deliberately left uncovered — see D106 and the
 [configuration reference](configuration.md#the-sni-gate) for what that leaves

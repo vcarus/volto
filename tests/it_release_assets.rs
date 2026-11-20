@@ -1137,3 +1137,132 @@ lto = true
     );
     assert_eq!(read("[profile.bench]", "overflow-checks"), None);
 }
+
+/// Whether `code` holds the keyword `unsafe` rather than `unsafe_code`.
+fn has_unsafe_keyword(code: &str) -> bool {
+    code.match_indices("unsafe").any(|(at, _)| {
+        let before = code[..at].chars().next_back();
+        let after = code[at + "unsafe".len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// `unsafe` in `src/` is confined to the libssl binding, and each use of it
+/// says why it is sound.
+///
+/// `src/lib.rs` carries `#![deny(unsafe_code)]` rather than `forbid`, because
+/// the server's TLS (D115) is a binding to AWS-LC's libssl that needs `unsafe`,
+/// and `forbid` cannot be lifted for one module. What `forbid` gave by itself is
+/// asserted here instead: `main.rs` still forbids it, `lib.rs` denies it, the
+/// one `allow(unsafe_code)` in `src/` is the one on `mod awslc` in `src/tls.rs`,
+/// and no file outside `src/tls/awslc/` writes the keyword. Inside that
+/// directory every `unsafe` block and `unsafe impl` has a `SAFETY:` comment
+/// above it, among the lines of the same statement, and every `unsafe fn` a
+/// `# Safety` section in its doc comment.
+#[test]
+fn unsafe_code_in_src_is_confined_to_the_libssl_binding() {
+    let root = source_root();
+    let mut allows = Vec::new();
+    let mut outside = Vec::new();
+    let mut unexplained = Vec::new();
+    for path in rust_files(&root) {
+        let relative = path
+            .strip_prefix(&root)
+            .expect("under src")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = read_text(&path);
+        let raw: Vec<&str> = text.lines().collect();
+        let code = scripts::code_lines(&text);
+        let in_binding = relative.starts_with("tls/awslc/");
+        for (index, line) in code.iter().enumerate() {
+            let Some(line) = line else { continue };
+            if line.contains("allow(unsafe_code)") {
+                allows.push(format!("src/{relative}"));
+            }
+            if !has_unsafe_keyword(line) {
+                continue;
+            }
+            if !in_binding {
+                outside.push(format!("src/{relative}:{}: {}", index + 1, line.trim()));
+                continue;
+            }
+            let explained = if line.contains("unsafe fn") || line.contains("unsafe extern") {
+                raw[..index]
+                    .iter()
+                    .rev()
+                    .take_while(|l| {
+                        l.trim_start().starts_with("///") || l.trim_start().starts_with("#[")
+                    })
+                    .any(|l| l.contains("# Safety"))
+            } else {
+                // Up through the lines of the same statement to the comment
+                // above it: stop at a line whose code ends one.
+                let mut found = false;
+                for back in (0..index).rev().take(20) {
+                    if raw[back].trim_start().starts_with("//") {
+                        if raw[back].contains("SAFETY") {
+                            found = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    match &code[back] {
+                        Some(previous)
+                            if previous.trim_end().ends_with(';')
+                                || previous.trim_end().ends_with('}') =>
+                        {
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                found
+            };
+            if !explained {
+                unexplained.push(format!("src/{relative}:{}: {}", index + 1, line.trim()));
+            }
+        }
+    }
+    assert_eq!(
+        allows,
+        ["src/tls.rs"],
+        "allow(unsafe_code) outside the one argued place"
+    );
+    assert!(
+        outside.is_empty(),
+        "`unsafe` outside src/tls/awslc/:\n{}",
+        outside.join("\n")
+    );
+    assert!(
+        unexplained.is_empty(),
+        "`unsafe` without a SAFETY comment or a # Safety section:\n{}",
+        unexplained.join("\n")
+    );
+
+    let code_of = |file: &str| {
+        scripts::code_lines(&read_text(&root.join(file)))
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        code_of("main.rs")
+            .iter()
+            .any(|l| l.trim() == "#![forbid(unsafe_code)]")
+    );
+    assert!(
+        code_of("lib.rs")
+            .iter()
+            .any(|l| l.trim() == "#![deny(unsafe_code)]")
+    );
+}
+
+#[test]
+fn has_unsafe_keyword_tells_the_keyword_from_the_lint() {
+    assert!(has_unsafe_keyword("let x = unsafe { f() };"));
+    assert!(has_unsafe_keyword("unsafe impl Send for X {}"));
+    assert!(!has_unsafe_keyword("#![deny(unsafe_code)]"));
+    assert!(!has_unsafe_keyword("not_unsafe()"));
+}

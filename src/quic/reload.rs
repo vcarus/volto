@@ -7,7 +7,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use anyhow::{Context, Result, bail};
-use quinn::crypto::rustls::QuicServerConfig;
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -42,11 +41,8 @@ use super::transport::transport_config;
 /// handshake time. QUIC has no way to renegotiate them mid-connection, so this
 /// is a property of the protocol rather than a shortcut.
 pub(super) fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
-    let crypto = tls::server_crypto(config)?;
-    let quic_crypto = QuicServerConfig::try_from(crypto)
-        .context("rustls configuration is not usable for QUIC (TLS 1.3 is required)")?;
-
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    let crypto = tls::server_config(config)?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport_config(&config.limits)?));
 
     Ok(server_config)

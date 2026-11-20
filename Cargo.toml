@@ -130,8 +130,8 @@ anyhow = "1"
 # Safe wrappers around the syscalls that have no portable equivalent in std:
 # getrlimit(RLIMIT_NOFILE) for the startup fd-budget check (POSIX, both hosts)
 # and IP_MTU_DISCOVER for the DF bit (Linux only, behind cfg in net.rs). Both
-# used to be hand-written `libc` FFI, and replacing them is what lets `src/`
-# carry `#![forbid(unsafe_code)]`.
+# used to be hand-written `libc` FFI, and replacing them is what keeps `unsafe`
+# out of `src/` apart from the TLS binding (`src/lib.rs` says which module).
 #
 # It is pure Rust with no C to build -- on Linux it issues the syscalls itself
 # rather than linking libc's -- so it adds nothing to the musl cross-build that
@@ -353,8 +353,9 @@ overflow-checks = true
 [lints.rust]
 # The default for every target in the package, tests and examples included: a
 # new file that wants `unsafe` must argue for a file-level `allow` (today there
-# are three, all in tests). `src/` is stricter still -- its two crate roots
-# carry `forbid`, which an inner `allow` cannot weaken.
+# are three in tests). In `src/`, `main.rs` carries `forbid`, which an inner
+# `allow` cannot weaken, and `lib.rs` carries `deny` with one module-level
+# `allow`, on the libssl binding `tls::awslc` (D115); `src/lib.rs` says why.
 unsafe_code = "deny"
 
 [lints.clippy]
