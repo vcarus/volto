@@ -1029,14 +1029,13 @@ impl Writer {
     /// is kept registers once and is a bare `Notified` poll afterwards.
     ///
     /// This is safe where `quinn::RecvStream::received_reset` is not (see
-    /// [`Reader::reset_by_peer`]): quinn keeps no single-slot waker for it, but
-    /// a `Notify` per stream, created on the first poll that has to wait. The
-    /// connection wakes and removes it when the peer stops the stream, when a
-    /// finished stream's data is all acknowledged, and when the connection
-    /// ends. Nothing else removes it, so a stream this endpoint resets keeps its
-    /// entry, a map slot and an `Arc<Notify>`, until the connection closes.
-    /// That is quinn's bookkeeping and cannot be avoided here without giving up
-    /// the `STOP_SENDING` watch.
+    /// [`Reader::reset_by_peer`]): quinn keeps a `Notify` per stream rather
+    /// than a single-slot waker, and removes it only when the peer stops the
+    /// stream, a finished stream's data is all acknowledged, or the connection
+    /// ends. So a stream this endpoint resets keeps its entry, a map slot and
+    /// an `Arc<Notify>`, until the connection closes, and the map grows by one
+    /// for each such stream; that is quinn's bookkeeping and cannot be avoided
+    /// without giving up the `STOP_SENDING` watch.
     ///
     /// Cancel-safe, so a `select!` may poll it and set it aside repeatedly.
     ///
@@ -1175,8 +1174,7 @@ impl Reader {
     /// stream that has bytes to give, so the watcher looks again on a timer
     /// instead. A reset that lands while quinn has nothing of the stream wakes
     /// the waiting read at once. Bytes in the read-ahead do not count either
-    /// way, because they have already left quinn; [`Reader::reset_by_peer`]
-    /// says how that plays out.
+    /// way (see `FrameReader::readable`).
     ///
     /// 250 ms is an order of magnitude under the bound the regression test
     /// holds the target's close to. Without a bound, a client that reset its
@@ -1210,20 +1208,15 @@ impl Reader {
     /// and `RecvStream::drop` while `all_data_read` is still false. The end of
     /// the connection empties every slot. A read that *succeeds* takes nothing
     /// out, so an entry outlives every later read of the bytes it was waiting
-    /// for. That
-    /// call writes into the slot on every poll that finds no reset, and a
-    /// `select!` which drops the arm leaves it behind.
+    /// for. That call writes into the slot on every poll that finds no reset,
+    /// and a `select!` which drops the arm leaves it behind.
     ///
-    /// In release builds that is a leak: one waker per tunnel, held until the
-    /// connection closes, keeping the finished task's cell alive with it. In
-    /// debug builds it is a panic, because `RecvStream::drop` debug-asserts the
-    /// slot is empty once the stream has been read to its end. An ordinary
-    /// upload causes it. The client sends chunk after chunk with its FIN behind
-    /// them, the pump waits writing chunk *k* while *k+1* onwards are already
-    /// buffered, and every one of those iterations leaves another waker behind.
-    /// Nothing becomes readable after the FIN, so the last one is never
-    /// cleared, and the clean end of the stream then panics the tunnel's task
-    /// inside a destructor.
+    /// In release builds that is a leak of one waker per tunnel until the
+    /// connection closes. In debug builds it is a panic, because
+    /// `RecvStream::drop` debug-asserts the slot is empty once the stream has
+    /// been read to its end, and an ordinary upload, whose pump waits in a
+    /// write while later chunks and the FIN are already buffered, leaves such
+    /// an entry behind.
     ///
     /// So the wait is built on the zero-length read alone, which registers only
     /// through quinn's own read path. That kind of entry is safe to abandon:
@@ -1242,19 +1235,12 @@ impl Reader {
     ///
     /// # The read-ahead
     ///
-    /// The zero-length read asks quinn, and the chunks in the read-ahead
-    /// ([`frame::READ_AHEAD_CHUNKS`]) have already left quinn. So the choice
-    /// between the timer and a wake-up depends on whether quinn holds bytes
-    /// beyond what the last read took. A stalled upload whose client keeps
-    /// sending refills quinn and is on the timer. A stalled upload whose last
-    /// read took everything quinn had waits in the zero-length read, and a
-    /// reset wakes it at once.
-    ///
-    /// A reset found here is reported while the read-ahead may still hold
-    /// bytes the client sent before it. The reading half would hand those out
-    /// first; this reports only the reset, and a tunnel acting on it drops them
-    /// with the rest of the stream. That matches quinn, which discards a reset
-    /// stream's unread bytes.
+    /// The zero-length read asks quinn alone (`FrameReader::readable` says
+    /// what that leaves out). A reset found here is reported while the
+    /// read-ahead may still hold bytes the client sent before it. The reading
+    /// half would hand those out first; this reports only the reset, and a
+    /// tunnel acting on it drops them with the rest of the stream. That matches
+    /// quinn, which discards a reset stream's unread bytes.
     ///
     /// # A lost connection
     ///
