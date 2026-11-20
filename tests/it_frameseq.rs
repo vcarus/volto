@@ -75,7 +75,7 @@ use common::rawstream::{
     H3_SETTINGS_ERROR, H3_STREAM_CREATION_ERROR, RESERVED_HTTP2_TYPES, SETTINGS_H3_DATAGRAM,
     SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
     STREAM_QPACK_ENCODER, application_close, connect_headers_frame, frame, grease_type, read_frame,
-    status_of, varint_frame,
+    settings_frame, status_of, varint_frame,
 };
 use common::{TIMEOUT, TestServer, connect_quic, spawn_echo_target};
 use volto::datagram;
@@ -130,16 +130,6 @@ where
             .await
             .expect("a case must not outlast its timeout");
     });
-}
-
-/// A SETTINGS frame carrying the given identifier/value pairs.
-fn settings_frame(pairs: &[(u64, u64)]) -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    for (identifier, value) in pairs {
-        datagram::put_varint(&mut payload, *identifier);
-        datagram::put_varint(&mut payload, *value);
-    }
-    frame(FRAME_SETTINGS, &payload)
 }
 
 /// A deterministic fill for frame payloads whose bytes carry no meaning.

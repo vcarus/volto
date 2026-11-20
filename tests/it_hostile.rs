@@ -93,11 +93,11 @@ use common::rawstream::{
     DENIED_TARGET, FRAME_CANCEL_PUSH, FRAME_DATA, FRAME_GOAWAY, FRAME_HEADERS, FRAME_MAX_PUSH_ID,
     FRAME_PUSH_PROMISE, FRAME_SETTINGS, H3_CLOSED_CRITICAL_STREAM, H3_EXCESSIVE_LOAD,
     H3_FRAME_UNEXPECTED, H3_ID_ERROR, H3_MISSING_SETTINGS, H3_NO_ERROR, H3_REQUEST_CANCELLED,
-    H3_STREAM_CREATION_ERROR, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER,
-    STREAM_QPACK_ENCODER, announce_full_sized_headers, application_close, assert_closed_with,
-    authenticate, authenticated_connect_headers_frame, collect_refusals, connect_headers_frame,
-    frame, grease_type, headers_frame, open_uni_stream, read_frame, status_of, status_of_response,
-    still_serving, varint_frame,
+    H3_STREAM_CREATION_ERROR, SETTINGS_MAX_FIELD_SECTION_SIZE, STREAM_CONTROL, STREAM_PUSH,
+    STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, announce_full_sized_headers, application_close,
+    assert_closed_with, authenticate, authenticated_connect_headers_frame, collect_refusals,
+    connect_headers_frame, frame, grease_type, headers_frame, open_uni_stream, read_frame,
+    settings_frame, status_of, status_of_response, still_serving, varint_frame,
 };
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
@@ -151,14 +151,14 @@ const USER: (&str, &str) = ("user1", "s3cret");
 /// A SETTINGS frame carrying one harmless setting.
 ///
 /// Non-empty on purpose: a zero-length frame is charged nothing, and one of the
-/// tests below is about what a control frame is charged.
-fn settings_frame() -> Vec<u8> {
-    let mut payload = BytesMut::new();
-    // SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1), which is what a
-    // client tells a server about its own willingness to receive.
-    datagram::put_varint(&mut payload, 0x06);
-    datagram::put_varint(&mut payload, volto::h3::MAX_FIELD_SECTION_SIZE);
-    frame(FRAME_SETTINGS, &payload)
+/// tests below is about what a control frame is charged. The setting is
+/// SETTINGS_MAX_FIELD_SECTION_SIZE (RFC 9114 §7.2.4.1), which is what a client
+/// tells a server about its own willingness to receive.
+fn harmless_settings() -> Vec<u8> {
+    settings_frame(&[(
+        SETTINGS_MAX_FIELD_SECTION_SIZE,
+        volto::h3::MAX_FIELD_SECTION_SIZE,
+    )])
 }
 
 /// Opens a request stream and writes a frame header for `kind` declaring
@@ -428,7 +428,7 @@ async fn unidirectional_streams_that_break_a_critical_stream_rule_end_the_connec
         // The legitimate control stream first, in every case: two of the
         // offences are about a *second* stream, and the third is about this one
         // ending.
-        let mut control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+        let mut control = open_uni_stream(&connection, STREAM_CONTROL, &harmless_settings()).await;
 
         if let Some(stream_type) = second_stream {
             let _second = open_uni_stream(&connection, stream_type, &[]).await;
@@ -527,7 +527,7 @@ async fn frame_types_reserved_for_http2_end_the_connection() {
 #[tokio::test]
 async fn frames_the_control_stream_may_not_carry_end_the_connection() {
     for (name, offence) in [
-        ("a second SETTINGS frame", settings_frame()),
+        ("a second SETTINGS frame", harmless_settings()),
         (
             "a HEADERS frame",
             frame(FRAME_HEADERS, b"not on this stream"),
@@ -538,7 +538,7 @@ async fn frames_the_control_stream_may_not_carry_end_the_connection() {
         let server = TestServer::start().await;
         let (_endpoint, connection) = connect_quic(&server).await;
 
-        let mut control = settings_frame();
+        let mut control = harmless_settings();
         control.extend_from_slice(&offence);
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
@@ -576,7 +576,7 @@ async fn oversized_control_stream_frames_are_refused_by_type() {
         let (_endpoint, connection) = connect_quic(&server).await;
 
         let mut control = BytesMut::new();
-        control.extend_from_slice(&settings_frame());
+        control.extend_from_slice(&harmless_settings());
         datagram::put_varint(&mut control, kind);
         datagram::put_varint(&mut control, PAST_ONE_FRAME);
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
@@ -868,7 +868,7 @@ async fn the_control_stream_does_not_share_the_request_buffering_budget() {
     // Two frames the control stream is entitled to send, both of them carrying a
     // payload: a zero-length frame would be charged nothing and would prove
     // nothing about whose budget it came out of.
-    let mut control = settings_frame();
+    let mut control = harmless_settings();
     control.extend_from_slice(&varint_frame(FRAME_MAX_PUSH_ID, 8));
     let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
@@ -1086,7 +1086,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
 async fn a_request_stream_flooded_with_grease_is_reset() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
-    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &harmless_settings()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
 
@@ -1139,7 +1139,7 @@ async fn a_few_grease_frames_before_a_connect_still_open_a_tunnel() {
     let server = TestServer::start().await;
     let echo = spawn_echo_target().await;
     let (_endpoint, connection) = connect_quic(&server).await;
-    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &harmless_settings()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
 
@@ -1249,7 +1249,7 @@ async fn a_goaway_from_the_peer_does_not_end_the_connection() {
     let server = TestServer::start().await;
     let (_endpoint, connection) = connect_quic(&server).await;
 
-    let mut control = settings_frame();
+    let mut control = harmless_settings();
     control.extend_from_slice(&varint_frame(FRAME_GOAWAY, 8));
     // Repeating it with an identifier that has not grown is legal and says the
     // peer has abandoned more, not fewer, of its own requests.
@@ -1296,7 +1296,7 @@ async fn a_goaway_from_the_peer_leaves_a_live_tunnel_running() {
     let server = TestServer::start().await;
     let echo = spawn_echo_target().await;
     let (_endpoint, connection) = connect_quic(&server).await;
-    let mut control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let mut control = open_uni_stream(&connection, STREAM_CONTROL, &harmless_settings()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     send.write_all(&connect_headers_frame(&echo.to_string()))
@@ -1356,7 +1356,7 @@ async fn interleaved_requests_delivered_a_byte_at_a_time_are_both_served() {
     let server = TestServer::start().await;
     let echo = spawn_echo_target().await;
     let (_endpoint, connection) = connect_quic(&server).await;
-    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &harmless_settings()).await;
 
     let authority = echo.to_string();
     let padding = "x".repeat(64);

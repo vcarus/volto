@@ -192,6 +192,17 @@ pub fn frame(kind: u64, payload: &[u8]) -> Vec<u8> {
     out.to_vec()
 }
 
+/// A SETTINGS frame carrying the given identifier/value pairs, in that order
+/// (RFC 9114 §7.2.4).
+pub fn settings_frame(pairs: &[(u64, u64)]) -> Vec<u8> {
+    let mut payload = BytesMut::new();
+    for (identifier, value) in pairs {
+        datagram::put_varint(&mut payload, *identifier);
+        datagram::put_varint(&mut payload, *value);
+    }
+    frame(FRAME_SETTINGS, &payload)
+}
+
 /// A frame whose whole payload is one varint: GOAWAY, CANCEL_PUSH, MAX_PUSH_ID.
 ///
 /// The three frames RFC 9114 §7.2.6, §7.2.3 and §7.2.7 define that way, so the

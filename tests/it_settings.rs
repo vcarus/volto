@@ -194,7 +194,7 @@ async fn a_frame_before_settings_ends_the_connection() {
         // A perfectly good SETTINGS frame, second. The rule is about order, and
         // sending nothing after the offending frame would leave the server
         // waiting rather than deciding.
-        control.extend_from_slice(&settings_frame());
+        control.extend_from_slice(&datagram_settings());
         let _control = open_uni_stream(&connection, STREAM_CONTROL, &control).await;
 
         let (code, reason) = rawstream::application_close(&connection, TIMEOUT).await;
@@ -363,7 +363,7 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 
     // Only now does the peer say datagrams are allowed. The control stream is
     // kept open for the rest of the test: closing it is H3_CLOSED_CRITICAL_STREAM.
-    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &datagram_settings()).await;
 
     // From here the reply must arrive as a QUIC datagram. Retried rather than
     // slept on: the SETTINGS frame and this datagram are in flight at the same
@@ -395,11 +395,8 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 }
 
 /// A SETTINGS frame enabling HTTP Datagrams (RFC 9297 §2.1.1).
-fn settings_frame() -> Vec<u8> {
-    let mut settings = BytesMut::new();
-    datagram::put_varint(&mut settings, SETTINGS_H3_DATAGRAM);
-    datagram::put_varint(&mut settings, 1);
-    rawstream::frame(FRAME_SETTINGS, &settings)
+fn datagram_settings() -> Vec<u8> {
+    rawstream::settings_frame(&[(SETTINGS_H3_DATAGRAM, 1)])
 }
 
 /// A peer that says `SETTINGS_H3_DATAGRAM = 1` but never told QUIC how large a
@@ -447,7 +444,7 @@ async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     // and no `max_datagram_frame_size` to send one with.
 
     // The contradiction, on the control stream: datagrams are welcome.
-    let _control = open_uni_stream(&connection, STREAM_CONTROL, &settings_frame()).await;
+    let _control = open_uni_stream(&connection, STREAM_CONTROL, &datagram_settings()).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     send.write_all(&connect_udp_headers_frame(
