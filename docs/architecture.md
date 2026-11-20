@@ -492,8 +492,8 @@ since the drops themselves are required to be silent.
 
 Get either wrong and the symptom is "the handshake succeeds, the tunnel is
 established, and not one packet gets through", with no error anywhere. The
-encoder and decoder are hand-rolled in `src/datagram.rs`, about 120 lines of
-code, and no dependency is carried for them.
+encoder and decoder are hand-rolled in `src/datagram.rs` and `src/varint.rs`,
+about 120 lines of code, and no dependency is carried for them.
 
 Routing uses a bounded channel and `try_send`: a session that is not draining
 its queue loses packets, which is correct UDP behaviour, instead of blocking the
@@ -656,9 +656,10 @@ connection that has already ended, where the closure is the connection going
 away rather than a fault the peer committed. That is the exemption the control
 stream makes for the same race.
 
-HTTP Datagrams are hand-rolled in `src/datagram.rs`. That started as a way around
-`h3-datagram` 0.0.2, which tagged every datagram with Quarter Stream ID 0 and so
-misrouted every session after the first on a connection; it is simply ours now —
+HTTP Datagrams are hand-rolled in `src/datagram.rs`, over the varints of
+`src/varint.rs`. That started as a way around `h3-datagram` 0.0.2, which tagged
+every datagram with Quarter Stream ID 0 and so misrouted every session after the
+first on a connection; it is simply ours now —
 about 120 lines of varint and Context ID work with no dependency behind them.
 
 ## The h3api facade

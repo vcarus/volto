@@ -23,7 +23,8 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::datagram::{self, MAX_UDP_PAYLOAD, TypeLength};
+use crate::datagram::MAX_UDP_PAYLOAD;
+use crate::varint::{self, TypeLength};
 
 /// DATAGRAM capsule type (RFC 9297 §3.5).
 pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
@@ -52,7 +53,7 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// one byte short is doing nothing RFC 9297 §3.2 forbids. So what is held is
 /// held until the session's idle timeout. One capsule's worth is all of it
 /// ([`CapsuleDecoder`] says what it copies and when).
-pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + datagram::len_u64(MAX_UDP_PAYLOAD);
+pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + varint::len_u64(MAX_UDP_PAYLOAD);
 
 /// Why a capsule sequence could not be decoded.
 ///
@@ -229,7 +230,7 @@ impl CapsuleDecoder {
                     }
                     // Discard as it arrives: an unknown capsule is never
                     // accumulated, however large it claims to be.
-                    let (discard, left) = datagram::take_from(remaining, self.chunk.len());
+                    let (discard, left) = varint::take_from(remaining, self.chunk.len());
                     self.chunk.advance(discard);
                     self.state = State::Skip { remaining: left };
                 }
@@ -259,7 +260,7 @@ impl CapsuleDecoder {
                     self.state = State::Header;
 
                     let context_id =
-                        datagram::take_varint(&mut value).ok_or(Error::MalformedDatagram)?;
+                        varint::take_varint(&mut value).ok_or(Error::MalformedDatagram)?;
 
                     return Ok(Some(Capsule::Datagram {
                         context_id,
@@ -299,9 +300,9 @@ impl CapsuleDecoder {
 /// carries `payload_len` bytes under `context_id`: the type, the length and
 /// the Context ID, each a varint.
 pub fn datagram_header_len(context_id: u64, payload_len: usize) -> usize {
-    datagram::varint_len(CAPSULE_TYPE_DATAGRAM)
-        + datagram::varint_len(datagram_value_len(context_id, payload_len))
-        + datagram::varint_len(context_id)
+    varint::varint_len(CAPSULE_TYPE_DATAGRAM)
+        + varint::varint_len(datagram_value_len(context_id, payload_len))
+        + varint::varint_len(context_id)
 }
 
 /// The longest header [`datagram_header_len`] gives for a UDP payload under
@@ -319,14 +320,14 @@ pub const UDP_DATAGRAM_HEADER_MAX: usize = 6;
 ///
 /// If `header` is shorter than [`datagram_header_len`].
 pub fn put_datagram_header(mut header: &mut [u8], context_id: u64, payload_len: usize) {
-    datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut header, datagram_value_len(context_id, payload_len));
-    datagram::put_varint(&mut header, context_id);
+    varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut header, datagram_value_len(context_id, payload_len));
+    varint::put_varint(&mut header, context_id);
 }
 
 /// The Capsule Length of a DATAGRAM capsule: the Context ID and the payload.
 fn datagram_value_len(context_id: u64, payload_len: usize) -> u64 {
-    datagram::len_u64(datagram::varint_len(context_id) + payload_len)
+    varint::len_u64(varint::varint_len(context_id) + payload_len)
 }
 
 /// Encodes a DATAGRAM capsule (RFC 9297 §3.5) into a buffer of its own.
@@ -512,8 +513,8 @@ mod tests {
         assert_eq!(decoder.buffered_len(), 0, "draining releases the value");
 
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, 0x41);
-        datagram::put_varint(&mut header, 1_000_000);
+        varint::put_varint(&mut header, 0x41);
+        varint::put_varint(&mut header, 1_000_000);
         decoder.push(header.clone().freeze());
         assert_eq!(decoder.buffered_len(), header.len(), "the header is held");
 
@@ -542,8 +543,8 @@ mod tests {
         wire.extend_from_slice(&encode_datagram(0, b"whole"));
         wire.extend_from_slice(&encode_unknown(0x41, &[0xff; 100]));
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-        datagram::put_varint(&mut header, 1000);
+        varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+        varint::put_varint(&mut header, 1000);
         wire.extend_from_slice(&header);
         wire.extend_from_slice(&[0x00; 10]);
         let chunk = wire.freeze();
@@ -602,8 +603,8 @@ mod tests {
     #[test]
     fn an_unknown_capsule_value_is_discarded_as_it_arrives() {
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, 0x41);
-        datagram::put_varint(&mut header, 10_000_000);
+        varint::put_varint(&mut header, 0x41);
+        varint::put_varint(&mut header, 10_000_000);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(header.freeze());
@@ -650,8 +651,8 @@ mod tests {
     #[test]
     fn an_oversized_datagram_capsule_is_rejected() {
         let mut header = BytesMut::new();
-        datagram::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
-        datagram::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
+        varint::put_varint(&mut header, CAPSULE_TYPE_DATAGRAM);
+        varint::put_varint(&mut header, MAX_DATAGRAM_CAPSULE_VALUE + 1);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(header.freeze());
@@ -668,8 +669,8 @@ mod tests {
     fn a_datagram_capsule_without_a_context_id_is_malformed() {
         // Type 0x00, length 0: no room for the Context ID varint.
         let mut wire = BytesMut::new();
-        datagram::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
-        datagram::put_varint(&mut wire, 0);
+        varint::put_varint(&mut wire, CAPSULE_TYPE_DATAGRAM);
+        varint::put_varint(&mut wire, 0);
 
         let mut decoder = CapsuleDecoder::new();
         decoder.push(wire.freeze());
@@ -773,8 +774,8 @@ mod tests {
     /// Encodes a capsule of a type the decoder does not know.
     fn encode_unknown(capsule_type: u64, value: &[u8]) -> Bytes {
         let mut buf = BytesMut::new();
-        datagram::put_varint(&mut buf, capsule_type);
-        datagram::put_varint(&mut buf, datagram::len_u64(value.len()));
+        varint::put_varint(&mut buf, capsule_type);
+        varint::put_varint(&mut buf, varint::len_u64(value.len()));
         buf.put_slice(value);
         buf.freeze()
     }

@@ -41,7 +41,8 @@ use super::error::{Code, StreamError, Violation};
 use super::frame::{self, Frame, FrameReader, Item};
 use super::message::{self, FieldValue, Fields, Method, Request, Status};
 use super::qpack::{self, Field};
-use super::{MAX_FIELD_SECTION_SIZE, VARINT_MAX_LEN, varint};
+use super::{MAX_FIELD_SECTION_SIZE, varint};
+use crate::varint::VARINT_MAX_LEN;
 
 /// An accepted request stream whose headers have not been read yet.
 pub struct Resolver {
@@ -745,7 +746,7 @@ fn malformed(detail: impl Into<Cow<'static, str>>) -> Violation {
 /// would allocate again on every frame anyway.
 fn frame_header(kind: u64, payload_len: usize) -> Bytes {
     let mut header = BytesMut::with_capacity(2 * VARINT_MAX_LEN);
-    frame::put_header(&mut header, kind, crate::datagram::len_u64(payload_len));
+    frame::put_header(&mut header, kind, crate::varint::len_u64(payload_len));
     header.freeze()
 }
 

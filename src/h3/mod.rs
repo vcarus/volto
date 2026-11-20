@@ -60,11 +60,6 @@ use error::Code;
 //# Implementations MUST ignore unknown or unsupported values in all
 //# extensible protocol elements.
 
-/// Longest a QUIC varint can be, in bytes (RFC 9000 §16), for sizing scratch
-/// buffers. This is a length. The largest representable value is
-/// [`crate::datagram::VARINT_MAX`].
-const VARINT_MAX_LEN: usize = 8;
-
 /// Largest field section this server will decode, in bytes.
 ///
 /// Advertised as `SETTINGS_MAX_FIELD_SECTION_SIZE`, so a client that respects

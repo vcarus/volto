@@ -66,12 +66,15 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::debug;
 
-use crate::datagram::{self, len_u64, peek_varint, put_varint, varint_len, varint_len_of_first};
+use crate::datagram;
+use crate::varint::{
+    VARINT_MAX_LEN, len_u64, peek_varint, put_varint, varint_len, varint_len_of_first,
+};
 
 use super::error::{Code, ConnectionError, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
 use super::stream::Resolver;
-use super::{VARINT_MAX_LEN, varint};
+use super::varint;
 
 /// Control stream (RFC 9114 §6.2.1).
 const STREAM_CONTROL: u64 = 0x00;
@@ -1130,7 +1133,7 @@ impl Drop for Connection {
 /// The stream id four past `last_accepted`, or zero if nothing was accepted.
 ///
 /// The GOAWAY identifier this server sends: the first request it will not
-/// serve. Clamped to [`crate::datagram::VARINT_MAX`] because the sum is written
+/// serve. Clamped to [`crate::varint::VARINT_MAX`] because the sum is written
 /// as a QUIC varint and nothing above that is representable. RFC 9000 §2.1
 /// bounds a stream id by the same value, so no legitimate peer can reach the
 /// clamp, and a saturating `u64::MAX` would be an assertion failure rather than
@@ -1138,7 +1141,7 @@ impl Drop for Connection {
 fn next_request_id(last_accepted: Option<u64>) -> u64 {
     last_accepted.map_or(0, |id| {
         id.saturating_add(REQUEST_STREAM_STEP)
-            .min(crate::datagram::VARINT_MAX)
+            .min(crate::varint::VARINT_MAX)
     })
 }
 
@@ -2372,7 +2375,7 @@ mod tests {
     /// `u64::MAX` would reach `put_varint`'s assertion instead of the wire.
     #[test]
     fn the_goaway_identifier_stays_inside_a_varint() {
-        let max = crate::datagram::VARINT_MAX;
+        let max = crate::varint::VARINT_MAX;
 
         for last_accepted in [max - REQUEST_STREAM_STEP, max, u64::MAX] {
             let identifier = next_request_id(Some(last_accepted));

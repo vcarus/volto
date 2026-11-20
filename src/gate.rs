@@ -202,9 +202,9 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, ConnectionId, UdpPoller};
 use tracing::debug;
 
-use crate::datagram::peek_varint;
 use crate::logfmt::escaped_bytes;
 use crate::tls::EchKey;
+use crate::varint::peek_varint;
 
 mod hold;
 

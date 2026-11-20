@@ -17,7 +17,7 @@ use std::borrow::Cow;
 
 use bytes::{BufMut, BytesMut};
 
-use crate::datagram::len_u64;
+use crate::varint::len_u64;
 
 use super::error::{Code, Violation};
 use super::huffman;

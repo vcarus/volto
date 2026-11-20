@@ -27,7 +27,9 @@
 //!   the rest of the crate uses.
 //! * [`conn`]: per-connection driving and request dispatch.
 //! * [`capsule`]: the Capsule Protocol (RFC 9297 §3) incremental decoder.
-//! * [`datagram`]: HTTP Datagram payload coding (RFC 9297) and QUIC varints.
+//! * [`datagram`]: HTTP Datagram payload coding (RFC 9297).
+//! * [`varint`]: QUIC varints, and the type-and-length header of frames and
+//!   capsules.
 //! * [`net`]: explicit name resolution and UDP socket setup.
 //! * [`logfmt`]: how a log field spells a value, and the bounds, escaping and
 //!   sampling applied to what a peer can put in a log line.
@@ -86,3 +88,4 @@ pub mod quic;
 pub mod shutdown;
 pub mod tls;
 pub mod tunnel;
+pub mod varint;

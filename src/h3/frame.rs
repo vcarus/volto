@@ -55,7 +55,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::datagram::{TypeLength, len_u64, peek_varint, put_varint, take_from};
+use crate::varint::{TypeLength, len_u64, peek_varint, put_varint, take_from};
 
 use super::error::{Code, StreamError, Violation};
 use super::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
@@ -1417,7 +1417,7 @@ pub fn seal_data(mut block: BytesMut) -> Bytes {
         .filter(|&payload| payload > 0)
         .expect("a block to seal holds a payload: an empty DATA frame is never sent");
     let length = len_u64(payload);
-    let header = crate::datagram::varint_len(DATA) + crate::datagram::varint_len(length);
+    let header = crate::varint::varint_len(DATA) + crate::varint::varint_len(length);
     let start = DATA_HEADER_ROOM
         .checked_sub(header)
         .expect("a payload below 2^30 bytes, whose header fits the room");
@@ -1581,7 +1581,7 @@ mod tests {
     /// than costing the peer its tunnels.
     #[test]
     fn enable_connect_protocol_is_ignored_whatever_its_value_is() {
-        for value in [0, 1, 2, crate::datagram::VARINT_MAX] {
+        for value in [0, 1, 2, crate::varint::VARINT_MAX] {
             let parsed = parse_settings(&settings(&[
                 (SETTING_ENABLE_CONNECT_PROTOCOL, value),
                 (SETTING_H3_DATAGRAM, 1),
@@ -1926,7 +1926,7 @@ mod tests {
                 StreamKind::Request,
                 false,
                 DATA,
-                crate::datagram::VARINT_MAX,
+                crate::varint::VARINT_MAX,
                 &budget()
             )
             .is_ok()
@@ -2144,7 +2144,7 @@ mod tests {
         fn control_decoder() -> FrameDecoder {
             FrameDecoder::new(StreamKind::ServerControl, Arc::new(BufferBudget::default()))
         }
-        let endless = crate::datagram::VARINT_MAX;
+        let endless = crate::varint::VARINT_MAX;
 
         for kind in [DATA, 0x21, 0x1f * 4 + 0x21, 0x4242] {
             for length in [0, 1, endless] {
@@ -2845,7 +2845,7 @@ mod tests {
     #[test]
     fn the_room_fits_the_longest_header_a_block_needs() {
         assert_eq!(
-            crate::datagram::varint_len(DATA) + crate::datagram::varint_len(0x3fff_ffff),
+            crate::varint::varint_len(DATA) + crate::varint::varint_len(0x3fff_ffff),
             DATA_HEADER_ROOM
         );
     }
@@ -2956,7 +2956,7 @@ pub(super) mod loopback {
         let mut payload = Vec::new();
         for index in 0..count {
             let body = vec![index; size];
-            put_header(&mut wire, DATA, crate::datagram::len_u64(size));
+            put_header(&mut wire, DATA, crate::varint::len_u64(size));
             wire.extend_from_slice(&body);
             payload.extend_from_slice(&body);
         }
