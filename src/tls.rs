@@ -35,10 +35,7 @@ pub(crate) const UNUSABLE_PAIR: &str =
 
 /// Refuses a leaf certificate webpki cannot parse, as the rustls server did.
 ///
-/// That server parsed the leaf with webpki when it took the pair
-/// (`with_single_cert`, through `CertifiedKey::from_der` and
-/// `ParsedCertificate::try_from` in rustls 0.23) and refused one it could not
-/// parse. AWS-LC's `d2i_X509` reads certificates webpki refuses, an X.509
+/// AWS-LC's `d2i_X509` reads certificates webpki refuses, an X.509
 /// version 1 certificate for one, so without this such a certificate would
 /// bind, [`names_not_covered`] would report nothing for it, and a client that
 /// verifies it would refuse every handshake. Called where the provider is

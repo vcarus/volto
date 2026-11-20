@@ -11,11 +11,8 @@
 //! The D106 second SNI gate is a ClientHello callback here. AWS-LC calls it
 //! after ECH has been decided, so the name it judges is the inner one when ECH
 //! is accepted and the outer one when it is not. The same callback is the
-//! second line behind the socket gate's ECH rules (D115, batch 2): with an ECH
-//! key it refuses a ClientHello whose ECH extension libssl did not accept, and
-//! under `require_ech` one that libssl accepted no ECH on, so that a defect in
-//! the socket gate is answered with an alert rather than with this server's
-//! ECHConfigList.
+//! second line behind the socket gate's ECH rules (D115); `judge_client_hello`
+//! says what it refuses and why.
 //!
 //! This is the one module of the crate that may use `unsafe` (`crate` says
 //! why). The rule inside it: every `unsafe` block carries a `SAFETY:` comment
@@ -149,10 +146,6 @@ pub struct EchSummary {
 
 /// The server side of the provider: one `SSL_CTX`, shared by every session.
 pub struct ServerConfig {
-    // Dropped before `data`. Every SSL made from the context holds a reference
-    // to it and every session holds an `Arc` of this value, so the context and
-    // the callback data outlive every SSL either way; the order is for the
-    // reader.
     ctx: SslCtx,
     data: Arc<CtxData>,
     ech: Option<EchSummary>,
@@ -295,13 +288,10 @@ impl<'a> Builder<'a> {
             // application protocol to justify, and this one does not use:
             // "Disabling 0-RTT entirely is the most effective defense against
             // replay attack." Every request here is a CONNECT carrying
-            // credentials. And no session tickets either (D115 item 3): a
-            // resumption that is not 0-RTT saves no round trip, only a
-            // certificate and a signature, Surge's connections are long-lived,
-            // and a ticket links one connection to the next. With tickets off
-            // there is nothing a client could resume, so 0-RTT is refused twice
-            // over; `tests::a_ticket_would_not_offer_early_data_either` pins
-            // the early-data switch on its own.
+            // credentials. No session tickets either (D115 item 3), so 0-RTT
+            // is refused twice over;
+            // `tests::a_ticket_would_not_offer_early_data_either` pins the
+            // early-data switch on its own.
             sys::SSL_CTX_set_early_data_enabled(ctx.as_ptr(), 0);
             sys::SSL_CTX_set_options(ctx.as_ptr(), OP_NO_TICKET);
             ffi::check(
@@ -736,8 +726,7 @@ unsafe extern "C" fn select_alpn(
 /// §3 names: "If the server understood the ClientHello extension but does not
 /// recognize the server name, the server SHOULD take one of two actions: either
 /// abort the handshake by sending a fatal-level unrecognized_name(112) alert or
-/// continue the handshake." The rustls server sent `access_denied` here,
-/// because rustls chose the alert (D106, addendum of 2026-11-20).
+/// continue the handshake."
 ///
 /// # Safety
 ///
@@ -795,12 +784,11 @@ unsafe extern "C" fn judge_client_hello(
 /// The server name the client asked for, if it is a DNS name.
 ///
 /// `SSL_get_servername` returns the `host_name` bytes as the client sent them,
-/// checked only for length and for a zero byte (`extract_sni`). rustls handed
-/// on a name only when it parsed as a DNS name, and treated anything else as no
-/// name at all; the same parser, from rustls-pki-types, gives the same answer
-/// here. That matters beyond parity: the name is written into the
-/// `connection established` line with `Display` (`logfmt::or_dash`), so a name
-/// carrying a newline or a terminal escape must never reach it.
+/// checked only for length and for a zero byte (`extract_sni`). Only a DNS
+/// name is handed on, judged by the rustls-pki-types parser: the name is
+/// written into the `connection established` line with `Display`
+/// (`logfmt::or_dash`), so a name carrying a newline or a terminal escape must
+/// never reach it.
 ///
 /// # Safety
 ///
@@ -1255,16 +1243,10 @@ impl crypto::Session for Session {
         // (`do_send_server_finished`) and the 1-RTT read secret only once the
         // client's Finished is verified (`do_read_client_finished`), so the
         // 1-RTT keys are handed over then, a round trip after the write secret.
-        // The server therefore sends no 0.5-RTT packet. That is one difference
-        // from the rustls server, which handed quinn the 1-RTT keys with the
-        // server's first flight: quinn-proto queues the server's first
-        // NEW_CONNECTION_ID frames at the Initial-to-Handshake upgrade
-        // (`issue_first_cids`) and sends Data-space frames as soon as it holds
-        // keys for that space (`space_can_send`), so with rustls those frames
-        // left in a 1-RTT packet of the first flight, and now they leave after
-        // the client's Finished. Read in quinn-proto 0.11.19, not captured on
-        // the wire. The server also cannot decrypt a 1-RTT packet before the
-        // handshake completes, which RFC 9001 §5.7 forbids anyway: "Endpoints
+        // The server therefore sends no 0.5-RTT packet: its first
+        // NEW_CONNECTION_ID frames leave after the client's Finished. The
+        // server also cannot decrypt a 1-RTT packet before the handshake
+        // completes, which RFC 9001 §5.7 forbids anyway: "Endpoints
         // in either role MUST NOT decrypt 1-RTT packets from their peer prior
         // to completing the handshake." quinn-proto discards a 1-RTT packet
         // that arrives before the keys (`unprotect_header`, "discarding

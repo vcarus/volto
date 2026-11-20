@@ -9,11 +9,10 @@
 //! derived from the transcript, so a client whose ClientHello was altered in
 //! flight could not read them; the tests say so where it matters.
 //!
-//! The ECH rows are the behaviour table of the 2026-11-20 spike, kept as
-//! regression tests: AWS-LC never refuses a handshake for an ECH reason. The
-//! last test is on real sockets: a quinn client on rustls sends its first
-//! flight to a bare UDP socket, which decrypts the Initial packets and checks
-//! how the ClientHello falls across them.
+//! The ECH rows pin that AWS-LC never refuses a handshake for an ECH reason
+//! (D115). The last test is on real sockets: a quinn client on rustls sends
+//! its first flight to a bare UDP socket, which decrypts the Initial packets
+//! and checks how the ClientHello falls across them.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,12 +91,9 @@ fn requiring(id: &Identity, ech: &EchKey) -> Arc<ServerConfig> {
 /// A server whose second ECH line is off, which is libssl's own ECH behaviour
 /// with nothing of this provider's in front of it.
 ///
-/// The spike's behaviour table, kept as regression tests here, is about what
-/// AWS-LC does with an ECH extension it cannot use: it never refuses, and
-/// answers on the outer ClientHello with `retry_configs`. That is the
-/// behaviour the socket gate and the second line exist to keep from anybody
-/// without the key, and those tests keep pinning it on this server, which is
-/// the configuration batch 1 built.
+/// What AWS-LC does with an ECH extension it cannot use: it never refuses, and
+/// answers on the outer ClientHello with `retry_configs`, which the socket
+/// gate and the second line exist to keep from anybody without the key.
 fn libssl_alone(id: &Identity, ech: &EchKey, groups: &[u16], names: &[&str]) -> Arc<ServerConfig> {
     built(id, Some(ech), groups, names, false, false)
 }
@@ -1570,8 +1566,7 @@ async fn first_flight(
 /// With an X25519MLKEM768 key share, the outer ClientHello of an ECH client
 /// does not fit one Initial packet, so whether ECH opens under our key cannot
 /// be judged from the first packet: the ECH AEAD authenticates the whole outer
-/// ClientHello (RFC 9849 §5.2). D115 rests on this; the 2026-11-20 spike
-/// measured it, and this keeps it measured.
+/// ClientHello (RFC 9849 §5.2). D115 rests on this.
 #[tokio::test]
 async fn an_ech_client_hello_with_a_post_quantum_share_spans_two_initials() {
     let key = ech_key(1);
