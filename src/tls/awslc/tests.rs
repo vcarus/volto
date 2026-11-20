@@ -1267,6 +1267,18 @@ fn next_1rtt_keys_follow_quic_ku() {
         }
     }
     assert!(server_one_rtt);
+    // libssl freed the handshake configuration when the handshake completed,
+    // and the calls made after it still work.
+    // SAFETY: the session's SSL is valid. With a length of 0 the call copies
+    // nothing; it returns 0 only when the SSL holds no configuration.
+    let shed =
+        unsafe { sys::SSL_set_session_id_context(session.ssl.as_ptr(), [0u8; 0].as_ptr(), 0) } == 0;
+    assert!(shed, "the handshake configuration is still held");
+    session
+        .export_keying_material(&mut [0u8; 32], b"EXPORTER-volto-test", b"")
+        .expect("the exporter works after the handshake");
+    assert!(session.handshake_data().is_some());
+    assert!(session.transport_parameters().expect("readable").is_some());
     let mut client_next = client_next.expect("client 1-RTT secrets");
     for generation in 1..=3 {
         let server_keys = session.next_1rtt_keys().expect("server key update");

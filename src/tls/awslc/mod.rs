@@ -949,6 +949,14 @@ impl Session {
         // `Session`).
         unsafe {
             sys::SSL_set_accept_state(ssl.as_ptr());
+            // libssl frees the handshake configuration (certificate and key
+            // references, ALPN list, local transport parameters, groups) once
+            // the handshake completes, since TLS 1.3 never renegotiates
+            // (`ssl_maybe_shed_handshake_config`). Every call this session
+            // makes afterwards reads `ssl->s3` or the established session, and
+            // a post-handshake message on a server ends in an alert
+            // (`tls13_post_handshake`), so none of them needs it.
+            sys::SSL_set_shed_handshake_config(ssl.as_ptr(), 1);
             ffi::check(
                 sys::SSL_set_quic_method(ssl.as_ptr(), &QUIC_METHOD),
                 "SSL_set_quic_method",
