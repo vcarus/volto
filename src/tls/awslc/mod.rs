@@ -1173,13 +1173,20 @@ impl crypto::Session for Session {
         // (`do_send_server_finished`) and the 1-RTT read secret only once the
         // client's Finished is verified (`do_read_client_finished`), so the
         // 1-RTT keys are handed over then, a round trip after the write secret.
-        // The server therefore cannot send 0.5-RTT data, which it never did on
-        // purpose, and it cannot decrypt a 1-RTT packet before the handshake
-        // completes, which RFC 9001 §5.7 forbids anyway: "Endpoints in either
-        // role MUST NOT decrypt 1-RTT packets from their peer prior to
-        // completing the handshake." quinn-proto discards a 1-RTT packet that
-        // arrives before the keys (`unprotect_header`, "discarding unexpected
-        // Data packet"), and the client sends it again.
+        // The server therefore sends no 0.5-RTT packet. That is one difference
+        // from the rustls server, which handed quinn the 1-RTT keys with the
+        // server's first flight: quinn-proto queues the server's first
+        // NEW_CONNECTION_ID frames at the Initial-to-Handshake upgrade
+        // (`issue_first_cids`) and sends Data-space frames as soon as it holds
+        // keys for that space (`space_can_send`), so with rustls those frames
+        // left in a 1-RTT packet of the first flight, and now they leave after
+        // the client's Finished. Read in quinn-proto 0.11.19, not captured on
+        // the wire. The server also cannot decrypt a 1-RTT packet before the
+        // handshake completes, which RFC 9001 §5.7 forbids anyway: "Endpoints
+        // in either role MUST NOT decrypt 1-RTT packets from their peer prior
+        // to completing the handshake." quinn-proto discards a 1-RTT packet
+        // that arrives before the keys (`unprotect_header`, "discarding
+        // unexpected Data packet"), and the client sends it again.
         let i = next.index();
         if shared.write[i].is_none() || shared.read[i].is_none() {
             return None;
