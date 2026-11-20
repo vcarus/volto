@@ -331,7 +331,7 @@ const QUINN_DEFAULT_STREAM_RECEIVE_WINDOW: u64 = 1_250_000;
 /// accounts for. That is the amplification the 64 KiB relay block in
 /// `tunnel/tcp.rs` is shaped to hold at 1.33x for reads of 16 KiB or more, and
 /// within the bounds by read size listed on `RELAY_BLOCK_SIZE` below that; see
-/// D47's 2026-08-23 addendum.
+/// D47.
 /// 10 MB over the ~90 ms path RTT is about 889 Mbps against a measured peak of
 /// 177 Mbps, so it is nowhere near a throughput constraint.
 ///
@@ -365,13 +365,9 @@ const _: () = assert!(SEND_WINDOW >= STREAM_RECEIVE_WINDOW.into_inner());
 
 /// Inbound QUIC DATAGRAM bytes the transport buffers per connection.
 ///
-/// Exactly what quinn already defaults to, and stated here for the reason D47
-/// gives for [`SEND_WINDOW`]: upstream derives it from `STREAM_RWND`, a private
-/// constant inside `TransportConfig::default` with no stability promise, and
-/// Dependabot proposes cargo bumps weekly. A patch release that moved that
-/// constant would move this buffer with it and change what an unauthenticated
-/// peer can make this process hold, silently and without a line of this tree
-/// changing.
+/// Exactly what quinn already defaults to, pinned for the reason given on
+/// [`SEND_WINDOW`]. Here a moved default would also change what an
+/// unauthenticated peer can make this process hold.
 ///
 /// It is 1.25 MB per connection, 320 MB across the default `max_connections`,
 /// and every byte of it is reachable before a credential has been seen: quinn
@@ -391,10 +387,8 @@ const DATAGRAM_RECEIVE_BUFFER: usize = 1_250_000;
 /// Out-of-order CRYPTO frame bytes the transport buffers per connection.
 ///
 /// Pinned at quinn's own 16 KiB, on the same argument as
-/// [`DATAGRAM_RECEIVE_BUFFER`]: it is held by a peer that has authenticated
-/// nothing, so it belongs in the inventory of what an unauthenticated
-/// connection costs, and an inventory that reads a dependency's private default
-/// is not an inventory. 16 KiB is ample for the one client flight this server
+/// [`DATAGRAM_RECEIVE_BUFFER`]: a peer that has authenticated nothing can fill
+/// it. 16 KiB is ample for the one client flight this server
 /// ever reassembles, a ClientHello, which is 1.2 KB and up with a
 /// post-quantum key share.
 const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
@@ -443,20 +437,14 @@ pub const MAX_PEER_UNI_STREAMS: u32 = 16;
 ///
 /// # Why it cannot stall a client that bursts
 ///
-/// A client may fire several CONNECTs the moment the handshake completes,
-/// before the first 200 comes back, and more than sixteen of them would find
-/// the seventeenth blocked rather than refused: STREAMS_BLOCKED, which is
-/// backpressure and not an error. What unblocks it is the first of the sixteen
-/// to authenticate, and that is decided before any name is resolved and any
-/// socket is opened (`conn::handle_request`). So the raise happens in the same
-/// task that read the first HEADERS, and its MAX_STREAMS goes out on the packet
-/// carrying that request's response. The seventeenth tunnel therefore waits the
-/// round trip the client was already waiting for its first answer, once per
-/// connection, and only on a connection that opens more than sixteen tunnels
-/// before any of them is answered. Below that this is never reached at all.
+/// A seventeenth CONNECT sent before the first answer is blocked
+/// (STREAMS_BLOCKED, backpressure rather than an error) until the first request
+/// authenticates. That raise is made before any name is resolved, so its
+/// MAX_STREAMS goes out on the packet carrying the first response, and the
+/// seventeenth tunnel waits only the round trip the client was already waiting
+/// (D98, `docs/configuration.md`).
 ///
-/// Closing streams returns credit before authentication too, which is what
-/// keeps a well-behaved unauthenticated peer moving at all. RFC 9000 §4.6
+/// Closing streams returns credit before authentication too. RFC 9000 §4.6
 /// leaves that to the receiver ("this document leaves implementations to decide
 /// when and how many streams should be advertised to a peer via MAX_STREAMS.
 /// Implementations might choose to increase limits as streams are closed"), and
@@ -488,7 +476,7 @@ mod tests {
     }
 
     /// The bound that stops one unauthenticated connection from exhausting the
-    /// host's memory (audit 2026-08, finding 1.1a).
+    /// host's memory.
     ///
     /// quinn's default is `receive_window: VarInt::MAX`, no aggregate limit;
     /// [`CONNECTION_RECEIVE_WINDOW`] has the arithmetic this replaces.
@@ -550,15 +538,12 @@ mod tests {
 
     /// quinn's own defaults still agree with what this module says about them.
     ///
-    /// The drift alarm covers two different claims, neither of which can change
-    /// behaviour any more — both values reaching the wire are set explicitly —
-    /// but either of which a cargo bump could turn into a false comment, and
-    /// Dependabot proposes those weekly. [`SEND_WINDOW`] is genuinely pinned at
-    /// quinn's default, so a moved default would invalidate the pin's own
-    /// justification. [`STREAM_RECEIVE_WINDOW`] is no longer a pin — it is a
-    /// deliberate raise — so quinn's value is not asserted against *ours*; what is
-    /// asserted is [`QUINN_DEFAULT_STREAM_RECEIVE_WINDOW`], the number the BDP
-    /// arithmetic there compares 2 MiB to.
+    /// Both values reaching the wire are set explicitly, so this guards
+    /// comments, not behaviour. [`SEND_WINDOW`] is pinned at quinn's default,
+    /// so a moved default would invalidate the pin's own justification.
+    /// [`STREAM_RECEIVE_WINDOW`] is a deliberate raise, so what is asserted is
+    /// [`QUINN_DEFAULT_STREAM_RECEIVE_WINDOW`], the number its BDP arithmetic
+    /// compares 2 MiB to.
     #[test]
     fn quinn_has_not_moved_the_defaults_we_quote() {
         let rendered = format!("{:?}", quinn::TransportConfig::default());
@@ -835,8 +820,8 @@ mod tests {
     }
 
     /// The default really is BBR, all the way to the controller a connection
-    /// runs. Since 1.2.0 that is the capped controller (D108), the type
-    /// [`controller_type_of`] names `bbr`.
+    /// runs: the capped controller (D108), the type [`controller_type_of`]
+    /// names `bbr`.
     ///
     /// The one assertion in this module with a production incident behind it.
     /// quinn defaults to CUBIC, so losing this mapping (a mis-edited match arm,
