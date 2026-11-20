@@ -2,8 +2,9 @@
 //!
 //! `it_sni_gate` asks whether the gate admits the right *names*, with real
 //! clients. This binary spells Initial packets by hand and asks three questions
-//! around that, all through the [`judgement`] seam the socket path itself calls
-//! and the [`nameless_crypto`] it derives Initial keys from.
+//! around that, all through the [`judgement`] seam the socket path itself calls,
+//! which opens each packet with the server's own Initial key code.
+//! [`nameless_crypto`] only builds the packets.
 //!
 //! **Is a first flight judged by its name and by nothing else?** A client has a
 //! great deal of freedom in how its first packet is laid out, and none of it may
@@ -1222,10 +1223,12 @@ fn a_real_aioquic_first_flight_is_judged_by_the_name_it_carries() {
 ///
 /// The assertions are the other half of it. They pin what each seed is a seed
 /// *for*, so a verdict that moves is a red test rather than a corpus that
-/// quietly stops covering anything — and they pin the claim [`nameless_crypto`]
-/// rests on, since these packets are built under a real self-signed certificate
-/// and opened by the nameless configuration behind [`judgement`]. Initial keys
-/// do not depend on the certificate; if they ever did, every refusal below
+/// quietly stops covering anything. They also pin the claim [`nameless_crypto`]
+/// rests on. These packets are built under a real self-signed certificate
+/// (`certified_crypto`) and opened by [`judgement`], which derives Initial keys
+/// with the server's own key code and no certificate at all, as it does for the
+/// packets the other tests build with [`nameless_crypto`]. Initial keys do not
+/// depend on the certificate; if they ever did, every refusal below
 /// that is decided behind the packet protection would fall through to
 /// [`Verdict::Pass`]. And each seed is judged twice,
 /// which is the fuzz target's "a verdict is a function of the bytes and the
