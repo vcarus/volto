@@ -112,13 +112,6 @@ const ALERT_UNRECOGNIZED_NAME: c_int = sys::SSL_AD_UNRECOGNIZED_NAME;
 /// says nothing about which parameter it was.
 const ALERT_HANDSHAKE_FAILURE: c_int = sys::SSL_AD_HANDSHAKE_FAILURE;
 
-/// The most Initial-level CRYPTO bytes kept for reading the outer ClientHello.
-///
-/// libssl's own limit for that level (`SSL_quic_max_handshake_flight_len`,
-/// 16384 at `ssl_encryption_initial`): `SSL_provide_quic_data` refuses a flight
-/// longer than this, so nothing past it can be a ClientHello libssl reads.
-const OUTER_HELLO_LIMIT: usize = 16 * 1024;
-
 /// What the configuration-level callbacks read.
 struct CtxData {
     /// ALPN identifiers, in server preference order.
@@ -889,7 +882,8 @@ struct Session {
     /// kept and the handshake's results are not read for the line.
     debug_line: bool,
     /// Initial-level CRYPTO bytes, kept until the outer ClientHello is whole,
-    /// and never more than [`OUTER_HELLO_LIMIT`].
+    /// and never more than [`hello::MAX_INITIAL_FLIGHT`], past which nothing is
+    /// a ClientHello libssl reads.
     initial: Vec<u8>,
     outer: Option<OuterHello>,
 }
@@ -988,7 +982,7 @@ impl Session {
         if !self.debug_line || self.level != Level::Initial || self.outer.is_some() {
             return;
         }
-        if self.initial.len() + buf.len() > OUTER_HELLO_LIMIT {
+        if self.initial.len() + buf.len() > hello::MAX_INITIAL_FLIGHT {
             // Longer than any ClientHello libssl reads; it refuses the flight
             // itself. Stop keeping bytes and log nothing about it.
             self.outer = Some(OuterHello::default());
@@ -1344,11 +1338,11 @@ impl crypto::Session for FailedSession {
 }
 
 /// The ceiling on what one probed handshake may hold in this provider's own
-/// buffers: the outer ClientHello copy, bounded by libssl's 16384-byte Initial
-/// flight limit, plus
-/// the handshake bytes libssl queued and quinn has not taken, which are the
-/// server's own flight (a certificate chain and a few small messages).
-pub const PROBE_HELD_LIMIT: usize = OUTER_HELLO_LIMIT + 64 * 1024;
+/// buffers: the outer ClientHello copy, bounded by libssl's Initial flight
+/// limit [`hello::MAX_INITIAL_FLIGHT`], plus the handshake bytes libssl queued
+/// and quinn has not taken, which are the server's own flight (a certificate
+/// chain and a few small messages).
+pub const PROBE_HELD_LIMIT: usize = hello::MAX_INITIAL_FLIGHT + 64 * 1024;
 
 /// A server configuration for [`ProbeSession`]: the certificate and key as
 /// DER, ALPN `h3`, no gate list, and the ECH key if given. Everything else is
