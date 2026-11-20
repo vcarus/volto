@@ -108,7 +108,8 @@ pub const RECV_WINDOW: usize = 2 * 1024;
 /// receive, which runs only once the socket is readable. From then on a
 /// session holds one block across every wait, 16 KiB. The overflow buffer is
 /// one per runtime thread rather than one per session, 63479 bytes, and is
-/// allocated by the first long packet a thread receives.
+/// allocated by the first receive of any length on that thread, because every
+/// receive offers it.
 pub const RECV_BLOCK_SIZE: usize = 16 * 1024;
 
 thread_local! {
