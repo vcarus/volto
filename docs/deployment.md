@@ -729,19 +729,13 @@ and reload. The startup line `accepting QUIC connections` then carries
 `ech=true` with the key's `ech_config_id` and `ech_public_name`.
 
 The public name is what an observer sees, so choose a name that says nothing
-about this server. It must be a plain host name (letters, digits, hyphens and
-dots, not ending in a number); `ech-keygen` refuses anything else. The public
-name does not go into `[security].expected_sni`: the gate admits a handshake
-whose ECH the key opens without looking at the name in the clear, and listing
-the public name would make it a second name a probe could copy. The real name
-stays on the list, because the TLS layer still judges the name inside the
-encryption. The full rules are under
+about this server. It does not go into `[security].expected_sni`, and the real
+name stays there. What `ech-keygen` accepts as a public name, why it stays off
+that list and what each ClientHello gets are under
 [Encrypted Client Hello](configuration.md#encrypted-client-hello).
 
 Keep the ECHConfigList as private as a password. The server never publishes it,
-and that is what lets the gate treat it as a credential: a handshake whose ECH
-extension the key does not open gets no reply at all, not even an
-acknowledgement, and never reaches the TLS layer.
+and that is what lets the gate treat it as a credential.
 
 In Surge, the list goes into the policy's `ech-config`. `sni` then names the
 real server and travels inside the encryption, while the public name is what
@@ -751,9 +745,13 @@ goes on the wire:
 volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
 ```
 
-A client whose list no longer matches the key, after a rotation for example,
-gets no reply at all and times out. A key change is therefore a change to every
-client's configuration: give each one the new list.
+**Rotating the key** is a new file and a reload: generate it with `ech-keygen`,
+point `ech_key` at it, `systemctl reload volto`, and give every client the new
+list. A client whose list no longer matches the key gets no reply at all and
+times out, with or without `require_ech`. The server holds one key at a time, so
+a client with the old list is cut off from the reload on, and a client given the
+new list before the reload is cut off until it. A key change is therefore a
+change to every client's configuration: make both in the same window.
 
 ### Requiring ECH
 
@@ -771,10 +769,8 @@ A client without `ech-config` then times out without an error message on
 either side, except this server's debug log, which names the reason for each
 dropped handshake. `require_ech` without `server.ech_key` is refused at startup,
 by `--check-config` and on reload, and so is a reload that removes the key while
-it is on. Rotating the key under `require_ech` cuts every client off until it
-has the new list, so hand out the new list first and reload second. The record
-of admitted ECH handshakes that stops a copied first flight from being answered
-lives in memory: a restart empties it, and so does a reload with a new key.
+it is on. A rotation under `require_ech` cuts clients off exactly as described
+above.
 
 ## Apple's relay client
 

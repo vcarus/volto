@@ -135,8 +135,8 @@ together with the CRYPTO bytes it carried. Once the held bytes make a whole
 ClientHello, the flight is judged. An ECH extension the key opens is admitted
 without its outer name being looked at, unless the same HPKE `enc` was admitted
 before from another address. An ECH extension the key does not open is dropped,
-which departs from RFC 9849 §7.1 on purpose: going on with the outer
-ClientHello would send the ECHConfigList back to whoever asked. A ClientHello
+which departs from RFC 9849 §7.1 on purpose, for the reason given under
+[Encrypted Client Hello](configuration.md#encrypted-client-hello). A ClientHello
 without ECH is dropped under `[security] require_ech` and otherwise judged by
 its name. An admitted flight's datagrams are handed to quinn from the next
 receive call, in the order they arrived, each in a buffer of its own; quinn's
@@ -146,12 +146,10 @@ time, in the number of flights and in bytes, each by a named constant in
 `gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
 `enc` values is bounded by count rather than time, emptied by a reload that
 changes the key, and lost at a restart; only a flight the key opened can add to
-it. The TLS layer keeps a second line under this one: with a key configured, its
-ClientHello callback refuses a ClientHello that carried an ECH extension libssl
-did not accept, and under `require_ech` one that libssl accepted no ECH on,
-with a `handshake_failure` alert and before the server writes any handshake
-message, so a defect in the gate costs an answer rather than the
-ECHConfigList.
+it. The TLS layer's ClientHello callback refuses the same ClientHellos a second
+time, so a defect in the gate costs a `handshake_failure` alert rather than the
+ECHConfigList; [Encrypted Client Hello](configuration.md#encrypted-client-hello)
+says which.
 
 Without an ECH key, the acknowledgement quinn returns for an Initial the gate
 passes that carries an ack-eliciting frame and no name is left uncovered: a

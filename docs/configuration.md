@@ -72,16 +72,16 @@ holds stays the same across restarts and reloads. Nothing in `config.toml`
 changes it. The file is read at startup, by `--check-config` and on every
 `SIGHUP`, and refused whole if a block is missing or doubled, if the private key
 is not X25519, if the two blocks do not belong together, or if the public name
-is one a client would ignore: it must be a host name of letters, digits and
-hyphens with no empty label, no label over 63 bytes, no label that begins or
-ends with a hyphen, and a last label that is neither all digits nor `0x`
-followed by hex digits (RFC 9849 §6.1.7). A refused file at `SIGHUP` leaves
-the running key in force.
+is one a client would ignore: it must be a host name of at most 255 bytes, of
+letters, digits and hyphens, with no empty label, no label over 63 bytes, no
+label that begins or ends with a hyphen, and a last label that is neither all
+digits nor `0x` followed by hex digits (RFC 9849 §6.1.7). `ech-keygen` applies
+the same rule to `--public-name`. A refused file at `SIGHUP` leaves the running
+key in force.
 
-**Rotating the key** is a new file and a reload: generate it with
-`ech-keygen`, point `ech_key` at it, `systemctl reload volto`, and give every
-client the new list. A client with the old list then gets no reply at all, like
-any other client whose ECH the key does not open.
+**Rotating the key** is a new file and a reload, and the server holds one key at
+a time; the steps are under
+[Encrypted Client Hello](deployment.md#encrypted-client-hello) in deployment.md.
 
 **What each ClientHello gets**, with a key configured:
 
