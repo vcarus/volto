@@ -180,10 +180,17 @@ binary's own message and nothing written, so the cause can be fixed and the
 installer re-run on a host it left untouched. A binary too old to know the flag
 is not asked, and the install goes ahead as it always did.
 
-Re-running is safe: an existing config file, certificate or user is kept.
+Re-running is safe: on a host that already has `/etc/volto/config.toml`, the
+config file, the certificate, the user, the binary and the unit are kept, and the
+service is not restarted; only a missing binary or unit is installed.
 `--force` regenerates the certificate only — it never rewrites `config.toml`, so
-hand edits survive. Regenerating changes the fingerprint, and every client then
-has to be updated.
+hand edits survive — and reloads the running service so it serves the new one.
+Regenerating changes the fingerprint, and every client then has to be updated.
+`--replace-binary` is the one way the installer replaces an installed binary: it
+asks the new binary whether it can load the existing config, keeps the current
+binary and unit as `.prev`, restarts the service and puts both back if it does
+not stay up, the way `deploy.sh` does. On a host the timer keeps updated,
+`deploy.sh --tag` is the usual way to change the binary.
 
 Generating the certificate by hand instead:
 

@@ -11,7 +11,12 @@
 # version: no domain and no renewals, but the fingerprint has to reach every
 # client through a channel you trust, and there is no revocation if it leaks.
 #
-# Safe to re-run: anything that already exists is left alone.
+# Safe to re-run: on a host that already has a config, the config, the
+# certificate, the user, the binary and the unit are kept and the service is
+# not restarted. --force regenerates the certificate and reloads the service;
+# --replace-binary replaces the binary and the unit, after asking the new
+# binary about the existing config, keeping .prev copies and rolling back if
+# the service does not stay up.
 #
 # The config this generates is not installed until the volto binary has been
 # asked whether it can load it -- `volto --check-config`, the same question
@@ -43,6 +48,7 @@ PORT="${PORT:-443}"
 USERNAME="${USERNAME:-surge}"
 PASSWORD="${PASSWORD:-}"
 FORCE=0
+REPLACE_BINARY=0
 PRINT_CONFIG=0
 CHECK_CONFIG=0
 
@@ -82,7 +88,13 @@ Options:
   -p, --port PORT      UDP port to listen on     (default: 443)
   -u, --username NAME  proxy username            (default: surge)
   -w, --password PASS  proxy password            (default: generated)
-  -f, --force          regenerate the certificate even if one exists
+  -f, --force          regenerate the certificate even if one exists, and
+                       reload the service so it serves the new one
+      --replace-binary on a host that already has /etc/volto/config.toml,
+                       replace the installed binary and unit too: the new
+                       binary is asked about the existing config first, the
+                       old ones are kept as .prev, and the service is restarted
+                       and rolled back if it does not stay up
       --print-config   print the config that would be generated, then exit
                        (changes nothing, needs no root; used by the test suite)
       --check-config   generate the config this run would install and ask the
@@ -115,10 +127,13 @@ can load it (volto --check-config); if it cannot, nothing is written and the
 binary's own complaint is printed. A volto too old to know that flag is not
 asked, and the install goes ahead unchecked.
 
-Re-running is safe: an existing config file, certificate or user is kept as it
-is. --force regenerates the certificate only; it never rewrites config.toml, so
-edits you made there survive. Note that regenerating the certificate changes the
-fingerprint, so every client has to be updated.
+Re-running is safe: on a host that already has /etc/volto/config.toml, the
+config file, the certificate, the user, the binary and the unit are kept as
+they are, and the service is not restarted; a missing binary or unit is
+installed. --force regenerates the certificate only; it never rewrites
+config.toml, so edits you made there survive. Note that regenerating the
+certificate changes the fingerprint, so every client has to be updated.
+--replace-binary is the one way this script replaces an installed binary.
 USAGE
 }
 
@@ -185,6 +200,7 @@ while [ $# -gt 0 ]; do
         -u|--username) [ $# -ge 2 ] || die "$1 needs a value"; USERNAME="$2"; shift 2 ;;
         -w|--password) [ $# -ge 2 ] || die "$1 needs a value"; PASSWORD="$2"; shift 2 ;;
         -f|--force)    FORCE=1; shift ;;
+        --replace-binary) REPLACE_BINARY=1; shift ;;
         --print-config) PRINT_CONFIG=1; shift ;;
         --check-config) CHECK_CONFIG=1; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -256,47 +272,72 @@ verify_config() {
 # exists, keeping it" branch then preserves on every later run -- the failure
 # would outlive the run that caused it. It cannot move any earlier than this:
 # one of the rules being checked is that the certificate and key the file names
-# are readable files, and the certificate is generated a few lines above.
-#
-# Whether the binary can be asked at all is settled by looking for the flag in
-# its own --help, not by running it and reading the failure. A volto from before
-# the flag existed answers an unknown argument with clap's usage error, and
-# taking that for "your configuration is broken" would turn every older binary
-# into a failed install -- the opposite of the point. The help text goes into a
-# variable rather than through a pipe to grep, because `grep -q` closes the pipe
-# on its first match and `set -o pipefail` would then report the producer's
-# SIGPIPE as a failure. A binary that cannot be asked leaves the run exactly as
-# it was before any of this existed.
+# exist and are files, and the certificate is generated a few lines above. A
+# binary too old to be asked leaves the run as it was before the check existed.
 check_generated_config() {
-    local help output
+    ask_binary "$1"
+    case "$ASK_VERDICT" in
+        loads) note "the generated config loads on this volto" ;;
+        unasked) note "this volto predates --check-config, so the generated config goes in unchecked" ;;
+        *)
+            {
+                echo "==> volto cannot load the config this install would write"
+                echo "$ASK_OUTPUT"
+                note "no configuration was written and the service was not started"
+                note "the position above is a line of $EXAMPLE_SRC, which is this"
+                note "config with four values substituted into it"
+                note "(docs/configuration.md, version compatibility, says which key arrived when)"
+            } >&2
+            die "refusing to install a config volto cannot load"
+            ;;
+    esac
+}
 
+# Asks $BINARY whether it can load the config file $1. Sets ASK_VERDICT to
+# `loads`, `refuses`, or `unasked` for a binary too old to know the flag, and
+# ASK_OUTPUT to the binary's own message, which the caller prints on stderr: it
+# names the line and the column but not the key, because a parse error redacts
+# every quoted segment, which can be a password.
+#
+# The flag is looked for in the binary's --help first, for the reason
+# deploy.sh's check_config_with gives.
+ASK_VERDICT=""
+ASK_OUTPUT=""
+ask_binary() {
+    local help
+
+    ASK_OUTPUT=""
     help="$("$BINARY" --help 2>&1)" || help=""
     case "$help" in
         *--check-config*) ;;
+        *) ASK_VERDICT=unasked; return 0 ;;
+    esac
+    if ASK_OUTPUT="$("$BINARY" --check-config --config "$1" 2>&1)"; then
+        ASK_VERDICT=loads
+    else
+        ASK_VERDICT=refuses
+    fi
+}
+
+# Asks $BINARY about the config this host already has, before a run that
+# replaces the installed binary, and ends the run when it cannot load it. The
+# same question deploy.sh asks before its swap (check_config_with).
+check_existing_config() {
+    ask_binary "$CONF"
+    case "$ASK_VERDICT" in
+        loads) note "$CONF loads on this volto" ;;
+        unasked) note "this volto predates --check-config, so it cannot be asked about $CONF" ;;
         *)
-            note "this volto predates --check-config, so the generated config goes in unchecked"
-            return 0
+            {
+                echo "==> volto cannot load $CONF"
+                echo "$ASK_OUTPUT"
+                note "nothing was installed; the binary, the unit and the service are as they were"
+                note "the position above names the line to comment out in $CONF"
+                note "(docs/configuration.md, version compatibility, says which key arrived when)"
+            } >&2
+            die "refusing to install $BINARY over a config it cannot load"
             ;;
     esac
-
-    if output="$("$BINARY" --check-config --config "$1" 2>&1)"; then
-        note "the generated config loads on this volto"
-        return 0
-    fi
-
-    # Everything about the refusal, on stderr, where a failing run's output is
-    # read from -- including the binary's own message, which names the line and
-    # the column but not the key (a parse error redacts every quoted segment,
-    # because the same message can quote a password).
-    {
-        echo "==> volto cannot load the config this install would write"
-        echo "$output"
-        note "no configuration was written and the service was not started"
-        note "the position above is a line of $EXAMPLE_SRC, which is this"
-        note "config with four values substituted into it"
-        note "(docs/configuration.md, version compatibility, says which key arrived when)"
-    } >&2
-    die "refusing to install a config volto cannot load"
 }
 
 # The port is validated here rather than in the preflight below, because both
@@ -357,6 +398,22 @@ check_credentials
 [ -f "$UNIT_SRC" ] || die "missing $UNIT_SRC"
 [ -f "$EXAMPLE_SRC" ] || die "missing $EXAMPLE_SRC"
 
+# A host with a config is a configured host: its binary and unit are replaced
+# only when they are missing or --replace-binary asks for it. Whether the new
+# binary can load the config that is already here is asked now, before
+# anything on the host changes, so a refusal leaves the host as it was.
+HAD_CONFIG=0
+[ ! -f "$CONF" ] || HAD_CONFIG=1
+PLACE_BINARY=1
+PLACE_UNIT=1
+if [ "$HAD_CONFIG" -eq 1 ] && [ "$REPLACE_BINARY" -eq 0 ]; then
+    [ ! -x "$BIN" ] || PLACE_BINARY=0
+    [ ! -f "$UNIT" ] || PLACE_UNIT=0
+fi
+if [ "$HAD_CONFIG" -eq 1 ] && [ "$PLACE_BINARY" -eq 1 ]; then
+    check_existing_config
+fi
+
 # --- certificate name -------------------------------------------------------
 
 # The name goes into the certificate (CN and SAN) and has to match what the
@@ -379,9 +436,6 @@ else
     useradd --system --no-create-home --shell /usr/sbin/nologin volto
     note "created system user 'volto'"
 fi
-
-install -m 0755 "$BINARY" "$BIN"
-note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
 
 install -d -o volto -g volto -m 0750 "$CONF_DIR"
 
@@ -439,9 +493,11 @@ restore_previous_pair() {
     die "installing the new certificate failed before anything was moved into place"
 }
 
+CERT_CHANGED=0
 if [ -f "$CERT" ] && [ -f "$KEY" ] && [ "$FORCE" -eq 0 ]; then
     note "certificate already exists, keeping it (use --force to regenerate)"
 else
+    CERT_CHANGED=1
     # The new pair is written beside the old one and moved into place only after
     # openssl has succeeded. A renewal that fails -- a full filesystem, a
     # provider that will not initialize, an extension this openssl does not know
@@ -526,7 +582,7 @@ else
     verify_config "$tmp"
     # Last thing before the file becomes this host's configuration, and after
     # the certificate exists -- one of the rules the binary checks is that the
-    # paths in the file are readable files.
+    # paths in the file exist and are files.
     check_generated_config "$tmp"
 
     install -o volto -g volto -m 0640 "$tmp" "$CONF"
@@ -535,16 +591,92 @@ else
     note "wrote $CONF"
 fi
 
-# --- service ----------------------------------------------------------------
+# --- binary, unit and service -----------------------------------------------
 
-install -m 0644 "$UNIT_SRC" "$UNIT"
-systemctl daemon-reload
-systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+# Puts back the binary and unit this run kept as .prev, reloads systemd, runs
+# `systemctl $1`, then ends the run. The ERR trap of the swap below calls it
+# with `start` and the health check with `restart`, as deploy.sh's put_back
+# does, for the reasons given there.
+put_back() {
+    trap - ERR
+    local restored=""
 
-if systemctl is-active --quiet "$SERVICE_NAME"; then
-    systemctl restart "$SERVICE_NAME"
+    if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
+        restored="binary"
+    fi
+    if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+        restored="${restored:+$restored and }unit"
+    fi
+    systemctl daemon-reload || true
+    systemctl "$1" "$SERVICE_NAME" || true
+
+    [ -n "$restored" ] ||
+        die "replacing the binary and unit failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
+    die "replacing the binary and unit failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+}
+
+if [ "$HAD_CONFIG" -eq 1 ] && [ "$PLACE_BINARY" -eq 0 ] && [ "$PLACE_UNIT" -eq 0 ]; then
+    note "kept the installed binary and unit (--replace-binary replaces them)"
+    # A reload makes the running service read the new certificate, and keeps
+    # every established tunnel.
+    if [ "$CERT_CHANGED" -eq 1 ] && systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl reload "$SERVICE_NAME"
+        note "reloaded $SERVICE_NAME, which serves the new certificate from now on"
+    fi
+elif [ "$HAD_CONFIG" -eq 1 ]; then
+    # A configured host: the files being replaced are kept as .prev first, as
+    # deploy.sh keeps them, and put back if the service does not come up. A
+    # .prev left by an earlier run is removed, so it is never restored as if
+    # it were what this run replaced.
+    rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new"
+    if [ "$PLACE_BINARY" -eq 1 ] && [ -x "$BIN" ]; then
+        install -m 0755 "$BIN" "$BIN.prev"
+        note "previous binary kept at $BIN.prev"
+    fi
+    if [ "$PLACE_UNIT" -eq 1 ] && [ -f "$UNIT" ]; then
+        install -m 0644 "$UNIT" "$UNIT.prev"
+        note "previous unit kept at $UNIT.prev"
+    fi
+    # The commands are written out here rather than in a function, because
+    # this script does not set -E and a function would not inherit the trap.
+    trap 'put_back start' ERR
+    if [ "$PLACE_BINARY" -eq 1 ]; then
+        install -m 0755 "$BINARY" "$BIN.new"
+        mv -f "$BIN.new" "$BIN"
+        note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
+    fi
+    [ "$PLACE_UNIT" -eq 0 ] || install -m 0644 "$UNIT_SRC" "$UNIT"
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME"
+    else
+        systemctl start "$SERVICE_NAME"
+    fi
+    # A command inside `if` does not fire the trap, so a service that came up
+    # and then died reaches the else branch.
+    sleep 3
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        trap - ERR
+    else
+        put_back restart
+    fi
 else
-    systemctl start "$SERVICE_NAME"
+    # A first install, or a host whose config was deleted: the config was just
+    # generated and asked about with this binary, so the binary and unit go in
+    # with it and no previous copy is kept.
+    install -m 0755 "$BINARY" "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
+    note "installed $("$BIN" --version 2>/dev/null || echo volto) to $BIN"
+    install -m 0644 "$UNIT_SRC" "$UNIT"
+    systemctl daemon-reload
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        systemctl restart "$SERVICE_NAME"
+    else
+        systemctl start "$SERVICE_NAME"
+    fi
 fi
 
 # --- firewall ---------------------------------------------------------------

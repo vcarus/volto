@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scripts::{
-    path_with_stubs, plant_binary_without_the_flag, plant_placeholder_certificates, real_binary,
-    repo_root, scratch_tree, stderr_of, stdout_of, write_executable,
+    loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
+    plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
+    write_executable,
 };
 use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
 
@@ -701,7 +702,8 @@ fn try_real_tool(name: &str) -> Option<PathBuf> {
 /// user is created. `apt-get` is only looked up before the certificate step.
 /// `systemctl` reports `service_status` for `is-active`: the `--quiet` form
 /// exits 0 only when the status is `active`, the plain form prints the status
-/// and exits 0, and every other invocation exits 0. `chown` does nothing.
+/// and exits 0, and every other invocation exits 0; every call is recorded in
+/// `systemctl.log` beside it. `chown` does nothing.
 /// `install` drops its `-o` and `-g` arguments, which name a user this host does
 /// not have, and runs the real `install`. `mv` counts its calls in `mv-calls`
 /// beside it.
@@ -717,6 +719,7 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
         &dir.join("systemctl"),
         &format!(
             "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
              if [ \"$1\" = is-active ]; then\n\
              \x20 if [ \"$2\" = --quiet ]; then\n\
              \x20   [ \"{service_status}\" = active ] || exit 1\n\
@@ -725,7 +728,8 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
              \x20 echo \"{service_status}\"\n\
              \x20 exit 0\n\
              fi\n\
-             exit 0\n"
+             exit 0\n",
+            log = dir.join("systemctl.log").display(),
         ),
     );
     write_executable(&dir.join("apt-get"), "#!/bin/sh\nexit 0\n");
@@ -1076,6 +1080,214 @@ fn an_install_whose_service_is_active_reports_success() {
     );
 }
 
+/// A configured host for the re-run tests: a config the real binary loads with
+/// `body` appended, its certificate pair, an installed binary that reports an
+/// old version, and an installed unit.
+fn configured_root(name: &str, body: &str) -> PathBuf {
+    let root = scratch_tree(
+        "install",
+        name,
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let dir = root.join("etc/volto");
+    let (cert, key) = plant_placeholder_certificates(&dir);
+    fs::write(
+        dir.join("config.toml"),
+        loadable_config_text(&cert, &key, "127.0.0.1:4433", "planted", body),
+    )
+    .expect("config must be writable");
+    write_executable(&root.join("usr/local/bin/volto"), OLD_BINARY);
+    fs::write(root.join("etc/systemd/system/volto.service"), OLD_UNIT)
+        .expect("the unit must be writable");
+    root
+}
+
+/// The installed binary and unit [`configured_root`] plants.
+const OLD_BINARY: &str = "#!/bin/sh\necho 'volto 0.0.1'\n";
+const OLD_UNIT: &str = "# the installed unit\n";
+
+/// What the stand-in `systemctl` was asked, one call per line.
+fn systemctl_calls(stubs: &Path) -> String {
+    fs::read_to_string(stubs.join("systemctl.log")).unwrap_or_default()
+}
+
+/// A re-run on a host that already has a config leaves the binary and the unit
+/// alone and does not restart the service (R8-M2).
+///
+/// The installer used to install `--binary` over `/usr/local/bin/volto` and the
+/// unit over the installed one on every run, with no config check and no
+/// `.prev`, and then restart. A re-run to regenerate a certificate from a
+/// checkout holding an older build downgraded the binary. With `--force` the
+/// certificate is regenerated and the running service reloaded, which keeps
+/// its tunnels.
+#[test]
+fn a_rerun_on_a_configured_host_keeps_the_binary_and_the_unit() {
+    for (name, args) in [
+        ("rerun-plain", &[][..]),
+        ("rerun-force", &["--force"][..]),
+    ] {
+        let root = configured_root(name, "");
+        let stubs = plant_root_stubs(&root, 0, "active");
+
+        let output = run_full_install_with_stubs(&root, &stubs, args);
+
+        let stderr = stderr_of(&output);
+        assert!(output.status.success(), "{name}: {stderr}");
+        assert_eq!(
+            fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+            Some(OLD_BINARY),
+            "{name}: the installed binary must be kept: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/systemd/system/volto.service"))
+                .ok()
+                .as_deref(),
+            Some(OLD_UNIT),
+            "{name}: the installed unit must be kept: {stderr}"
+        );
+        assert!(
+            !root.join("usr/local/bin/volto.prev").exists(),
+            "{name}: nothing was replaced, so nothing is kept as .prev"
+        );
+        let calls = systemctl_calls(&stubs);
+        assert!(
+            !calls.contains("restart")
+                && !calls.contains("start volto")
+                && !calls.contains("daemon-reload"),
+            "{name}: the service must not be restarted: {calls}"
+        );
+        assert_eq!(
+            calls.contains("reload volto"),
+            name == "rerun-force",
+            "{name}: only a regenerated certificate reloads the service: {calls}"
+        );
+        assert!(
+            stdout_of(&output).contains("kept the installed binary and unit"),
+            "{name}: the run must say what it kept: {}",
+            stdout_of(&output)
+        );
+    }
+}
+
+/// `--replace-binary` asks the new binary about the existing config before
+/// anything moves, and a refusal leaves the host as it was.
+#[test]
+fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
+    let root = configured_root("replace-refused", "\n[limits]\na_key_a_later_release_added = 2\n");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let old_cert = fs::read(root.join("etc/volto/cert.pem")).expect("the certificate");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary", "--force"]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("unknown field") && stderr.contains("over a config it cannot load"),
+        "the binary's own refusal must reach the operator: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        Some(OLD_BINARY),
+        "the installed binary must be untouched: {stderr}"
+    );
+    assert_eq!(
+        fs::read(root.join("etc/volto/cert.pem")).ok(),
+        Some(old_cert),
+        "the refusal comes before the certificate step: {stderr}"
+    );
+    assert!(!root.join("usr/local/bin/volto.prev").exists());
+    assert_eq!(systemctl_calls(&stubs), "", "the service must be left alone");
+}
+
+/// `--replace-binary` with a binary that loads the config keeps the previous
+/// binary and unit as `.prev`, the way `deploy.sh` does, and restarts.
+#[test]
+fn replacing_the_binary_keeps_the_previous_one_and_restarts() {
+    let root = configured_root("replace-accepted", "");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    fs::write(root.join("usr/local/bin/volto.prev"), "a stale previous binary\n")
+        .expect("the stale .prev must be writable");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
+
+    let stderr = stderr_of(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        fs::read(root.join("usr/local/bin/volto")).ok(),
+        fs::read(real_binary()).ok(),
+        "the new binary must be installed"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("usr/local/bin/volto.prev")).ok().as_deref(),
+        Some(OLD_BINARY),
+        "the previous binary must be kept, not a stale .prev: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/systemd/system/volto.service.prev"))
+            .ok()
+            .as_deref(),
+        Some(OLD_UNIT),
+        "the previous unit must be kept"
+    );
+    assert_eq!(
+        fs::read(root.join("etc/systemd/system/volto.service")).ok(),
+        fs::read(repo_root().join("script/masque.service")).ok(),
+        "the shipped unit must be installed"
+    );
+    let calls = systemctl_calls(&stubs);
+    assert!(
+        calls.contains("daemon-reload\n") && calls.contains("restart volto\n"),
+        "the service must be restarted on the new files: {calls}"
+    );
+}
+
+/// A failed restart after `--replace-binary` puts the previous binary and unit
+/// back and starts the service on them.
+#[test]
+fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
+    let root = configured_root("replace-rollback", "");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    write_executable(
+        &stubs.join("systemctl"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in\n\
+             \x20 'restart volto') exit 1 ;;\n\
+             \x20 'is-active volto') echo active ;;\n\
+             esac\n\
+             exit 0\n",
+            stubs.join("systemctl.log").display()
+        ),
+    );
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("restored the previous binary and unit"),
+        "the run must say what it restored: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        Some(OLD_BINARY),
+        "the previous binary must be back: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("etc/systemd/system/volto.service"))
+            .ok()
+            .as_deref(),
+        Some(OLD_UNIT),
+        "the previous unit must be back: {stderr}"
+    );
+    assert!(
+        systemctl_calls(&stubs).ends_with("restart volto\ndaemon-reload\nstart volto\n"),
+        "the rollback reloads systemd and starts the service: {}",
+        systemctl_calls(&stubs)
+    );
+}
+
 /// The report must survive a certificate that openssl cannot read.
 ///
 /// Under `set -euo pipefail` the plain assignments that read the fingerprint and
@@ -1130,6 +1342,7 @@ fn the_script_documents_itself() {
         "--username",
         "--print-config",
         "--check-config",
+        "--replace-binary",
         "Re-running is safe",
     ] {
         assert!(
