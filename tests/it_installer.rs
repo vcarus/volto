@@ -1397,6 +1397,62 @@ fn a_symbolic_link_in_place_of_the_key_is_refused() {
     assert!(!dir.join("config.toml").exists(), "no config may be written");
 }
 
+/// The certificate name must be a host name before it reaches openssl
+/// (R8-L8).
+///
+/// `--sni 'a.example,IP:192.0.2.1'` put an IP address into the certificate's
+/// subjectAltName, a `/` added subject fields to `-subj`, and either went into
+/// the printed policy line as well.
+#[test]
+fn a_certificate_name_that_is_not_a_host_name_is_refused() {
+    let long_label = format!("{}.example", "a".repeat(64));
+    let too_long = vec!["abcdefghi"; 26].join(".");
+    for name in [
+        "a.example,IP:192.0.2.1",
+        "a.example/O=Somebody",
+        "-leading.example",
+        "trailing-.example",
+        "a..example",
+        ".example",
+        "example.",
+        "192.0.2.1",
+        "under_score.example",
+        "spa ce.example",
+        long_label.as_str(),
+        too_long.as_str(),
+    ] {
+        let root = scratch_tree(
+            "install",
+            "bad-sni",
+            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+        );
+        let stubs = plant_root_stubs(&root, 0, "active");
+        let output = run_full_install_with_stubs(&root, &stubs, &["--sni", name]);
+
+        let stderr = stderr_of(&output);
+        assert!(!output.status.success(), "{name:?} must be refused: {}", stdout_of(&output));
+        assert!(
+            stderr.contains("the certificate name must be a host name"),
+            "{name:?}: the refusal must say why: {stderr}"
+        );
+        assert!(
+            !root.join("etc/volto/cert.pem").exists(),
+            "{name:?}: no certificate may be generated"
+        );
+    }
+
+    for name in ["volto.test", "a-b.example", "x", "A1.example.org"] {
+        let root = scratch_tree(
+            "install",
+            "good-sni",
+            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+        );
+        let stubs = plant_root_stubs(&root, 0, "active");
+        let output = run_full_install_with_stubs(&root, &stubs, &["--sni", name]);
+        assert!(output.status.success(), "{name:?}: {}", stderr_of(&output));
+    }
+}
+
 /// The report must survive a certificate that openssl cannot read.
 ///
 /// Under `set -euo pipefail` the plain assignments that read the fingerprint and

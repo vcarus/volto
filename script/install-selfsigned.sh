@@ -84,7 +84,9 @@ and one user, then prints the Surge policy line to paste into your config.
 Options:
   -b, --binary PATH    volto binary to install   (default: ./target/release/volto)
   -s, --sni NAME       certificate name and SNI  (asked for interactively when
-                       neither this nor $SNI is set; default: volto.internal)
+                       neither this nor $SNI is set; default: volto.internal);
+                       a host name: letters, digits, hyphens and dots, not
+                       ending in a number
   -p, --port PORT      UDP port to listen on     (default: 443)
   -u, --username NAME  proxy username            (default: surge)
   -w, --password PASS  proxy password            (default: generated)
@@ -425,6 +427,22 @@ if [ "$SNI_GIVEN" -eq 0 ] && [ -t 0 ]; then
     read -r -p "Certificate domain/SNI [$SNI]: " answer || answer=""
     [ -z "$answer" ] || SNI="$answer"
 fi
+
+# The name goes into openssl's -subj and -addext arguments and into the printed
+# policy line, where a comma adds a second subjectAltName entry (an IP address
+# among them) and a slash a subject field. So it must be a host name by our
+# rule: dot-separated labels of ASCII letters, digits and inner hyphens, each
+# at most 63 bytes, at most 253 in all, and a last label that is not all
+# digits, so no IPv4 address passes. In the C locale, so the ranges are ASCII
+# and the length is in bytes.
+check_sni() {
+    local LC_ALL=C
+    local label='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+    if [ "${#SNI}" -gt 253 ] || ! [[ "$SNI" =~ ^($label\.)*$label$ ]] || [[ "${SNI##*.}" =~ ^[0-9]+$ ]]; then
+        die "the certificate name must be a host name (letters, digits, hyphens and dots, not ending in a number), got: $SNI"
+    fi
+}
+check_sni
 
 echo "==> installing volto (self-signed, sni=$SNI, port=$PORT)"
 

@@ -138,8 +138,9 @@ EC P-256 certificate valid for ten years, derives `/etc/volto/config.toml` from
 the shipped example with a random password, installs and starts the systemd unit,
 opens the port in ufw if it is active, and prints the fingerprint, the expiry
 date and a pasteable Surge policy line. It asks for the certificate name when
-neither `--sni` nor `$SNI` is set and a terminal is attached; everything else has
-a default:
+neither `--sni` nor `$SNI` is set and a terminal is attached, and refuses a name
+that is not a host name (letters, digits, hyphens and dots, not ending in a
+number); everything else has a default:
 
 ```sh
 sudo script/install-selfsigned.sh \
