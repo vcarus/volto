@@ -434,8 +434,10 @@ impl Memory {
     /// Holds one opened first Initial and, if it completes its flight, judges
     /// the flight.
     ///
-    /// `fragments` are the CRYPTO frames of the datagram's first packet, or
-    /// `None` when its frames do not parse. Every flight dropped on the way,
+    /// `fragments` are the CRYPTO frames of every Initial packet of the flight
+    /// in the datagram, the first one and those coalesced behind it, or `None`
+    /// when the frames of one of them do not parse or include a type no
+    /// Initial packet may carry. Every flight dropped on the way,
     /// this one or another, is reported once through `report`, and `None` is
     /// this datagram's own flight dropped.
     pub(super) fn take(
