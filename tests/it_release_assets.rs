@@ -1251,6 +1251,72 @@ fn the_unit_allows_the_address_families_name_resolution_needs() {
     }
 }
 
+/// The directives `script/masque.service` sets, one `Key=value` per entry, from
+/// the lines that are not comments.
+fn unit_directives() -> Vec<String> {
+    read_text(&repo_root().join("script/masque.service"))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.starts_with('['))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The unit carries the hardening the 2026-11-21 review judged safe for what
+/// the binary needs, and not the directive that did nothing (R8-L11).
+///
+/// What the binary needs: bind one UDP port, possibly below 1024, through
+/// `CAP_NET_BIND_SERVICE`; read `/etc/volto`; open TCP and UDP sockets to
+/// anywhere and resolve names through the system resolver; take `SIGHUP` as a
+/// reload, which `RestartForceExitStatus=SIGHUP` keeps from ending the service
+/// in its first milliseconds; write a keylog file only when a drop-in grants a
+/// path. `Type=exec` makes a start fail when the binary cannot be executed,
+/// `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
+/// the `/proc` entries only `--diagnostics` reads, and `RemoveIPC=yes` removes
+/// IPC objects it never makes. `ReadOnlyPaths=/etc/volto` added nothing under
+/// `ProtectSystem=strict`. The directives that would break the binary
+/// (`PrivateUsers=`, `PrivateNetwork=`, `IPAddressDeny=`, `SocketBindDeny=`)
+/// stay out.
+#[test]
+fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
+    let directives = unit_directives();
+    for expected in [
+        "Type=exec",
+        "UMask=0077",
+        "ProcSubset=pid",
+        "RemoveIPC=yes",
+        "ProtectSystem=strict",
+        "ProtectProc=invisible",
+        "User=volto",
+        "Group=volto",
+        "AmbientCapabilities=CAP_NET_BIND_SERVICE",
+        "CapabilityBoundingSet=CAP_NET_BIND_SERVICE",
+        "RestartForceExitStatus=SIGHUP",
+        "ExecReload=/bin/kill -HUP $MAINPID",
+        "SystemCallFilter=@system-service",
+    ] {
+        assert!(
+            directives.iter().any(|line| line == expected),
+            "script/masque.service must set {expected}: {directives:#?}"
+        );
+    }
+    for absent in [
+        "ReadOnlyPaths=",
+        "ReadWritePaths=",
+        "DynamicUser=",
+        "PrivateUsers=",
+        "PrivateNetwork=",
+        "IPAddressDeny=",
+        "SocketBindDeny=",
+        "Type=simple",
+    ] {
+        assert!(
+            !directives.iter().any(|line| line.starts_with(absent)),
+            "script/masque.service must not set {absent}: {directives:#?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // One MSRV
 // ---------------------------------------------------------------------------

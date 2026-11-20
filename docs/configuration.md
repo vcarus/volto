@@ -679,9 +679,9 @@ the log usable for confirming which authorization header a client actually sends
 A keylog file decrypts **every** session through the proxy, including sessions
 already recorded. Turn it off and delete the file when you are done.
 
-Under the shipped unit it writes nowhere. `ProtectSystem=strict` with
-`ReadOnlyPaths=/etc/volto` and no `ReadWritePaths=` leaves the service no
-writable path but its own `PrivateTmp=yes` directory, and the server notes the
+Under the shipped unit it writes nowhere. `ProtectSystem=strict` with no
+`ReadWritePaths=` leaves the service no writable path but its own
+`PrivateTmp=yes` directory, and the server notes the
 failure to open at `debug` and carries on, so the operator gets a server that started,
 a startup warning saying the keylog is on, and no file. Give it a directory and
 a path with a drop-in:

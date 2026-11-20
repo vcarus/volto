@@ -413,7 +413,7 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
 /// the end of the process.
 ///
 /// `systemctl reload` sends the signal as soon as the unit is active, which for
-/// `Type=simple` is as soon as the process exists. Until a handler is installed
+/// `Type=exec` is as soon as the binary has been executed. Until a handler is installed
 /// the signal's default action ends the process, and systemd does not restart a
 /// service that died by `SIGHUP` unless the unit says so. The first stdout line
 /// is the startup warning about authentication, written before `Server::bind`.

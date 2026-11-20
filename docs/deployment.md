@@ -473,13 +473,16 @@ Start it once that edit is made:
 sudo systemctl start volto
 ```
 
-The unit runs as a fixed system user rather than with `DynamicUser=yes` on
-purpose: the private key must be readable by this service and nothing else,
-which needs a stable group to grant it to (`root:volto`, mode 0640).
-`AmbientCapabilities=CAP_NET_BIND_SERVICE` is what allows binding a low port
-without root, and the rest of the unit is standard systemd hardening —
-`ProtectSystem=strict` with `ReadOnlyPaths=/etc/volto`, a `@system-service`
-syscall filter, no new privileges.
+The unit runs as a fixed system user rather than with `DynamicUser=yes`: the
+files in `/etc/volto` are granted to its group (`root:volto`, key mode 0640), and
+a reload reads them again from the paths the config names. A dynamic user has no
+stable group to grant them to; each file would have to be passed with
+`LoadCredential=` instead. `AmbientCapabilities=CAP_NET_BIND_SERVICE` is what
+allows binding a low port without root, and the rest of the unit is standard
+systemd hardening — `ProtectSystem=strict` with no writable path, `UMask=0077`,
+`ProcSubset=pid`, a `@system-service` syscall filter, no new privileges.
+`Type=exec` makes `systemctl start` and `restart` fail at once when the binary
+cannot be executed.
 
 `RUST_LOG` overrides the configured log level without editing the config:
 

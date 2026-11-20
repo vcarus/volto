@@ -30,7 +30,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# exec rather than simple: systemd counts the start as done only once the binary
+# has been executed, so a missing or unexecutable binary fails `systemctl start`
+# and `restart` at once. deploy.sh's rollback then acts on the failed restart
+# instead of on the health check three seconds later.
+Type=exec
 ExecStart=/usr/local/bin/volto --config /etc/volto/config.toml
 
 # SIGHUP re-reads the config file: new credentials and destination policy for new
@@ -72,10 +76,12 @@ LimitNOFILE=131072
 # Runs unprivileged. Binding 443 needs a capability rather than root: this grants
 # exactly that one and nothing else.
 #
-# A fixed system user rather than DynamicUser=yes on purpose: the private key must
-# be readable by this service and by nothing else, which needs a stable owner to
-# grant it to (chown volto:volto, mode 0640). DynamicUser would force the key to be
-# world-readable instead.
+# A fixed system user rather than DynamicUser=yes: the files in /etc/volto are
+# granted to its group (root:volto, key mode 0640), and the paths the config
+# names are the files a reload reads again. A dynamic user has no stable group
+# to grant them to; each file would have to be passed with LoadCredential=
+# (systemd 247 and later) and the config would have to name the credential
+# paths instead.
 User=volto
 Group=volto
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -83,6 +89,17 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 
 # --- Filesystem -------------------------------------------------------------
+# The service writes a file only when [log] keylog is on, so it is given no
+# writable path: ProtectSystem=strict makes the whole filesystem read-only to it,
+# /etc/volto included, and PrivateTmp gives it a /tmp of its own. A keylog file
+# needs a ReadWritePaths= drop-in (docs/configuration.md, [log]). UMask=0077
+# makes any file it creates its user's alone; the keylog file is opened with
+# mode 0600 as well.
+#
+# Have certbot's deploy hook copy the renewed files into /etc/volto (root:volto,
+# key mode 0640) and then `systemctl reload volto`, rather than pointing the
+# config at /etc/letsencrypt: the live symlinks there are root-only.
+UMask=0077
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
@@ -94,14 +111,13 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-
-# Read-only access to the config and the certificates. ProtectSystem=strict makes
-# the rest of the filesystem read-only, so this is the only path that matters.
-#
-# Have certbot's deploy hook copy the renewed files into /etc/volto (root:volto,
-# key mode 0640) and then `systemctl reload volto`, rather than pointing this at
-# /etc/letsencrypt: the live symlinks there are root-only.
-ReadOnlyPaths=/etc/volto
+# Only the process directories under /proc. The server reads /proc/self alone;
+# `volto --diagnostics`, which reads /proc/sys and other processes' limits, is a
+# command run from a shell and not under this unit.
+ProcSubset=pid
+# volto uses no System V IPC or POSIX message queue; any the user left behind is
+# removed when the service stops.
+RemoveIPC=yes
 
 # --- Syscall and network surface -------------------------------------------
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
