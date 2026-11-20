@@ -619,73 +619,47 @@ fn enqueue(inbound: &mpsc::Sender<Bytes>, payload: Bytes) -> bool {
 /// slow target cause unbounded memory growth. The same queue serves both phases
 /// of a session: before the target socket exists, where it holds what RFC 9298
 /// §5 calls optimistically sent packets, and while it runs. So this constant is
-/// the whole per-session bound.
+/// the whole per-session bound on queued datagrams.
 ///
-/// # What this costs at the configured limits
+/// # What a session costs at the configured limits
 ///
-/// A session holds three buffers, and this constant sizes only the first of
-/// them.
+/// A session holds three buffers, and this constant sizes only the first.
 ///
-/// The queue is `depth x payload`. A QUIC DATAGRAM frame cannot be fragmented,
-/// so a datagram never exceeds the `max_udp_payload_size` this server
-/// advertises (quinn's default, 1472 bytes), although RFC 9298 §5 permits a
-/// 65527-byte UDP payload. At `INBOUND_QUEUE_DEPTH` = 64 that is about 92 KiB.
-/// That holds because `enqueue` copies a payload that waits behind
-/// others: quinn hands out each one as a slice of the buffer its whole receive
-/// batch arrived in, which is up to 64 packets of 1472 bytes with GRO on Linux,
-/// and the slice keeps that buffer allocated. A payload that goes into an empty
-/// queue is not copied, so one queued payload can keep one batch buffer, at most
-/// 94208 bytes, alive. The worst case of the queue is therefore 63 copies and
-/// one batch, about 183 KiB.
+/// * The queue. A QUIC DATAGRAM frame cannot be fragmented, so a datagram never
+///   exceeds the `max_udp_payload_size` this server advertises (quinn's
+///   default, 1472 bytes): 64 of them are about 92 KiB. A payload that waits
+///   behind others is a copy, and the one in an empty queue may be a slice
+///   that keeps a whole GRO batch alive, at most 94208 bytes (`enqueue`), so
+///   the worst case is 63 copies and one batch, about 183 KiB.
+/// * The block a running session receives its *target's* packets into
+///   ([`crate::tunnel`]'s UDP path), 16 KiB, allocated only once the target
+///   first sends.
+/// * The [`crate::capsule::CapsuleDecoder`] on the request stream, which holds
+///   at most one DATAGRAM capsule value,
+///   [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`], about 64 KiB, until the
+///   session's idle timeout
+///   (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`
+///   and `a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk`).
 ///
-/// The second is the block a running session receives its *target's* packets
-/// into ([`crate::tunnel`]'s UDP path), 16 KiB per session. It is allocated
-/// only once the target first sends, so a session refused before its socket is
-/// bound, or whose target never answers, never allocates one. A packet longer
-/// than the block's 2 KiB window continues into a buffer each runtime thread has
-/// once. That is why the block can be this small: a packet that has arrived
-/// must fit somewhere before its length is known.
-///
-/// The third is the [`crate::capsule::CapsuleDecoder`] on the request stream,
-/// which buffers a DATAGRAM capsule's value until all of it has arrived.
-/// [`crate::capsule::MAX_DATAGRAM_CAPSULE_VALUE`] bounds it, and a peer that
-/// declares that much and stops one byte short holds it for the session's idle
-/// timeout. The buffer is allocated once at the declared length, so it is at
-/// most 64 KiB, and the decoder keeps no stream chunk alive behind it
-/// (`tests/it_bounds.rs::a_session_holds_one_unfinished_capsule_and_no_more`
-/// and `a_decoder_keeps_one_unfinished_capsule_of_a_large_chunk`).
-///
-/// A session therefore costs about 263 KiB at worst, and the worst case of a
-/// server is that times `max_targets_per_conn` times `max_connections`. With the
-/// shipped defaults (`max_targets_per_conn` = 256, `max_connections` = 256) that
-/// is about 66 MiB per connection and 16.4 GiB across a server saturated at both
-/// limits. Without GRO, as on macOS, a batch is one packet and the session's
-/// figure is about 172 KiB.
-/// Lowering either limit lowers it proportionally.
-///
-/// All three are released by dropping what owns them, on every path a session
-/// ends by.
-/// `tests/it_bounds.rs::a_connection_keeps_nothing_for_the_sessions_it_has_closed`
-/// measures that.
+/// A session therefore costs about 263 KiB at worst, 172 KiB without GRO (as
+/// on macOS), and a server that times `max_targets_per_conn` times
+/// `max_connections`: with the shipped defaults of 256 and 256, about 66 MiB
+/// per connection and 16.4 GiB across a server saturated at both limits.
+/// Lowering either limit lowers it proportionally. All three are released by
+/// dropping what owns them, on every path a session ends by
+/// (`tests/it_bounds.rs::a_connection_keeps_nothing_for_the_sessions_it_has_closed`).
 ///
 /// Registering a session before its target socket exists does **not** raise
-/// that ceiling. The queue is the same size in both phases, sessions are still
+/// that ceiling: the queue is the same size in both phases, sessions are still
 /// capped by the per-connection tunnel quota, and a full queue is already
-/// reachable on a running session whenever a client sends faster than the proxy
-/// forwards. It only changes how long a full queue can stay undrained: no longer
-/// than name resolution takes. After that the session either starts draining or
-/// is refused and the queue is discarded with it.
+/// reachable on a running session. It only bounds how long a full queue can
+/// stay undrained by how long name resolution takes.
 ///
-/// Beside the sessions, each connection has one hold for datagrams that arrive
-/// before their session has claimed them ([`EARLY_DATAGRAMS`]): at most 8
-/// copies of at most 1472 bytes, about 11.5 KiB. A copy is handed over only
-/// within [`EARLY_DATAGRAM_HOLD`] of its arrival; an unclaimed one is discarded
-/// when the hold is next touched after that, and at the latest with the
-/// connection, so the memory is bounded by the connection's life and not by
-/// the hold time. It does not grow
-/// with the number of sessions, and it is reachable before authentication, so
-/// it is part of what an unauthenticated peer can make a connection hold:
-/// about 2.9 MiB across the default `max_connections` of 256.
+/// Beside the sessions, each connection has one hold of about 11.5 KiB for
+/// datagrams that arrive before their session has claimed them
+/// ([`EARLY_DATAGRAMS`]). It does not grow with the number of sessions, and it
+/// is reachable before authentication: about 2.9 MiB across the default
+/// `max_connections` of 256.
 pub const INBOUND_QUEUE_DEPTH: usize = 64;
 
 /// One session's inbound HTTP Datagrams, and its claim on a Quarter Stream ID.
