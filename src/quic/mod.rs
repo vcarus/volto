@@ -19,7 +19,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
-use crate::gate::{Expected, Gate, Names};
+use crate::gate::{Expected, Gate};
 use crate::shutdown::{self, Shutdown, Trigger};
 use crate::{conn, h3api};
 
@@ -201,7 +201,7 @@ impl Server {
     /// the socket is not: with an empty list every datagram passes through
     /// untouched, and a `SIGHUP` can then turn the gate on without a restart.
     pub fn bind(config: Arc<Config>) -> Result<Self> {
-        let (quic_config, ech) = server_config(&config)?;
+        let (quic_config, ech, policy) = server_config(&config)?;
         // Taken before the configuration moves into the endpoint. The Initial
         // keys the gate needs are a function of the client's own Destination
         // Connection ID rather than of the certificate (RFC 9001 §5.2), so this
@@ -225,7 +225,7 @@ impl Server {
             .wrap_udp_socket(socket)
             .context("failed to hand the UDP socket to the async runtime")?;
 
-        let expected = Expected::new(Names::new(&config.security.expected_sni));
+        let expected = Expected::new(policy);
         let socket = Arc::new(Gate::new(socket, expected.clone(), crypto));
 
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
@@ -365,6 +365,8 @@ impl Server {
             ech = self.ech.is_some(),
             ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.config_id)),
             ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.public_name.as_str())),
+            // Whether the gate drops every handshake without ECH (D115).
+            require_ech = config.security.require_ech,
             "accepting QUIC connections"
         );
 
@@ -1233,11 +1235,16 @@ pub(crate) mod tests {
             "nor the server configuration an accept reads"
         );
         assert!(
-            bound.server.expected.current().accepts("localhost"),
+            bound.server.expected.current().names().accepts("localhost"),
             "nor the gate's list"
         );
         assert!(
-            !bound.server.expected.current().accepts("other.example"),
+            !bound
+                .server
+                .expected
+                .current()
+                .names()
+                .accepts("other.example"),
             "nor the gate's list"
         );
 
@@ -1248,7 +1255,14 @@ pub(crate) mod tests {
             .expect("the reload applies once the swap is free");
 
         assert_eq!(bound.server.config().limits.max_streams_bidi, 32);
-        assert!(bound.server.expected.current().accepts("other.example"));
+        assert!(
+            bound
+                .server
+                .expected
+                .current()
+                .names()
+                .accepts("other.example")
+        );
         assert!(
             !Arc::ptr_eq(&bound.server.quic_config(), &before),
             "the reload replaces the server configuration an accept reads"

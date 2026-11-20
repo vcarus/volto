@@ -30,6 +30,19 @@ const PUBLIC_NAME: &str = "public.example";
 /// A quinn client on rustls with ECH enabled for `list`, X25519MLKEM768 first
 /// as Surge orders its groups.
 fn ech_endpoint(ca: &CertificateDer<'static>, list: &[u8]) -> quinn::Endpoint {
+    ech_endpoint_idle(ca, list, None)
+}
+
+/// How long a client that is meant to hear nothing waits before it gives up,
+/// which turns the silence into `ConnectionError::TimedOut`.
+const CLIENT_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`ech_endpoint`] with its idle timeout set to `idle`, when given.
+fn ech_endpoint_idle(
+    ca: &CertificateDer<'static>,
+    list: &[u8],
+    idle: Option<std::time::Duration>,
+) -> quinn::Endpoint {
     use rustls::crypto::aws_lc_rs::kx_group;
 
     let mut roots = rustls::RootCertStore::empty();
@@ -54,9 +67,15 @@ fn ech_endpoint(ca: &CertificateDer<'static>, list: &[u8]) -> quinn::Endpoint {
         .with_root_certificates(roots)
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"h3".to_vec()];
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("quic tls"),
     ));
+    if let Some(idle) = idle {
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(idle.try_into().expect("a legal idle timeout")));
+        transport.keep_alive_interval(None);
+        client_config.transport_config(Arc::new(transport));
+    }
     let mut endpoint =
         quinn::Endpoint::client("127.0.0.1:0".parse().expect("bind address")).expect("client");
     endpoint.set_default_client_config(client_config);
@@ -178,9 +197,9 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     assert!(one_line(&buffer, mark, "TLS handshake complete").contains("ech_accepted=false"));
     drop(client);
 
-    // A reload with a new key file puts the new key in force: the old list is
-    // answered on the outer ClientHello, which a rustls client refuses, and the
-    // new list is accepted.
+    // A reload with a new key file puts the new key in force: the old list no
+    // longer opens, so the socket gate drops its handshake without any reply
+    // (D115, batch 2), and the new list is accepted.
     let (new_path, new_key) = key_file(&keys, "ech-new.pem", 9);
     server.rewrite_config(&format!(
         "ech_key = \"{}\"\n{ALLOW_PRIVATE}",
@@ -195,13 +214,15 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
         )),
         "{reloaded}"
     );
-    let error = finish_connect(&ech_endpoint(&server.ca, &list), server.addr)
-        .await
-        .expect_err("rustls does not complete a handshake on the outer ClientHello");
-    let text = format!("{error:?}");
+    let error = finish_connect(
+        &ech_endpoint_idle(&server.ca, &list, Some(CLIENT_IDLE)),
+        server.addr,
+    )
+    .await
+    .expect_err("an ECH extension the key does not open completes no handshake");
     assert!(
-        text.contains("certificate") || text.contains("EncryptedClientHello"),
-        "{text}"
+        matches!(error, quinn::ConnectionError::TimedOut),
+        "the old list must get silence, not a reply: {error:?}"
     );
     let mut client =
         H3Client::connect_on(ech_endpoint(&server.ca, &new_key.config_list()), &server).await;

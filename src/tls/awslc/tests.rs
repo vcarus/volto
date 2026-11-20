@@ -701,6 +701,34 @@ fn a_hello_retry_request_keeps_ech() {
     );
 }
 
+/// The client shape `it_gate_shapes::a_hello_retry_request_under_ech_completes_through_the_hold`
+/// uses draws a HelloRetryRequest from the production group list: it offers
+/// SecP256r1MLKEM768 first, which this server does not accept, and X25519
+/// second, for which it sent no share.
+#[test]
+fn a_client_offering_secp256r1mlkem768_first_draws_a_hello_retry_request() {
+    let id = identity();
+    let key = ech_key(1);
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(
+        Some(enable(&key.config_list())),
+        vec![kx_group::SECP256R1MLKEM768, kx_group::X25519],
+        recorder.clone(),
+    );
+    let outcome = handshake(
+        server(&id, Some(&key), &GROUPS, &[]),
+        Arc::new(client),
+        &recorder,
+        &untouched,
+    );
+    assert!(outcome.hello_retry, "{outcome:?}");
+    assert_eq!(outcome.group, 0x001d, "X25519 after the retry");
+    assert!(
+        outcome.ech_accepted && outcome.server_done && outcome.client_done,
+        "{outcome:?}"
+    );
+}
+
 /// (f') The same HelloRetryRequest with an ECHConfig the server does not hold.
 #[test]
 fn a_hello_retry_request_keeps_a_rejection() {

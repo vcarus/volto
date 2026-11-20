@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::gate::{Expected, Names};
+use crate::gate::{Expected, Names, Policy};
 use crate::shutdown::Shutdown;
 use crate::tls;
 
@@ -42,17 +42,24 @@ use super::transport::transport_config;
 /// is a property of the protocol rather than a shortcut.
 ///
 /// It also returns the ECH state the TLS layer was built with, for the startup
-/// and reload lines. That is taken from the TLS configuration that was built
-/// rather than from the file again, so the line reports the key in force.
+/// and reload lines, and the gate's policy. Both are taken from the TLS
+/// configuration that was built rather than from the file again, so the line
+/// reports the key in force and the socket gate opens ECH extensions with the
+/// very key libssl holds.
 pub(super) fn server_config(
     config: &Config,
-) -> Result<(quinn::ServerConfig, Option<tls::EchSummary>)> {
+) -> Result<(quinn::ServerConfig, Option<tls::EchSummary>, Policy)> {
     let crypto = tls::server_config(config)?;
     let ech = crypto.ech().cloned();
+    let policy = Policy::new(
+        Names::new(&config.security.expected_sni),
+        crypto.ech_key().cloned(),
+        config.security.require_ech,
+    );
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport_config(&config.limits)?));
 
-    Ok((server_config, ech))
+    Ok((server_config, ech, policy))
 }
 
 /// The live configuration, swapped wholesale on reload.
@@ -198,7 +205,7 @@ impl ReloadHandle {
         // Loads and parses the certificate and key, which is the step most likely
         // to fail during a renewal, and the ECH key. Done before anything is
         // swapped.
-        let (quic_config, ech) = server_config(&config)
+        let (quic_config, ech, policy) = server_config(&config)
             .context("the new configuration's certificate and key are not usable")?;
 
         // Rendered before the guard is taken, because it opens and parses
@@ -240,14 +247,18 @@ impl ReloadHandle {
 
         // Past this point nothing can fail, so the swaps cannot half-apply.
         //
-        // The gate's list goes first, and deliberately: between it and the
+        // The gate's policy goes first, and deliberately: between it and the
         // endpoint's own configuration the socket admits the new set of names
         // while the endpoint still holds the old certificate, which is a
         // handshake that gets as far as the TLS layer and is refused there. The
         // other order would have the endpoint present the new certificate to a
         // name the socket still drops, which is the same refusal without the
         // reply. The gate exists so that a name it does not know gets no reply
-        // at all.
+        // at all. The same holds for a new ECH key: in between, the socket
+        // admits a flight that opens under the new key while libssl still holds
+        // the old one, which does not accept it, and the TLS layer's second line
+        // refuses a ClientHello whose ECH it did not accept before it sends
+        // anything that carries the ECHConfigList.
         //
         // No connection depends on the order of the live `Config` and the slot:
         // `Server::accept_under_the_swap` takes this lock across both of the
@@ -269,7 +280,7 @@ impl ReloadHandle {
         // `Server::shutdown_grace`, but each of those reads one key and does
         // not compare it with any of the other three values, so the order of
         // the writes does not change what they see.
-        self.expected.set(Names::new(&config.security.expected_sni));
+        self.expected.set(policy);
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         *self
             .quic_config
@@ -289,6 +300,8 @@ impl ReloadHandle {
             ech = ech.is_some(),
             ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.config_id)),
             ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.public_name.as_str())),
+            // Whether the gate drops every handshake without ECH (D115).
+            require_ech = config.security.require_ech,
             "configuration reloaded; new connections will use it"
         );
 

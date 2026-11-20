@@ -37,8 +37,10 @@ key = "/etc/volto/privkey.pem"
 # ECH key file, written by `volto ech-keygen --public-name <name> --out <file>`,
 # which also prints the ECHConfigList a client's `ech-config` takes
 # (`volto ech-config <file>` prints it again). Without it the server is plain
-# TLS 1.3. With the SNI gate on, list the key's public name in
-# [security] expected_sni too. Not set by default.
+# TLS 1.3. With it, the gate opens every ECH extension with the key before the
+# TLS layer sees it, and drops a handshake whose ECH extension the key does not
+# open without any reply. Keep the list private: it is what lets a client in.
+# The public name does not go in [security] expected_sni. Not set by default.
 #ech_key = "/etc/volto/ech.pem"
 
 [auth]
@@ -369,6 +371,19 @@ initial_rtt_ms = 150
 # startup and a reload, and the new list applies to handshakes from then on.
 # Default: []
 #expected_sni = []
+
+# Drop every handshake that carries no ECH extension, too. Needs
+# [server] ech_key, and is refused without it.
+#
+# With an ECH key, a handshake whose ECH extension the key opens is admitted
+# whatever expected_sni says, and one whose ECH extension the key does not open
+# is dropped. A handshake with no ECH extension is judged by expected_sni as
+# usual. With this on it is dropped instead, silently, so only a client that
+# holds the ECHConfigList gets any answer from this port. Configure every client
+# with the list first (Surge's `ech-config`): a client without it then times out
+# with no error anywhere but this server's debug log. Reloadable.
+# Default: false
+#require_ech = false
 
 [log]
 # A tracing filter: a bare level (trace/debug/info/warn/error) or a directive list

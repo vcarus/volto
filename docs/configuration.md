@@ -31,14 +31,20 @@ whole and the running configuration keeps serving; see
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging. A list that does not offer `h3` starts a server no client can reach — HTTP/3 is the only protocol volto serves, so TLS ends every handshake with `no_application_protocol`, an alert that says nothing about why — and volto warns about it at startup |
 | `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. The tunnels get one grace period. The exit can take up to `2 * shutdown_grace + 3` seconds at the shipped constants, because after the grace period and a 1 s close flush, a name lookup still running on the blocking pool gets a second grace period plus 2 s (`getaddrinfo` cannot be cancelled), so systemd's `TimeoutStopSec` must be above that. The ceiling is there because the value is a bound: a drain longer than an hour has outlived any service manager's patience, so it would only replace the graceful ending with a `SIGKILL` |
-| `ech_key` | path | none | ECH key file written by `volto ech-keygen`. Without it the server is plain TLS 1.3; with it the server also accepts Encrypted Client Hello. See [Encrypted Client Hello](#encrypted-client-hello) |
+| `ech_key` | path | none | ECH key file written by `volto ech-keygen`. Without it the server is plain TLS 1.3; with it the server also accepts Encrypted Client Hello, and drops a handshake whose ECH extension the key does not open without any reply. See [Encrypted Client Hello](#encrypted-client-hello) |
 
 ### Encrypted Client Hello
 
 With `ech_key` set, a client that holds the server's ECHConfigList can encrypt
 its ClientHello, so the name it asks for travels inside the encryption and only
 the ECHConfig's public name is in the clear. A client without the list still
-connects as before: ECH is accepted, not required.
+connects as before, unless [`[security].require_ech`](#security) is on.
+
+The server never publishes the ECHConfigList: an operator hands it to each
+client. That makes the key a credential the server can check before it answers
+anything, and the SNI gate does exactly that. It holds a new handshake's first
+packets until the ClientHello is complete, opens the ECH extension with the
+key, and only then lets the handshake reach QUIC and TLS.
 
 **Generating the key.**
 
@@ -73,23 +79,32 @@ force.
 
 **Rotating the key** is a new file and a reload: generate it with
 `ech-keygen`, point `ech_key` at it, `systemctl reload volto`, and give every
-client the new list. A client with the old list is then answered on the outer
-ClientHello and fails its handshake.
+client the new list. A client with the old list then gets no reply at all, like
+any other client whose ECH the key does not open.
 
-**What a client without the right key sees.** The server never refuses a
-handshake for an ECH reason, as RFC 9849 §7.1 requires. A ClientHello whose
-ECH extension the key does not open (an older key, GREASE, a damaged payload)
-is answered on its outer ClientHello, with the certificate, and the server's
-encrypted reply carries this server's ECHConfigList as `retry_configs`, which
-RFC 9849 §7.1 also requires and AWS-LC does not let a server leave out. A
-ClientHello with no ECH extension gets no ECH extension back.
+**What each ClientHello gets**, with a key configured:
 
-**With the SNI gate on**, list the public name in
-`[security].expected_sni` as well as the real name: the socket-level gate reads
-the name in the clear, which for an ECH client is the public name, and drops
-the handshake if that name is not listed. volto warns at startup when it is not.
-The second gate then judges the name inside the encrypted ClientHello when ECH
-is accepted, and the name in the clear otherwise.
+| ClientHello | `require_ech = false` | `require_ech = true` |
+|---|---|---|
+| no ECH extension | judged by `expected_sni` as usual | dropped without a reply |
+| an ECH extension the key opens | admitted; the name in the clear is not looked at | admitted; the name in the clear is not looked at |
+| an ECH extension the key does not open (an older key, GREASE, a damaged payload) | dropped without a reply | dropped without a reply |
+| the ECH of a handshake already admitted, sent again from another address | dropped without a reply | dropped without a reply |
+
+A dropped ClientHello gets nothing back, not even a QUIC acknowledgement, and
+nothing of it reaches the TLS layer. That differs from RFC 9849 §7.1 on
+purpose: the RFC has a server go on with the outer ClientHello and send its
+ECHConfigList back as `retry_configs`, which would hand the list to anyone who
+sends an ECH extension at all. The same ECH sent again from the address it
+first came from is admitted, which is a client retransmitting its first
+packets. The record of admitted ECH handshakes lives in memory, is emptied by a
+reload that changes the key, and is lost at a restart.
+
+**`expected_sni` and the public name.** A ClientHello whose ECH the key opens
+is admitted without its public name being looked at, so the public name does
+not belong in `expected_sni`; listing it would make it a second name a probe
+could copy. The TLS layer still judges the name inside the encrypted
+ClientHello against `expected_sni`, so the real name stays on the list.
 
 ## `[auth]`
 
@@ -454,6 +469,7 @@ family, an IP literal above all, is unaffected by any of the three.
 | `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
+| `require_ech` | bool | `false` | Drop every handshake that carries no ECH extension, without any reply, so only a client holding the ECHConfigList reaches TLS. Needs `[server].ech_key` and is refused without it, at startup, by `--check-config` and on reload. Reloadable. Configure every client with the list before turning it on: a client without it then sees the port as closed. See [Encrypted Client Hello](#encrypted-client-hello) |
 | `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default and what every release before this one did. A non-empty list turns on the SNI gate: a handshake whose ClientHello does not name one of these hosts is dropped at the socket before the QUIC layer sees it, so a port scan of this address gets nothing back — no Version Negotiation packet, no `CONNECTION_CLOSE`, no TLS alert. Matched name for name, ASCII case-insensitive, with one trailing root dot ignored; no wildcards and no suffix matching, and a name with an empty label (a leading dot, two dots in a row, or a second trailing dot) or an IP address literal is refused at startup, because RFC 6066 section 3 does not permit either in a `server_name` and no conforming client would send one. Every client must then send the name as SNI (in Surge, the `sni=` parameter), or it sees the port as closed with no error anywhere but this server's debug log — so change this key and the clients together. A name the certificate does not cover draws a warning at startup and on reload, because a typo here is otherwise indistinguishable from a dead server. See below |
 
 - **This whole section is snapshotted per connection, at accept.** A reload
@@ -581,14 +597,22 @@ in the same change window.
 
 Some details worth knowing before relying on it:
 
-- **A name is checked twice.** The socket-level check reads the ClientHello out
-  of the client's first Initial packet, which is where a ClientHello normally
-  fits whole. One that is split across several packets is deliberately let
-  through — refusing a first flight before its extensions have arrived would make
-  a large ClientHello unreachable — and is stopped a layer up instead, by a
-  certificate resolver that declines to present a certificate for a name it does
-  not know. That second refusal is a TLS alert rather than silence, which is the
-  one case where a probe learns something.
+- **A name is checked twice.** Without an ECH key, the socket-level check reads
+  the ClientHello out of the client's first Initial packet, which is where a
+  small ClientHello fits whole. One that is split across several packets is
+  deliberately let through — refusing a first flight before its extensions have
+  arrived would make a large ClientHello unreachable — and is stopped a layer up
+  instead, by the TLS layer, which refuses a name it does not know before it
+  sends a certificate. That second refusal is a TLS alert rather than silence,
+  which is the one case where a probe learns something.
+- **With an ECH key, the whole ClientHello is judged.** The gate holds the first
+  packets of a new handshake until its ClientHello is complete, then lets them
+  through or drops them all; see [Encrypted Client Hello](#encrypted-client-hello).
+  The ClientHello split across packets is then judged at the socket like any
+  other, and an Initial packet that carries no ClientHello at all is held and,
+  when none follows, dropped, so the acknowledgements described below are not
+  sent. What is held is bounded in time (two seconds), in number (64 handshakes
+  at once, the oldest giving way to a new one) and in bytes (4 MiB in all).
 - **Reloadable.** `SIGHUP` applies a new list to handshakes from then on;
   connections already open are unaffected, exactly like the rest of the file.
 - **Not a certificate selector.** There is still one certificate and one key.
@@ -832,6 +856,7 @@ with the table below and the line number in the journal.
 | `[limits].mtu_upper_bound` | v0.4.5 |
 | `[security].expected_sni` | v0.9.0 |
 | `[server].ech_key` | the release after v1.5.0 |
+| `[security].require_ech` | the release after v1.5.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
 bites in practice, because the shipped example sets it and every install made by

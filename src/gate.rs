@@ -10,8 +10,11 @@
 //!
 //! This module puts a filter *under* quinn, at the socket, so that a datagram
 //! quinn would answer never reaches it. It is off unless `[security]
-//! expected_sni` names at least one host: an empty list is the shipped default
-//! and every datagram passes through untouched.
+//! expected_sni` names at least one host or `[server] ech_key` names an ECH
+//! key: with neither, which is the shipped default, every datagram passes
+//! through untouched. Without a key the gate keeps no state and judges each
+//! datagram on its own, as the next three sections describe. A key adds the
+//! hold of the section after them.
 //!
 //! # What passes
 //!
@@ -60,7 +63,7 @@
 //! * **An Initial whose ClientHello is cut short before its extensions**:
 //!   passes. A ClientHello may span several Initial packets, and a gate that
 //!   guessed here would refuse a legitimate client whose first flight is large;
-//!   the certificate resolver in [`crate::tls`] is the second gate that catches
+//!   the ClientHello callback in [`crate::tls`] is the second gate that catches
 //!   what this one lets through.
 //! * **An Initial carrying a complete ClientHello**: refused unless its
 //!   `server_name` extension (RFC 6066 §3) names a host in the configured list.
@@ -108,6 +111,69 @@
 //! Nor is any of this traffic obfuscation. The gate hides that a *service* is
 //! here from somebody who does not know the name to ask for; it does nothing
 //! about what a connection looks like once one is open.
+//!
+//! # The hold, with an ECH key
+//!
+//! The server never publishes its ECHConfigList; an operator hands it to each
+//! client. So an ECH extension that opens under the key is a credential, and it
+//! can be checked before the server sends a single packet (D115). It cannot be
+//! checked from one Initial packet: the HPKE associated data is the whole outer
+//! ClientHello (RFC 9849 §5.2, quoted at `EchKey::opens`), and a ClientHello
+//! with a post-quantum key share does not fit one packet. So with a key
+//! configured the gate keeps state.
+//!
+//! Every datagram is still judged by its first packet, and every rule of *What
+//! passes* that is decided before the packet is opened stays as it is: a
+//! version other than 1 and a Destination Connection ID under eight bytes are
+//! refused, and a short header, a long header that is not an Initial, an
+//! Initial in a datagram under 1200 bytes and an Initial that does not open
+//! under its own connection ID's keys pass. An Initial that does open is the
+//! first flight of a new handshake, and it is *held*: copied out of the
+//! batch, under the key of its Destination Connection ID and source address,
+//! together with the CRYPTO bytes its frames carry. The datagram in the batch
+//! is blinded, so quinn never sees it there. When the CRYPTO stream of a flight
+//! holds a whole ClientHello, the flight is judged, and either every datagram
+//! it held is released to quinn in the order they arrived, or all of them are
+//! dropped and nothing is sent. The judgement is `hold::judge`:
+//!
+//! * an ECH extension the key opens is admitted, unless the same HPKE `enc`
+//!   was admitted before from another address, which is a copy of somebody
+//!   else's flight. The name in the clear is not looked at;
+//! * an ECH extension the key does not open is dropped, whatever
+//!   `[security] require_ech` says. This is our own rule and a deviation from
+//!   RFC 9849 §7.1, which has a server go on with the outer ClientHello and so
+//!   send the ECHConfigList back as `retry_configs`;
+//! * no ECH extension is dropped under `require_ech`, and otherwise judged by
+//!   its name as above, against the whole ClientHello rather than one packet.
+//!
+//! An Initial that carries no ClientHello (a PING, a lone CRYPTO frame past
+//! offset 0, a ClientHello cut short) is held like any other and, when nothing
+//! completes it, dropped. So the acknowledgements of *What is left uncovered*
+//! are not sent while a key is configured; Stateless Resets still are.
+//!
+//! **Bounds.** Everything held came from a peer that has not authenticated,
+//! so the hold is bounded in time, in number and in bytes at once, each by a
+//! constant in `hold` with its reason: a flight is held for at most
+//! `HOLD_LIFETIME`, at most `HOLD_FLIGHTS` flights are held at once, one
+//! flight holds at most `HOLD_FLIGHT_BYTES` and reassembles at most
+//! `HOLD_HELLO_BYTES` of CRYPTO stream, and the hold as a whole, released
+//! datagrams included, at most `HOLD_TOTAL_BYTES`. A full table, or a hold out
+//! of bytes, evicts its oldest flight. No timer runs: a flight past its
+//! lifetime is never released, and it is freed by the next first Initial that
+//! reaches the hold, which is when its room could be wanted.
+//!
+//! **Release.** A released datagram has to come back in a later receive call,
+//! since the batch it arrived in has already been handed over with it blinded.
+//! `poll_recv` therefore hands out released datagrams first, one to a buffer
+//! with a stride of its own length, before it reads the socket again. A
+//! release only ever happens inside a call that returns `Ready`, and quinn
+//! calls again after every `Ready`, so a release needs no waker.
+//!
+//! **The replay record** keeps every `enc` the key opened, with its address,
+//! for the life of the process up to `REPLAY_ENTRIES`, and does not expire by
+//! time. Only a flight the key opened adds to it, so a peer without the key
+//! cannot grow it. A reload that changes the key empties it, and it is not kept
+//! across a restart.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -115,8 +181,9 @@ use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock};
 use std::task::{Context, Poll};
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use quinn::udp::{RecvMeta, Transmit};
@@ -125,6 +192,13 @@ use tracing::debug;
 
 use crate::datagram::peek_varint;
 use crate::logfmt::escaped_bytes;
+use crate::tls::EchKey;
+
+mod hold;
+
+#[doc(hidden)]
+pub use hold::Dropped;
+use hold::{Arrival, Memory, Taken};
 
 /// The QUIC version this server speaks, as it appears in a long header.
 const QUIC_V1: u32 = 0x0000_0001;
@@ -261,75 +335,194 @@ fn normalise(name: &str) -> String {
     root_relative(name).to_ascii_lowercase()
 }
 
-/// The list the gate is enforcing right now.
+/// What the gate enforces: the names a ClientHello may carry, the ECH key,
+/// and whether ECH is required.
 ///
-/// A `SIGHUP` replaces it, so the handle is shared rather than copied: the
-/// socket wrapper is built once at bind time and has to see a reload without
-/// being rebuilt, since rebuilding it would mean rebinding the port.
+/// Built from `[security] expected_sni`, `[security] require_ech` and the key
+/// `server.ech_key` names, at bind and on every reload. The gate is on when the
+/// list holds a name or there is a key; with neither, every datagram passes
+/// untouched. A key turns on the hold the module documentation describes.
+#[derive(Debug)]
+pub struct Policy {
+    names: Names,
+    ech: Option<Arc<EchKey>>,
+    require_ech: bool,
+}
+
+impl Policy {
+    /// The policy of `names`, the ECH key `ech` and `require_ech`.
+    ///
+    /// `require_ech` is read only where there is a key: the configuration
+    /// refuses it without one at startup, by `--check-config` and on reload,
+    /// so no running server holds that pair.
+    pub fn new(names: Names, ech: Option<Arc<EchKey>>, require_ech: bool) -> Self {
+        Self {
+            names,
+            ech,
+            require_ech,
+        }
+    }
+
+    /// Whether the gate judges anything at all.
+    pub fn is_on(&self) -> bool {
+        !self.names.is_empty() || self.ech.is_some()
+    }
+
+    /// The names a ClientHello without ECH has to carry, or an empty list for
+    /// any name.
+    pub fn names(&self) -> &Names {
+        &self.names
+    }
+}
+
+/// A policy of names alone: no ECH key, so no hold.
+impl From<Names> for Policy {
+    fn from(names: Names) -> Self {
+        Self::new(names, None, false)
+    }
+}
+
+/// Whether `a` and `b` are the same ECH key.
+///
+/// Compared by the ECHConfigList each one prints, which holds the public key,
+/// so two files with the same list hold the same key. A reload re-reads the
+/// file every time, so the two are never the same allocation even when the
+/// key did not change.
+fn same_key(a: Option<&EchKey>, b: Option<&EchKey>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.config_list() == b.config_list(),
+        _ => false,
+    }
+}
+
+/// What a change of policy from `old` to `new` does to the hold and the
+/// replay record: a new ECH key empties the record, and no key empties the
+/// hold. [`Expected::set`] says why.
+fn follow(memory: &mut Memory, old: &Policy, new: &Policy) {
+    if !same_key(old.ech.as_deref(), new.ech.as_deref()) {
+        memory.replay.clear();
+    }
+    if new.ech.is_none() {
+        memory.hold.clear();
+    }
+}
+
+/// The policy the gate is enforcing right now, and the state it keeps.
+///
+/// A `SIGHUP` replaces the policy, so the handle is shared rather than copied:
+/// the socket wrapper is built once at bind time and has to see a reload
+/// without being rebuilt, since rebuilding it would mean rebinding the port.
 ///
 /// Read once per receive batch rather than once per datagram, and written once
 /// per reload, so a plain `RwLock` around an `Arc` is all the sharing this needs.
 ///
-/// The flag beside it answers "is there a list at all" without taking the lock,
-/// because an empty list is the shipped default. A gate that is off then costs
-/// a receive batch one atomic load rather than a read guard, an `Arc` clone and
-/// its drop.
-#[derive(Clone, Debug)]
+/// The flag beside it answers "is the gate on at all" without taking the lock,
+/// because a gate that is off is the shipped default. A gate that is off then
+/// costs a receive batch one atomic load rather than a read guard, an `Arc`
+/// clone and its drop.
+///
+/// The hold and the replay record live here too, rather than in [`Gate`],
+/// because a reload has to reach them: a new ECH key clears the replay record,
+/// and a policy without a key clears the hold.
+#[derive(Clone)]
 pub struct Expected(Arc<Held>);
 
-/// The list and the flag that says whether it holds anything.
-#[derive(Debug)]
+/// The policy, the flag that says whether it is on, and the hold.
 struct Held {
-    names: RwLock<Arc<Names>>,
-    /// Whether `names` is non-empty. Written after `names`, read before it.
+    policy: RwLock<Arc<Policy>>,
+    /// Whether `policy` is on. Written after `policy`, read before it.
     any: AtomicBool,
+    /// The hold and the replay record, which only a policy with a key uses.
+    memory: Mutex<Memory>,
+    /// Whether `memory` has released datagrams waiting for the next receive
+    /// call. Written under the `memory` lock.
+    releasing: AtomicBool,
+}
+
+impl fmt::Debug for Expected {
+    /// Hand-written because the hold is not `Debug`: it is datagrams.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Expected").field(&self.current()).finish()
+    }
 }
 
 impl Expected {
-    /// A handle starting on `names`.
-    pub fn new(names: Names) -> Self {
-        let any = AtomicBool::new(!names.is_empty());
+    /// A handle starting on `policy`, with an empty hold.
+    pub fn new(policy: impl Into<Policy>) -> Self {
+        let policy = policy.into();
+        let any = AtomicBool::new(policy.is_on());
         Self(Arc::new(Held {
-            names: RwLock::new(Arc::new(names)),
+            policy: RwLock::new(Arc::new(policy)),
             any,
+            memory: Mutex::new(Memory::new()),
+            releasing: AtomicBool::new(false),
         }))
     }
 
-    /// Replaces the list, for every datagram received from now on.
+    /// Replaces the policy, for every datagram received from now on.
     ///
-    /// The list is written first and the flag second, with a `Release` store
+    /// The policy is written first and the flag second, with a `Release` store
     /// against the `Acquire` load in [`Expected::any`], so a reader that sees
-    /// the flag set also sees the list the flag is about.
+    /// the flag set also sees the policy the flag is about.
     ///
     /// The order matters in one direction only. A reader that has already
-    /// loaded the flag while it still said "empty" judges its batch against the
-    /// list that was in force a moment earlier, which is what a reload means
+    /// loaded the flag while it still said "off" judges its batch against the
+    /// policy that was in force a moment earlier, which is what a reload means
     /// for every datagram that arrived just before it and is why the gate can
     /// be reloaded at all. Storing the flag first would allow the opposite: a
-    /// reader seeing "there is a list" and then reading a list that is not yet
-    /// the new one, which is a judgement made against a list no configuration
-    /// ever asked for.
-    pub fn set(&self, names: Names) {
-        let any = !names.is_empty();
-        *self.0.names.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(names);
+    /// reader seeing "the gate is on" and then reading a policy that is not yet
+    /// the new one, which is a judgement made against a policy no
+    /// configuration ever asked for.
+    ///
+    /// A new ECH key empties the replay record, because the record is the
+    /// `enc` values one key opened. A policy without a key empties the hold,
+    /// because nothing would judge what it holds; the clients of those
+    /// flights send them again and the gate passes them as it now does. Both
+    /// happen under the hold's lock, with the policy swapped inside it. A
+    /// receive call that read the old policy just before and takes the lock
+    /// just after can still record one `enc` of the old key, whose flight no
+    /// longer opens under the new one, so the entry is never matched.
+    pub fn set(&self, policy: impl Into<Policy>) {
+        let policy = Arc::new(policy.into());
+        let any = policy.is_on();
+        {
+            let mut memory = self.memory();
+            follow(&mut memory, &self.current(), &policy);
+            *self
+                .0
+                .policy
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = policy;
+        }
         self.0.any.store(any, Ordering::Release);
     }
 
-    /// Whether the list in force holds any name, without taking the lock.
+    /// Whether the policy in force judges anything, without taking the lock.
     pub fn any(&self) -> bool {
         self.0.any.load(Ordering::Acquire)
     }
 
-    /// The list in force.
+    /// The policy in force.
     ///
     /// Poisoning would mean a panic while swapping an `Arc`; the value itself is
     /// immutable, so there is nothing to observe half-written.
-    pub fn current(&self) -> Arc<Names> {
+    pub fn current(&self) -> Arc<Policy> {
         self.0
-            .names
+            .policy
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The hold and the replay record.
+    ///
+    /// Poisoning would mean a panic inside the hold's bookkeeping, which takes
+    /// nothing it cannot give back: the guard is taken over and the next datagram
+    /// is judged against whatever the hold then holds, which is bounded either
+    /// way.
+    fn memory(&self) -> MutexGuard<'_, Memory> {
+        self.0.memory.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -360,45 +553,186 @@ impl Gate {
         }
     }
 
-    /// Judges one datagram and blinds it if it is refused.
+    /// Judges one datagram without the hold and blinds it if it is refused.
     fn screen(&self, remote: SocketAddr, datagram: &mut [u8], expected: &Names) {
         let Verdict::Refuse(refusal) = self.judge.judge(datagram, expected) else {
             return;
         };
-
-        // DEBUG rather than a production level: this fires once per refused
-        // datagram, which is once per packet of a scan, and D97's rule is that a
-        // line a peer can repeat at will is either sampled or expensive. The
-        // per-packet debug lines elsewhere in this server are deliberately
-        // neither, and this is one of them.
-        match refusal {
-            Refusal::Version(version) => debug!(
-                %remote,
-                version = format_args!("{version:#010x}"),
-                "dropping a QUIC packet: the SNI gate answers no version but 1"
-            ),
-            Refusal::ShortConnectionId(length) => debug!(
-                %remote,
-                connection_id_length = length,
-                "dropping an Initial packet: its destination connection ID is shorter than \
-                 eight bytes"
-            ),
-            Refusal::NotClientHello => debug!(
-                %remote,
-                "dropping an Initial packet: its first handshake message is not a ClientHello"
-            ),
-            Refusal::Anonymous => debug!(
-                %remote,
-                "dropping a handshake: its ClientHello carries no server_name"
-            ),
-            Refusal::OtherName(name) => debug!(
-                %remote,
-                server_name = %escaped_bytes(&name),
-                "dropping a handshake: its server_name is not one this server answers to"
-            ),
-        }
-
+        log_refusal(remote, &refusal);
         blind(datagram);
+    }
+
+    /// Judges one datagram with the hold, which an ECH key turns on, and blinds
+    /// it unless it passes.
+    ///
+    /// A first Initial is copied into the hold before it is blinded in the
+    /// batch, so quinn never sees it there; if its flight is admitted, the copy
+    /// is what quinn receives, from the next receive call. The hold's lock and
+    /// the clock are taken the first time a batch has a first Initial in it,
+    /// and not at all for a batch of short headers, which is the data path.
+    fn screen_holding<'a>(
+        &'a self,
+        meta: &RecvMeta,
+        datagram: &mut [u8],
+        policy: &Policy,
+        memory: &mut Option<MutexGuard<'a, Memory>>,
+        now: &mut Option<Instant>,
+    ) {
+        let (dcid, frames) = match self.judge.classify(datagram, true) {
+            Classified::Pass => return,
+            Classified::Refuse(refusal) => {
+                log_refusal(meta.addr, &refusal);
+                blind(datagram);
+                return;
+            }
+            Classified::Opened { dcid, frames, more } => (dcid, (frames, more)),
+        };
+        let memory = memory.get_or_insert_with(|| self.expected.memory());
+        let now = *now.get_or_insert_with(Instant::now);
+        let arrival = Arrival {
+            now,
+            meta: *meta,
+            datagram,
+            dcid,
+        };
+        if hold_opened(memory, arrival, &frames.0, &frames.1, policy, &mut log_drop)
+            == Screened::Released
+        {
+            self.expected.0.releasing.store(true, Ordering::Release);
+        }
+        blind(datagram);
+    }
+
+    /// Hands quinn the datagrams of admitted flights, one per buffer, and says
+    /// how many.
+    ///
+    /// Each goes into a buffer of its own with `stride` equal to its length, so
+    /// quinn reads it as one datagram whatever GRO did to the batch it first
+    /// arrived in. quinn's receive buffers each hold the largest datagram it
+    /// accepts (`RecvState::new` sizes them at the maximum UDP payload times
+    /// the GRO segment count), and one that would not fit is dropped rather
+    /// than cut, which a datagram quinn itself received never needs.
+    fn deliver(&self, bufs: &mut [IoSliceMut<'_>], metas: &mut [RecvMeta]) -> usize {
+        let mut memory = self.expected.memory();
+        let room = bufs.len().min(metas.len());
+        let mut delivered = 0;
+        while delivered < room {
+            let Some(held) = memory.hold.pop_released() else {
+                break;
+            };
+            let length = held.bytes.len();
+            let Some(slot) = bufs[delivered].get_mut(..length) else {
+                continue;
+            };
+            slot.copy_from_slice(&held.bytes);
+            let mut meta = held.meta;
+            meta.len = length;
+            meta.stride = length;
+            metas[delivered] = meta;
+            delivered += 1;
+        }
+        self.expected
+            .0
+            .releasing
+            .store(!memory.hold.released.is_empty(), Ordering::Release);
+        delivered
+    }
+}
+
+/// Logs one refused datagram.
+///
+/// DEBUG rather than a production level: this fires once per refused datagram,
+/// which is once per packet of a scan, and D97's rule is that a line a peer can
+/// repeat at will is either sampled or expensive. The per-packet debug lines
+/// elsewhere in this server are deliberately neither, and this is one of them.
+fn log_refusal(remote: SocketAddr, refusal: &Refusal) {
+    match refusal {
+        Refusal::Version(version) => debug!(
+            %remote,
+            version = format_args!("{version:#010x}"),
+            "dropping a QUIC packet: the SNI gate answers no version but 1"
+        ),
+        Refusal::ShortConnectionId(length) => debug!(
+            %remote,
+            connection_id_length = length,
+            "dropping an Initial packet: its destination connection ID is shorter than \
+             eight bytes"
+        ),
+        Refusal::NotClientHello => debug!(
+            %remote,
+            "dropping an Initial packet: its first handshake message is not a ClientHello"
+        ),
+        Refusal::Anonymous => debug!(
+            %remote,
+            "dropping a handshake: its ClientHello carries no server_name"
+        ),
+        Refusal::OtherName(name) => debug!(
+            %remote,
+            server_name = %escaped_bytes(name),
+            "dropping a handshake: its server_name is not one this server answers to"
+        ),
+    }
+}
+
+/// Logs one first flight the hold dropped.
+///
+/// One line per flight, however many datagrams it had (D97), at DEBUG for the
+/// reason [`log_refusal`] gives.
+fn log_drop(remote: SocketAddr, dropped: Dropped) {
+    let why = match &dropped {
+        Dropped::NotClientHello => "its first handshake message is not a ClientHello",
+        Dropped::Unreadable => "its ClientHello does not parse",
+        Dropped::TooLong => "its ClientHello is longer than libssl reads",
+        Dropped::Conflict => "two of its packets carry different bytes at one offset",
+        Dropped::Frames => "a packet of it carries frames an Initial packet may not",
+        Dropped::EchNotOpened => "its ECH extension does not open under this server's key",
+        Dropped::Replayed => "its ECH was already admitted from another address",
+        Dropped::EchRequired => "it carries no ECH extension and security.require_ech is on",
+        Dropped::Anonymous => "its ClientHello carries no server_name",
+        Dropped::OtherName(_) => "its server_name is not one this server answers to",
+        Dropped::Expired => "its ClientHello did not complete in time",
+        Dropped::Evicted => "the hold was full and this was its oldest flight",
+        Dropped::TooBig => "it outgrew the bytes one held flight may take",
+    };
+    match dropped {
+        Dropped::OtherName(name) => debug!(
+            %remote,
+            server_name = %escaped_bytes(&name),
+            "dropping a first flight: {why}"
+        ),
+        _ => debug!(%remote, "dropping a first flight: {why}"),
+    }
+}
+
+/// What the hold made of one opened first Initial, shared by the socket path
+/// and [`Screening`].
+///
+/// `frames` are those of the datagram's first packet and `more` those of the
+/// Initial packets of the same flight coalesced behind it. A packet whose
+/// frames do not parse, or carry a type no Initial packet may, makes the whole
+/// flight one the hold drops: quinn would close the connection over it, which
+/// is a reply.
+fn hold_opened(
+    memory: &mut Memory,
+    arrival: Arrival<'_>,
+    frames: &[u8],
+    more: &[BytesMut],
+    policy: &Policy,
+    report: &mut dyn FnMut(SocketAddr, Dropped),
+) -> Screened {
+    let mut fragments = Vec::new();
+    let mut whole = true;
+    for payload in std::iter::once(frames).chain(more.iter().map(|m| &m[..])) {
+        match crypto_frames(payload) {
+            Some(walk) if walk.whole => fragments.extend(walk.fragments),
+            _ => whole = false,
+        }
+    }
+    let fragments = whole.then_some(fragments.as_slice());
+    match memory.take(arrival, fragments, policy, report) {
+        Some(Taken::Held) => Screened::Held,
+        Some(Taken::Released) => Screened::Released,
+        None => Screened::Dropped,
     }
 }
 
@@ -422,11 +756,32 @@ struct Judge {
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
 }
 
+/// What [`Judge::classify`] made of a datagram.
+enum Classified {
+    /// Hand it to quinn unchanged.
+    Pass,
+    /// Make quinn's decoder throw it away.
+    Refuse(Refusal),
+    /// A first Initial that opened under the keys its own Destination
+    /// Connection ID derives: that connection ID, and the packet's frames.
+    Opened {
+        dcid: ConnectionId,
+        frames: BytesMut,
+        /// The frames of the Initial packets of the same flight coalesced
+        /// behind it, when [`Judge::classify`] was asked for them.
+        more: Vec<BytesMut>,
+    },
+}
+
 impl Judge {
-    /// What should happen to one datagram.
-    fn judge(&self, datagram: &[u8], expected: &Names) -> Verdict {
+    /// What should happen to one datagram, as far as it can be said without
+    /// reading its ClientHello: passed, refused, or opened as a first Initial.
+    ///
+    /// `coalesced` asks for the Initial packets of the same flight behind the
+    /// first as well ([`Judge::coalesced_frames`]), which only the hold reads.
+    fn classify(&self, datagram: &[u8], coalesced: bool) -> Classified {
         let Some(&first) = datagram.first() else {
-            return Verdict::Pass;
+            return Classified::Pass;
         };
 
         // A short header names a connection by its ID, which is state this
@@ -438,13 +793,13 @@ impl Judge {
         //# A packet with a short header does not include a
         //# length, so it can only be the last packet included in a UDP datagram.
         if first & LONG_HEADER_FORM == 0 {
-            return Verdict::Pass;
+            return Classified::Pass;
         }
 
         let Some(version) = datagram.get(1..5) else {
             // Too short for quinn to read a version out of, so too short for it
             // to answer with a Version Negotiation packet.
-            return Verdict::Pass;
+            return Classified::Pass;
         };
         let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
 
@@ -460,25 +815,25 @@ impl Judge {
         // `EndpointConfig` also supports, refusing removes the connection rather
         // than the reply; the module documentation says so in full.
         if version != QUIC_V1 {
-            return Verdict::Refuse(Refusal::Version(version));
+            return Classified::Refuse(Refusal::Version(version));
         }
 
         // Handshake, 0-RTT and Retry packets for a connection this endpoint does
         // not hold are dropped by quinn without a reply, and for one it does
         // hold they belong to a handshake that already passed this gate.
         if first & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE {
-            return Verdict::Pass;
+            return Classified::Pass;
         }
 
         if datagram.len() < MIN_INITIAL_DATAGRAM {
-            return Verdict::Pass;
+            return Classified::Pass;
         }
 
         let Some(header) = InitialHeader::parse(datagram) else {
             // Not a packet quinn could decode either (a header that runs off
             // the end of the datagram, a length field that claims more than
             // arrived), and one it drops without a reply.
-            return Verdict::Pass;
+            return Classified::Pass;
         };
 
         // Judged on the header alone, ahead of the decryption, because quinn
@@ -501,7 +856,7 @@ impl Judge {
         // connection ID and a payload nobody sealed) pass through to that
         // reply, because a packet that fails decryption is passed.
         if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
-            return Verdict::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
+            return Classified::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
         }
 
         let Some(frames) = self.decrypt(datagram, &header) else {
@@ -521,7 +876,28 @@ impl Judge {
             //# client uses the Source Connection ID supplied by the server as the
             //# Destination Connection ID for subsequent packets, including any 0-RTT
             //# packets.
-            return Verdict::Pass;
+            return Classified::Pass;
+        };
+
+        let more = if coalesced {
+            self.coalesced_frames(datagram, &header)
+        } else {
+            Vec::new()
+        };
+        Classified::Opened {
+            dcid: ConnectionId::new(&datagram[header.dcid.clone()]),
+            frames,
+            more,
+        }
+    }
+
+    /// What should happen to one datagram without the hold: its ClientHello is
+    /// judged by its name, from what its first packet holds.
+    fn judge(&self, datagram: &[u8], expected: &Names) -> Verdict {
+        let frames = match self.classify(datagram, false) {
+            Classified::Pass => return Verdict::Pass,
+            Classified::Refuse(refusal) => return Verdict::Refuse(refusal),
+            Classified::Opened { frames, .. } => frames,
         };
 
         let Some(crypto) = crypto_stream_prefix(&frames) else {
@@ -532,7 +908,8 @@ impl Judge {
 
         match first_flight(&crypto) {
             // A ClientHello that does not fit in this packet is judged by the
-            // certificate resolver instead; see the module documentation.
+            // second gate in the TLS layer instead; see the module
+            // documentation.
             FirstFlight::Truncated => Verdict::Pass,
             FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
             FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
@@ -582,56 +959,116 @@ impl Judge {
             .crypto
             .initial_keys(QUIC_V1, &ConnectionId::new(&datagram[header.dcid.clone()]))
             .ok()?;
-
-        // The other half, which the cipher's sample size decides.
-        let sample_end = number_end_limit.checked_add(keys.header.remote.sample_size())?;
-        if sample_end > header.packet_end {
-            return None;
-        }
-
-        // Only the header and the sample it is unmasked with are copied. Header
-        // protection reads up to `sample_end` and writes five bytes inside it,
-        // the first byte and the packet number, so the rest of the packet has
-        // no reason to be moved: the payload below is taken from the datagram
-        // where it already is, and the associated data the AEAD needs is inside
-        // this copy.
-        let mut head = datagram[..sample_end].to_vec();
-        keys.header
-            .remote
-            .decrypt(header.packet_number_offset, &mut head);
-
-        // The two bits the header protection was hiding.
-        let number_length = usize::from(head[0] & 0x03) + 1;
-        let number_end = header.packet_number_offset.checked_add(number_length)?;
-        if number_end > header.packet_end {
-            return None;
-        }
-
-        // The truncated packet number, used as the full one. A client's Initial
-        // packet numbers start at zero and are still single digits by the time
-        // its first flight is complete, so the encoded bits are the whole number.
-        // RFC 9000 §17.1 makes the sender include enough of them for a peer
-        // that has acknowledged nothing to reconstruct it, and there is nothing
-        // to acknowledge yet.
-        let mut number = 0u64;
-        for byte in &head[header.packet_number_offset..number_end] {
-            number = (number << 8) | u64::from(*byte);
-        }
-
-        // The AEAD tag is the tail of the payload; a "packet" too short to hold
-        // one is not one, and the check is here rather than left to the cipher
-        // so that this function is total on its own terms.
-        if header.packet_end - number_end < keys.packet.remote.tag_len() {
-            return None;
-        }
-
-        let mut frames = BytesMut::from(&datagram[number_end..header.packet_end]);
-        keys.packet
-            .remote
-            .decrypt(number, &head[..number_end], &mut frames)
-            .ok()?;
-        Some(frames)
+        open_with(&keys, datagram, header)
     }
+
+    /// The frames of every Initial packet coalesced behind the first one of
+    /// `datagram`, whose header is `first`, that belongs to the same flight.
+    ///
+    /// Only the hold asks for these, because only the hold reads a flight
+    /// rather than a packet: a client may put two Initial packets of one first
+    /// flight into one datagram, and the ClientHello is then not whole without
+    /// the second. A packet behind the first belongs to the flight when it is a
+    /// version 1 Initial with the same Destination Connection ID, and then it
+    /// opens under the same keys, which RFC 9001 §5.2 derives from that
+    /// connection ID; one that does not open is skipped, as quinn skips it. The
+    /// walk stops at the first packet that is anything else, because RFC 9000
+    /// §12.2 lets a receiver route on the first packet alone and a short header
+    /// can only be last. A datagram with nothing behind its first packet, which
+    /// is every first flight quinn and Surge send, costs nothing here.
+    fn coalesced_frames(&self, datagram: &[u8], first: &InitialHeader) -> Vec<BytesMut> {
+        let mut frames = Vec::new();
+        if first.packet_end >= datagram.len() {
+            return frames;
+        }
+        let dcid = &datagram[first.dcid.clone()];
+        let Ok(keys) = self.crypto.initial_keys(QUIC_V1, &ConnectionId::new(dcid)) else {
+            return frames;
+        };
+        let mut at = first.packet_end;
+        while let Some(packet) = datagram.get(at..).filter(|rest| !rest.is_empty()) {
+            let Some(&byte) = packet.first() else { break };
+            if byte & LONG_HEADER_FORM == 0
+                || byte & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE
+                || packet.get(1..5) != Some(&QUIC_V1.to_be_bytes()[..])
+            {
+                break;
+            }
+            let Some(header) = InitialHeader::parse(packet) else {
+                break;
+            };
+            if packet.get(header.dcid.clone()) != Some(dcid) {
+                break;
+            }
+            if let Some(opened) = open_with(&keys, packet, &header) {
+                frames.push(opened);
+            }
+            at += header.packet_end;
+        }
+        frames
+    }
+}
+
+/// Removes header protection and packet protection from the Initial packet at
+/// the start of `datagram`, whose header is `header`, under `keys`.
+///
+/// `None` for a packet too short for the keys to be applied or one that does
+/// not authenticate; [`Judge::decrypt`] says what each means.
+fn open_with(
+    keys: &quinn::crypto::Keys,
+    datagram: &[u8],
+    header: &InitialHeader,
+) -> Option<BytesMut> {
+    let number_end_limit = header.packet_number_offset.checked_add(4)?;
+
+    // The other half, which the cipher's sample size decides.
+    let sample_end = number_end_limit.checked_add(keys.header.remote.sample_size())?;
+    if sample_end > header.packet_end {
+        return None;
+    }
+
+    // Only the header and the sample it is unmasked with are copied. Header
+    // protection reads up to `sample_end` and writes five bytes inside it,
+    // the first byte and the packet number, so the rest of the packet has
+    // no reason to be moved: the payload below is taken from the datagram
+    // where it already is, and the associated data the AEAD needs is inside
+    // this copy.
+    let mut head = datagram[..sample_end].to_vec();
+    keys.header
+        .remote
+        .decrypt(header.packet_number_offset, &mut head);
+
+    // The two bits the header protection was hiding.
+    let number_length = usize::from(head[0] & 0x03) + 1;
+    let number_end = header.packet_number_offset.checked_add(number_length)?;
+    if number_end > header.packet_end {
+        return None;
+    }
+
+    // The truncated packet number, used as the full one. A client's Initial
+    // packet numbers start at zero and are still single digits by the time
+    // its first flight is complete, so the encoded bits are the whole number.
+    // RFC 9000 §17.1 makes the sender include enough of them for a peer
+    // that has acknowledged nothing to reconstruct it, and there is nothing
+    // to acknowledge yet.
+    let mut number = 0u64;
+    for byte in &head[header.packet_number_offset..number_end] {
+        number = (number << 8) | u64::from(*byte);
+    }
+
+    // The AEAD tag is the tail of the payload; a "packet" too short to hold
+    // one is not one, and the check is here rather than left to the cipher
+    // so that this function is total on its own terms.
+    if header.packet_end - number_end < keys.packet.remote.tag_len() {
+        return None;
+    }
+
+    let mut frames = BytesMut::from(&datagram[number_end..header.packet_end]);
+    keys.packet
+        .remote
+        .decrypt(number, &head[..number_end], &mut frames)
+        .ok()?;
+    Some(frames)
 }
 
 impl fmt::Debug for Gate {
@@ -661,32 +1098,55 @@ impl AsyncUdpSocket for Gate {
         bufs: &mut [IoSliceMut<'_>],
         metas: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        // The datagrams of flights the hold admitted go first, ahead of the
+        // socket. They were released inside an earlier call of this function,
+        // which returned `Ready`, and quinn's endpoint driver calls again after
+        // every `Ready`: `RecvState::poll_socket` loops until the socket is
+        // `Pending`, and when its work limiter stops the loop first it reports
+        // `keep_going` and the driver wakes itself. So a release needs no
+        // waker of its own and waits for no timer.
+        if self.expected.0.releasing.load(Ordering::Acquire) {
+            let delivered = self.deliver(bufs, metas);
+            if delivered > 0 {
+                return Poll::Ready(Ok(delivered));
+            }
+        }
+
         let count = match self.inner.poll_recv(cx, bufs, metas) {
             Poll::Ready(Ok(count)) => count,
             other => return other,
         };
 
         // The flag first, so a gate that is off pays one atomic load per batch
-        // and takes neither the lock nor a clone of the list.
+        // and takes neither the lock nor a clone of the policy.
         if !self.expected.any() {
             return Poll::Ready(Ok(count));
         }
 
-        let expected = self.expected.current();
-        if expected.is_empty() {
+        let policy = self.expected.current();
+        if !policy.is_on() {
             return Poll::Ready(Ok(count));
         }
 
+        let mut memory = None;
+        let mut now = None;
         for (meta, buf) in metas.iter().zip(bufs.iter_mut()).take(count) {
             // Exactly how quinn's own receive loop walks a GRO run: `len` bytes
             // of buffer holding datagrams `stride` bytes apart, the last one
-            // possibly shorter.
+            // possibly shorter. A datagram the gate holds or refuses is blinded
+            // where it lies rather than cut out, so the strides stay as they
+            // were; see the module documentation.
             let len = meta.len.min(buf.len());
             let stride = meta.stride.max(1);
             let mut at = 0;
             while at < len {
                 let end = at.saturating_add(stride).min(len);
-                self.screen(meta.addr, &mut buf[at..end], &expected);
+                let datagram = &mut buf[at..end];
+                if policy.ech.is_some() {
+                    self.screen_holding(meta, datagram, &policy, &mut memory, &mut now);
+                } else {
+                    self.screen(meta.addr, datagram, &policy.names);
+                }
                 at = end;
             }
         }
@@ -734,7 +1194,7 @@ pub enum Verdict {
 ///
 /// Hidden, and public for the same reason [`Verdict`] is.
 #[doc(hidden)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// A long header naming a QUIC version this server does not speak.
     Version(u32),
@@ -828,17 +1288,23 @@ impl InitialHeader {
     }
 }
 
-/// The CRYPTO stream bytes an Initial packet carries from offset 0 onwards.
+/// The CRYPTO frames of an Initial packet's payload, in the order they came.
+struct Frames<'a> {
+    /// Each frame's offset and data.
+    fragments: Vec<(u64, &'a [u8])>,
+    /// Whether the walk reached the end of the payload, rather than stopping
+    /// at a frame type RFC 9000 §17.2.2 does not allow in an Initial packet.
+    whole: bool,
+}
+
+/// Walks an Initial packet's frames and collects its CRYPTO frames.
 ///
-/// `None` means the packet has no CRYPTO frame starting at offset 0 (an
-/// acknowledgement, or a retransmitted middle of a first flight), which is the
-/// case the gate passes through rather than judging.
-///
-/// Frames are walked rather than searched for, because a frame's length is
-/// implied by its type and skipping one wrongly would find CRYPTO data that is
-/// not there. Only the frame types RFC 9000 §17.2.2 allows in an Initial packet
-/// are understood; anything else ends the walk with whatever was found so far.
-fn crypto_stream_prefix(payload: &[u8]) -> Option<Cow<'_, [u8]>> {
+/// `None` is a frame whose fields do not fit the payload. Frames are walked
+/// rather than searched for, because a frame's length is implied by its type
+/// and skipping one wrongly would find CRYPTO data that is not there. Only the
+/// frame types RFC 9000 §17.2.2 allows in an Initial packet are understood;
+/// anything else ends the walk with whatever was found so far, and says so.
+fn crypto_frames(payload: &[u8]) -> Option<Frames<'_>> {
     let mut fragments: Vec<(u64, &[u8])> = Vec::new();
     let mut at = 0usize;
 
@@ -883,9 +1349,29 @@ fn crypto_stream_prefix(payload: &[u8]) -> Option<Cow<'_, [u8]>> {
             }
             // Not a frame type an Initial packet may carry. Stop reading rather
             // than guess: what follows is not frames as we understand them.
-            _ => break,
+            _ => {
+                return Some(Frames {
+                    fragments,
+                    whole: false,
+                });
+            }
         }
     }
+
+    Some(Frames {
+        fragments,
+        whole: true,
+    })
+}
+
+/// The CRYPTO stream bytes an Initial packet carries from offset 0 onwards.
+///
+/// `None` means the packet has no CRYPTO frame starting at offset 0 (an
+/// acknowledgement, or a retransmitted middle of a first flight), which is the
+/// case the stateless gate passes through rather than judging. The frames are
+/// those [`crypto_frames`] finds.
+fn crypto_stream_prefix(payload: &[u8]) -> Option<Cow<'_, [u8]>> {
+    let mut fragments = crypto_frames(payload)?.fragments;
 
     // Sorted and appended while contiguous, so a first flight split across
     // several CRYPTO frames in one packet reads as one stream.
@@ -934,15 +1420,31 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 #[doc(hidden)]
 pub use crate::hello::{FirstFlight, first_flight};
 
-// The seams `fuzz/fuzz_targets/gate.rs` and `tests/it_gate_shapes.rs` reach
-// this module through (D83): [`judgement`], [`first_flight`] above, and
-// [`nameless_crypto`] for building the packets they judge.
+// The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
+// `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`] and
+// [`Screening`], [`first_flight`] above, and [`nameless_crypto`] for building
+// the packets they judge.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
-// coverage-guided fuzzer is for. Neither judging seam is an entry point of its
-// own: each calls the function the socket path calls, so a finding here is a
+// coverage-guided fuzzer is for. No judging seam is an entry point of its own:
+// each calls the functions the socket path calls, so a finding here is a
 // finding in what the server runs.
+
+/// The hold's bounds, for the fuzz target and the tests that assert them.
+#[doc(hidden)]
+pub use hold::{
+    HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME, HOLD_TOTAL_BYTES,
+    REPLAY_ENTRIES,
+};
+
+/// The judge every seam shares, built once per process.
+fn seam_judge() -> &'static Judge {
+    static JUDGE: OnceLock<Judge> = OnceLock::new();
+    JUDGE.get_or_init(|| Judge {
+        crypto: nameless_crypto(),
+    })
+}
 
 /// The gate's verdict on one datagram, for the fuzz target and the tests.
 ///
@@ -955,12 +1457,131 @@ pub use crate::hello::{FirstFlight, first_flight};
 /// to call it, and nothing in this crate does.
 #[doc(hidden)]
 pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
-    static JUDGE: OnceLock<Judge> = OnceLock::new();
-    JUDGE
-        .get_or_init(|| Judge {
-            crypto: nameless_crypto(),
-        })
-        .judge(datagram, expected)
+    seam_judge().judge(datagram, expected)
+}
+
+/// What the gate with the hold did with one datagram.
+///
+/// Hidden, and public for [`Screening`]'s callers.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Screened {
+    /// Handed to quinn unchanged.
+    Passed,
+    /// Refused without the hold, as the stateless gate refuses it.
+    Refused(Refusal),
+    /// Held: quinn does not see it unless its flight is admitted.
+    Held,
+    /// It completed its flight, which was admitted: every datagram of the
+    /// flight is waiting for [`Screening::released`].
+    Released,
+    /// Its flight was dropped, and with it every datagram the flight held.
+    Dropped,
+}
+
+/// The gate with the hold, driven one datagram at a time, for the fuzz target
+/// and the tests.
+///
+/// It runs the receive path's own code: [`Judge::classify`], then the hold
+/// through the function `Gate::screen_holding` calls, under a policy the
+/// caller gives and a clock the caller moves. The socket, the batch walk, the
+/// blinding and the delivery into quinn's buffers are what is left out.
+#[doc(hidden)]
+pub struct Screening {
+    policy: Policy,
+    memory: Memory,
+    epoch: Instant,
+}
+
+impl Screening {
+    /// A gate under `policy` with an empty hold.
+    pub fn new(policy: impl Into<Policy>) -> Self {
+        Self {
+            policy: policy.into(),
+            memory: Memory::new(),
+            epoch: Instant::now(),
+        }
+    }
+
+    /// Screens `datagram` from `from`, received `after` the screening began.
+    ///
+    /// Returns what became of it and every flight the hold dropped on the
+    /// way, with the address it came from. A policy without an ECH key is the
+    /// stateless gate, as on the socket path.
+    pub fn receive(
+        &mut self,
+        after: Duration,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> (Screened, Vec<(SocketAddr, Dropped)>) {
+        let mut drops = Vec::new();
+        let judge = seam_judge();
+        if self.policy.ech.is_none() {
+            let screened = match judge.judge(datagram, &self.policy.names) {
+                Verdict::Pass => Screened::Passed,
+                Verdict::Refuse(refusal) => Screened::Refused(refusal),
+            };
+            return (screened, drops);
+        }
+        let screened = match judge.classify(datagram, true) {
+            Classified::Pass => Screened::Passed,
+            Classified::Refuse(refusal) => Screened::Refused(refusal),
+            Classified::Opened { dcid, frames, more } => {
+                let meta = RecvMeta {
+                    addr: from,
+                    len: datagram.len(),
+                    stride: datagram.len(),
+                    ..RecvMeta::default()
+                };
+                let arrival = Arrival {
+                    now: self.epoch + after,
+                    meta,
+                    datagram,
+                    dcid,
+                };
+                hold_opened(
+                    &mut self.memory,
+                    arrival,
+                    &frames,
+                    &more,
+                    &self.policy,
+                    &mut |from, why| drops.push((from, why)),
+                )
+            }
+        };
+        (screened, drops)
+    }
+
+    /// Takes the datagrams of admitted flights, in the order quinn would get
+    /// them, with the address each came from.
+    pub fn released(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+        std::iter::from_fn(|| self.memory.hold.pop_released())
+            .map(|held| (held.meta.addr, held.bytes))
+            .collect()
+    }
+
+    /// How many flights are held.
+    pub fn flights(&self) -> usize {
+        self.memory.hold.flights()
+    }
+
+    /// Every byte the hold occupies, as its byte bound counts.
+    pub fn held_bytes(&self) -> usize {
+        self.memory.hold.bytes()
+    }
+
+    /// How many `enc` values the replay record holds.
+    pub fn replay_entries(&self) -> usize {
+        self.memory.replay.len()
+    }
+
+    /// Replaces the policy as a reload does, with the same effect on the
+    /// replay record and the hold as [`Expected::set`].
+    pub fn set(&mut self, policy: impl Into<Policy>) {
+        let policy = policy.into();
+        follow(&mut self.memory, &self.policy, &policy);
+        self.policy = policy;
+    }
 }
 
 /// A TLS configuration with no identity at all, as a source of Initial keys.
@@ -1053,11 +1674,11 @@ mod tests {
     #[test]
     fn a_replaced_list_is_what_the_next_datagram_is_judged_against() {
         let expected = Expected::new(Names::new(&["old.example".to_owned()]));
-        assert!(expected.current().accepts("old.example"));
+        assert!(expected.current().names().accepts("old.example"));
 
         expected.set(Names::new(&["new.example".to_owned()]));
-        assert!(!expected.current().accepts("old.example"));
-        assert!(expected.current().accepts("new.example"));
+        assert!(!expected.current().names().accepts("old.example"));
+        assert!(expected.current().names().accepts("new.example"));
     }
 
     /// The flag is what `poll_recv` reads before it takes the lock, so it has

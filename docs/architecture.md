@@ -61,8 +61,9 @@ The provider is the one module of the crate that uses
 
 `gate.rs` sits between that socket and quinn. It is an `AsyncUdpSocket` wrapper,
 so it sees every datagram before the QUIC layer does, and it is off unless
-`[security] expected_sni` names at least one host — an empty list, the shipped
-default, passes everything through untouched.
+`[security] expected_sni` names at least one host or `server.ech_key` names an
+ECH key. With neither, the shipped default, it passes everything through
+untouched.
 
 It exists because quinn's endpoint is conservative but not silent. A long-header
 packet naming a version it does not speak draws a Version Negotiation packet; an
@@ -121,13 +122,38 @@ still one certificate and one key, and naming several hosts means answering to
 all of them with the same certificate. With ECH accepted, the name it judges is
 the one inside the encrypted ClientHello; otherwise it is the one in the clear.
 
+With an ECH key configured the gate keeps state, because ECH cannot be judged
+from one packet: the HPKE associated data is the whole outer ClientHello
+(RFC 9849 §5.2), and a ClientHello with a post-quantum key share spans two
+Initial packets. An Initial that opens under its own connection ID's keys is the
+start of a new handshake, and the gate copies it out of the batch, blinds it in
+place as above, and holds the copy under its connection ID and source address
+together with the CRYPTO bytes it carried. Once the held bytes make a whole
+ClientHello, the flight is judged. An ECH extension the key opens is admitted
+without its outer name being looked at, unless the same HPKE `enc` was admitted
+before from another address. An ECH extension the key does not open is dropped,
+which departs from RFC 9849 §7.1 on purpose: going on with the outer
+ClientHello would send the ECHConfigList back to whoever asked. A ClientHello
+without ECH is dropped under `[security] require_ech` and otherwise judged by
+its name. An admitted flight's datagrams are handed to quinn from the next
+receive call, in the order they arrived, each in a buffer of its own; quinn's
+endpoint driver polls again after every batch, so this needs no timer. A
+dropped flight is discarded whole and nothing is sent. The hold is bounded in
+time, in the number of flights and in bytes, each by a named constant in
+`gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
+`enc` values is bounded by count rather than time, emptied by a reload that
+changes the key, and lost at a restart; only a flight the key opened can add to
+it.
+
 Stateless resets are deliberately left uncovered — see D106 and the
 [configuration reference](configuration.md#the-sni-gate) for what that leaves
 visible and why filtering on the address instead would break connection
-migration. So is the acknowledgement quinn returns for an Initial the gate
-passes that carries an ack-eliciting frame and no name — a PING on its own, or a
-ClientHello the gate could not finish reading — because refusing those means
-refusing a large first flight, which this design will not do. None of this is
+migration. Without an ECH key, so is the acknowledgement quinn returns for an
+Initial the gate passes that carries an ack-eliciting frame and no name — a PING
+on its own, or a ClientHello the gate could not finish reading — because
+refusing those means refusing a large first flight, which the stateless gate
+will not do. With a key, those packets are held like any other first flight and
+dropped when nothing completes them. None of this is
 traffic obfuscation, which stays a non-goal: the gate hides that a service is
 here from somebody who does not know the name to ask for, and says nothing about
 what a connection looks like once one is open.

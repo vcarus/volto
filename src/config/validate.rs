@@ -19,10 +19,27 @@ impl Config {
         validate_limits(&self.limits)?;
         validate_auth(&self.auth)?;
         validate_security(&self.security)?;
+        validate_require_ech(&self.security, &self.server)?;
         validate_certificate_paths(&self.server)?;
 
         Ok(())
     }
+}
+
+/// `security.require_ech` needs `server.ech_key`.
+///
+/// Without a key no ClientHello can open, so the gate would drop every client
+/// without a word, which is the silent misconfiguration D106's validation
+/// exists to refuse. Checked on the configuration, so startup, `--check-config`
+/// and a reload all refuse it.
+fn validate_require_ech(security: &Security, server: &Server) -> Result<()> {
+    if security.require_ech && server.ech_key.is_none() {
+        bail!(
+            "security.require_ech = true needs server.ech_key: without an ECH key no \
+             handshake can carry ECH, so every client would be dropped without a reply"
+        );
+    }
+    Ok(())
 }
 
 /// Validates `[server]` apart from the certificate and key paths, which
@@ -443,6 +460,20 @@ mod tests {
             .to_string();
         assert!(message.contains(key), "{key} must be named: {message}");
         message
+    }
+
+    /// `require_ech` without a key would drop every client, so it is refused,
+    /// naming both keys; off, or with a key, it is not.
+    #[test]
+    fn require_ech_without_an_ech_key_is_refused() {
+        let message = rejected("[security]\nrequire_ech = true", "security.require_ech");
+        assert!(message.contains("server.ech_key"), "{message}");
+
+        assert_valid_apart_from_certs(&parse("[security]\nrequire_ech = false"), "require_ech off");
+        assert_valid_apart_from_certs(
+            &parse("ech_key = \"/tmp/ech.pem\"\n[security]\nrequire_ech = true"),
+            "require_ech with a key",
+        );
     }
 
     #[test]

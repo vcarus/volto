@@ -143,6 +143,10 @@ pub struct ServerConfig {
     ctx: SslCtx,
     data: Arc<CtxData>,
     ech: Option<EchSummary>,
+    /// The ECH key the context holds, for the socket gate, which opens ECH
+    /// extensions with the same key before libssl sees them. Loaded once per
+    /// build so that the two can never hold different keys.
+    ech_key: Option<Arc<EchKey>>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -159,6 +163,11 @@ impl ServerConfig {
     pub fn ech(&self) -> Option<&EchSummary> {
         self.ech.as_ref()
     }
+
+    /// The ECH key this configuration was built with.
+    pub fn ech_key(&self) -> Option<&Arc<EchKey>> {
+        self.ech_key.as_ref()
+    }
 }
 
 /// Builds the provider from the configuration.
@@ -170,17 +179,24 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
     let server = &config.server;
     let certs = super::load_certs(&server.cert)?;
     let key = super::load_key(&server.key)?;
-    let ech = server.ech_key.as_deref().map(EchKey::load).transpose()?;
-    Builder {
+    let ech = server
+        .ech_key
+        .as_deref()
+        .map(EchKey::load)
+        .transpose()?
+        .map(Arc::new);
+    let mut built = Builder {
         certs: certs.iter().map(|c| c.as_ref().to_vec()).collect(),
         key: Zeroizing::new(key.secret_der().to_vec()),
         alpn: server.alpn_wire(),
         names: Names::new(&config.security.expected_sni),
-        ech: ech.as_ref(),
+        ech: ech.as_deref(),
         groups: &GROUPS,
         keylog: config.log.keylog.then(KeyLog::from_env).flatten(),
     }
-    .build()
+    .build()?;
+    built.ech_key = ech;
+    Ok(built)
 }
 
 /// Everything [`ServerConfig`] is built from, already decoded.
@@ -312,7 +328,12 @@ impl Builder<'_> {
             }
         };
 
-        Ok(ServerConfig { ctx, data, ech })
+        Ok(ServerConfig {
+            ctx,
+            data,
+            ech,
+            ech_key: None,
+        })
     }
 }
 

@@ -717,10 +717,18 @@ and reload. The startup line `accepting QUIC connections` then carries
 
 The public name is what an observer sees, so choose a name that says nothing
 about this server. It must be a plain host name (letters, digits, hyphens and
-dots, not ending in a number); `ech-keygen` refuses anything else. If
-`[security].expected_sni` is set, add the public name to it, because the
-socket-level SNI gate sees only the name in the clear. The full rules are under
+dots, not ending in a number); `ech-keygen` refuses anything else. The public
+name does not go into `[security].expected_sni`: the gate admits a handshake
+whose ECH the key opens without looking at the name in the clear, and listing
+the public name would make it a second name a probe could copy. The real name
+stays on the list, because the TLS layer still judges the name inside the
+encryption. The full rules are under
 [Encrypted Client Hello](configuration.md#encrypted-client-hello).
+
+Keep the ECHConfigList as private as a password. The server never publishes it,
+and that is what lets the gate treat it as a credential: a handshake whose ECH
+extension the key does not open gets no reply at all, not even an
+acknowledgement, and never reaches the TLS layer.
 
 In Surge, the list goes into the policy's `ech-config`. `sni` then names the
 real server and travels inside the encryption, while the public name is what
@@ -730,9 +738,30 @@ goes on the wire:
 volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
 ```
 
-A client whose list no longer matches the key, after a rotation for example, is
-answered on the outer ClientHello and fails its handshake. Give every client the
-new list when the key changes.
+A client whose list no longer matches the key, after a rotation for example,
+gets no reply at all and times out. A key change is therefore a change to every
+client's configuration: give each one the new list.
+
+### Requiring ECH
+
+With `[security].require_ech = true`, a handshake that carries no ECH extension
+is dropped too, so the port answers nobody who does not hold the list. Turn it on
+in this order:
+
+1. Configure every client with `ech-config` and check that each one connects.
+   The startup and reload lines report `ech=true`, and with debug logging each
+   handshake line reports `ech_accepted=true`.
+2. Set `require_ech = true` and reload. The reload line then reports
+   `require_ech=true`.
+
+A client without `ech-config` then times out without an error message on
+either side, except this server's debug log, which names the reason for each
+dropped handshake. `require_ech` without `server.ech_key` is refused at startup,
+by `--check-config` and on reload, and so is a reload that removes the key while
+it is on. Rotating the key under `require_ech` cuts every client off until it
+has the new list, so hand out the new list first and reload second. The record
+of admitted ECH handshakes that stops a copied first flight from being answered
+lives in memory: a restart empties it, and so does a reload with a new key.
 
 ## Apple's relay client
 

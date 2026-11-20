@@ -37,6 +37,7 @@
 //! unanswered_packet_budget = 64
 //! max_auth_failures        = 5
 //! expected_sni             = []   # non-empty turns the SNI gate on
+//! require_ech              = false # true drops every handshake without ECH
 //!
 //! [log]
 //! level  = "info"      # optional, this is the default
@@ -645,6 +646,15 @@ pub struct Security {
     /// so a port scan of this address gets no answer at all. See
     /// [`crate::gate`] for what that covers and what it does not.
     pub expected_sni: Vec<String>,
+    /// Drop every handshake that does not open under `server.ech_key`.
+    ///
+    /// Off by default. With an ECH key configured, the gate already drops a
+    /// ClientHello whose ECH extension the key does not open; this also drops
+    /// one that carries no ECH extension at all, silently, so only a client
+    /// holding the ECHConfigList reaches the TLS layer. Refused without
+    /// `server.ech_key`, because it would drop every client. Reloadable, like
+    /// `expected_sni`. See [`crate::gate`].
+    pub require_ech: bool,
 }
 
 /// `[server]`: the QUIC listener and its TLS identity.
@@ -737,6 +747,7 @@ impl Default for Security {
             unanswered_packet_budget: DEFAULT_UNANSWERED_PACKET_BUDGET,
             max_auth_failures: DEFAULT_MAX_AUTH_FAILURES,
             expected_sni: Vec::new(),
+            require_ech: false,
         }
     }
 }
@@ -1389,6 +1400,7 @@ pub(crate) mod tests {
             unanswered_packet_budget,
             max_auth_failures,
             expected_sni,
+            require_ech,
         } = cfg.security.clone();
         let security = Security::default();
 
@@ -1397,6 +1409,7 @@ pub(crate) mod tests {
         assert_eq!(unanswered_packet_budget, security.unanswered_packet_budget);
         assert_eq!(max_auth_failures, security.max_auth_failures);
         assert_eq!(expected_sni, security.expected_sni);
+        assert_eq!(require_ech, security.require_ech);
 
         let Log { level, keylog } = cfg.log.clone();
         let log = Log::default();
@@ -1576,8 +1589,9 @@ pub(crate) mod tests {
     ///
     /// The body is the complete key set as of v0.4.3, every key set explicitly
     /// so a rename cannot pass unnoticed, and it deliberately does *not*
-    /// mention the two keys added since: `mtu_upper_bound` (v0.4.5) and
-    /// `security.expected_sni` (v0.9.0). An upgrade never rewrites
+    /// mention the keys added since: `mtu_upper_bound` (v0.4.5),
+    /// `security.expected_sni` (v0.9.0), `server.ech_key` and
+    /// `security.require_ech` (both after v1.5.0). An upgrade never rewrites
     /// `/etc/volto/config.toml`, so this is the file the new binary actually
     /// gets handed.
     #[test]
@@ -1626,6 +1640,7 @@ pub(crate) mod tests {
         // The keys added since are absent, so they take their compiled-in
         // defaults rather than leaving the file half-applied.
         assert!(cfg.security.expected_sni.is_empty());
+        assert!(!cfg.security.require_ech);
         assert_eq!(cfg.limits.mtu_upper_bound, None);
         assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(cfg.limits.mtu_upper_bound(), 1436);

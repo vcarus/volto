@@ -835,3 +835,38 @@ fn the_check_refuses_a_bad_ech_key_file_by_the_name_of_its_key() {
     );
     assert!(stderr.contains("do not form a usable ECH key"), "{stderr}");
 }
+
+/// `--check-config` refuses `security.require_ech` without `server.ech_key`,
+/// naming both keys, because no client could reach such a server; with a key
+/// it accepts it.
+#[test]
+fn the_check_refuses_require_ech_without_an_ech_key() {
+    let dir = config_dir("require-ech-check");
+    let path = write_config(&dir, "127.0.0.1:4433", "\n[security]\nrequire_ech = true\n");
+    let refused = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stdout_of(&refused));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("security.require_ech") && stderr.contains("server.ech_key"),
+        "the refusal names both keys: {stderr}"
+    );
+
+    let key = dir.join("ech.pem");
+    let written = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--out",
+        key.to_str().unwrap(),
+    ]);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
+    let text = fs::read_to_string(&path).expect("the config");
+    let text = text.replacen(
+        "\n\n[auth]",
+        &format!("\nech_key = \"{}\"\n\n[auth]", key.display()),
+        1,
+    );
+    fs::write(&path, text).expect("rewrite the config");
+    let checked = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
+}

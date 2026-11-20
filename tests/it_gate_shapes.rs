@@ -41,17 +41,27 @@
 mod common;
 
 use std::assert_matches;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, TestServer, bulk_alpn, client_endpoint, is_version_negotiation,
-    udp_answer, udp_answers,
+    ALLOW_PRIVATE, GATE_LOCALHOST, TempDir, TestServer, bulk_alpn, client_endpoint,
+    is_version_negotiation, udp_answer, udp_answers,
 };
 use quinn::ConnectionId;
+use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
+use rustls::crypto::SupportedKxGroup;
+use rustls::crypto::aws_lc_rs::{hpke, kx_group};
+use rustls::pki_types::EchConfigListBytes;
 use volto::datagram::{peek_varint, put_varint};
-use volto::gate::{FirstFlight, Names, Refusal, Verdict, first_flight, judgement, nameless_crypto};
+use volto::gate::{
+    Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
+    HOLD_TOTAL_BYTES, Names, Policy, Refusal, Screened, Screening, Verdict, first_flight,
+    judgement, nameless_crypto,
+};
+use volto::tls::EchKey;
 
 /// How long a server is given to prove it is not answering.
 ///
@@ -1557,4 +1567,1175 @@ async fn an_initial_whose_crypto_starts_past_the_beginning_is_silent() {
 #[ignore = "the shape is answered: a PING-only Initial draws an ACK with no name anywhere in it"]
 async fn an_initial_carrying_only_a_ping_is_silent() {
     draws_no_reply("a PING-only Initial, DCID 8 bytes", &[0x55; 8], &[0x01]).await;
+}
+
+// ---------------------------------------------------------------------------
+// (e) The hold, with an ECH key (D115, batch 2)
+// ---------------------------------------------------------------------------
+//
+// With an ECH key configured the gate holds the first packets of a new
+// handshake until its ClientHello is whole, then releases every one of them
+// to quinn or drops them all. The seam tests below drive `Screening`, which
+// runs the receive path's own classification and hold under a clock the test
+// moves; the on-wire tests send the same flights at a real server and assert
+// that a dropped one draws nothing at all. The ClientHellos are written by
+// rustls, an independent TLS implementation with client-side ECH, so what is
+// judged is a real ClientHello and not one this binary spelled to agree with
+// the parser.
+
+/// The public name every test ECH key carries.
+const PUBLIC_NAME: &str = "public.example";
+
+/// A new ECH key under `config_id`.
+fn ech_key(config_id: u8) -> Arc<EchKey> {
+    Arc::new(EchKey::generate(PUBLIC_NAME, config_id, 0).expect("generate an ECH key"))
+}
+
+/// The gate's policy with `key`, the name list `names` and `require_ech`.
+fn hold_policy(key: &Arc<EchKey>, names: &[&str], require_ech: bool) -> Policy {
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    Policy::new(Names::new(&names), Some(key.clone()), require_ech)
+}
+
+/// How a test client offers ECH.
+#[derive(Clone, Debug)]
+enum Offer {
+    /// No ECH extension.
+    Plain,
+    /// ECH under this ECHConfigList.
+    Ech(Vec<u8>),
+    /// A GREASE ECH extension, which no key opens.
+    Grease,
+}
+
+/// The rustls `EchMode` for `offer`, or none.
+fn ech_mode(offer: &Offer) -> Option<EchMode> {
+    match offer {
+        Offer::Plain => None,
+        Offer::Ech(list) => Some(EchMode::from(
+            EchConfig::new(
+                EchConfigListBytes::from(list.clone()),
+                hpke::ALL_SUPPORTED_SUITES,
+            )
+            .expect("rustls reads the list"),
+        )),
+        Offer::Grease => {
+            let suite = hpke::DH_KEM_X25519_HKDF_SHA256_AES_128;
+            let (placeholder, _) =
+                rustls::crypto::hpke::Hpke::generate_key_pair(suite).expect("a GREASE key");
+            Some(EchMode::from(EchGreaseConfig::new(suite, placeholder)))
+        }
+    }
+}
+
+/// A rustls client configuration offering `offer`, with `groups` in that
+/// order, trusting `roots`.
+fn rustls_client(
+    offer: &Offer,
+    groups: &[&'static dyn SupportedKxGroup],
+    roots: rustls::RootCertStore,
+) -> rustls::ClientConfig {
+    let provider = Arc::new(rustls::crypto::CryptoProvider {
+        kx_groups: groups.to_vec(),
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    });
+    let builder = rustls::ClientConfig::builder_with_provider(provider);
+    let builder = match ech_mode(offer) {
+        Some(mode) => builder.with_ech(mode).expect("ECH with TLS 1.3"),
+        None => builder
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3"),
+    };
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    config
+}
+
+/// X25519MLKEM768 first, as Surge orders its groups. An ECH ClientHello with
+/// this share does not fit one Initial packet.
+fn surge_groups() -> Vec<&'static dyn SupportedKxGroup> {
+    vec![
+        kx_group::X25519MLKEM768,
+        kx_group::X25519,
+        kx_group::SECP256R1,
+    ]
+}
+
+/// X25519 alone, for an ECH ClientHello that fits one Initial packet.
+fn small_groups() -> Vec<&'static dyn SupportedKxGroup> {
+    vec![kx_group::X25519]
+}
+
+/// The client's QUIC transport parameters: `initial_source_connection_id`
+/// (RFC 9000 §18.2, id 0x0f) and nothing else. quinn checks it against the
+/// Source Connection ID of the Initial header, so with it the server goes on
+/// with the handshake and answers.
+fn client_parameters(scid: &[u8]) -> Vec<u8> {
+    let mut parameters = vec![0x0f, u8::try_from(scid.len()).expect("a short id")];
+    parameters.extend_from_slice(scid);
+    parameters
+}
+
+/// The first CRYPTO bytes a rustls QUIC client writes, which is its
+/// ClientHello, asking for `name`.
+fn rustls_hello(offer: &Offer, groups: &[&'static dyn SupportedKxGroup], name: &str) -> Vec<u8> {
+    let config = rustls_client(offer, groups, rustls::RootCertStore::empty());
+    let mut client = rustls::quic::ClientConnection::new(
+        Arc::new(config),
+        rustls::quic::Version::V1,
+        rustls::pki_types::ServerName::try_from(name.to_owned()).expect("a name"),
+        client_parameters(&Shape::default().scid),
+    )
+    .expect("start a rustls client");
+    let mut hello = Vec::new();
+    client.write_hs(&mut hello);
+    assert_eq!(
+        hello.first(),
+        Some(&CLIENT_HELLO),
+        "rustls wrote a ClientHello"
+    );
+    hello
+}
+
+/// The Initial packets of a first flight carrying `hello` as `pieces`
+/// consecutive runs, one run to a packet, packet numbers from 0, addressed to
+/// and keyed by `dcid`, carrying `token`.
+fn hold_flight(
+    crypto: &dyn quinn::crypto::ServerConfig,
+    dcid: &[u8],
+    token: &[u8],
+    hello: &[u8],
+    pieces: usize,
+) -> Vec<Vec<u8>> {
+    let run = hello.len().div_ceil(pieces);
+    hello
+        .chunks(run)
+        .enumerate()
+        .map(|(index, part)| {
+            let shape = Shape {
+                dcid: dcid.to_vec(),
+                token: token.to_vec(),
+                number: u8::try_from(index).expect("a few packets"),
+                packet_length: MIN_INITIAL_DATAGRAM.max(part.len() + token.len() + 64),
+                ..Shape::default()
+            };
+            shaped_initial(crypto, &shape, &crypto_frame_at(index * run, part))
+        })
+        .collect()
+}
+
+/// An address on loopback, told apart by its port.
+fn from(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Feeds `datagrams` to `screening` from `peer`, all at `after`, and returns
+/// what became of each and every drop on the way.
+fn feed(
+    screening: &mut Screening,
+    after: Duration,
+    peer: SocketAddr,
+    datagrams: &[Vec<u8>],
+) -> (Vec<Screened>, Vec<(SocketAddr, Dropped)>) {
+    let mut screened = Vec::new();
+    let mut drops = Vec::new();
+    for datagram in datagrams {
+        let (verdict, dropped) = screening.receive(after, peer, datagram);
+        screened.push(verdict);
+        drops.extend(dropped);
+    }
+    (screened, drops)
+}
+
+/// Asserts that feeding `datagrams` holds every one but the last, which
+/// releases them all, in arrival order, with nothing dropped and nothing left
+/// held.
+#[track_caller]
+fn released_whole(screening: &mut Screening, peer: SocketAddr, datagrams: &[Vec<u8>], what: &str) {
+    let (screened, drops) = feed(screening, Duration::ZERO, peer, datagrams);
+    let mut expected = vec![Screened::Held; datagrams.len() - 1];
+    expected.push(Screened::Released);
+    assert_eq!(screened, expected, "{what}");
+    assert!(drops.is_empty(), "{what}: {drops:?}");
+    let released: Vec<Vec<u8>> = screening
+        .released()
+        .into_iter()
+        .map(|(source, bytes)| {
+            assert_eq!(source, peer, "{what}: released for its own address");
+            bytes
+        })
+        .collect();
+    assert_eq!(
+        released, datagrams,
+        "{what}: every datagram, in arrival order"
+    );
+    assert_eq!(screening.flights(), 0, "{what}: nothing left held");
+    assert_eq!(screening.held_bytes(), 0, "{what}: no byte left held");
+}
+
+/// Asserts that feeding `datagrams` drops their flight for `why` and releases
+/// nothing.
+#[track_caller]
+fn dropped_whole(
+    screening: &mut Screening,
+    peer: SocketAddr,
+    datagrams: &[Vec<u8>],
+    why: &Dropped,
+    what: &str,
+) {
+    let (screened, drops) = feed(screening, Duration::ZERO, peer, datagrams);
+    assert_eq!(
+        screened.last(),
+        Some(&Screened::Dropped),
+        "{what}: {screened:?}"
+    );
+    assert_eq!(drops, vec![(peer, why.clone())], "{what}");
+    assert!(screening.released().is_empty(), "{what}: nothing released");
+    assert_eq!(screening.flights(), 0, "{what}: nothing left held");
+}
+
+/// An ECH first flight is held until its ClientHello is whole and then
+/// released in the order it arrived, however it is laid out: in one packet,
+/// two, three, in order or not, with a duplicate, or with both of its packets
+/// in one datagram. The outer name, the public name, is off the list and is
+/// not looked at; `require_ech` is on and changes nothing for a flight whose
+/// ECH opens.
+#[test]
+fn an_ech_flight_is_held_until_its_client_hello_is_whole_and_released_in_order() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let offer = Offer::Ech(key.config_list());
+    let small = rustls_hello(&offer, &small_groups(), "localhost");
+    let large = rustls_hello(&offer, &surge_groups(), "localhost");
+    assert!(
+        small.len() < 1100 && large.len() > 1300,
+        "one ClientHello fits a packet and one does not: {} and {}",
+        small.len(),
+        large.len()
+    );
+
+    let one = hold_flight(&*crypto, &CLIENT_CID, &[], &small, 1);
+    let two = hold_flight(&*crypto, &CLIENT_CID, &[], &large, 2);
+    let three = hold_flight(&*crypto, &CLIENT_CID, &[], &large, 3);
+    let reversed: Vec<Vec<u8>> = two.iter().rev().cloned().collect();
+    let middle_first = vec![three[1].clone(), three[2].clone(), three[0].clone()];
+    let duplicate = vec![two[0].clone(), two[0].clone(), two[1].clone()];
+    let coalesced = {
+        let small_packets: Vec<Vec<u8>> = large
+            .chunks(large.len().div_ceil(2))
+            .enumerate()
+            .map(|(index, part)| {
+                let shape = Shape {
+                    number: u8::try_from(index).expect("two"),
+                    packet_length: part.len() + 64,
+                    ..Shape::default()
+                };
+                shaped_initial(
+                    &*crypto,
+                    &shape,
+                    &crypto_frame_at(index * large.len().div_ceil(2), part),
+                )
+            })
+            .collect();
+        vec![small_packets.concat()]
+    };
+    assert!(coalesced[0].len() >= MIN_INITIAL_DATAGRAM);
+
+    for (what, datagrams) in [
+        ("one packet", &one),
+        ("two packets in order", &two),
+        ("three packets in order", &three),
+        ("two packets reversed", &reversed),
+        ("three packets, middle first", &middle_first),
+        ("a duplicate of the first packet", &duplicate),
+        ("both packets coalesced in one datagram", &coalesced),
+    ] {
+        let mut screening = Screening::new(hold_policy(&key, &["localhost"], true));
+        released_whole(&mut screening, from(1), datagrams, what);
+        assert_eq!(screening.replay_entries(), 1, "{what}: its enc is recorded");
+    }
+}
+
+/// A client that sends its first flight again, after a loss or because the
+/// server's answer was lost, keeps its ClientHello and so its HPKE `enc`, from
+/// the same address, and is admitted again.
+#[test]
+fn a_first_flight_sent_again_from_its_own_address_is_admitted_again() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+
+    let mut screening = Screening::new(hold_policy(&key, &[], true));
+    released_whole(&mut screening, from(1), &flight, "the first time");
+    released_whole(&mut screening, from(1), &flight, "sent again");
+    assert_eq!(screening.replay_entries(), 1);
+}
+
+/// The flight after a Retry: the same ClientHello, so the same `enc`, from
+/// the same address, but addressed to the connection ID the Retry chose,
+/// carrying its token, and keyed by that connection ID (RFC 9001 §5.2), so
+/// every byte of every packet differs from the first flight's.
+#[test]
+fn the_flight_after_a_retry_is_admitted() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let first = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let after_retry = hold_flight(&*crypto, &SERVER_CID, &[0x7e; 40], &hello, 2);
+    assert_ne!(first, after_retry);
+
+    let mut screening = Screening::new(hold_policy(&key, &[], true));
+    released_whole(&mut screening, from(1), &first, "the first flight");
+    released_whole(
+        &mut screening,
+        from(1),
+        &after_retry,
+        "the flight after a Retry",
+    );
+    assert_eq!(screening.replay_entries(), 1, "one ClientHello, one entry");
+}
+
+/// The same flight from another address is a copy of somebody else's, and is
+/// dropped; the copy cannot be told from the original by anything but where
+/// it came from.
+#[test]
+fn the_same_ech_from_another_address_is_a_replay() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let rewrapped = hold_flight(&*crypto, &[0x5c; 8], &[], &hello, 2);
+
+    for require_ech in [false, true] {
+        let mut screening = Screening::new(hold_policy(&key, &[], require_ech));
+        released_whole(&mut screening, from(1), &flight, "the original");
+        dropped_whole(
+            &mut screening,
+            from(2),
+            &flight,
+            &Dropped::Replayed,
+            "the copy from another port",
+        );
+        dropped_whole(
+            &mut screening,
+            from(2),
+            &rewrapped,
+            &Dropped::Replayed,
+            "its ClientHello under a new connection ID from another port",
+        );
+        // The original's address is still admitted.
+        released_whole(&mut screening, from(1), &flight, "the original again");
+    }
+}
+
+/// One ClientHello of a given kind, two packets of it.
+struct Row {
+    what: &'static str,
+    hello: Vec<u8>,
+    /// The name list, and what becomes of the flight with `require_ech` off
+    /// and on: `None` admitted, `Some` dropped for that reason.
+    names: &'static [&'static str],
+    off: Option<Dropped>,
+    on: Option<Dropped>,
+}
+
+/// The ClientHello `hello` with its ECH payload's last byte changed, which is
+/// inside the AEAD tag.
+fn damaged_ech(hello: &[u8]) -> Vec<u8> {
+    let mut hello = hello.to_vec();
+    let body = volto::hello::client_hello_body(&hello).expect("a whole ClientHello");
+    let ech = volto::hello::ech_outer(body).expect("an ECH extension");
+    hello[4 + ech.payload.end - 1] ^= 0x01;
+    hello
+}
+
+/// Every row of the rule table, with `require_ech` off and on. A dropped
+/// flight releases nothing, which on the socket is a flight quinn never sees.
+#[test]
+fn every_row_of_the_rule_table_is_what_the_hold_does() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let copied_id = ech_key(7);
+    let other = ech_key(9);
+    let groups = surge_groups();
+    let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
+    let inner_only = client_hello(&extension(0xfe0d, &[0x01]));
+
+    let rows = [
+        Row {
+            what: "no ECH, a name on the list",
+            hello: rustls_hello(&Offer::Plain, &groups, "localhost"),
+            names: &["localhost"],
+            off: None,
+            on: Some(Dropped::EchRequired),
+        },
+        Row {
+            what: "no ECH, a name off the list",
+            hello: rustls_hello(&Offer::Plain, &groups, UNLISTED),
+            names: &["localhost"],
+            off: Some(Dropped::OtherName(UNLISTED.as_bytes().to_vec())),
+            on: Some(Dropped::EchRequired),
+        },
+        Row {
+            what: "no ECH, no list",
+            hello: rustls_hello(&Offer::Plain, &groups, UNLISTED),
+            names: &[],
+            off: None,
+            on: Some(Dropped::EchRequired),
+        },
+        Row {
+            what: "no ECH, no server_name, the list on",
+            hello: client_hello(&[]),
+            names: &["localhost"],
+            off: Some(Dropped::Anonymous),
+            on: Some(Dropped::EchRequired),
+        },
+        Row {
+            what: "ECH the key opens, the public name off the list",
+            hello: ours.clone(),
+            names: &["localhost"],
+            off: None,
+            on: None,
+        },
+        Row {
+            what: "GREASE ECH",
+            hello: rustls_hello(&Offer::Grease, &groups, "localhost"),
+            names: &["localhost"],
+            off: Some(Dropped::EchNotOpened),
+            on: Some(Dropped::EchNotOpened),
+        },
+        Row {
+            what: "ECH under another key with our config_id",
+            hello: rustls_hello(&Offer::Ech(copied_id.config_list()), &groups, "localhost"),
+            names: &["localhost"],
+            off: Some(Dropped::EchNotOpened),
+            on: Some(Dropped::EchNotOpened),
+        },
+        Row {
+            what: "ECH under another key and config_id",
+            hello: rustls_hello(&Offer::Ech(other.config_list()), &groups, "localhost"),
+            names: &[],
+            off: Some(Dropped::EchNotOpened),
+            on: Some(Dropped::EchNotOpened),
+        },
+        Row {
+            what: "ECH under our key with a damaged payload",
+            hello: damaged_ech(&ours),
+            names: &[],
+            off: Some(Dropped::EchNotOpened),
+            on: Some(Dropped::EchNotOpened),
+        },
+        Row {
+            what: "an ECH extension of the inner type",
+            hello: inner_only,
+            names: &[],
+            off: Some(Dropped::EchNotOpened),
+            on: Some(Dropped::EchNotOpened),
+        },
+        Row {
+            what: "a first message that is not a ClientHello",
+            hello: vec![0x02, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00],
+            names: &[],
+            off: Some(Dropped::NotClientHello),
+            on: Some(Dropped::NotClientHello),
+        },
+    ];
+
+    for row in rows {
+        let pieces = if row.hello.len() > 1000 { 2 } else { 1 };
+        let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &row.hello, pieces);
+        for (require_ech, expected) in [(false, &row.off), (true, &row.on)] {
+            let what = format!("{}, require_ech = {require_ech}", row.what);
+            let mut screening = Screening::new(hold_policy(&key, row.names, require_ech));
+            match expected {
+                None => released_whole(&mut screening, from(1), &flight, &what),
+                Some(why) => dropped_whole(&mut screening, from(1), &flight, why, &what),
+            }
+        }
+    }
+}
+
+/// A flight whose ClientHello never completes is held for its lifetime and
+/// then dropped, and nothing of it is ever released. That covers the first
+/// packet of a flight whose second is lost, and the three shapes that draw an
+/// acknowledgement from the stateless gate (an Initial with a PING alone, half
+/// a ClientHello, a CRYPTO frame past offset 0), which with a key are silent.
+#[test]
+fn a_flight_that_never_completes_is_dropped_when_its_time_is_up() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let named = named_hello("localhost");
+
+    for (what, datagram) in [
+        ("the first packet of two", flight[0].clone()),
+        (
+            "a PING and nothing else",
+            initial(&*crypto, &CLIENT_CID, &[0x01]),
+        ),
+        (
+            "half a ClientHello",
+            initial(
+                &*crypto,
+                &CLIENT_CID,
+                &crypto_frame_at(0, &named[..named.len() / 2]),
+            ),
+        ),
+        (
+            "a CRYPTO frame at offset 64",
+            initial(&*crypto, &CLIENT_CID, &crypto_frame_at(64, &named)),
+        ),
+    ] {
+        let mut screening = Screening::new(hold_policy(&key, &[], false));
+        let (screened, drops) = feed(&mut screening, Duration::ZERO, from(1), &[datagram]);
+        assert_eq!(screened, vec![Screened::Held], "{what}");
+        assert!(drops.is_empty(), "{what}");
+
+        // Just inside the lifetime, another flight's packet changes nothing
+        // for this one.
+        let inside = HOLD_LIFETIME - Duration::from_millis(1);
+        let other = initial(&*crypto, &[0x99; 8], &[0x01]);
+        let (_, drops) = feed(
+            &mut screening,
+            inside,
+            from(2),
+            std::slice::from_ref(&other),
+        );
+        assert!(drops.is_empty(), "{what}: still within its lifetime");
+        assert_eq!(screening.flights(), 2, "{what}");
+
+        // At the lifetime, the next packet that reaches the hold frees it.
+        let (_, drops) = feed(&mut screening, HOLD_LIFETIME, from(3), &[other]);
+        assert_eq!(drops, vec![(from(1), Dropped::Expired)], "{what}");
+        assert!(screening.released().is_empty(), "{what}: nothing released");
+    }
+
+    // The missing second packet, arriving after its flight was dropped, starts
+    // a flight of its own that has no beginning and is never released.
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    feed(&mut screening, Duration::ZERO, from(1), &flight[..1]);
+    let (screened, _) = feed(&mut screening, HOLD_LIFETIME, from(1), &flight[1..]);
+    assert_eq!(screened, vec![Screened::Held]);
+    assert!(screening.released().is_empty());
+}
+
+/// With the table full, a new flight evicts the oldest one, which is dropped,
+/// and the new flight completes as it would have.
+#[test]
+fn a_full_hold_evicts_its_oldest_flight() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let mut screening = Screening::new(hold_policy(&key, &[], true));
+
+    let stuck: Vec<Vec<Vec<u8>>> = (0..HOLD_FLIGHTS)
+        .map(|index| {
+            let mut dcid = [0x10u8; 8];
+            dcid[..2].copy_from_slice(&u16::try_from(index).expect("small").to_be_bytes());
+            hold_flight(&*crypto, &dcid, &[], &hello, 2)
+        })
+        .collect();
+    for flight in &stuck {
+        let (screened, drops) = feed(&mut screening, Duration::ZERO, from(1), &flight[..1]);
+        assert_eq!(screened, vec![Screened::Held]);
+        assert!(drops.is_empty());
+    }
+    assert_eq!(screening.flights(), HOLD_FLIGHTS);
+
+    let newcomer = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let (screened, drops) = feed(&mut screening, Duration::ZERO, from(2), &newcomer);
+    assert_eq!(screened, vec![Screened::Held, Screened::Released]);
+    assert_eq!(
+        drops,
+        vec![(from(1), Dropped::Evicted)],
+        "the oldest made way"
+    );
+    assert_eq!(screening.released().len(), 2);
+    assert_eq!(screening.flights(), HOLD_FLIGHTS - 1);
+
+    // The evicted flight's second packet finds no flight to complete.
+    let (screened, _) = feed(&mut screening, Duration::ZERO, from(1), &stuck[0][1..]);
+    assert_eq!(screened, vec![Screened::Held]);
+    assert!(screening.released().is_empty());
+}
+
+/// Two packets of one flight that carry different bytes at one offset drop
+/// the flight: the ClientHello judged has to be the one quinn would hand
+/// libssl, and with two versions of a byte there is no such ClientHello.
+#[test]
+fn fragments_that_disagree_drop_the_flight() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let mut changed = hello.clone();
+    changed[10] ^= 0x01;
+    let liar = initial(&*crypto, &CLIENT_CID, &crypto_frame_at(0, &changed[..64]));
+
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    feed(&mut screening, Duration::ZERO, from(1), &flight[..1]);
+    dropped_whole(
+        &mut screening,
+        from(1),
+        &[liar],
+        &Dropped::Conflict,
+        "a second version of a byte",
+    );
+}
+
+/// Whatever is sent, the hold stays inside its bounds: no more flights than
+/// the table holds, no more bytes than the hold may take, a flight that grows
+/// past its own budget dropped, and a ClientHello longer than libssl reads
+/// dropped as soon as its length says so.
+#[test]
+fn the_hold_stays_inside_its_bounds_under_a_flood() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+
+    // A ClientHello header claiming just under 16 KiB, so the flight waits
+    // for the rest of it, and then runs of its body.
+    let mut header = vec![CLIENT_HELLO, 0x00, 0x3f, 0xf0];
+    header.extend_from_slice(&[0x03, 0x03]);
+    let body = vec![0x5a; 1400];
+    let packet = |dcid: &[u8], number: usize, frames: &[u8]| {
+        let shape = Shape {
+            dcid: dcid.to_vec(),
+            packet_length: 1500,
+            number: u8::try_from(number % 200).expect("small"),
+            ..Shape::default()
+        };
+        shaped_initial(&*crypto, &shape, frames)
+    };
+    let bounded = |screening: &Screening| {
+        assert!(screening.flights() <= HOLD_FLIGHTS, "the table bound");
+        assert!(screening.held_bytes() <= HOLD_TOTAL_BYTES, "the byte bound");
+    };
+
+    // One flight sent its header and then the same run again and again:
+    // nothing new for the stream, 1500 more bytes of datagram each time.
+    let opening = packet(&[0x21; 8], 0, &crypto_frame_at(0, &header));
+    let again = packet(&[0x21; 8], 1, &crypto_frame_at(header.len(), &body));
+    feed(&mut screening, Duration::ZERO, from(1), &[opening]);
+    let mut outgrown = None;
+    for round in 0..(HOLD_FLIGHT_BYTES / 1500 + 2) {
+        let (_, drops) = screening.receive(Duration::ZERO, from(1), &again);
+        bounded(&screening);
+        if drops.contains(&(from(1), Dropped::TooBig)) {
+            outgrown = Some(round);
+            break;
+        }
+    }
+    let outgrown = outgrown.expect("the flight outgrew HOLD_FLIGHT_BYTES");
+    assert!(
+        (outgrown + 2) * 1500 > HOLD_FLIGHT_BYTES - HOLD_HELLO_BYTES,
+        "not before its datagrams and stream filled the budget"
+    );
+
+    // Twice as many flights as the table holds, each sending runs of its body.
+    for round in 0..12usize {
+        for flight in 0..(2 * HOLD_FLIGHTS) {
+            let mut dcid = [0x20u8; 8];
+            dcid[..2].copy_from_slice(&u16::try_from(flight).expect("small").to_be_bytes());
+            let frames = if round == 0 {
+                crypto_frame_at(0, &header)
+            } else {
+                crypto_frame_at(header.len() + (round - 1) * body.len(), &body)
+            };
+            screening.receive(Duration::ZERO, from(2), &packet(&dcid, round, &frames));
+            bounded(&screening);
+        }
+    }
+    assert_eq!(
+        screening.flights(),
+        HOLD_FLIGHTS,
+        "the table is full and no fuller"
+    );
+    assert!(
+        screening.released().is_empty(),
+        "nothing in it was a ClientHello"
+    );
+
+    // A ClientHello whose length is past what libssl reads is dropped at once,
+    // and so is a CRYPTO frame that reaches past it.
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    let long = [CLIENT_HELLO, 0x00, 0x40, 0x00];
+    const { assert!(HOLD_HELLO_BYTES < 0x4000 + 4) };
+    let datagram = initial(&*crypto, &[0x33; 8], &crypto_frame_at(0, &long));
+    dropped_whole(
+        &mut screening,
+        from(9),
+        &[datagram],
+        &Dropped::TooLong,
+        "a length past libssl's",
+    );
+    let past = u64::try_from(HOLD_HELLO_BYTES).expect("small");
+    let mut frame = vec![0x06];
+    put_varint_into(&mut frame, past);
+    put_varint_into(&mut frame, 1);
+    frame.push(0x00);
+    let datagram = initial(&*crypto, &[0x34; 8], &frame);
+    dropped_whole(
+        &mut screening,
+        from(9),
+        &[datagram],
+        &Dropped::TooLong,
+        "an offset past libssl's",
+    );
+}
+
+/// A QUIC varint appended to `out`.
+fn put_varint_into(out: &mut Vec<u8>, value: u64) {
+    let mut bytes = BytesMut::new();
+    put_varint(&mut bytes, value);
+    out.extend_from_slice(&bytes);
+}
+
+/// A reload that keeps the key keeps the replay record, a reload that changes
+/// it empties the record, and a policy without a key empties the hold.
+#[test]
+fn a_new_key_empties_the_replay_record_and_no_key_empties_the_hold() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    released_whole(&mut screening, from(1), &flight, "admitted");
+    assert_eq!(screening.replay_entries(), 1);
+
+    // The same key read again, as a reload of an unchanged file does.
+    let same = Arc::new(EchKey::from_pem(key.to_pem().as_bytes()).expect("the same key"));
+    screening.set(hold_policy(&same, &[], false));
+    assert_eq!(
+        screening.replay_entries(),
+        1,
+        "the same key keeps its record"
+    );
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &flight,
+        &Dropped::Replayed,
+        "still a replay",
+    );
+
+    screening.set(hold_policy(&ech_key(7), &[], false));
+    assert_eq!(
+        screening.replay_entries(),
+        0,
+        "a new key starts a new record"
+    );
+
+    let mut screening = Screening::new(hold_policy(&key, &[], false));
+    feed(&mut screening, Duration::ZERO, from(1), &flight[..1]);
+    assert_eq!(screening.flights(), 1);
+    screening.set(Names::new(&[]));
+    assert_eq!(screening.flights(), 0, "no key, nothing held");
+    assert_eq!(screening.held_bytes(), 0);
+}
+
+/// Without an ECH key the gate keeps no state: a first packet is judged on its
+/// own and passed or refused, exactly as `judgement` judges it.
+#[test]
+fn without_an_ech_key_the_gate_holds_nothing() {
+    let crypto = nameless_crypto();
+    let (first, _) = large_first_flight(&*crypto, UNLISTED, 0..0);
+    let names = Names::new(&[LISTED.to_owned()]);
+    let mut screening = Screening::new(Names::new(&[LISTED.to_owned()]));
+    let (screened, drops) = feed(
+        &mut screening,
+        Duration::ZERO,
+        from(1),
+        std::slice::from_ref(&first),
+    );
+    assert_eq!(screened, vec![Screened::Passed]);
+    assert_eq!(judgement(&first, &names), Verdict::Pass);
+    assert!(drops.is_empty());
+    let named = initial(
+        &*crypto,
+        &CLIENT_CID,
+        &crypto_frame_at(0, &named_hello(UNLISTED)),
+    );
+    let (screened, _) = feed(&mut screening, Duration::ZERO, from(1), &[named]);
+    assert_eq!(
+        screened,
+        vec![Screened::Refused(Refusal::OtherName(
+            UNLISTED.as_bytes().to_vec()
+        ))]
+    );
+    assert_eq!(screening.flights(), 0);
+    assert_eq!(screening.held_bytes(), 0);
+}
+
+// On the wire: a real server with an ECH key, a raw UDP socket, and the whole
+// of `PATIENCE` to prove that a dropped flight draws nothing. Every silence is
+// paired with an answer from the same server to a flight it admits, which is
+// what says the flights are well formed enough to be answered at all.
+
+/// A server with an ECH key, `require_ech` and the name list `names`, and the
+/// directory holding its key file, which has to outlive it.
+async fn ech_server(key: &EchKey, require_ech: bool, names: &[&str]) -> (TestServer, TempDir) {
+    let keys = TempDir::new("ech-gate");
+    let path = keys.path().join("ech.pem");
+    volto::tls::write_new_key_file(&path, key).expect("write the key file");
+    let names: Vec<String> = names.iter().map(|name| format!("\"{name}\"")).collect();
+    let server = TestServer::start_with(&format!(
+        "ech_key = \"{}\"\n[security]\nallow_private_networks = true\n\
+         require_ech = {require_ech}\nexpected_sni = [{}]\n",
+        path.display(),
+        names.join(", ")
+    ))
+    .await;
+    (server, keys)
+}
+
+/// Sends `datagrams` from a fresh socket and collects every datagram that
+/// comes back within [`PATIENCE`].
+async fn answers_to(addr: SocketAddr, datagrams: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a probing socket");
+    answers_on(&socket, addr, datagrams).await
+}
+
+/// [`answers_to`] from `socket`, so that a test can send twice from one
+/// address.
+async fn answers_on(
+    socket: &tokio::net::UdpSocket,
+    addr: SocketAddr,
+    datagrams: &[Vec<u8>],
+) -> Vec<Vec<u8>> {
+    for datagram in datagrams {
+        socket.send_to(datagram, addr).await.expect("send");
+    }
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let mut heard = Vec::new();
+    let mut buffer = vec![0u8; 65536];
+    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.recv(&mut buffer)).await {
+        heard.push(buffer[..read].to_vec());
+    }
+    heard
+}
+
+/// Sends every flight of `shapes` from a socket of its own, all at once, and
+/// asserts that none of them draws a single datagram.
+#[track_caller]
+fn all_silent<'a>(
+    addr: SocketAddr,
+    shapes: Vec<(&'static str, Vec<Vec<u8>>)>,
+) -> impl Future<Output = ()> + 'a {
+    let caller = std::panic::Location::caller();
+    async move {
+        let mut probes = tokio::task::JoinSet::new();
+        for (what, datagrams) in shapes {
+            probes.spawn(async move { (what, answers_to(addr, &datagrams).await) });
+        }
+        while let Some(done) = probes.join_next().await {
+            let (what, heard) = done.expect("a probe task");
+            assert!(
+                heard.is_empty(),
+                "{what} (at {caller}) must draw nothing, and drew {} datagrams",
+                heard.len()
+            );
+        }
+    }
+}
+
+/// An ECH flight the key opens is answered; its ClientHello copied into a new
+/// flight from another address draws nothing; and the flight from its own
+/// address is answered again. With `require_ech` on, which changes nothing
+/// for a flight whose ECH opens.
+///
+/// The copy is wrapped under a connection ID of its own, which is what a
+/// replay does: Initial keys come from the connection ID the sender picks
+/// (RFC 9001 §5.2), so anybody who saw a first flight can re-send its
+/// ClientHello as a new one. Sent under the original connection ID instead,
+/// quinn would route it to the connection the original opened and answer
+/// nothing, whether or not the gate dropped it, so the test would prove
+/// nothing about the gate.
+#[tokio::test]
+async fn an_ech_flight_is_answered_and_its_copy_from_elsewhere_draws_nothing() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let rewrapped = hold_flight(&*crypto, &[0x5c; 8], &[], &hello, 2);
+
+    let original = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let heard = answers_on(&original, server.addr, &flight).await;
+    assert!(!heard.is_empty(), "a flight whose ECH opens is answered");
+
+    let copy = answers_to(server.addr, &rewrapped).await;
+    assert!(
+        copy.is_empty(),
+        "its copy from another port drew {} datagrams",
+        copy.len()
+    );
+
+    let again = answers_on(&original, server.addr, &flight).await;
+    assert!(
+        !again.is_empty(),
+        "the same flight from its own address is answered"
+    );
+}
+
+/// Every flight the rule table drops draws nothing on the wire, with
+/// `require_ech` off and on, while the same server answers an ECH flight its
+/// key opens.
+#[tokio::test]
+async fn every_flight_the_rule_table_drops_draws_nothing_either_way() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let groups = surge_groups();
+    let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
+    // Each flight under a connection ID of its own, so that quinn would open a
+    // new connection for any of them the gate let through, and answer it.
+    let next = std::cell::Cell::new(0x40u8);
+    let flight = |hello: &[u8]| {
+        next.set(next.get() + 1);
+        hold_flight(&*crypto, &[next.get(); 8], &[], hello, 2)
+    };
+
+    for require_ech in [false, true] {
+        let (server, _keys) = ech_server(&key, require_ech, &["localhost"]).await;
+        assert!(
+            !answers_to(server.addr, &flight(&ours)).await.is_empty(),
+            "require_ech = {require_ech}: the control flight is answered"
+        );
+        let mut shapes = vec![
+            (
+                "GREASE ECH",
+                flight(&rustls_hello(&Offer::Grease, &groups, "localhost")),
+            ),
+            (
+                "ECH under another key with our config_id",
+                flight(&rustls_hello(
+                    &Offer::Ech(ech_key(7).config_list()),
+                    &groups,
+                    "localhost",
+                )),
+            ),
+            (
+                "ECH under another key",
+                flight(&rustls_hello(
+                    &Offer::Ech(ech_key(9).config_list()),
+                    &groups,
+                    "localhost",
+                )),
+            ),
+            ("ECH with a damaged payload", flight(&damaged_ech(&ours))),
+            (
+                "no ECH, a name off the list",
+                flight(&rustls_hello(&Offer::Plain, &groups, UNLISTED)),
+            ),
+        ];
+        if require_ech {
+            shapes.push((
+                "no ECH, a name on the list",
+                flight(&rustls_hello(&Offer::Plain, &groups, "localhost")),
+            ));
+        }
+        all_silent(server.addr, shapes).await;
+    }
+}
+
+/// Without `require_ech`, a flight with no ECH extension naming a host on the
+/// list is answered: a client that has no list is not dropped for it.
+#[tokio::test]
+async fn without_require_ech_a_flight_without_ech_is_judged_by_its_name() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let (server, _keys) = ech_server(&key, false, &["localhost"]).await;
+    let hello = rustls_hello(&Offer::Plain, &surge_groups(), "localhost");
+    let heard = answers_to(
+        server.addr,
+        &hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2),
+    )
+    .await;
+    assert!(
+        !heard.is_empty(),
+        "a plain flight naming a listed host is answered"
+    );
+}
+
+/// A flight that never completes draws nothing: the first packet of two, and
+/// the three shapes that draw an acknowledgement from the stateless gate,
+/// which with a key are held and dropped like any other incomplete flight.
+/// The control sends the same three to a server without the gate, which
+/// acknowledges them.
+#[tokio::test]
+async fn a_flight_that_never_completes_draws_nothing() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let named = named_hello("localhost");
+    let residue = || {
+        vec![
+            (
+                "a PING and nothing else",
+                vec![initial(&*crypto, &[0x55; 8], &[0x01])],
+            ),
+            (
+                "half a ClientHello",
+                vec![initial(
+                    &*crypto,
+                    &[0x33; 8],
+                    &crypto_frame_at(0, &named[..named.len() / 2]),
+                )],
+            ),
+            (
+                "a CRYPTO frame at offset 64",
+                vec![initial(&*crypto, &[0x44; 8], &crypto_frame_at(64, &named))],
+            ),
+        ]
+    };
+
+    let off = TestServer::start_with(ALLOW_PRIVATE).await;
+    for (what, datagrams) in residue() {
+        assert!(
+            !answers_to(off.addr, &datagrams).await.is_empty(),
+            "{what}: without the gate this draws a reply, or it tests nothing"
+        );
+    }
+
+    let (server, _keys) = ech_server(&key, false, &[]).await;
+    let mut shapes = residue();
+    shapes.push((
+        "the first packet of two",
+        hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2)[..1].to_vec(),
+    ));
+    all_silent(server.addr, shapes).await;
+}
+
+/// A quinn client on rustls with `offer`, `groups` in that order, and an idle
+/// timeout of two seconds, so that silence is a fast `TimedOut`.
+fn quick_client(
+    ca: &rustls::pki_types::CertificateDer<'static>,
+    offer: &Offer,
+    groups: &[&'static dyn SupportedKxGroup],
+) -> quinn::Endpoint {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.clone()).expect("trust the test CA");
+    let crypto = rustls_client(offer, groups, roots);
+    let mut config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("quic tls"),
+    ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(PATIENCE.try_into().expect("a legal idle timeout")));
+    transport.keep_alive_interval(None);
+    config.transport_config(Arc::new(transport));
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().expect("an address")).expect("a client");
+    endpoint.set_default_client_config(config);
+    endpoint
+}
+
+/// What one quinn handshake with `offer` came to.
+async fn handshake_with(
+    server: &TestServer,
+    offer: &Offer,
+    groups: &[&'static dyn SupportedKxGroup],
+) -> Result<quinn::Connection, quinn::ConnectionError> {
+    let endpoint = quick_client(&server.ca, offer, groups);
+    let connecting = endpoint
+        .connect(server.addr, "localhost")
+        .expect("start connecting");
+    tokio::time::timeout(PATIENCE * 3, connecting)
+        .await
+        .expect("a handshake ends one way or the other")
+}
+
+/// With `require_ech` on, a real client holding the list connects, and one
+/// without it, or with another key's list, hears nothing. With it off, the
+/// client without a list connects too.
+#[tokio::test]
+async fn require_ech_admits_a_client_with_the_list_and_nothing_else() {
+    let key = ech_key(7);
+    let groups = surge_groups();
+    let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
+
+    handshake_with(&server, &Offer::Ech(key.config_list()), &groups)
+        .await
+        .expect("a client with the list connects");
+    for (what, offer) in [
+        ("no list", Offer::Plain),
+        ("another key's list", Offer::Ech(ech_key(9).config_list())),
+        ("GREASE", Offer::Grease),
+    ] {
+        let error = handshake_with(&server, &offer, &groups)
+            .await
+            .expect_err("no handshake without the key");
+        assert_matches!(
+            error,
+            quinn::ConnectionError::TimedOut,
+            "a client with {what} must hear nothing: {error:?}"
+        );
+    }
+
+    let (open, _keys) = ech_server(&key, false, &["localhost"]).await;
+    handshake_with(&open, &Offer::Plain, &groups)
+        .await
+        .expect("without require_ech a client with no list connects");
+}
+
+/// A HelloRetryRequest under ECH: the client offers SecP256r1MLKEM768 first
+/// and sends only that share, which this server does not accept, so libssl
+/// asks for an X25519 share with a HelloRetryRequest. The second ClientHello
+/// travels in Initial packets addressed to the server's connection ID, which
+/// the gate cannot open and passes, and ECH is kept across both (the
+/// provider's `a_hello_retry_request_keeps_ech`). Under `require_ech`.
+#[tokio::test]
+async fn a_hello_retry_request_under_ech_completes_through_the_hold() {
+    let key = ech_key(7);
+    let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
+    let groups = [kx_group::SECP256R1MLKEM768, kx_group::X25519];
+    handshake_with(&server, &Offer::Ech(key.config_list()), &groups)
+        .await
+        .expect("a handshake with a HelloRetryRequest completes under the hold");
+}
+
+/// `require_ech` is reloadable, like `expected_sni`: turning it on drops a
+/// client without the list from the next handshake on, and a reload that
+/// would set it without a key is refused and changes nothing.
+#[tokio::test]
+async fn require_ech_is_reloadable_and_refused_without_a_key() {
+    let key = ech_key(7);
+    let groups = surge_groups();
+    let (server, keys) = ech_server(&key, false, &[]).await;
+    handshake_with(&server, &Offer::Plain, &groups)
+        .await
+        .expect("require_ech off: a client without the list connects");
+
+    let path = keys.path().join("ech.pem");
+    server.rewrite_config(&format!(
+        "ech_key = \"{}\"\n[security]\nallow_private_networks = true\nrequire_ech = true\n",
+        path.display()
+    ));
+    server.reload().expect("the reload applies");
+    let error = handshake_with(&server, &Offer::Plain, &groups)
+        .await
+        .expect_err("require_ech on: no handshake without the list");
+    assert_matches!(error, quinn::ConnectionError::TimedOut, "{error:?}");
+    handshake_with(&server, &Offer::Ech(key.config_list()), &groups)
+        .await
+        .expect("a client with the list still connects");
+
+    server.rewrite_config("[security]\nallow_private_networks = true\nrequire_ech = true\n");
+    let refused = server
+        .reload()
+        .expect_err("require_ech without a key is refused");
+    assert!(
+        format!("{refused:#}").contains("security.require_ech"),
+        "{refused:#}"
+    );
+    let error = handshake_with(&server, &Offer::Plain, &groups)
+        .await
+        .expect_err("the refused reload left require_ech on");
+    assert_matches!(error, quinn::ConnectionError::TimedOut, "{error:?}");
 }

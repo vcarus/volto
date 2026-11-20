@@ -106,27 +106,6 @@ impl Config {
             }
         }
 
-        // With the SNI gate on, the socket judges the name in the clear, and an
-        // ECH client puts the ECHConfig's public name there. A public name off
-        // the list therefore drops every ECH ClientHello at the socket, before
-        // the TLS layer could open it, and without a reply. The key file is read
-        // here for the name; one that cannot be read has already been refused by
-        // `validate`.
-        if !self.security.expected_sni.is_empty()
-            && let Some(path) = &self.server.ech_key
-            && let Ok(key) = crate::tls::EchKey::load(path)
-            && !crate::gate::Names::new(&self.security.expected_sni).accepts(key.public_name())
-        {
-            warnings.push(format!(
-                "server.ech_key = {} has the public name \"{}\", which security.expected_sni \
-                 does not list: an ECH client sends that name in the clear, so the SNI gate \
-                 drops every ECH handshake without a reply. Add the public name to \
-                 expected_sni.",
-                path.display(),
-                key.public_name()
-            ));
-        }
-
         if self.limits.udp_session_timeout < 120 {
             warnings.push(format!(
                 "limits.udp_session_timeout = {} is below the two minutes RFC 9298 §3.1 \
@@ -464,35 +443,6 @@ mod tests {
             !warnings.iter().any(|w| w.contains("does not cover")),
             "{warnings:?}"
         );
-    }
-
-    /// With the gate on, an ECH public name off the list is warned about,
-    /// because the socket sees that name in the clear and drops every ECH
-    /// ClientHello for it; with the name on the list, or the gate off, nothing.
-    #[test]
-    fn an_ech_public_name_the_gate_drops_is_warned_about() {
-        let (cert, key) = minted_certificate(&["proxy.example"]);
-        let ech = cert.with_file_name("ech.pem");
-        let generated = crate::tls::EchKey::generate("front.example", 1, 0).expect("generate");
-        crate::tls::write_new_key_file(&ech, &generated).expect("write");
-        let with = |security: &str| {
-            parse_with_certificate(
-                &cert,
-                &key,
-                &format!("ech_key = {:?}\n{security}", ech.display().to_string()),
-            )
-            .warnings()
-            .into_iter()
-            .filter(|w| w.contains("public name"))
-            .collect::<Vec<_>>()
-        };
-        let warned = with("[security]\nexpected_sni = [\"proxy.example\"]");
-        assert_eq!(warned.len(), 1, "{warned:?}");
-        assert!(warned[0].contains("\"front.example\""), "{warned:?}");
-        assert!(
-            with("[security]\nexpected_sni = [\"proxy.example\", \"Front.example.\"]").is_empty()
-        );
-        assert!(with("").is_empty());
     }
 
     #[test]
