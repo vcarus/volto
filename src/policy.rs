@@ -15,8 +15,8 @@
 //! `::ffff:127.0.0.1` is loopback written as IPv6: the kernel routes it to
 //! 127.0.0.1, while a naive matcher sees an IPv6 address that matches none of the
 //! IPv4 rules. Every check therefore starts by canonicalizing
-//! ([`canonical`]), and the deprecated `::/96` compatible range is folded in for
-//! the same reason.
+//! ([`canonical`]). The deprecated `::/96` compatible range is not canonicalized:
+//! its row in `PRIVATE_PREFIXES` refuses it whole.
 //!
 //! # Two buckets
 //!
