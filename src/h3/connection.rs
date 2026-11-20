@@ -856,11 +856,8 @@ impl Handle {
     ///
     /// RFC 9114 §6.2.1 forbids a peer from resetting or stopping the control
     /// stream, so anything other than the connection going away is the peer
-    /// breaking that rule:
-    ///
-    //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-    //# If either control stream is closed at any point, this MUST be treated
-    //# as a connection error of type H3_CLOSED_CRITICAL_STREAM.
+    /// breaking that rule, which is H3_CLOSED_CRITICAL_STREAM (quoted at
+    /// [`critical_stream_closed`]).
     ///
     /// The same verdict covers the two QPACK streams this endpoint opens, on the
     /// strength of RFC 9204 §4.2 rather than this sentence (the reasoning is on
@@ -1560,10 +1557,8 @@ impl Control {
         let frame = match item {
             Item::Frame(frame) => frame,
 
-            // DATA on the control stream is a frame that does not belong there,
-            // and as the first thing on it, it is simply not SETTINGS. An empty
-            // one is no different: §6.2.1 asks which frame *type* came first,
-            // and a DATA frame that carries nothing is still a DATA frame.
+            // Unreachable, like every refusing arm below: `frame::misplaced`
+            // decides these from the frame header and quotes the rules.
             Item::Data(_) => {
                 return Err(if seen {
                     unexpected("a DATA frame on the control stream")
@@ -1573,8 +1568,7 @@ impl Control {
             }
 
             // RFC 9114 §9's rule that unknown values are ignored, quoted in
-            // full in `super`. Ignored, but only after SETTINGS. A grease frame
-            // sent first is still "any other frame type" below.
+            // full in `super`. A grease frame sent first never gets here.
             Item::Skipped { kind } => {
                 if !seen {
                     return Err(missing_settings());
@@ -1598,18 +1592,6 @@ impl Control {
                 }
                 Ok(())
             }
-
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.4
-            //# If an endpoint receives a second SETTINGS frame on the control
-            //# stream, the endpoint MUST respond with a connection error of type
-            //# H3_FRAME_UNEXPECTED.
-            (Frame::Settings(_), true) => Err(unexpected("a second SETTINGS frame")),
-
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
-            //# If the first frame of the control stream is any other frame type,
-            //# this MUST be treated as a connection error of type
-            //# H3_MISSING_SETTINGS.
-            (_, false) => Err(missing_settings()),
 
             (Frame::Goaway(identifier), true) => {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-5.2
@@ -1653,17 +1635,12 @@ impl Control {
                 Ok(())
             }
 
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.5
-            //# A server MUST treat the receipt of a PUSH_PROMISE frame as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
+            // Unreachable through `serve_control`: `frame::misplaced` refuses
+            // each of these from its header and quotes the rule it applies.
+            (Frame::Settings(_), true) => Err(unexpected("a second SETTINGS frame")),
             (Frame::PushPromise, true) => Err(unexpected("a PUSH_PROMISE frame")),
-
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
-            //# HEADERS frames can only be sent on request streams or push
-            //# streams. If a HEADERS frame is received on a control stream,
-            //# the recipient MUST respond with a connection error of type
-            //# H3_FRAME_UNEXPECTED.
             (Frame::Headers(_), true) => Err(unexpected("a HEADERS frame on the control stream")),
+            (_, false) => Err(missing_settings()),
         }
     }
 }
