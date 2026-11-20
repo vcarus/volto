@@ -235,6 +235,9 @@ impl Builder<'_> {
             self.certs[0].as_slice(),
         ))?;
         ffi::clear_errors();
+        // Here as well as in `Session::new`, so that startup and a reload fail
+        // with the reason rather than every connection.
+        session_index()?;
         // SAFETY: TLS_method returns a static method table; SSL_CTX_new returns
         // a new context or null, which `from_ptr` turns into an error.
         let ctx = SslCtx::from_ptr(
@@ -360,18 +363,44 @@ impl Builder<'_> {
     }
 }
 
-/// The ex_data slot on each SSL that holds its session's [`Shared`] address.
-fn session_index() -> c_int {
-    static INDEX: OnceLock<c_int> = OnceLock::new();
-    *INDEX.get_or_init(|| {
-        // SAFETY: no argument and no free callback: the slot holds a borrowed
-        // address that the session owns, so AWS-LC must not free it. Returns a
-        // fresh index, or -1 when it cannot, which `SSL_set_ex_data` then
-        // refuses and `Session::new` reports.
-        unsafe {
-            sys::SSL_get_ex_new_index(0, std::ptr::null_mut(), std::ptr::null_mut(), None, None)
-        }
-    })
+/// The ex_data slot on each SSL that holds its session's [`Shared`] address,
+/// once [`session_index`] has obtained it.
+static SESSION_INDEX: OnceLock<c_int> = OnceLock::new();
+
+/// The index of the slot in [`SESSION_INDEX`], obtained on the first call.
+///
+/// `SSL_get_ex_new_index` returns -1 when its allocation fails, and
+/// `SSL_set_ex_data` aborts the process on a negative index
+/// (`CRYPTO_set_ex_data`). So a failure is an error here, which `Builder::build`
+/// and `Session::new` return before any SSL is given the index, and it is not
+/// cached: the next call asks again.
+fn session_index() -> Result<c_int> {
+    #[cfg(test)]
+    if tests::EX_INDEX_FAILS.with(std::cell::Cell::get) {
+        return checked_index(-1);
+    }
+    if let Some(&index) = SESSION_INDEX.get() {
+        return Ok(index);
+    }
+    // SAFETY: no argument and no free callback: the slot holds a borrowed
+    // address that the session owns, so AWS-LC must not free it. Returns a
+    // fresh index, or -1 when it cannot.
+    let index = unsafe {
+        sys::SSL_get_ex_new_index(0, std::ptr::null_mut(), std::ptr::null_mut(), None, None)
+    };
+    // Two threads that race here each obtain an index and one of them goes
+    // unused, which costs one empty slot.
+    checked_index(index).map(|index| *SESSION_INDEX.get_or_init(|| index))
+}
+
+/// `index` if `SSL_get_ex_new_index` returned one.
+fn checked_index(index: c_int) -> Result<c_int> {
+    ensure!(
+        index >= 0,
+        "SSL_get_ex_new_index failed: {}",
+        ffi::error_stack()
+    );
+    Ok(index)
 }
 
 /// The four QUIC encryption levels, as libssl numbers them.
@@ -445,8 +474,10 @@ static QUIC_METHOD: sys::SSL_QUIC_METHOD = sys::SSL_QUIC_METHOD {
 /// slot holds the address of that session's `Shared`, which lives as long as
 /// the SSL does; any other SSL's slot is null.
 unsafe fn shared<'a>(ssl: *const sys::SSL) -> Option<&'a Mutex<Shared>> {
+    // Without an index no session was made, so no SSL holds a `Shared`.
+    let index = *SESSION_INDEX.get()?;
     // SAFETY: per the function contract, `ssl` is valid.
-    let ptr = unsafe { sys::SSL_get_ex_data(ssl, session_index()) };
+    let ptr = unsafe { sys::SSL_get_ex_data(ssl, index) };
     // SAFETY: a non-null value is the address of the session's `Shared`,
     // valid for the SSL's life; only shared references are ever made from it.
     unsafe { ptr.cast::<Mutex<Shared>>().as_ref() }
@@ -893,6 +924,7 @@ struct OuterHello {
 impl Session {
     fn new(config: Arc<ServerConfig>, version: Version, encoded: &[u8]) -> Result<Self> {
         ffi::clear_errors();
+        let index = session_index()?;
         // SAFETY: `config.ctx` is a configured SSL_CTX; SSL_new takes its own
         // reference to it and returns a new SSL or null.
         let ssl = Ssl::from_ptr(unsafe { sys::SSL_new(config.ctx.as_ptr()) }, "SSL_new")?;
@@ -901,9 +933,11 @@ impl Session {
             ..Shared::default()
         }));
         // SAFETY: `ssl` is fresh and owned here. The QUIC method table is a
-        // static; AWS-LC copies the transport parameters. The ex_data value is
-        // the address of the `Shared` allocation, which `shared` keeps alive
-        // until after the SSL is freed (field order of `Session`).
+        // static; AWS-LC copies the transport parameters. `index` is not
+        // negative (`session_index`), so `SSL_set_ex_data` does not abort. The
+        // ex_data value is the address of the `Shared` allocation, which
+        // `shared` keeps alive until after the SSL is freed (field order of
+        // `Session`).
         unsafe {
             sys::SSL_set_accept_state(ssl.as_ptr());
             ffi::check(
@@ -922,7 +956,7 @@ impl Session {
             );
             let ptr = Arc::as_ptr(&shared).cast_mut().cast::<c_void>();
             ffi::check(
-                sys::SSL_set_ex_data(ssl.as_ptr(), session_index(), ptr),
+                sys::SSL_set_ex_data(ssl.as_ptr(), index, ptr),
                 "SSL_set_ex_data",
             )?;
         }

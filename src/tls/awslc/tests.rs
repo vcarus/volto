@@ -1481,6 +1481,46 @@ fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     );
 }
 
+thread_local! {
+    /// Makes `session_index` see what `SSL_get_ex_new_index` returns when its
+    /// allocation fails, on this test's thread only.
+    pub(super) static EX_INDEX_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A failed ex_data index is an error from `Session::new` and from
+/// `Builder::build`, and never reaches `SSL_set_ex_data`, which aborts the
+/// process on a negative index (`CRYPTO_set_ex_data`). The next call, with the
+/// allocation back, succeeds.
+#[test]
+fn a_failed_ex_data_index_is_an_error_and_not_an_abort() {
+    let id = identity();
+    let config = server(&id, None, &GROUPS, &[]);
+    EX_INDEX_FAILS.set(true);
+    let session = Session::new(config.clone(), Version::V1, &PARAMS).err();
+    let build = Builder {
+        certs: vec![id.cert.clone()],
+        key: Zeroizing::new(id.key.clone()),
+        alpn: vec![b"h3".to_vec()],
+        names: Names::new(&[]),
+        ech: None,
+        refuse_unaccepted_ech: false,
+        require_ech: false,
+        groups: &GROUPS,
+        keylog: None,
+    }
+    .build()
+    .err();
+    EX_INDEX_FAILS.set(false);
+    for (what, error) in [("Session::new", session), ("Builder::build", build)] {
+        let error = error.unwrap_or_else(|| panic!("{what} succeeded without an index"));
+        assert!(
+            format!("{error:#}").contains("SSL_get_ex_new_index failed"),
+            "{what}: {error:#}"
+        );
+    }
+    assert!(Session::new(config, Version::V1, &PARAMS).is_ok());
+}
+
 /// QUIC varint (RFC 9000 §16).
 fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
     let first = *bytes.get(*at)?;
