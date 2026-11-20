@@ -254,12 +254,18 @@ fn congestion_factory(
 /// Aggregate flow-control window for one connection, in bytes.
 ///
 /// The bound on what an *unauthenticated* peer can make this process hold.
-/// quinn's own default is `VarInt::MAX`, no aggregate limit at all, and with
-/// this server's raised stream limit that is 1024 x the 2 MiB
-/// [`STREAM_RECEIVE_WINDOW`]. So a single connection could hold 2 GiB of
-/// receive buffer before we ever see a request to authenticate: open the
-/// streams, fill each window, stop. On a 1 GB VPS one connection is enough to
-/// end the process.
+/// quinn's own default is `VarInt::MAX`, no aggregate limit at all. Before
+/// authentication a connection has 16 bidirectional streams
+/// ([`INITIAL_BIDI_STREAMS`], D98) and 16 unidirectional ones
+/// ([`MAX_PEER_UNI_STREAMS`]), so without this cap it could hold 32 x the
+/// 2 MiB [`STREAM_RECEIVE_WINDOW`], 64 MiB of receive buffer, before we ever
+/// see a request to authenticate: open the streams, fill each window, stop.
+/// After authentication the stream limit is `max_streams_bidi`, and the
+/// per-stream product grows with it.
+///
+/// This bounds one connection. Across the server it is credit of 16 MiB times
+/// `max_connections`, 4 GiB at the default 256, all of it reachable before a
+/// credential is checked; D99 records that row.
 ///
 /// The cap only constrains data that has arrived and not yet been read, and both
 /// tunnel pumps read continuously, so it binds exactly when the target is slower
@@ -484,9 +490,8 @@ mod tests {
     /// The bound that stops one unauthenticated connection from exhausting the
     /// host's memory (audit 2026-08, finding 1.1a).
     ///
-    /// quinn's default is `receive_window: VarInt::MAX` — no aggregate limit —
-    /// which with 1024 streams of 2 MiB each is 2 GiB per connection, reachable
-    /// before any request is authenticated.
+    /// quinn's default is `receive_window: VarInt::MAX`, no aggregate limit;
+    /// [`CONNECTION_RECEIVE_WINDOW`] has the arithmetic this replaces.
     #[test]
     fn the_connection_receive_window_is_bounded() {
         let rendered = transport_debug(&crate::config::Limits::default());
