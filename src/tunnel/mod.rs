@@ -145,37 +145,95 @@ pub(crate) fn parse_port(text: &str) -> Result<u16, &'static str> {
     }
 }
 
-/// Whether a host component carries a bracket that is not part of an IP literal.
+/// Judges a host the way both routes must, and gives back the host to dial.
 ///
-/// RFC 3986 §3.2.2 gives "[" and "]" to the IP-literal form alone, and says so
-/// explicitly: "This is the only place where square bracket characters are allowed
-/// in the URI syntax." The grammar it says that of is
+/// `host` is what the route has cut out of its own syntax: the part of a
+/// CONNECT authority before the port, brackets included, or the template's
+/// `target_host` once its percent-encoding is decoded. Both routes call this
+/// and nothing else on the host, so one host gets one answer whichever route
+/// names it. `tunnel::tests::both_routes_give_one_host_shape_one_answer` holds
+/// the two to that, shape by shape.
+///
+/// The grammar is RFC 3986 §3.2.2's for an authority:
 ///
 /// ```text
 /// host        = IP-literal / IPv4address / reg-name
 ///
 /// IP-literal = "[" ( IPv6address / IPvFuture  ) "]"
+///
+/// reg-name    = *( unreserved / pct-encoded / sub-delims )
 /// ```
 ///
-/// so a bracket left inside a host, once the pair that delimits an IP literal
-/// has been taken off, is not part of the address or the name it sits in.
-/// Refused rather than tolerated because the host is what gets dialled and what
-/// gets logged, and `example.com]` must not quietly become `example.com`, nor
-/// `[a[b]:443` be dialled as `a[b`.
+/// and RFC 9298 §3's for the template, which drops the brackets and keeps the
+/// other two: "target_host = IPv6address / IPv4address / reg-name". What
+/// follows from the two:
 ///
-/// Both routes take that pair off whatever it holds, so `[example.com]:443`
-/// and `%5Bexample.com%5D` are dialled as `example.com`, although the grammar
-/// above gives the brackets only an IPv6address or an IPvFuture. This rule
-/// refuses a bracket that is left over; it does not check what the pair held.
+/// * **Brackets hold an IPv6 address and nothing else.** RFC 3986 §3.2.2:
+///   "This is the only place where square bracket characters are allowed in
+///   the URI syntax." A bracketed reg-name or IPv4 address is in neither
+///   grammar. IPvFuture is in the first, and the same section says what to do
+///   with it: an application that does not know the version flag "should
+///   return an appropriate error for "address mechanism not supported"". The
+///   template has no brackets at all. The bracketed form is accepted there
+///   around an IPv6 address all the same, as in an authority; that tolerance
+///   is ours.
+/// * **A colon is an IPv6 address.** The authority route has already refused
+///   one outside brackets, where it cannot be told from the port's. The
+///   template route writes an IPv6 literal bare: "if "target_host" contains an
+///   IPv6 literal, the colons (":") MUST be percent-encoded" (RFC 9298 §3).
+///   A decoded host with a colon that is not an IPv6 address, such as
+///   `example.com:80`, is in none of the three rules.
+/// * **No zone index.** RFC 9298 §3: "Note that IPv6 scoped addressing zone
+///   identifiers are not supported." RFC 3986 §3.2.2 says the same of its
+///   grammar: "This syntax does not support IPv6 scoped addressing zone
+///   identifiers." A scope names an interface on the client's side, which
+///   means nothing on the proxy's. `Ipv6Addr` parses no zone, and the rule
+///   below refuses the "%" of one written outside the address.
+/// * **A reg-name is ASCII from two sets**, RFC 3986 §2.3's
+///   `unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"` and §2.2's
+///   `sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="`.
+///   That rule also covers an IPv4 address, whose digits and dots are in the
+///   first set. The grammar's third member, `pct-encoded`, is refused: this is
+///   our rule. The authority route does not decode, and the template route
+///   decodes once, as RFC 9298 §3.1 asks ("decodes their percent-encoding").
+///   Neither RFC says what a "%" still in the host after that stands for, so
+///   both routes refuse it rather than guess.
 ///
-/// Both characters are asked about at all three call sites, rather than only
-/// the one each of them can actually see, so the three cannot drift: on the two
-/// bracketed routes a "]" cannot survive, because the split that found the
-/// literal takes the first one, and asking costs nothing. The refusal each call
-/// site answers with stays at the call site, because a CONNECT authority and a
-/// URI template are refused in different words.
-pub(crate) fn stray_bracket(host: &str) -> bool {
-    host.contains(['[', ']'])
+/// A trailing dot is a reg-name character and stays: RFC 3986 §3.2.2 says the
+/// rightmost label of a fully qualified name "may be followed by a single "."".
+/// What the name resolves to, and whether that address may be reached, is
+/// the resolver's and the destination policy's question, not this one.
+///
+/// The refusal is a reason for the debug line; each route answers it with the
+/// 400 it gives every other malformed target.
+pub(crate) fn parse_host(host: &str) -> Result<&str, &'static str> {
+    let (literal, bracketed) = match host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        Some(inside) => (inside, true),
+        None => (host, false),
+    };
+    if literal.is_empty() {
+        return Err("empty host");
+    }
+
+    if bracketed || literal.contains(':') {
+        return match literal.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(literal),
+            Err(_) if bracketed => Err("IP literal is not an IPv6 address"),
+            Err(_) => Err("host with a colon is not an IPv6 address"),
+        };
+    }
+
+    if literal.contains(['[', ']']) {
+        return Err("stray bracket in host");
+    }
+    let reg_name = |byte: u8| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte);
+    if !literal.bytes().all(reg_name) {
+        return Err("host is not a registered name or an IP address");
+    }
+    Ok(literal)
 }
 
 /// How many times over a connection may spend `unanswered_packet_budget` before
@@ -1217,6 +1275,154 @@ mod tests {
         assert_matches!(failure, ResolveFailure::TimedOut(reported) if reported == budget,
             "{failure}");
         assert_eq!(failure.proxy_error(), ProxyError::DnsTimeout);
+    }
+
+    /// Every host shape, spelled once for each route, gets one answer from both
+    /// parsers: the same host to dial, or a refusal from each.
+    ///
+    /// The routes spell a host differently, so each row gives both spellings:
+    /// a CONNECT authority writes an IPv6 literal in brackets (RFC 3986
+    /// §3.2.2), and the template writes it bare with its colons escaped
+    /// (RFC 9298 §3). The template's percent-encoding is its own syntax, so
+    /// the template spelling of a shape is the CONNECT host encoded once.
+    #[test]
+    fn both_routes_give_one_host_shape_one_answer() {
+        // (shape, CONNECT authority, template `target_host`, host dialled)
+        let shapes: [(&str, &str, &str, Option<&str>); 22] = [
+            (
+                "reg-name",
+                "example.com:443",
+                "example.com",
+                Some("example.com"),
+            ),
+            (
+                "reg-name with a trailing dot",
+                "example.com.:443",
+                "example.com.",
+                Some("example.com."),
+            ),
+            (
+                "reg-name with every sub-delim",
+                "a!$&'()*+,;=b:443",
+                "a%21%24%26%27%28%29%2A%2B%2C%3B%3Db",
+                Some("a!$&'()*+,;=b"),
+            ),
+            (
+                "IPv4 literal",
+                "192.0.2.1:443",
+                "192.0.2.1",
+                Some("192.0.2.1"),
+            ),
+            (
+                "IPv6 literal",
+                "[2001:db8::1]:443",
+                "2001%3Adb8%3A%3A1",
+                Some("2001:db8::1"),
+            ),
+            (
+                "IPv6 literal ending in IPv4",
+                "[::ffff:192.0.2.1]:443",
+                "%3A%3Affff%3A192.0.2.1",
+                Some("::ffff:192.0.2.1"),
+            ),
+            (
+                "IPv6 literal, bracketed in the template too",
+                "[2001:db8::1]:443",
+                "%5B2001%3Adb8%3A%3A1%5D",
+                Some("2001:db8::1"),
+            ),
+            (
+                "bracketed reg-name",
+                "[example.com]:443",
+                "%5Bexample.com%5D",
+                None,
+            ),
+            (
+                "bracketed IPv4 literal",
+                "[192.0.2.1]:443",
+                "%5B192.0.2.1%5D",
+                None,
+            ),
+            (
+                "IPvFuture",
+                "[v1.fe80::a+en1]:443",
+                "%5Bv1.fe80%3A%3Aa%2Ben1%5D",
+                None,
+            ),
+            (
+                "zone index, raw",
+                "[fe80::1%eth0]:443",
+                "fe80%3A%3A1%25eth0",
+                None,
+            ),
+            (
+                "zone index, raw, bracketed",
+                "[fe80::1%eth0]:443",
+                "%5Bfe80%3A%3A1%25eth0%5D",
+                None,
+            ),
+            (
+                "zone index, percent-encoded (RFC 6874)",
+                "[fe80::1%25eth0]:443",
+                "fe80%3A%3A1%2525eth0",
+                None,
+            ),
+            (
+                "a colon that is not an IPv6 literal",
+                "[example.com:80]:443",
+                "example.com%3A80",
+                None,
+            ),
+            ("empty", ":443", "", None),
+            ("empty IP literal", "[]:443", "%5B%5D", None),
+            (
+                "a percent-encoded octet in the host",
+                "ex%61mple.com:443",
+                "ex%2561mple.com",
+                None,
+            ),
+            (
+                "non-ASCII",
+                "b\u{fc}cher.example:443",
+                "b%C3%BCcher.example",
+                None,
+            ),
+            ("a space", "a b:443", "a%20b", None),
+            ("a control character", "a\u{1}b:443", "a%01b", None),
+            ("a slash", "a/b:443", "a%2Fb", None),
+            (
+                "a stray bracket",
+                "example.com]:443",
+                "example.com%5D",
+                None,
+            ),
+        ];
+
+        let mut disagreements = Vec::new();
+        for (shape, authority, target_host, expected) in shapes {
+            let connect = tcp::split_authority(authority)
+                .ok()
+                .map(|(host, port)| (host, port == 443));
+            let template = udp::parse_target(
+                &format!("{}{target_host}/443/", udp::WELL_KNOWN_PREFIX),
+                None,
+            )
+            .ok()
+            .map(|(host, port)| (host, port == 443));
+            let expected = expected.map(|host| (host.to_owned(), true));
+            if connect != expected || template != expected {
+                disagreements.push(format!(
+                    "{shape}: expected {expected:?}, CONNECT {authority:?} gave {connect:?}, \
+                     template {target_host:?} gave {template:?}"
+                ));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "{} shapes answered wrongly:\n{}",
+            disagreements.len(),
+            disagreements.join("\n")
+        );
     }
 
     /// The value `future` has *without waiting*, or `None` if it would wait.

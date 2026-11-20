@@ -734,19 +734,18 @@ proptest! {
         prop_assert_eq!(parse_target(&path, None), Ok((host, port)));
     }
 
-    /// The same for a percent-encoded host, which is the only way to spell a
-    /// bare IPv6 literal (RFC 9298 §3 escapes the colons) or anything else
-    /// that would otherwise break the path apart.
+    /// The same for a percent-encoded host: every reg-name character, each
+    /// one encoded, decodes back to the host it spelled.
     #[test]
     fn the_template_round_trips_a_percent_encoded_host(
-        // A bracket is the template's syntax rather than part of a host, so no
-        // host containing one round trips: the enclosing pair comes off, which
-        // `the_template_round_trips_ip_literals` pins, and any other bracket is
-        // refused outright. Excluded by construction rather than by
-        // `prop_assume!`: the rejection budget is a constant 1024 while
-        // `PROPTEST_CASES` scales, so an assume that discards ~10% of inputs
-        // aborts any run long enough to be called a fuzzer.
-        host in "[^\\p{C}\\[\\]]{1,32}",
+        // RFC 3986's `unreserved` and `sub-delims`, the characters a reg-name
+        // is made of (`tunnel::parse_host`). A colon belongs to an IPv6
+        // address, which `the_template_round_trips_ip_literals` covers, and
+        // every other character is refused. Excluded by construction rather
+        // than by `prop_assume!`: the rejection budget is a constant 1024
+        // while `PROPTEST_CASES` scales, so an assume that discards a share
+        // of the inputs aborts any run long enough to be called a fuzzer.
+        host in "[A-Za-z0-9._~!$&'()*+,;=-]{1,32}",
         port in 1u16..=u16::MAX,
     ) {
         let path = format!("{PREFIX}{}/{port}/", percent_encode_all(host.as_bytes()));
@@ -880,12 +879,13 @@ proptest! {
 /// future tightening is a deliberate change rather than a surprise.
 ///
 /// None of it is a defect: the port is digits and nothing else (RFC 3986
-/// §3.2.3) but leading zeros are digits, and the host is percent-decoded and
-/// handed on without a syntax check -- name resolution and the destination
-/// policy are what refuse a host, and they see the decoded string either way.
+/// §3.2.3) but leading zeros are digits, and percent-encoding applies to the
+/// whole template, the port segment included.
 ///
 /// A leading `+` used to be on this list, because `u16::from_str` takes a sign.
 /// It is refused now, and `a_signed_port_is_refused` above is where that lives.
+/// So did a decoded host that is not a host, which `tunnel::parse_host` now
+/// refuses on both routes.
 #[test]
 fn the_template_accepts_more_spellings_than_it_advertises() {
     assert_eq!(
@@ -898,12 +898,10 @@ fn the_template_accepts_more_spellings_than_it_advertises() {
         Ok(("example.com".to_owned(), 53))
     );
 
-    // Hosts are decoded, not validated: anything that is UTF-8 gets through.
-    assert_eq!(
-        parse_target("/.well-known/masque/udp/%20%01not%2Fa%2Fhost/53/", None),
-        Ok((" \u{1}not/a/host".to_owned(), 53))
-    );
-    // Except when the escapes do not spell UTF-8 at all.
+    // A decoded host is judged as a host: a space, a control character and a
+    // slash are not reg-name characters.
+    assert!(parse_target("/.well-known/masque/udp/%20%01not%2Fa%2Fhost/53/", None).is_err());
+    // Nor is anything whose escapes do not spell UTF-8.
     assert!(parse_target("/.well-known/masque/udp/%FF/53/", None).is_err());
 }
 

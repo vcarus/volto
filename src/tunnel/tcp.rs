@@ -962,51 +962,36 @@ async fn torn_down(teardown_rx: &mut watch::Receiver<State>) -> Teardown {
 /// tunnel costs a QUIC connection per input. `fuzz/fuzz_targets/authority.rs`
 /// holds both to the same invariants.
 ///
-/// The two agree on brackets and on the port, and differ on one shape: a host
-/// with a colon outside brackets is refused here, while the template route
-/// decodes `example.com%3A80` to a host with a colon in it and hands that to
-/// the resolver, which answers 502 `dns_error`. The template has to let colons
-/// through, because RFC 9298 §3 writes an IPv6 literal bare with its colons
-/// percent-encoded.
+/// The host is judged by `tunnel::parse_host`, which the template route
+/// calls too, so the two give one host one answer. What is left here is the
+/// authority's own syntax: no userinfo, and a port after the last colon unless
+/// the host is an IP literal, whose brackets keep its colons apart from the
+/// port's.
 pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
     if authority.contains('@') {
         return Err("userinfo is not allowed in a CONNECT authority");
     }
 
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(rest) => {
-            let (host, rest) = rest.split_once(']').ok_or("unterminated IPv6 literal")?;
-            if host.is_empty() {
-                return Err("empty host");
-            }
-            if tunnel::stray_bracket(host) {
-                return Err("stray bracket in host");
-            }
-            let port = rest
-                .strip_prefix(':')
-                .ok_or("missing port after IPv6 literal")?;
-            (host.to_owned(), port)
+    let (host, port) = if authority.starts_with('[') {
+        let end = authority.find(']').ok_or("unterminated IPv6 literal")?;
+        let port = authority[end + 1..]
+            .strip_prefix(':')
+            .ok_or("missing port after IPv6 literal")?;
+        (&authority[..=end], port)
+    } else {
+        let (host, port) = authority.rsplit_once(':').ok_or("missing port")?;
+        if host.contains(':') {
+            // Ambiguous with host:port; brackets are mandatory.
+            return Err("unbracketed IPv6 literal");
         }
-        None => {
-            let (host, port) = authority.rsplit_once(':').ok_or("missing port")?;
-            if host.is_empty() {
-                return Err("empty host");
-            }
-            if host.contains(':') {
-                // Ambiguous with host:port; brackets are mandatory.
-                return Err("unbracketed IPv6 literal");
-            }
-            if tunnel::stray_bracket(host) {
-                return Err("stray bracket in host");
-            }
-            (host.to_owned(), port)
-        }
+        (host, port)
     };
 
+    let host = tunnel::parse_host(host)?;
     // RFC 3986 §3.2.3's `port = *DIGIT`: see [`tunnel::parse_port`].
     let port = tunnel::parse_port(port)?;
 
-    Ok((host, port))
+    Ok((host.to_owned(), port))
 }
 
 #[cfg(test)]

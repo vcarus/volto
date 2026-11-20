@@ -421,6 +421,13 @@ port in 1..=65535 and an empty query. IPv6 literals arrive **without** brackets,
 with the colons escaped (`2001:db8::42` → `2001%3Adb8%3A%3A42`) per RFC 9298
 §3; the bracketed form is also accepted.
 
+The decoded host meets the rule a CONNECT authority's host meets
+(`tunnel::parse_host`), so the two routes give one host one answer. It is an
+IPv6 address, or a name or IPv4 address made of RFC 3986's `unreserved` and
+`sub-delims` characters. Brackets hold an IPv6 address only, a zone index is
+refused (RFC 9298 §3 does not support one), and so is a host with a colon that
+is not an IPv6 address or with a `%` left after decoding. Each is a 400.
+
 Two ordering rules that are easy to get wrong:
 
 - **Answer 2xx immediately** — do not wait for the target to send anything. UDP

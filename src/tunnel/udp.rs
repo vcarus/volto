@@ -1513,10 +1513,11 @@ pub fn validate(req: &Request) -> Result<(), &'static str> {
 /// Parsing is deliberately lenient about the things clients disagree on, and
 /// strict about anything ambiguous. The trailing slash is optional, and an IPv6
 /// literal is accepted both in the RFC 9298 §3 form (bare, only the colons
-/// escaped) and bracketed. What comes out is a host, with the
-/// brackets of the second form already off:
-/// [`crate::net::ConnectionResolver::lookup`] resolves names and literals, not
-/// URI components.
+/// escaped) and bracketed. The host is judged by `tunnel::parse_host`, the
+/// rule `tcp::split_authority` uses too, so the two routes give one host one
+/// answer. What comes out is a host, with the brackets of the second form
+/// already off: [`crate::net::ConnectionResolver::lookup`] resolves names and
+/// literals, not URI components.
 pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'static str> {
     // A query string would make the URI something other than the template.
     if query.is_some_and(|query| !query.is_empty()) {
@@ -1540,31 +1541,12 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
     let host = percent_decode_str(host)
         .decode_utf8()
         .map_err(|_| "target_host is not valid UTF-8")?;
-    if host.is_empty() {
-        return Err("empty target_host");
-    }
 
-    // The brackets belong to this template and come off here. RFC 9298 §3
-    // writes an IPv6 literal bare, with only its colons escaped, but some
-    // clients send the bracketed form and it costs nothing to accept. Taking
-    // them off is this parser's job rather than the resolver's, which is handed
-    // a host and not a piece of URI syntax.
-    let unbracketed = host
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .filter(|literal| !literal.is_empty())
-        .map(str::to_owned);
-    let host = unbracketed.unwrap_or_else(|| host.into_owned());
-
-    // A bracket that survived that pair is not part of any host
-    // ([`tunnel::stray_bracket`]). The two routes are the same malformation and
-    // get the same 400. Without this check `example.com%5D` would reach the
-    // resolver and come back a 502 dns_error. A colon is not checked here, so
-    // a host the authority route refuses for an unbracketed colon reaches the
-    // resolver on this one; see `tcp::split_authority`.
-    if tunnel::stray_bracket(&host) {
-        return Err("stray bracket in host");
-    }
+    // RFC 9298 §3.1: the proxy "decodes their percent-encoding", and what that
+    // gives is judged by the rule the authority route uses
+    // ([`tunnel::parse_host`]), which also takes off the brackets of the one
+    // bracketed form it accepts.
+    let host = tunnel::parse_host(&host)?.to_owned();
 
     let port = percent_decode_str(port)
         .decode_utf8()
@@ -2317,12 +2299,15 @@ mod tests {
         assert!(parse_target("/.well-known/masque/udp/192.0.2.1/53/", Some("")).is_ok());
     }
 
-    /// A percent-encoded slash must stay inside its segment.
+    /// A percent-encoded slash must stay inside its segment. It then reaches
+    /// the host rule as part of the host, which refuses it: a slash is not a
+    /// reg-name character. A split at it would have refused the path for its
+    /// segment count instead.
     #[test]
     fn an_encoded_slash_does_not_split_segments() {
         assert_eq!(
             parse("/.well-known/masque/udp/a%2Fb/53"),
-            Ok(("a/b".to_owned(), 53))
+            Err("host is not a registered name or an IP address")
         );
     }
 

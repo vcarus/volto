@@ -71,11 +71,15 @@ fuzz_target!(|data: &[u8]| {
 fn check(host: &str, port: u16) {
     assert!(!host.is_empty(), "an accepted target names a host");
     assert_ne!(port, 0, "port zero is not a port");
-    // Brackets belong to the URI syntax the host was cut out of, and RFC 3986
-    // §3.2.2 gives them to the IP-literal form alone. One that survived the
-    // parser is a host neither form describes.
+    // `tunnel::parse_host`, the rule both parsers share: an IPv6 address, or
+    // a reg-name or IPv4 address made of RFC 3986's `unreserved` and
+    // `sub-delims`. Brackets belong to the URI syntax the host was cut out of,
+    // so neither form leaves one in the host.
     assert!(
-        !host.contains(['[', ']']),
-        "a bracket survived into the host: {host:?}"
+        host.parse::<std::net::Ipv6Addr>().is_ok()
+            || host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=".contains(&byte)),
+        "the host is neither an IPv6 address nor a reg-name: {host:?}"
     );
 }
