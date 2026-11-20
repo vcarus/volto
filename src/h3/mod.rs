@@ -34,9 +34,9 @@
 //!   `Drop` behaviour (a finish on the send side, `STOP_SENDING` on the receive
 //!   side) is what `tunnel::tcp` reasons about.
 //! * **The peer's state is shared, not polled.** One background task per
-//!   connection reads every unidirectional stream and every datagram, so the
-//!   peer's SETTINGS take effect when they arrive rather than the next time a
-//!   request is accepted.
+//!   connection accepts every unidirectional stream, each then read by a task
+//!   of its own, and reads every datagram, so the peer's SETTINGS take effect
+//!   when they arrive rather than the next time a request is accepted.
 //! * **A connection error is a `quinn::Connection::close`.** RFC 9114 §8 makes
 //!   an HTTP/3 connection error a QUIC CONNECTION_CLOSE carrying the HTTP/3
 //!   code, which is what that call sends. Every operation still in flight then

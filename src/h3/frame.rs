@@ -31,12 +31,12 @@
 //! Charging the buffering budget for a frame that is not allowed there would
 //! let a peer hold the budget with frames it may not send at all.
 //!
-//! The decoder is pure: it holds every byte of state, and [`FrameReader`] is
-//! the few lines that feed it from a QUIC stream. That split makes the frame
-//! layer testable a byte at a time, and makes [`FrameReader`] cancel-safe: the
-//! only await is the read, and nothing it produces is lost by dropping the
-//! future. `tunnel::udp` reads request streams inside a `select!` with a
-//! timeout, so that property is required.
+//! The decoder is pure: it holds every byte of state, and [`FrameReader`]
+//! feeds it from a QUIC stream. That split makes the frame layer testable a
+//! byte at a time, and makes [`FrameReader`] cancel-safe: the only await is
+//! the read, and nothing it produces is lost by dropping the future.
+//! `tunnel::udp` reads request streams inside a `select!` with a timeout, so
+//! that property is required.
 //!
 //! # The one read-ahead
 //!
