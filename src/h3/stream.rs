@@ -535,10 +535,12 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
         return Err(malformed("a :path that is not an absolute path"));
     }
 
-    let (path, query) = match target.iter().position(|byte| *byte == b'?') {
-        Some(mark) => (&target[..mark], Some(&target[mark + 1..])),
-        None => (target, None),
-    };
+    let (path, query) = target
+        .iter()
+        .position(|byte| *byte == b'?')
+        .map_or((target, None), |mark| {
+            (&target[..mark], Some(&target[mark + 1..]))
+        });
 
     if !path.iter().all(|byte| is_pchar(*byte) || *byte == b'/') {
         return Err(malformed("a :path with a character no path may contain"));

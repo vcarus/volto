@@ -208,22 +208,18 @@ impl Shared {
     ) -> Option<DatagramReceiver> {
         let (sink, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
 
-        let (expired, released) = {
-            let mut routes = self.lock();
-            match routes.sessions.entry(quarter_stream_id) {
-                Entry::Occupied(_) => return None,
-                Entry::Vacant(slot) => slot.insert(sink),
-            };
-            routes.claimed(quarter_stream_id);
-
-            if routes.early.is_empty() {
-                (Vec::new(), 0)
-            } else {
-                let expired = routes.expire(now());
-                let released = routes.release(quarter_stream_id);
-                (expired, released)
-            }
+        let mut routes = self.lock();
+        match routes.sessions.entry(quarter_stream_id) {
+            Entry::Occupied(_) => return None,
+            Entry::Vacant(slot) => slot.insert(sink),
         };
+        routes.claimed(quarter_stream_id);
+        let (expired, released) = if routes.early.is_empty() {
+            (Vec::new(), 0)
+        } else {
+            (routes.expire(now()), routes.release(quarter_stream_id))
+        };
+        drop(routes);
 
         self.count_expired(expired);
         if released > 0 {
