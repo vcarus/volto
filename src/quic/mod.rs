@@ -545,33 +545,32 @@ impl Server {
         // survives too. That is not done, because D31 records key rotation on
         // reload as the current behaviour.
         if !incoming.remote_address_validated() {
-            if incoming.may_retry() {
-                match incoming.retry() {
-                    Ok(()) => {
-                        // DEBUG for the same reason the refusal below is: a
-                        // flood is exactly when this fires.
-                        debug!(
-                            %remote,
-                            live,
-                            max_connections,
-                            "the server is full: asking an unvalidated address \
-                             to prove itself before it may take a slot"
-                        );
-                        return None;
-                    }
-                    // Unreachable as quinn stands: it documents `may_retry()`
-                    // as guaranteed true whenever the address is unvalidated.
-                    // Handled rather than unwrapped because the fallback is
-                    // the safe one either way.
-                    //
-                    //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
-                    //# In response to processing an Initial packet
-                    //# containing a token that was provided in a Retry
-                    //# packet, a server cannot send another Retry
-                    //# packet; it can only refuse the connection or
-                    //# permit it to proceed.
-                    Err(error) => incoming = error.into_incoming(),
+            match incoming.retry() {
+                Ok(()) => {
+                    // DEBUG for the same reason the refusal below is: a flood
+                    // is exactly when this fires.
+                    debug!(
+                        %remote,
+                        live,
+                        max_connections,
+                        "the server is full: asking an unvalidated address \
+                         to prove itself before it may take a slot"
+                    );
+                    return None;
                 }
+                // Unreachable as quinn stands: `retry` fails only when
+                // `may_retry()` is false, and quinn documents `may_retry()` as
+                // true whenever the address is unvalidated. Handled rather
+                // than unwrapped because the fallback is the safe one either
+                // way.
+                //
+                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+                //# In response to processing an Initial packet
+                //# containing a token that was provided in a Retry
+                //# packet, a server cannot send another Retry
+                //# packet; it can only refuse the connection or
+                //# permit it to proceed.
+                Err(error) => incoming = error.into_incoming(),
             }
 
             debug!(
