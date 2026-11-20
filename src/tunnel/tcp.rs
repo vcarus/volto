@@ -205,11 +205,11 @@ impl Teardown {
         match self {
             // A target error is what the pump that saw it already put on the
             // response direction.
-            Self::TargetError => h3api::CONNECT_ERROR,
+            Self::TargetError => h3api::Code::H3_CONNECT_ERROR,
             // The other direction of a client abort is cancelled, as §4.4 asks
             // (quoted on `Teardown`), and §8.1 gives this code for "the request
             // or its response (including pushed response) is cancelled".
-            Self::ClientAbort => h3api::REQUEST_CANCELLED,
+            Self::ClientAbort => h3api::Code::H3_REQUEST_CANCELLED,
         }
     }
 }
@@ -506,7 +506,7 @@ async fn client_to_target(
                         // abortive close, because unlike there the socket is
                         // still open: the target must not read a polite FIN off
                         // a tunnel this server cut.
-                        reader.stop_receiving(h3api::CONNECT_ERROR);
+                        reader.stop_receiving(h3api::Code::H3_CONNECT_ERROR);
                         let tcp_write = tcp_write.release();
                         abort_target(tcp_write.as_ref());
                         tcp_write.forget();
@@ -521,7 +521,7 @@ async fn client_to_target(
                     // Dropped as it always was: the target has already ended
                     // this connection, so there is nothing to reset.
                     drop(tcp_write.release());
-                    reader.stop_receiving(h3api::CONNECT_ERROR);
+                    reader.stop_receiving(h3api::Code::H3_CONNECT_ERROR);
                     state.send_replace(State::TornDown(Teardown::TargetError));
                     return;
                 }
@@ -827,7 +827,7 @@ async fn target_to_client(
                         // truncation reading as a complete response.
                         // `Writer::send_data_in_place` quotes RFC 9114 §7.1 on
                         // this.
-                        writer.reset(h3api::REQUEST_CANCELLED);
+                        writer.reset(h3api::Code::H3_REQUEST_CANCELLED);
                         abort_target(tcp_read.as_ref());
                         // Nobody reads this: the other pump returned when the
                         // client finished. It is written so that every exit
@@ -854,7 +854,7 @@ async fn target_to_client(
                 // The target reset the connection. RFC 9114 §4.4 maps this onto
                 // a stream reset with H3_CONNECT_ERROR.
                 debug!(%error, "read from target failed");
-                writer.reset(h3api::CONNECT_ERROR);
+                writer.reset(h3api::Code::H3_CONNECT_ERROR);
                 state.send_replace(State::TornDown(Teardown::TargetError));
                 return;
             }

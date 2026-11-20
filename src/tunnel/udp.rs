@@ -784,7 +784,7 @@ impl Session<'_> {
         // RFC 9298 §3.1: closing the UDP socket and closing the request stream
         // go together. The socket closes when `self` drops; the stream needs
         // saying explicitly.
-        self.reader.stop_receiving(h3api::NO_ERROR);
+        self.reader.stop_receiving(h3api::Code::H3_NO_ERROR);
         if let Err(error) = self.writer.finish() {
             debug!(stream_id, %error, "failed to finish the connect-udp stream");
         }
@@ -890,7 +890,7 @@ impl Session<'_> {
                 length = payload.len(),
                 "client sent an oversized UDP payload, aborting the session"
             );
-            return self.abort(h3api::DATAGRAM_ERROR);
+            return self.abort(h3api::Code::H3_DATAGRAM_ERROR);
         }
 
         // RFC 9298 §7. The packet is dropped rather than the session closed: a
@@ -924,7 +924,7 @@ impl Session<'_> {
                         "the connection's unanswered packet budget is spent, closing this session"
                     ),
                 }
-                return self.abort(h3api::REQUEST_CANCELLED);
+                return self.abort(h3api::Code::H3_REQUEST_CANCELLED);
             }
 
             *remaining -= 1;
@@ -1022,7 +1022,7 @@ impl Session<'_> {
                     timeout_secs = self.ctx.stall_budget.as_secs(),
                     "client stopped reading the capsule stream, resetting it"
                 );
-                self.abort(h3api::REQUEST_CANCELLED)
+                self.abort(h3api::Code::H3_REQUEST_CANCELLED)
             }
         }
     }
@@ -1067,7 +1067,7 @@ impl Session<'_> {
                             // RFC 9297 §5.2 registers 0x33 as exactly this: a
                             // "Datagram or Capsule Protocol parse error".
                             debug!(stream_id, %error, "malformed capsule");
-                            return self.abort(h3api::DATAGRAM_ERROR);
+                            return self.abort(h3api::Code::H3_DATAGRAM_ERROR);
                         }
                     }
                 }
@@ -1095,7 +1095,7 @@ impl Session<'_> {
                     // fault of the message, so the code the RFC names for a
                     // malformed message is sent.
                     debug!(stream_id, "connect-udp stream ended mid-capsule");
-                    self.abort(h3api::MESSAGE_ERROR)
+                    self.abort(h3api::Code::H3_MESSAGE_ERROR)
                 }
             }
             Err(error) => {
@@ -2196,7 +2196,7 @@ mod tests {
         assert_eq!(taken + 1, BURST, "a burst handles {BURST} events in all");
         assert!(!burst_continues(BURST, Step::Continue));
 
-        for over in [Step::Stop, Step::Aborted(h3api::REQUEST_CANCELLED)] {
+        for over in [Step::Stop, Step::Aborted(h3api::Code::H3_REQUEST_CANCELLED)] {
             assert!(
                 !burst_continues(1, over),
                 "{over:?} must end the burst after the event that produced it"

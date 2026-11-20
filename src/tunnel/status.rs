@@ -468,7 +468,7 @@ async fn answer_then_finish(
     unfinished: &'static str,
 ) {
     let stream_id = stream.id();
-    stream.stop_receiving(h3api::NO_ERROR);
+    stream.stop_receiving(h3api::Code::H3_NO_ERROR);
 
     if !respond(stream, status, fields, failed, gave_up).await {
         return;

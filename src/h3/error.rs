@@ -52,6 +52,10 @@ macro_rules! codes {
 
 codes! {
     /// A datagram or capsule could not be parsed (RFC 9297 §5.2).
+    ///
+    /// The registry names 0x33 "Datagram or Capsule Protocol parse error", so
+    /// it is more precise than H3_MESSAGE_ERROR for a fault inside the payload
+    /// rather than in the HTTP message itself.
     (0x33, H3_DATAGRAM_ERROR);
     /// No error: a close with nothing to report (RFC 9114 §8.1).
     (0x100, H3_NO_ERROR);
@@ -78,6 +82,10 @@ codes! {
     /// The request was rejected without being processed (RFC 9114 §5.2).
     (0x10b, H3_REQUEST_REJECTED);
     /// The request or its response is cancelled (RFC 9114 §8.1).
+    ///
+    /// Also the closest registered code for a response body this server gives
+    /// up on because the peer stopped reading it: nothing was malformed and
+    /// nothing failed upstream, the transfer simply cannot be completed.
     (0x10c, H3_REQUEST_CANCELLED);
     /// The request stream ended without a fully formed request (RFC 9114 §4.1).
     (0x10d, H3_REQUEST_INCOMPLETE);

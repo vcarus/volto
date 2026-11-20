@@ -33,29 +33,6 @@ pub use crate::h3::frame::{DATA_HEADER_ROOM, READ_AHEAD_CHUNKS};
 pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};
 pub use crate::h3::stream::{Reader, Resolver, RespondError, Stream, Writer};
 
-/// No error: a clean teardown.
-pub const NO_ERROR: Code = Code::H3_NO_ERROR;
-
-/// The proxy's connection to the target failed or was reset (RFC 9114 §8.1).
-pub const CONNECT_ERROR: Code = Code::H3_CONNECT_ERROR;
-
-/// The peer sent something malformed (RFC 9114 §8.1).
-pub const MESSAGE_ERROR: Code = Code::H3_MESSAGE_ERROR;
-
-/// The request or its response is cancelled (RFC 9114 §8.1).
-///
-/// The closest registered code for a response body this server gives up on
-/// because the peer stopped reading it: nothing was malformed and nothing failed
-/// upstream, the transfer simply cannot be completed.
-pub const REQUEST_CANCELLED: Code = Code::H3_REQUEST_CANCELLED;
-
-/// A datagram or capsule could not be parsed (RFC 9297 §5.2).
-///
-/// The registry entry for 0x33 is literally "Datagram or Capsule Protocol parse
-/// error", which is more precise than H3_MESSAGE_ERROR for anything that went
-/// wrong inside the payload rather than in the HTTP message itself.
-pub const DATAGRAM_ERROR: Code = Code::H3_DATAGRAM_ERROR;
-
 /// Connection close code used when a peer exhausts its authentication attempts.
 ///
 /// It closes the whole connection rather than a stream. The code is
@@ -106,7 +83,9 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
         // a connection cleanly; H3_NO_ERROR (0x100) is what RFC 9114 §8.1
         // defines for the same intent. Both mean the peer simply left. Any other
         // code is the peer reporting a problem and stays a warning.
-        ConnectionError::ApplicationClose { code } if code.value() == 0 || *code == NO_ERROR => {
+        ConnectionError::ApplicationClose { code }
+            if code.value() == 0 || *code == Code::H3_NO_ERROR =>
+        {
             Some(BenignClose::PeerClosed)
         }
 
@@ -115,7 +94,7 @@ pub fn benign_close(error: &ConnectionError) -> Option<BenignClose> {
         // authenticated has gone silent for too long (D76). The peer was idle;
         // that an application timer rather than the transport's own noticed it
         // does not make it a fault.
-        ConnectionError::Local(violation) if violation.code() == NO_ERROR => {
+        ConnectionError::Local(violation) if violation.code() == Code::H3_NO_ERROR => {
             Some(BenignClose::Idle)
         }
 
@@ -132,7 +111,7 @@ mod tests {
     fn a_peer_reset_is_told_apart_from_every_other_failure() {
         assert_eq!(
             peer_reset_code(&StreamError::RemoteTerminate {
-                code: CONNECT_ERROR
+                code: Code::H3_CONNECT_ERROR
             }),
             Some(0x10f)
         );
@@ -150,7 +129,7 @@ mod tests {
             benign_close(&ConnectionError::Timeout),
             Some(BenignClose::Idle)
         );
-        for code in [Code::new(0), NO_ERROR] {
+        for code in [Code::new(0), Code::H3_NO_ERROR] {
             assert_eq!(
                 benign_close(&ConnectionError::ApplicationClose { code }),
                 Some(BenignClose::PeerClosed),
@@ -165,7 +144,7 @@ mod tests {
     fn our_own_quiet_close_is_routine() {
         assert_eq!(
             benign_close(&ConnectionError::Local(Violation::connection(
-                NO_ERROR,
+                Code::H3_NO_ERROR,
                 "no request within the timeout"
             ))),
             Some(BenignClose::Idle)
