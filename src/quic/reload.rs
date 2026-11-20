@@ -1,6 +1,5 @@
-//! Reloading a running server: the live configuration, the server
-//! configuration an accept runs a connection on, and the lock that orders the
-//! writes to both.
+//! Reloading a running server: the live configuration generation an accept
+//! runs a connection on, and the lock that orders a reload against the drain.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -13,7 +12,7 @@ use crate::config::Config;
 use crate::gate::{Expected, Policy};
 use crate::names::Names;
 use crate::shutdown::Shutdown;
-use crate::tls;
+use crate::{tls, tunnel};
 
 #[cfg(doc)]
 use super::Server;
@@ -26,14 +25,15 @@ use super::transport::transport_config;
 /// apart. A reload that quietly dropped the stream limit or the keep-alive would
 /// be hard to find, since everything would work until the connection went idle
 /// behind a relay. It is also what makes every value below reloadable: a
-/// `SIGHUP` rebuilds this, writes it to the slot [`Server::accept_under_the_swap`]
-/// reads and hands a copy to `Endpoint::set_server_config`, so the new numbers
-/// apply to every connection this process accepts from then on.
+/// `SIGHUP` rebuilds this, writes it into the [`Live`] generation
+/// [`Server::accept_on_one_generation`] reads and hands a copy to
+/// `Endpoint::set_server_config`, so the new numbers apply to every connection
+/// this process accepts from then on.
 ///
 /// The endpoint's copy governs the pending path: quinn-proto reads it as a
 /// connection's first Initial arrives, for the Initial keys, token validation
-/// and the Retry seal. The handshake runs on the slot's copy instead; see
-/// [`Server::accept_under_the_swap`].
+/// and the Retry seal. The handshake runs on the generation's copy instead; see
+/// [`Server::accept_on_one_generation`].
 ///
 /// Connections already open keep the transport parameters they negotiated at
 /// handshake time. QUIC has no way to renegotiate them mid-connection, so this
@@ -60,53 +60,41 @@ pub(super) fn server_config(
     Ok((server_config, ech, policy))
 }
 
-/// The live configuration, swapped wholesale on reload.
+/// What a new connection is accepted with, one value per configuration
+/// generation, so one read gets a matching pair (D22).
+pub(super) struct Live {
+    /// The configuration, with the credentials and destination rules built
+    /// from it, shared by every connection of the generation.
+    pub(super) generation: Arc<tunnel::Generation>,
+    /// The transport parameters and the TLS identity, kept beside the
+    /// endpoint's own copy rather than read back out of it, because quinn
+    /// exposes no getter and because the endpoint's copy may be a generation
+    /// old by the time a connection is accepted
+    /// ([`Server::accept_on_one_generation`] says why).
+    pub(super) quic: Arc<quinn::ServerConfig>,
+}
+
+/// The live generation, swapped wholesale on reload.
 ///
 /// A plain `RwLock` rather than anything fancier: it is read once per accepted
 /// connection and written once per `SIGHUP`, and the guard is never held across an
 /// await, only long enough to clone the `Arc`.
-pub(super) type LiveConfig = Arc<RwLock<Arc<Config>>>;
+pub(super) type LiveSlot = Arc<RwLock<Arc<Live>>>;
 
-/// The `quinn::ServerConfig` a new connection is accepted with.
+/// Orders a reload against the drain.
 ///
-/// The transport parameters and the TLS identity, kept beside the endpoint's own
-/// copy rather than read back out of it, because quinn exposes no getter and
-/// because the endpoint's copy may be a generation old by the time a connection
-/// is accepted ([`Server::accept_under_the_swap`] says why).
+/// [`ReloadHandle::reload`] reads the shutdown latch and then re-opens the
+/// listener, so a `SIGTERM` landing between the two would put the endpoint back
+/// to accepting handshakes [`Server::drain`] has just refused, and quinn's
+/// unaccepted `Incoming` queue would grow for the whole grace period. D22 states
+/// that this must not happen. `reload` holds the guard across the latch read and
+/// its writes, `drain` across its own `set_server_config(None)`. An accept does
+/// not take it: the [`Live`] it reads is one value.
 ///
-/// The same `RwLock` shape as [`LiveConfig`], for the same reasons.
-/// `quinn::ServerConfig` is a set of `Arc`s, so both clones are a few reference
-/// counts.
-pub(super) type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
-
-/// Serialises everything that decides what a new connection is accepted with.
-///
-/// Four writes make a reload, the SNI gate's list, the live [`Config`], the
-/// `quinn::ServerConfig` an accept runs on and the endpoint's own copy of it, and
-/// a fifth closes the listener at the start of the drain. Held apart, they are
-/// two check-then-act races on the same state.
-///
-/// The first is [`ReloadHandle::reload`] against [`Server::drain`]: the reload
-/// reads the shutdown latch and then re-opens the listener, so a `SIGTERM`
-/// landing between the two puts the endpoint back to accepting handshakes the
-/// drain has just refused, and quinn's unaccepted `Incoming` queue grows for the
-/// whole grace period. D22 states that this must not happen. The second is the
-/// reload against an accept: a connection taken off `endpoint.accept()` between
-/// two of the four writes runs on one generation's transport parameters and
-/// another's `Authenticator`, `Policy` and quotas for its whole life, which is
-/// the half-applied state the same ADR says there is none of.
-///
-/// Three callers take it. `reload` holds it across the latch read and all four
-/// writes, `drain` across its own `set_server_config(None)`, and
-/// [`Server::accept_under_the_swap`] across the pair of reads that decide what
-/// one new connection runs on, which closes the second race (D22).
-///
-/// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
-/// the values themselves each have their own lock. It is never held across an
-/// await, since `reload` is synchronous throughout, `drain` holds it for one
-/// `set_server_config` call, and `accept_under_the_swap` for two synchronous
-/// reads and the synchronous `Incoming::accept_with` they feed. The slow half of
-/// a reload, parsing the file and the certificate, happens before it is taken.
+/// A `std::sync::Mutex<()>` because there is nothing to protect but the order.
+/// It is never held across an await, since `reload` is synchronous throughout
+/// and `drain` holds it for one `set_server_config` call. The slow half of a
+/// reload, parsing the file and the certificate, happens before it is taken.
 #[derive(Clone)]
 pub(super) struct ConfigSwap(Arc<Mutex<()>>);
 
@@ -141,10 +129,9 @@ impl ConfigSwap {
 #[derive(Clone)]
 pub struct ReloadHandle {
     pub(super) endpoint: quinn::Endpoint,
-    pub(super) config: LiveConfig,
-    /// The server's own slot, written in the same guarded block as `config` and
-    /// as the endpoint's copy; see [`LiveQuicConfig`].
-    pub(super) quic_config: LiveQuicConfig,
+    /// The server's own slot, written in the same guarded block as the
+    /// endpoint's copy; see [`Live`].
+    pub(super) live: LiveSlot,
     pub(super) shutdown: Shutdown,
     /// The SNI gate's list, which is swapped with the rest (D106).
     pub(super) expected: Expected,
@@ -184,14 +171,16 @@ impl ReloadHandle {
             .context("the new configuration's certificate and key are not usable")?;
 
         // Rendered before the guard is taken, because it opens and parses
-        // `server.cert` a second time (see `Config::warnings`), and the guard
-        // is the one `Server::accept_under_the_swap` takes for every connection
-        // it accepts. The strings are logged after the swap.
+        // `server.cert` a second time (see `Config::warnings`), and the drain
+        // waits for the guard. The strings are logged after the swap.
         let warnings = config.warnings();
 
         // One value for the slot and the endpoint's copy (see
         // `server_config`), so the two cannot be two different configurations.
-        let accepted_with = Arc::new(quic_config);
+        let live = Arc::new(Live {
+            generation: Arc::new(tunnel::Generation::new(config.clone())),
+            quic: Arc::new(quic_config),
+        });
 
         // Everything from the latch read to the last write is one step, and the
         // drain takes the same lock around its own `set_server_config`. Held
@@ -201,13 +190,11 @@ impl ReloadHandle {
         // outside it, so a `SIGHUP` with a large certificate cannot delay a
         // drain that is waiting for this.
         //
-        // The guard covers the latch read through the fourth write and nothing
+        // The guard covers the latch read through the last write and nothing
         // after it. It is dropped straight after `set_server_config`, before the
         // log lines and the fd check: those report what was swapped rather than
         // decide it, and holding the guard across them would let a blocked log
-        // sink stall the accept path, which takes the same mutex synchronously
-        // on a runtime worker, and the drain, which takes it before closing the
-        // endpoint.
+        // sink stall the drain, which takes it before closing the endpoint.
         let swapping = self.swap.hold();
 
         // A reload during shutdown must not re-open the listener that `drain` just
@@ -237,23 +224,23 @@ impl ReloadHandle {
         // libssl sends retry configs only when it holds ECH keys, so that
         // handshake carries no ECHConfigList either.
         //
-        // The live `Config` and the slot are read only under the swap, so their
-        // order changes nothing a connection sees; users go first so the order
-        // reads like the gate's. `set_server_config` goes after the slot so the
-        // endpoint never holds a configuration the slot does not hold yet.
-        // Outside the swap, `Gate::poll_recv` and quinn-proto's first-Initial
-        // read see the gate's list before the endpoint's configuration, the
-        // order the first paragraph gives. `admit` and `Server::shutdown_grace`
-        // each read one key of the live `Config` and compare it with nothing
-        // else, so the order does not change what they see.
+        // The slot goes second, as one write, so an accept reads the old pair or
+        // the new pair and never one of each. An accept between the gate's list
+        // and the slot runs wholly on the old generation, certificate included,
+        // which is the TLS refusal of the paragraph above for a name only the
+        // new list admits. `set_server_config` goes after the slot so the
+        // endpoint never holds a configuration the slot does not hold yet; an
+        // accept between the two states the new configuration over an
+        // `Incoming` the endpoint's old copy opened, as for any handshake
+        // queued before a reload. `Gate::poll_recv` and quinn-proto's
+        // first-Initial read see the gate's list before the endpoint's
+        // configuration, the order the first paragraph gives. `admit` and
+        // `Server::shutdown_grace` each read one key of the live `Config` and
+        // compare it with nothing else, so the order does not change what they
+        // see.
         self.expected.set(policy);
-        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
-        *self
-            .quic_config
-            .write()
-            .unwrap_or_else(PoisonError::into_inner) = accepted_with.clone();
-        self.endpoint
-            .set_server_config(Some((*accepted_with).clone()));
+        *self.live.write().unwrap_or_else(PoisonError::into_inner) = live.clone();
+        self.endpoint.set_server_config(Some((*live.quic).clone()));
         drop(swapping);
 
         info!(
