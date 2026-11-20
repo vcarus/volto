@@ -28,13 +28,26 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$ROOT/target/interop-local"
 mkdir -p "$WORK"
 
-export VOLTO_ADDR="127.0.0.1:14443"
+# Two free UDP ports on loopback, chosen by binding port 0, so a process that
+# already holds a fixed port cannot fail the run. CI sets fixed ones. The
+# sockets close before volto binds, so another process could take a port in
+# between; `serve.sh wait` then reports the server dead, as it did for a
+# fixed port in use.
+PORTS="$(python3 -c '
+import socket
+sockets = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(2)]
+for s in sockets:
+    s.bind(("127.0.0.1", 0))
+print(*(s.getsockname()[1] for s in sockets))
+')"
+read -r PORT ECH_PORT <<< "$PORTS"
+export VOLTO_ADDR="127.0.0.1:$PORT"
 export VOLTO_SNI="localhost"
 export VOLTO_USER="interop"
 export VOLTO_PASSWORD="interop-password-not-a-secret"
 export VOLTO_CERT="$WORK/cert.pem"
 # The second server, which holds an ECH key and requires ECH (serve.sh prepare-ech).
-export VOLTO_ECH_ADDR="127.0.0.1:14444"
+export VOLTO_ECH_ADDR="127.0.0.1:$ECH_PORT"
 
 # The certificate and the configuration, from the fixture CI uses.
 "$ROOT/tests/interop/serve.sh" prepare "$WORK"
