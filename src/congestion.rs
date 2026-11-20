@@ -6,8 +6,7 @@
 //!
 //! quinn-proto 0.11.x's BBR overestimates the bottleneck bandwidth, so its
 //! congestion window never limits what is in flight. Paths below are in that
-//! crate. The quinn-proto citations in volto were verified against quinn-proto
-//! 0.11.19 on 2026-10-16. quinn calls `Controller::on_ack` once per
+//! crate. quinn calls `Controller::on_ack` once per
 //! acknowledged packet (`src/connection/mod.rs`,
 //! `Connection::on_packet_acked`). For each call BBR takes that packet's bytes
 //! over the time since the previous call
@@ -25,17 +24,13 @@
 //! tens of megabytes, and in-flight data is limited only by the recovery window
 //! and the peer's flow control. quinn paces from the window
 //! (`src/connection/pacing.rs`, `Pacer::delay`, which adds 1.25 windows of
-//! tokens per smoothed RTT), so nothing slows the sender to the bottleneck. On
-//! one production path a bulk download lost 17 to 21 percent of the packets
-//! sent this way.
+//! tokens per smoothed RTT), so nothing slows the sender to the bottleneck, and
+//! a bulk download loses what the bottleneck queue cannot hold (D108).
 //!
 //! [`BbrCapped`] forwards every callback to quinn's BBR and only lowers
-//! [`Controller::window`]. It measures the delivery rate once per round trip:
-//! the bytes acknowledged, over the time their ACKs took to arrive or the time
-//! the packets they belong to took to send, whichever is longer. It keeps the
-//! largest of the stored samples, where a stored sample leaves when a newer one
-//! is stored ten or more intervals after it, and caps the window at 1.25 times
-//! that rate times its own minimum RTT. The cap is never below the window a new
+//! [`Controller::window`]. It caps the window at 1.25 times the delivery rate it
+//! measures once per round trip (see `DeliveryRate`) times its own minimum RTT.
+//! The cap is never below the window a new
 //! connection starts with, 240 kB with quinn's default (200 packets of 1200
 //! bytes), so on a path whose bandwidth-delay product is under 192 kB the
 //! window can be 240 kB. Because quinn paces from the window, the cap also sets
@@ -120,17 +115,15 @@
 //! about a quarter of a second.
 //!
 //! A delivery-rate sample is bounded by the send interval of its packets as
-//! well as by its ACK interval (see `DeliveryRate`). With the ACK interval
-//! alone, ACKs that arrive together, as they do after a fall in RTT, give a
-//! sample far above what the path carries. quinn reports a sender blocked by
-//! the peer's flow control as app-limited, so the lower samples that follow are
-//! not stored, and it stays in the estimate until a sample is stored ten or
-//! more intervals after it. While nothing is stored the estimate does not
-//! change. The first sample stored after ten or more such intervals replaces
-//! the whole estimate, and because quinn's app-limited flag is the connection's
-//! state when the ACK arrives, not when the packet was sent, that sample can
-//! measure packets sent while the sender was app-limited and put the cap about
-//! one round trip low until the next sample.
+//! well as by its ACK interval (see `DeliveryRate`), because ACKs that arrive
+//! together, as they do after a fall in RTT, would otherwise give a sample far
+//! above what the path carries, and quinn's app-limited report for a
+//! flow-control-blocked sender would keep the lower samples that follow out of
+//! the estimate. One limit remains: quinn's app-limited flag is the
+//! connection's state when the ACK arrives, not when the packet was sent, so
+//! the first sample stored after ten or more unstored intervals, which replaces
+//! the whole estimate, can measure packets sent while the sender was
+//! app-limited and put the cap about one round trip low until the next sample.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -180,8 +173,7 @@ const FALLEN_PERCENT: u128 = 50;
 /// count as [`SAMPLES_WITHOUT_GROWTH`]; the rule is ours. Any rise counts, not
 /// only one of [`GROWTH_PERCENT`]: with the window at 1.25 times the estimate,
 /// a raised window shows in the sample about two round trips later, so the
-/// estimate grows by about 12 percent per sample, and in the lab by 3 to 25
-/// percent.
+/// estimate grows by about 12 percent per sample.
 const RISES_TO_RESTART: u8 = 3;
 
 /// How long a minimum RTT holds without a sample at or below it before a probe
@@ -538,10 +530,7 @@ impl DeliveryRate {
     fn on_ack(&mut self, sent: Instant, bytes: u64, app_limited: bool) {
         self.bytes = self.bytes.saturating_add(bytes);
         self.app_limited |= app_limited;
-        // The latest send time only moves forward, so a packet acknowledged out
-        // of order does not shorten the send interval. The earliest one moves
-        // back when the packet was sent before the interval started, as it is
-        // when a peer acknowledges the newest packet first.
+        // The two send times of the type's doc.
         self.sent = self.sent.max(Some(sent));
         self.earliest = Some(self.earliest.map_or(sent, |earliest| earliest.min(sent)));
     }
