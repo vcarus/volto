@@ -1560,6 +1560,33 @@ mod tests {
         }
     }
 
+    /// A port has one spelling (see `tunnel::parse_port`): a leading zero is
+    /// refused as a sign is, and zero alone keeps its own refusal.
+    #[test]
+    fn rejects_a_port_with_a_leading_zero() {
+        for authority in [
+            "example.com:0443",
+            "example.com:00443",
+            "example.com:080",
+            "example.com:00",
+            "[2001:db8::1]:0443",
+        ] {
+            assert_eq!(
+                split_authority(authority),
+                Err("port has a leading zero"),
+                "{authority} must not be dialled"
+            );
+        }
+        assert_eq!(
+            split_authority("example.com:0"),
+            Err("port must not be zero")
+        );
+        assert_eq!(
+            split_authority("example.com:80"),
+            Ok(("example.com".to_owned(), 80))
+        );
+    }
+
     #[test]
     fn rejects_ambiguous_and_malformed_hosts() {
         assert!(split_authority(":443").is_err());

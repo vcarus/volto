@@ -2282,6 +2282,28 @@ mod tests {
         }
     }
 
+    /// The authority route's rule for a port with a leading zero, and on the
+    /// decoded segment, so `%30443` meets it as `0443` does.
+    #[test]
+    fn rejects_a_port_with_a_leading_zero() {
+        for path in [
+            "/.well-known/masque/udp/192.0.2.1/0443/",
+            "/.well-known/masque/udp/192.0.2.1/00443/",
+            "/.well-known/masque/udp/192.0.2.1/080/",
+            "/.well-known/masque/udp/192.0.2.1/%30443/",
+        ] {
+            assert_eq!(
+                parse(path),
+                Err("port has a leading zero"),
+                "{path} must not be dialled"
+            );
+        }
+        assert_eq!(
+            parse("/.well-known/masque/udp/192.0.2.1/0/"),
+            Err("port must not be zero")
+        );
+    }
+
     #[test]
     fn rejects_an_empty_host() {
         assert!(parse("/.well-known/masque/udp//53").is_err());

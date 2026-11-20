@@ -417,7 +417,9 @@ https://$PROXY_HOST:$PROXY_PORT/.well-known/masque/udp/{target_host}/{target_por
 ```
 
 Parsing is deliberately lenient: percent-decoding, an optional trailing slash, a
-port in 1..=65535 and an empty query. IPv6 literals arrive **without** brackets,
+port in 1..=65535 and an empty query. The port is digits only, with no sign and
+no leading zero, on this route and on the CONNECT route alike, so that one port
+has one spelling. IPv6 literals arrive **without** brackets,
 with the colons escaped (`2001:db8::42` → `2001%3Adb8%3A%3A42`) per RFC 9298
 §3; the bracketed form is also accepted.
 

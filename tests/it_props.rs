@@ -860,6 +860,19 @@ proptest! {
         prop_assert!(parse_target(&path, None).is_err(), "port {sign}{port}");
     }
 
+    /// A port has one spelling: any run of leading zeros in front of a port is
+    /// refused, percent-encoded or not, because the template is decoded before
+    /// the number is read.
+    #[test]
+    fn a_port_with_a_leading_zero_is_refused(
+        host in literal_host(),
+        zeros in prop_oneof![Just("0"), Just("00"), Just("%30"), Just("0%30")],
+        port in 1u16..=u16::MAX,
+    ) {
+        let path = format!("{PREFIX}{host}/{zeros}{port}/");
+        prop_assert!(parse_target(&path, None).is_err(), "port {zeros}{port}");
+    }
+
     /// Arbitrary input never panics, and a success is always a usable target:
     /// a non-empty host and a non-zero port.
     #[test]
@@ -878,20 +891,16 @@ proptest! {
 /// What the template accepts that a reader might not expect, pinned so that a
 /// future tightening is a deliberate change rather than a surprise.
 ///
-/// None of it is a defect: the port is digits and nothing else (RFC 3986
-/// §3.2.3) but leading zeros are digits, and percent-encoding applies to the
-/// whole template, the port segment included.
+/// None of it is a defect: percent-encoding applies to the whole template, the
+/// port segment included.
 ///
-/// A leading `+` used to be on this list, because `u16::from_str` takes a sign.
-/// It is refused now, and `a_signed_port_is_refused` above is where that lives.
-/// So did a decoded host that is not a host, which `tunnel::parse_host` now
-/// refuses on both routes.
+/// A leading `+` used to be on this list, because `u16::from_str` takes a sign,
+/// and so did a leading zero. Both are refused now, and
+/// `a_signed_port_is_refused` and `a_port_with_a_leading_zero_is_refused` above
+/// are where that lives. So did a decoded host that is not a host, which
+/// `tunnel::parse_host` now refuses on both routes.
 #[test]
 fn the_template_accepts_more_spellings_than_it_advertises() {
-    assert_eq!(
-        parse_target("/.well-known/masque/udp/example.com/00053/", None),
-        Ok(("example.com".to_owned(), 53))
-    );
     // Percent-encoding applies to the port segment too.
     assert_eq!(
         parse_target("/.well-known/masque/udp/example.com/%35%33/", None),

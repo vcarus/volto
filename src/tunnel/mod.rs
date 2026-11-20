@@ -114,29 +114,32 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// port        = *DIGIT
 /// ```
 ///
-/// Used by both parsers in place of `u16::from_str`, which is more generous
-/// than the grammar: it takes a leading `+` or `-`. Without the digit check
-/// `example.com:+443` and `/.well-known/masque/udp/example.com/+443/` would be
-/// dialled as 443. Nothing would be bypassed, because `Policy::allows_port`
-/// judges the number that came out of the parse and that is the number the
-/// socket is opened on. The cost is normalisation: one target would have two
-/// spellings, the authority in the log and the port on the wire would
+/// Used by both parsers in place of `u16::from_str`, and stricter than both
+/// it and the grammar, so that a port has one spelling per target. Two
+/// spellings of one port would be dialled as one number, so nothing would be
+/// bypassed: `Policy::allows_port` judges the number that came out of the
+/// parse and that is the number the socket is opened on. The cost is
+/// normalisation: the authority in the log and the port on the wire would
 /// disagree, and RFC 9110 §9.3.6 asks a server to "reject a CONNECT request
-/// that targets an empty or invalid port number".
+/// that targets an empty or invalid port number". Two spellings are refused:
 ///
-/// That argument is about the sign, which the grammar does not allow. Leading
-/// zeros are another matter: `*DIGIT` allows them, so `example.com:0443` is a
-/// valid spelling, is accepted, and is dialled as 443. Its log line spells the
-/// port differently from the number dialled, and this rule does not prevent
-/// that.
+/// * A sign, which `u16::from_str` takes and the grammar does not.
+///   Without the digit check `example.com:+443` and
+///   `/.well-known/masque/udp/example.com/+443/` would be dialled as 443.
+/// * A leading zero, which `*DIGIT` allows. `example.com:0443` and
+///   `example.com:000443` would be dialled as 443. Refusing them is our rule,
+///   not the grammar's.
 ///
 /// The empty string and zero are refused as well, which is not what `*DIGIT`
 /// says on its own. RFC 9298 §3 requires `target_port` to "represent an
 /// integer between 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty
-/// port beside an invalid one.
+/// port beside an invalid one. Zero alone is that refusal, not a leading zero.
 pub(crate) fn parse_port(text: &str) -> Result<u16, &'static str> {
     if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err("invalid port");
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return Err("port has a leading zero");
     }
     match text.parse() {
         Ok(0) => Err("port must not be zero"),
