@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, SharedBuffer, TestServer, bulk_alpn, client_endpoint,
     client_endpoint_with_transport, echoes, finish_connect_as, is_version_negotiation,
     open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_answer,
     udp_round_trip, version_probe,
@@ -46,6 +46,10 @@ const GATE_OTHER: &str =
 
 /// The gate off, which is the shipped default.
 const GATE_OFF: &str = ALLOW_PRIVATE;
+
+/// The log the tests here read: the server's own lines about its connections
+/// and its drain, through [`SharedBuffer::shared`].
+const LOG_FILTER: &str = "volto::quic=info";
 
 /// How long a refused handshake is given to prove it is not coming back.
 ///
@@ -377,8 +381,14 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
 ///
 /// A connection that never closes its tunnel keeps the server in its grace
 /// period while the probe is out.
+///
+/// The probe waits for the drain's "shutting down: no new connections" line,
+/// which `Server::drain` writes after it has closed the gate's expected set and
+/// removed the server configuration. Its `grace_secs=3` is this test's own
+/// grace period, which tells it from a drain of any other test here.
 #[tokio::test]
 async fn an_initial_during_the_shutdown_grace_draws_no_stateless_reset() {
+    let log = SharedBuffer::shared(LOG_FILTER);
     let mut server =
         TestServer::start_with(&format!("shutdown_grace = 3\n{}", common::ALLOW_PRIVATE)).await;
     let target = common::spawn_echo_target().await;
@@ -389,8 +399,10 @@ async fn an_initial_during_the_shutdown_grace_draws_no_stateless_reset() {
     // Before the drain the same bytes are an Initial that does not decrypt,
     // which quinn drops without a reply, so silence then proves nothing; the
     // probe is sent only after the drain has begun.
+    let mark = log.mark();
     server.shutdown();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    log.wait_for_line(mark, &["log_id=\"7x7xt92f\"", "grace_secs=3"])
+        .await;
 
     let mut initial = vec![0xc0]; // long header, fixed bit, Initial type
     initial.extend_from_slice(&1u32.to_be_bytes());
