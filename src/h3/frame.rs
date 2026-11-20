@@ -1111,7 +1111,7 @@ fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Res
         .into());
     }
 
-    if let Some(violation) = misplaced(stream, settings_seen, kind, length) {
+    if let Some(violation) = misplaced(stream, settings_seen, kind) {
         return Err(violation.into());
     }
 
@@ -1160,10 +1160,9 @@ fn unexpected(detail: &'static str) -> Violation {
 /// returned whole rather than as a reason phrase for the caller to wrap.
 ///
 /// `settings_seen` is whether the decoder has already handed out a SETTINGS
-/// frame and `length` the frame's declared payload length. Only
-/// [`StreamKind::ServerControl`] reads either; the comments in its arm state
-/// the ordering, which `it_frameseq` models.
-fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Option<Violation> {
+/// frame. Only [`StreamKind::ServerControl`] reads it; the comments in its arm
+/// state the ordering, which `it_frameseq` models.
+fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64) -> Option<Violation> {
     match stream {
         // Nothing: the permissive kind, built for a client's response stream.
         // The server reads its peer's control stream as
@@ -1192,23 +1191,10 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) ->
                 ));
             }
 
-            // After SETTINGS, HEADERS and PUSH_PROMISE are refused from the
-            // header at every length. The type is the offence, so there is no
-            // payload verdict to preserve, and charging the budget for them
-            // would let a peer hold it with frames it may not send. A second
-            // SETTINGS is refused from the header at every length too, because
-            // RFC 9114 §7.2.4 makes the type the offence. The remaining
-            // buffered types are parsed before `connection::Control::accept`
-            // sees them, so under the cap their payload verdict comes first;
-            // RFC 9114 does not rank it against the control-stream rules. Past
-            // the cap there is no payload to parse and the header decides,
-            // or the cap would answer a MUST-close with a stream error.
-            let type_decided =
-                matches!(kind, HEADERS | PUSH_PROMISE) || (settings_seen && kind == SETTINGS);
-            if length <= MAX_BUFFERED_FRAME && !type_decided {
-                return None;
-            }
-
+            // After SETTINGS, HEADERS, PUSH_PROMISE and a second SETTINGS are
+            // refused from the header at every length: the type is the
+            // offence, and charging the budget for them would let a peer hold
+            // it with frames it may not send.
             match kind {
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
                 //# HEADERS frames can only be sent on request streams or push
@@ -2047,7 +2033,7 @@ mod tests {
 
             for kind in allowed {
                 assert!(
-                    misplaced(stream, false, *kind, MAX_BUFFERED_FRAME + 1).is_none(),
+                    misplaced(stream, false, *kind).is_none(),
                     "{stream:?}: frame type {kind:#x} belongs here"
                 );
             }
@@ -2143,7 +2129,7 @@ mod tests {
                     "{kind:#x} of {length} bytes after SETTINGS is parsed"
                 );
             }
-            assert!(misplaced(StreamKind::ServerControl, true, kind, PAST).is_none());
+            assert!(misplaced(StreamKind::ServerControl, true, kind).is_none());
         }
 
         // The first SETTINGS is the one frame this stream is waiting for, so it
