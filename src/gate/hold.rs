@@ -53,22 +53,37 @@ pub const HOLD_FLIGHTS: usize = 64;
 /// bytes reach past it, or whose ClientHello says it is longer, is dropped.
 pub const HOLD_HELLO_BYTES: usize = 16 * 1024;
 
-/// The most bytes one held flight may occupy: its datagrams as received, plus
-/// the buffer its CRYPTO stream is reassembled in.
+/// The most bytes one held flight may count: its datagrams as received, plus
+/// the buffer its CRYPTO stream is reassembled in and that buffer's bitmap,
+/// each by its length.
 ///
 /// The largest ClientHello the hold reassembles ([`HOLD_HELLO_BYTES`]) takes
 /// about fifteen Initial packets of 1500 bytes, which with its reassembly
 /// buffer is about 40 KiB; this leaves room above that for duplicates. A
 /// ClientHello of a client this server serves is under 2 KiB in two packets.
-/// A flight that would grow past it is dropped. Our own value.
+/// A flight that would grow past it is dropped. Our own value. The heap behind
+/// a flight is more than its count; [`HOLD_TOTAL_BYTES`] says how much more.
 pub const HOLD_FLIGHT_BYTES: usize = 64 * 1024;
 
-/// The most bytes the hold occupies in all: every held flight, and the
-/// released datagrams waiting for the next receive call.
+/// The most bytes the hold counts in all: every held flight as
+/// [`HOLD_FLIGHT_BYTES`] counts it, and the released datagrams waiting for the
+/// next receive call.
 ///
 /// [`HOLD_FLIGHTS`] flights at [`HOLD_FLIGHT_BYTES`] each, 4 MiB. A datagram
-/// that would push the hold past it evicts the oldest flights first, as a full
-/// table does.
+/// that would push the count past it evicts the oldest flights first, as a
+/// full table does.
+///
+/// The count is of lengths, so the heap the hold takes at worst is larger:
+/// about 6 MiB, before the allocator's own rounding. std's vector grows by
+/// doubling, so a stream buffer's capacity is under twice its length, which
+/// is under 16 KiB more per flight for the bytes and 2 KiB for the bitmap.
+/// Each held datagram has a record of 96 bytes beside its bytes (its receive
+/// metadata and its vector), and a flight's list of records has room for at
+/// most 64, because a held datagram is at least 1200 bytes and a flight
+/// counts at most 64 KiB: 6 KiB. That is under 24 KiB per flight, 1.5 MiB for
+/// [`HOLD_FLIGHTS`] flights. The released queue holds at most 3495 datagrams
+/// of 1200 bytes inside the 4 MiB, and its records take at most 4096 times
+/// 96 bytes, 384 KiB.
 pub const HOLD_TOTAL_BYTES: usize = HOLD_FLIGHTS * HOLD_FLIGHT_BYTES;
 
 /// How many admitted ECH flights the replay record remembers.
@@ -78,10 +93,15 @@ pub const HOLD_TOTAL_BYTES: usize = HOLD_FLIGHTS * HOLD_FLIGHT_BYTES;
 /// bounded by count instead, at 2^20 entries: about 800 connections a day on
 /// the busier of the two hosts fill it in three and a half years. At the limit
 /// the oldest entry goes, so a copy of a flight older than the last 2^20
-/// admitted ones is no longer recognised. An entry is two 64-bit tags in the
-/// map and one in the order queue, so a full record is about 44 MiB with the
-/// map's spare capacity. Only a flight the key opened adds an entry. Our own
-/// value.
+/// admitted ones is no longer recognised. Only a flight the key opened adds
+/// an entry. Our own value.
+///
+/// An entry is two 64-bit tags in the map and one in the order queue. A full
+/// record is a map of 2^21 buckets of 17 bytes (the two tags and a control
+/// byte) and a queue of 2^20 tags of 8 bytes, 42 MiB, and evicting the oldest
+/// entry for each new one keeps the map at that size. While the map grows past
+/// 917,504 entries, its old table of 2^20 buckets is held as well, 59 MiB for
+/// that moment.
 pub const REPLAY_ENTRIES: usize = 1 << 20;
 
 /// One received datagram the hold keeps, as quinn would have received it.
@@ -155,9 +175,10 @@ impl Flight {
 /// A CRYPTO stream reassembled from offset 0, up to [`HOLD_HELLO_BYTES`].
 ///
 /// The buffer grows to the highest offset seen and a bitmap records which of
-/// its bytes have arrived, so inserting a fragment costs its own length and no
-/// arrangement of fragments costs more: no fragment list to sort, no interval
-/// list to merge.
+/// its bytes have arrived, so inserting a fragment costs its own length plus
+/// what the buffer grows by to reach its end, which over a flight's life is at
+/// most [`HOLD_HELLO_BYTES`], and no arrangement of fragments costs more: no
+/// fragment list to sort, no interval list to merge.
 #[derive(Default)]
 struct Stream {
     data: Vec<u8>,
@@ -176,7 +197,8 @@ enum Refused {
 }
 
 impl Stream {
-    /// What the buffer and the bitmap occupy.
+    /// What the buffer and the bitmap count: their lengths, not their
+    /// capacity.
     fn footprint(&self) -> usize {
         self.data.len() + self.have.len() * 8
     }
@@ -357,12 +379,12 @@ impl Hold {
         self.flights.len()
     }
 
-    /// Every byte the hold occupies.
+    /// Every byte the hold counts against [`HOLD_TOTAL_BYTES`].
     pub(super) fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Every byte the hold occupies, summed from what it holds rather than
+    /// Every byte the hold counts, summed from what it holds rather than
     /// read from the running count: each flight's datagrams and its stream's
     /// buffer and bitmap, and every released datagram.
     ///
