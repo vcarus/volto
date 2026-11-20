@@ -682,6 +682,19 @@ else
 
     # Removed by cleanup, the EXIT trap.
     TMP="$(mktemp -d)"
+    # The release's binary is run from here, to ask it about the config. On a
+    # filesystem mounted noexec that fails, and Linux reports such a file as not
+    # executable, so the cause is named before anything is downloaded.
+    # findmnt is util-linux, on every Ubuntu host; without it the check after
+    # the unpack below still names this as one of two causes.
+    if command -v findmnt >/dev/null 2>&1; then
+        mount_options="$(findmnt -no OPTIONS --target "$TMP" 2>/dev/null || true)"
+        case ",$mount_options," in
+            *,noexec,*)
+                die "$TMP is on a filesystem mounted noexec, where the release's binary cannot be run -- set TMPDIR to a directory that allows execution (for the timer, Environment=TMPDIR= in a drop-in for $TIMER_NAME.service)"
+                ;;
+        esac
+    fi
 
     # Every network call fits inside the timer service's TimeoutStartSec=15min
     # (900 s), so systemd cannot stop the run inside the binary swap window
@@ -710,7 +723,9 @@ else
 
     tar -xzf "$TMP/$NAME.tar.gz" -C "$TMP"
     SRC="$TMP/$NAME"
-    [ -x "$SRC/volto" ] || die "the archive did not contain a volto binary"
+    [ -f "$SRC/volto" ] || die "the archive did not contain a volto binary"
+    [ -x "$SRC/volto" ] ||
+        die "$SRC/volto cannot be executed where it was unpacked: the archive's file has no execute bit, or $TMP is on a filesystem mounted noexec (then set TMPDIR to a directory that allows execution)"
     # The installed copy of this script is replaced only from a release whose
     # signature was verified. A release from before signing carries a script
     # that verifies nothing, and installing that one would end the check for

@@ -1884,6 +1884,11 @@ impl Host {
     /// binary that answers `--check-config` as `candidate` says, and the
     /// `SHA256SUMS` that lists it. Returns the binary's text.
     fn publish(&self, tag: &str, candidate: Candidate) -> String {
+        self.publish_with_mode(tag, candidate, 0o755)
+    }
+
+    /// [`Host::publish`], with the binary in the archive at `mode`.
+    fn publish_with_mode(&self, tag: &str, candidate: Candidate, mode: u32) -> String {
         let version = tag.trim_start_matches('v');
         let name = format!("volto-{version}-x86_64-unknown-linux-musl");
         let unpacked = self.staging.join(&name);
@@ -1906,6 +1911,8 @@ impl Host {
              esac\n"
         );
         write_executable(&unpacked.join("volto"), &binary);
+        fs::set_permissions(unpacked.join("volto"), fs::Permissions::from_mode(mode))
+            .expect("the binary's mode must be settable");
         write_executable(
             &unpacked.join("script/deploy.sh"),
             "#!/bin/sh\n# the copy of deploy.sh inside the release archive\nexit 1\n",
@@ -2439,6 +2446,58 @@ fn the_binary_is_replaced_by_a_rename() {
         installs.lines().any(|line| line.ends_with(&format!(" {bin}.new"))),
         "the new binary is written beside the old one: {installs}"
     );
+}
+
+/// A work directory on a `noexec` filesystem is named as the cause, before
+/// anything is downloaded (R8-L4).
+///
+/// Linux reports a file on such a mount as not executable, so `[ -x ]` on the
+/// unpacked binary failed and the run said the archive held no binary, every
+/// day, on a host whose `/tmp` follows a common hardening benchmark. The
+/// stand-in `findmnt` reports the mount the way util-linux prints it.
+#[test]
+fn a_noexec_work_directory_is_named_as_the_cause() {
+    let host = Host::new("noexec", Service::ComesUp);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    write_executable(
+        &host.stubs.join("findmnt"),
+        "#!/bin/sh
+echo rw,nosuid,nodev,noexec,relatime
+",
+    );
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("is on a filesystem mounted noexec") && stderr.contains("TMPDIR"),
+        "the run must name the mount and the way out: {stderr}"
+    );
+    assert_eq!(host.calls("curl"), "", "nothing may be downloaded first");
+    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
+}
+
+/// A binary that is in the archive and cannot be executed is not reported as
+/// missing (R8-L4).
+#[test]
+fn an_unexecutable_binary_is_not_reported_as_missing() {
+    let host = Host::new("unexecutable", Service::ComesUp);
+    host.plant_install();
+    host.publish_with_mode(UNSIGNED_TAG, Candidate::LoadsTheConfig, 0o644);
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        !stderr.contains("did not contain a volto binary")
+            && stderr.contains("cannot be executed where it was unpacked")
+            && stderr.contains("noexec"),
+        "the run must give both possible causes: {stderr}"
+    );
+    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
 }
 
 /// A run that finds the lock held stops before it does anything (R8-L6).
