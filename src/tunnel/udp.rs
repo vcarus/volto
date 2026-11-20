@@ -2427,38 +2427,31 @@ mod tests {
         assert_eq!(validate(&connect_udp_request()), Ok(()));
     }
 
+    /// One rule for both directions: an error about one packet costs that
+    /// packet, and an error about the socket ends the session.
+    ///
     /// RFC 9298 §5: a payload the link cannot carry is discarded, not a reason
-    /// to end the session.
+    /// to end the session. RFC 9298 §3.1 requires the request stream to be
+    /// closed when the socket itself is reported unusable, which is what
+    /// `ECONNREFUSED` from an ICMP port-unreachable means. The send side asks
+    /// [`is_per_packet_error`] and the read side [`read_verdict`], which is
+    /// that predicate mapped onto a step, so the verdicts below hold both. On
+    /// Linux a queued ICMP error is handed to whichever syscall comes next, and
+    /// `recv` is the one a session waiting on its target is parked in;
+    /// [`read_verdict`] records the run that showed `EMSGSIZE` reaching a read.
     ///
     /// Tested as a pure function because the condition cannot be produced on
     /// loopback: `EMSGSIZE` needs the DF bit, which is a no-op on macOS, and a
     /// Linux loopback MTU is far larger than anything a test would send. The
-    /// three codes below are POSIX and defined on both hosts.
+    /// codes below are POSIX and defined on both hosts.
     #[test]
-    fn per_packet_send_errors_do_not_end_the_session() {
-        for code in [Errno::MSGSIZE, Errno::PERM, Errno::ACCESS, Errno::NOBUFS] {
-            let error = std::io::Error::from(code);
-            assert!(
-                is_per_packet_error(&error),
-                "errno {code} ({error}) must only cost one packet"
-            );
-        }
-    }
-
-    /// The read side grades an error the same way the send side does, and for
-    /// the same reason: on Linux a queued ICMP error is handed to whichever
-    /// syscall comes next, and `recv` is the one a session waiting on its target
-    /// is parked in. `EMSGSIZE` reaching a read was measured rather than
-    /// supposed; [`read_verdict`] records the run.
-    #[test]
-    fn a_per_packet_error_on_the_read_side_does_not_end_the_session() {
+    fn a_per_packet_error_costs_a_packet_and_a_socket_failure_ends_the_session() {
         for code in [Errno::MSGSIZE, Errno::PERM, Errno::ACCESS, Errno::NOBUFS] {
             let error = std::io::Error::from(code);
             assert_eq!(
                 read_verdict(&error),
                 Step::Continue,
-                "errno {code} ({error}) costs one packet on the send side and must \
-                 cost one packet here"
+                "errno {code} ({error}) must only cost one packet"
             );
         }
 
@@ -2478,70 +2471,56 @@ mod tests {
         );
     }
 
-    /// The other half of the rule: RFC 9298 §3.1 requires the request stream to
-    /// be closed when the socket itself is reported unusable, which is what
-    /// `ECONNREFUSED` from an ICMP port-unreachable means.
-    #[test]
-    fn socket_failures_still_end_the_session() {
-        for code in [Errno::CONNREFUSED, Errno::NETUNREACH, Errno::HOSTUNREACH] {
-            let error = std::io::Error::from(code);
-            assert!(
-                !is_per_packet_error(&error),
-                "errno {code} ({error}) must end the session"
-            );
-        }
-
-        // An error with no OS number at all is not a per-packet verdict either.
-        assert!(!is_per_packet_error(&std::io::Error::other("synthetic")));
-    }
-
     /// What Surge advertised as `max_datagram_frame_size` until a 2026-11 beta
     /// raised it to 1500, and still the limit an older client gives.
     const SURGE_MAX_DATAGRAM_FRAME_SIZE: usize = 1300;
 
-    /// An `info!` on the doubling schedule, and the running total in it.
+    /// An `info!` on the doubling schedule, and the running total in it, for
+    /// both conditions the outbound path grades.
     ///
-    /// RFC 9298 §6.1 fixes the behaviour — the packet is dropped, never downgraded
-    /// to a capsule — so only its visibility is in question here. At `debug!`
-    /// alone the condition could not be seen at all in production, and a line per
-    /// dropped packet would be the flood D44 removed elsewhere.
+    /// RFC 9298 §6.1 fixes what happens to an oversized packet (it is dropped,
+    /// never downgraded to a capsule), and quinn decides an eviction, so only
+    /// their visibility is in question here. At `debug!` alone neither could be
+    /// seen in production, and a line per packet would be the flood D44
+    /// removed elsewhere.
     ///
-    /// Eight drops, because the schedule is the assertion: reports land on the
-    /// 1st, 2nd, 4th and 8th and on none of the others, and each says how many
-    /// drops this session has had. Asserting the whole sequence at once rather
+    /// Eight occurrences, because the schedule is the assertion: reports land
+    /// on the 1st, 2nd, 4th and 8th and on none of the others, and each says
+    /// how many there have been. Asserting the whole sequence at once rather
     /// than "the first one only" is what tells the schedule apart from the two
-    /// mutations next to it — reporting always, and reporting on everything but
+    /// mutations next to it: reporting always, and reporting on everything but
     /// the first.
     ///
-    /// A pure function for the same reason as the errno rule above: a live session
-    /// needs a real QUIC connection, while the decision being asserted lives
-    /// entirely in the arithmetic and the sampler.
+    /// Pure arithmetic and a sampler: a live session would need a QUIC
+    /// connection whose path is too small, or whose send queue is a megabyte
+    /// behind, while the decision being asserted lives entirely in [`grade`].
     #[test]
-    fn oversize_drops_of_a_session_are_reported_on_a_doubling_schedule() {
-        // A 4 KiB answer — an EDNS0/DNSSEC response is routinely this size.
+    fn a_per_packet_condition_is_reported_on_a_doubling_schedule() {
+        // A 4 KiB answer, which an EDNS0/DNSSEC response routinely is, against
+        // an older Surge's limit; and a datagram against a queue with no room.
         let oversize = datagram::encoded_len(9, datagram::CONTEXT_ID_UDP_PAYLOAD, 4096);
         assert!(oversize > SURGE_MAX_DATAGRAM_FRAME_SIZE);
 
-        let drops = crate::logfmt::Sampler::new();
-        let verdicts: Vec<Graded> = (0..8)
-            .map(|_| grade(oversize, SURGE_MAX_DATAGRAM_FRAME_SIZE, &drops))
-            .collect();
+        for (value, limit) in [(oversize, SURGE_MAX_DATAGRAM_FRAME_SIZE), (1200, 0)] {
+            let sampler = crate::logfmt::Sampler::new();
+            let verdicts: Vec<Graded> = (0..8).map(|_| grade(value, limit, &sampler)).collect();
 
-        assert_eq!(
-            verdicts,
-            vec![
-                Graded::Report(1),
-                Graded::Report(2),
-                Graded::Quiet,
-                Graded::Report(4),
-                Graded::Quiet,
-                Graded::Quiet,
-                Graded::Quiet,
-                Graded::Report(8),
-            ],
-            "an operator must be told at once that this is happening, and then how \
-             far it has got -- without a line per dropped packet"
-        );
+            assert_eq!(
+                verdicts,
+                vec![
+                    Graded::Report(1),
+                    Graded::Report(2),
+                    Graded::Quiet,
+                    Graded::Report(4),
+                    Graded::Quiet,
+                    Graded::Quiet,
+                    Graded::Quiet,
+                    Graded::Report(8),
+                ],
+                "{value} over {limit}: an operator must be told at once that this is \
+                 happening, and then how far it has got, without a line per packet"
+            );
+        }
     }
 
     /// The other half: an ordinary packet is sent untouched and does not advance
@@ -2577,33 +2556,6 @@ mod tests {
                 &drops
             ),
             Graded::Report(1)
-        );
-    }
-
-    /// The same doubling schedule for a queue that has fallen behind.
-    ///
-    /// Pure arithmetic and a sampler, like the oversize rule above, and asserted
-    /// the same way: a live session would need a QUIC connection whose send queue
-    /// is a megabyte behind, which is exactly the state no test can arrange.
-    #[test]
-    fn send_buffer_evictions_of_a_session_are_reported_on_a_doubling_schedule() {
-        let evictions = crate::logfmt::Sampler::new();
-        let verdicts: Vec<Graded> = (0..8).map(|_| grade(1200, 0, &evictions)).collect();
-
-        assert_eq!(
-            verdicts,
-            vec![
-                Graded::Report(1),
-                Graded::Report(2),
-                Graded::Quiet,
-                Graded::Report(4),
-                Graded::Quiet,
-                Graded::Quiet,
-                Graded::Quiet,
-                Graded::Report(8),
-            ],
-            "an operator must be told at once that queued datagrams are being \
-             discarded, and then how many"
         );
     }
 

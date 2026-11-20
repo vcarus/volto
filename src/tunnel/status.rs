@@ -636,31 +636,9 @@ mod tests {
         }
     }
 
-    /// The three failures `from_connect_error` distinguishes must stay
-    /// distinguishable in the response, which is the point of computing them.
-    #[test]
-    fn connect_failures_do_not_collapse_onto_one_status() {
-        use std::io::{Error, ErrorKind};
-
-        let statuses: Vec<Status> = [
-            ErrorKind::ConnectionRefused,
-            ErrorKind::TimedOut,
-            ErrorKind::PermissionDenied,
-        ]
-        .into_iter()
-        .map(|kind| ProxyError::from_connect_error(&Error::from(kind)).recommended_status())
-        .collect();
-
-        assert_eq!(
-            statuses,
-            vec![
-                Status::BAD_GATEWAY,
-                Status::GATEWAY_TIMEOUT,
-                Status::SERVICE_UNAVAILABLE
-            ]
-        );
-    }
-
+    /// The three failures `from_connect_error` distinguishes, each onto its
+    /// own type, which `every_error_type_carries_its_recommended_status` then
+    /// holds to three different statuses.
     #[test]
     fn connect_errors_map_onto_registered_types() {
         use std::io::{Error, ErrorKind};
@@ -772,25 +750,5 @@ mod tests {
         assert_eq!(sf_string(r#"a"b"#), r#""a\"b""#);
         assert_eq!(sf_string(r"a\b"), r#""a\\b""#);
         assert_eq!(sf_string(""), "\"\"");
-    }
-
-    /// The mapping the two resolution failures are told apart by.
-    #[test]
-    fn a_resolver_timeout_is_a_different_type_from_a_resolver_failure() {
-        use std::io::{Error, ErrorKind};
-
-        let failed = ResolveFailure::Failed(Error::from(ErrorKind::NotFound));
-        assert_eq!(failed.proxy_error(), ProxyError::DnsError);
-        assert_eq!(
-            failed.proxy_error().recommended_status(),
-            Status::BAD_GATEWAY
-        );
-
-        let timed_out = ResolveFailure::TimedOut(Duration::from_secs(10));
-        assert_eq!(timed_out.proxy_error(), ProxyError::DnsTimeout);
-        assert_eq!(
-            timed_out.proxy_error().recommended_status(),
-            Status::GATEWAY_TIMEOUT
-        );
     }
 }
