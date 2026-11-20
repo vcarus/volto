@@ -1481,12 +1481,8 @@ fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     );
 }
 
-/// The server's flight is handed to quinn's empty buffer rather than copied
-/// into it, so the session's queues keep no allocation once quinn has taken
-/// the bytes.
-#[test]
-fn the_server_flight_is_handed_over_without_a_copy() {
-    let id = identity();
+/// The first ClientHello of a plain client with X25519MLKEM768 first.
+fn client_hello() -> Vec<u8> {
     let client = Arc::new(client_config(
         None,
         pq_first(),
@@ -1501,10 +1497,19 @@ fn the_server_flight_is_handed_over_without_a_copy() {
     .expect("start a client");
     let mut hello = Vec::new();
     rustls.write_hs(&mut hello);
+    hello
+}
+
+/// The server's flight is handed to quinn's empty buffer rather than copied
+/// into it, so the session's queues keep no allocation once quinn has taken
+/// the bytes.
+#[test]
+fn the_server_flight_is_handed_over_without_a_copy() {
+    let id = identity();
     let mut session =
         Session::new(server(&id, None, &GROUPS, &[]), Version::V1, &PARAMS).expect("a session");
     session
-        .read_handshake(&hello)
+        .read_handshake(&client_hello())
         .expect("the server reads the ClientHello");
     let mut taken = 0;
     loop {
@@ -1518,6 +1523,30 @@ fn the_server_flight_is_handed_over_without_a_copy() {
     assert!(taken > 0, "the server wrote its flight");
     let capacities: Vec<usize> = session.lock().out.iter().map(Vec::capacity).collect();
     assert_eq!(capacities, [0; 4]);
+}
+
+/// The outer ClientHello is copied only when the debug line that reports it
+/// is enabled, which it is not in production.
+#[test]
+fn the_outer_client_hello_is_kept_only_for_the_debug_line() {
+    let id = identity();
+    let config = server(&id, None, &GROUPS, &[]);
+    let hello = client_hello();
+    let half = &hello[..hello.len() / 2];
+    let held = || {
+        let mut session = Session::new(config.clone(), Version::V1, &PARAMS).expect("a session");
+        session
+            .read_handshake(half)
+            .expect("half a ClientHello is read");
+        session.initial.len()
+    };
+    let off = tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), held);
+    let debug = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(std::io::sink)
+        .finish();
+    let on = tracing::subscriber::with_default(debug, held);
+    assert_eq!((off, on), (0, half.len()));
 }
 
 thread_local! {

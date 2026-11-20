@@ -913,6 +913,10 @@ struct Session {
     next: Option<(Secret, Secret)>,
     handshaking: bool,
     got_handshake_data: bool,
+    /// Whether the `TLS handshake complete` debug line is enabled, read once
+    /// when the session starts. When it is off, the outer ClientHello is not
+    /// kept and the handshake's results are not read for the line.
+    debug_line: bool,
     /// Initial-level CRYPTO bytes, kept until the outer ClientHello is whole,
     /// and never more than [`OUTER_HELLO_LIMIT`].
     initial: Vec<u8>,
@@ -974,6 +978,7 @@ impl Session {
             next: None,
             handshaking: true,
             got_handshake_data: false,
+            debug_line: tracing::enabled!(tracing::Level::DEBUG),
             initial: Vec::new(),
             outer: None,
         })
@@ -1001,7 +1006,7 @@ impl Session {
 
     /// Keeps Initial-level bytes until the outer ClientHello can be read.
     fn note_outer_hello(&mut self, buf: &[u8]) {
-        if self.level != Level::Initial || self.outer.is_some() {
+        if !self.debug_line || self.level != Level::Initial || self.outer.is_some() {
             return;
         }
         if self.initial.len() + buf.len() > OUTER_HELLO_LIMIT {
@@ -1024,6 +1029,9 @@ impl Session {
     }
 
     fn log_handshake(&self) {
+        if !self.debug_line {
+            return;
+        }
         // SAFETY: `self.ssl` is valid; the getters only read the completed
         // handshake's results, and the strings they return are static (group
         // and cipher names) or copied at once (`server_name`).
@@ -1404,9 +1412,14 @@ pub struct ProbeSession(Session);
 
 impl ProbeSession {
     /// A fresh server session on `config`, for QUIC version 1, with
-    /// `transport_parameters` as the server's own encoded parameters.
+    /// `transport_parameters` as the server's own encoded parameters. The
+    /// debug line's work is done whatever the subscriber enables, so that the
+    /// fuzz target, which installs no subscriber, reaches the outer
+    /// ClientHello copy.
     pub fn new(config: Arc<ServerConfig>, transport_parameters: &[u8]) -> Result<Self> {
-        Session::new(config, Version::V1, transport_parameters).map(Self)
+        let mut session = Session::new(config, Version::V1, transport_parameters)?;
+        session.debug_line = true;
+        Ok(Self(session))
     }
 
     /// Hands `bytes` to the session at its current level, as quinn hands the
