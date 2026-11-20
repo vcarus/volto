@@ -367,12 +367,13 @@ impl Shared {
         });
     }
 
-    /// Counts the held datagrams that were let go unclaimed, after the lock
-    /// that took them out of the hold is released.
+    /// Counts the held datagrams that were let go unclaimed, expired or
+    /// dropped with the connection, after the lock that took them out of the
+    /// hold is released.
     ///
     /// Each is a datagram whose session never claimed it, so each is the
     /// unroutable drop it would have been without the hold, only later.
-    fn count_expired(&self, expired: Vec<Early>) {
+    fn count_expired(&self, expired: impl IntoIterator<Item = Early>) {
         for early in expired {
             self.count_unroutable(early.quarter_stream_id);
         }
@@ -390,9 +391,7 @@ impl Shared {
             routes.closed = true;
             std::mem::take(&mut routes.early)
         };
-        for early in held {
-            self.count_unroutable(early.quarter_stream_id);
-        }
+        self.count_expired(held);
     }
 
     /// The routing table and the hold, with a poisoned lock treated as an
@@ -545,10 +544,8 @@ impl Routes {
 
     /// Records a claim, which moves the mark.
     fn claimed(&mut self, quarter_stream_id: u64) {
-        self.highest_claimed = Some(
-            self.highest_claimed
-                .map_or(quarter_stream_id, |highest| highest.max(quarter_stream_id)),
-        );
+        // `None` orders below every `Some`.
+        self.highest_claimed = self.highest_claimed.max(Some(quarter_stream_id));
     }
 
     /// Takes out every held datagram that has been held for
@@ -588,18 +585,15 @@ impl Routes {
             return 0;
         };
         let mut released = 0;
-        let mut index = 0;
-        while let Some(early) = self.early.get(index) {
+        self.early.retain_mut(|early| {
             if early.quarter_stream_id != quarter_stream_id {
-                index += 1;
-                continue;
+                return true;
             }
-            if let Some(early) = self.early.remove(index)
-                && inbound.try_send(early.payload).is_ok()
-            {
+            if inbound.try_send(std::mem::take(&mut early.payload)).is_ok() {
                 released += 1;
             }
-        }
+            false
+        });
         released
     }
 }
