@@ -840,10 +840,14 @@ fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
 /// `warning` enables only a target that no event has. The filter cannot tell
 /// such a typo from a real target name, so a real one such as `volto` is
 /// refused as well, and `volto=trace` says the same thing without doubt.
-/// `log.level` has the same rule (`config::validate`). Everything else is left
-/// to the parser: a directive with `=`, `[` or `,` names its targets on
-/// purpose, which is what `RUST_LOG` is for, and `off` is a level that silences
-/// the process on purpose.
+/// Everything else is left to the parser: a directive with `=`, `[` or `,`
+/// names its targets on purpose, which is what `RUST_LOG` is for, and `off` is
+/// a level that silences the process on purpose.
+///
+/// `log.level` has a stricter rule of its own (`config::validate`): a bare word
+/// must be one of the five level names, compared without trimming, where this
+/// one trims the value and also takes `off` and the digits `0` to `5` that
+/// `LevelFilter` parses.
 fn refusal(text: &str) -> Option<String> {
     let word = text.trim();
     if word.is_empty() {
