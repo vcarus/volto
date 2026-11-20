@@ -389,9 +389,14 @@ async fn a_request_that_stalls_before_its_headers_is_reset() {
 /// response stream with the error code H3_REQUEST_INCOMPLETE." A reset is such
 /// a termination as much as a FIN is, and the FIN case already takes the
 /// SHOULD.
+///
+/// The server runs on the default 60 s idle timeout, which is also the stall
+/// deadline of the test above. A stalled stream draws the same code when that
+/// deadline lapses, so the wait here, [`TIMEOUT`], has to end well before it:
+/// only an answer to the reset itself can arrive in time.
 #[tokio::test]
 async fn a_request_reset_before_its_headers_draws_an_abort() {
-    let server = TestServer::start_with(IMPATIENT).await;
+    let server = TestServer::start().await;
     let (_endpoint, connection) = silent_peer(&server).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
