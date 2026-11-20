@@ -427,39 +427,94 @@ async fn next_request(
 }
 
 /// Resolves one request, authenticates it, and routes it to a tunnel.
+///
+/// Four phases, in this order, and each may answer the request and end it: the
+/// checks on the message, the credentials, the connection's tunnel quota, and
+/// the route.
 async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
+    let Some((req, mut stream)) = resolve(resolver).await else {
+        return;
+    };
+    let stream_id = stream.id();
+    log_request(&req, stream_id);
+
+    if let Some(refusal) = refused_as_a_message(&req) {
+        refusal.log(stream_id);
+        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
+        return;
+    }
+
+    if !authenticate(&req, &context, &mut stream).await {
+        return;
+    }
+
+    // One slot per request, held until this task ends however it ends.
+    let Some(_slot) = take_slot(&context, &mut stream).await else {
+        return;
+    };
+
+    route(&req, stream, &context).await;
+}
+
+/// Reads a request's headers, or `None` when the stream has already been dealt
+/// with.
+async fn resolve(resolver: h3api::Resolver) -> Option<(Request, h3api::Stream)> {
     // Bounded for the same reason the accept loop is: a peer may open a request
     // stream, send one byte and stop, and `max_streams_bidi` of those would be
     // `max_streams_bidi` parked tasks per connection, from a peer that has not
     // authenticated. On expiry the stream is reset with H3_REQUEST_INCOMPLETE
     // and the connection carries on (D76).
-    let (req, mut stream) = match resolver.resolve().await {
-        Ok(resolved) => resolved,
+    match resolver.resolve().await {
+        Ok(resolved) => Some(resolved),
         Err(error) => {
             // Malformed headers, a client reset mid-headers, and similar. The
             // resolver has already reset the stream for us.
             debug!(%error, "failed to resolve request");
-            return;
+            None
         }
-    };
+    }
+}
 
-    let stream_id = stream.id();
-    log_request(&req, stream_id);
+/// Why a request is refused with 400 for what its message carries, before
+/// anything has looked at who sent it.
+#[derive(Debug, PartialEq, Eq)]
+enum MessageRefusal {
+    /// A connection-specific field, named.
+    ConnectionSpecificField(&'static str),
+    /// More credential values than [`auth::MAX_CREDENTIAL_VALUES`], counted.
+    TooManyCredentials(usize),
+}
 
-    // Before authentication, before the quota, before routing: RFC 9114 §4.2
-    // makes a message carrying a connection-specific field malformed, and that
-    // is a judgement about the message rather than about who sent it or what it
-    // asks for. The other half of the same sentence, the `Connection` field
-    // itself, is refused in the codec, which is earlier still. Judging this
-    // half after the credentials check would answer one MUST with 407 to an
+impl MessageRefusal {
+    fn log(&self, stream_id: u64) {
+        match *self {
+            Self::ConnectionSpecificField(field) => debug!(
+                stream_id,
+                field, "request carries a connection-specific field"
+            ),
+            Self::TooManyCredentials(offered) => debug!(
+                stream_id,
+                offered,
+                allowed = auth::MAX_CREDENTIAL_VALUES,
+                "request carries more credential values than it may"
+            ),
+        }
+    }
+}
+
+/// The 400 verdicts on the message itself, in the order they are judged.
+///
+/// Both come before authentication, before the quota and before routing,
+/// because each is a judgement about the message rather than about who sent it
+/// or what it asks for.
+fn refused_as_a_message(req: &Request) -> Option<MessageRefusal> {
+    // RFC 9114 §4.2 makes a message carrying a connection-specific field
+    // malformed. The other half of the same sentence, the `Connection` field
+    // itself, is refused in the codec, which is earlier still. Judging this half
+    // after the credentials check would answer one MUST with 407 to an
     // unauthenticated peer and 400 to an authenticated one.
-    if let Some(field) = tunnel::connection_specific_field(&req) {
-        debug!(
-            stream_id,
-            field, "request carries a connection-specific field"
-        );
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
-        return;
+    if let Some(field) = tunnel::connection_specific_field(req) {
+        return Some(MessageRefusal::ConnectionSpecificField(field));
     }
 
     // Before any credential is tried, and so before any of them is charged: D3
@@ -467,20 +522,20 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     // name is every value that answers for. A request carrying more is asking
     // this server to run the constant-time comparison once per value and to
     // answer one 407 for all of them, which is a batch of guesses at the price
-    // of a single failure (D76 addendum of 2026-09-04). It is a judgement about
-    // the message rather than about who sent it, so it is a 400 like the field
-    // check above it.
+    // of a single failure (D76 addendum of 2026-09-04).
     let offered = auth::credential_values(&req.fields);
     if offered > auth::MAX_CREDENTIAL_VALUES {
-        debug!(
-            stream_id,
-            offered,
-            allowed = auth::MAX_CREDENTIAL_VALUES,
-            "request carries more credential values than it may"
-        );
-        tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
-        return;
+        return Some(MessageRefusal::TooManyCredentials(offered));
     }
+
+    None
+}
+
+/// Checks the request's credentials, and answers it when they fail.
+///
+/// `true` means the request may go on to the quota and the route.
+async fn authenticate(req: &Request, context: &Context, stream: &mut h3api::Stream) -> bool {
+    let stream_id = stream.id();
 
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
@@ -500,11 +555,12 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             // claimed the connection first: the accept loop is already closing
             // it, and the request must not be routed or answered.
             if !context.mark_authenticated(user) {
-                return;
+                return false;
             }
             if let Some(username) = user {
                 debug!(stream_id, username, "request authenticated");
             }
+            true
         }
         Err(denials) => {
             // One line per refused request, not one per refused value: the
@@ -568,29 +624,34 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
                     h3api::AUTH_FAILURE_LIMIT_CODE,
                     "too many authentication failures",
                 );
-                return;
+                return false;
             }
 
             tunnel::refuse_with(
-                &mut stream,
+                stream,
                 Status::PROXY_AUTHENTICATION_REQUIRED,
                 auth::challenge_fields(),
             )
             .await;
-            return;
+            false
         }
     }
+}
 
-    // One slot per request, held until this task ends however it ends. Taken
-    // before any socket is opened, so the limit bounds file descriptors rather
-    // than trailing them.
-    let Some(_slot) = context.quota.acquire() else {
+/// Takes one of the connection's tunnel slots, or refuses the request when it
+/// has none left.
+///
+/// Taken before any socket is opened, so the limit bounds file descriptors
+/// rather than trailing them.
+async fn take_slot(context: &Context, stream: &mut h3api::Stream) -> Option<tunnel::Slot> {
+    let Some(slot) = context.quota.acquire() else {
         // Sampled for the reason `tunnel::admit_target`'s refusal is: a
         // connection that has reached its limit answers every further request
         // this way, at one HEADERS frame apiece, for as long as the peer keeps
         // asking. The first refusal is a warning and the reports carry the
         // running total, so an operator sees both that the limit was hit and
         // how hard (`crate::logfmt::Sampler`).
+        let stream_id = stream.id();
         let live = context.quota.live();
         match context.limit_refusals.record() {
             Some(refusals) => warn!(
@@ -603,19 +664,25 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             ),
             None => debug!(stream_id, live, "connection is at its tunnel limit"),
         }
-        tunnel::refuse_because(&mut stream, ProxyError::ConnectionLimitReached).await;
-        return;
+        tunnel::refuse_because(stream, ProxyError::ConnectionLimitReached).await;
+        return None;
     };
 
     // Counted where the slot is taken rather than where the request arrived, so
     // the connection's closing line reports tunnels this connection actually
     // got, not requests it made (D72).
     context.tunnels.fetch_add(1, Ordering::Relaxed);
+    Some(slot)
+}
 
-    match tunnel::route(&req) {
+/// Hands an admitted request to the tunnel its method and `:protocol` name.
+async fn route(req: &Request, mut stream: h3api::Stream, context: &Context) {
+    let stream_id = stream.id();
+
+    match tunnel::route(req) {
         Route::Tcp => match req.authority.as_deref() {
             Some(authority) => {
-                tunnel::tcp::run(authority, stream, &context).await;
+                tunnel::tcp::run(authority, stream, context).await;
             }
             None => {
                 // Unreachable: RFC 9114 §4.4 is enforced in the codec, which
@@ -630,7 +697,7 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             }
         },
         Route::ConnectUdp => {
-            udp::run(&req, stream, &context).await;
+            udp::run(req, stream, context).await;
         }
         Route::UnsupportedProtocol(protocol) => {
             debug!(
@@ -824,6 +891,82 @@ mod tests {
             );
             assert!(!redacted.contains("dXNlcjE6czNjcmV0"), "{redacted:?}");
         }
+    }
+
+    /// A CONNECT request carrying the given fields.
+    fn request_with(fields: &[(&str, &str)]) -> Request {
+        let mut request = Request::new(h3api::Method::Connect);
+        request.authority = Some("example.com:443".into());
+        for (name, value) in fields {
+            request.fields.append(
+                *name,
+                FieldValue::parse(value.as_bytes()).expect("field value"),
+            );
+        }
+        request
+    }
+
+    /// A request with nothing wrong in its message is left to the later phases,
+    /// credentials and all.
+    #[test]
+    fn an_ordinary_message_is_not_refused() {
+        assert_eq!(refused_as_a_message(&request_with(&[])), None);
+        assert_eq!(
+            refused_as_a_message(&request_with(&[
+                ("proxy-authorization", "Basic eA=="),
+                ("authorization", "Basic eQ=="),
+                ("user-agent", "surge"),
+            ])),
+            None,
+            "one value per credential field is every value D3 answers for"
+        );
+    }
+
+    /// Each connection-specific field is named in the refusal.
+    #[test]
+    fn a_connection_specific_field_is_refused_by_name() {
+        for field in [
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "upgrade",
+        ] {
+            assert_eq!(
+                refused_as_a_message(&request_with(&[(field, "x")])),
+                Some(MessageRefusal::ConnectionSpecificField(field)),
+            );
+        }
+    }
+
+    /// A third credential value is refused, and counted, whichever name it
+    /// repeats.
+    #[test]
+    fn more_credential_values_than_allowed_are_refused() {
+        let three = request_with(&[
+            ("proxy-authorization", "Basic eA=="),
+            ("proxy-authorization", "Basic eQ=="),
+            ("authorization", "Basic ej0="),
+        ]);
+        assert_eq!(
+            refused_as_a_message(&three),
+            Some(MessageRefusal::TooManyCredentials(3))
+        );
+    }
+
+    /// The field check is judged first, so a request failing both is refused
+    /// for the field.
+    #[test]
+    fn the_field_check_comes_before_the_credential_count() {
+        let both = request_with(&[
+            ("authorization", "Basic eA=="),
+            ("authorization", "Basic eQ=="),
+            ("authorization", "Basic ej0="),
+            ("upgrade", "h2c"),
+        ]);
+        assert_eq!(
+            refused_as_a_message(&both),
+            Some(MessageRefusal::ConnectionSpecificField("upgrade"))
+        );
     }
 
     /// The request dump runs before the credentials check, so a peer that has
