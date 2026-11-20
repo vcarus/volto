@@ -199,11 +199,15 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
 /// A datagram that reaches the server before the request stream it names is
 /// held and delivered once the session claims it (D114).
 ///
-/// Sent once and never repeated, so the echo can only come from the held copy.
-/// The pause between the datagram and the request makes the order certain: the
-/// server has routed the datagram before the stream exists. It is well inside
-/// `EARLY_DATAGRAM_HOLD`, so the datagram is still held when the session claims
-/// its Quarter Stream ID.
+/// Sent once and never repeated, so the echo can only come from the held copy,
+/// and exactly one echo comes back: a held datagram is delivered once.
+///
+/// The pause between the datagram and the request is what puts the datagram
+/// first. It is a bounded wait and not a certainty: the client cannot see when
+/// the server routes a datagram, so on a slow machine the stream could be
+/// claimed first and this would pass on the ordinary path. The pause is well
+/// inside `EARLY_DATAGRAM_HOLD`, so the datagram is still held when the session
+/// claims its Quarter Stream ID.
 #[tokio::test]
 async fn a_datagram_sent_before_its_request_reaches_the_target() {
     let server = TestServer::start().await;
@@ -224,6 +228,11 @@ async fn a_datagram_sent_before_its_request_reaches_the_target() {
         &answer.payload[..],
         b"early",
         "the datagram sent before the request must reach the target"
+    );
+    let again = tokio::time::timeout(Duration::from_millis(300), client.quic.read_datagram()).await;
+    assert!(
+        again.is_err(),
+        "the held datagram was delivered more than once: {again:?}"
     );
 
     let echoed = udp_round_trip(&client, qsid, b"later").await;

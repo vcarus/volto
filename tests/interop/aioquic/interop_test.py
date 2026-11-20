@@ -420,8 +420,9 @@ async def test_datagram_before_its_request_is_delivered():
             # The stream the next request will open, named before it exists.
             stream_id = client._quic.get_next_available_stream_id()
             client.send_udp(stream_id, b"sent-before-the-request")
-            # Long enough that the datagram is routed before the stream
-            # exists, and well inside volto's hold time of 333 ms.
+            # What puts the datagram before the stream: a bounded wait, since
+            # the client cannot see when the server routes it. Well inside
+            # volto's hold time of 333 ms.
             await asyncio.sleep(0.05)
 
             opened = await client.connect_udp(host, port)
@@ -433,6 +434,16 @@ async def test_datagram_before_its_request_is_delivered():
                 f"{reply!r} != {want!r} (a datagram sent before its request must "
                 "be held until the session is open, then forwarded)"
             )
+
+            # Delivered once: no second copy arrives for the session.
+            await asyncio.sleep(0.3)
+            queued = client._queue(stream_id)
+            repeats = []
+            while not queued.empty():
+                event = queued.get_nowait()
+                if isinstance(event, DatagramReceived):
+                    repeats.append(event.data)
+            assert not repeats, f"the held datagram was delivered again: {repeats!r}"
     finally:
         transport.close()
 
