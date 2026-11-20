@@ -226,7 +226,7 @@ mod hold;
 
 #[doc(hidden)]
 pub use hold::Dropped;
-use hold::{Arrival, Memory, Taken};
+use hold::{Arrival, Memory};
 
 /// The QUIC version this server speaks, as it appears in a long header.
 const QUIC_V1: u32 = 0x0000_0001;
@@ -695,8 +695,14 @@ impl Gate {
             datagram,
             dcid,
         };
-        if hold_opened(memory, arrival, &frames.0, &frames.1, policy, &mut log_drop)
-            == Screened::Released
+        if hold_opened(
+            memory,
+            &arrival,
+            &frames.0,
+            &frames.1,
+            policy,
+            &mut log_drop,
+        ) == Screened::Released
         {
             self.expected.0.releasing.store(true, Ordering::Release);
         }
@@ -814,7 +820,7 @@ fn log_drop(remote: SocketAddr, dropped: Dropped) {
 /// is a reply.
 fn hold_opened(
     memory: &mut Memory,
-    arrival: Arrival<'_>,
+    arrival: &Arrival<'_>,
     frames: &[u8],
     more: &[BytesMut],
     policy: &Policy,
@@ -829,11 +835,7 @@ fn hold_opened(
         }
     }
     let fragments = whole.then_some(fragments.as_slice());
-    match memory.take(arrival, fragments, policy, report) {
-        Some(Taken::Held) => Screened::Held,
-        Some(Taken::Released) => Screened::Released,
-        None => Screened::Dropped,
-    }
+    memory.take(arrival, fragments, policy, report)
 }
 
 /// The half of the gate that judges datagrams, held by [`Gate`] and needing no
@@ -1688,7 +1690,7 @@ impl Screening {
                 };
                 hold_opened(
                     &mut self.memory,
-                    arrival,
+                    &arrival,
                     &frames,
                     &more,
                     &self.policy,

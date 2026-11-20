@@ -18,7 +18,7 @@ use quinn::udp::RecvMeta;
 
 use crate::hello::{self, Ech, Message};
 
-use super::Policy;
+use super::{Policy, Screened};
 
 /// How long a first flight is held for its ClientHello to complete.
 ///
@@ -356,15 +356,6 @@ pub(super) struct Arrival<'a> {
     pub(super) dcid: ConnectionId,
 }
 
-/// What became of one datagram the hold was given.
-pub(super) enum Taken {
-    /// It is held.
-    Held,
-    /// It completed its flight, which was admitted: every datagram of it is in
-    /// `released`.
-    Released,
-}
-
 impl Hold {
     fn new() -> Self {
         Self {
@@ -437,6 +428,137 @@ impl Hold {
             }
         }
     }
+
+    /// Where the flight of `dcid` from `from` is, if it is held.
+    fn find(&self, dcid: &ConnectionId, from: SocketAddr) -> Option<usize> {
+        self.flights
+            .iter()
+            .position(|flight| flight.dcid == *dcid && flight.from == from)
+    }
+
+    /// What the flight at `found`, or a new one when it is `None`, would count
+    /// with a datagram of `datagram` bytes in it and its stream grown to
+    /// `end`.
+    ///
+    /// The sum cannot overflow: a held flight counts at most
+    /// [`HOLD_FLIGHT_BYTES`], a datagram is a slice and so at most `isize::MAX`
+    /// bytes, and a stream with its bitmap is at most [`HOLD_HELLO_BYTES`] and
+    /// an eighth more.
+    fn bytes_after(&self, found: Option<usize>, datagram: usize, end: usize) -> usize {
+        match found.and_then(|index| self.flights.get(index)) {
+            Some(flight) => flight.datagram_bytes + datagram + flight.stream.footprint_at(end),
+            None => datagram + Stream::default().footprint_at(end),
+        }
+    }
+
+    /// Starts an empty flight for `arrival`, evicting the oldest one when the
+    /// table is full, and says where it is: last, since it is the newest.
+    fn open(
+        &mut self,
+        arrival: &Arrival<'_>,
+        report: &mut dyn FnMut(SocketAddr, Dropped),
+    ) -> usize {
+        if self.flights.len() >= HOLD_FLIGHTS
+            && let Some(oldest) = self.remove(0)
+        {
+            report(oldest.from, Dropped::Evicted);
+        }
+        self.flights.push_back(Flight {
+            dcid: arrival.dcid,
+            from: arrival.meta.addr,
+            started: arrival.now,
+            datagrams: Vec::new(),
+            datagram_bytes: 0,
+            stream: Stream::default(),
+        });
+        // Not empty after the push, so the subtraction cannot underflow.
+        self.flights.len() - 1
+    }
+
+    /// Evicts the oldest flights ahead of the one at `index` until the hold
+    /// has room for `growth` more bytes, as a full table does, and says where
+    /// that flight is now: `Ok` with room, `Err` when evicting every flight
+    /// ahead of it still leaves none.
+    ///
+    /// `index` falls by one for each flight removed ahead of it, and the loop
+    /// stops at 0, so it cannot underflow.
+    fn make_room(
+        &mut self,
+        mut index: usize,
+        growth: usize,
+        report: &mut dyn FnMut(SocketAddr, Dropped),
+    ) -> Result<usize, usize> {
+        while self.bytes + growth > HOLD_TOTAL_BYTES && index > 0 {
+            if let Some(oldest) = self.remove(0) {
+                report(oldest.from, Dropped::Evicted);
+            }
+            index -= 1;
+        }
+        if self.bytes + growth > HOLD_TOTAL_BYTES {
+            Err(index)
+        } else {
+            Ok(index)
+        }
+    }
+
+    /// Writes `fragments` into the stream of the flight at `index` and, if
+    /// every one joins, keeps `arrival`'s datagram in it.
+    ///
+    /// The only place a held flight's contents change. The count is raised by
+    /// what the flight counts after the writes less what it counted before
+    /// them, on the path that keeps the datagram and on the one that refuses
+    /// it, so it is always the sum of what is held. A fragment can be refused
+    /// after the fragments ahead of it in the same datagram have grown the
+    /// stream, and the caller then removes the flight with that growth in it,
+    /// which [`Hold::remove`] takes off the count again. The growth
+    /// [`Hold::make_room`] made room for is the most this can add: exactly it
+    /// when every fragment joins, less when one is refused. The subtraction
+    /// cannot underflow, because a stream and a flight's datagrams only grow.
+    fn write(
+        &mut self,
+        index: usize,
+        arrival: &Arrival<'_>,
+        fragments: &[(u64, &[u8])],
+    ) -> Result<(), Dropped> {
+        let flight = &mut self.flights[index];
+        let before = flight.bytes();
+        let written = fragments
+            .iter()
+            .try_for_each(|(offset, bytes)| flight.stream.insert(*offset, bytes));
+        if written.is_ok() {
+            flight.datagrams.push(HeldDatagram {
+                meta: arrival.meta,
+                bytes: arrival.datagram.to_vec(),
+            });
+            flight.datagram_bytes += arrival.datagram.len();
+        }
+        self.bytes += flight.bytes() - before;
+        written.map_err(|refused| match refused {
+            Refused::TooLong => Dropped::TooLong,
+            Refused::Conflict => Dropped::Conflict,
+        })
+    }
+}
+
+/// Where the CRYPTO stream of a flight ends once `fragments` have joined it,
+/// or `None` when one of them reaches past [`HOLD_HELLO_BYTES`].
+///
+/// The limit test is [`Stream::insert`]'s own, applied to every fragment,
+/// empty ones included, so a datagram `insert` would refuse as too long is
+/// found here, before the hold makes room for it. An empty fragment does not
+/// move the end, because it does not grow the buffer.
+fn crypto_end(fragments: &[(u64, &[u8])]) -> Option<usize> {
+    let mut end = 0usize;
+    for (offset, bytes) in fragments {
+        let stop = usize::try_from(*offset).ok()?.checked_add(bytes.len())?;
+        if stop > HOLD_HELLO_BYTES {
+            return None;
+        }
+        if !bytes.is_empty() {
+            end = end.max(stop);
+        }
+    }
+    Some(end)
 }
 
 /// The hold and the replay record, behind one lock in the gate.
@@ -459,112 +581,50 @@ impl Memory {
     /// `fragments` are the CRYPTO frames of every Initial packet of the flight
     /// in the datagram, the first one and those coalesced behind it, or `None`
     /// when the frames of one of them do not parse or include a type no
-    /// Initial packet may carry. Every flight dropped on the way,
-    /// this one or another, is reported once through `report`, and `None` is
-    /// this datagram's own flight dropped.
+    /// Initial packet may carry. Every flight dropped on the way, this one or
+    /// another, is reported once through `report`.
+    ///
+    /// The phases run in this order: expiry; the checks that need only the
+    /// datagram and the flight it joins (frames that do not parse, CRYPTO
+    /// bytes past [`HOLD_HELLO_BYTES`], a flight past [`HOLD_FLIGHT_BYTES`]);
+    /// a new flight, and room in the hold, both of which may evict the oldest
+    /// flights; the write; the judgement. So a datagram dropped by one of
+    /// those checks evicts no other flight.
     pub(super) fn take(
         &mut self,
-        arrival: Arrival<'_>,
+        arrival: &Arrival<'_>,
         fragments: Option<&[(u64, &[u8])]>,
         policy: &Policy,
         report: &mut dyn FnMut(SocketAddr, Dropped),
-    ) -> Option<Taken> {
-        let Arrival {
-            now,
-            meta,
-            datagram,
-            dcid,
-        } = arrival;
-        let from = meta.addr;
-        self.hold.expire(now, report);
-
-        let index = match self
-            .hold
-            .flights
-            .iter()
-            .position(|f| f.dcid == dcid && f.from == from)
-        {
-            Some(index) => index,
-            None => {
-                if self.hold.flights.len() >= HOLD_FLIGHTS
-                    && let Some(oldest) = self.hold.remove(0)
-                {
-                    report(oldest.from, Dropped::Evicted);
-                }
-                self.hold.flights.push_back(Flight {
-                    dcid,
-                    from,
-                    started: now,
-                    datagrams: Vec::new(),
-                    datagram_bytes: 0,
-                    stream: Stream::default(),
-                });
-                self.hold.flights.len() - 1
-            }
-        };
+    ) -> Screened {
+        let from = arrival.meta.addr;
+        self.hold.expire(arrival.now, report);
+        let found = self.hold.find(&arrival.dcid, from);
 
         let Some(fragments) = fragments else {
-            return self.drop_flight(index, Dropped::Frames, report);
+            return self.drop_found(found, from, Dropped::Frames, report);
         };
-
-        // What the flight would occupy with this datagram in it.
-        let mut end = 0usize;
-        for (offset, bytes) in fragments.iter().filter(|(_, bytes)| !bytes.is_empty()) {
-            let Some(stop) = usize::try_from(*offset)
-                .ok()
-                .and_then(|start| start.checked_add(bytes.len()))
-                .filter(|stop| *stop <= HOLD_HELLO_BYTES)
-            else {
-                return self.drop_flight(index, Dropped::TooLong, report);
-            };
-            end = end.max(stop);
-        }
-        let flight = &self.hold.flights[index];
-        let after = flight.datagram_bytes + datagram.len() + flight.stream.footprint_at(end);
+        let Some(end) = crypto_end(fragments) else {
+            return self.drop_found(found, from, Dropped::TooLong, report);
+        };
+        let after = self.hold.bytes_after(found, arrival.datagram.len(), end);
         if after > HOLD_FLIGHT_BYTES {
-            return self.drop_flight(index, Dropped::TooBig, report);
-        }
-        let growth = after - flight.bytes();
-        // Room in the hold as a whole: the oldest other flights make way, as
-        // a full table does.
-        let mut index = index;
-        while self.hold.bytes + growth > HOLD_TOTAL_BYTES && index > 0 {
-            if let Some(oldest) = self.hold.remove(0) {
-                report(oldest.from, Dropped::Evicted);
-            }
-            index -= 1;
-        }
-        if self.hold.bytes + growth > HOLD_TOTAL_BYTES {
-            return self.drop_flight(index, Dropped::Evicted, report);
+            return self.drop_found(found, from, Dropped::TooBig, report);
         }
 
-        // The only place a held flight's contents change. The count is raised
-        // by what the flight occupies after the writes less what it occupied
-        // before them, on the path that keeps the datagram and on the one that
-        // refuses it, so it is always the sum of what is held. A fragment can
-        // be refused after the fragments ahead of it in the same datagram have
-        // grown the stream, and the flight is then removed with that growth in
-        // it, which `Hold::remove` takes off the count again. `growth` above is
-        // the most this can add: exactly it when every fragment joins, less
-        // when one is refused.
-        let flight = &mut self.hold.flights[index];
-        let before = flight.bytes();
-        let written = fragments
-            .iter()
-            .try_for_each(|(offset, bytes)| flight.stream.insert(*offset, bytes));
-        if written.is_ok() {
-            flight.datagrams.push(HeldDatagram {
-                meta,
-                bytes: datagram.to_vec(),
-            });
-            flight.datagram_bytes += datagram.len();
-        }
-        self.hold.bytes += flight.bytes() - before;
-        if let Err(refused) = written {
-            let why = match refused {
-                Refused::TooLong => Dropped::TooLong,
-                Refused::Conflict => Dropped::Conflict,
-            };
+        let index = match found {
+            Some(index) => index,
+            None => self.hold.open(arrival, report),
+        };
+        // `bytes_after` is at least what the flight counts now, because
+        // `footprint_at` is at least `footprint` and the datagram is added,
+        // so the subtraction cannot underflow.
+        let growth = after - self.hold.flights[index].bytes();
+        let index = match self.hold.make_room(index, growth, report) {
+            Ok(index) => index,
+            Err(index) => return self.drop_flight(index, Dropped::Evicted, report),
+        };
+        if let Err(why) = self.hold.write(index, arrival, fragments) {
             return self.drop_flight(index, why, report);
         }
 
@@ -574,16 +634,9 @@ impl Memory {
             from,
             &mut self.replay,
         ) {
-            None => Some(Taken::Held),
+            None => Screened::Held,
             Some(Err(why)) => self.drop_flight(index, why, report),
-            Some(Ok(())) => {
-                let flight = self.hold.remove(index)?;
-                for datagram in flight.datagrams {
-                    self.hold.bytes += datagram.bytes.len();
-                    self.hold.released.push_back(datagram);
-                }
-                Some(Taken::Released)
-            }
+            Some(Ok(())) => self.release(index),
         }
     }
 
@@ -593,10 +646,40 @@ impl Memory {
         index: usize,
         why: Dropped,
         report: &mut dyn FnMut(SocketAddr, Dropped),
-    ) -> Option<Taken> {
-        let flight = self.hold.remove(index)?;
-        report(flight.from, why);
-        None
+    ) -> Screened {
+        if let Some(flight) = self.hold.remove(index) {
+            report(flight.from, why);
+        }
+        Screened::Dropped
+    }
+
+    /// Drops the datagram from `from`, and with it the flight at `found` if
+    /// one is held, and reports why once, whether or not a flight was held.
+    fn drop_found(
+        &mut self,
+        found: Option<usize>,
+        from: SocketAddr,
+        why: Dropped,
+        report: &mut dyn FnMut(SocketAddr, Dropped),
+    ) -> Screened {
+        if let Some(index) = found {
+            self.hold.remove(index);
+        }
+        report(from, why);
+        Screened::Dropped
+    }
+
+    /// Moves every datagram of the admitted flight at `index` to `released`,
+    /// in the order they arrived, keeping the byte count.
+    fn release(&mut self, index: usize) -> Screened {
+        let Some(flight) = self.hold.remove(index) else {
+            return Screened::Dropped;
+        };
+        for datagram in flight.datagrams {
+            self.hold.bytes += datagram.bytes.len();
+            self.hold.released.push_back(datagram);
+        }
+        Screened::Released
     }
 }
 
@@ -752,5 +835,80 @@ mod tests {
         // the second is still there.
         assert!(replay.admit(&0usize.to_be_bytes(), addr(2)));
         assert!(!replay.admit(&2usize.to_be_bytes(), addr(2)));
+    }
+
+    /// Hands `memory` one datagram from `from`, addressed to `dcid`, and says
+    /// whether the hold kept it and which flights it dropped on the way.
+    fn take_one(
+        memory: &mut Memory,
+        from: SocketAddr,
+        dcid: u8,
+        datagram: &[u8],
+        fragments: Option<&[(u64, &[u8])]>,
+    ) -> (bool, Vec<(SocketAddr, Dropped)>) {
+        let policy = Policy::new(super::super::Names::new(&[]), None, false);
+        let mut drops = Vec::new();
+        let arrival = Arrival {
+            now: Instant::now(),
+            meta: RecvMeta {
+                addr: from,
+                ..RecvMeta::default()
+            },
+            datagram,
+            dcid: ConnectionId::new(&[dcid; 8]),
+        };
+        let screened = memory.take(&arrival, fragments, &policy, &mut |from, why| {
+            drops.push((from, why));
+        });
+        (screened != Screened::Dropped, drops)
+    }
+
+    /// A datagram that starts a new flight and is dropped for what it carries
+    /// evicts no other flight, even with the table full: the drop is found
+    /// before the table makes room.
+    #[test]
+    fn a_new_flight_the_hold_drops_evicts_nothing() {
+        let mut memory = Memory::new();
+        let datagram = vec![0u8; 1200];
+        // The start of a ClientHello whose declared length has not arrived.
+        let start: &[(u64, &[u8])] = &[(0, &[1, 0, 0, 10])];
+        for index in 0..HOLD_FLIGHTS {
+            let port = u16::try_from(index).expect("small");
+            let (kept, drops) = take_one(&mut memory, addr(port), 1, &datagram, Some(start));
+            assert!(kept && drops.is_empty(), "flight {index} is held");
+        }
+        assert_eq!(memory.hold.flights(), HOLD_FLIGHTS);
+
+        let past: &[(u64, &[u8])] = &[(u64::try_from(HOLD_HELLO_BYTES).expect("small"), b"x")];
+        let large = vec![0u8; HOLD_FLIGHT_BYTES + 1];
+        for (what, datagram, fragments, why) in [
+            ("frames that do not parse", &datagram, None, Dropped::Frames),
+            (
+                "CRYPTO past the limit",
+                &datagram,
+                Some(past),
+                Dropped::TooLong,
+            ),
+            (
+                "a datagram past the flight bound",
+                &large,
+                Some(start),
+                Dropped::TooBig,
+            ),
+        ] {
+            let (kept, drops) = take_one(&mut memory, addr(9999), 2, datagram, fragments);
+            assert!(!kept, "{what}: dropped");
+            assert_eq!(
+                drops,
+                vec![(addr(9999), why)],
+                "{what}: only its own flight"
+            );
+            assert_eq!(
+                memory.hold.flights(),
+                HOLD_FLIGHTS,
+                "{what}: nothing evicted"
+            );
+            assert_eq!(memory.hold.bytes(), memory.hold.recount(), "{what}");
+        }
     }
 }
