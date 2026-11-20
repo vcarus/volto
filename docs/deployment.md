@@ -779,8 +779,9 @@ ECH is optional. Without a key the server runs plain TLS 1.3; with one, a client
 that holds the server's ECHConfigList sends its real server name encrypted, and
 only the key's public name travels in the clear. Generate the key on the host,
 so the private key never leaves it. `/etc/volto` belongs to root, so the key is
-written as root and then given to the service's group, as the other files
-there are:
+written as root and given to the service's group, as the other files there are.
+`ech-keygen` run as root in that directory creates the file `root:volto` 0640
+itself; the last two lines make sure of it with a release that does not:
 
 ```sh
 sudo volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
@@ -810,13 +811,17 @@ goes on the wire:
 volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
 ```
 
-**Rotating the key** is a new file and a reload: generate it with `ech-keygen`,
+**Rotating the key** is a new file and a reload: generate it with the three
+commands above, with `--out` and the two following lines naming a new file,
 point `ech_key` at it, `systemctl reload volto`, and give every client the new
-list. A client whose list no longer matches the key gets no reply at all and
-times out, with or without `require_ech`. The server holds one key at a time, so
-a client with the old list is cut off from the reload on, and a client given the
-new list before the reload is cut off until it. A key change is therefore a
-change to every client's configuration: make both in the same window.
+list. A key the service cannot read is refused by the reload, which keeps the
+old key and logs `configuration reload failed`, so look for `configuration
+reloaded` in the journal before the clients are changed. A client whose list no
+longer matches the key gets no reply at all and times out, with or without
+`require_ech`. The server holds one key at a time, so a client with the old list
+is cut off from the reload on, and a client given the new list before the reload
+is cut off until it. A key change is therefore a change to every client's
+configuration: make both in the same window.
 
 ### Requiring ECH
 

@@ -126,24 +126,64 @@ pub fn random_bytes(out: &mut [u8]) -> Result<()> {
     aws_lc_rs::rand::fill(out).map_err(|_| anyhow::anyhow!("the random number generator failed"))
 }
 
-/// Writes `key` to a new file at `path`, readable by its owner only.
+/// Writes `key` to a new file at `path`, readable by its owner only, or by its
+/// owner and the directory's group when root writes it into a directory closed
+/// to other users ([`shared_group`]).
 ///
 /// Refuses a path that exists: the file is a credential a client was given, and
 /// overwriting it would lock every such client out without a word.
 pub fn write_new_key_file(path: &Path, key: &EchKey) -> Result<()> {
     use std::io::Write as _;
-    write_new_file(path, |file| file.write_all(key.to_pem().as_bytes()))
+    use std::os::unix::fs::MetadataExt as _;
+
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    // A directory that cannot be read is no reason to refuse: the file is then
+    // created for its owner only, and `create_new` reports the real error.
+    let group = std::fs::metadata(directory).ok().and_then(|directory| {
+        shared_group(
+            rustix::process::geteuid().is_root(),
+            directory.mode(),
+            directory.gid(),
+        )
+    });
+    write_new_file(path, group, |file| file.write_all(key.to_pem().as_bytes()))
 }
 
-/// Creates `path`, which must not exist yet, readable by its owner only, lets
-/// `fill` write it, and syncs it to disk.
+/// The group a new key file is given read access to, or `None` to leave it
+/// readable by its owner only.
 ///
-/// When `fill` or the sync fails (a full disk, say), the file is removed
-/// again. It is ours to remove, because `create_new` made it a moment
-/// earlier, and leaving the partial file would make the next attempt at the
-/// same path fail, since an existing file is never replaced.
-fn write_new_file(path: &Path, fill: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+/// Our own rule, for the layout the installer writes: `/etc/volto` is
+/// `root:volto` 0750, only root can create a file in it, and the service reads
+/// each file there through the group. A key written there by root for its
+/// owner only is one the service cannot open. So when root writes the file
+/// into a directory closed to other users (no `o` bits) whose group can
+/// traverse it, the file takes the directory's group at mode 0640, the mode
+/// of `key.pem` and `config.toml` beside it. Anything else (a run as another
+/// user, `/tmp`, `/etc`) stays 0600: the group of a directory open to every
+/// user says nothing about who may read a private key.
+fn shared_group(root: bool, directory_mode: u32, directory_gid: u32) -> Option<u32> {
+    (root && directory_mode & 0o007 == 0 && directory_mode & 0o010 != 0).then_some(directory_gid)
+}
+
+/// Creates `path`, which must not exist yet, readable by its owner only, or
+/// by its owner and `group` at mode 0640 when one is given, lets `fill` write
+/// it, and syncs it to disk.
+///
+/// The file is created 0600 and given the group before anything is written,
+/// so the key is never readable by more than the two. When that, `fill` or
+/// the sync fails (a full disk, say), the file is removed again. It is ours
+/// to remove, because `create_new` made it a moment earlier, and leaving the
+/// partial file would make the next attempt at the same path fail, since an
+/// existing file is never replaced.
+fn write_new_file(
+    path: &Path,
+    group: Option<u32>,
+    fill: impl FnOnce(&mut File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -156,7 +196,17 @@ fn write_new_file(path: &Path, fill: impl FnOnce(&mut File) -> std::io::Result<(
                 path.display()
             )
         })?;
-    let Err(error) = fill(&mut file).and_then(|()| file.sync_all()) else {
+    let shared = |file: &mut File| match group {
+        Some(gid) => {
+            std::os::unix::fs::fchown(&*file, None, Some(gid))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o640))
+        }
+        None => Ok(()),
+    };
+    let Err(error) = shared(&mut file)
+        .and_then(|()| fill(&mut file))
+        .and_then(|()| file.sync_all())
+    else {
         return Ok(());
     };
     drop(file);
@@ -195,7 +245,7 @@ mod tests {
     fn a_failed_write_leaves_no_partial_file_behind() {
         let dir = scratch();
         let path = dir.join("ech.pem");
-        let error = write_new_file(&path, |file| {
+        let error = write_new_file(&path, None, |file| {
             file.write_all(b"-----BEGIN PRIVATE KEY-----\n")?;
             Err(std::io::Error::other("no space left on the test device"))
         })
@@ -210,6 +260,56 @@ mod tests {
 
         let key = EchKey::generate("public.example", 7, 0).expect("a key");
         write_new_key_file(&path, &key).expect("the next attempt writes the file");
+        assert!(EchKey::load(&path).is_ok());
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// Root writing into a directory closed to other users gives the key the
+    /// directory's group; every other case leaves it to its owner.
+    #[test]
+    fn only_root_in_a_closed_directory_shares_the_key_with_its_group() {
+        const VOLTO: u32 = 998;
+        assert_eq!(
+            shared_group(true, 0o40750, VOLTO),
+            Some(VOLTO),
+            "/etc/volto"
+        );
+        assert_eq!(shared_group(true, 0o40770, VOLTO), Some(VOLTO));
+        assert_eq!(shared_group(true, 0o40710, VOLTO), Some(VOLTO));
+        for (root, mode) in [
+            (false, 0o40750),
+            (true, 0o40755),
+            (true, 0o41777),
+            (true, 0o40751),
+            (true, 0o40700),
+            (true, 0o40740),
+        ] {
+            assert_eq!(shared_group(root, mode, VOLTO), None, "{root} {mode:o}");
+        }
+    }
+
+    /// A shared key file is 0640 and carries the group from its first byte
+    /// on. Any user can give a file it owns to its own group, so this runs
+    /// without root.
+    #[test]
+    fn a_shared_key_file_is_0640_with_the_group_given() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = scratch();
+        let path = dir.join("ech.pem");
+        let gid = rustix::process::getegid().as_raw();
+        let key = EchKey::generate("public.example", 7, 0).expect("a key");
+        write_new_file(&path, Some(gid), |file| {
+            let metadata = file.metadata()?;
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+            assert_eq!(metadata.gid(), gid);
+            file.write_all(key.to_pem().as_bytes())
+        })
+        .expect("the file is written");
+
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o640);
+        assert_eq!(metadata.gid(), gid);
         assert!(EchKey::load(&path).is_ok());
         std::fs::remove_dir_all(&dir).expect("clean up");
     }

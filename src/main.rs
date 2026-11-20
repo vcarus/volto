@@ -79,7 +79,9 @@ enum Command {
         /// clear, and checks the certificate against when ECH is rejected.
         #[arg(long, value_name = "NAME")]
         public_name: String,
-        /// Where to write the key file. Created with mode 0600.
+        /// Where to write the key file. Created with mode 0600, or 0640 with
+        /// the directory's group when root writes it into a directory closed
+        /// to other users, such as /etc/volto.
         #[arg(long, value_name = "FILE")]
         out: PathBuf,
         /// The ECHConfig's config_id. Random when left out.

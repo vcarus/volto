@@ -49,15 +49,22 @@ key, and only then lets the handshake reach QUIC and TLS.
 **Generating the key.**
 
 ```sh
-volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+sudo volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+sudo chgrp volto /etc/volto/ech.pem
+sudo chmod 0640 /etc/volto/ech.pem
 ```
 
-writes the key file with mode 0600 and prints the ECHConfigList on stdout, in
-standard base64. That value is what a client takes, for example Surge's
-`ech-config`. `--config-id` picks the ECHConfig's config_id (random when left
-out), and `--max-name-length` its `maximum_name_length`, which only steers how
-much a client pads (default 0). An existing file is never overwritten. To print
-the list again from the file:
+writes the key file and prints the ECHConfigList on stdout, in standard base64.
+That value is what a client takes, for example Surge's `ech-config`.
+`--config-id` picks the ECHConfig's config_id (random when left out), and
+`--max-name-length` its `maximum_name_length`, which only steers how much a
+client pads (default 0). An existing file is never overwritten. `/etc/volto` is
+`root:volto` 0750, so only root can create the file, and the service reads it
+through the `volto` group. Run as root in a directory closed to other users,
+`ech-keygen` creates the file 0640 with the directory's group itself; anywhere
+else, or run as another user, it creates the file 0600 for its owner only. The
+`chgrp` and `chmod` lines then change nothing, and they give the service the
+file when an earlier release wrote it. To print the list again from the file:
 
 ```sh
 volto ech-config /etc/volto/ech.pem
