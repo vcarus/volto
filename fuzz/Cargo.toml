@@ -33,7 +33,6 @@ bytes = "1"
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
     "std",
-    "logging",
 ] }
 
 [dependencies.volto]
