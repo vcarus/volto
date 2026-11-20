@@ -134,8 +134,7 @@ impl Roster {
     /// the loop already holds, so the caller need not take the lock again.
     ///
     /// A method rather than the loop written out at the accept path, so that
-    /// what the unit tests run is what the server runs. Tests that walked a copy
-    /// would stay green if the server's own loop went back to a single eviction.
+    /// what the unit tests run is what the server runs.
     ///
     /// One guard for the whole loop rather than two acquisitions per pass. With
     /// the lock taken and released between the length read and the eviction, a
@@ -171,9 +170,8 @@ impl Roster {
 /// stays on the roster; only a slot this function claimed is removed and
 /// notified.
 ///
-/// A free function over the guard rather than a method that takes its own, so
-/// that [`Roster::evict_until_below`] can run it repeatedly under one guard and
-/// the roster's own tests can run exactly what the server runs.
+/// A free function over the guard, so that [`Roster::evict_until_below`] can
+/// run it repeatedly under one guard.
 fn evict_oldest_from(slots: &mut BTreeMap<u64, Slot>) -> Option<SocketAddr> {
     let sequence = *slots
         .iter()
@@ -246,15 +244,6 @@ mod tests {
 
     /// A cap that has just been lowered is caught up with, not lived over.
     ///
-    /// One eviction per arrival is all a server sitting at a steady cap needs.
-    /// A `SIGHUP` that lowers `max_connections` below the number of connections
-    /// already live is the case that is not steady: [`Server::admit`] reads the cap
-    /// per accepted connection, so the newcomer is judged against the new value
-    /// while everybody already in was admitted under the old one, and without
-    /// the loop inside `evict_until_below` -- the accept path's own, called here
-    /// rather than copied -- the roster would sit above the new cap for as long
-    /// as those connections lasted.
-    ///
     /// Five live and a cap of two leaves room for the newcomer, so four go: the
     /// loop stops at one, and the arrival that runs it makes two.
     #[test]
@@ -276,10 +265,8 @@ mod tests {
         );
     }
 
-    /// The loop stops when there is nothing left it may take.
-    ///
-    /// An authenticated connection is never a candidate, so a roster of them is
-    /// what makes the accept loop refuse rather than spin.
+    /// The loop stops when there is nothing left it may take, which is what
+    /// makes the accept loop refuse rather than spin.
     #[test]
     fn eviction_stops_when_every_connection_has_authenticated() {
         let roster = Roster::new();
@@ -299,12 +286,8 @@ mod tests {
         assert_eq!(remaining, 3, "which is the remainder the caller refuses on");
     }
 
-    /// An authenticated slot is skipped even when the scan reaches it first.
-    ///
-    /// The scan starts at the oldest connection, so a roster whose oldest entry
-    /// has authenticated must walk past it rather than stop: the eviction is
-    /// decided by winning the gate's compare-and-swap, not by reading a flag and
-    /// removing afterwards.
+    /// An authenticated slot is skipped even when the scan reaches it first:
+    /// the scan walks past it rather than stopping.
     #[test]
     fn an_authenticated_slot_is_skipped_and_the_next_candidate_is_taken() {
         let roster = Roster::new();
