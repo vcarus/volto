@@ -37,6 +37,17 @@ pub const EXIT_SLACK: Duration = Duration::from_secs(1);
 // two (D90).
 const _: () = assert!(!EXIT_SLACK.is_zero());
 
+/// How long the endpoint waits for its `CONNECTION_CLOSE` frames to be flushed
+/// at step 4. [`blocking_grace`] adds it to the grace period: the two together
+/// are the whole of what the async side of the shutdown may spend.
+pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+// Added to a grace period an operator may set to zero, and the drain that
+// precedes it may equally have nothing to wait for. At zero a shutdown would
+// leave the endpoint no time at all to put the CONNECTION_CLOSE it just wrote
+// on the wire.
+const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
+
 /// How long the blocking pool gets once the runtime's own work is over.
 ///
 /// `server.shutdown_grace` plus the endpoint's close flush plus [`EXIT_SLACK`],
@@ -53,7 +64,7 @@ const _: () = assert!(!EXIT_SLACK.is_zero());
 /// `TimeoutStopSec`.
 pub fn blocking_grace(grace: Duration) -> Duration {
     grace
-        .saturating_add(crate::quic::CLOSE_FLUSH_TIMEOUT)
+        .saturating_add(CLOSE_FLUSH_TIMEOUT)
         .saturating_add(EXIT_SLACK)
 }
 
@@ -207,7 +218,7 @@ pub(crate) mod tests {
             let grace = Duration::from_secs(seconds);
             assert_eq!(
                 blocking_grace(grace),
-                grace + crate::quic::CLOSE_FLUSH_TIMEOUT + EXIT_SLACK,
+                grace + CLOSE_FLUSH_TIMEOUT + EXIT_SLACK,
                 "the allowance for a grace of {seconds}s must cover the drain, the \
                  close flush and the slack"
             );
@@ -252,7 +263,7 @@ pub(crate) mod tests {
     #[test]
     fn the_shipped_unit_waits_out_the_longest_exit() {
         let grace = Duration::from_secs(crate::config::DEFAULT_SHUTDOWN_GRACE);
-        let exit = grace + crate::quic::CLOSE_FLUSH_TIMEOUT + blocking_grace(grace);
+        let exit = grace + CLOSE_FLUSH_TIMEOUT + blocking_grace(grace);
         let timeout = shipped_unit_value("TimeoutStopSec");
         assert!(
             Duration::from_secs(timeout) > exit,

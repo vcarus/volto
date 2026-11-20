@@ -922,7 +922,8 @@ impl Server {
 
         // Give the CONNECTION_CLOSE frames a moment to leave the socket. Bounded,
         // because this is the last thing standing between us and exiting.
-        let _ = tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
+        let _ =
+            tokio::time::timeout(shutdown::CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
     }
 }
 
@@ -1100,20 +1101,6 @@ fn log_connection_closed(
         }
     }
 }
-
-/// How long to wait for `CONNECTION_CLOSE` frames to be flushed on shutdown.
-///
-/// `pub(crate)` for [`crate::shutdown::blocking_grace`], which adds it to the
-/// grace period: the two together are the whole of what the async side of the
-/// shutdown may spend, and the wait for the blocking pool is measured against
-/// the same total.
-pub(crate) const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
-
-// `shutdown::blocking_grace` adds this to a grace period an operator may set to
-// zero, and the drain that precedes it may equally have nothing to wait for. At
-// zero here a shutdown would leave the endpoint no time at all to put the
-// CONNECTION_CLOSE it just wrote on the wire.
-const _: () = assert!(!CLOSE_FLUSH_TIMEOUT.is_zero());
 
 #[cfg(test)]
 pub(crate) mod tests {
