@@ -1731,6 +1731,11 @@ fn from(port: u16) -> SocketAddr {
 
 /// Feeds `datagrams` to `screening` from `peer`, all at `after`, and returns
 /// what became of each and every drop on the way.
+///
+/// After every datagram the hold's byte count is checked against the bytes it
+/// holds, summed again from its contents, so every test that feeds the hold
+/// also checks that the count has not drifted.
+#[track_caller]
 fn feed(
     screening: &mut Screening,
     after: Duration,
@@ -1741,6 +1746,11 @@ fn feed(
     let mut drops = Vec::new();
     for datagram in datagrams {
         let (verdict, dropped) = screening.receive(after, peer, datagram);
+        assert_eq!(
+            screening.recounted_bytes(),
+            screening.held_bytes(),
+            "the byte count is what the hold holds"
+        );
         screened.push(verdict);
         drops.extend(dropped);
     }
@@ -2285,6 +2295,11 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
     let bounded = |screening: &Screening| {
         assert!(screening.flights() <= HOLD_FLIGHTS, "the table bound");
         assert!(screening.held_bytes() <= HOLD_TOTAL_BYTES, "the byte bound");
+        assert_eq!(
+            screening.recounted_bytes(),
+            screening.held_bytes(),
+            "the byte bound is checked against what is held"
+        );
     };
 
     // One flight sent its header and then the same run again and again:
@@ -2842,28 +2857,55 @@ async fn require_ech_is_reloadable_and_refused_without_a_key() {
 /// `fuzz/fuzz_targets/hold.rs`.
 const HOLD_FUZZ_KEY: [u8; 32] = [0x42; 32];
 
+/// The Destination Connection IDs a sealed record may be addressed to,
+/// `DCIDS` in `fuzz/fuzz_targets/hold.rs`. The first is [`CLIENT_CID`], which
+/// the flights below use.
+const HOLD_FUZZ_DCIDS: [[u8; 8]; 4] = [CLIENT_CID, [0xa1; 8], [0xa2; 8], [0xa3; 8]];
+
+/// The record header bit that makes a record's body frames to seal.
+const HOLD_FUZZ_SEALED: u8 = 0x04;
+
+/// What one record of a hold fuzz input carries.
+enum Body {
+    /// A datagram, as it arrived.
+    Raw(Vec<u8>),
+    /// Frames for `volto::gate::sealed_initial`, addressed to
+    /// `HOLD_FUZZ_DCIDS[selector & 3]` with packet number `selector >> 2`.
+    Sealed { selector: u8, frames: Vec<u8> },
+}
+
 /// One record of a hold fuzz input: the source address index, the time that
-/// passes before it in 50 ms steps, and the datagram.
+/// passes before it in 100 ms steps, and its body.
 struct Record {
     source: u8,
     steps: u8,
-    datagram: Vec<u8>,
+    body: Body,
 }
 
 /// Encodes `records` under the policy byte `policy` in the target's format.
 fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
     let mut input = vec![policy];
     for record in records {
-        input.push((record.steps << 2) | (record.source & 0x03));
-        let length = u16::try_from(record.datagram.len()).expect("a datagram under 64 KiB");
+        assert!(record.steps < 32, "five bits of time");
+        let (sealed, body) = match &record.body {
+            Body::Raw(datagram) => (0, datagram.clone()),
+            Body::Sealed { selector, frames } => {
+                let mut body = vec![*selector];
+                body.extend_from_slice(frames);
+                (HOLD_FUZZ_SEALED, body)
+            }
+        };
+        input.push((record.steps << 3) | sealed | (record.source & 0x03));
+        let length = u16::try_from(body.len()).expect("a body under 64 KiB");
         input.extend_from_slice(&length.to_be_bytes());
-        input.extend_from_slice(&record.datagram);
+        input.extend_from_slice(&body);
     }
     input
 }
 
 /// Runs a hold fuzz input the way the target does and returns what became of
-/// its last record.
+/// its last record, checking the byte count against the hold's contents
+/// after every record as the target does.
 fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
     let (&policy, mut rest) = input.split_first().expect("a policy byte");
     let names: &[&str] = if policy & 0x02 != 0 {
@@ -2876,12 +2918,24 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
     let mut last = Screened::Passed;
     while let [header, high, low, tail @ ..] = rest {
         let length = usize::from(u16::from_be_bytes([*high, *low]));
-        let (datagram, next) = tail.split_at(length);
+        let (body, next) = tail.split_at(length);
         rest = next;
-        after += Duration::from_millis(50 * u64::from(header >> 2));
+        after += Duration::from_millis(100 * u64::from(header >> 3));
+        let datagram = if header & HOLD_FUZZ_SEALED == 0 {
+            body.to_vec()
+        } else {
+            let (selector, frames) = body.split_first().expect("a selector byte");
+            volto::gate::sealed_initial(
+                &HOLD_FUZZ_DCIDS[usize::from(selector & 0x03)],
+                selector >> 2,
+                frames,
+            )
+        };
         last = screening
-            .receive(after, from(40_000 + u16::from(header & 0x03)), datagram)
+            .receive(after, from(40_000 + u16::from(header & 0x03)), &datagram)
             .0;
+        assert_eq!(screening.recounted_bytes(), screening.held_bytes());
+        screening.released();
     }
     last
 }
@@ -2892,7 +2946,9 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
 /// The target cannot spell an ECH extension that opens, so without these it
 /// would never reach the HPKE check, the replay record or a release. Each seed
 /// is a whole input, run here through the same format the target reads; the
-/// assertion is the outcome of its last record. `fuzz/corpus/` is
+/// assertion is the outcome of its last record. The `sealed-` seeds carry the
+/// same flights as frames for the target to seal, which is how the fuzzer
+/// edits what the hold reads rather than ciphertext. `fuzz/corpus/` is
 /// machine-local and gitignored (D83), so this runs with every `cargo test`.
 #[test]
 fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
@@ -2902,15 +2958,11 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     );
     let groups = surge_groups();
     let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
+    let small = rustls_hello(&Offer::Ech(key.config_list()), &small_groups(), "localhost");
+    let plain_hello = rustls_hello(&Offer::Plain, &groups, "localhost");
     let two = hold_flight(&*crypto, &CLIENT_CID, &[], &ours, 2);
     let three = hold_flight(&*crypto, &CLIENT_CID, &[], &ours, 3);
-    let plain = hold_flight(
-        &*crypto,
-        &CLIENT_CID,
-        &[],
-        &rustls_hello(&Offer::Plain, &groups, "localhost"),
-        2,
-    );
+    let plain = hold_flight(&*crypto, &CLIENT_CID, &[], &plain_hello, 2);
     let grease = hold_flight(
         &*crypto,
         &CLIENT_CID,
@@ -2921,8 +2973,31 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     let record = |source: u8, steps: u8, datagram: &Vec<u8>| Record {
         source,
         steps,
-        datagram: datagram.clone(),
+        body: Body::Raw(datagram.clone()),
     };
+    // `hello` in two packets of one CRYPTO frame each, as frames to seal, to
+    // the first connection ID with packet numbers 0 and 1.
+    let sealed_two = |source: u8, hello: &[u8]| -> Vec<Record> {
+        let run = hello.len().div_ceil(2);
+        hello
+            .chunks(run)
+            .enumerate()
+            .map(|(index, part)| Record {
+                source,
+                steps: 0,
+                body: Body::Sealed {
+                    selector: u8::try_from(index << 2).expect("two packets"),
+                    frames: crypto_frame_at(index * run, part),
+                },
+            })
+            .collect()
+    };
+    // A ClientHello that fits one packet, as two CRYPTO frames of that one
+    // packet: the layout a disagreement inside one packet is made from.
+    let mut two_frames = crypto_frame_at(0, &small[..small.len() / 2]);
+    two_frames.extend_from_slice(&crypto_frame_at(small.len() / 2, &small[small.len() / 2..]));
+    let mut replayed = sealed_two(0, &ours);
+    replayed.extend(sealed_two(1, &ours));
 
     let seeds: Vec<(&str, Vec<u8>, Screened)> = vec![
         (
@@ -2962,7 +3037,7 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
                 &[
                     record(0, 0, &two[0]),
                     record(0, 0, &two[1]),
-                    record(0, 10, &two[0]),
+                    record(0, 5, &two[0]),
                     record(0, 0, &two[1]),
                 ],
             ),
@@ -2985,7 +3060,52 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
         ),
         (
             "a-first-packet-that-expires",
-            hold_input(0x00, &[record(0, 0, &two[0]), record(0, 63, &two[1])]),
+            hold_input(0x00, &[record(0, 0, &two[0]), record(0, 31, &two[1])]),
+            Screened::Held,
+        ),
+        (
+            "sealed-ech-in-two-packets",
+            hold_input(0x01, &sealed_two(0, &ours)),
+            Screened::Released,
+        ),
+        (
+            "sealed-ech-in-two-frames-of-one-packet",
+            hold_input(
+                0x01,
+                &[Record {
+                    source: 0,
+                    steps: 0,
+                    body: Body::Sealed {
+                        selector: 0,
+                        frames: two_frames,
+                    },
+                }],
+            ),
+            Screened::Released,
+        ),
+        (
+            "sealed-ech-replayed-from-another-address",
+            hold_input(0x00, &replayed),
+            Screened::Dropped,
+        ),
+        (
+            "sealed-plain-with-the-name-listed",
+            hold_input(0x02, &sealed_two(0, &plain_hello)),
+            Screened::Released,
+        ),
+        (
+            "sealed-a-ping",
+            hold_input(
+                0x00,
+                &[Record {
+                    source: 0,
+                    steps: 0,
+                    body: Body::Sealed {
+                        selector: 0,
+                        frames: vec![0x01],
+                    },
+                }],
+            ),
             Screened::Held,
         ),
     ];

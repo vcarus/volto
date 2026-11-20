@@ -352,6 +352,26 @@ impl Hold {
         self.bytes
     }
 
+    /// Every byte the hold occupies, summed from what it holds rather than
+    /// read from the running count: each flight's datagrams and its stream's
+    /// buffer and bitmap, and every released datagram.
+    ///
+    /// The fuzz target and the tests compare it with [`Hold::bytes`] after
+    /// every datagram, because a bound checked against the count alone cannot
+    /// see a count that has drifted below what is held.
+    pub(super) fn recount(&self) -> usize {
+        let flights: usize = self
+            .flights
+            .iter()
+            .map(|flight| {
+                let datagrams: usize = flight.datagrams.iter().map(|d| d.bytes.len()).sum();
+                datagrams + flight.stream.footprint()
+            })
+            .sum();
+        let released: usize = self.released.iter().map(|d| d.bytes.len()).sum();
+        flights + released
+    }
+
     /// Drops every held flight, reporting none: for a reload that removed the
     /// key, after which nothing would ever judge them.
     pub(super) fn clear(&mut self) {

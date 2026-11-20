@@ -1579,6 +1579,13 @@ impl Screening {
         self.memory.hold.bytes()
     }
 
+    /// Every byte the hold occupies, summed from what it holds. Equal to
+    /// [`Screening::held_bytes`] after every datagram, or the count has
+    /// drifted.
+    pub fn recounted_bytes(&self) -> usize {
+        self.memory.hold.recount()
+    }
+
     /// How many `enc` values the replay record holds.
     pub fn replay_entries(&self) -> usize {
         self.memory.replay.len()
@@ -1633,6 +1640,57 @@ pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
         quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
             .expect("a TLS 1.3 configuration carries an initial cipher suite"),
     )
+}
+
+/// The most frame bytes [`sealed_initial`] carries: what a two-byte Length
+/// field leaves after the one-byte packet number and the AEAD tag.
+#[doc(hidden)]
+pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
+
+/// A first Initial carrying `frames`, sealed under the keys its own
+/// Destination Connection ID `dcid` derives, for the fuzz target `hold` and
+/// the test that writes its seeds.
+///
+/// The fuzz target cannot spell a packet that authenticates, so without this
+/// it could change a held packet's bytes only by breaking its AEAD, and the
+/// hold would never see frames the fuzzer chose. With it, the fuzzer chooses
+/// the frames and this function seals them, with [`nameless_crypto`]'s keys,
+/// which are the keys the gate opens the packet with.
+///
+/// The header is the plainest a client sends: QUIC v1, no Source Connection
+/// ID, no token, a two-byte Length field and a one-byte packet number
+/// `number`. The frames are followed by PADDING up to a 1200-byte datagram,
+/// and cut at [`SEALED_FRAMES_MAX`] bytes.
+#[doc(hidden)]
+pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
+    let keys = seam_judge()
+        .crypto
+        .initial_keys(QUIC_V1, &ConnectionId::new(dcid))
+        .expect("Initial keys for QUIC v1");
+    let tag = keys.packet.remote.tag_len();
+    let frames = &frames[..frames.len().min(SEALED_FRAMES_MAX)];
+
+    let mut packet = vec![LONG_HEADER_FORM | 0x40 | INITIAL_PACKET_TYPE];
+    packet.extend_from_slice(&QUIC_V1.to_be_bytes());
+    packet.push(8);
+    packet.extend_from_slice(dcid);
+    packet.push(0); // no Source Connection ID
+    packet.push(0); // no token
+    let number_offset = packet.len() + 2;
+    let payload = frames
+        .len()
+        .max(MIN_INITIAL_DATAGRAM - number_offset - 1 - tag);
+    let length = u16::try_from(1 + payload + tag).expect("at most SEALED_FRAMES_MAX frame bytes");
+    packet.extend_from_slice(&(0x4000 | length).to_be_bytes());
+    packet.push(number);
+    packet.extend_from_slice(frames);
+    packet.resize(number_offset + 1 + payload, 0); // PADDING
+    packet.resize(number_offset + 1 + payload + tag, 0); // room for the tag
+    keys.packet
+        .remote
+        .encrypt(u64::from(number), &mut packet, number_offset + 1);
+    keys.header.remote.encrypt(number_offset, &mut packet);
+    packet
 }
 
 #[cfg(test)]
