@@ -88,10 +88,8 @@ impl Drop for Slot {
 /// rationed and is taken only once a request has proved it deserves one, while
 /// this is taken the moment the request stream is accepted and rations nothing.
 /// It lets the drain see a request that is *between* those two points (headers
-/// still arriving, credentials being checked). A drain that counted only
-/// tunnels would close the connection on such a request, against the "might
-/// have been processed" its own GOAWAY identifier had just signalled (RFC 9114
-/// §5.2).
+/// still arriving, credentials being checked), for the reason `Quota`'s
+/// `pending` field gives.
 ///
 /// Dropping is the only way it is given back, for the reason [`Slot`] gives.
 pub struct Pending {
@@ -165,9 +163,9 @@ impl Quota {
     ///
     /// Both halves count, and the second is the one a tunnel count alone
     /// misses: a request accepted before the GOAWAY whose headers are still
-    /// arriving holds no slot, and closing the connection on it contradicts the
-    /// "might have been processed" its GOAWAY identifier signalled (RFC 9114
-    /// §5.2) without the REQUEST_REJECTED that would let the client retry.
+    /// arriving holds no slot (see `Quota`'s `pending` field). Closing the
+    /// connection on it would also send no REQUEST_REJECTED that would let the
+    /// client retry.
     pub fn is_busy(&self) -> bool {
         self.live() > 0 || self.pending.load(Ordering::Relaxed) > 0
     }
@@ -548,11 +546,9 @@ mod tests {
     ///
     /// `crate::conn::handle` polls `wait_until_idle` for the whole of a GOAWAY
     /// drain, while requests below the GOAWAY identifier are still being
-    /// dispatched. When the wait was `acquire_many(limit)` the fair semaphore
-    /// handed it every free permit up front, so `live()` reported the limit and
-    /// `acquire()` refused everyone until the drain ended -- and the connection
-    /// answered `503 connection_limit_reached` to requests below the GOAWAY
-    /// identifier (RFC 9114 §5.2).
+    /// dispatched. A wait that took `acquire_many(limit)` would be handed every
+    /// free permit up front by the fair semaphore, and every request would be
+    /// refused until the drain ended; [`Quota`] has the argument.
     #[tokio::test]
     async fn waiting_for_idle_neither_spends_the_budget_nor_miscounts_it() {
         let quota = Quota::new(4);
@@ -613,7 +609,7 @@ mod tests {
     /// two points `live()` is zero while the connection has committed to serving
     /// something -- and after a GOAWAY that something is a request the peer was
     /// told "might have been processed" (RFC 9114 §5.2). A drain reading
-    /// `live()` alone closed the connection on it.
+    /// `live()` alone would close the connection on it.
     #[tokio::test]
     async fn a_request_that_has_not_taken_a_slot_still_holds_the_drain() {
         let quota = Quota::new(4);
@@ -649,7 +645,7 @@ mod tests {
     ///
     /// `Pending` rations nothing -- it only records that a request exists -- and
     /// a version of it that spent a permit would refuse tunnels a connection is
-    /// entitled to, which is the shape of the bug `wait_until_idle` used to have.
+    /// entitled to, the same shape as the wait [`Quota`]'s doc rules out.
     #[test]
     fn an_accepted_request_does_not_spend_the_tunnel_budget() {
         let quota = Quota::new(2);

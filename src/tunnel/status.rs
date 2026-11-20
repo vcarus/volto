@@ -436,13 +436,11 @@ pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fie
 /// ending an established session gets, and the only one that says nothing went
 /// wrong.
 ///
-/// Keep the STOP_SENDING up front (D59). RFC 9114 §4.1 leaves the choice open:
-/// a server may abort reading the request, or leave the client to finish and
-/// close it. The other shape, 200 and FIN followed by reading and discarding
-/// until the client closes, makes no difference to the client stack that
-/// answers this close with a transport-level PROTOCOL_VIOLATION: a frame-level
-/// comparison showed it resets within a round trip either way. That fault is
-/// on the client's side and does not depend on what this close sends.
+/// Keep the STOP_SENDING up front. RFC 9114 §4.1 leaves the choice open: a
+/// server may abort reading the request, or leave the client to finish and
+/// close it. D59 records why the other shape, reading and discarding until the
+/// client closes, was rolled back: the PROTOCOL_VIOLATION some clients answer
+/// this close with does not depend on its shape.
 pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields) {
     answer_then_finish(
         stream,
