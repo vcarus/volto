@@ -52,6 +52,18 @@ async fn enabling_keylog_writes_the_tls_secrets() {
     let _stream = open_tcp_tunnel(&mut client, &target.to_string()).await;
 
     let contents = std::fs::read_to_string(&keylog).expect("the keylog file must exist");
+    // The file holds every traffic secret, so the server creates it readable by
+    // its owner only, whatever the umask lets through.
+    let mode = std::os::unix::fs::PermissionsExt::mode(
+        &std::fs::metadata(&keylog)
+            .expect("the keylog file's metadata")
+            .permissions(),
+    );
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "the keylog file is open to group or others: {mode:o}"
+    );
     assert!(
         !contents.is_empty(),
         "the keylog file must not be empty once a session has been negotiated"

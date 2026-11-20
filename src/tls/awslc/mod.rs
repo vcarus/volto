@@ -815,14 +815,19 @@ fn dns_name(raw: &str) -> Option<String> {
 /// configuration is built, the file is opened for appending and created if
 /// missing, and an unset variable or a file that cannot be opened makes keylog
 /// a no-op rather than a startup failure. The no-op is reported at debug.
+/// Unlike rustls, a file created here is readable by its owner only, because
+/// it holds every traffic secret; an existing file keeps its mode.
 struct KeyLog(Mutex<File>);
 
 impl KeyLog {
     fn from_env() -> Option<Arc<Self>> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         let path = std::env::var_os("SSLKEYLOGFILE")?;
         match std::fs::OpenOptions::new()
             .append(true)
             .create(true)
+            .mode(0o600)
             .open(&path)
         {
             Ok(file) => Some(Arc::new(Self(Mutex::new(file)))),
