@@ -736,74 +736,6 @@ impl Server {
             // roster, however this task ends.
             let _registration = registration;
 
-            let quic = tokio::select! {
-                () = evicted.notified() => {
-                    // Dropping the half-built connection ends it, exactly as
-                    // letting the deadline below lapse does, with the
-                    // `CONNECTION_CLOSE(APPLICATION_ERROR)` and empty reason
-                    // this function's documentation describes, since the
-                    // `Incoming` was accepted before either arm could run.
-                    // DEBUG rather than the INFO the established case gets:
-                    // there is no connection yet, so there is nothing to report
-                    // about one.
-                    debug!(
-                        %remote,
-                        "evicted before its QUIC handshake completed: the server is full"
-                    );
-                    return;
-                }
-
-                handshake = tokio::time::timeout(handshake_deadline, accepted) => match handshake {
-                    Ok(Ok(quic)) => quic,
-                    Ok(Err(error)) => {
-                        // A failed handshake is routine on a public port: scanners,
-                        // version negotiation, stale retries.
-                        //
-                        // Through `peer_error` because a peer that closes during
-                        // the handshake writes the reason phrase inside this
-                        // error, and `Display` escapes nothing. An established
-                        // connection has the same exposure, and both use the
-                        // same function.
-                        debug!(
-                            %remote,
-                            error = %crate::logfmt::peer_error(error),
-                            "QUIC handshake failed"
-                        );
-                        return;
-                    }
-                    // Equally routine, and logged at the same level for the same
-                    // reason: a flood is exactly when this fires.
-                    Err(_elapsed) => {
-                        debug!(
-                            %remote,
-                            timeout_secs = handshake_deadline.as_secs(),
-                            "QUIC handshake did not complete in time"
-                        );
-                        return;
-                    }
-                },
-            };
-
-            let peer = peer_info(&quic);
-            info!(
-                log_id = "7l4svyo3",
-                remote = %peer.remote,
-                alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
-                server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
-                // At this point the estimate comes from the handshake samples
-                // alone; the close logs below carry the lifetime smoothed value.
-                rtt_ms = quic.rtt().as_millis(),
-                "connection established"
-            );
-
-            // `conn::handle` consumes the connection; keep a handle so the close
-            // logs can report what the connection learned about its path: the
-            // RTT it measured, the address the peer ended on, and the MTU.
-            // `remote_now` differing from `remote` is the only externally
-            // visible trace of a migration or NAT rebind during the
-            // connection's life.
-            let rtt_probe = quic.clone();
-
             // Created here rather than inside the connection so they survive
             // it: `conn::handle` hands the first to every request and the
             // second to the HTTP/3 datagram router, and both are read below,
@@ -811,46 +743,132 @@ impl Server {
             let tunnels = Arc::new(AtomicU64::new(0));
             let dropped_datagrams = Arc::new(AtomicU64::new(0));
 
-            // Which of the two log levels this connection deserves is decided
-            // from the error value `conn::handle` returned, and never from
-            // `rtt_probe.close_reason()`. Returning from `conn::handle` drops
-            // the HTTP/3 connection, whose `Drop` closes the QUIC connection with
-            // H3_NO_ERROR; quinn's close path then unconditionally overwrites
-            // the stored reason with `LocallyClosed`. So by the time control is
-            // back here, `close_reason()` reports that drop rather than whatever
-            // actually ended the connection, and an idle timeout would be
-            // logged as an error.
+            // Written once the handshake completes, so the closing line can tell
+            // an eviction during the handshake from one after it. `conn::handle`
+            // consumes the connection; the handle kept here lets the close logs
+            // report what the connection learned about its path: the RTT it
+            // measured, the address the peer ended on, and the MTU.
+            // `remote_now` differing from `remote` is the only externally
+            // visible trace of a migration or NAT rebind during the
+            // connection's life.
+            let mut established: Option<(SocketAddr, quinn::Connection)> = None;
+
+            // One wait on the eviction for the whole connection, handshake and
+            // all. `select!` drops the connection's future before it runs the
+            // eviction arm, so the borrow of `established` has ended there.
             let closed = tokio::select! {
                 // The newcomer that took this slot is already being served; all
-                // that is left here is to stop. Graded with the idle endings
-                // rather than as an error, because nothing about this
-                // connection failed.
-                () = evicted.notified() => Ok(CloseReason::Evicted),
+                // that is left here is to stop. Before the handshake completes,
+                // dropping the half-built connection ends it with the
+                // `CONNECTION_CLOSE(APPLICATION_ERROR)` this function's
+                // documentation describes. After it, the close is graded with
+                // the idle endings rather than as an error, because nothing
+                // about this connection failed.
+                () = evicted.notified() => Some(Ok(CloseReason::Evicted)),
 
-                handled = conn::handle(quic, config, shutdown, &resolver, tunnels.clone(), dropped_datagrams.clone(), authenticated) =>
-                    match handled {
-                        // The accept loop ended on its own terms: the GOAWAY drain
-                        // completed.
+                closed = async {
+                    let quic = match tokio::time::timeout(handshake_deadline, accepted).await {
+                        Ok(Ok(quic)) => quic,
+                        Ok(Err(error)) => {
+                            // A failed handshake is routine on a public port:
+                            // scanners, version negotiation, stale retries.
+                            //
+                            // Through `peer_error` because a peer that closes
+                            // during the handshake writes the reason phrase
+                            // inside this error, and `Display` escapes nothing.
+                            // An established connection has the same exposure,
+                            // and both use the same function.
+                            debug!(
+                                %remote,
+                                error = %crate::logfmt::peer_error(error),
+                                "QUIC handshake failed"
+                            );
+                            return None;
+                        }
+                        // Equally routine, and logged at the same level for the
+                        // same reason: a flood is exactly when this fires.
+                        Err(_elapsed) => {
+                            debug!(
+                                %remote,
+                                timeout_secs = handshake_deadline.as_secs(),
+                                "QUIC handshake did not complete in time"
+                            );
+                            return None;
+                        }
+                    };
+
+                    let peer = peer_info(&quic);
+                    info!(
+                        log_id = "7l4svyo3",
+                        remote = %peer.remote,
+                        alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
+                        server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
+                        // At this point the estimate comes from the handshake
+                        // samples alone; the close logs below carry the lifetime
+                        // smoothed value.
+                        rtt_ms = quic.rtt().as_millis(),
+                        "connection established"
+                    );
+                    established = Some((peer.remote, quic.clone()));
+
+                    // Which of the two log levels this connection deserves is
+                    // decided from the error value `conn::handle` returned, and
+                    // never from `close_reason()` on the kept handle. Returning
+                    // from `conn::handle` drops the HTTP/3 connection, whose
+                    // `Drop` closes the QUIC connection with H3_NO_ERROR; quinn's
+                    // close path then unconditionally overwrites the stored
+                    // reason with `LocallyClosed`. So by the time control is back
+                    // here, `close_reason()` reports that drop rather than
+                    // whatever actually ended the connection, and an idle timeout
+                    // would be logged as an error.
+                    let handled = conn::handle(
+                        quic,
+                        config,
+                        shutdown,
+                        &resolver,
+                        tunnels.clone(),
+                        dropped_datagrams.clone(),
+                        authenticated,
+                    )
+                    .await;
+                    Some(match handled {
+                        // The accept loop ended on its own terms: the GOAWAY
+                        // drain completed.
                         Ok(()) => Ok(CloseReason::Drained),
                         Err(error) => match h3api::benign_close(&error) {
-                            // Surge abandons connections without a CONNECTION_CLOSE
-                            // (network switch, app exit), so letting one idle out is the
-                            // everyday goodbye, not a failure.
+                            // Surge abandons connections without a
+                            // CONNECTION_CLOSE (network switch, app exit), so
+                            // letting one idle out is the everyday goodbye, not a
+                            // failure.
                             Some(h3api::BenignClose::Idle) => Ok(CloseReason::Idle),
                             // A peer that closed cleanly is equally routine.
                             Some(h3api::BenignClose::PeerClosed) => Ok(CloseReason::PeerClosed),
                             None => Err(error),
                         },
-                    },
+                    })
+                } => closed,
             };
 
-            log_connection_closed(
-                peer.remote,
-                &rtt_probe,
-                closed,
-                tunnels.load(Ordering::Relaxed),
-                dropped_datagrams.load(Ordering::Relaxed),
-            );
+            // `None` is a handshake that failed or lapsed, already logged where
+            // it was decided.
+            let Some(closed) = closed else { return };
+            match established {
+                // Only an eviction ends a connection before its handshake has
+                // completed. DEBUG rather than the INFO the established case
+                // gets: there is no connection yet, so there is nothing to
+                // report about one.
+                None => debug!(
+                    %remote,
+                    "evicted before its QUIC handshake completed: the server is full"
+                ),
+                Some((remote, rtt_probe)) => log_connection_closed(
+                    remote,
+                    &rtt_probe,
+                    closed,
+                    tunnels.load(Ordering::Relaxed),
+                    dropped_datagrams.load(Ordering::Relaxed),
+                ),
+            }
         }
     }
 
