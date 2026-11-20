@@ -1579,9 +1579,12 @@ pub use crate::hello::{FirstFlight, first_flight};
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
-// coverage-guided fuzzer is for. No judging seam is an entry point of its own:
-// each calls the functions the socket path calls, so a finding here is a
-// finding in what the server runs.
+// coverage-guided fuzzer is for. Each judging seam calls the functions the
+// socket path calls, with one difference: its `Judge` derives Initial keys
+// through rustls ([`nameless_crypto`]), while the server's derives them through
+// its own provider, `tls::awslc::keys`. Both implement RFC 9001 §5.2 and
+// derive the same keys, but the header and packet key code the fuzz targets
+// run is rustls's, so the server's key code is not what they explore.
 
 /// The hold's bounds, for the fuzz target and the tests that assert them.
 #[doc(hidden)]
@@ -1601,9 +1604,11 @@ fn seam_judge() -> &'static Judge {
 /// The gate's verdict on one datagram, for the fuzz target and the tests.
 ///
 /// This is `Gate::screen`'s own `Judge::judge`, over a judge built once per
-/// process, so the judgement a fuzzer explores is the judgement a received
-/// datagram gets. The socket, the batch walk and the blinding are the only
-/// parts left out, and none of them is a parser.
+/// process. The socket, the batch walk and the blinding are left out, and
+/// none of them is a parser. The Initial keys are rustls's rather than the
+/// server's provider's (see [`nameless_crypto`]): the same keys, from another
+/// implementation, so the header and packet key code a fuzzer runs here is
+/// not the code a received datagram runs.
 ///
 /// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
 /// to call it, and nothing in this crate does.
@@ -1636,8 +1641,10 @@ pub enum Screened {
 ///
 /// It runs the receive path's own code: [`Judge::classify`], then the hold
 /// through the function `Gate::screen_holding` calls, under a policy the
-/// caller gives and a clock the caller moves. The socket, the batch walk, the
-/// blinding and the delivery into quinn's buffers are what is left out.
+/// caller gives and a clock the caller moves, with the seams' rustls Initial
+/// keys in place of the server's (see [`judgement`]). The socket, the batch
+/// walk, the blinding and the delivery into quinn's buffers are what is left
+/// out.
 #[doc(hidden)]
 pub struct Screening {
     policy: Policy,
@@ -1773,7 +1780,9 @@ pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
 /// the keys the running server derives, and [`judgement`], the fuzz target and
 /// the tests that spell Initial packets need no key material, no file and no
 /// clock to open or to build the packets the real gate opens. The resolver is
-/// never asked for anything: nothing here starts a TLS session.
+/// never asked for anything: nothing here starts a TLS session. It derives
+/// them with rustls's code, where the server uses its own provider's
+/// (`tls::awslc::keys`): the keys are the same, the code is not.
 ///
 /// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
 /// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
