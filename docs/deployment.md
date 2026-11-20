@@ -521,14 +521,17 @@ A cloud provider's security group needs the same rule, on UDP.
 
 ## File-descriptor budget
 
-Each tunnel — TCP or UDP — costs one descriptor, and one client multiplexes many
-onto a single QUIC connection. The quota is per connection, so the number the
-process has to have descriptors for is the **product**, plus a fixed 64 for the
-listening socket, stdio and the certificate a `SIGHUP` re-reads. A QUIC stream
-holds no descriptor of its own. Not counted are the resolver sockets of lookups
-whose request has already given up: such a lookup keeps its socket to the
-nameserver open until `getaddrinfo` returns, and the lookup budget allows up to
-384 of them at the defaults, so the process can need that many more:
+Each tunnel, TCP or UDP, costs one descriptor, and one client multiplexes many
+onto a single QUIC connection. The quota is per connection, so
+`max_targets_per_conn` and systemd's `LimitNOFILE` are two halves of one budget:
+the number the process has to have descriptors for is the **product**, plus
+`FD_HEADROOM` = 64 descriptors for the listening socket, stdio and the
+certificate a `SIGHUP` re-reads. With `max_connections = 0`, which removes the
+connection cap, the check counts one connection's quota. A QUIC stream holds no
+descriptor of its own. Not counted are the resolver sockets of lookups whose
+request has already given up: such a lookup keeps its socket to the nameserver
+open until `getaddrinfo` returns, and the lookup budget allows up to 384 of them
+at the defaults, so the process can need that many more:
 
 ```
 limits.max_connections × limits.max_targets_per_conn + 64
@@ -550,8 +553,9 @@ this host's descriptor budget rather than at the targets, and it carries no
 `next-hop` because nothing was contacted. The same answer covers the other ways
 a host can run out — no kernel buffer, no ephemeral port left to bind.
 
-volto compares that number against `RLIMIT_NOFILE` at startup and warns when it
-does not fit, which is worth heeding rather than silencing. Take the headroom in
+volto compares that number against `RLIMIT_NOFILE` at startup and on every
+reload, and warns when it does not fit, which is worth heeding rather than
+silencing. Take the headroom in
 whichever direction suits the host: raise `LimitNOFILE`, or lower
 `limits.max_connections`, which is also the knob that bounds memory.
 
