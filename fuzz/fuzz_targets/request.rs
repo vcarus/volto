@@ -263,7 +263,8 @@ fn check(request: &Request) {
     }
 
     if let Some(authority) = request.authority.as_deref() {
-        // `tunnel::tcp` and `net::resolve` are handed this without re-checking.
+        // `tunnel::tcp` and `ConnectionResolver::lookup` are handed this without
+        // re-checking.
         assert!(!authority.is_empty(), "an authority is never empty");
         assert!(authority.is_ascii(), "an authority is ASCII: {authority:?}");
     }
