@@ -80,11 +80,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Static musl binaries, so a release runs on any glibc vintage. aws-lc-rs
-      # needs a working cross C toolchain for aarch64, which is what `cross`
-      # provides; the non-FIPS build ships pre-generated bindings, so it wants a
-      # C compiler but neither cmake nor bindgen nor Go. --locked builds the
-      # committed lockfile and nothing else.
+      # Static musl binaries, so a release runs on any glibc vintage. Since D115
+      # AWS-LC needs a musl C and C++ toolchain, cmake and libclang for both
+      # targets, which is what the `cross` images provide; Go is still not
+      # needed. --locked builds the committed lockfile and nothing else.
       #
       # cross.yml runs this exact step on the pull requests that can break it,
       # which is only worth anything while the two are identical. The markers
@@ -92,6 +91,13 @@ jobs:
       # files; this prose is outside them and differs per file, and everything
       # inside them, comments included, has to match byte for byte.
       # >>> mirrored build step (release.yml <-> cross.yml) >>>
+      # `force-use-cross: true` builds both targets inside a `cross` image. The
+      # server's TLS (D115) builds AWS-LC's libssl, which is C++, through cmake
+      # and generates its bindings with bindgen. The `cross` images carry
+      # cmake, libclang, a musl C++ compiler and the bindgen sysroot for each
+      # target. The runner does not: the action would otherwise build the
+      # x86_64 target on the runner with musl-gcc, where no musl C++ compiler
+      # exists and bindgen finds no C headers for a musl target.
       # `strip: true` is the action's own input and it is a no-op for a target
       # this action cross-builds, which is how the first v0.10.0 release shipped
       # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
@@ -104,6 +110,7 @@ jobs:
           target: ${{ matrix.target }}
           args: "--locked --release"
           strip: true
+          force-use-cross: true
       # <<< mirrored build step (release.yml <-> cross.yml) <<<
 
       # >>> mirrored smoke step (release.yml <-> cross.yml) >>>

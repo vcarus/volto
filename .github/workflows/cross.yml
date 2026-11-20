@@ -64,6 +64,13 @@ jobs:
       # the markers below and fails if they differ by a byte, and release.yml is
       # in this workflow's `paths` filter so editing that side runs this side.
       # >>> mirrored build step (release.yml <-> cross.yml) >>>
+      # `force-use-cross: true` builds both targets inside a `cross` image. The
+      # server's TLS (D115) builds AWS-LC's libssl, which is C++, through cmake
+      # and generates its bindings with bindgen. The `cross` images carry
+      # cmake, libclang, a musl C++ compiler and the bindgen sysroot for each
+      # target. The runner does not: the action would otherwise build the
+      # x86_64 target on the runner with musl-gcc, where no musl C++ compiler
+      # exists and bindgen finds no C headers for a musl target.
       # `strip: true` is the action's own input and it is a no-op for a target
       # this action cross-builds, which is how the first v0.10.0 release shipped
       # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
@@ -76,6 +83,7 @@ jobs:
           target: ${{ matrix.target }}
           args: "--locked --release"
           strip: true
+          force-use-cross: true
       # <<< mirrored build step (release.yml <-> cross.yml) <<<
 
       # >>> mirrored smoke step (release.yml <-> cross.yml) >>>

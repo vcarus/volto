@@ -60,7 +60,7 @@ sudo script/deploy.sh --enable-timer       # or: install + keep it updated
 
 ### 3. From source
 
-Rust 1.100 or newer. `Cargo.lock` is committed, so build `--locked` to get the dependency graph the releases are built from.
+Rust 1.100 or newer, a C and C++ compiler, cmake and libclang (the server's TLS builds AWS-LC's libssl; see [Building](docs/deployment.md#building)). `Cargo.lock` is committed, so build `--locked` to get the dependency graph the releases are built from.
 
 ```sh
 cargo build --release --locked             # target/release/volto

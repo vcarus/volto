@@ -90,6 +90,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
+      # (D115), builds through cmake, and its Rust bindings are generated at
+      # build time by bindgen, which loads libclang. Installed rather than
+      # assumed from the runner image, so the job states what it needs.
+      - name: Install cmake and libclang
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -128,6 +134,12 @@ jobs:
       MSRV: "1.100"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
+      # (D115), builds through cmake, and its Rust bindings are generated at
+      # build time by bindgen, which loads libclang. Installed rather than
+      # assumed from the runner image, so the job states what it needs.
+      - name: Install cmake and libclang
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
       - name: Assert the pin matches Cargo.toml
         run: |
           declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
@@ -152,7 +164,7 @@ jobs:
 
   fuzz:
     # `fuzz/` is its own cargo workspace (the cargo-fuzz convention), so no
-    # other job in this file so much as parses it. Its eight targets reach into
+    # other job in this file so much as parses it. Its targets reach into
     # `src` for items that are `pub` only because they ask for them --
     # `h3::stream::build_request`, `tunnel::tcp::split_authority`,
     # `tunnel::udp::parse_target` -- and a rename or a signature change to any
@@ -191,6 +203,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
+      # (D115), builds through cmake, and its Rust bindings are generated at
+      # build time by bindgen, which loads libclang. Installed rather than
+      # assumed from the runner image, so the job states what it needs.
+      - name: Install cmake and libclang
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -256,6 +274,21 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
+      # (D115), builds through cmake, and its Rust bindings are generated at
+      # build time by bindgen, which loads libclang. Installed rather than
+      # assumed from the runner image, so the job states what it needs.
+      - name: Install cmake and libclang
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
+      # On macOS the image's Xcode carries libclang; cmake comes from Homebrew,
+      # which the image also carries, and is installed only if it is missing.
+      - name: Check cmake and libclang
+        if: runner.os == 'macOS'
+        run: |
+          command -v cmake >/dev/null || brew install cmake
+          cmake --version
+          xcrun --find clang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
@@ -300,6 +333,12 @@ jobs:
       VOLTO_PASSWORD: interop-password-not-a-secret
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
+      # (D115), builds through cmake, and its Rust bindings are generated at
+      # build time by bindgen, which loads libclang. Installed rather than
+      # assumed from the runner image, so the job states what it needs.
+      - name: Install cmake and libclang
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
