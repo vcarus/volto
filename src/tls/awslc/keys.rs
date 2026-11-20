@@ -8,11 +8,14 @@
 //! build as libssl, and it uses the same AEAD and header protection primitives
 //! rustls's QUIC keys use.
 //!
-//! The Initial and Retry values are written here rather than borrowed because
-//! neither quinn nor rustls exports them for an AES-128 key: quinn-proto's
-//! rustls helpers are `pub(crate)`, and rustls's `quic::Algorithm` builds a
-//! packet key from an `AeadKey`, whose public constructor makes 32-byte keys
-//! only. The unit tests below check every value against RFC 9001 Appendix A.
+//! The keys of every level are made here, the Initial keys included. rustls
+//! exports the Initial keys (`quic::Keys::initial`), but no way to make a
+//! packet key from a secret libssl hands over: `KeyBuilder`, `Secrets::new`
+//! and `AeadKey::with_length` are `pub(crate)`, and `AeadKey`'s public
+//! constructor makes 32-byte keys only, so an AES-128 key cannot be built from
+//! outside. One implementation for every level is simpler than two. Neither
+//! quinn nor rustls exports the Retry key. The unit tests below check every
+//! value against RFC 9001 Appendix A.
 
 #![forbid(unsafe_code)]
 
