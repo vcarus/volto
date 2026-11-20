@@ -441,6 +441,22 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
         );
     }
 
+    // The second SNI gate reads the client's name through rustls-pki-types'
+    // `DnsName` (`tls::awslc::dns_name`) and treats a name it refuses as no
+    // name, so an entry that judge refuses admits no client. The checks above
+    // refuse a subset of what it refuses and keep their own messages; this is
+    // the judge itself, so the two cannot disagree. What it adds: a label is at
+    // most 63 bytes, no label starts or ends with `-`, and the last label is not
+    // a number (all digits, or `0x` and hex digits).
+    if rustls::pki_types::DnsName::try_from(bare).is_err() {
+        bail!(
+            "security.expected_sni[{index}] = {name:?} is not a DNS host name the server's \
+             TLS accepts, so the gate would refuse every handshake that names it: a label \
+             is at most 63 bytes and does not start or end with '-', and the last label is \
+             not a number"
+        );
+    }
+
     Ok(())
 }
 
@@ -989,12 +1005,34 @@ mod tests {
         );
         assert_eq!(cfg.security.expected_sni.len(), 3);
         assert_valid_apart_from_certs(&cfg, "a list of expected SNI names");
+
+        // Names the TLS layer's `DnsName` accepts, at the edges of its rules:
+        // `_` anywhere in a label, an inner `-`, a 63-byte label, an all-digit
+        // label that is not the last, and a last label that starts like a hex
+        // number but is not one.
+        let label = "a".repeat(63);
+        for name in [
+            "_acme.example",
+            "host_.example",
+            "a-b.example",
+            &format!("{label}.example"),
+            "123.example",
+            "host.0xg",
+        ] {
+            assert!(
+                rustls::pki_types::DnsName::try_from(name).is_ok(),
+                "{name} is a premise of this test"
+            );
+            let cfg = parse(&format!("[security]\nexpected_sni = [\"{name}\"]"));
+            assert_valid_apart_from_certs(&cfg, name);
+        }
     }
 
     /// Every rejection names the entry, because a gate misconfigured this way
     /// fails silently by design: the server starts and no client can open it.
     #[test]
     fn expected_sni_rejects_names_no_client_hello_could_carry() {
+        let long_label = format!("\"{}.example\"", "a".repeat(64));
         for (entry, wanted) in [
             ("\"\"", "is empty"),
             ("\".\"", "is empty"),
@@ -1017,6 +1055,15 @@ mod tests {
             ("\"192.0.2.1.\"", "IP address literal"),
             ("\"2001:db8::1\"", "contains"),
             ("\"::1\"", "contains"),
+            // What the TLS layer's `DnsName` refuses and the checks above do
+            // not: such a name never reaches the second SNI gate as a name, so
+            // the gate admits no client for it (R7-M1).
+            ("\"proxy-.example\"", "not a DNS host name"),
+            ("\"-proxy.example\"", "not a DNS host name"),
+            ("\"host.123\"", "not a DNS host name"),
+            ("\"host.0\"", "not a DNS host name"),
+            ("\"host.0x1f\"", "not a DNS host name"),
+            (long_label.as_str(), "not a DNS host name"),
         ] {
             let message = rejected(
                 &format!("[security]\nexpected_sni = [{entry}]"),
@@ -1035,19 +1082,22 @@ mod tests {
     /// The length rule's own boundary, which the case above only reaches from
     /// the far side.
     ///
-    /// [`MAX_EXPECTED_SNI`] bytes is the longest name a ClientHello can carry,
-    /// so it has to be accepted; one more has to be refused, and the refusal has
-    /// to print both the length it got and the limit, because that pair is what
-    /// tells an operator whether the entry is a typo or a name no client could
-    /// ever send. Nothing pinned the accepting side, so `>=` in place of the `>`
-    /// refused the longest legal name and every test stayed green.
+    /// [`MAX_EXPECTED_SNI`] bytes in labels of at most 63 is the longest name a
+    /// ClientHello can carry, so it has to be accepted; one more byte has to be
+    /// refused, and the refusal has to print both the length it got and the
+    /// limit, because that pair is what tells an operator whether the entry is a
+    /// typo or a name no client could ever send. Nothing pinned the accepting
+    /// side, so `>=` in place of the `>` refused the longest legal name and every
+    /// test stayed green.
     #[test]
     fn the_longest_expected_sni_is_accepted_and_one_byte_more_is_not() {
-        let longest = "a".repeat(MAX_EXPECTED_SNI);
+        let label = |len: usize| "a".repeat(len);
+        let longest = [label(63), label(63), label(63), label(61)].join(".");
+        assert_eq!(longest.len(), MAX_EXPECTED_SNI);
         let cfg = parse(&format!("[security]\nexpected_sni = [\"{longest}\"]"));
         assert_valid_apart_from_certs(&cfg, "a name of exactly the maximum length");
 
-        let over = "a".repeat(MAX_EXPECTED_SNI + 1);
+        let over = [label(63), label(63), label(63), label(62)].join(".");
         let message = rejected(
             &format!("[security]\nexpected_sni = [\"{over}\"]"),
             "security.expected_sni[0]",
