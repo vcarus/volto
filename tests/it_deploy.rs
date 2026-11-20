@@ -746,13 +746,7 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
         bin.display(),
         unit.display()
     );
-    let output = run_shell_call(
-        "script/deploy.sh",
-        "put_back",
-        "start",
-        &stubs,
-        &prelude,
-    );
+    let output = run_shell_call("script/deploy.sh", "put_back", "start", &stubs, &prelude);
 
     let stderr = stderr_of(&output);
     assert!(
@@ -2066,7 +2060,10 @@ fn an_old_layout_moves_to_root_ownership_on_the_next_run_and_stays_there() {
         .chain([format!("root:volto {}", dir.display())])
         .collect();
     expected.sort();
-    assert_eq!(calls, expected, "the directory and its four regular files move to root: {stdout}");
+    assert_eq!(
+        calls, expected,
+        "the directory and its four regular files move to root: {stdout}"
+    );
     for (name, mode) in [
         ("config.toml", 0o640),
         ("cert.pem", 0o644),
@@ -2080,8 +2077,16 @@ fn an_old_layout_moves_to_root_ownership_on_the_next_run_and_stays_there() {
         );
     }
     assert_eq!(mode_of(&dir), 0o750);
-    assert_eq!(mode_of(&target), 0o600, "a link's target must not be changed");
-    assert_eq!(mode_of(&linked), 0o600, "a second name's file must not be changed");
+    assert_eq!(
+        mode_of(&target),
+        0o600,
+        "a link's target must not be changed"
+    );
+    assert_eq!(
+        mode_of(&linked),
+        0o600,
+        "a second name's file must not be changed"
+    );
     assert_eq!(
         fs::read_to_string(dir.join("config.toml")).ok().as_deref(),
         Some("# planted\n"),
@@ -2365,8 +2370,11 @@ fn a_stale_prev_from_an_earlier_update_is_never_restored() {
     let host = Host::new("stale-unit-prev", Service::RestartFails);
     plant_binary(&host.root, INSTALLED_VERSION);
     plant_config(&host.root);
-    fs::write(host.root.join("etc/systemd/system/volto.service.prev"), "a stale unit\n")
-        .expect("plant the stale unit");
+    fs::write(
+        host.root.join("etc/systemd/system/volto.service.prev"),
+        "a stale unit\n",
+    )
+    .expect("plant the stale unit");
     host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
 
     let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
@@ -2403,7 +2411,9 @@ fn a_stale_prev_from_an_earlier_update_is_never_restored() {
         "the stale binary must not be restored: {stderr}"
     );
     assert!(
-        stderr.contains("volto 1.3.7 failed to start and there is no previous binary to roll back to"),
+        stderr.contains(
+            "volto 1.3.7 failed to start and there is no previous binary to roll back to"
+        ),
         "{stderr}"
     );
 }
@@ -2439,11 +2449,15 @@ fn the_binary_is_replaced_by_a_rename() {
     let bin = host.bin().display().to_string();
     let installs = host.calls("install");
     assert!(
-        installs.lines().all(|line| !line.ends_with(&format!(" {bin}"))),
+        installs
+            .lines()
+            .all(|line| !line.ends_with(&format!(" {bin}"))),
         "nothing may be installed straight over {bin}: {installs}"
     );
     assert!(
-        installs.lines().any(|line| line.ends_with(&format!(" {bin}.new"))),
+        installs
+            .lines()
+            .any(|line| line.ends_with(&format!(" {bin}.new"))),
         "the new binary is written beside the old one: {installs}"
     );
 }
@@ -2476,7 +2490,11 @@ echo rw,nosuid,nodev,noexec,relatime
         "the run must name the mount and the way out: {stderr}"
     );
     assert_eq!(host.calls("curl"), "", "nothing may be downloaded first");
-    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
+    assert_eq!(
+        host.calls("systemctl"),
+        "",
+        "the service must be left alone"
+    );
 }
 
 /// A binary that is in the archive and cannot be executed is not reported as
@@ -2497,7 +2515,11 @@ fn an_unexecutable_binary_is_not_reported_as_missing() {
             && stderr.contains("noexec"),
         "the run must give both possible causes: {stderr}"
     );
-    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
+    assert_eq!(
+        host.calls("systemctl"),
+        "",
+        "the service must be left alone"
+    );
 }
 
 /// A run that finds the lock held stops before it does anything (R8-L6).
@@ -2521,7 +2543,11 @@ fn a_run_stops_when_another_run_holds_the_lock() {
         "the refusal must say why: {stderr}"
     );
     assert_eq!(host.calls("curl"), "", "nothing may be downloaded");
-    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
+    assert_eq!(
+        host.calls("systemctl"),
+        "",
+        "the service must be left alone"
+    );
     assert_eq!(
         fs::read_to_string(host.bin()).ok(),
         Some(format!("#!/bin/sh\necho \"volto {INSTALLED_VERSION}\"\n")),

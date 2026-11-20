@@ -293,7 +293,9 @@ fn credentials_with_a_pipe_or_an_ampersand_reach_the_config_verbatim() {
     ] {
         let text = generated_config(&["-u", username, "-w", password]);
         let config: Config = toml::from_str(&text).unwrap_or_else(|error| {
-            panic!("{username:?} {password:?} produced a config volto cannot parse: {error}\n{text}")
+            panic!(
+                "{username:?} {password:?} produced a config volto cannot parse: {error}\n{text}"
+            )
         });
 
         assert_eq!(config.auth.users.len(), 1, "{text}");
@@ -333,9 +335,33 @@ fn plant_argv_recorders(dir: &Path, stubs: Option<&Path>, tools: &[&str]) -> Pat
 
 /// Every external command the installer runs, by name.
 const INSTALLER_TOOLS: &[&str] = &[
-    "sed", "grep", "awk", "head", "cut", "wc", "cat", "tr", "mktemp", "rm", "openssl", "install",
-    "mv", "chown", "chgrp", "chmod", "date", "hostname", "id", "systemctl", "sleep", "useradd",
-    "ufw", "dirname", "find", "cmp", "apt-get",
+    "sed",
+    "grep",
+    "awk",
+    "head",
+    "cut",
+    "wc",
+    "cat",
+    "tr",
+    "mktemp",
+    "rm",
+    "openssl",
+    "install",
+    "mv",
+    "chown",
+    "chgrp",
+    "chmod",
+    "date",
+    "hostname",
+    "id",
+    "systemctl",
+    "sleep",
+    "useradd",
+    "ufw",
+    "dirname",
+    "find",
+    "cmp",
+    "apt-get",
 ];
 
 /// The password never appears on the argument vector of a program the
@@ -1136,10 +1162,7 @@ fn systemctl_calls(stubs: &Path) -> String {
 /// its tunnels.
 #[test]
 fn a_rerun_on_a_configured_host_keeps_the_binary_and_the_unit() {
-    for (name, args) in [
-        ("rerun-plain", &[][..]),
-        ("rerun-force", &["--force"][..]),
-    ] {
+    for (name, args) in [("rerun-plain", &[][..]), ("rerun-force", &["--force"][..])] {
         let root = configured_root(name, "");
         let stubs = plant_root_stubs(&root, 0, "active");
 
@@ -1148,7 +1171,9 @@ fn a_rerun_on_a_configured_host_keeps_the_binary_and_the_unit() {
         let stderr = stderr_of(&output);
         assert!(output.status.success(), "{name}: {stderr}");
         assert_eq!(
-            fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+            fs::read_to_string(root.join("usr/local/bin/volto"))
+                .ok()
+                .as_deref(),
             Some(OLD_BINARY),
             "{name}: the installed binary must be kept: {stderr}"
         );
@@ -1187,7 +1212,10 @@ fn a_rerun_on_a_configured_host_keeps_the_binary_and_the_unit() {
 /// anything moves, and a refusal leaves the host as it was.
 #[test]
 fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
-    let root = configured_root("replace-refused", "\n[limits]\na_key_a_later_release_added = 2\n");
+    let root = configured_root(
+        "replace-refused",
+        "\n[limits]\na_key_a_later_release_added = 2\n",
+    );
     let stubs = plant_root_stubs(&root, 0, "active");
     let old_cert = fs::read(root.join("etc/volto/cert.pem")).expect("the certificate");
 
@@ -1200,7 +1228,9 @@ fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
         "the binary's own refusal must reach the operator: {stderr}"
     );
     assert_eq!(
-        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        fs::read_to_string(root.join("usr/local/bin/volto"))
+            .ok()
+            .as_deref(),
         Some(OLD_BINARY),
         "the installed binary must be untouched: {stderr}"
     );
@@ -1210,7 +1240,11 @@ fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
         "the refusal comes before the certificate step: {stderr}"
     );
     assert!(!root.join("usr/local/bin/volto.prev").exists());
-    assert_eq!(systemctl_calls(&stubs), "", "the service must be left alone");
+    assert_eq!(
+        systemctl_calls(&stubs),
+        "",
+        "the service must be left alone"
+    );
 }
 
 /// `--replace-binary` with a binary that loads the config keeps the previous
@@ -1219,8 +1253,11 @@ fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
 fn replacing_the_binary_keeps_the_previous_one_and_restarts() {
     let root = configured_root("replace-accepted", "");
     let stubs = plant_root_stubs(&root, 0, "active");
-    fs::write(root.join("usr/local/bin/volto.prev"), "a stale previous binary\n")
-        .expect("the stale .prev must be writable");
+    fs::write(
+        root.join("usr/local/bin/volto.prev"),
+        "a stale previous binary\n",
+    )
+    .expect("the stale .prev must be writable");
 
     let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
 
@@ -1232,7 +1269,9 @@ fn replacing_the_binary_keeps_the_previous_one_and_restarts() {
         "the new binary must be installed"
     );
     assert_eq!(
-        fs::read_to_string(root.join("usr/local/bin/volto.prev")).ok().as_deref(),
+        fs::read_to_string(root.join("usr/local/bin/volto.prev"))
+            .ok()
+            .as_deref(),
         Some(OLD_BINARY),
         "the previous binary must be kept, not a stale .prev: {stderr}"
     );
@@ -1284,7 +1323,9 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
         "the run must say what it restored: {stderr}"
     );
     assert_eq!(
-        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        fs::read_to_string(root.join("usr/local/bin/volto"))
+            .ok()
+            .as_deref(),
         Some(OLD_BINARY),
         "the previous binary must be back: {stderr}"
     );
@@ -1336,8 +1377,10 @@ fn a_first_install_writes_the_root_owned_layout() {
     );
     let install = fs::read_to_string(stubs.join("install.log")).unwrap_or_default();
     assert!(
-        install.lines().any(|line| line.starts_with("-o root -g volto -m 0640 ")
-            && line.ends_with(&format!(" {}", dir.join("config.toml").display()))),
+        install
+            .lines()
+            .any(|line| line.starts_with("-o root -g volto -m 0640 ")
+                && line.ends_with(&format!(" {}", dir.join("config.toml").display()))),
         "the config must be installed root:volto 0640: {install}"
     );
     assert!(!install.contains("-o volto"), "{install}");
@@ -1352,7 +1395,11 @@ fn a_first_install_writes_the_root_owned_layout() {
     assert_eq!(mode("key.pem"), 0o640);
     assert_eq!(mode("config.toml"), 0o640);
     assert_eq!(
-        fs::metadata(&dir).expect("the directory").permissions().mode() & 0o777,
+        fs::metadata(&dir)
+            .expect("the directory")
+            .permissions()
+            .mode()
+            & 0o777,
         0o750
     );
 }
@@ -1369,7 +1416,12 @@ fn a_symbolic_link_in_place_of_the_key_is_refused() {
     let root = scratch_tree(
         "install",
         "key-symlink",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system", "outside"],
+        &[
+            "etc/volto",
+            "usr/local/bin",
+            "etc/systemd/system",
+            "outside",
+        ],
     );
     let dir = root.join("etc/volto");
     fs::write(dir.join("cert.pem"), "not a certificate\n").expect("plant the certificate");
@@ -1388,13 +1440,23 @@ fn a_symbolic_link_in_place_of_the_key_is_refused() {
         "the refusal must say why: {stderr}"
     );
     assert_eq!(
-        fs::metadata(&target).expect("the target").permissions().mode() & 0o777,
+        fs::metadata(&target)
+            .expect("the target")
+            .permissions()
+            .mode()
+            & 0o777,
         0o600,
         "the link's target must keep its mode: {stderr}"
     );
     let chown = fs::read_to_string(stubs.join("chown.log")).unwrap_or_default();
-    assert!(!chown.contains("key.pem"), "nothing may chown through the link: {chown}");
-    assert!(!dir.join("config.toml").exists(), "no config may be written");
+    assert!(
+        !chown.contains("key.pem"),
+        "nothing may chown through the link: {chown}"
+    );
+    assert!(
+        !dir.join("config.toml").exists(),
+        "no config may be written"
+    );
 }
 
 /// The certificate name must be a host name before it reaches openssl
@@ -1430,7 +1492,11 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
         let output = run_full_install_with_stubs(&root, &stubs, &["--sni", name]);
 
         let stderr = stderr_of(&output);
-        assert!(!output.status.success(), "{name:?} must be refused: {}", stdout_of(&output));
+        assert!(
+            !output.status.success(),
+            "{name:?} must be refused: {}",
+            stdout_of(&output)
+        );
         assert!(
             stderr.contains("the certificate name must be a host name"),
             "{name:?}: the refusal must say why: {stderr}"
@@ -1565,10 +1631,18 @@ fn a_run_without_a_terminal_does_not_replace_the_password_silently() {
         stderr.contains("would replace the one the clients use"),
         "the refusal must say why: {stderr}"
     );
-    assert!(!root.join("etc/volto/config.toml").exists(), "no config may be written");
-    assert!(!root.join("etc/volto/cert.pem").exists(), "no certificate may be written");
+    assert!(
+        !root.join("etc/volto/config.toml").exists(),
+        "no config may be written"
+    );
+    assert!(
+        !root.join("etc/volto/cert.pem").exists(),
+        "no certificate may be written"
+    );
     assert_eq!(
-        fs::read_to_string(root.join("usr/local/bin/volto")).ok().as_deref(),
+        fs::read_to_string(root.join("usr/local/bin/volto"))
+            .ok()
+            .as_deref(),
         Some(OLD_BINARY),
         "the binary must be left alone"
     );
