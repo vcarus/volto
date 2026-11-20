@@ -104,18 +104,50 @@ impl EchKey {
             "EVP_HPKE_KEY_generate",
         )?;
         let private = raw_private_key(&hpke)?;
+        Self::from_private_bytes(&private, public_name, config_id, max_name_length)
+    }
+
+    /// The key whose X25519 private key is `private`, with a new ECHConfig for
+    /// it.
+    ///
+    /// The ECHConfig is a function of the key, the config_id, the public name
+    /// and the maximum name length, so the same four give the same
+    /// ECHConfigList every time. [`EchKey::generate`] calls this with a key it
+    /// drew; the fuzz target `hold` and the test that writes its seeds call it
+    /// with fixed bytes, so that a seed's ECH opens under the target's key.
+    pub fn from_private_bytes(
+        private: &[u8; X25519_KEY_LEN],
+        public_name: &str,
+        config_id: u8,
+        max_name_length: u8,
+    ) -> Result<Self> {
+        check_public_name(public_name)?;
+        // SAFETY: as in `generate`.
+        let hpke = HpkeKey::from_ptr(unsafe { sys::EVP_HPKE_KEY_new() }, "EVP_HPKE_KEY_new")?;
+        // SAFETY: `hpke` is a fresh key owned here, the KEM table is static,
+        // and `private` holds the 32 bytes whose length is passed. AWS-LC
+        // copies them.
+        let rc = unsafe {
+            sys::EVP_HPKE_KEY_init(
+                hpke.as_ptr(),
+                sys::EVP_hpke_x25519_hkdf_sha256(),
+                private.as_ptr(),
+                private.len(),
+            )
+        };
+        ffi::check(rc, "EVP_HPKE_KEY_init")?;
         let config = marshal_config(&hpke, config_id, public_name, max_name_length)?;
         let fields = ConfigFields::parse(&config)?;
 
         let key = Self {
             hpke,
-            private,
+            private: Zeroizing::new(*private),
             config,
             config_id,
             public_name: public_name.to_owned(),
             suites: fields.suites,
         };
-        // The same check `from_pem` makes, so a generated key is one this
+        // The same check `from_pem` makes, so a key made here is one this
         // server will load.
         key.keys()?;
         Ok(key)
@@ -690,6 +722,20 @@ mod tests {
         // Two keys differ, so the file is what pins the list.
         let other = EchKey::generate("public.example", 7, 32).expect("generate");
         assert_ne!(other.config_list(), key.config_list());
+    }
+
+    /// The same private bytes give the same ECHConfigList, which is what lets
+    /// the fuzz target and its seeds agree on a key; other bytes do not.
+    #[test]
+    fn the_same_private_bytes_give_the_same_list() {
+        let key = |byte: u8| {
+            EchKey::from_private_bytes(&[byte; 32], "public.example", 7, 0).expect("a key")
+        };
+        assert_eq!(key(0x42).config_list(), key(0x42).config_list());
+        assert_ne!(key(0x42).config_list(), key(0x43).config_list());
+        let pem = key(0x42).to_pem();
+        let back = EchKey::from_pem(pem.as_bytes()).expect("read back");
+        assert_eq!(back.config_list(), key(0x42).config_list());
     }
 
     /// The list carries what the file fixes: version 0xfe0d, the config_id, the

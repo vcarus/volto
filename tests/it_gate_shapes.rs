@@ -2739,3 +2739,167 @@ async fn require_ech_is_reloadable_and_refused_without_a_key() {
         .expect_err("the refused reload left require_ech on");
     assert_matches!(error, quinn::ConnectionError::TimedOut, "{error:?}");
 }
+
+// ---------------------------------------------------------------------------
+// (f) The seed corpus of `fuzz/fuzz_targets/hold.rs`
+// ---------------------------------------------------------------------------
+
+/// The X25519 private key of the hold fuzz target's ECH key, `FUZZ_KEY` in
+/// `fuzz/fuzz_targets/hold.rs`.
+const HOLD_FUZZ_KEY: [u8; 32] = [0x42; 32];
+
+/// One record of a hold fuzz input: the source address index, the time that
+/// passes before it in 50 ms steps, and the datagram.
+struct Record {
+    source: u8,
+    steps: u8,
+    datagram: Vec<u8>,
+}
+
+/// Encodes `records` under the policy byte `policy` in the target's format.
+fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
+    let mut input = vec![policy];
+    for record in records {
+        input.push((record.steps << 2) | (record.source & 0x03));
+        let length = u16::try_from(record.datagram.len()).expect("a datagram under 64 KiB");
+        input.extend_from_slice(&length.to_be_bytes());
+        input.extend_from_slice(&record.datagram);
+    }
+    input
+}
+
+/// Runs a hold fuzz input the way the target does and returns what became of
+/// its last record.
+fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
+    let (&policy, mut rest) = input.split_first().expect("a policy byte");
+    let names: &[&str] = if policy & 0x02 != 0 {
+        &["localhost"]
+    } else {
+        &[]
+    };
+    let mut screening = Screening::new(hold_policy(key, names, policy & 0x01 != 0));
+    let mut after = Duration::ZERO;
+    let mut last = Screened::Passed;
+    while let [header, high, low, tail @ ..] = rest {
+        let length = usize::from(u16::from_be_bytes([*high, *low]));
+        let (datagram, next) = tail.split_at(length);
+        rest = next;
+        after += Duration::from_millis(50 * u64::from(header >> 2));
+        last = screening
+            .receive(after, from(40_000 + u16::from(header & 0x03)), datagram)
+            .0;
+    }
+    last
+}
+
+/// Writes the seed corpus for `fuzz/fuzz_targets/hold.rs`, and pins what each
+/// seed was built to reach.
+///
+/// The target cannot spell an ECH extension that opens, so without these it
+/// would never reach the HPKE check, the replay record or a release. Each seed
+/// is a whole input, run here through the same format the target reads; the
+/// assertion is the outcome of its last record. `fuzz/corpus/` is
+/// machine-local and gitignored (D83), so this runs with every `cargo test`.
+#[test]
+fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
+    let crypto = nameless_crypto();
+    let key = Arc::new(
+        EchKey::from_private_bytes(&HOLD_FUZZ_KEY, PUBLIC_NAME, 7, 0).expect("the fuzz key"),
+    );
+    let groups = surge_groups();
+    let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
+    let two = hold_flight(&*crypto, &CLIENT_CID, &[], &ours, 2);
+    let three = hold_flight(&*crypto, &CLIENT_CID, &[], &ours, 3);
+    let plain = hold_flight(
+        &*crypto,
+        &CLIENT_CID,
+        &[],
+        &rustls_hello(&Offer::Plain, &groups, "localhost"),
+        2,
+    );
+    let grease = hold_flight(
+        &*crypto,
+        &CLIENT_CID,
+        &[],
+        &rustls_hello(&Offer::Grease, &groups, "localhost"),
+        2,
+    );
+    let record = |source: u8, steps: u8, datagram: &Vec<u8>| Record {
+        source,
+        steps,
+        datagram: datagram.clone(),
+    };
+
+    let seeds: Vec<(&str, Vec<u8>, Screened)> = vec![
+        (
+            "ech-in-two-packets",
+            hold_input(0x01, &[record(0, 0, &two[0]), record(0, 0, &two[1])]),
+            Screened::Released,
+        ),
+        (
+            "ech-in-three-packets-reversed",
+            hold_input(
+                0x01,
+                &[
+                    record(0, 0, &three[2]),
+                    record(0, 0, &three[1]),
+                    record(0, 0, &three[0]),
+                ],
+            ),
+            Screened::Released,
+        ),
+        (
+            "ech-replayed-from-another-address",
+            hold_input(
+                0x00,
+                &[
+                    record(0, 0, &two[0]),
+                    record(0, 0, &two[1]),
+                    record(1, 1, &two[0]),
+                    record(1, 0, &two[1]),
+                ],
+            ),
+            Screened::Dropped,
+        ),
+        (
+            "ech-retransmitted-from-its-own-address",
+            hold_input(
+                0x01,
+                &[
+                    record(0, 0, &two[0]),
+                    record(0, 0, &two[1]),
+                    record(0, 10, &two[0]),
+                    record(0, 0, &two[1]),
+                ],
+            ),
+            Screened::Released,
+        ),
+        (
+            "plain-with-the-name-listed",
+            hold_input(0x02, &[record(0, 0, &plain[0]), record(0, 0, &plain[1])]),
+            Screened::Released,
+        ),
+        (
+            "plain-under-require-ech",
+            hold_input(0x03, &[record(0, 0, &plain[0]), record(0, 0, &plain[1])]),
+            Screened::Dropped,
+        ),
+        (
+            "grease",
+            hold_input(0x00, &[record(0, 0, &grease[0]), record(0, 0, &grease[1])]),
+            Screened::Dropped,
+        ),
+        (
+            "a-first-packet-that-expires",
+            hold_input(0x00, &[record(0, 0, &two[0]), record(0, 63, &two[1])]),
+            Screened::Held,
+        ),
+    ];
+
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/hold");
+    std::fs::create_dir_all(&directory).expect("a corpus directory to write seeds into");
+    for (name, input, outcome) in seeds {
+        assert_eq!(run_hold_input(&key, &input), outcome, "the seed {name}");
+        std::fs::write(directory.join(name), &input).expect("a seed file");
+    }
+}
