@@ -331,6 +331,9 @@ jobs:
       # the lifetime of one job, on a loopback socket.
       VOLTO_USER: interop
       VOLTO_PASSWORD: interop-password-not-a-secret
+      # The second server, which holds an ECH key and runs with require_ech,
+      # for the masque-go ECH case (tests/interop/ech_test.go).
+      VOLTO_ECH_ADDR: 127.0.0.1:14444
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
@@ -371,6 +374,19 @@ jobs:
           echo $! > interop/server.pid
           tests/interop/serve.sh wait interop/server.log "$(cat interop/server.pid)"
 
+      # The ECH server: an ECH key, require_ech, the same certificate and
+      # credentials. serve.sh writes its configuration and the two
+      # ECHConfigLists the Go case reads, one for its key and one for a key it
+      # does not hold.
+      - name: Start the ECH server
+        id: ech-server
+        run: |
+          tests/interop/serve.sh prepare-ech "$PWD/interop" ./target/debug/volto
+          nohup ./target/debug/volto --config interop/config-ech.toml \
+            > interop/server-ech.log 2>&1 &
+          echo $! > interop/server-ech.pid
+          tests/interop/serve.sh wait interop/server-ech.log "$(cat interop/server-ech.pid)"
+
       - name: Drive it with masque-go
         working-directory: tests/interop
         env:
@@ -380,7 +396,10 @@ jobs:
         # a restored cache entry would let this job pass without a single packet
         # being sent. The timeout is the backstop for a tunnel that hangs instead
         # of failing: `go test` then panics and the job fails.
-        run: go test -v -count=1 -timeout 120s ./...
+        run: |
+          VOLTO_ECH_CONFIG="$(cat ../../interop/ech.list)" \
+          VOLTO_ECH_OTHER_CONFIG="$(cat ../../interop/ech-other.list)" \
+            go test -v -count=1 -timeout 120s ./...
 
       # This step and the two after it run even when the masque-go half failed.
       # aioquic is the only independent coverage of the TCP tunnel, so a Go
@@ -415,7 +434,9 @@ jobs:
       # gets the log printed by the step below.
       - name: The server log is clean
         if: ${{ !cancelled() && steps.server.outcome == 'success' }}
-        run: tests/interop/serve.sh check interop/server.log
+        run: |
+          tests/interop/serve.sh check interop/server.log
+          tests/interop/serve.sh check interop/server-ech.log
 
       # Runs even when an earlier step failed, including before the server was
       # started, so neither file is assumed to exist. The log is the half of a
@@ -424,9 +445,11 @@ jobs:
       - name: Stop the server and show its log
         if: always()
         run: |
-          if [ -f interop/server.pid ]; then
-            kill "$(cat interop/server.pid)" 2>/dev/null || true
-          fi
-          if [ -f interop/server.log ]; then
-            cat interop/server.log
-          fi
+          for name in server server-ech; do
+            if [ -f "interop/$name.pid" ]; then
+              kill "$(cat "interop/$name.pid")" 2>/dev/null || true
+            fi
+            if [ -f "interop/$name.log" ]; then
+              cat "interop/$name.log"
+            fi
+          done

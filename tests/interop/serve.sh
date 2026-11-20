@@ -17,14 +17,19 @@
 # an EXIT trap. Six lines apiece, and no shared shape worth naming.
 #
 # Usage, with VOLTO_ADDR / VOLTO_SNI / VOLTO_USER / VOLTO_PASSWORD in the
-# environment:
+# environment, and VOLTO_ECH_ADDR for prepare-ech:
 #
-#   serve.sh prepare <workdir>        # cert.pem, key.pem, config.toml
-#   serve.sh wait    <logfile> <pid>  # block until the server is accepting
-#   serve.sh check   <logfile>        # judge the log the run left behind
+#   serve.sh prepare     <workdir>          # cert.pem, key.pem, config.toml
+#   serve.sh prepare-ech <workdir> <volto>  # ech.pem, ech.list, ech-other.list, config-ech.toml
+#   serve.sh wait        <logfile> <pid>    # block until the server is accepting
+#   serve.sh check       <logfile>          # judge the log the run left behind
 #
 # `prepare` leaves the certificate at <workdir>/cert.pem, the key beside it,
-# and the configuration at <workdir>/config.toml.
+# and the configuration at <workdir>/config.toml. `prepare-ech` runs after it:
+# it writes a second configuration, for a second server on VOLTO_ECH_ADDR with
+# the same certificate, an ECH key and `require_ech = true`, and the two
+# ECHConfigLists the masque-go ECH case reads, one for that key and one for a
+# key the server does not hold, generated with the volto binary given.
 set -euo pipefail
 
 # The certificate: regenerated only when absent or within an hour of expiring,
@@ -77,6 +82,43 @@ max_targets_per_conn = 64
 [log]
 # Every inbound request is logged with its headers, so a client-side failure
 # can be read off the server side too.
+level = "debug"
+EOF
+}
+
+# The ECH server: the same listener settings and credentials, an ECH key, and
+# require_ech, so that a client without the key gets no reply at all. Both keys
+# are fresh on every run (`ech-keygen` never overwrites a file) and share one
+# config_id, so the list for the other key differs from ours only in the key:
+# the server has to run HPKE to tell them apart.
+write_ech_config() {
+    local work="$1" volto="$2"
+    rm -f "$work/ech.pem" "$work/ech-other.pem"
+    "$volto" ech-keygen --public-name public.example --config-id 7 --out "$work/ech.pem" \
+        | tr -d '\n' > "$work/ech.list"
+    "$volto" ech-keygen --public-name public.example --config-id 7 --out "$work/ech-other.pem" \
+        | tr -d '\n' > "$work/ech-other.list"
+    cat > "$work/config-ech.toml" <<EOF
+[server]
+listen = "$VOLTO_ECH_ADDR"
+cert = "$work/cert.pem"
+key = "$work/key.pem"
+ech_key = "$work/ech.pem"
+
+[auth]
+users = [{ username = "$VOLTO_USER", password = "$VOLTO_PASSWORD" }]
+
+[security]
+allow_private_networks = true
+require_ech = true
+
+[limits]
+socket_recv_buffer = 212992
+socket_send_buffer = 212992
+max_connections = 16
+max_targets_per_conn = 64
+
+[log]
 level = "debug"
 EOF
 }
@@ -174,6 +216,10 @@ case "${1:-}" in
         prepare_certificate "$work"
         write_config "$work"
         ;;
+    prepare-ech)
+        work="${2:?usage: serve.sh prepare-ech <workdir> <volto>}"
+        write_ech_config "$work" "${3:?usage: serve.sh prepare-ech <workdir> <volto>}"
+        ;;
     wait)
         wait_until_ready "${2:?usage: serve.sh wait <logfile> <pid>}" \
             "${3:?usage: serve.sh wait <logfile> <pid>}"
@@ -182,7 +228,7 @@ case "${1:-}" in
         check_log "${2:?usage: serve.sh check <logfile>}"
         ;;
     *)
-        echo "usage: serve.sh {prepare <workdir>|wait <logfile> <pid>|check <logfile>}" >&2
+        echo "usage: serve.sh {prepare <workdir>|prepare-ech <workdir> <volto>|wait <logfile> <pid>|check <logfile>}" >&2
         exit 2
         ;;
 esac
