@@ -310,10 +310,19 @@ async fn heard_on(socket: &UdpSocket) -> Vec<Vec<u8>> {
 /// connection, and the server drops it after its draining period, which on
 /// loopback is a few tens of milliseconds. The gate is off, because a short
 /// header passes the gate whether it is on or not.
+///
+/// The server's "connection closed" line for the relay's address says the
+/// server has seen the close, which is when its draining period starts. The
+/// end of that period, when quinn forgets the connection, is not visible from
+/// outside the server, so the replay waits a fixed second after the line: many
+/// times three probe timeouts on loopback.
 #[tokio::test]
 async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
+    let log = SharedBuffer::shared(LOG_FILTER);
     let server = TestServer::start_with(GATE_OFF).await;
     let recorder = Recorder::start(server.addr).await;
+    let seen_as = recorder.upstream.local_addr().expect("the relay's address");
+    let mark = log.mark();
 
     let endpoint = client_endpoint(&server.ca, &["h3"]);
     let connection = endpoint
@@ -327,14 +336,23 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
         .accept_uni()
         .await
         .expect("the server's control stream");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let packet = recorder
-        .recorded
-        .lock()
-        .expect("the record")
-        .first()
-        .cloned()
-        .expect("the client sent a short-header packet");
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    let packet = loop {
+        let first = recorder
+            .recorded
+            .lock()
+            .expect("the record")
+            .first()
+            .cloned();
+        if let Some(packet) = first {
+            break packet;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the client sent no short-header packet"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     // quinn-proto answers nothing shorter than 22 bytes with a reset, so a
     // shorter packet would prove nothing.
     assert!(packet.len() >= 22, "{} bytes", packet.len());
@@ -342,7 +360,10 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     endpoint.wait_idle().await;
 
     // The server's draining period is three probe timeouts, a few tens of
-    // milliseconds on loopback; a second is ample.
+    // milliseconds on loopback, from the close the line reports; a second
+    // after it is ample.
+    log.wait_for_line(mark, &["connection closed", &format!("remote={seen_as} ")])
+        .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
     recorder.relay.abort();
 
