@@ -1405,7 +1405,7 @@ fn rustls_quic_session(config: &Arc<rustls::ClientConfig>) -> rustls::quic::Clie
 #[ignore = "benchmark: run it deliberately, with --release --nocapture"]
 fn bench_gate_cost_per_first_flight() {
     use rustls::crypto::aws_lc_rs::kx_group;
-    use volto::gate::{Names, Policy, Screening};
+    use volto::gate::{Names, Policy, Screened, Screening};
     use volto::tls::{EchKey, ProbeSession, probe_server_config};
 
     let flights = env_u64("VOLTO_BENCH_FLIGHTS", 20_000);
@@ -1429,16 +1429,22 @@ fn bench_gate_cost_per_first_flight() {
     let dcid = [0x5e; 8];
     let from = SocketAddr::from(([127, 0, 0, 1], 40_000));
 
-    let cases: Vec<(&str, Policy, Vec<Vec<u8>>)> = vec![
+    // Each case with what the gate makes of its last datagram the first time
+    // the flight arrives, which is what says the case reaches the branch it
+    // names: a case that fell through to a cheaper path would be timed as
+    // that path, under this name.
+    let cases: Vec<(&str, Policy, Vec<Vec<u8>>, Screened)> = vec![
         (
             "no key, stateless gate, a listed name, 1 packet",
             listed(),
             sealed_flight(&dcid, &hello(None, &small), 1),
+            Screened::Passed,
         ),
         (
             "key, no ECH extension, 1 packet",
             with_key(),
             sealed_flight(&dcid, &hello(None, &small), 1),
+            Screened::Released,
         ),
         (
             "key, no ECH extension, 1 packet and one byte after it",
@@ -1450,42 +1456,56 @@ fn bench_gate_cost_per_first_flight() {
                     datagram
                 })
                 .collect(),
+            Screened::Released,
         ),
         (
             "key, ECH under another key with our config_id, 1 packet",
             with_key(),
             sealed_flight(&dcid, &hello(Some(&other.config_list()), &small), 1),
+            Screened::Dropped,
         ),
         (
             "key, ECH that opens, 1 packet",
             with_key(),
             sealed_flight(&dcid, &hello(Some(&key.config_list()), &small), 1),
+            Screened::Released,
         ),
         (
             "no key, stateless gate, a listed name, 2 packets",
             listed(),
             sealed_flight(&dcid, &hello(None, &surge), 2),
+            Screened::Passed,
         ),
         (
             "key, no ECH extension, 2 packets",
             with_key(),
             sealed_flight(&dcid, &hello(None, &surge), 2),
+            Screened::Released,
         ),
         (
             "key, ECH under another key with our config_id, 2 packets",
             with_key(),
             sealed_flight(&dcid, &hello(Some(&other.config_list()), &surge), 2),
+            Screened::Dropped,
         ),
         (
             "key, ECH that opens, 2 packets",
             with_key(),
             sealed_flight(&dcid, &hello(Some(&key.config_list()), &surge), 2),
+            Screened::Released,
         ),
     ];
 
-    for (what, policy, flight) in cases {
+    for (what, policy, flight, expected) in cases {
         assert!(flight.iter().all(|datagram| datagram.len() >= 1200));
         let mut screening = Screening::new(policy);
+        let (last, first_pass) = flight.split_last().expect("a flight of one packet or more");
+        for datagram in first_pass {
+            screening.receive(Duration::ZERO, from, datagram);
+        }
+        let (screened, drops) = screening.receive(Duration::ZERO, from, last);
+        assert_eq!(screened, expected, "{what}: {drops:?}");
+        screening.released();
         let mut run = |count: u64| {
             for _ in 0..count {
                 for datagram in &flight {
