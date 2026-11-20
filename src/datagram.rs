@@ -53,13 +53,9 @@ pub enum DecodeError {
 impl DecodeError {
     /// Whether RFC 9297 §2.1 requires the whole connection to be closed.
     ///
-    /// Two MUSTs, both about the Quarter Stream ID field: a datagram carrying a
-    /// value above 2^60-1, and one "whose payload is too short to allow parsing
-    /// the Quarter Stream ID field", must each "be treated as an HTTP/3
-    /// connection error of type H3_DATAGRAM_ERROR (0x33)". Both are quoted
-    /// verbatim, with their machine-readable anchors, where they are acted on,
-    /// in `h3::connection::route_datagram`. This is the pointer to them rather
-    /// than a second copy (D79).
+    /// Two MUSTs, both about the Quarter Stream ID field: a value above
+    /// 2^60-1, and a payload too short to parse it. Both are quoted where they
+    /// are acted on, in `h3::connection::route_datagram` (D79).
     ///
     /// A truncated Context ID is deliberately *not* one of them. Nothing in
     /// RFC 9298 §5 says what to do with it, so dropping the datagram is
@@ -342,9 +338,8 @@ mod tests {
         assert_eq!(quarter_stream_id(400), 100);
     }
 
-    /// The regression that motivates this module: distinct sessions must encode
-    /// to distinct Quarter Stream IDs. `h3-datagram` 0.0.2 emitted zero for all
-    /// of them, misrouting every session after the first.
+    /// Distinct sessions must encode to distinct Quarter Stream IDs, or every
+    /// session after the first misroutes.
     #[test]
     fn distinct_streams_encode_to_distinct_datagrams() {
         let mut seen = std::collections::HashSet::new();

@@ -17,11 +17,9 @@
 //!   which is what lets the protocol be extended. Skipping uses the declared
 //!   length, so a decoder that cannot skip cannot resynchronise.
 //!
-//! Length is a varint and so may declare up to 2^62 bytes. Values of a known
-//! type are buffered, which is bounded here by rejecting anything larger than a
-//! UDP payload can be; values of unknown types are discarded as they arrive and
-//! are never buffered at all. Without both rules a peer could name a huge length
-//! and make the proxy allocate for it.
+//! Length is a varint and so may declare up to 2^62 bytes, so a known type's
+//! value is bounded ([`MAX_DATAGRAM_CAPSULE_VALUE`]) and an unknown type's is
+//! discarded as it arrives.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -52,11 +50,8 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// value has to be buffered whole because a UDP payload cannot be forwarded
 /// piecewise, and a peer that declares the largest one allowed and then stops
 /// one byte short is doing nothing RFC 9297 §3.2 forbids. So what is held is
-/// held until the session's idle timeout. One capsule's worth is all of it:
-/// the decoder copies a value only when it is split across chunks, into a
-/// buffer allocated once at the declared length, and keeps no handle on any
-/// chunk once it has been drained. An unknown type is discarded as it arrives
-/// without being buffered at all.
+/// held until the session's idle timeout. One capsule's worth is all of it
+/// ([`CapsuleDecoder`] says what it copies and when).
 pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + datagram::len_u64(MAX_UDP_PAYLOAD);
 
 /// Why a capsule sequence could not be decoded.

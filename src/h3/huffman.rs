@@ -19,11 +19,8 @@ use std::sync::OnceLock;
 
 use super::error::{Code, Violation};
 
-/// Longest code in the table, in bits.
-///
-/// A `usize` because every use of it is an array bound or an index into one:
-/// the three per-length tables below are `MAX_CODE_BITS + 1` long, and the
-/// decoder's running bit count is compared against it before it indexes them.
+/// Longest code in the table, in bits; a `usize` because every use of it is an
+/// array bound or an index.
 const MAX_CODE_BITS: usize = 30;
 
 /// The EOS symbol's index in [`CODES`].
@@ -234,12 +231,8 @@ pub fn decode(encoded: &[u8]) -> Result<Vec<u8>, Violation> {
     Ok(out)
 }
 
-/// The one error this module produces: a stream error, not a connection one.
-///
-/// RFC 7541 §5.2 states each of these faults as a "decoding error" without a
-/// class, and none of them is one of the three connection errors RFC 9204
-/// names. The stream class is our own rule; `stream_error` in
-/// [`super::qpack`] states the reason.
+/// The one error this module produces: a stream error, not a connection one,
+/// by our own rule; `stream_error` in [`super::qpack`] states the reason.
 fn failed(detail: &'static str) -> Violation {
     Violation::stream(Code::QPACK_DECOMPRESSION_FAILED, detail)
 }

@@ -194,10 +194,7 @@ impl Violation {
     /// Whether a 431 is the right thing to tell the peer about this.
     ///
     /// True only for [`Self::field_section_too_large`], which says why, and
-    /// false once such a violation is escalated to a connection error. The one
-    /// reader is [`crate::h3::stream::Resolver::resolve`]; every other
-    /// stream-class violation, this code included, is answered by the bare reset
-    /// that says nothing a peer could act on wrongly.
+    /// false once such a violation is escalated to a connection error.
     pub fn is_field_section_too_large(&self) -> bool {
         self.class == Class::FieldSectionTooLarge
     }
@@ -266,24 +263,16 @@ impl From<quinn::ConnectionError> for ConnectionError {
     ///
     /// # The reason phrase
     ///
-    /// Both kinds of QUIC close carry a reason phrase (RFC 9000 §19.19). It is
-    /// any bytes the peer chooses, bounded only by the packet that carried it,
-    /// from anybody who can complete a handshake, authenticated or not. It ends
-    /// up in a production log line: [`crate::quic`] records the whole error
-    /// with `%` on the `WARN` for a connection that ended badly, and `Display`
-    /// escapes nothing. A newline in it would forge a journal entry attributed
-    /// to this server, and a kilobyte of text would be a kilobyte of journal per
-    /// handshake.
+    /// Both kinds of QUIC close carry a reason phrase the peer writes, and it
+    /// reaches the `WARN` that [`crate::quic`] writes for a connection that
+    /// ended badly; [`crate::logfmt::peer_error`] says what that would cost.
     ///
     /// For an application close only the code survives the conversion, because
     /// [`crate::h3api::benign_close`] grades on the code and nothing downstream
     /// reads the text. The transport case keeps quinn's error whole, because a
     /// peer's QUIC stack reports useful detail there. Its phrase is bounded and
-    /// escaped here, where the peer's bytes enter this type, rather than where
-    /// they are logged. [`crate::auth`] cuts a claimed user-id at the same point
-    /// for the same reason. [`crate::logfmt::peer_error`] is that cut, and
-    /// [`crate::quic`] makes the same call on a handshake that fails before
-    /// this conversion.
+    /// escaped here by [`crate::logfmt::peer_error`], where the peer's bytes
+    /// enter this type, rather than where they are logged.
     fn from(error: quinn::ConnectionError) -> Self {
         match error {
             quinn::ConnectionError::ApplicationClosed(close) => Self::ApplicationClose {

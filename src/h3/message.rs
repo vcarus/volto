@@ -73,10 +73,8 @@ impl Status {
     ///
     /// # Panics
     ///
-    /// Never in practice: every constant here is an ASCII literal and
-    /// [`Self::parse`] accepts nothing else, so the digits cannot be anything a
-    /// `str` will not hold. The check is kept rather than made unchecked
-    /// because it costs three comparisons on a path that writes a response.
+    /// Never: every constant here is an ASCII literal and [`Self::parse`]
+    /// accepts nothing else.
     pub fn as_str(&self) -> &str {
         std::str::from_utf8(&self.0).expect("a status is three ASCII digits")
     }
