@@ -1288,8 +1288,9 @@ impl DatagramPath {
     /// The MTU is on the line because the limit is the smaller of two things:
     /// what the peer's `max_datagram_frame_size` allows and what one packet at
     /// the current path MTU holds. A Surge that advertises 1300 gives a limit
-    /// of 1291 at any MTU we use, and one that advertises 1500 gives 1398 at an
-    /// MTU of 1436 and 1204 at 1242 (D48 addendum 2026-11-13). Without the MTU
+    /// of 1291 once the path MTU has reached 1329, and one that advertises 1500
+    /// gives 1398 at an MTU of 1436. Below those MTUs the MTU sets the limit for
+    /// both: 1204 at 1242 (D48 addendum 2026-11-13). Without the MTU
     /// a low limit cannot be told from a path that shrank (D81). It is read
     /// from the connection statistics on a reported drop only, never per
     /// packet.
