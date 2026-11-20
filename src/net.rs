@@ -76,8 +76,9 @@ fn literal(host: &str, port: u16) -> Option<SocketAddr> {
 /// `tokio::net::lookup_host`, which spawns exactly this, for one reason: the
 /// permit has to be dropped by the *thread*, not by the future. A
 /// `connect_timeout` that expires drops the caller, and `getaddrinfo` is not
-/// cancellable: the thread stays in the resolver until the stub gives up. A
-/// permit released at that moment would say a slot is free while the thread it
+/// cancellable: the thread stays in the resolver until the stub gives up, five
+/// seconds per attempt on a stock `resolv.conf` and tens of seconds where the
+/// nameserver answers nothing at all. A permit released at that moment would say a slot is free while the thread it
 /// stands for is still gone, which is the accounting that lets a client park
 /// the pool one `connect_timeout` at a time (D90).
 ///
@@ -118,12 +119,9 @@ async fn on_the_blocking_pool(
 /// Name lookups the whole process may have in flight beyond the one every
 /// connection keeps in reserve.
 ///
-/// The number this bounds is threads, not queries: `on_the_blocking_pool`
-/// hands a name to `getaddrinfo` on the runtime's *blocking* pool, and that call
-/// is not cancellable. A `connect_timeout` that expires drops the future and
-/// answers the client, but the thread stays in the resolver until the stub gives
-/// up on its own: five seconds per attempt on a stock `resolv.conf`, tens of
-/// seconds where the nameserver answers nothing at all. So an unbounded proxy
+/// The number this bounds is threads, not queries: a lookup holds a thread of
+/// the runtime's *blocking* pool until `getaddrinfo` returns, whatever the
+/// client does meanwhile (`on_the_blocking_pool`). So an unbounded proxy
 /// converts one client's black-holed names directly into parked threads, and the
 /// pool is process-wide: with the default `max_connections` x
 /// `max_targets_per_conn` at 65 536 in-flight requests against tokio's 512
@@ -166,11 +164,9 @@ pub const RESERVED_LOOKUP_CEILING: usize = 1024;
 /// `min(max_connections, 1024)`, and the ceiling when `max_connections` is `0`.
 ///
 /// One per connection the pool is sized for. A reserved-slot lookup holds one
-/// of these as well as its connection's own slot, and gives it back where it
-/// gives back the slot, in the blocking thread. So a lookup whose connection
-/// has closed keeps counting until `getaddrinfo` returns, and connection
-/// turnover cannot hand out more reserved slots than the pool has threads for
-/// (D90).
+/// of these as well as its connection's own slot and gives both back in the
+/// blocking thread, so connection turnover cannot hand out more reserved slots
+/// than the pool has threads for (D90).
 ///
 /// Read from `max_connections` once, at startup, like [`blocking_pool_size`],
 /// because it is the pool's number. A `SIGHUP` that changes `max_connections`
@@ -248,15 +244,11 @@ impl ResolverBudget {
 /// * **One reserved slot**, held by this connection alone and by nothing else.
 ///   No other connection can use it, so among live connections none is starved
 ///   outright: at worst its lookups run one at a time. This is the guarantee,
-///   with the one limit the next sentences state; the shared allowance is only
-///   ever an optimisation on top of it.
-///   A reserved-slot lookup also holds one permit of the server's reserved
-///   allowance ([`reserved_lookups`]) until its thread returns. While the
-///   connections that hold those permits are live, there is one for each of
-///   them. Lookups of connections that have closed keep theirs until
-///   `getaddrinfo` returns, so after heavy connection turnover a reserved
-///   lookup may wait for one of them. That wait is bounded by the host
-///   resolver's timeout, and it is what keeps the pool from being oversubscribed.
+///   with the one limit the next sentence states; the shared allowance is only
+///   ever an optimisation on top of it. After heavy connection turnover a
+///   reserved lookup may wait for a permit of [`reserved_lookups`] that a
+///   closed connection's lookup still holds, which is bounded by the host
+///   resolver's timeout.
 /// * **[`BURST_LOOKUPS`] from the shared allowance**, so ordinary use (a
 ///   client opening thirty tunnels at once) still resolves them in parallel,
 ///   while one connection can never hold more than its share of the pool.
@@ -267,11 +259,9 @@ impl ResolverBudget {
 /// One of these per connection, made by [`ResolverBudget::per_connection`] and
 /// held for the connection's whole life by its [`crate::tunnel::Context`].
 /// Deliberately not [`Clone`]: the bound is the connection's, so a second handle
-/// counting separately would be no bound at all. That is also why the four
-/// semaphores are held inline rather than behind an `Arc`: with one owner and no
-/// clone, an outer `Arc` would be an allocation for nothing. Each semaphore
-/// keeps its own, because `acquire_owned` needs an `Arc<Semaphore>` and two of
-/// them are server-wide allowances every connection really does share.
+/// counting separately would be no bound at all. With one owner, the
+/// semaphores need no outer `Arc`; each has its own because `acquire_owned`
+/// needs one.
 #[derive(Debug)]
 pub struct ConnectionResolver {
     /// This connection's own slot. One permit, never shared.
@@ -764,13 +754,9 @@ mod tests {
         /// back only part of that would erode the budget one mass expiry at a
         /// time until no connection could resolve anything.
         ///
-        /// Note what this does *not* say. A lookup that has already reached the
-        /// blocking pool keeps its slot when its caller gives up, on purpose:
-        /// the permit travels into the blocking task and is released by the
-        /// thread, because `getaddrinfo` is not cancellable and a slot freed at
-        /// `connect_timeout` would say a thread is free while it is still gone
-        /// (D90). What is proved here is the other half — a lookup that never
-        /// got a slot must not keep a claim on one.
+        /// A lookup that has already reached the blocking pool keeps its slot
+        /// on purpose ([`on_the_blocking_pool`]). What is proved here is the
+        /// other half: a lookup that never got a slot keeps no claim on one.
         #[test]
         fn lookups_that_all_give_up_at_once_give_back_everything_they_held() {
             let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
