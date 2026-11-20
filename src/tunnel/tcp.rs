@@ -1119,15 +1119,8 @@ pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
         }
     };
 
-    // RFC 3986 §3.2.3's `port = *DIGIT`, asked before the parse because
-    // `u16::from_str` also takes a sign: see [`tunnel::is_port`].
-    if !tunnel::is_port(port) {
-        return Err("invalid port");
-    }
-    let port: u16 = port.parse().map_err(|_| "invalid port")?;
-    if port == 0 {
-        return Err("port must not be zero");
-    }
+    // RFC 3986 §3.2.3's `port = *DIGIT`: see [`tunnel::parse_port`].
+    let port = tunnel::parse_port(port)?;
 
     Ok((host, port))
 }

@@ -102,7 +102,7 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "upgrade",
 ];
 
-/// Whether `text` is a port the way RFC 3986 §3.2.3 spells one.
+/// Reads a port the way RFC 3986 §3.2.3 spells one, as the number it names.
 ///
 /// That section: "The port subcomponent of authority is designated by an
 /// optional port number in decimal following the host and delimited from it by a
@@ -112,15 +112,15 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// port        = *DIGIT
 /// ```
 ///
-/// Asked by both parsers before `u16::from_str`, which is more generous than the
-/// grammar: it takes a leading `+` or `-`. Without this check `example.com:+443`
-/// and `/.well-known/masque/udp/example.com/+443/` would be dialled as 443.
-/// Nothing would be bypassed, because `Policy::allows_port` judges the number
-/// that came out of the parse and that is the number the socket is opened on.
-/// The cost is normalisation: one target would have two spellings, the
-/// authority in the log and the port on the wire would disagree, and RFC 9110
-/// §9.3.6 asks a server to "reject a CONNECT request that targets an empty or
-/// invalid port number".
+/// Used by both parsers in place of `u16::from_str`, which is more generous
+/// than the grammar: it takes a leading `+` or `-`. Without the digit check
+/// `example.com:+443` and `/.well-known/masque/udp/example.com/+443/` would be
+/// dialled as 443. Nothing would be bypassed, because `Policy::allows_port`
+/// judges the number that came out of the parse and that is the number the
+/// socket is opened on. The cost is normalisation: one target would have two
+/// spellings, the authority in the log and the port on the wire would
+/// disagree, and RFC 9110 §9.3.6 asks a server to "reject a CONNECT request
+/// that targets an empty or invalid port number".
 ///
 /// That argument is about the sign, which the grammar does not allow. Leading
 /// zeros are another matter: `*DIGIT` allows them, so `example.com:0443` is a
@@ -128,15 +128,19 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// port differently from the number dialled, and this rule does not prevent
 /// that.
 ///
-/// The empty string is refused here as well, which is not what `*DIGIT` says on
-/// its own. RFC 9298 §3 requires `target_port` to "represent an integer between
-/// 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty port beside an
-/// invalid one. Both callers would refuse it in the parse that follows anyway;
-/// saying so here keeps the two rules in one place.
-///
-/// Written once so that the two parsers cannot spell a port differently.
-pub(crate) fn is_port(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+/// The empty string and zero are refused as well, which is not what `*DIGIT`
+/// says on its own. RFC 9298 §3 requires `target_port` to "represent an
+/// integer between 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty
+/// port beside an invalid one.
+pub(crate) fn parse_port(text: &str) -> Result<u16, &'static str> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("invalid port");
+    }
+    match text.parse() {
+        Ok(0) => Err("port must not be zero"),
+        Ok(port) => Ok(port),
+        Err(_) => Err("invalid port"),
+    }
 }
 
 /// Whether a host component carries a bracket that is not part of an IP literal.
@@ -153,24 +157,21 @@ pub(crate) fn is_port(text: &str) -> bool {
 ///
 /// so a bracket left inside a host, once the pair that delimits an IP literal
 /// has been taken off, is not part of the address or the name it sits in.
+/// Refused rather than tolerated because the host is what gets dialled and what
+/// gets logged, and `example.com]` must not quietly become `example.com`, nor
+/// `[a[b]:443` be dialled as `a[b`.
 ///
 /// Both routes take that pair off whatever it holds, so `[example.com]:443`
 /// and `%5Bexample.com%5D` are dialled as `example.com`, although the grammar
 /// above gives the brackets only an IPv6address or an IPvFuture. This rule
 /// refuses a bracket that is left over; it does not check what the pair held.
-/// Refused rather than tolerated because the host is what gets dialled and what
-/// gets logged, and `example.com]` must not quietly become `example.com`, nor
-/// `[a[b]:443` be dialled as `a[b`.
 ///
 /// Both characters are asked about at all three call sites, rather than only
 /// the one each of them can actually see, so the three cannot drift: on the two
 /// bracketed routes a "]" cannot survive, because the split that found the
-/// literal takes the first one, and asking costs nothing.
-///
-/// Written once beside [`is_port`] and for the same reason, for the two routes
-/// a client can name a host by. The refusal each call site answers with stays
-/// at the call site, because a CONNECT authority and a URI template are refused
-/// in different words.
+/// literal takes the first one, and asking costs nothing. The refusal each call
+/// site answers with stays at the call site, because a CONNECT authority and a
+/// URI template are refused in different words.
 pub(crate) fn stray_bracket(host: &str) -> bool {
     host.contains(['[', ']'])
 }

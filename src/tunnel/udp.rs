@@ -1608,14 +1608,8 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         .map_err(|_| "target_port is not valid UTF-8")?;
     // RFC 9298 §3 writes `target_port = port`, which is RFC 3986 §3.2.3's
     // `*DIGIT`; the template is decoded first, so `%2B443` meets the same rule
-    // as `+443` does. See [`tunnel::is_port`].
-    if !tunnel::is_port(&port) {
-        return Err("invalid target_port");
-    }
-    let port: u16 = port.parse().map_err(|_| "invalid target_port")?;
-    if port == 0 {
-        return Err("target_port must not be zero");
-    }
+    // as `+443` does. See [`tunnel::parse_port`].
+    let port = tunnel::parse_port(&port)?;
 
     Ok((host, port))
 }
