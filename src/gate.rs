@@ -455,6 +455,9 @@ struct Held {
     /// Whether `memory` has released datagrams waiting for the next receive
     /// call. Written under the `memory` lock.
     releasing: AtomicBool,
+    /// Whether the server has stopped taking new connections. Set once, by
+    /// [`Expected::close`], and never cleared.
+    closed: AtomicBool,
 }
 
 impl fmt::Debug for Expected {
@@ -474,6 +477,7 @@ impl Expected {
             any,
             memory: Mutex::new(Memory::new()),
             releasing: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }))
     }
 
@@ -518,6 +522,46 @@ impl Expected {
                 .unwrap_or_else(PoisonError::into_inner) = policy;
         }
         self.0.any.store(any, Ordering::Release);
+    }
+
+    /// Stops every new handshake at the socket, for the rest of the process:
+    /// from the next receive call on, [`Gate`] drops every datagram that
+    /// starts with an Initial packet, whatever the policy says and whether it
+    /// is on or off, and delivers nothing more out of the hold.
+    ///
+    /// `Server::drain` calls this just before it removes the endpoint's server
+    /// configuration. Without it the shutdown grace is the one time the
+    /// endpoint answers a stranger: quinn-proto 0.11.19
+    /// `Endpoint::handle_first_packet` answers an Initial it cannot route with
+    /// a Stateless Reset when the endpoint has no server configuration, which
+    /// is the case from the drain's first step until the process ends.
+    ///
+    /// The rule is on the packet type alone because the gate cannot know which
+    /// connections the endpoint still holds. So it also drops the later
+    /// Initial packets of a handshake that was in flight when the drain began,
+    /// and that handshake ends at the client's timeout. Nothing is lost by
+    /// that: such a connection would be born under a GOAWAY and could carry no
+    /// request. An established connection sends no Initial packet, so its
+    /// traffic is untouched.
+    ///
+    /// The order against the server configuration is what makes this exact.
+    /// quinn's endpoint driver holds the endpoint's mutex from `poll_recv`
+    /// through the handling of the batch it returned (quinn 0.11.12
+    /// `EndpointDriver::poll`), and `Endpoint::set_server_config` takes the
+    /// same mutex. A batch received before this store is therefore handled
+    /// whole while the server configuration is still present, and every batch
+    /// received after the configuration is gone was screened with the flag
+    /// set, as long as the caller stores first and removes second.
+    ///
+    /// The hold is left as it is: nothing delivers from it again, it is
+    /// bounded, and the process is ending.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Expected::close`] was called.
+    pub fn closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
     }
 
     /// Whether the policy in force judges anything, without taking the lock.
@@ -1150,6 +1194,23 @@ impl AsyncUdpSocket for Gate {
         bufs: &mut [IoSliceMut<'_>],
         metas: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        // A closed gate admits no Initial and delivers nothing from the hold;
+        // `Expected::close` says why. One atomic load per batch otherwise.
+        if self.expected.closed() {
+            let count = match self.inner.poll_recv(cx, bufs, metas) {
+                Poll::Ready(Ok(count)) => count,
+                other => return other,
+            };
+            for (meta, buf) in metas.iter().zip(bufs.iter_mut()).take(count) {
+                each_datagram(meta, buf, |datagram| {
+                    if starts_with_an_initial(datagram) {
+                        blind(datagram);
+                    }
+                });
+            }
+            return Poll::Ready(Ok(count));
+        }
+
         // The datagrams of flights the hold admitted go first, ahead of the
         // socket. They were released inside an earlier call of this function,
         // which returned `Ready`, and quinn's endpoint driver calls again after
@@ -1183,24 +1244,13 @@ impl AsyncUdpSocket for Gate {
         let mut held = None;
         let mut now = None;
         for (meta, buf) in metas.iter().zip(bufs.iter_mut()).take(count) {
-            // Exactly how quinn's own receive loop walks a GRO run: `len` bytes
-            // of buffer holding datagrams `stride` bytes apart, the last one
-            // possibly shorter. A datagram the gate holds or refuses is blinded
-            // where it lies rather than cut out, so the strides stay as they
-            // were; see the module documentation.
-            let len = meta.len.min(buf.len());
-            let stride = meta.stride.max(1);
-            let mut at = 0;
-            while at < len {
-                let end = at.saturating_add(stride).min(len);
-                let datagram = &mut buf[at..end];
+            each_datagram(meta, buf, |datagram| {
                 if policy.ech.is_some() {
                     self.screen_holding(meta, datagram, &mut held, &mut now);
                 } else {
                     self.screen(meta.addr, datagram, &policy.names);
                 }
-                at = end;
-            }
+            });
         }
 
         Poll::Ready(Ok(count))
@@ -1262,6 +1312,35 @@ pub enum Refusal {
     /// Peer-chosen bytes, exactly as the extension spelled them: whatever reads
     /// them owes them [`crate::logfmt::escaped_bytes`] before they reach a log.
     OtherName(Vec<u8>),
+}
+
+/// Calls `screen` on each datagram of one received buffer.
+///
+/// Exactly how quinn's own receive loop walks a GRO run: `len` bytes of buffer
+/// holding datagrams `stride` bytes apart, the last one possibly shorter. A
+/// datagram the gate holds or refuses is blinded where it lies rather than cut
+/// out, so the strides stay as they were; see the module documentation.
+fn each_datagram(meta: &RecvMeta, buf: &mut [u8], mut screen: impl FnMut(&mut [u8])) {
+    let len = meta.len.min(buf.len());
+    let stride = meta.stride.max(1);
+    let mut at = 0;
+    while at < len {
+        let end = at.saturating_add(stride).min(len);
+        screen(&mut buf[at..end]);
+        at = end;
+    }
+}
+
+/// Whether the first packet of `datagram` is an Initial, read off its first
+/// byte alone: the long header form with packet type 0, which is the Initial
+/// type in every version quinn's endpoint accepts (QUIC v1 and the drafts 29
+/// to 34). The version is not read, so a long header of any other version with
+/// these bits counts too, and dropping that one changes nothing a closed
+/// endpoint would have done with it.
+fn starts_with_an_initial(datagram: &[u8]) -> bool {
+    datagram.first().is_some_and(|first| {
+        first & LONG_HEADER_FORM != 0 && first & LONG_PACKET_TYPE == INITIAL_PACKET_TYPE
+    })
 }
 
 /// Makes quinn's packet decoder reject a datagram before it can answer it.
@@ -1901,6 +1980,20 @@ mod tests {
 
         assert_eq!(expected.memory().hold.flights(), 0, "a flight was stranded");
         assert_eq!(datagram, sent, "the gate is off, so quinn gets it as sent");
+    }
+
+    /// The closed gate's rule reads the header form and the packet type and
+    /// nothing else: an Initial with or without the fixed bit, and not a
+    /// 0-RTT, Handshake, Retry or short-header packet, nor an empty datagram.
+    #[test]
+    fn only_a_long_header_of_type_zero_starts_with_an_initial() {
+        for first in [0xc0u8, 0x80, 0xcf, 0x8f] {
+            assert!(starts_with_an_initial(&[first, 0, 0, 0, 1]), "{first:#x}");
+        }
+        for first in [0xd0u8, 0xe0, 0xf0, 0x40, 0x00, 0x7f] {
+            assert!(!starts_with_an_initial(&[first, 0, 0, 0, 1]), "{first:#x}");
+        }
+        assert!(!starts_with_an_initial(&[]));
     }
 
     #[test]

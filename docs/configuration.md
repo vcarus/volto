@@ -642,9 +642,9 @@ Some details worth knowing before relying on it:
   The gate itself passes every short-header packet, because telling a live
   connection's packets from a stranger's needs state the gate does not have,
   and filtering on the address instead would break the connection migration a
-  phone behind a relay's NAT depends on. One exception remains: during the
-  shutdown grace, after the server stops accepting new connections, quinn
-  answers an Initial the gate lets through with a Stateless Reset.
+  phone behind a relay's NAT depends on. During the shutdown grace, after the
+  server stops accepting new connections, it drops every Initial packet without
+  a reply, so a client that arrives then gives up at its own handshake timeout.
 - **Rejected names.** A name that no ClientHello could carry is refused at
   startup rather than accepted and never matched — an empty string, a wildcard, a
   name over 253 bytes, anything outside the ASCII letters, digits, `-`, `.` and

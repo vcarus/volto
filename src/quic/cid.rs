@@ -32,9 +32,10 @@
 //! The one other caller of `Endpoint::stateless_reset` is
 //! `Endpoint::handle_first_packet`, and it calls it only when the endpoint has
 //! no server configuration. This server has one from bind until
-//! `Server::drain` removes it at shutdown, so during the shutdown grace an
-//! Initial the gate lets through is still answered with a Stateless Reset; this
-//! wrapper does not change that.
+//! `Server::drain` removes it at shutdown, and `Server::drain` closes the gate
+//! first (`gate::Expected::close`), which from then on drops every datagram
+//! that starts with an Initial. So that caller is never reached with a packet
+//! from the network, and this wrapper has nothing to do with it.
 //!
 //! The cost: a client whose connection the server has forgotten, and that
 //! missed the CONNECTION_CLOSE, learns that the connection is gone from its own

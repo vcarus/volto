@@ -364,6 +364,57 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     );
 }
 
+/// An Initial that arrives during the shutdown grace draws nothing, with the
+/// gate off.
+///
+/// `Server::drain` removes the endpoint's server configuration, and
+/// quinn-proto 0.11.19 `Endpoint::handle_first_packet` answers an Initial it
+/// cannot route with a Stateless Reset when there is none, before it reads
+/// anything past the header. So the probe needs no sealed payload: a QUIC v1
+/// Initial header with an eight-byte Destination Connection ID and 1200 bytes
+/// in all. Without `gate::Expected::close` in the drain this probe drew one
+/// short-header datagram.
+///
+/// A connection that never closes its tunnel keeps the server in its grace
+/// period while the probe is out.
+#[tokio::test]
+async fn an_initial_during_the_shutdown_grace_draws_no_stateless_reset() {
+    let mut server =
+        TestServer::start_with(&format!("shutdown_grace = 3\n{}", common::ALLOW_PRIVATE)).await;
+    let target = common::spawn_echo_target().await;
+    let mut client = common::H3Client::connect(&server).await;
+    let mut stream = common::open_tcp_tunnel(&mut client, &target.to_string()).await;
+    common::echoes(&mut stream, b"held open").await;
+
+    // Before the drain the same bytes are an Initial that does not decrypt,
+    // which quinn drops without a reply, so silence then proves nothing; the
+    // probe is sent only after the drain has begun.
+    server.shutdown();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut initial = vec![0xc0]; // long header, fixed bit, Initial type
+    initial.extend_from_slice(&1u32.to_be_bytes());
+    initial.push(8); // Destination Connection ID length
+    initial.extend_from_slice(&[0xcd; 8]);
+    initial.push(0); // Source Connection ID length
+    initial.push(0); // token length
+    initial.extend_from_slice(&0x4400u16.to_be_bytes()); // Length, two bytes
+    initial.resize(1200, 0x5a);
+
+    let heard = common::udp_answers(server.addr, &initial, Duration::from_secs(1)).await;
+    assert!(
+        heard.is_empty(),
+        "an Initial during the grace drew {} datagrams, the first of {} bytes",
+        heard.len(),
+        heard.first().map_or(0, Vec::len)
+    );
+
+    // The tunnel was still being served while the probe was out, so the
+    // silence is the grace period's and not a stopped server's.
+    common::echoes(&mut stream, b"still up").await;
+    server.wait_until_stopped(common::STOP_TIMEOUT).await;
+}
+
 // ---------------------------------------------------------------------------
 // The second gate: a ClientHello too large for one Initial packet
 // ---------------------------------------------------------------------------

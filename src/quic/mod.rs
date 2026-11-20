@@ -862,8 +862,12 @@ impl Server {
     /// instant the signal fires rather than waiting to be told.
     async fn drain(&self, connections: &mut JoinSet<()>) {
         // Stop new handshakes at the source. Packets for existing connections are
-        // unaffected; a client that arrives now sees the port as closed and can
-        // fail over immediately rather than after a timeout.
+        // unaffected. A client that arrives now hears nothing and gives up at
+        // its own handshake timeout: the gate is closed first, so the Stateless
+        // Reset quinn would send an Initial once the server configuration is
+        // gone is never drawn (D106 addendum 2026-11-20, user ruling). The
+        // order of the two calls is load-bearing and `Expected::close` says
+        // why.
         //
         // "New" counts from the first Initial. A handshake quinn had already
         // queued as an `Incoming` keeps the server configuration it arrived
@@ -885,6 +889,7 @@ impl Server {
         // Dropped explicitly and at once: it is a `std::sync::Mutex` guard and
         // the wait below is an await, so it must not still be alive there.
         let swapping = self.swap.hold();
+        self.expected.close();
         self.endpoint.set_server_config(None);
         drop(swapping);
 
