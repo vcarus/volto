@@ -210,6 +210,55 @@ pub fn varint_len_of_first(first: u8) -> usize {
     1 << (first >> 6)
 }
 
+/// A type and a length, the two varints in front of every HTTP/3 frame
+/// (RFC 9114 §7.1) and every capsule (RFC 9297 §3.2), assembled across chunks.
+///
+/// A header that lies whole inside a chunk is read off it in place. One that a
+/// chunk ends inside is kept here, a byte at a time, until the next chunk
+/// completes it. A fixed array rather than a growable buffer, so a decoder that
+/// holds one allocates nothing for it. It cannot overflow: [`Self::take`]
+/// stops as soon as both varints have arrived, and RFC 9000 §16 bounds each at
+/// eight bytes.
+#[derive(Debug, Default)]
+pub(crate) struct TypeLength {
+    held: [u8; 16],
+    len: usize,
+}
+
+impl TypeLength {
+    /// The type and the length, or `None` with every byte of `chunk` kept here.
+    pub(crate) fn take(&mut self, chunk: &mut Bytes) -> Option<(u64, u64)> {
+        if self.len == 0
+            && let Some((kind, length, used)) = peek_two(chunk)
+        {
+            chunk.advance(used);
+            return Some((kind, length));
+        }
+        while let Some(&byte) = chunk.first() {
+            chunk.advance(1);
+            self.held[self.len] = byte;
+            self.len += 1;
+            if let Some((kind, length, _)) = peek_two(&self.held[..self.len]) {
+                self.len = 0;
+                return Some((kind, length));
+            }
+        }
+        None
+    }
+
+    /// How many bytes of an unfinished header are kept.
+    pub(crate) fn held(&self) -> usize {
+        self.len
+    }
+}
+
+/// Two varints off the front of `bytes`, and the number of bytes they took.
+fn peek_two(bytes: &[u8]) -> Option<(u64, u64, usize)> {
+    let (first, first_len) = peek_varint(bytes)?;
+    let (second, second_len) = peek_varint(&bytes[first_len..])?;
+    Some((first, second, first_len + second_len))
+}
+
 /// Encoded length of `value` as a QUIC varint.
 #[inline]
 pub fn varint_len(value: u64) -> usize {

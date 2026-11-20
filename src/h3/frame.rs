@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::datagram::{len_u64, peek_varint, put_varint, take_from};
+use crate::datagram::{TypeLength, len_u64, peek_varint, put_varint, take_from};
 
 use super::error::{Code, StreamError, Violation};
 use super::{HEADERS_BUFFER_BUDGET, MAX_FIELD_SECTION_SIZE};
@@ -184,9 +184,6 @@ const _: () = assert!(
     len_u64(super::HEADERS_BUFFER_BUDGET).is_multiple_of(MAX_BUFFERED_FRAME)
         && len_u64(super::HEADERS_BUFFER_BUDGET) / MAX_BUFFERED_FRAME >= 16
 );
-
-/// Longest frame header there can be: a type and a length, both varints.
-const MAX_FRAME_HEADER: usize = 2 * super::VARINT_MAX_LEN;
 
 /// Why a stream carrying a tunnel is closed when a frame that is not DATA
 /// arrives on it.
@@ -591,14 +588,10 @@ pub struct FrameDecoder {
     chunk: Bytes,
     /// Frame header bytes carried over from earlier chunks.
     ///
-    /// A fixed array rather than a growable buffer, so that constructing a
-    /// decoder allocates nothing: one is built per stream, and a peer opening
-    /// streams should not cost a heap allocation each time. It cannot
-    /// overflow: [`Self::take_frame_header`] stops as soon as two varints have
-    /// arrived, and RFC 9000 §16 bounds each at eight bytes.
-    header: [u8; MAX_FRAME_HEADER],
-    /// How many bytes of [`Self::header`] have arrived.
-    header_len: usize,
+    /// Allocates nothing, so constructing a decoder allocates nothing: one is
+    /// built per stream, and a peer opening streams should not cost a heap
+    /// allocation each time.
+    header: TypeLength,
     /// The connection's buffering budget, shared with every other decoder on
     /// it (D77).
     ///
@@ -644,8 +637,7 @@ impl FrameDecoder {
     pub fn new(stream: StreamKind, budget: Arc<BufferBudget>) -> Self {
         Self {
             chunk: Bytes::new(),
-            header: [0; MAX_FRAME_HEADER],
-            header_len: 0,
+            header: TypeLength::default(),
             budget,
             stream,
             settings_seen: false,
@@ -680,7 +672,7 @@ impl FrameDecoder {
     /// the stream was truncated, this MUST be treated as a connection error of
     /// type H3_FRAME_ERROR."
     pub fn at_frame_boundary(&self) -> bool {
-        matches!(self.state, State::Header) && self.header_len == 0
+        matches!(self.state, State::Header) && self.header.held() == 0
     }
 
     /// The next item, or `None` when more bytes are needed.
@@ -688,7 +680,7 @@ impl FrameDecoder {
         loop {
             match self.state {
                 State::Header => {
-                    let Some((kind, length)) = self.take_frame_header() else {
+                    let Some((kind, length)) = self.header.take(&mut self.chunk) else {
                         return Ok(None);
                     };
                     self.state =
@@ -774,28 +766,6 @@ impl FrameDecoder {
                     }
                 }
             }
-        }
-    }
-
-    /// Reads a frame type and length, or `None` if not all of it has arrived.
-    ///
-    /// Byte at a time because a header is at most [`MAX_FRAME_HEADER`] bytes and
-    /// may straddle any number of chunks; the copy is into a fixed array of
-    /// exactly that size.
-    fn take_frame_header(&mut self) -> Option<(u64, u64)> {
-        loop {
-            let header = &self.header[..self.header_len];
-            if let Some((kind, used)) = peek_varint(header)
-                && let Some((length, _)) = peek_varint(&header[used..])
-            {
-                self.header_len = 0;
-                return Some((kind, length));
-            }
-
-            let byte = *self.chunk.first()?;
-            self.chunk.advance(1);
-            self.header[self.header_len] = byte;
-            self.header_len += 1;
         }
     }
 

@@ -25,7 +25,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-use crate::datagram::{self, MAX_UDP_PAYLOAD};
+use crate::datagram::{self, MAX_UDP_PAYLOAD, TypeLength};
 
 /// DATAGRAM capsule type (RFC 9297 §3.5).
 pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
@@ -123,10 +123,6 @@ enum State {
     },
 }
 
-/// The longest capsule header: a Type and a Length, each a varint of at most 8
-/// bytes.
-const MAX_HEADER_LEN: usize = 16;
-
 /// An incremental capsule decoder.
 ///
 /// Feed it chunks with [`CapsuleDecoder::push`], then drain with
@@ -134,17 +130,19 @@ const MAX_HEADER_LEN: usize = 16;
 ///
 /// A capsule that lies whole inside one chunk is cut out of that chunk, so its
 /// payload is a slice of the chunk and no byte is copied. Only a capsule split
-/// across chunks is copied, into a buffer of the decoder's own: a header of at
-/// most 16 bytes, or a DATAGRAM value of at most [`MAX_DATAGRAM_CAPSULE_VALUE`]
-/// bytes, allocated once at the declared length. When `next_capsule` returns
-/// `Ok(None)` the decoder no longer refers to any chunk it was given, so what it
-/// holds between chunks is that buffer alone.
+/// across chunks is copied, into the decoder's own storage: a header into a
+/// fixed array of 16 bytes, or a DATAGRAM value of at most
+/// [`MAX_DATAGRAM_CAPSULE_VALUE`] bytes into a buffer allocated once at the
+/// declared length. When `next_capsule` returns `Ok(None)` the decoder no
+/// longer refers to any chunk it was given, so what it holds between chunks is
+/// that storage alone.
 #[derive(Debug)]
 pub struct CapsuleDecoder {
     /// The undecoded rest of the last chunk pushed.
     chunk: Bytes,
-    /// The start of a header or a DATAGRAM value that an earlier chunk ended
-    /// inside.
+    /// The start of a header that an earlier chunk ended inside.
+    header: TypeLength,
+    /// The start of a DATAGRAM value that an earlier chunk ended inside.
     partial: BytesMut,
     state: State,
 }
@@ -155,19 +153,12 @@ impl Default for CapsuleDecoder {
     }
 }
 
-/// Reads a whole capsule header off the front of `bytes`: the Type, the Length
-/// and the number of bytes the two took.
-fn peek_header(bytes: &[u8]) -> Option<(u64, u64, usize)> {
-    let (capsule_type, type_len) = datagram::peek_varint(bytes)?;
-    let (length, length_len) = datagram::peek_varint(&bytes[type_len..])?;
-    Some((capsule_type, length, type_len + length_len))
-}
-
 impl CapsuleDecoder {
     /// A decoder positioned at the start of a capsule sequence.
     pub fn new() -> Self {
         Self {
             chunk: Bytes::new(),
+            header: TypeLength::default(),
             partial: BytesMut::new(),
             state: State::Header,
         }
@@ -197,7 +188,10 @@ impl CapsuleDecoder {
     pub fn at_capsule_boundary(&self) -> bool {
         // A spent `Skip` is never seen here: `next_capsule` turns it into
         // `Header` before it returns.
-        matches!(self.state, State::Header) && self.partial.is_empty() && self.chunk.is_empty()
+        matches!(self.state, State::Header)
+            && self.header.held() == 0
+            && self.partial.is_empty()
+            && self.chunk.is_empty()
     }
 
     /// The number of bytes the decoder is currently holding.
@@ -210,7 +204,7 @@ impl CapsuleDecoder {
     /// decoder that skips an unknown capsule from one that buffers its value and
     /// returns the same `Ok(None)` either way.
     pub fn buffered_len(&self) -> usize {
-        self.partial.len() + self.chunk.len()
+        self.header.held() + self.partial.len() + self.chunk.len()
     }
 
     /// Decodes the next capsule of interest.
@@ -246,7 +240,7 @@ impl CapsuleDecoder {
                 }
 
                 State::Header => {
-                    let Some((capsule_type, length)) = self.take_header() else {
+                    let Some((capsule_type, length)) = self.header.take(&mut self.chunk) else {
                         return Ok(None);
                     };
 
@@ -277,45 +271,6 @@ impl CapsuleDecoder {
                         payload: value,
                     }));
                 }
-            }
-        }
-    }
-
-    /// Consumes a whole capsule header, or keeps what there is of one.
-    ///
-    /// Both varints must be present before either is consumed. A header that
-    /// the chunk ends inside is moved to `partial`, and the next chunk completes
-    /// it there.
-    fn take_header(&mut self) -> Option<(u64, u64)> {
-        if self.partial.is_empty() {
-            if let Some((capsule_type, length, header_len)) = peek_header(&self.chunk) {
-                self.chunk.advance(header_len);
-                return Some((capsule_type, length));
-            }
-            if !self.chunk.is_empty() {
-                self.partial = BytesMut::with_capacity(MAX_HEADER_LEN);
-                self.partial.extend_from_slice(&self.chunk);
-                self.chunk.clear();
-            }
-            return None;
-        }
-
-        // At most `MAX_HEADER_LEN` bytes are ever needed, and the bytes past
-        // the header are left in the chunk.
-        let held = self.partial.len();
-        let take = self.chunk.len().min(MAX_HEADER_LEN - held);
-        self.partial.extend_from_slice(&self.chunk[..take]);
-        match peek_header(&self.partial) {
-            Some((capsule_type, length, header_len)) => {
-                self.chunk.advance(header_len - held);
-                self.partial.clear();
-                Some((capsule_type, length))
-            }
-            None => {
-                // Two varints fit in `MAX_HEADER_LEN` bytes, so an incomplete
-                // header means the whole chunk was taken.
-                self.chunk.advance(take);
-                None
             }
         }
     }
