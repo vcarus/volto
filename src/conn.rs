@@ -700,10 +700,13 @@ fn log_request(req: &Request, stream_id: u64) {
     // `handle_request` states for the `str` it logs. See `logfmt`.
     let protocol = req.protocol.as_deref().map(bounded);
 
+    // `:method` is a token and `:path` is pchar, `/` and `?` only, so `%`
+    // cannot forge a line with either; `bounded` cuts their length, which the
+    // peer chooses before it has authenticated.
     debug!(
         stream_id,
-        method = %req.method,
-        path = %req.path.as_deref().unwrap_or_default(),
+        method = %bounded(req.method.as_str()),
+        path = %bounded(req.path.as_deref().unwrap_or_default()),
         authority = ?req.authority.as_deref(),
         scheme = ?req.scheme.as_deref(),
         protocol = ?protocol,
@@ -824,6 +827,56 @@ mod tests {
             );
             assert!(!redacted.contains("dXNlcjE6czNjcmV0"), "{redacted:?}");
         }
+    }
+
+    /// The request dump runs before the credentials check, so a peer that has
+    /// not authenticated chooses how long its `:path` and `:method` are. Both
+    /// are cut to what [`bounded`] keeps, like every other peer token a log line
+    /// carries.
+    #[test]
+    fn the_request_dump_bounds_the_peer_path_and_method() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buffer lock").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let long_path = format!("/{}", "p".repeat(4096));
+        let long_method = "M".repeat(4096);
+        let mut request = Request::new(h3api::Method::Other(long_method.as_str().into()));
+        request.path = Some(long_path.as_str().into());
+
+        let buffer = Buffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("debug")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || log_request(&request, 0));
+
+        let logged = String::from_utf8_lossy(&buffer.0.lock().expect("buffer lock")).into_owned();
+        assert!(logged.contains("inbound request"), "{logged}");
+        assert!(logged.contains(bounded(&long_path).as_ref()), "{logged}");
+        assert!(logged.contains(bounded(&long_method).as_ref()), "{logged}");
+        assert!(
+            !logged.contains(&"p".repeat(64)),
+            "an unbounded :path: {logged}"
+        );
+        assert!(
+            !logged.contains(&"M".repeat(64)),
+            "an unbounded :method: {logged}"
+        );
     }
 
     /// A non-UTF-8 value cannot be split into scheme and secret, so all of it goes.
