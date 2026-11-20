@@ -427,10 +427,9 @@ pub enum Item {
     Frame(Frame),
     /// A frame of an unknown type, skipped in full (RFC 9114 §9).
     ///
-    /// Reported rather than swallowed for the same reason as an empty DATA
-    /// frame: RFC 9114 §6.2.1 asks what the first frame on the control stream
-    /// was, and a frame this server did not understand is still a frame. Every
-    /// other reader ignores it, which is what §9 requires.
+    /// Reported rather than swallowed so that a reader sees it arrive: the
+    /// control stream's reader logs these on a sampled schedule. Every reader
+    /// otherwise ignores it, which is what §9 requires.
     Skipped {
         /// The frame type that was skipped.
         kind: u64,
@@ -1176,26 +1175,33 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64) -> Option<Viola
             //# H3_MISSING_SETTINGS.
             //
             // The first frame's type is in its header, so this is decided
-            // before the length cap and before any payload is parsed.
-            // Otherwise an oversized HEADERS or PUSH_PROMISE sent first would
-            // get the cap's stream error (a 431 where the connection must
-            // close), and a malformed first GOAWAY or MAX_PUSH_ID would get its
-            // payload error where §6.2.1 has already decided the frame. DATA
-            // and unknown types carry no cap and are left to the caller. The
-            // first SETTINGS is the frame this stream is waiting for, so it is
+            // before the length cap and before any payload is parsed, for
+            // every type. Otherwise an oversized HEADERS or PUSH_PROMISE sent
+            // first would get the cap's stream error (a 431 where the
+            // connection must close), a malformed first GOAWAY or MAX_PUSH_ID
+            // would get its payload error where §6.2.1 has already decided the
+            // frame, and an unknown first frame declaring 2^62-1 bytes would
+            // be skipped for as long as the peer kept sending. The first
+            // SETTINGS is the frame this stream is waiting for, so it is
             // exempt here and its payload is parsed.
-            if !settings_seen && kind != SETTINGS && BufferedKind::from_type(kind).is_some() {
+            if !settings_seen && kind != SETTINGS {
                 return Some(Violation::connection(
                     Code::H3_MISSING_SETTINGS,
                     format!("frame type {kind:#x} before SETTINGS on the control stream"),
                 ));
             }
 
-            // After SETTINGS, HEADERS, PUSH_PROMISE and a second SETTINGS are
-            // refused from the header at every length: the type is the
-            // offence, and charging the budget for them would let a peer hold
-            // it with frames it may not send.
+            // After SETTINGS, DATA, HEADERS, PUSH_PROMISE and a second
+            // SETTINGS are refused from the header at every length: the type
+            // is the offence, and charging the budget for them would let a
+            // peer hold it with frames it may not send.
             match kind {
+                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.1
+                //# If a DATA frame is received on a control stream, the
+                //# recipient MUST respond with a connection error of type
+                //# H3_FRAME_UNEXPECTED.
+                DATA => Some(unexpected("a DATA frame on the control stream")),
+
                 //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.2
                 //# HEADERS frames can only be sent on request streams or push
                 //# streams. If a HEADERS frame is received on a control stream,
@@ -1217,8 +1223,8 @@ fn misplaced(stream: StreamKind, settings_seen: bool, kind: u64) -> Option<Viola
 
                 // GOAWAY, CANCEL_PUSH and MAX_PUSH_ID belong on this stream once
                 // SETTINGS has opened it, and the cap is their only bound. The
-                // first SETTINGS is allowed here; DATA and unknown types are
-                // the caller's, as above.
+                // first SETTINGS is allowed here, and an unknown type is
+                // skipped under §9.
                 _ => None,
             }
         }
@@ -1772,8 +1778,7 @@ mod tests {
     }
 
     /// RFC 9114 §9: unknown types, grease included, are skipped by their
-    /// declared length and never buffered -- but their arrival is announced,
-    /// because a reader applying §6.2.1's "first frame" rule has to see them.
+    /// declared length and never buffered, and their arrival is announced.
     #[test]
     fn unknown_frame_types_are_skipped() {
         for kind in [0x21u64, 0x1f * 7 + 0x21, 0x4242] {
@@ -1873,6 +1878,11 @@ mod tests {
             StreamKind::ServerControl,
         ] {
             let mut wire = BytesMut::new();
+            // The peer's control stream opens with SETTINGS, or its first
+            // grease frame is refused (RFC 9114 §6.2.1).
+            if stream == StreamKind::ServerControl {
+                wire.extend_from_slice(&frame(SETTINGS, &[]));
+            }
             for _ in 0..=MAX_SKIPPED_FRAMES {
                 put_header(&mut wire, 0x21, 0);
             }
@@ -1884,6 +1894,8 @@ mod tests {
             loop {
                 match decoder.next_item() {
                     Ok(Some(Item::Skipped { .. })) => skipped += 1,
+                    Ok(Some(Item::Frame(Frame::Settings(_))))
+                        if stream == StreamKind::ServerControl => {}
                     Ok(Some(other)) => panic!("{stream:?}: unexpected {other:?}"),
                     Ok(None) => break,
                     Err(error) => panic!("{stream:?}: grease is not counted here, got {error:?}"),
@@ -2043,9 +2055,10 @@ mod tests {
     /// The control stream's header-decidable rules, and where they stop.
     ///
     /// Before SETTINGS, §6.2.1's first-frame rule is decided from the header at
-    /// every length for every buffered type but SETTINGS: HEADERS, PUSH_PROMISE,
-    /// GOAWAY, CANCEL_PUSH and MAX_PUSH_ID are H3_MISSING_SETTINGS whatever
-    /// their payload, and DATA and unknown types are left to `accept`. The first
+    /// every length for every type but SETTINGS: HEADERS, PUSH_PROMISE, GOAWAY,
+    /// CANCEL_PUSH and MAX_PUSH_ID are H3_MISSING_SETTINGS whatever their
+    /// payload, as DATA and unknown types are
+    /// (`a_first_frame_that_is_not_settings_is_refused_from_its_header`). The first
     /// SETTINGS is the frame the stream waits for, so it is exempt: under the
     /// cap it is buffered and parsed and a malformed one keeps its payload
     /// verdict; over the cap it keeps the load answer. Once SETTINGS has opened
@@ -2166,6 +2179,58 @@ mod tests {
         };
         assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
         assert!(!violation.is_connection_error());
+    }
+
+    /// RFC 9114 §6.2.1's first-frame rule turns on the type alone, so DATA and
+    /// an unknown type sent first are refused from their header like every
+    /// other type. An unknown first frame declaring 2^62-1 bytes would
+    /// otherwise be skipped for as long as the peer kept sending, and the rule
+    /// would never be applied. After SETTINGS, DATA is refused from its header
+    /// too (§7.2.1), while an unknown type is still skipped (§9).
+    #[test]
+    fn a_first_frame_that_is_not_settings_is_refused_from_its_header() {
+        fn control_decoder() -> FrameDecoder {
+            FrameDecoder::new(StreamKind::ServerControl, Arc::new(BufferBudget::default()))
+        }
+        let endless = crate::datagram::VARINT_MAX;
+
+        for kind in [DATA, 0x21, 0x1f * 4 + 0x21, 0x4242] {
+            for length in [0, 1, endless] {
+                let mut decoder = control_decoder();
+                let mut wire = BytesMut::new();
+                put_header(&mut wire, kind, length);
+                decoder.push(wire.freeze());
+
+                let Err(Error::Protocol(violation)) = decoder.next_item() else {
+                    panic!("a first frame of type {kind:#x} and {length} bytes must be refused")
+                };
+                assert_eq!(violation.code(), Code::H3_MISSING_SETTINGS);
+                assert!(violation.is_connection_error());
+            }
+        }
+
+        // After SETTINGS: DATA is refused with none of its payload sent, and an
+        // unknown type is skipped.
+        for (kind, refused) in [(DATA, true), (0x21, false)] {
+            let mut decoder = control_decoder();
+            let mut wire = BytesMut::from(&frame(SETTINGS, &[])[..]);
+            put_header(&mut wire, kind, endless);
+            decoder.push(wire.freeze());
+
+            assert_matches!(
+                decoder.next_item(),
+                Ok(Some(Item::Frame(Frame::Settings(_))))
+            );
+            if refused {
+                let Err(Error::Protocol(violation)) = decoder.next_item() else {
+                    panic!("DATA on the control stream must be refused from its header")
+                };
+                assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
+                assert!(violation.is_connection_error());
+            } else {
+                assert_matches!(decoder.next_item(), Ok(None));
+            }
+        }
     }
 
     /// The transition the tunnels make: a stream that accepted a field section

@@ -32,7 +32,7 @@
 //! | i2 | Opens a second control stream, a client-initiated push stream, or closes its control stream cleanly | RFC 9114 §6.2.1/§6.2.2 (`src/h3/connection.rs`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR for the first two, H3_CLOSED_CRITICAL_STREAM (0x104) for the third | [`unidirectional_streams_that_break_a_critical_stream_rule_end_the_connection`] |
 //! | i3 | Opens a second QPACK encoder or decoder stream | RFC 9204 §4.2: one of each per endpoint (`serve_qpack`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR (0x103) | [`a_second_qpack_stream_of_either_kind_ends_the_connection`] |
 //! | j | Sends a frame type reserved for HTTP/2 (0x02, 0x06, 0x08, 0x09) | `RESERVED_HTTP2_TYPES` (`src/h3/frame.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), whatever stream it arrives on | [`frame_types_reserved_for_http2_end_the_connection`] |
-//! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream, or announces an oversized HEADERS/PUSH_PROMISE first | RFC 9114 §6.2.1 first-frame rule: a frame type other than SETTINGS is missing settings at every length (`frame::misplaced` decides every buffered type but SETTINGS from the header at every length; DATA and unknown types carry no cap and are left to `Control::accept`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a), never a 431 | `it_settings::a_frame_before_settings_ends_the_connection`, [`an_oversized_frame_before_settings_is_still_missing_settings`] |
+//! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream, or announces an oversized HEADERS/PUSH_PROMISE first | RFC 9114 §6.2.1 first-frame rule: a frame type other than SETTINGS is missing settings at every length (`frame::misplaced` decides every type but SETTINGS from the header at every length) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a), never a 431 | `it_settings::a_frame_before_settings_ends_the_connection`, [`an_oversized_frame_before_settings_is_still_missing_settings`] |
 //! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431, and nothing charged to the buffering budget on the way | [`control_stream_frames_on_a_request_stream_end_the_connection`], [`a_frame_refused_for_its_type_is_never_charged_for`] |
 //! | j6 | Announces a HEADERS frame on a tunnel whose CONNECT has been answered, and never finishes it | RFC 9114 §4.4, decided from the frame header rather than after the payload (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105); the announcement never reaches the budget, so tunnels cannot pin it between them | [`a_field_section_on_an_established_tunnel_ends_the_connection`] |
 //! | j7 | Opens a request stream with a DATA frame, before any HEADERS | RFC 9114 §4.1's rule about the *order* of a request's frames, which `frame::misplaced` leaves to the reader of the request (`Resolver::resolve`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105) | [`a_data_frame_before_any_headers_ends_the_connection`] |
@@ -49,7 +49,7 @@
 //! | n | Opens more request streams than it is allowed at once | `[limits] max_streams_bidi` (`src/quic/transport.rs`) | The next one is never granted; the streams already open are untouched | [`the_bidirectional_stream_limit_caps_what_one_peer_can_open`] |
 //! | n1 | Opens request streams before it has authenticated | `INITIAL_BIDI_STREAMS` = 16, a transport parameter, raised to `[limits] max_streams_bidi` by the first request that authenticates (`src/quic/transport.rs`, `Context::mark_authenticated`) | The seventeenth is never granted: no credit, so no stream, no request task and no 407 to write. A peer that authenticates gets the configured allowance in one step | `it_transport::an_unauthenticated_connection_is_held_to_the_initial_stream_allowance`, `it_transport::authenticating_raises_the_stream_allowance_to_the_configured_one` |
 //! | n2 | Opens more tunnels than one connection may hold | `[limits] max_targets_per_conn`, taken before any socket is (`src/conn.rs`) | 503 with `Proxy-Status: connection_limit_reached`; other connections have their own budget | `it_policy::the_tunnel_quota_is_enforced_per_connection`, `it_policy::tcp_and_udp_tunnels_share_the_quota` |
-//! | o | Opens its control stream with an unknown frame whose declared length never ends, then authenticates | **None.** The MISSING_SETTINGS verdict is suspended for as long as the frame runs, and an authenticated connection is not bounded | Nothing: the connection serves requests for ever. **Recorded residual** (review L1, "recorded, not fixed"): the cost to this server is zero -- the payload is discarded as it arrives, never buffered -- and it needs credentials, so it buys an authenticated peer nothing it does not already have | [`an_unfinished_unknown_frame_suspends_the_settings_verdict`] pins today's behaviour so a change is noticed |
+//! | o | Opens its control stream with an unknown frame whose declared length never ends, before or after authenticating | RFC 9114 §6.2.1 first-frame rule, decided from the frame header for every type but SETTINGS (`frame::misplaced`) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a) at the frame header, whether or not the peer has authenticated | [`an_unfinished_unknown_first_frame_is_refused_from_its_header`] |
 //! | p | Opens and resets request streams in a storm, each announcing a full-sized field section | No rate limit; what has to hold is that every charge is released when the frame dies with its stream (`FrameDecoder`'s guard, D77) | Nothing; the budget is exactly where it was afterwards | [`a_storm_of_reset_requests_leaves_the_budget_where_it_was`] |
 //! | p2 | Floods a request stream with reserved or unknown (grease) frames before its HEADERS, each declaring no payload, so the reader skips without end | `frame::MAX_SKIPPED_FRAMES` per stream (RFC 9114 §10.5, `src/h3/frame.rs`) | RESET_STREAM + STOP_SENDING H3_EXCESSIVE_LOAD (0x107) -- a bare reset and never a 431, since no field section was ever too large; the connection carries on | [`a_request_stream_flooded_with_grease_is_reset`] |
 //! | q | Asks for a target in private address space, or on a denied port | `[security] allow_private_networks`, `denied_ports` (`src/policy.rs`) | 403 with `Proxy-Status: destination_ip_prohibited` / `http_request_denied` | `it_policy::loopback_is_prohibited_by_default`, `it_policy::special_purpose_and_transition_addresses_are_prohibited_by_default`, `it_policy::a_denied_port_is_refused_on_both_paths` |
@@ -1171,26 +1171,24 @@ async fn a_few_grease_frames_before_a_connect_still_open_a_tunnel() {
 }
 
 // ---------------------------------------------------------------------------
-// o: the recorded residual
+// o: an unknown first frame that never ends
 // ---------------------------------------------------------------------------
 
-/// An unknown frame whose declared length never ends suspends the SETTINGS
-/// verdict for as long as the peer cares to keep it running.
+/// An unknown frame whose declared length never ends, sent first on the
+/// control stream, is refused from its header with H3_MISSING_SETTINGS.
 ///
-/// **This is a recorded residual, not a bound** (review L1, decided "recorded,
-/// not fixed"). RFC 9114 §9 says unknown frame types are ignored, so the decoder
-/// discards the payload as it arrives -- which means the frame is never
-/// *completed*, and the rule that the control stream must open with SETTINGS is
-/// never reached. The cost to this server is zero: nothing is buffered, and the
-/// stream is one the peer was entitled to open anyway.
+/// RFC 9114 §9 has the decoder discard an unknown frame's payload as it
+/// arrives, so a first-frame verdict that waited for the frame to end would
+/// never be reached, and a peer could keep its connection without ever sending
+/// SETTINGS. RFC 9114 §6.2.1's rule turns on the type alone, so the frame
+/// header decides it (`frame::misplaced`).
 ///
-/// What keeps it harmless is the first half of this test: while the connection
-/// has never authenticated, D76's absolute deadline closes it regardless of what
-/// its control stream is doing. Past that door the suspension is unlimited, which
-/// is the second half -- pinned so that a change to either half is noticed here
-/// rather than in production.
+/// The first half is a peer that has not authenticated: the close is
+/// H3_MISSING_SETTINGS, not the H3_NO_ERROR of D76's deadline. The second half
+/// authenticates first and then opens its control stream the same way: the
+/// credentials do not lift the rule.
 #[tokio::test]
-async fn an_unfinished_unknown_frame_suspends_the_settings_verdict() {
+async fn an_unfinished_unknown_first_frame_is_refused_from_its_header() {
     /// An unknown frame declaring the largest length a varint can carry
     /// (2^62-1), of which one byte is sent.
     fn endless_unknown_frame() -> Vec<u8> {
@@ -1203,18 +1201,17 @@ async fn an_unfinished_unknown_frame_suspends_the_settings_verdict() {
 
     let server = TestServer::start_with(&format!("{IMPATIENT}{}", auth_section(&[USER]))).await;
 
-    // Unauthenticated: the verdict is suspended, and the connection goes anyway.
-    // H3_NO_ERROR rather than H3_MISSING_SETTINGS is the point -- what ended it
-    // was the deadline, not the rule the frame is standing on.
     let (_endpoint, unauthenticated) = silent_peer(&server).await;
     let _control =
         open_uni_stream(&unauthenticated, STREAM_CONTROL, &endless_unknown_frame()).await;
-    assert_closed_with(&unauthenticated, H3_NO_ERROR, Duration::from_secs(6)).await;
+    assert_closed_with(
+        &unauthenticated,
+        H3_MISSING_SETTINGS,
+        Duration::from_secs(6),
+    )
+    .await;
 
-    // Authenticated: nothing bounds it any more.
     let (_endpoint, authenticated) = silent_peer(&server).await;
-    let _control = open_uni_stream(&authenticated, STREAM_CONTROL, &endless_unknown_frame()).await;
-
     let (mut send, mut recv) = authenticated
         .open_bi()
         .await
@@ -1230,15 +1227,11 @@ async fn an_unfinished_unknown_frame_suspends_the_settings_verdict() {
     assert_eq!(
         status_of(&payload),
         "403",
-        "the credentials must be accepted, which is what lifts the D76 bound"
+        "the credentials must be accepted before the control stream opens"
     );
 
-    // Well past the bound the first half of this test measured.
-    stays_open(&authenticated, Duration::from_secs(4)).await;
-    assert!(
-        authenticated.close_reason().is_none(),
-        "an authenticated connection whose SETTINGS never arrived is not closed for it"
-    );
+    let _control = open_uni_stream(&authenticated, STREAM_CONTROL, &endless_unknown_frame()).await;
+    assert_closed_with(&authenticated, H3_MISSING_SETTINGS, Duration::from_secs(6)).await;
 }
 
 // ---------------------------------------------------------------------------

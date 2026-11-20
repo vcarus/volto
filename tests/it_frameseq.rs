@@ -451,8 +451,15 @@ fn script_verdict(events: &[ControlEvent], end: ControlEnd) -> u64 {
         // H3_CLOSED_CRITICAL_STREAM.
         ControlEnd::FinishCleanly => H3_CLOSED_CRITICAL_STREAM,
         // RFC 9114 §7.1: a stream that ends with its last frame truncated is
-        // H3_FRAME_ERROR.
-        ControlEnd::FinishMidFrame => H3_FRAME_ERROR,
+        // H3_FRAME_ERROR. The truncated frame is a grease frame, judged in
+        // the state the events left behind: before SETTINGS its header is
+        // already H3_MISSING_SETTINGS (§6.2.1), and the truncation is never
+        // reached.
+        ControlEnd::FinishMidFrame => {
+            let mut with_grease = events.to_vec();
+            with_grease.push(ControlEvent::Grease { n: 3, len: 5 });
+            control_verdict(&with_grease).unwrap_or(H3_FRAME_ERROR)
+        }
     }
 }
 
