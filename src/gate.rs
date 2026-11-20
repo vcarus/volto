@@ -62,7 +62,10 @@
 //!   dropped there without a reply.
 //! * **An Initial with no CRYPTO frame at offset 0**: passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
-//!   the flight it belongs to was judged when it started.
+//!   the flight it belongs to was judged when it started. Without a key the gate
+//!   reads the first packet of a datagram only (D115), so a first packet of PING
+//!   and PADDING with a whole ClientHello in an Initial coalesced behind it
+//!   passes too, and its name is judged by the second gate.
 //! * **An Initial whose ClientHello is cut short before its extensions**:
 //!   passes. A ClientHello may span several Initial packets, and a gate that
 //!   guessed here would refuse a legitimate client whose first flight is large;
@@ -101,6 +104,12 @@
 //! that somebody a QUIC v1 Initial keyed the way RFC 9001 §5.2 says, which is a
 //! probe aimed at this server rather than the scan of an address the gate is
 //! for.
+//!
+//! A ClientHello that reaches libssl past this gate (cut short and completed in
+//! the next datagram, or in an Initial coalesced behind a first packet without
+//! one) and names a host off the list draws more than an acknowledgement: the
+//! second gate refuses it with an `unrecognized_name(112)` alert in a
+//! CONNECTION_CLOSE (D106).
 //!
 //! Nor is any of this traffic obfuscation. The gate hides that a *service* is
 //! here from somebody who does not know the name to ask for; it does nothing
