@@ -682,9 +682,15 @@ impl Context {
         match username {
             // A name that exists: its own bucket, which only a success as that
             // user clears.
+            // Looked up before it is inserted, so only the first failure as a
+            // name copies it.
             Some(username) if self.auth.is_configured(username) => {
-                let bucket = failures.configured.entry(username.to_owned()).or_default();
-                *bucket = bucket.saturating_add(1);
+                match failures.configured.get_mut(username) {
+                    Some(bucket) => *bucket = bucket.saturating_add(1),
+                    None => {
+                        failures.configured.insert(username.to_owned(), 1);
+                    }
+                }
             }
             // A name nobody has, so nobody can ever succeed as it.
             Some(_) => failures.unconfigured = failures.unconfigured.saturating_add(1),
@@ -1606,6 +1612,19 @@ mod tests {
         assert_eq!(failures.configured.get("user1").copied(), Some(1));
         assert_eq!(failures.unconfigured, 5);
         assert_eq!(failures.anonymous, 1);
+    }
+
+    /// Failures as one configured user add up in that user's one bucket.
+    #[tokio::test]
+    async fn failures_as_one_user_add_up_in_its_bucket() {
+        let context = one_user_context().await;
+        for _ in 0..3 {
+            assert!(!context.record_auth_failure(Some("user1")));
+        }
+
+        let failures = context.auth_failures();
+        assert_eq!(failures.configured.len(), 1);
+        assert_eq!(failures.configured.get("user1").copied(), Some(3));
     }
 
     /// A resolver that never answers costs the request its budget and no more,
