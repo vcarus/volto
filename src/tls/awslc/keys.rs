@@ -540,7 +540,7 @@ mod tests {
         // And back, through the client's keys.
         let client = {
             let (client, server) = initial_secrets(Version::V1, &hex(CID));
-            keys_for_client(&client, &server)
+            super::keys(&client, &server)
         };
         client.header.remote.decrypt(header.len() - 2, &mut packet);
         assert_eq!(packet[..header.len()], header[..]);
@@ -551,10 +551,6 @@ mod tests {
             .decrypt(1, &header, &mut body)
             .expect("the RFC's packet opens");
         assert_eq!(&body[..], &payload[..]);
-    }
-
-    fn keys_for_client(client: &Secret, server: &Secret) -> Keys {
-        keys(client, server)
     }
 
     /// A.4: "ff000000010008f067a5502a4262b574 6f6b656e04a265ba2eff4d829058fb3f

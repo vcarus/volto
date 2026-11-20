@@ -1253,12 +1253,11 @@ impl crypto::Session for Session {
         // that arrives before the keys (`unprotect_header`, "discarding
         // unexpected Data packet"), and the client sends it again.
         let i = next.index();
+        // Taken together or not at all, so a lone secret waits for its pair.
         if shared.write[i].is_none() || shared.read[i].is_none() {
             return None;
         }
-        let (Some(local), Some(remote)) = (shared.write[i].take(), shared.read[i].take()) else {
-            return None;
-        };
+        let (local, remote) = shared.write[i].take().zip(shared.read[i].take())?;
         drop(shared);
         self.level = next;
         if next == Level::Application {
@@ -1458,12 +1457,7 @@ impl ProbeSession {
 
     /// The level the session reads at: 0 Initial, 2 Handshake, 3 1-RTT.
     pub fn level(&self) -> u8 {
-        match self.0.level {
-            Level::Initial => 0,
-            Level::EarlyData => 1,
-            Level::Handshake => 2,
-            Level::Application => 3,
-        }
+        u8::try_from(self.0.level.index()).expect("a level index is at most 3")
     }
 
     /// Whether the handshake is still running.
