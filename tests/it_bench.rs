@@ -1311,3 +1311,282 @@ fn bench_datagram_encode() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The gate's cost per first flight, beside one handshake's (D115)
+// ---------------------------------------------------------------------------
+
+/// A first flight of `hello` sealed as one Initial per piece, as a client
+/// sends it, each 1200 bytes or more.
+fn sealed_flight(dcid: &[u8; 8], hello: &[u8], pieces: usize) -> Vec<Vec<u8>> {
+    let run = hello.len().div_ceil(pieces);
+    hello
+        .chunks(run)
+        .enumerate()
+        .map(|(index, part)| {
+            let mut frame = vec![0x06];
+            let mut offset = bytes::BytesMut::new();
+            datagram::put_varint(&mut offset, (index * run) as u64);
+            frame.extend_from_slice(&offset);
+            let mut length = bytes::BytesMut::new();
+            datagram::put_varint(&mut length, part.len() as u64);
+            frame.extend_from_slice(&length);
+            frame.extend_from_slice(part);
+            volto::gate::sealed_initial(dcid, index as u8, &frame)
+        })
+        .collect()
+}
+
+/// A rustls QUIC client offering `ech` (an ECHConfigList) or no ECH, with
+/// `groups` in that order, trusting `root`.
+fn rustls_quic_client(
+    ech: Option<&[u8]>,
+    groups: &[&'static dyn rustls::crypto::SupportedKxGroup],
+    root: Option<&rustls::pki_types::CertificateDer<'static>>,
+) -> Arc<rustls::ClientConfig> {
+    use rustls::client::{EchConfig, EchMode};
+    let provider = Arc::new(rustls::crypto::CryptoProvider {
+        kx_groups: groups.to_vec(),
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    });
+    let builder = rustls::ClientConfig::builder_with_provider(provider);
+    let builder = match ech {
+        Some(list) => builder
+            .with_ech(EchMode::from(
+                EchConfig::new(
+                    rustls::pki_types::EchConfigListBytes::from(list.to_vec()),
+                    rustls::crypto::aws_lc_rs::hpke::ALL_SUPPORTED_SUITES,
+                )
+                .expect("rustls reads the list"),
+            ))
+            .expect("ECH"),
+        None => builder
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3"),
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    if let Some(root) = root {
+        roots.add(root.clone()).expect("trust the certificate");
+    }
+    let mut config = builder.with_root_certificates(roots).with_no_client_auth();
+    config.alpn_protocols = vec![b"h3".to_vec()];
+    Arc::new(config)
+}
+
+/// A rustls QUIC client session asking for `localhost`.
+fn rustls_quic_session(config: &Arc<rustls::ClientConfig>) -> rustls::quic::ClientConnection {
+    rustls::quic::ClientConnection::new(
+        config.clone(),
+        rustls::quic::Version::V1,
+        rustls::pki_types::ServerName::try_from("localhost").expect("a name"),
+        vec![0x01, 0x01, 0x00],
+    )
+    .expect("a client")
+}
+
+/// The CPU one unauthenticated first flight costs the gate, by kind, beside
+/// the CPU the server's TLS spends on one whole handshake (D115 review,
+/// finding L1 of the gate half).
+///
+/// Single-threaded and in memory, so wall time is CPU time. The gate's work
+/// runs through `gate::Screening`, which is the receive path's own
+/// classification, Initial decryption, hold and judgement; the socket, the
+/// batch walk and the copy into quinn's buffers are left out. Its Initial keys
+/// come from rustls on aws-lc-rs where the server's come from `tls::awslc` on
+/// aws-lc-rs, which derive the same keys with the same HKDF. A one-packet
+/// flight carries an X25519 ClientHello, which is the most HPKE work one
+/// 1200-byte datagram can ask for; a two-packet flight carries the
+/// X25519MLKEM768 ClientHello Surge sends. The handshake is the server half
+/// of one TLS 1.3 handshake through `tls::ProbeSession` with a rustls client
+/// offering X25519MLKEM768 first, an ECDSA P-256 certificate as
+/// `install-selfsigned.sh` makes, and no ECH; QUIC packet protection and
+/// quinn's own work are not in it.
+#[test]
+#[ignore = "benchmark: run it deliberately, with --release --nocapture"]
+fn bench_gate_cost_per_first_flight() {
+    use rustls::crypto::aws_lc_rs::kx_group;
+    use volto::gate::{Names, Policy, Screening};
+    use volto::tls::{EchKey, ProbeSession, probe_server_config};
+
+    let flights = env_u64("VOLTO_BENCH_FLIGHTS", 20_000);
+    let handshakes = env_u64("VOLTO_BENCH_HANDSHAKES", 2_000);
+    let small: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = vec![kx_group::X25519];
+    let surge: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = vec![
+        kx_group::X25519MLKEM768,
+        kx_group::X25519,
+        kx_group::SECP256R1,
+    ];
+    let hello = |ech: Option<&[u8]>, groups: &[&'static dyn rustls::crypto::SupportedKxGroup]| {
+        let mut out = Vec::new();
+        rustls_quic_session(&rustls_quic_client(ech, groups, None)).write_hs(&mut out);
+        out
+    };
+
+    let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
+    let other = EchKey::generate("public.example", 7, 0).expect("another key");
+    let with_key = || Policy::new(Names::new(&[]), Some(key.clone()), false);
+    let listed = || Policy::from(Names::new(&["localhost".to_owned()]));
+    let dcid = [0x5e; 8];
+    let from = SocketAddr::from(([127, 0, 0, 1], 40_000));
+
+    let cases: Vec<(&str, Policy, Vec<Vec<u8>>)> = vec![
+        (
+            "no key, stateless gate, a listed name, 1 packet",
+            listed(),
+            sealed_flight(&dcid, &hello(None, &small), 1),
+        ),
+        (
+            "key, no ECH extension, 1 packet",
+            with_key(),
+            sealed_flight(&dcid, &hello(None, &small), 1),
+        ),
+        (
+            "key, no ECH extension, 1 packet and one byte after it",
+            with_key(),
+            sealed_flight(&dcid, &hello(None, &small), 1)
+                .into_iter()
+                .map(|mut datagram| {
+                    datagram.push(0);
+                    datagram
+                })
+                .collect(),
+        ),
+        (
+            "key, ECH under another key with our config_id, 1 packet",
+            with_key(),
+            sealed_flight(&dcid, &hello(Some(&other.config_list()), &small), 1),
+        ),
+        (
+            "key, ECH that opens, 1 packet",
+            with_key(),
+            sealed_flight(&dcid, &hello(Some(&key.config_list()), &small), 1),
+        ),
+        (
+            "no key, stateless gate, a listed name, 2 packets",
+            listed(),
+            sealed_flight(&dcid, &hello(None, &surge), 2),
+        ),
+        (
+            "key, no ECH extension, 2 packets",
+            with_key(),
+            sealed_flight(&dcid, &hello(None, &surge), 2),
+        ),
+        (
+            "key, ECH under another key with our config_id, 2 packets",
+            with_key(),
+            sealed_flight(&dcid, &hello(Some(&other.config_list()), &surge), 2),
+        ),
+        (
+            "key, ECH that opens, 2 packets",
+            with_key(),
+            sealed_flight(&dcid, &hello(Some(&key.config_list()), &surge), 2),
+        ),
+    ];
+
+    for (what, policy, flight) in cases {
+        assert!(flight.iter().all(|datagram| datagram.len() >= 1200));
+        let mut screening = Screening::new(policy);
+        let mut run = |count: u64| {
+            for _ in 0..count {
+                for datagram in &flight {
+                    std::hint::black_box(screening.receive(
+                        Duration::ZERO,
+                        from,
+                        std::hint::black_box(datagram),
+                    ));
+                }
+                std::hint::black_box(screening.released());
+            }
+        };
+        run(flights / 10);
+        let window = Window::open();
+        run(flights);
+        let totals = window.close();
+        let per_flight = totals.cpu.as_secs_f64() * 1e6 / flights as f64;
+        println!(
+            "bench gate_flight {what}: {per_flight:.1} cpu-us/flight, {:.1} cpu-us/datagram, \
+             {:.1} wall-us/flight",
+            per_flight / flight.len() as f64,
+            totals.wall.as_secs_f64() * 1e6 / flights as f64,
+        );
+    }
+
+    // One Initial key derivation on its own, which is what a datagram with
+    // bytes after its first packet used to cost a second time.
+    let crypto = volto::gate::nameless_crypto();
+    let derive = |count: u64| {
+        for _ in 0..count {
+            std::hint::black_box(
+                crypto
+                    .initial_keys(1, &quinn::ConnectionId::new(std::hint::black_box(&dcid)))
+                    .expect("Initial keys"),
+            );
+        }
+    };
+    derive(flights / 10);
+    let window = Window::open();
+    derive(flights);
+    let totals = window.close();
+    println!(
+        "bench gate_flight one Initial key derivation: {:.1} cpu-us",
+        totals.cpu.as_secs_f64() * 1e6 / flights as f64
+    );
+
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("a self-signed certificate");
+    let cert = issued.cert.der().clone();
+    let server = probe_server_config(&cert, &issued.signing_key.serialize_der(), None)
+        .expect("a server configuration");
+    let client = rustls_quic_client(None, &surge, Some(&cert));
+    let params = [0x01, 0x01, 0x00];
+    let handshake = |server_time: &mut Duration| {
+        let mut client = rustls_quic_session(&client);
+        let mut to_server = Vec::new();
+        client.write_hs(&mut to_server);
+        let started = Instant::now();
+        let mut session = ProbeSession::new(server.clone(), &params).expect("a session");
+        *server_time += started.elapsed();
+        for _ in 0..8 {
+            if to_server.is_empty() {
+                break;
+            }
+            let started = Instant::now();
+            assert!(session.read(&to_server), "the server reads the client");
+            let out = session.write();
+            *server_time += started.elapsed();
+            to_server.clear();
+            for (_, bytes) in out {
+                client.read_hs(&bytes).expect("the client reads the server");
+                loop {
+                    let mut buf = Vec::new();
+                    let change = client.write_hs(&mut buf);
+                    let empty = buf.is_empty();
+                    to_server.extend_from_slice(&buf);
+                    if empty
+                        && (change.is_none()
+                            || matches!(change, Some(rustls::quic::KeyChange::OneRtt { .. })))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(!session.is_handshaking(), "the handshake completed");
+    };
+    let mut warm = Duration::ZERO;
+    for _ in 0..handshakes / 10 {
+        handshake(&mut warm);
+    }
+    let mut server_time = Duration::ZERO;
+    let window = Window::open();
+    for _ in 0..handshakes {
+        handshake(&mut server_time);
+    }
+    let totals = window.close();
+    println!(
+        "bench gate_flight full handshake, server TLS only: {:.1} us/handshake; client and \
+         server together {:.1} cpu-us/handshake",
+        server_time.as_secs_f64() * 1e6 / handshakes as f64,
+        totals.cpu.as_secs_f64() * 1e6 / handshakes as f64,
+    );
+}

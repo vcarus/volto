@@ -807,7 +807,7 @@ impl Judge {
     /// reading its ClientHello: passed, refused, or opened as a first Initial.
     ///
     /// `coalesced` asks for the Initial packets of the same flight behind the
-    /// first as well ([`Judge::coalesced_frames`]), which only the hold reads.
+    /// first as well ([`coalesced_frames`]), which only the hold reads.
     fn classify(&self, datagram: &[u8], coalesced: bool) -> Classified {
         let Some(&first) = datagram.first() else {
             return Classified::Pass;
@@ -888,7 +888,7 @@ impl Judge {
             return Classified::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
         }
 
-        let Some(frames) = self.decrypt(datagram, &header) else {
+        let Some((keys, frames)) = self.decrypt(datagram, &header) else {
             // Authentication failed under the keys this packet's own
             // Destination Connection ID derives. That is every client Initial
             // after the server has answered: the client has switched to the
@@ -909,7 +909,7 @@ impl Judge {
         };
 
         let more = if coalesced {
-            self.coalesced_frames(datagram, &header)
+            coalesced_frames(&keys, datagram, &header)
         } else {
             Vec::new()
         };
@@ -952,7 +952,7 @@ impl Judge {
     }
 
     /// Removes header protection and packet protection from an Initial packet,
-    /// returning its frames.
+    /// returning the Initial keys it opened under and its frames.
     ///
     /// `None` is either a packet too short for the keys to be applied (one
     /// quinn could not read either) or an authentication failure under the
@@ -961,7 +961,11 @@ impl Judge {
     /// instead, or a packet that only says it is a QUIC v1 Initial. The caller
     /// passes both through, because quinn tells them apart with the state this
     /// gate lacks and drops the second kind without a reply.
-    fn decrypt(&self, datagram: &[u8], header: &InitialHeader) -> Option<BytesMut> {
+    fn decrypt(
+        &self,
+        datagram: &[u8],
+        header: &InitialHeader,
+    ) -> Option<(quinn::crypto::Keys, BytesMut)> {
         // quinn's header key takes the whole packet and reads its sample from
         // four bytes past the packet number, so a packet too short for that
         // would panic rather than fail. RFC 9001 §5.4.2 puts the sample there.
@@ -988,54 +992,58 @@ impl Judge {
             .crypto
             .initial_keys(QUIC_V1, &ConnectionId::new(&datagram[header.dcid.clone()]))
             .ok()?;
-        open_with(&keys, datagram, header)
+        let frames = open_with(&keys, datagram, header)?;
+        Some((keys, frames))
     }
+}
 
-    /// The frames of every Initial packet coalesced behind the first one of
-    /// `datagram`, whose header is `first`, that belongs to the same flight.
-    ///
-    /// Only the hold asks for these, because only the hold reads a flight
-    /// rather than a packet: a client may put two Initial packets of one first
-    /// flight into one datagram, and the ClientHello is then not whole without
-    /// the second. A packet behind the first belongs to the flight when it is a
-    /// version 1 Initial with the same Destination Connection ID, and then it
-    /// opens under the same keys, which RFC 9001 §5.2 derives from that
-    /// connection ID; one that does not open is skipped, as quinn skips it. The
-    /// walk stops at the first packet that is anything else, because RFC 9000
-    /// §12.2 lets a receiver route on the first packet alone and a short header
-    /// can only be last. A datagram with nothing behind its first packet, which
-    /// is every first flight quinn and Surge send, costs nothing here.
-    fn coalesced_frames(&self, datagram: &[u8], first: &InitialHeader) -> Vec<BytesMut> {
-        let mut frames = Vec::new();
-        if first.packet_end >= datagram.len() {
-            return frames;
-        }
-        let dcid = &datagram[first.dcid.clone()];
-        let Ok(keys) = self.crypto.initial_keys(QUIC_V1, &ConnectionId::new(dcid)) else {
-            return frames;
-        };
-        let mut at = first.packet_end;
-        while let Some(packet) = datagram.get(at..).filter(|rest| !rest.is_empty()) {
-            let Some(&byte) = packet.first() else { break };
-            if byte & LONG_HEADER_FORM == 0
-                || byte & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE
-                || packet.get(1..5) != Some(&QUIC_V1.to_be_bytes()[..])
-            {
-                break;
-            }
-            let Some(header) = InitialHeader::parse(packet) else {
-                break;
-            };
-            if packet.get(header.dcid.clone()) != Some(dcid) {
-                break;
-            }
-            if let Some(opened) = open_with(&keys, packet, &header) {
-                frames.push(opened);
-            }
-            at += header.packet_end;
-        }
-        frames
+/// The frames of every Initial packet coalesced behind the first one of
+/// `datagram`, whose header is `first` and which opened under `keys`, that
+/// belongs to the same flight.
+///
+/// Only the hold asks for these, because only the hold reads a flight rather
+/// than a packet: a client may put two Initial packets of one first flight
+/// into one datagram, and the ClientHello is then not whole without the
+/// second. A packet behind the first belongs to the flight when it is a
+/// version 1 Initial with the same Destination Connection ID, and then it
+/// opens under the same keys, which RFC 9001 §5.2 derives from that connection
+/// ID, so the keys the first packet opened under are used again rather than
+/// derived a second time. One that does not open is skipped, as quinn skips
+/// it. The walk stops at the first packet that is anything else, because RFC
+/// 9000 §12.2 lets a receiver route on the first packet alone and a short
+/// header can only be last. A datagram with nothing behind its first packet,
+/// which is every first flight quinn and Surge send, costs nothing here.
+fn coalesced_frames(
+    keys: &quinn::crypto::Keys,
+    datagram: &[u8],
+    first: &InitialHeader,
+) -> Vec<BytesMut> {
+    let mut frames = Vec::new();
+    if first.packet_end >= datagram.len() {
+        return frames;
     }
+    let dcid = &datagram[first.dcid.clone()];
+    let mut at = first.packet_end;
+    while let Some(packet) = datagram.get(at..).filter(|rest| !rest.is_empty()) {
+        let Some(&byte) = packet.first() else { break };
+        if byte & LONG_HEADER_FORM == 0
+            || byte & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE
+            || packet.get(1..5) != Some(&QUIC_V1.to_be_bytes()[..])
+        {
+            break;
+        }
+        let Some(header) = InitialHeader::parse(packet) else {
+            break;
+        };
+        if packet.get(header.dcid.clone()) != Some(dcid) {
+            break;
+        }
+        if let Some(opened) = open_with(keys, packet, &header) {
+            frames.push(opened);
+        }
+        at += header.packet_end;
+    }
+    frames
 }
 
 /// Removes header protection and packet protection from the Initial packet at
