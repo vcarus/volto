@@ -1,7 +1,7 @@
 //! Two modes on the HTTP/3 datagram codec, chosen by the first byte.
 //!
 //! Even inputs: arbitrary bytes through [`datagram::decode`]. A successful
-//! decode is re-encoded and decoded again, and the two decodes must agree —
+//! decode is re-encoded and decoded again, and the two decodes must agree:
 //! the wire form may shorten (varints have non-canonical spellings) but the
 //! meaning must not move. [`datagram::peek_varint`] and
 //! [`datagram::take_varint`] must also agree with each other on the raw bytes.

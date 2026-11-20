@@ -469,8 +469,8 @@ mod tests {
     /// `Display` is what `quic/mod.rs` records with `%error` on the `WARN` that
     /// ends a connection. `Display` escapes nothing, and systemd splits a
     /// service's stdout on `\n`, so a reason phrase reaching that line whole
-    /// hands any peer that can complete a handshake a journal entry of its own
-    /// -- forged, attributed to this server, and free.
+    /// hands any peer that can complete a handshake a journal entry of its own:
+    /// forged, attributed to this server, and free.
     ///
     /// The peer's own words are still worth having, so they are kept: bounded and
     /// `Debug`-escaped where they enter this type, which is the same division of

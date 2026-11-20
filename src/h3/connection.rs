@@ -380,7 +380,7 @@ impl Shared {
     /// Called when the connection is dropped, so that nothing held outlives
     /// it and every held datagram is counted before the connection's closing
     /// line reads the count. After this a datagram with no session is dropped
-    /// at once, as it was before the hold existed.
+    /// at once.
     fn close_routes(&self) {
         let held = {
             let mut routes = self.lock();
@@ -507,7 +507,7 @@ struct Routes {
     /// will never claim (a TCP tunnel, a refused request), or it is a
     /// CONNECT-UDP request still on its way to a claim that a later stream
     /// overtook. The last case is the one this mark gives up: such a datagram
-    /// is dropped, as it was before the hold.
+    /// is dropped.
     ///
     /// The mark is the claimed one rather than the accepted one, because a
     /// datagram sent with its request can reach the router after the request
@@ -2034,14 +2034,14 @@ mod tests {
     }
 
     /// A grease frame is two bytes on the wire and a peer may send them for as
-    /// long as the connection lives, so the line they used to buy apiece was the
-    /// highest ratio of journal to peer bytes in this server.
+    /// long as the connection lives, so a line apiece would be the highest
+    /// ratio of journal to peer bytes in this server.
     ///
     /// What is asserted here is that every one of them reaches the sampler,
     /// which is the half the log cannot show: the schedule's whole point is that
     /// most occurrences produce no line, so a test reading lines could not tell
-    /// "sampled" from "stopped counting". The schedule itself — 1, 2, 4, 8, and
-    /// seventeen lines for sixty-five thousand — is
+    /// "sampled" from "stopped counting". The schedule itself (1, 2, 4, 8, and
+    /// seventeen lines for sixty-five thousand) is
     /// `logfmt::tests::a_sampler_turns_a_flood_into_a_handful_of_lines`.
     #[test]
     fn every_skipped_frame_is_counted_and_only_a_few_are_said_out_loud() {
@@ -2532,8 +2532,8 @@ mod tests {
     /// The routing rule itself: a datagram reaches the session that claimed its
     /// Quarter Stream ID and no other.
     ///
-    /// The bug class this guards against is silent -- a session receiving
-    /// another's traffic looks exactly like a session that works -- so both
+    /// The bug class this guards against is silent: a session receiving
+    /// another's traffic looks exactly like a session that works. So both
     /// halves are asserted: what each receiver got, and that neither got the
     /// other's.
     #[tokio::test]
@@ -2692,16 +2692,16 @@ mod tests {
     /// its own while the sessions on the connection claim and give up their
     /// Quarter Stream IDs on theirs, so a delivery and a claim ending race by
     /// construction. Three failures could hide in that race and all three are
-    /// silent -- a payload handed to the session next door, an entry left behind
+    /// silent: a payload handed to the session next door, an entry left behind
     /// by a receiver that was being delivered to as it dropped, and an id a
-    /// session cannot re-claim because its own entry outlived it -- so all three
+    /// session cannot re-claim because its own entry outlived it. So all three
     /// are asserted rather than inferred from the table being the right size.
     ///
     /// Bounded on both sides: the sessions do a fixed number of rounds, and the
     /// router stops on their last one or on its own deadline, whichever comes
     /// first, so nothing here can spin. Each session also *waits* for its first
-    /// delivery rather than sampling for one -- `FIRST_DELIVERY` below says why
-    /// -- so that what the assertions judge is the table rather than how the
+    /// delivery rather than sampling for one (`FIRST_DELIVERY` below says why),
+    /// so that what the assertions judge is the table rather than how the
     /// machine happened to schedule the router.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn delivery_racing_registration_neither_misroutes_nor_leaks() {
@@ -2715,10 +2715,9 @@ mod tests {
         /// `SESSIONS` of them, and a session that only ever `try_recv`s can run
         /// all `ROUNDS` of its loop through an empty queue and finish having
         /// received nothing. That is this test's own scheduling, not a routing
-        /// fault, and it used to surface as the "nothing was ever routed"
-        /// assertion failing under parallel load.
+        /// fault, and it would fail the "nothing was ever routed" assertion.
         ///
-        /// Waiting once per session fixes the shape rather than the symptom --
+        /// Waiting once per session fixes the shape rather than the symptom:
         /// every session now starts from a delivery it can account for, and the
         /// churn of claims and drops that actually runs the race is unchanged
         /// in the `ROUNDS - 1` rounds after it. Nothing here is being measured,
@@ -2869,7 +2868,7 @@ mod tests {
     /// and lets the proxy buffer them. Claiming the Quarter Stream ID before the
     /// target socket exists is what turns that permission into behaviour: a
     /// datagram the router delivers while the session loop has not started yet
-    /// must still be there when it does — once, in order, and without a consumer
+    /// must still be there when it does: once, in order, and without a consumer
     /// running.
     ///
     /// Deterministic on purpose: forcing that ordering through a live server
@@ -3084,7 +3083,7 @@ mod tests {
     /// Only a datagram whose stream may still claim it is held. A stream at or
     /// below the highest claimed id has been accepted already: it is a closed
     /// session, or a stream that never claimed (a TCP tunnel, a refused
-    /// request), and its datagrams are dropped at once as before the hold.
+    /// request), and its datagrams are dropped at once.
     #[test]
     fn a_datagram_for_a_stream_already_past_its_claim_is_not_held() {
         let shared = Arc::new(Shared::default());
@@ -3301,12 +3300,11 @@ mod tests {
 
     /// A drop shape speaks on the doubling schedule; every drop counts.
     ///
-    /// Eight drops rather than three, because the schedule itself is the
-    /// assertion now: a report has to land on the 1st, 2nd, 4th and 8th drop
-    /// and on none of the others, and each has to carry the running total. The
-    /// two mutations a weaker test would let through -- reporting always, and
-    /// reporting on every call but the first -- both produce a sequence this
-    /// one names as wrong.
+    /// Eight drops, because the schedule itself is the assertion: a report has
+    /// to land on the 1st, 2nd, 4th and 8th drop and on none of the others, and
+    /// each has to carry the running total. The two mutations a weaker test would let through, reporting always and
+    /// reporting on every call but the first, both produce a sequence this one
+    /// names as wrong.
     #[test]
     fn a_drop_shape_is_reported_on_a_doubling_schedule_and_counted_every_time() {
         let shared = Shared::default();
@@ -3333,9 +3331,8 @@ mod tests {
     /// RFC 9114 §6.2.1 and RFC 9204 §4.2 stand while the connection does; once
     /// it is over, the same ending is the peer saying goodbye a packet early.
     ///
-    /// All four endings are listed rather than one of them, because the
-    /// exemption used to be written per call site and the control stream's
-    /// reset was the site that did not have it.
+    /// All four endings are listed rather than one of them, so that an
+    /// ending whose caller lost the exemption is caught.
     #[test]
     fn a_critical_stream_ending_is_a_fault_only_while_the_connection_lives() {
         let endings = [

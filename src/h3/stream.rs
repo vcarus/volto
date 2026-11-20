@@ -1723,7 +1723,7 @@ mod tests {
         assert!(build_request(fields).is_ok());
     }
 
-    /// Ordinary fields survive intact -- this is how credentials reach `auth`.
+    /// Ordinary fields survive intact: this is how credentials reach `auth`.
     #[test]
     fn regular_fields_reach_the_request() {
         let mut fields = connect();

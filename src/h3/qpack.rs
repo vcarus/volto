@@ -620,8 +620,8 @@ mod tests {
     }
 
     /// RFC 9204 §4.5.1.1: with a zero table capacity nothing can have been
-    /// inserted, so a non-zero count is one no conformant encoder could send --
-    /// one of the three failures the RFC states as a connection error.
+    /// inserted, so a non-zero count is one no conformant encoder could send.
+    /// It is one of the three connection errors this decoder can reach.
     #[test]
     fn a_non_zero_required_insert_count_is_refused() {
         let error =
@@ -632,8 +632,8 @@ mod tests {
 
     /// RFC 9204 §4.5.1.2 makes a field block with a Sign bit of 1 invalid
     /// "if the value of Required Insert Count is less than or equal to the
-    /// value of Delta Base" -- and this decoder's Required Insert Count is
-    /// always zero, so the Sign bit alone settles it.
+    /// value of Delta Base". This decoder's Required Insert Count is always
+    /// zero, so the Sign bit alone settles it.
     #[test]
     fn a_set_sign_bit_is_refused() {
         // 0x00 = Required Insert Count 0, 0x81 = S = 1 with Delta Base 1, then

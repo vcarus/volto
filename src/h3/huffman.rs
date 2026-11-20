@@ -348,8 +348,8 @@ mod tests {
     }
 
     /// Every failure carries QPACK_DECOMPRESSION_FAILED and ends the stream
-    /// rather than the connection -- the class this server chose, and the one
-    /// RFC 9204 §7.4 states for the only such failure it does classify.
+    /// rather than the connection. That is the class this server chose, and
+    /// the one RFC 9204 §7.4 states for the only such failure it does classify.
     #[test]
     fn every_failure_is_a_qpack_stream_error() {
         for input in [vec![0u8], vec![0xff; 5], vec![0b0000_0111, 0xff]] {

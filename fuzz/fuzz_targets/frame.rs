@@ -4,7 +4,7 @@
 //!
 //! The harness respects the decoder's contract (`push` only once `next_item`
 //! has returned `Ok(None)`, nothing after an error), so the `debug_assert!` in
-//! `push` — enabled in cargo-fuzz builds — checks the decoder, not the harness.
+//! `push`, enabled in cargo-fuzz builds, checks the decoder, not the harness.
 
 #![no_main]
 
@@ -34,10 +34,8 @@ fuzz_target!(|data: &[u8]| {
     let budget = Arc::new(BufferBudget::default());
     let mut decoder = FrameDecoder::new(kind, budget);
 
-    // One copy of the input, sliced per chunk. The decoder may retain what it is
-    // handed, so each chunk has to be a `Bytes` of its own -- but a `slice` of
-    // one buffer is a refcount bump, where a `copy_from_slice` per chunk is an
-    // allocate-and-copy per 1..16 bytes of every input the fuzzer produces.
+    // One copy of the input, sliced per chunk: a `slice` is a refcount bump,
+    // where a copy per chunk would allocate per 1..16 input bytes.
     let all = Bytes::copy_from_slice(rest);
     let mut chunk_len = 1 + (control as usize) % 16;
     let mut offset = 0;

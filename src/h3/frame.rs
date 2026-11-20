@@ -1748,9 +1748,9 @@ mod tests {
     /// RFC 9114 §10.5: a request stream may make this server skip only so many
     /// reserved or unknown frames before it is a stream error.
     ///
-    /// The flood is zero-length grease frames -- the input a byte-counting bound
+    /// The flood is zero-length grease frames, the input a byte-counting bound
     /// could never stop, since two wire bytes declaring no payload are charged
-    /// nothing -- so this proves the count is of frames. The first
+    /// nothing. So this proves the count is of frames. The first
     /// `MAX_SKIPPED_FRAMES` are skipped and announced; the one past the limit is
     /// the refusal.
     #[test]
@@ -1873,7 +1873,7 @@ mod tests {
     }
 
     /// An empty frame of either kind must not stall the decoder waiting for a
-    /// payload that will never come -- and must still be reported, so that a
+    /// payload that will never come, and must still be reported, so that a
     /// caller can tell "a DATA frame arrived" from "nothing arrived".
     #[test]
     fn zero_length_frames_do_not_stall_the_decoder() {
@@ -2028,7 +2028,7 @@ mod tests {
     /// SETTINGS (§7.2.4), before its payload is parsed; GOAWAY, CANCEL_PUSH and
     /// MAX_PUSH_ID belong there, so under the cap they are buffered and parsed,
     /// with a payload error able to precede the state rules because RFC 9114
-    /// ranks neither -- the ordering `it_frameseq` models -- and past the cap
+    /// ranks neither (the ordering `it_frameseq` models), and past the cap
     /// the cap answers. The permissive kind applies none of these rules: the
     /// suite's client builds it for its own response stream.
     #[test]
@@ -2267,7 +2267,7 @@ mod tests {
     }
 
     /// D77: the connection's budget is charged for what a frame *announces*,
-    /// and given back on both of the ways a frame stops being held -- it
+    /// and given back on both of the ways a frame stops being held: it
     /// completes, or the stream carrying it dies half-way through.
     #[test]
     fn a_buffered_frame_holds_budget_until_it_completes_or_is_dropped() {
@@ -2359,7 +2359,7 @@ mod tests {
     /// that cannot show what [`BufferBudget::charge`] is written for: a peer
     /// opens as many request streams as it likes and their HEADERS frames arrive
     /// together, so the charges really do contend. `try_update` is what makes a
-    /// refused charge leave the counter alone -- an add-then-check would let two
+    /// refused charge leave the counter alone. An add-then-check would let two
     /// streams failing at once each subtract the other's rolled-back bytes, and
     /// the bound would then hold on average rather than at every instant.
     ///
@@ -2435,7 +2435,7 @@ mod tests {
     /// An add-then-check charge is wrong there in a way that is invisible to the
     /// arithmetic afterwards: the counter goes over the bound for as long as it
     /// takes to roll the refused bytes back, and any stream that reads it in that
-    /// window is refused a frame the connection had room for -- a 431 to a client
+    /// window is refused a frame the connection had room for: a 431 to a client
     /// that broke no rule. `try_update` never publishes the rejected value at
     /// all, so a reader cannot see one.
     ///
