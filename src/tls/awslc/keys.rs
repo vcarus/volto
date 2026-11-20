@@ -315,6 +315,11 @@ pub(crate) fn retry_tag(version: Version, orig_dst_cid: &[u8], packet: &[u8]) ->
 /// A packet protection key: an AEAD key and the IV it is nonced from.
 struct AeadPacketKey {
     key: LessSafeKey,
+    /// A plain array rather than `Zeroizing`, unlike the key and the secrets.
+    /// RFC 9001 §5.3 uses the IV only to form each packet's nonce: "The
+    /// exclusive OR of the padded packet number and the IV forms the AEAD
+    /// nonce." The protection rests on the key; a nonce has to be unique, not
+    /// secret, so the IV is not key material. Our own reading.
     iv: [u8; 12],
     suite: Suite,
 }

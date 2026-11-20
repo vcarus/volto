@@ -235,9 +235,15 @@ impl EchKey {
         ));
         der.extend_from_slice(&X25519_PKCS8_PREFIX);
         der.extend_from_slice(&self.private[..]);
-        let mut out = Zeroizing::new(String::new());
+        let list = self.config_list();
+        // Sized for both blocks before the first byte is written, so the
+        // string is never moved to a larger buffer, which would leave a copy of
+        // the private key's base64 behind in freed memory.
+        let mut out = Zeroizing::new(String::with_capacity(
+            pem_block_len("PRIVATE KEY", der.len()) + pem_block_len("ECHCONFIG", list.len()),
+        ));
         pem_block(&mut out, "PRIVATE KEY", &der);
-        pem_block(&mut out, "ECHCONFIG", &self.config_list());
+        pem_block(&mut out, "ECHCONFIG", &list);
         out
     }
 
@@ -647,6 +653,15 @@ pub fn check_public_name(name: &str) -> Result<()> {
 }
 
 /// Appends one PEM block, 64 base64 characters to a line.
+/// How many bytes [`pem_block`] writes for `der_len` bytes under `label`: the
+/// two boundary lines, and the base64 text in lines of 64 characters, each
+/// with its newline.
+fn pem_block_len(label: &str, der_len: usize) -> usize {
+    let text = der_len.div_ceil(3) * 4;
+    let boundaries = "-----BEGIN -----\n".len() + "-----END -----\n".len() + 2 * label.len();
+    boundaries + text + text.div_ceil(64)
+}
+
 pub(super) fn pem_block(out: &mut String, label: &str, der: &[u8]) {
     let text = Zeroizing::new(base64(der));
     out.push_str("-----BEGIN ");
@@ -691,6 +706,18 @@ mod tests {
 
     /// RFC 4648 §10: "BASE64("") = """, "BASE64("f") = "Zg=="" and the rest
     /// of that list.
+    /// The key file's text is written into a string sized for it before the
+    /// first byte, so it is never moved to a larger buffer and no copy of the
+    /// private key's base64 is left in a freed one.
+    #[test]
+    fn the_key_file_text_is_written_into_a_buffer_of_its_own_size() {
+        for public_name in ["public.example", "a.much.longer.public.name.example"] {
+            let key = EchKey::generate(public_name, 7, 0).expect("a key");
+            let pem = key.to_pem();
+            assert_eq!(pem.capacity(), pem.len(), "{public_name}");
+        }
+    }
+
     #[test]
     fn base64_matches_rfc_4648() {
         for (input, output) in [
