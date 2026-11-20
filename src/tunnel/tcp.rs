@@ -94,7 +94,7 @@ use std::io::{self, IoSlice};
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -683,43 +683,34 @@ fn gather(first: Bytes, reader: &mut Reader, batch: &mut Vec<Bytes>) {
 
 /// Writes every byte of `batch` to the target, in order, and leaves it empty.
 ///
-/// `write_vectored` may take any prefix of what it is offered, so after each
-/// call the pieces it took whole are dropped and the one it took part of is
-/// trimmed, and the rest is offered again. A TCP write half reports
-/// `is_write_vectored`, so each call is one `writev`. On a writer that did not,
-/// tokio would write the first piece per call, and the loop would still write
-/// every byte in order, one `write` per piece.
+/// `write_vectored` may take any prefix of what it is offered, and
+/// `IoSlice::advance_slices` drops what it took before the rest is offered
+/// again. A TCP write half reports `is_write_vectored`, so each call is one
+/// `writev`. On a writer that did not, tokio would write the first piece per
+/// call, and the loop would still write every byte in order, one `write` per
+/// piece. [`gather`] never makes a batch of more than [`WRITE_BATCH_PIECES`]
+/// pieces; a longer one would be written that many pieces at a time.
 ///
-/// Not cancel-safe: abandoned part-way, some of `batch` has been written.
-/// `client_to_target` says why the places that abandon it may.
+/// Not cancel-safe: abandoned part-way, some of `batch` has been written and
+/// all of it is still there. `client_to_target` says why the places that
+/// abandon it may, and each of them drops `batch`.
 async fn write_batch(tcp: &mut OwnedWriteHalf, batch: &mut Vec<Bytes>) -> io::Result<()> {
-    while !batch.is_empty() {
-        let mut written = {
-            let mut slices = [IoSlice::new(&[]); WRITE_BATCH_PIECES];
-            for (slice, piece) in slices.iter_mut().zip(batch.iter()) {
-                *slice = IoSlice::new(piece);
-            }
-            let offered = batch.len().min(WRITE_BATCH_PIECES);
-            tcp.write_vectored(&slices[..offered]).await?
-        };
-        if written == 0 {
-            return Err(io::ErrorKind::WriteZero.into());
+    for pieces in batch.chunks(WRITE_BATCH_PIECES) {
+        let mut storage = [IoSlice::new(&[]); WRITE_BATCH_PIECES];
+        for (slice, piece) in storage.iter_mut().zip(pieces) {
+            *slice = IoSlice::new(piece);
         }
+        let mut slices = &mut storage[..pieces.len()];
 
-        let mut whole = 0;
-        while let Some(piece) = batch.get(whole)
-            && piece.len() <= written
-        {
-            written -= piece.len();
-            whole += 1;
-        }
-        batch.drain(..whole);
-        // What is left of `written` is less than the first remaining piece,
-        // so that piece exists whenever anything is left.
-        if let Some(partial) = batch.first_mut() {
-            partial.advance(written);
+        while !slices.is_empty() {
+            let written = tcp.write_vectored(slices).await?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            IoSlice::advance_slices(&mut slices, written);
         }
     }
+    batch.clear();
     Ok(())
 }
 
