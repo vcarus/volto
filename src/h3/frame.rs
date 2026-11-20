@@ -258,9 +258,9 @@ impl BufferBudget {
     /// request streams cannot get its own well-formed SETTINGS or GOAWAY
     /// refused. A refusal there could not be the stream-class one a charge past
     /// the budget produces, since closing the control stream is itself a
-    /// connection error (RFC 9114 §6.2.1, quoted in [`super::connection`]).
+    /// connection error (RFC 9114 §6.2.1, quoted in [`super::control`]).
     ///
-    /// Not public: the one reader that needs it is in [`super::connection`].
+    /// Not public: the one reader that needs it is in [`super::control`].
     pub(super) fn unshared() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -542,7 +542,7 @@ pub struct FrameDecoder {
     /// equals under §4.4 and have their own reader. The control stream's are
     /// deliberately not counted: greasing it is what §7.2.8 invites, and the
     /// cost there is bounded by the [`logfmt::Sampler`] in
-    /// [`super::connection`] on the *log line* each one produces. It only
+    /// [`super::control`] on the *log line* each one produces. It only
     /// grows. A request stream that becomes a tunnel stops adding to it, and
     /// there is nothing to reset.
     ///

@@ -20,8 +20,12 @@
 //!   the peer's (RFC 9114 §7.2.4).
 //! * [`message`]: what a request and a response are made of: a status, a
 //!   method, field lines.
-//! * [`connection`]: the connection: SETTINGS, the control stream, GOAWAY,
-//!   and inbound HTTP Datagram routing (RFC 9297).
+//! * [`connection`]: the connection: the handshake, GOAWAY, and the task that
+//!   serves what the peer sends outside its request streams.
+//! * `control`: the peer's unidirectional streams: the control stream's rules
+//!   and the QPACK stream checks.
+//! * [`router`]: inbound HTTP Datagram routing (RFC 9297), and the hold for
+//!   datagrams that arrive before their session.
 //! * [`request`]: a decoded field section checked and turned into a request.
 //! * [`stream`]: one request stream, from its HEADERS to its last byte.
 //!
@@ -46,12 +50,14 @@
 //!   fails on its own.
 
 pub mod connection;
+mod control;
 pub mod error;
 pub mod frame;
 pub mod huffman;
 pub mod message;
 pub mod qpack;
 pub mod request;
+pub mod router;
 pub mod settings;
 pub mod stream;
 

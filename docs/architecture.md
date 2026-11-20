@@ -196,8 +196,9 @@ RFC 9209 `Proxy-Status` vocabulary refusals are written in, and
 Every wait that stands between a packet arriving and a tunnel opening is
 bounded, whatever the connection's authentication state, and two limits share
 the job. All but two of those waits are bounded by `limits.max_idle_timeout`:
-the QUIC/TLS handshake in `quic/`, the HTTP/3 handshake and the read of each
-peer unidirectional stream's type in `h3/connection.rs`, the read of a request
+the QUIC/TLS handshake in `quic/`, the HTTP/3 handshake in `h3/connection.rs`
+and the read of each peer unidirectional stream's type in `h3/control.rs`, the
+read of a request
 stream's HEADERS in `Resolver::resolve`, and every response this server writes
 before a tunnel starts relaying — 400, 403, 407, 431, 501 and the 5xx family,
 the 200 that closes on the spot, and the 200 that opens a tunnel — in
@@ -468,7 +469,8 @@ socket must also close the request stream.
 ## Datagram routing
 
 Each connection routes inbound datagrams to per-session channels from its own
-background task, in `src/h3/connection.rs` — the same task that reads the peer's
+background task, with the routing in `src/h3/router.rs` and the task in
+`src/h3/connection.rs` — the same task that reads the peer's
 unidirectional streams, since both belong to the connection and both end with
 it. A peer may hold `MAX_PEER_UNI_STREAMS` = 16 of those open at once (a
 transport parameter rather than a configuration key) where HTTP/3 needs three,

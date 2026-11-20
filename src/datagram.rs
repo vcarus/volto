@@ -55,7 +55,7 @@ impl DecodeError {
     ///
     /// Two MUSTs, both about the Quarter Stream ID field: a value above
     /// 2^60-1, and a payload too short to parse it. Both are quoted where they
-    /// are acted on, in `h3::connection::route_datagram` (D79).
+    /// are acted on, in `h3::router::route_datagram` (D79).
     ///
     /// A truncated Context ID is deliberately *not* one of them. Nothing in
     /// RFC 9298 §5 says what to do with it, so dropping the datagram is
