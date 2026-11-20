@@ -209,11 +209,8 @@ fn validate_limits(limits: &Limits) -> Result<()> {
         );
     }
 
-    // `socket2` converts these with `size as c_int`, so a value above
-    // `i32::MAX` reaches the kernel truncated to a different number: 2^32
-    // becomes 0, which is the operating system's minimum rather than the
-    // default the operator asked to leave alone. Refusing at load time is
-    // what makes the number in the file the number the kernel receives.
+    // Refused rather than truncated on the way to the kernel; see
+    // `MAX_SOCKET_BUFFER`.
     for (key, value) in [
         ("limits.socket_recv_buffer", limits.socket_recv_buffer),
         ("limits.socket_send_buffer", limits.socket_send_buffer),
@@ -246,15 +243,11 @@ fn validate_auth(auth: &Auth) -> Result<()> {
             );
         }
         if user.username.len() > crate::logfmt::MAX_TOKEN {
-            // A user-id this long is unusable in a subtler way. Failures are
-            // bucketed by the user-id the request claimed, in the form a log
-            // line carries it (truncated at `logfmt::MAX_TOKEN`), so a
-            // name past that bound never matches the configured one, and its
-            // failures land in the bucket no success can clear. The client
-            // that really does hold those credentials would then lose its
-            // connection at the `security.max_auth_failures`-th lifetime
-            // failure however often it authenticates in between. Refusing
-            // the name here is what makes that state unreachable.
+            // Failures are counted under the user-id as a log line carries
+            // it, truncated at `logfmt::MAX_TOKEN`, so a longer name could
+            // never be cleared by its own success, and its owner would lose
+            // the connection at the `security.max_auth_failures`-th failure
+            // however often it authenticates in between.
             //
             // The name is not echoed: it is not a secret, but it lives in
             // the same table as one, and nothing out of `[auth]` goes to
@@ -544,18 +537,8 @@ mod tests {
 
     /// A user-id longer than a log line carries whole is refused at load.
     ///
-    /// Not a style rule: such a name can never be cleared by its own success.
-    /// A failure that names it is charged by the truncated copy the log format
-    /// hands out, which matches no configured user, so it lands in the bucket
-    /// no success ever clears — and the client that really does hold those
-    /// credentials loses the connection on the fifth lifetime failure however
-    /// often it authenticates in between. Refusing the configuration is what
-    /// makes that state unreachable.
-    ///
     /// The limit is exactly the log format's, and the message must name it
-    /// without echoing the user-id: a name is not a password, but it sits next
-    /// to one in the same table, and this file's whole discipline is that
-    /// nothing out of `[auth]` reaches stderr.
+    /// without echoing the user-id.
     #[test]
     fn an_over_long_username_is_rejected_without_echoing_it() {
         let username = "u".repeat(crate::logfmt::MAX_TOKEN + 1);
@@ -654,13 +637,7 @@ mod tests {
     ///
     /// TOML integers deserialize across the whole of the target type, so every
     /// `u64` here is something an operator can write in the file, `u64::MAX`
-    /// included. The check used to double the interval before comparing it,
-    /// which above `u64::MAX / 2` has no answer to give: a debug build panicked
-    /// inside `validate` — a validator that aborts the process instead of
-    /// returning `Err` — and a release build wrapped the product to a small
-    /// number, accepted the interval and passed it to quinn, where the first
-    /// established connection turns it into `Instant::now() + interval` and
-    /// panics the connection driver instead.
+    /// included, and doubling one above `u64::MAX / 2` overflows.
     #[test]
     fn an_overflowing_keep_alive_interval_is_rejected_rather_than_panicking() {
         for keepalive in [u64::MAX, u64::MAX - 1, u64::MAX / 2 + 1, 1u64 << 63] {
@@ -820,13 +797,9 @@ mod tests {
 
     /// The stream credit is work per handshake, so it has a ceiling (D86).
     ///
-    /// quinn reserves a slot for every unit of it when the allowance is
-    /// granted — once per connection since the pre-authentication clamp, at
-    /// its first authenticated request — so an operator writing a large number
-    /// here is not raising a limit but adding work to every connection. D86's
-    /// per-handshake measurements ran 11 ms at the default 1024 to 7.3 s at a
-    /// million, with no completed handshake within ten seconds at four
-    /// million; `u32::MAX` is a config file away from any of those.
+    /// An operator writing a large number here is not raising a limit but
+    /// adding work to every connection; `MAX_STREAMS_BIDI_CEILING` gives the
+    /// cost.
     #[test]
     fn a_stream_limit_past_the_ceiling_is_rejected() {
         for streams in [u32::MAX, MAX_STREAMS_BIDI_CEILING + 1] {
@@ -944,13 +917,8 @@ mod tests {
 
     /// The drain period is a bound, so it has to stay one (D86).
     ///
-    /// Unlike the timers above, an absurd grace period does not panic anything:
-    /// `tokio::time::timeout` folds a duration it cannot add to `Instant::now()`
-    /// into a deadline in the far future, so `u64::MAX` seconds was accepted and
-    /// silently removed the bound `crate::quic`'s drain is built around — a
-    /// `SIGTERM` would then wait on connections that may never end until the
-    /// service manager's `SIGKILL` arrived, which is the ungraceful ending the
-    /// grace period exists to avoid.
+    /// Unlike the timers above, an absurd grace period does not panic anything;
+    /// it removes the bound silently, as `MAX_SHUTDOWN_GRACE` describes.
     #[test]
     fn an_unbounded_shutdown_grace_is_rejected() {
         for grace in [u64::MAX, MAX_SHUTDOWN_GRACE + 1] {
@@ -1096,10 +1064,7 @@ mod tests {
     /// A socket buffer above the socket API's limit is refused, and the
     /// boundary is accepted.
     ///
-    /// `socket2` converts the value with `size as c_int`, so `2147483648`
-    /// truncates to a negative number and the kernel receives a different size
-    /// than the file names. `0` stays the escape hatch that leaves the socket
-    /// alone.
+    /// See `MAX_SOCKET_BUFFER`.
     #[test]
     fn socket_buffer_sizes_above_the_32_bit_api_limit_are_rejected() {
         for key in ["socket_recv_buffer", "socket_send_buffer"] {
