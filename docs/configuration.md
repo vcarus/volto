@@ -798,7 +798,9 @@ a soft one that is too low can be raised here at all or needs the unit changed,
 and on Linux the same pair for the running service, read from `/proc`; the four
 `net.core` UDP buffer sysctls named under [UDP socket
 buffers](deployment.md#udp-socket-buffers), read from `/proc/sys` on Linux and
-reported as unavailable on any other platform; and `uname -srm`.
+reported as unavailable on any other platform; and the kernel's name, release
+and machine, the line `uname -srm` prints, read with the system call so that no
+`uname` program is needed.
 
 **Passwords are redacted.** Every `[auth].users` entry prints its password as
 `<redacted>`, by the same guard that keeps one out of the error a malformed file

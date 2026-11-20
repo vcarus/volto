@@ -155,8 +155,9 @@ anyhow = "1"
 # rather than linking libc's -- so it adds nothing to the musl cross-build that
 # release.yml and cross.yml run.
 #
-# `net` is the sockopt module and `process` is getrlimit/setrlimit; `std` is
-# rustix's own default and is spelled out because the default set is off.
+# `net` is the sockopt module, `process` is getrlimit/setrlimit, and `system` is
+# the `uname` that `--diagnostics` prints; `std` is rustix's own default and is
+# spelled out because the default set is off.
 #
 # It also supplies the errno values `tunnel` matches on (`rustix::io::Errno`) to
 # tell a per-target failure from a process-wide one, so `src/` names `libc`
@@ -165,6 +166,7 @@ rustix = { version = "1", default-features = false, features = [
     "net",
     "process",
     "std",
+    "system",
 ] }
 
 # SO_RCVBUF/SO_SNDBUF on the endpoint's UDP socket (D56). Already in the tree via

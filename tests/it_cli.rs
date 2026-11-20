@@ -716,6 +716,34 @@ fn the_support_bundle_names_the_version_and_redacts_the_password() {
     );
 }
 
+/// The bundle's operating system line is the three words `uname -srm` prints,
+/// read without a `uname` program: a minimal container has none on its `PATH`,
+/// and the run below has an empty one.
+#[test]
+fn the_support_bundle_reads_the_kernel_without_a_uname_program() {
+    let dir = config_dir("diagnostics-uname");
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    let output = Command::new(real_binary())
+        .env_remove("JOURNAL_STREAM")
+        .env("PATH", "")
+        .args(["--diagnostics", "--config", path.to_str().unwrap()])
+        .output()
+        .expect("the volto binary must be runnable");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let stdout = stdout_of(&output);
+    let line = stdout
+        .lines()
+        .skip_while(|line| *line != "[operating system]")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no operating system line: {stdout}"));
+    let uname = Command::new("uname")
+        .args(["-s", "-r", "-m"])
+        .output()
+        .expect("the test host has uname");
+    assert_eq!(line, String::from_utf8_lossy(&uname.stdout).trim());
+}
+
 /// The two flags answer different questions, so a command line naming both is
 /// refused rather than resolved by a precedence nobody would remember.
 #[test]

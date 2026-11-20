@@ -279,9 +279,9 @@ fn report_config_check(path: &Path, config: &Config) {
 /// output is not a log line, so D100's accounted set is untouched. Everything
 /// here is either this process's own memory, a `getrlimit` on itself, four files
 /// under `/proc/sys`, the `exe` link, `comm` and `limits` of the processes
-/// listed under `/proc`, or one `uname`. The `/proc/<pid>` reads are Linux only
-/// and every one of them is allowed to fail: a refused or missing file becomes
-/// a line saying so, never a non-zero exit.
+/// listed under `/proc`, or one `uname` system call. The `/proc/<pid>` reads are
+/// Linux only and every one of them is allowed to fail: a refused or missing
+/// file becomes a line saying so, never a non-zero exit.
 ///
 /// Passwords are redacted because `Config` is printed through its `Debug`, and
 /// `impl Debug for config::User` renders the password as `<redacted>`.
@@ -455,21 +455,16 @@ fn print_service_fd_limits() {
     println!("the service's own limits are not available on this platform (/proc is Linux only)");
 }
 
-/// `uname -srm`, or a line saying why there is none.
-///
-/// A process rather than `rustix::system::uname`, because rustix's `system`
-/// feature is not enabled, and this runs once in a command an operator typed.
+/// The kernel's name, release and machine, the three words `uname -srm`
+/// prints, read with the system call so that no `uname` program is needed.
 fn uname() -> String {
-    match std::process::Command::new("uname")
-        .args(["-s", "-r", "-m"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        Ok(output) => format!("uname exited with {}", output.status),
-        Err(error) => format!("uname could not be run ({error})"),
-    }
+    let uts = rustix::system::uname();
+    format!(
+        "{} {} {}",
+        uts.sysname().to_string_lossy(),
+        uts.release().to_string_lossy(),
+        uts.machine().to_string_lossy()
+    )
 }
 
 /// Everything that needs a runtime, which is everything after the configuration.
