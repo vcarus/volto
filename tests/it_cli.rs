@@ -419,6 +419,13 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
 /// is the startup warning about authentication, written before `Server::bind`.
 /// The handler has to exist by then, so the signal sent at that line must come
 /// back as a reload, and the process must still stop cleanly on `SIGTERM`.
+///
+/// What this catches is a handler created after `Server::bind`, which reads
+/// and parses the certificate. It does not catch one created between the
+/// warning line and `Server::bind`: that window is microseconds, and the
+/// signal sent here reaches the process only after the line has crossed a
+/// pipe, a reader thread and a channel. Catching that would need the binary
+/// to pause at the warning line on request, which it has no hook for.
 #[test]
 fn a_sighup_during_startup_is_taken_as_a_reload() {
     use std::io::{BufRead, BufReader};
