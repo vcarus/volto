@@ -650,9 +650,11 @@ happens only while a lookup is still running. So the exit takes at most
 the tunnels' allowance: with `shutdown_grace = 20` the tunnels are closed at
 20 s. Set systemd's `TimeoutStopSec` above the whole bound, not above the grace
 period alone: the shipped unit uses 45, which covers the 13 seconds the default
-grace of 5 can take. An hour is the most that can be configured, and at that
-ceiling the bound is 7203 seconds, so `TimeoutStopSec` has to be raised past 45
-as well, or systemd sends SIGKILL mid-drain.
+grace of 5 can take. An hour is the most that can be configured, because a drain
+longer than that has outlived any service manager's patience and would only
+replace the graceful ending with a SIGKILL. At that ceiling the bound is 7203
+seconds, so `TimeoutStopSec` has to be raised past 45 as well, or systemd sends
+SIGKILL mid-drain. `shutdown_grace = 0` closes every tunnel at once.
 
 The GOAWAY carries an identifier, and it is a promise in both directions.
 Requests below it were already accepted and are still served during the drain,
