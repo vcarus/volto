@@ -141,7 +141,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `keep_alive_interval` | seconds | `20` | Keep-alive period; `0` switches it off. **Must be strictly less than `max_idle_timeout / 2`**, or startup and reload fail |
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
-| `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. The default is below quinn's 1452, the value safe over both IPv4 and IPv6 on Ethernet, because a size is adopted after one probe of it is acknowledged, and a path can deliver that probe while losing most traffic at that size under load. 1436 is what a measured relay path carries; the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) give the measurement. An operator who has measured their own path at bulk rate can raise it, at most to 1472. A bound above what the path carries costs failed probes on a path that drops oversize packets, and lost traffic until the black-hole detector fires on a path that delivers single probes but not bulk traffic at that size. No effect (and a startup warning) when `mtu_discovery` is off |
+| `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. No effect (and a startup warning) when `mtu_discovery` is off. Why the default is 1436 rather than quinn's 1452, and when to raise it, is in the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) |
 | `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `bbr-uncapped`, `cubic` or `newreno`. `bbr` is quinn's BBR with its window capped, the default since 1.2.0. `bbr-uncapped` is quinn's BBR as it ships, which `bbr` selected before 1.2.0 |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Range `0`..`2147483647`, the largest value the socket API's signed 32-bit argument can carry; a larger one is refused at load time rather than truncated. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
@@ -342,10 +342,8 @@ bottleneck rate 1.6 to 2.9 s after that, against 3.2 to 3.6 s before the startup
 gain could return, at a cost of 0.05 to 0.21 percent of the packets sent in the
 45 s after the rise. It is the default since 1.2.0, after download A/B runs on a
 production relay path in which it lost fewer packets and carried more data than
-`bbr-uncapped` in every run. In v1.1.0 and v1.1.1 it was opt-in under the name
-`bbr-capped`; 1.2.0 accepted that name as an alias, and from 1.3.0 a file that
-writes it does not load, so write `bbr` or leave the key out. `bbr-uncapped`
-selects quinn's BBR as it ships, the controller `bbr` selected before 1.2.0.
+`bbr-uncapped` in every run. The names it had before 1.2.0 are under
+[What is stable from v1.0.0](#what-is-stable-from-v100).
 
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines
@@ -414,16 +412,18 @@ This is the key that is sent blind, and a size the path cannot carry kills the
 connection with nothing to fall back to.
 
 **A probe that gets through is not the same as a path that carries the size.**
-Discovery adopts a size once one probe of it is acknowledged. On a measured
-relay path, IPv4 packets above 1464 bytes (UDP payload above 1436) arrived with
+Discovery adopts a size once one probe of it is acknowledged, and a path can
+deliver that probe while losing most traffic at that size under load. On a
+measured relay path, IPv4 packets above 1464 bytes (UDP payload above 1436) arrived with
 the DF bit cleared. Single probes of those sizes got through, so discovery
 adopted 1452 or 1464, and at bulk rate 62 to 89 percent of the packets at that
 size were lost. The black-hole detector then dropped the size to 1200, and
 after its one-minute cooldown the same probe succeeded again. Packets of up to
 1464 IP bytes kept DF set and lost about what 1200-byte packets lost. 1436 is
 the largest UDP payload whose IPv4 packet crosses that path with DF set, which
-is why it is both the default and the shipped value. quinn's 1452 is a 1480-byte
-IPv4 packet, above that boundary, and in one of two runs with that ceiling 85
+is why it is both the default and the shipped value. quinn's 1452, the value
+that fits both IPv4 and IPv6 on Ethernet, is a 1480-byte IPv4 packet, above that
+boundary, and in one of two runs with that ceiling 85
 percent of the 1452-byte packets were lost. The example shipped 1464 before:
 what an IPv4 uplink behind a 1492-byte first-hop IP MTU leaves. That uplink was
 measured correctly, but it is not the segment that limits the relay path. Over
@@ -431,12 +431,16 @@ IPv6, 1452 is what an Ethernet frame leaves and 1436 is below it, so the default
 holds on either family.
 
 **The counter to watch is `mtu_black_holes=` in the connection close line.** A
-ceiling above what the path carries under load shows up as connections that
-carried bulk traffic and close with it non-zero. On the measured path, a ceiling
-of 1400 ran with no black-hole event. 1472, clean Ethernet over IPv4, is the
-most volto accepts, and `ping -M do` alone does not justify raising the ceiling
-toward it, because a path that clears DF delivers that probe too. Raise it only
-after a bulk transfer at the new size has run with `mtu_black_holes=0`. Neither
+ceiling above what the path carries costs failed probes on a path that drops
+oversize packets. On a path that delivers single probes but not bulk traffic at
+that size, it costs lost traffic until the black-hole detector fires, and shows
+up as connections that carried bulk traffic and close with the counter non-zero.
+On the measured path, a ceiling of 1400 ran with no black-hole event. 1472,
+clean Ethernet over IPv4, is the most volto accepts, and `ping -M do` alone does
+not justify raising the ceiling toward it, because a path that clears DF
+delivers that probe too. An operator who has measured their own path can raise
+it, but only after a bulk transfer at the new size has run with
+`mtu_black_holes=0`. Neither
 value is a measurement of *your* path: lower `initial_mtu` on the first sign
 that a handshake is not getting through.
 
@@ -901,16 +905,15 @@ Configuration keys and the command-line arguments are stable within 1.x, under
 four rules. A key keeps its name and its meaning. A file written for any earlier
 1.x release still loads. A documented default can move in a minor release when
 the release note says so, and the old value stays settable. A key is removed
-only after at least one minor release has warned about it at startup. One
-exception to the second rule is recorded below: v1.3.0 removed the accepted
-value `congestion_control = "bbr-capped"` without a warning release. The cases
-so far are these. v1.2.0 lowers the documented default of `mtu_upper_bound` from
+only after at least one minor release has warned about it at startup. The
+cases so far are these. v1.2.0 lowers the documented default of `mtu_upper_bound` from
 1452 to 1436 on measured evidence (the MTU paragraphs under [Notes that matter
 in practice](#notes-that-matter-in-practice) give it); a host that relied on
 1452 can set it explicitly. v1.2.0 also changes what `bbr`, the default value of
 `congestion_control`, selects: since 1.2.0 it is quinn's BBR with its window
 capped, the controller v1.1.0 and v1.1.1 called `bbr-capped`. A file that writes
-`bbr` or leaves the key out gets it without an edit. 1.2.0 also accepted
+`bbr` or leaves the key out gets it without an edit. In v1.1.0 and v1.1.1 that
+controller was opt-in under the name `bbr-capped`, and 1.2.0 also accepted
 `bbr-capped` as an alias. v1.3.0 removes the alias without a warning release
 first, which is the one exception to the rules above so far. The value existed
 for two patch releases only, so a file that still writes `bbr-capped` is refused
