@@ -1,3 +1,5 @@
+use std::ops::RangeInclusive;
+
 use anyhow::{Context, Result, bail};
 
 use super::{
@@ -62,69 +64,164 @@ fn validate_server(server: &Server) -> Result<()> {
         }
     }
 
-    if server.shutdown_grace > MAX_SHUTDOWN_GRACE {
-        bail!(
-            "server.shutdown_grace = {} exceeds {MAX_SHUTDOWN_GRACE} seconds; \
-             a drain that long outlives the service manager's own kill timeout, \
-             and use 0 to close every tunnel at once instead",
-            server.shutdown_grace
-        );
+    Bound {
+        key: "server.shutdown_grace",
+        value: server.shutdown_grace,
+        range: 0..=MAX_SHUTDOWN_GRACE,
+        unit: " seconds",
+        why: "a longer drain outlives the service manager's own kill timeout, and 0 \
+              closes every tunnel at once",
     }
+    .check()?;
 
     Ok(())
 }
 
+/// An integer key, the inclusive range its value must fall in, and why the
+/// range ends where it does.
+struct Bound {
+    key: &'static str,
+    value: u64,
+    range: RangeInclusive<u64>,
+    /// Appended to both ends of the range: `" seconds"`, `" bytes"`, or empty
+    /// for a count.
+    unit: &'static str,
+    why: &'static str,
+}
+
+impl Bound {
+    /// The one refusal every range in the configuration shares.
+    fn check(&self) -> Result<()> {
+        if !self.range.contains(&self.value) {
+            bail!(
+                "{} = {} must be between {} and {}{}; {}",
+                self.key,
+                self.value,
+                self.range.start(),
+                self.range.end(),
+                self.unit,
+                self.why
+            );
+        }
+        Ok(())
+    }
+}
+
+/// A socket buffer size as a [`Bound`] value. `usize` is never wider than 64
+/// bits on a target this builds for, and a value that did not fit would still
+/// be refused as past the ceiling.
+fn wide(bytes: usize) -> u64 {
+    u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
 /// Validates `[limits]`.
+///
+/// Every key is a [`Bound`] except `keep_alive_interval`, which is judged
+/// against `max_idle_timeout` by [`validate_keep_alive`]. The keys are checked
+/// in the order listed, the keep-alive after the idle timeout it depends on.
 fn validate_limits(limits: &Limits) -> Result<()> {
-    if limits.udp_session_timeout == 0 || limits.udp_session_timeout > MAX_IDLE_TIMEOUT_CEILING {
-        bail!(
-            "limits.udp_session_timeout = {} must be between 1 and \
-             {MAX_IDLE_TIMEOUT_CEILING} seconds",
-            limits.udp_session_timeout
-        );
-    }
-    if limits.connect_timeout > MAX_IDLE_TIMEOUT_CEILING {
-        bail!(
-            "limits.connect_timeout = {} exceeds {MAX_IDLE_TIMEOUT_CEILING} seconds; \
-             use 0 to disable the budget instead",
-            limits.connect_timeout
-        );
-    }
-    if limits.max_targets_per_conn == 0 {
-        bail!("limits.max_targets_per_conn must be greater than zero");
-    }
-    if limits.max_targets_per_conn > MAX_TARGETS_PER_CONN_CEILING {
-        bail!(
-            "limits.max_targets_per_conn = {} exceeds the {MAX_TARGETS_PER_CONN_CEILING} \
-             this server allows; every tunnel costs a file descriptor",
-            limits.max_targets_per_conn
-        );
-    }
+    let timers_and_counts = [
+        Bound {
+            key: "limits.udp_session_timeout",
+            value: limits.udp_session_timeout,
+            range: 1..=MAX_IDLE_TIMEOUT_CEILING,
+            unit: " seconds",
+            why: "0 is not a timeout, and the value is added to the clock to make a deadline",
+        },
+        Bound {
+            key: "limits.connect_timeout",
+            value: limits.connect_timeout,
+            range: 0..=MAX_IDLE_TIMEOUT_CEILING,
+            unit: " seconds",
+            why: "the value is added to the clock to make a deadline, and 0 disables the budget",
+        },
+        Bound {
+            key: "limits.max_targets_per_conn",
+            value: limits.max_targets_per_conn.into(),
+            range: 1..=MAX_TARGETS_PER_CONN_CEILING.into(),
+            unit: "",
+            why: "0 refuses every tunnel, and every tunnel costs a file descriptor",
+        },
+        Bound {
+            key: "limits.max_streams_bidi",
+            value: limits.max_streams_bidi.into(),
+            range: 1..=MAX_STREAMS_BIDI_CEILING.into(),
+            unit: "",
+            why: "0 lets no tunnel open, and a stream slot is reserved for every unit of \
+                  the credit when it is granted, so the whole value is paid by a \
+                  connection's first authenticated request",
+        },
+        Bound {
+            key: "limits.max_idle_timeout",
+            value: limits.max_idle_timeout,
+            range: 1..=MAX_IDLE_TIMEOUT_CEILING,
+            unit: " seconds",
+            why: "0 is not a timeout, and past an hour any relay's conntrack entry has \
+                  expired long before",
+        },
+    ];
+    let sizes = [
+        Bound {
+            key: "limits.initial_mtu",
+            value: limits.initial_mtu.into(),
+            range: MIN_INITIAL_MTU.into()..=MAX_INITIAL_MTU.into(),
+            unit: " bytes",
+            why: "QUIC needs at least the lower end (RFC 9000 §14), and the value is a UDP \
+                  payload size, of which an Ethernet frame leaves at most the upper end \
+                  over IPv6, so a larger handshake packet is dropped by the path with \
+                  nothing to fall back to",
+        },
+        // The ceiling in effect. An absent key resolves to a value in this range
+        // by construction (`Limits::mtu_upper_bound`), once `initial_mtu` is in
+        // its own, so only a ceiling the file writes can be refused.
+        Bound {
+            key: "limits.mtu_upper_bound",
+            value: limits.mtu_upper_bound().into(),
+            range: limits.initial_mtu.into()..=MAX_MTU_UPPER_BOUND.into(),
+            unit: " bytes",
+            why: "discovery searches upward from limits.initial_mtu, so a ceiling below \
+                  it describes a search that cannot happen, and an Ethernet frame leaves \
+                  at most the upper end of UDP payload over IPv4",
+        },
+        Bound {
+            key: "limits.initial_rtt_ms",
+            value: limits.initial_rtt_ms,
+            range: INITIAL_RTT_RANGE_MS,
+            unit: " milliseconds",
+            why: "it seeds the handshake retransmission timers, and a value below the real \
+                  path RTT retransmits packets that were never lost",
+        },
+        // Refused rather than truncated on the way to the kernel; see
+        // `MAX_SOCKET_BUFFER`.
+        Bound {
+            key: "limits.socket_recv_buffer",
+            value: wide(limits.socket_recv_buffer),
+            range: 0..=wide(MAX_SOCKET_BUFFER),
+            unit: " bytes",
+            why: SOCKET_BUFFER_WHY,
+        },
+        Bound {
+            key: "limits.socket_send_buffer",
+            value: wide(limits.socket_send_buffer),
+            range: 0..=wide(MAX_SOCKET_BUFFER),
+            unit: " bytes",
+            why: SOCKET_BUFFER_WHY,
+        },
+    ];
 
-    if limits.max_streams_bidi == 0 {
-        bail!(
-            "limits.max_streams_bidi must be greater than zero, or no tunnel could \
-             ever be opened"
-        );
-    }
-    if limits.max_streams_bidi > MAX_STREAMS_BIDI_CEILING {
-        bail!(
-            "limits.max_streams_bidi = {} exceeds the {MAX_STREAMS_BIDI_CEILING} this \
-             server allows; a stream slot is reserved for every unit of the credit when \
-             the allowance is granted, so the value is paid in one go by a connection's \
-             first authenticated request rather than when a stream is opened",
-            limits.max_streams_bidi
-        );
-    }
+    timers_and_counts.iter().try_for_each(Bound::check)?;
+    validate_keep_alive(limits)?;
+    sizes.iter().try_for_each(Bound::check)
+}
 
-    if limits.max_idle_timeout == 0 || limits.max_idle_timeout > MAX_IDLE_TIMEOUT_CEILING {
-        bail!(
-            "limits.max_idle_timeout = {} must be between 1 and \
-             {MAX_IDLE_TIMEOUT_CEILING} seconds",
-            limits.max_idle_timeout
-        );
-    }
+/// The reason both socket buffer keys share.
+const SOCKET_BUFFER_WHY: &str = "the value is passed to setsockopt as a signed 32-bit \
+                                 integer, so a larger one is truncated before the kernel \
+                                 sees it, and 0 keeps the operating system default";
 
+/// `limits.keep_alive_interval` against `limits.max_idle_timeout`, the one
+/// `[limits]` rule that is not a fixed range.
+fn validate_keep_alive(limits: &Limits) -> Result<()> {
     // Strictly below half, not at it: at exactly half, losing a single
     // keep-alive packet is enough for the connection to time out. The relay in
     // front of this server is the reason keep-alives exist at all. Its UDP
@@ -153,76 +250,6 @@ fn validate_limits(limits: &Limits) -> Result<()> {
             limits.max_idle_timeout,
             half
         );
-    }
-
-    if limits.initial_mtu < MIN_INITIAL_MTU {
-        bail!(
-            "limits.initial_mtu = {} is below the {MIN_INITIAL_MTU} bytes QUIC \
-             requires (RFC 9000 §14); a smaller value cannot carry a QUIC \
-             handshake packet",
-            limits.initial_mtu
-        );
-    }
-
-    if limits.initial_mtu > MAX_INITIAL_MTU {
-        bail!(
-            "limits.initial_mtu = {} is above the {MAX_INITIAL_MTU} bytes this \
-             server allows; the value is a UDP payload size, and an Ethernet \
-             frame leaves that much of one over IPv6, so a handshake sent in \
-             larger packets is dropped by the path with nothing to fall back to",
-            limits.initial_mtu
-        );
-    }
-
-    // Only a ceiling the file writes is checked. An absent one resolves to
-    // a value that is in range by construction (`Limits::mtu_upper_bound`).
-    if let Some(upper_bound) = limits.mtu_upper_bound {
-        if upper_bound < limits.initial_mtu {
-            bail!(
-                "limits.mtu_upper_bound = {} is below limits.initial_mtu = {}; \
-                 discovery searches upward from the initial size, so a ceiling \
-                 under the start describes a search that cannot happen",
-                upper_bound,
-                limits.initial_mtu
-            );
-        }
-
-        if upper_bound > MAX_MTU_UPPER_BOUND {
-            bail!(
-                "limits.mtu_upper_bound = {} is above the {MAX_MTU_UPPER_BOUND} bytes this \
-                 server allows; the value is a UDP payload size, and an Ethernet \
-                 frame leaves at most that much of one over IPv4, so a larger \
-                 bound could only probe sizes no standard path carries",
-                upper_bound
-            );
-        }
-    }
-
-    if !INITIAL_RTT_RANGE_MS.contains(&limits.initial_rtt_ms) {
-        bail!(
-            "limits.initial_rtt_ms = {} must be between {} and {}; it seeds the \
-             handshake retransmission timers, and a value below the real path \
-             RTT retransmits packets that were never lost",
-            limits.initial_rtt_ms,
-            INITIAL_RTT_RANGE_MS.start(),
-            INITIAL_RTT_RANGE_MS.end()
-        );
-    }
-
-    // Refused rather than truncated on the way to the kernel; see
-    // `MAX_SOCKET_BUFFER`.
-    for (key, value) in [
-        ("limits.socket_recv_buffer", limits.socket_recv_buffer),
-        ("limits.socket_send_buffer", limits.socket_send_buffer),
-    ] {
-        if value > MAX_SOCKET_BUFFER {
-            bail!(
-                "{key} = {value} is above the {MAX_SOCKET_BUFFER} bytes the socket \
-                 API accepts; the value is passed to setsockopt as a signed 32-bit \
-                 integer, so a larger one is truncated before the kernel sees it. \
-                 Use 0 to keep the operating system default instead"
-            );
-        }
     }
 
     Ok(())
@@ -1080,6 +1107,93 @@ mod tests {
         for key in ["socket_recv_buffer", "socket_send_buffer"] {
             let cfg = parse(&format!("[limits]\n{key} = 2147483647"));
             assert_valid_apart_from_certs(&cfg, key);
+        }
+    }
+
+    /// Every range in the configuration, end by end: each end is accepted, the
+    /// integer past it is refused in the one shared wording, naming the key and
+    /// both ends.
+    ///
+    /// The ranges are written out here rather than read from the table in
+    /// `validate_limits`, so a row that moved is caught rather than followed.
+    #[test]
+    fn every_range_accepts_its_ends_and_refuses_one_past_each() {
+        let ceiling = MAX_IDLE_TIMEOUT_CEILING;
+        let buffer = u64::try_from(MAX_SOCKET_BUFFER).expect("fits");
+        // (table, key, lower end, upper end, a line the lower end needs)
+        let ranges: [(&str, &str, u64, u64, &str); 11] = [
+            ("[server]", "shutdown_grace", 0, MAX_SHUTDOWN_GRACE, ""),
+            ("[limits]", "udp_session_timeout", 1, ceiling, ""),
+            ("[limits]", "connect_timeout", 0, ceiling, ""),
+            (
+                "[limits]",
+                "max_targets_per_conn",
+                1,
+                MAX_TARGETS_PER_CONN_CEILING.into(),
+                "",
+            ),
+            (
+                "[limits]",
+                "max_streams_bidi",
+                1,
+                MAX_STREAMS_BIDI_CEILING.into(),
+                "",
+            ),
+            // An idle timeout of 1 leaves room for no keep-alive but none.
+            (
+                "[limits]",
+                "max_idle_timeout",
+                1,
+                ceiling,
+                "keep_alive_interval = 0",
+            ),
+            (
+                "[limits]",
+                "initial_mtu",
+                MIN_INITIAL_MTU.into(),
+                MAX_INITIAL_MTU.into(),
+                "",
+            ),
+            // The lower end is the default `initial_mtu`.
+            (
+                "[limits]",
+                "mtu_upper_bound",
+                crate::config::DEFAULT_INITIAL_MTU.into(),
+                MAX_MTU_UPPER_BOUND.into(),
+                "",
+            ),
+            (
+                "[limits]",
+                "initial_rtt_ms",
+                *INITIAL_RTT_RANGE_MS.start(),
+                *INITIAL_RTT_RANGE_MS.end(),
+                "",
+            ),
+            ("[limits]", "socket_recv_buffer", 0, buffer, ""),
+            ("[limits]", "socket_send_buffer", 0, buffer, ""),
+        ];
+
+        for (table, key, low, high, companion) in ranges {
+            // `parse` opens the body inside `[server]`, so a `[server]` key
+            // goes in bare.
+            let body = |value: u64| {
+                let header = if table == "[server]" { "" } else { table };
+                format!("{header}\n{key} = {value}\n{companion}")
+            };
+            for value in [low, high] {
+                assert_valid_apart_from_certs(&parse(&body(value)), &body(value));
+            }
+            let past = low.checked_sub(1).into_iter().chain([high + 1]);
+            for value in past {
+                let message = rejected(&body(value), key);
+                let section = &table[1..table.len() - 1];
+                assert!(
+                    message.starts_with(&format!(
+                        "{section}.{key} = {value} must be between {low} and {high}"
+                    )),
+                    "one wording for every range: {message}"
+                );
+            }
         }
     }
 
