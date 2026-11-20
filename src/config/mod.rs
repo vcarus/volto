@@ -858,8 +858,9 @@ const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 /// The longest host name a `server_name` extension can carry, in bytes.
 ///
 /// A fully qualified DNS name is at most 255 bytes on the wire, of which two are
-/// the root label's length byte and the trailing zero, leaving 253 for the
-/// presentation form. A configured name longer than that could never be matched,
+/// the first label's length byte and the root label's zero byte (every later
+/// length byte takes the place of a dot), leaving 253 for the presentation
+/// form. A configured name longer than that could never be matched,
 /// because no client could have asked for it.
 pub const MAX_EXPECTED_SNI: usize = 253;
 
