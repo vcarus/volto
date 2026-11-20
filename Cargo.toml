@@ -153,8 +153,7 @@ anyhow = "1"
 #
 # It is pure Rust with no C to build -- on Linux it issues the syscalls itself
 # rather than linking libc's -- so it adds nothing to the musl cross-build that
-# release.yml and cross.yml run. It was already being compiled here anyway, as a
-# dev dependency: proptest -> tempfile -> rustix.
+# release.yml and cross.yml run.
 #
 # `net` is the sockopt module and `process` is getrlimit/setrlimit; `std` is
 # rustix's own default and is spelled out because the default set is off.
@@ -177,19 +176,10 @@ rustix = { version = "1", default-features = false, features = [
 socket2 = "0.6"
 
 # The global allocator of the musl builds, installed in `src/main.rs` through
-# `src/alloc.rs`. The release binaries are static musl, and on 2026-11-11
-# `tests/it_bench.rs` measured them against `x86_64-unknown-linux-gnu` on
-# `3df1a21`: same host, a `rust:1` container, three interleaved rounds, the
-# range of the medians. Allocation counts were identical on both targets, so
-# the gap is libc, and musl's `malloc` is the first part of it to replace.
-#
-#     test                          gnu             musl
-#     tcp_download   cpu-s/GB       6.64 to 6.91    11.81 to 14.98
-#     tcp_upload     cpu-s/GB       5.78 to 6.54    8.65 to 12.48
-#     udp_1200 t->c  cpu-us/pkt     12.34 to 12.69  18.41 to 20.35
-#     udp_1200 c->t  cpu-us/pkt     12.09 to 12.48  13.94 to 14.64
-#     tcp_churn      cpu-us/cycle   325 to 329      392 to 413
-#     udp_churn      cpu-us/cycle   294 to 316      373 to 400
+# `src/alloc.rs`. The release binaries are static musl, which `tests/it_bench.rs`
+# measured costlier in CPU than `x86_64-unknown-linux-gnu` with identical
+# allocation counts, so the gap is libc, and musl's `malloc` is the first part
+# of it to replace. The measurement is in the commit that added this.
 #
 # musl only: glibc's allocator already keeps per-thread caches, and the gnu,
 # macOS and test builds stay on `std::alloc::System`, so mimalloc is not
@@ -321,31 +311,24 @@ proptest = "1"
 [profile.dev]
 debug = "line-tables-only"
 
-# Fat LTO with a single codegen unit, measured rather than assumed. On a Linux
-# container on 2026-09-02, against the profile cargo ships by default, it took
-# 11.5% off the stripped binary and 13-17% off the CPU cost of a 64-byte
-# datagram each way -- the shape of the DNS queries Surge sends through the
-# tunnel -- while MTU-sized datagrams and bulk TCP moved 2-8%, half of it inside
-# the run-to-run noise. The encode path alone got 24-41% faster; the rest of
-# the pipeline is syscalls and crypto, which LTO cannot reach. The price is the
-# final link: about 8 s to about 65 s on an 8-thread host, paid only by the
-# release workflows and by whoever rebuilds `it_bench` in release. `thin` was
-# measured too and produced a *larger* binary, so it is not the middle option
-# it looks like. Re-measure before keeping this if the per-packet allocation on
-# the outbound datagram path ever goes away (D29): that allocation is much of
-# what LTO is inlining today.
+# Fat LTO with a single codegen unit, measured rather than assumed: against the
+# profile cargo ships by default it made the binary smaller and small datagrams,
+# the shape of the DNS queries Surge sends through the tunnel, cheaper in CPU.
+# The price is a much longer final link, paid only by the release workflows and
+# by whoever rebuilds `it_bench` in release. `thin` produced a *larger* binary
+# than fat, so it is not the middle option it looks like. Re-measure before
+# keeping this if the per-packet allocation on the outbound datagram path ever
+# goes away (D29): that allocation is much of what LTO is inlining today.
 [profile.release]
 lto = "fat"
 codegen-units = 1
-# Stripped by the profile rather than by the release workflow, because the
-# workflow's strip step is a no-op for the cross-built aarch64 target: the
-# v0.10.0 aarch64 asset published on 2026-09-05 carried 23 MB of DWARF and the
-# v0.9.3 one still carried its symbol tables, while the x86_64 asset, built on
-# its own architecture, was stripped both times. `strip = true` goes through
-# rustc and the linker, so it holds for every target the same way. It also keeps
-# `debug` at the profile default: turning line tables on here was tried in
-# v0.10.0 and, besides disabling Cargo's default debuginfo strip, it set
-# `DEBUG=true` for build scripts, which made `cc` compile aws-lc with `-g`.
+# Stripped by the profile rather than by a strip step in the release workflow,
+# because such a step does nothing for the cross-built aarch64 target, whose
+# asset then ships its DWARF and symbol tables. `strip = true` goes through
+# rustc and the linker, so it holds for every target the same way. `debug`
+# stays at the profile default: line tables here disable Cargo's default
+# debuginfo strip and set `DEBUG=true` for build scripts, which makes `cc`
+# compile aws-lc with `-g`.
 strip = true
 
 # Integer overflow panics in volto's own code in release builds too, as it
@@ -361,8 +344,6 @@ strip = true
 # aborts the process: the driver unwraps its poisoned mutex in its destructor
 # while the panic unwinds (quinn 0.11.12 `src/endpoint.rs`, `Drop for
 # EndpointDriver`). `Expected::memory` in `src/gate.rs` gives the whole chain.
-# The 2026-11-18 NGINX HTTP/2 advisory CVE-2026-123007 began with
-# exactly such an underflow in a flow-control window check.
 #
 # Scoped to this package. The dependencies keep the profile default (off):
 # their hot paths (quinn-proto, rustls) are not ours to slow, and aws-lc is C,

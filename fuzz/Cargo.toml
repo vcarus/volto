@@ -2,11 +2,8 @@
 name = "volto-fuzz"
 version = "0.0.0"
 publish = false
-# Edition 2024, as the root moved to in 93c043d, so a target cannot quietly keep
-# an idiom `src/` has already left behind. Migrating changed no source: `cargo
-# fix --edition` rewrote nothing, and the one `tail-expr-drop-order` warning it
-# raised (in `frame`) is a `Bytes` refcount landing a few lines later, with no
-# lock or channel behind it.
+# Edition 2024, the root's, so a target cannot quietly keep an idiom `src/` has
+# already left behind.
 edition = "2024"
 
 # A resolver input, not a support claim. Edition 2024 implies resolver 3, which

@@ -43,8 +43,7 @@ jobs:
     # The same limit as ci.yml's jobs carry.
     timeout-minutes: 15
     env:
-      # mdBook 0.5.4, the latest release at the time this was pinned
-      # (2026-09-02). Pinned by version *and* by digest of the exact asset:
+      # mdBook, pinned by version *and* by digest of the exact asset:
       # a release tarball can be replaced in place, and this step runs with the
       # repository checked out. `cargo install` is deliberately not used -- it
       # would build a second dependency tree on every run and pin nothing.

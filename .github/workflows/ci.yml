@@ -178,10 +178,7 @@ jobs:
     # release.yml now needs this workflow green, and a nightly regression is not
     # a reason to hold a release.
     #
-    # `--locked`, which this job did without for as long as `fuzz/Cargo.lock`
-    # was too stale for the flag to run at all -- it recorded volto 0.5.3 and
-    # the pre-D102 `ring` graph. With that lockfile regenerated the flag earns
-    # its place twice over. It makes the job answer for the graph that is
+    # `--locked` does two things. It makes the job answer for the graph that is
     # committed rather than for whatever cargo resolves on the morning it runs,
     # which is the only way a green check here and a green container run weeks
     # later are statements about the same thing. And it stops a silent resolve:
@@ -224,11 +221,9 @@ jobs:
     #
     # cargo-audit skips every lockfile entry whose source is not the default
     # registry, and it does not fall back to the version a git dependency
-    # declares. No entry is in that position today: the h3 and h3-quinn git pins
-    # went with D75's in-tree HTTP/3 layer, and the `[patch.crates-io]` pin of
-    # `quinn-proto` went when 0.11.18 shipped the fixes it carried. A git
-    # dependency added later would fall out of RustSec coverage without saying
-    # so, and would need a step here to recover it.
+    # declares. No entry is in that position today. A git dependency added
+    # later would fall out of RustSec coverage without saying so, and would
+    # need a step here to recover it.
     name: audit (RustSec)
     runs-on: ubuntu-latest
     timeout-minutes: 15
