@@ -400,7 +400,7 @@ func TestMissingCredentialsAreChallenged(t *testing.T) {
 	if rsp.StatusCode != http.StatusProxyAuthRequired {
 		t.Fatalf("status = %d, want 407", rsp.StatusCode)
 	}
-	if got := rsp.Header.Get("Proxy-Authenticate"); got != `Basic realm="masque"` {
-		t.Errorf("Proxy-Authenticate = %q, want %q", got, `Basic realm="masque"`)
+	if got := rsp.Header.Get("Proxy-Authenticate"); got != `Basic realm="proxy"` {
+		t.Errorf("Proxy-Authenticate = %q, want %q", got, `Basic realm="proxy"`)
 	}
 }

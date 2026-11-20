@@ -118,7 +118,7 @@ async fn bad_or_missing_credentials_are_refused_with_a_challenge() {
                 .fields
                 .get("proxy-authenticate")
                 .and_then(FieldValue::to_str),
-            Some("Basic realm=\"masque\""),
+            Some("Basic realm=\"proxy\""),
             "RFC 9110 §11.7.1: a 407 must carry a challenge"
         );
     }

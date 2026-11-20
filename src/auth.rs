@@ -59,7 +59,12 @@ pub const MAX_CREDENTIAL_VALUES: usize = CREDENTIAL_FIELDS.len();
 /// RFC 9110 §11.7.1 requires a `Proxy-Authenticate` field on every 407. Surge
 /// sends credentials up front and does not wait to be challenged, so this is for
 /// interoperability and for whoever is debugging with `curl`.
-pub const CHALLENGE: &str = "Basic realm=\"masque\"";
+///
+/// RFC 7617 §2 makes `realm` required for Basic, so the challenge carries one.
+/// Any peer that completes a handshake can read it, so it says no more than a
+/// 407 already does: it names neither the protocol nor a product (D73 addendum
+/// of 2026-11-20).
+pub const CHALLENGE: &str = "Basic realm=\"proxy\"";
 
 /// Checks request credentials against the configured users.
 pub struct Authenticator {
@@ -723,7 +728,7 @@ mod tests {
         let fields = challenge_fields();
         assert_eq!(
             fields.get(PROXY_AUTHENTICATE).and_then(FieldValue::to_str),
-            Some("Basic realm=\"masque\"")
+            Some("Basic realm=\"proxy\"")
         );
     }
 

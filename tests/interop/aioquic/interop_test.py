@@ -450,7 +450,7 @@ async def test_missing_credentials_are_challenged():
             except Refused as refusal:
                 assert refusal.status == 407, f"status {refusal.status}, want 407"
                 challenge = refusal.headers.get(b"proxy-authenticate")
-                assert challenge == b'Basic realm="masque"', challenge
+                assert challenge == b'Basic realm="proxy"', challenge
             else:
                 raise AssertionError("an unauthenticated CONNECT-UDP succeeded")
     finally:
