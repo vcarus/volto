@@ -22,8 +22,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 mod awslc;
 
 pub use awslc::{
-    EchKey, EchSummary, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config,
-    server_config,
+    EchKey, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config, server_config,
 };
 
 /// What an operator is told when the two configured files do not pair up.

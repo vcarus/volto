@@ -68,15 +68,15 @@ fn identity_for(key: &rcgen::KeyPair) -> Vec<u8> {
 
 const PUBLIC_NAME: &str = "public.example";
 
-fn ech_key(config_id: u8) -> EchKey {
-    EchKey::generate(PUBLIC_NAME, config_id, 32).expect("generate an ECH key")
+fn ech_key(config_id: u8) -> Arc<EchKey> {
+    Arc::new(EchKey::generate(PUBLIC_NAME, config_id, 32).expect("generate an ECH key"))
 }
 
 /// A server on `id`, with ECH under `ech` and the second gate's list `names`,
 /// built as `server_config` builds one: with a key, the second ECH line on.
 fn server(
     id: &Identity,
-    ech: Option<&EchKey>,
+    ech: Option<&Arc<EchKey>>,
     groups: &[u16],
     names: &[&str],
 ) -> Arc<ServerConfig> {
@@ -84,7 +84,7 @@ fn server(
 }
 
 /// The same server with `require_ech` on.
-fn requiring(id: &Identity, ech: &EchKey) -> Arc<ServerConfig> {
+fn requiring(id: &Identity, ech: &Arc<EchKey>) -> Arc<ServerConfig> {
     built(id, Some(ech), &GROUPS, &[], true, true)
 }
 
@@ -94,13 +94,18 @@ fn requiring(id: &Identity, ech: &EchKey) -> Arc<ServerConfig> {
 /// What AWS-LC does with an ECH extension it cannot use: it never refuses, and
 /// answers on the outer ClientHello with `retry_configs`, which the socket
 /// gate and the second line exist to keep from anybody without the key.
-fn libssl_alone(id: &Identity, ech: &EchKey, groups: &[u16], names: &[&str]) -> Arc<ServerConfig> {
+fn libssl_alone(
+    id: &Identity,
+    ech: &Arc<EchKey>,
+    groups: &[u16],
+    names: &[&str],
+) -> Arc<ServerConfig> {
     built(id, Some(ech), groups, names, false, false)
 }
 
 fn built(
     id: &Identity,
-    ech: Option<&EchKey>,
+    ech: Option<&Arc<EchKey>>,
     groups: &[u16],
     names: &[&str],
     refuse_unaccepted_ech: bool,
@@ -1353,6 +1358,15 @@ fn the_builder_defaults_keep_the_second_ech_line_on() {
         outcome.ech_accepted && outcome.server_done && outcome.client_done,
         "{outcome:?}"
     );
+}
+
+/// A probe configuration built with an ECH key reports the key libssl holds.
+#[test]
+fn a_probe_configuration_reports_its_ech_key() {
+    let id = identity();
+    let key = ech_key(7);
+    let config = super::probe_server_config(&id.cert, &id.key, Some(&key)).expect("a server");
+    assert!(config.ech().is_some_and(|held| Arc::ptr_eq(held, &key)));
 }
 
 /// The first ClientHello of a plain client with X25519MLKEM768 first.

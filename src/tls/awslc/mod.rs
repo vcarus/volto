@@ -135,24 +135,14 @@ struct CtxData {
     keylog: Option<Arc<KeyLog>>,
 }
 
-/// The ECH state a server was built with, for its startup line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchSummary {
-    /// The ECHConfig's config_id.
-    pub config_id: u8,
-    /// The ECHConfig's public name.
-    pub public_name: String,
-}
-
 /// The server side of the provider: one `SSL_CTX`, shared by every session.
 pub struct ServerConfig {
     ctx: SslCtx,
     data: Arc<CtxData>,
-    ech: Option<EchSummary>,
-    /// The ECH key the context holds, for the socket gate, which opens ECH
-    /// extensions with the same key before libssl sees them. Loaded once per
-    /// build so that the two can never hold different keys.
-    ech_key: Option<Arc<EchKey>>,
+    /// The ECH key the context holds. The startup line reports it and the
+    /// socket gate opens ECH extensions with it before libssl sees them, so
+    /// all three use the one key loaded per build.
+    ech: Option<Arc<EchKey>>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -165,14 +155,9 @@ impl std::fmt::Debug for ServerConfig {
 }
 
 impl ServerConfig {
-    /// Whether ECH is on, and with which config_id and public name.
-    pub fn ech(&self) -> Option<&EchSummary> {
+    /// The ECH key this configuration was built with, if ECH is on.
+    pub fn ech(&self) -> Option<&Arc<EchKey>> {
         self.ech.as_ref()
-    }
-
-    /// The ECH key this configuration was built with.
-    pub fn ech_key(&self) -> Option<&Arc<EchKey>> {
-        self.ech_key.as_ref()
     }
 }
 
@@ -191,7 +176,7 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         .map(EchKey::load)
         .transpose()?
         .map(Arc::new);
-    let mut built = Builder {
+    Builder {
         alpn: server.alpn_wire(),
         names: Names::new(&config.security.expected_sni),
         require_ech: config.security.require_ech,
@@ -199,12 +184,10 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         ..Builder::new(
             certs.iter().map(|c| c.as_ref().to_vec()).collect(),
             key,
-            ech.as_deref(),
+            ech.as_ref(),
         )
     }
-    .build()?;
-    built.ech_key = ech;
-    Ok(built)
+    .build()
 }
 
 /// Everything [`ServerConfig`] is built from, already decoded.
@@ -213,7 +196,7 @@ struct Builder<'a> {
     key: Zeroizing<Vec<u8>>,
     alpn: Vec<Vec<u8>>,
     names: Names,
-    ech: Option<&'a EchKey>,
+    ech: Option<&'a Arc<EchKey>>,
     refuse_unaccepted_ech: bool,
     require_ech: bool,
     groups: &'a [u16],
@@ -224,7 +207,7 @@ impl<'a> Builder<'a> {
     /// A builder for `certs`, `key` and `ech` with everything else at its
     /// default: ALPN `h3`, no gate list, the second ECH line on whenever there
     /// is an ECH key, no `require_ech`, [`GROUPS`] and no keylog.
-    fn new(certs: Vec<Vec<u8>>, key: Zeroizing<Vec<u8>>, ech: Option<&'a EchKey>) -> Self {
+    fn new(certs: Vec<Vec<u8>>, key: Zeroizing<Vec<u8>>, ech: Option<&'a Arc<EchKey>>) -> Self {
         Self {
             certs,
             key,
@@ -343,29 +326,21 @@ impl<'a> Builder<'a> {
             }
         }
 
-        let ech = match self.ech {
-            None => None,
-            Some(key) => {
-                let keys = key.keys()?;
-                // SAFETY: `keys` holds one ECHConfig marked as a retry config;
-                // SSL_CTX_set1_ech_keys takes its own reference to it, and the
-                // context is still unshared.
-                ffi::check(
-                    unsafe { sys::SSL_CTX_set1_ech_keys(ctx.as_ptr(), keys.as_ptr()) },
-                    "SSL_CTX_set1_ech_keys",
-                )?;
-                Some(EchSummary {
-                    config_id: key.config_id(),
-                    public_name: key.public_name().to_owned(),
-                })
-            }
-        };
+        if let Some(key) = self.ech {
+            let keys = key.keys()?;
+            // SAFETY: `keys` holds one ECHConfig marked as a retry config;
+            // SSL_CTX_set1_ech_keys takes its own reference to it, and the
+            // context is still unshared.
+            ffi::check(
+                unsafe { sys::SSL_CTX_set1_ech_keys(ctx.as_ptr(), keys.as_ptr()) },
+                "SSL_CTX_set1_ech_keys",
+            )?;
+        }
 
         Ok(ServerConfig {
             ctx,
             data,
-            ech,
-            ech_key: None,
+            ech: self.ech.cloned(),
         })
     }
 }
@@ -1388,7 +1363,7 @@ pub const PROBE_HELD_LIMIT: usize = OUTER_HELLO_LIMIT + 64 * 1024;
 pub fn probe_server_config(
     cert: &[u8],
     key: &[u8],
-    ech: Option<&EchKey>,
+    ech: Option<&Arc<EchKey>>,
 ) -> Result<Arc<ServerConfig>> {
     Builder::new(vec![cert.to_vec()], Zeroizing::new(key.to_vec()), ech)
         .build()

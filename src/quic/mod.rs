@@ -181,7 +181,7 @@ pub struct Server {
     startup_log_level: String,
     /// The ECH state the server was bound with, for the startup line. A reload
     /// reports its own in the reload line.
-    ech: Option<crate::tls::EchSummary>,
+    ech: Option<Arc<crate::tls::EchKey>>,
 }
 
 impl Server {
@@ -369,8 +369,8 @@ impl Server {
             // in every ClientHello it sends. The public name passed the key
             // file's LDH check, so `Display` is safe.
             ech = self.ech.is_some(),
-            ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.config_id)),
-            ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.public_name.as_str())),
+            ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.config_id())),
+            ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.public_name())),
             // Whether the gate drops every handshake without ECH (D115).
             require_ech = config.security.require_ech,
             "accepting QUIC connections"

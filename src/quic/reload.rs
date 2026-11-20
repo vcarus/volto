@@ -46,12 +46,12 @@ use super::transport::transport_config;
 /// very key libssl holds.
 pub(super) fn server_config(
     config: &Config,
-) -> Result<(quinn::ServerConfig, Option<tls::EchSummary>, Policy)> {
+) -> Result<(quinn::ServerConfig, Option<Arc<tls::EchKey>>, Policy)> {
     let crypto = tls::server_config(config)?;
     let ech = crypto.ech().cloned();
     let policy = Policy::new(
         Names::new(&config.security.expected_sni),
-        crypto.ech_key().cloned(),
+        ech.clone(),
         config.security.require_ech,
     );
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
@@ -264,8 +264,8 @@ impl ReloadHandle {
             // The ECH key in force from now on. The public name is one the key
             // file's check accepted, an LDH host name, so `Display` is safe.
             ech = ech.is_some(),
-            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.config_id)),
-            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.public_name.as_str())),
+            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.config_id())),
+            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.public_name())),
             // Whether the gate drops every handshake without ECH (D115).
             require_ech = config.security.require_ech,
             "configuration reloaded; new connections will use it"

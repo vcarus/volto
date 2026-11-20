@@ -213,7 +213,7 @@ fn fixture() -> &'static Fixture {
             .expect("the key")
             .secret_pkcs8_der()
             .to_vec();
-        let ech_key = EchKey::generate("public.example", 1, 0).expect("an ECH key");
+        let ech_key = Arc::new(EchKey::generate("public.example", 1, 0).expect("an ECH key"));
         let plain = probe_server_config(&cert, &key, None).expect("a server");
         let ech = probe_server_config(&cert, &key, Some(&ech_key)).expect("an ECH server");
         let plain_client = client_config(None, None);
