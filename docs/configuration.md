@@ -465,7 +465,7 @@ family, an IP literal above all, is unaffected by any of the three.
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
 | `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
 | `require_ech` | bool | `false` | Drop every handshake that carries no ECH extension, without any reply, so only a client holding the ECHConfigList reaches TLS. Needs `[server].ech_key` and is refused without it, at startup, by `--check-config` and on reload. Reloadable. Configure every client with the list before turning it on: a client without it then sees the port as closed. See [Encrypted Client Hello](#encrypted-client-hello) |
-| `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default and what every release before this one did. A non-empty list turns on the SNI gate: a handshake whose ClientHello does not name one of these hosts is dropped at the socket before the QUIC layer sees it, so a port scan of this address gets nothing back — no Version Negotiation packet, no `CONNECTION_CLOSE`, no TLS alert. Matched name for name, ASCII case-insensitive, with one trailing root dot ignored; no wildcards and no suffix matching, and a name with an empty label (a leading dot, two dots in a row, or a second trailing dot) or an IP address literal is refused at startup, because RFC 6066 section 3 does not permit either in a `server_name` and no conforming client would send one. So is a name the server's TLS does not read as a DNS host name (a label longer than 63 bytes, a label that starts or ends with `-`, or a last label that is a number), because the server treats such a name in a ClientHello as no name and refuses the handshake. Every client must then send the name as SNI (in Surge, the `sni=` parameter), or it sees the port as closed with no error anywhere but this server's debug log — so change this key and the clients together. A name the certificate does not cover draws a warning at startup and on reload, because a typo here is otherwise indistinguishable from a dead server. See below |
+| `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default. A non-empty list turns on the SNI gate, and a handshake whose ClientHello names none of these hosts is refused, as a rule with no reply at all. Every client must then send the name as SNI (in Surge, the `sni=` parameter), so change this key and the clients together. How names are matched, which are refused at startup and what the gate does are under [The SNI gate](#the-sni-gate) |
 
 - **This whole section is snapshotted per connection, at accept.** A reload
   applies it to connections accepted after it, and a connection already open
@@ -575,7 +575,9 @@ Each range is refused with a 403 while `allow_private_networks` is `false`. An I
 what a client may reach. With it set, the UDP port stops answering anybody who
 cannot name the host: the check runs on the datagram itself, under the QUIC
 layer, and a handshake that fails it is discarded rather than refused. There is
-no reply of any kind, so a scan of the address finds a closed port.
+no reply of any kind, no Version Negotiation packet, no `CONNECTION_CLOSE` and
+no TLS alert, so a scan of the address finds a closed port. The one exception is
+the TLS alert described under "A name is checked twice" below.
 
 What it is for is a deployment whose address is not the name — volto behind a
 relay, where the port is on an IP that nothing else advertises. What it is *not*
@@ -586,12 +588,15 @@ one is open, and it does not stop a probe that already knows the name.
 and make sure every client sends that name as SNI. Surge does when the policy
 line names the host; when the policy points at a relay's IP instead, that is the
 `sni=` parameter (with `server-cert-verify-name=`), which such a deployment
-already needs. A client that sends the wrong name — or none — gets silence, and
-silence is indistinguishable from the server being down, so the two halves belong
-in the same change window.
+already needs. A client that sends the wrong name, or none, gets silence, and
+silence is indistinguishable from the server being down: no error appears
+anywhere but this server's debug log. So the two halves belong in the same
+change window.
 
 Some details worth knowing before relying on it:
 
+- **Matching** is name for name, ASCII case-insensitive, with one trailing root
+  dot ignored. There are no wildcards and no suffix matching.
 - **A name is checked twice.** Without an ECH key, the socket-level check reads
   the ClientHello out of the client's first Initial packet, which is where a
   small ClientHello fits whole. One that is split across several packets is
@@ -612,7 +617,9 @@ Some details worth knowing before relying on it:
   connections already open are unaffected, exactly like the rest of the file.
 - **Not a certificate selector.** There is still one certificate and one key.
   Naming several hosts means volto answers to all of them with the same
-  certificate, so they all have to be on it.
+  certificate, so they all have to be on it. A name the certificate does not
+  cover draws a warning at startup and on reload, because a typo here is
+  otherwise indistinguishable from a dead server.
 - **A packet that names nobody can still draw an acknowledgement.** The check
   refuses an Initial whose Destination Connection ID is under the eight bytes
   RFC 9000 §7.2 requires of a client's first packet, since no later one is that
@@ -634,10 +641,16 @@ Some details worth knowing before relying on it:
   server stops accepting new connections, it drops every Initial packet without
   a reply, so a client that arrives then gives up at its own handshake timeout.
 - **Rejected names.** A name that no ClientHello could carry is refused at
-  startup rather than accepted and never matched — an empty string, a wildcard, a
-  name over 253 bytes, anything outside the ASCII letters, digits, `-`, `.` and
-  `_` an A-label is made of. The failure mode this avoids is a gate that starts
-  cleanly and silently refuses every client.
+  startup, by `--check-config` and on reload, rather than accepted and never
+  matched: an empty string, a wildcard, a name over 253 bytes, and anything
+  outside the ASCII letters, digits, `-`, `.` and `_` an A-label is made of. So
+  is a name with an empty label (a leading dot, two dots in a row, or a second
+  trailing dot) and an IP address literal, because RFC 6066 §3 permits neither
+  in a `server_name`. So is a name the server's TLS does not read as a DNS host
+  name (a label longer than 63 bytes, a label that starts or ends with `-`, or a
+  last label that is a number), because the server treats such a name in a
+  ClientHello as no name and refuses the handshake. The failure mode this avoids
+  is a gate that starts cleanly and silently refuses every client.
 
 ## `[log]`
 

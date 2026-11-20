@@ -120,10 +120,8 @@ split across several of them is passed through on purpose: refusing a first
 flight whose extensions have not arrived would make a large ClientHello
 unreachable. Such a handshake is stopped by a ClientHello callback that refuses
 a name that is not on the list with a fatal `unrecognized_name(112)` alert,
-before the server sends anything. It is not a certificate selector: there is
-still one certificate and one key, and naming several hosts means answering to
-all of them with the same certificate. With ECH accepted, the name it judges is
-the one inside the encrypted ClientHello; otherwise it is the one in the clear.
+before the server sends anything. With ECH accepted, the name it judges is the
+one inside the encrypted ClientHello; otherwise it is the one in the clear.
 
 With an ECH key configured the gate keeps state, because ECH cannot be judged
 from one packet: the HPKE associated data is the whole outer ClientHello
@@ -155,12 +153,10 @@ Without an ECH key, the acknowledgement quinn returns for an Initial the gate
 passes that carries an ack-eliciting frame and no name is left uncovered: a
 PING on its own, or a ClientHello the gate could not finish reading. Refusing
 those means refusing a large first flight, which the stateless gate will not do.
-The [configuration reference](configuration.md#the-sni-gate) says what that
-leaves visible. With a key, those packets are held like any other first flight and
-dropped when nothing completes them. None of this is
-traffic obfuscation, which stays a non-goal: the gate hides that a service is
-here from somebody who does not know the name to ask for, and says nothing about
-what a connection looks like once one is open.
+With a key, those packets are held like any other first flight and dropped when
+nothing completes them. What the gate leaves visible, and what it is not, is
+under [The SNI gate](configuration.md#the-sni-gate) in the configuration
+reference.
 
 Each accepted connection is handed to `h3api::Connection::handshake`, which must
 advertise **both** `SETTINGS_ENABLE_CONNECT_PROTOCOL` (0x08) and
