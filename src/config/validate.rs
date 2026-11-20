@@ -306,16 +306,10 @@ fn validate_security(security: &Security) -> Result<()> {
 /// so [`Config::validate`] runs it last.
 fn validate_certificate_paths(server: &Server) -> Result<()> {
     if !server.cert.is_file() {
-        bail!(
-            "server.cert = {} is not a readable file",
-            server.cert.display()
-        );
+        bail!("server.cert = {} is not a file", server.cert.display());
     }
     if !server.key.is_file() {
-        bail!(
-            "server.key = {} is not a readable file",
-            server.key.display()
-        );
+        bail!("server.key = {} is not a file", server.key.display());
     }
     // A leaf the server's TLS would refuse at startup is refused here too, in
     // the same words (`tls::check_leaf`). A file that does not read as a
