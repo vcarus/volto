@@ -2417,7 +2417,7 @@ mod tests {
     /// Linux loopback MTU is far larger than anything a test would send. The
     /// codes below are POSIX and defined on both hosts.
     #[test]
-    fn a_per_packet_error_costs_a_packet_and_a_socket_failure_ends_the_session() {
+    fn a_per_packet_error_on_the_read_side_does_not_end_the_session() {
         for code in [Errno::MSGSIZE, Errno::PERM, Errno::ACCESS, Errno::NOBUFS] {
             let error = std::io::Error::from(code);
             assert_eq!(
