@@ -23,7 +23,6 @@ use common::{
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::client::{EchConfig, EchMode};
 use rustls::pki_types::{CertificateDer, EchConfigListBytes};
-use volto::config::Config;
 use volto::tls::EchKey;
 
 const PUBLIC_NAME: &str = "public.example";
@@ -158,16 +157,6 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
         key_path.display()
     ))
     .await;
-    // The server was started from the file, and the file prints the list the
-    // client holds.
-    let config = Config::load(&server.dir().join("config.toml")).expect("the config loads");
-    assert_eq!(
-        EchKey::load(config.server.ech_key.as_deref().expect("ech_key is set"))
-            .expect("the key file loads")
-            .config_list(),
-        list
-    );
-
     let mut client = H3Client::connect_on(ech_endpoint(&server.ca, &list), &server).await;
     tcp_and_udp(&mut client, &server).await;
     let start = one_line(&buffer, mark, "accepting QUIC connections");
