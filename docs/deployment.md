@@ -18,20 +18,22 @@ get the dependency graph the releases are built from:
 cargo build --release --locked      # target/release/volto
 ```
 
-On Debian or Ubuntu that needs `build-essential` and `pkg-config`. Compiling on
-the server itself is the simplest route; the dependency stack is pure Rust apart
-from the C code aws-lc-rs builds (and, on musl, mimalloc), so cross-compiling
-works as well:
+On Debian or Ubuntu that needs `build-essential`, `pkg-config`, `cmake` and
+`libclang-dev`. Compiling on the server itself is the simplest route; the
+dependency stack is pure Rust apart from AWS-LC, the C library behind the
+server's TLS (and, on musl, mimalloc), so cross-compiling works as well:
 
 ```sh
 rustup target add x86_64-unknown-linux-musl
 cargo build --release --locked --target x86_64-unknown-linux-musl
 ```
 
-Cross-compiling to musl needs a C toolchain for aws-lc-rs (`musl-tools` for the
-x86_64 target, a cross toolchain for aarch64). The non-FIPS build used here
-ships pre-generated bindings, so no cmake, bindgen or Go is involved -- a C
-compiler is enough.
+Cross-compiling to musl needs a C and C++ toolchain for AWS-LC (`musl-tools`
+for the x86_64 target, a cross toolchain for aarch64), plus cmake and libclang.
+The server's TLS runs on AWS-LC's libssl, whose Rust bindings are generated at
+build time by bindgen, which loads libclang, and whose C sources are built
+through cmake. Go is not needed. The `cross` images the release workflow uses
+already carry cmake and libclang.
 
 A musl build also compiles mimalloc with the same C compiler and uses it as the global allocator in place of musl's `malloc`. A musl build measured a higher CPU cost than a glibc build of the same commit, and the allocator is the part of libc this replaces. Every other target keeps the platform allocator. The reasoning and the numbers are in `src/alloc.rs` and in the comment above the `mimalloc` dependency in `Cargo.toml`.
 

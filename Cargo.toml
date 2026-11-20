@@ -62,6 +62,39 @@ rustls = { version = "0.23", default-features = false, features = [
 # PEM parsing comes from rustls' own `pki_types::pem::PemObject` (rustls-pki-types
 # >= 1.9); `rustls-pemfile` is unmaintained (RUSTSEC-2025-0134) and was only a
 # wrapper around the same code.
+#
+# rustls is no longer the server's TLS (D115). It stays for three things: the
+# PEM parsing above, the certificate name check behind the `expected_sni`
+# warning (`tls::names_not_covered`), and quinn's `HandshakeData` type, which
+# `quic::peer_info` reads. Every client in the test suite is rustls as well,
+# which keeps the two ends of each test on different TLS implementations.
+
+# The server's TLS (D115): volto's own quinn crypto provider in `src/tls/awslc/`
+# runs the handshake on AWS-LC's libssl, which has server-side ECH and
+# BoringSSL's QUIC interface. It is the same `aws-lc-sys` build that already
+# backs rustls through aws-lc-rs (D102), so naming it here adds edges and
+# features, not a second copy of AWS-LC. `ssl` is what builds and binds libssl.
+# It implies `bindgen` and `all-bindings`, so the bindings are generated at
+# build time with libclang instead of taken from the pregenerated crypto-only
+# files, and the build goes through cmake: every builder now needs cmake and
+# libclang (`docs/deployment.md`). bindgen pulls `prettyplease`, which is held
+# at 0.2.37 in `Cargo.lock`: 0.3.0 depends on syn 3 while bindgen 0.73.2
+# unifies on the syn 2 in this tree and then fails to compile. A plain
+# `cargo update` tries 0.3 again; put it back with
+# `cargo update -p prettyplease --precise 0.2.37` until a bindgen release
+# accepts 0.3.
+aws-lc-sys = { version = "0.47", default-features = false, features = ["ssl"] }
+# Packet protection, header protection and the Initial and Retry keys of the
+# provider (`src/tls/awslc/keys.rs`) are safe code over aws-lc-rs's AEAD, HKDF
+# and QUIC header protection, the same primitives rustls's QUIC keys use. Already
+# in the tree through rustls; this is a direct edge to it.
+aws-lc-rs = { version = "1.19", default-features = false, features = [
+    "aws-lc-sys",
+] }
+# Clears the TLS traffic secrets and the ECH private key from memory when the
+# provider drops them, as rustls does with its own secrets. Already in the tree
+# through aws-lc-rs and rustls.
+zeroize = "1"
 
 # 1.50 is the first release with `TcpStream::set_zero_linger`, which
 # `tunnel::tcp` uses to reset a target connection.
