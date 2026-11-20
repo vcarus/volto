@@ -1,0 +1,83 @@
+name: ASan
+
+# The server's TLS (D115) is volto's own quinn provider over AWS-LC's libssl,
+# and `src/tls/awslc/` holds every `unsafe` block in the crate: pointers handed
+# to C, lengths read back from it, and objects libssl allocates and this code
+# has to free exactly once. Nothing in ci.yml watches memory. This workflow
+# runs the provider's unit tests and the handshake-heavy integration tests
+# under AddressSanitizer, with AWS-LC's C compiled with it as well, and with
+# leak detection on, so an object that is never freed fails the run too.
+#
+# Gated to the paths that can change what the sanitizer would see: the
+# provider, the gate that feeds it, and the dependency surface. A workflow of
+# its own because the gate is the `paths` filter, as in cross.yml.
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/tls/**
+      - src/tls.rs
+      - src/gate/**
+      - src/gate.rs
+      - src/hello.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/asan.yml
+  pull_request:
+    paths:
+      - src/tls/**
+      - src/tls.rs
+      - src/gate/**
+      - src/gate.rs
+      - src/hello.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/asan.yml
+  workflow_dispatch:
+
+concurrency:
+  group: asan-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # `-Zsanitizer` exists on nightly only. A dated nightly, so that a red run
+  # is about this repository and not about that day's compiler. Move it by
+  # hand when it is too old to build a dependency.
+  NIGHTLY: nightly-2026-11-15
+
+jobs:
+  asan:
+    name: asan (tls provider)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install cmake and libclang
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: asan
+
+      # `--target` is spelled out so that RUSTFLAGS reaches the crates built
+      # for the target and not the build scripts and proc macros, which run on
+      # the host and are not what is being tested. CFLAGS and CXXFLAGS are read
+      # by aws-lc-sys's cmake build, so libcrypto and libssl are instrumented
+      # too and an overrun inside C is reported, not only one in Rust.
+      - name: Provider unit tests and handshake tests under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          CFLAGS: -fsanitize=address -fno-omit-frame-pointer
+          CXXFLAGS: -fsanitize=address -fno-omit-frame-pointer
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          set -euo pipefail
+          cargo test --locked --target x86_64-unknown-linux-gnu --lib tls::
+          cargo test --locked --target x86_64-unknown-linux-gnu \
+            --test it_handshake --test it_tls --test it_sni_gate --test it_reload
