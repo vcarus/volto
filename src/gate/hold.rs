@@ -88,11 +88,10 @@ pub const HOLD_TOTAL_BYTES: usize = HOLD_FLIGHTS * HOLD_FLIGHT_BYTES;
 ///
 /// The record does not expire by time, because an entry that expired would let
 /// a copy of that flight, sent from another address, draw a ServerHello. It is
-/// bounded by count instead, at 2^20 entries: about 800 connections a day on
-/// the busier of the two hosts fill it in three and a half years. At the limit
-/// the oldest entry goes, so a copy of a flight older than the last 2^20
-/// admitted ones is no longer recognised. Only a flight the key opened adds
-/// an entry. Our own value.
+/// bounded by count instead, at 2^20 entries. At the limit the oldest entry
+/// goes, so a copy of a flight older than the last 2^20 admitted ones is no
+/// longer recognised. Only a flight the key opened adds an entry. Our own
+/// value.
 ///
 /// An entry is two 64-bit tags in the map and one in the order queue. A full
 /// record is a map of 2^21 buckets of 17 bytes (the two tags and a control

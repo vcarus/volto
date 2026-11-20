@@ -611,8 +611,7 @@ impl Expected {
     /// drops the driver while it unwinds, and quinn's `Drop for EndpointDriver`
     /// calls `lock().unwrap()` on the poisoned mutex. A panic in a destructor
     /// during unwinding aborts the process, so every connection ends with it.
-    /// This was observed on 2026-11-20 with an underflow in the hold's byte
-    /// count. Taking over a poisoned guard here therefore matters only for a
+    /// Taking over a poisoned guard here therefore matters only for a
     /// panic on the reload side, in [`Expected::set`], which would leave the
     /// next datagram judged against whatever the hold then holds, and that is
     /// bounded either way.
@@ -1565,10 +1564,9 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
 ///
 /// Both live in [`crate::hello`], the one ClientHello parser the gate, the TLS
 /// provider and the tests share. They are re-exported here, hidden and public,
-/// for the callers that reached them through this module before: the fuzz
-/// target and `tests/it_gate_shapes.rs` hand CRYPTO bytes to the reader
-/// directly, because the only other way to reach it is to spell a whole
-/// Initial packet that authenticates, which a fuzzer cannot do by luck.
+/// for the fuzz target and `tests/it_gate_shapes.rs`, which hand CRYPTO bytes
+/// to the reader directly, because the only other way to reach it is to spell
+/// a whole Initial packet that authenticates, which a fuzzer cannot do by luck.
 #[doc(hidden)]
 pub use crate::hello::{FirstFlight, first_flight};
 
@@ -1896,10 +1894,9 @@ mod tests {
 
     /// One dot and no more, which is what makes the four callers agree.
     ///
-    /// `trim_end_matches('.')`, which this replaced in `tls::names_not_covered`,
-    /// answers `host.tw` for the last two of these; the gate and the validator
-    /// answered `host.tw.` and `host.tw..`, so a certificate check and a
-    /// ClientHello match were run on different strings.
+    /// `trim_end_matches('.')` would answer `host.tw` for the last two of
+    /// these, and a certificate check and a ClientHello match would then run
+    /// on different strings.
     #[test]
     fn only_one_trailing_dot_is_the_root() {
         assert_eq!(root_relative("host.tw"), "host.tw");

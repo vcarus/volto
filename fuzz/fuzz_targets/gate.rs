@@ -160,7 +160,7 @@ fn judge_a_datagram(datagram: &[u8], names: &Names, list: &[&str]) {
                 Refusal::OtherName(name) => {
                     // The refusal carries the peer's bytes raw, so the bound is
                     // asked of the rendering the log line builds from them,
-                    // which is where `escaped_bytes` is now applied.
+                    // which is where `escaped_bytes` is applied.
                     assert!(
                         volto::logfmt::escaped_bytes(name).len() < MAX_BOUNDED,
                         "an unbounded name reached a log"
@@ -215,18 +215,18 @@ fn names_outside_the_list_are_refused(datagram: &[u8], name: &[u8], list: &[&str
     );
 }
 
-/// The v0.9.1 rule: only a packet the gate could open may be refused for what
-/// was behind its packet protection, which is the ClientHello.
+/// Only a packet the gate could open may be refused for what was behind its
+/// packet protection, which is the ClientHello.
 ///
 /// The keys are derived from the Destination Connection ID in the datagram
 /// itself, so changing that field must turn any such refusal into a pass. A
 /// packet keyed by something the gate cannot see is exactly the shape of every
 /// client Initial after the server has answered (RFC 9000 §7.2, RFC 9001 §5.2),
-/// and refusing those cost every admitted handshake a probe timeout in v0.9.0.
+/// and refusing those would cost every admitted handshake a probe timeout.
 ///
-/// `Refusal::ShortConnectionId` left this set on 2026-09-07. It is read off the
-/// header ahead of the decryption, the way quinn reads its own, so rotating a
-/// byte of the connection ID leaves both the length it names and the refusal.
+/// `Refusal::ShortConnectionId` is not in this set. It is read off the header
+/// ahead of the decryption, the way quinn reads its own, so rotating a byte of
+/// the connection ID leaves both the length it names and the refusal.
 fn refusing_needs_the_keys_this_datagram_carries(
     datagram: &[u8],
     names: &Names,

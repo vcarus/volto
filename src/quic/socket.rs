@@ -170,11 +170,11 @@ impl SocketBuffers {
 ///
 /// Two ways a host can decline. It can clamp, which is what both hosts we build
 /// for do: Linux at `net.core.rmem_max`, macOS at `kern.ipc.maxsockbuf` (8 MiB
-/// by default, measured on Darwin 24). Or it can fail the call outright, which
-/// older macOS releases are documented to do above the same ceiling and which
-/// costs nothing to handle. Both endings are warned about and neither stops the
-/// server. `0` asks for nothing at all, for a host whose operator has already
-/// sized these elsewhere.
+/// by default). Or it can fail the call outright, which older macOS releases
+/// are documented to do above the same ceiling and which costs nothing to
+/// handle. Both endings are warned about and neither stops the server. `0`
+/// asks for nothing at all, for a host whose operator has already sized these
+/// elsewhere.
 fn request_socket_buffer(
     socket: &SockRef<'_>,
     which: SocketBuffer,
@@ -290,12 +290,10 @@ mod tests {
     /// default limit of 256 with the default quota of 256, where one connection
     /// at its quota consumes every descriptor the process has.
     ///
-    /// And on the shipped quotas under a 65536-descriptor limit, which is the
-    /// case that made the old single-connection arithmetic wrong (review M7):
-    /// 256 connections x 256 tunnels is that limit exactly, so the defaults
-    /// leave not one descriptor of headroom and the check said nothing. That
-    /// pairing is synthetic now that the shipped unit sets 131072, and is kept
-    /// because the product landing on the limit is the tightest case there is.
+    /// And on the shipped quotas under a 65536-descriptor limit: 256
+    /// connections x 256 tunnels is that limit exactly, so the defaults leave
+    /// not one descriptor of headroom. The product landing on the limit is the
+    /// tightest case there is.
     #[test]
     fn a_tight_fd_budget_is_recognised() {
         assert!(fd_budget_is_tight(256, 1, 256), "the macOS default pairing");
