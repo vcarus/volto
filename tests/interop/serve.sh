@@ -84,6 +84,9 @@ max_targets_per_conn = 64
 # can be read off the server side too.
 level = "debug"
 EOF
+    # Private, as an installed file is: a configuration file every local user
+    # can read draws a WARN at startup, which check_log would count.
+    chmod 600 "$work/config.toml"
 }
 
 # The ECH server: the same listener settings and credentials, an ECH key, and
@@ -121,6 +124,7 @@ max_targets_per_conn = 64
 [log]
 level = "debug"
 EOF
+    chmod 600 "$work/config-ech.toml"
 }
 
 # Poll for the line the accept loop logs once it is bound, rather than sleeping:

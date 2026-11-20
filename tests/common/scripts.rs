@@ -49,6 +49,14 @@ pub fn source_root() -> PathBuf {
     repo_root().join("src")
 }
 
+/// Writes a configuration file with mode 0600, as an installed one is kept
+/// from other users, so that loading it draws no warning about its mode.
+pub fn write_private(path: &Path, text: &str) {
+    fs::write(path, text).expect("the config must be writable");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .expect("the config's mode must be settable");
+}
+
 /// The volto binary this test run built, which is the only thing that can answer
 /// what the real program does with a file.
 ///

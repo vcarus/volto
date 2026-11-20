@@ -265,6 +265,13 @@ impl TestServer {
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, config_text(&cert, &key, extra, log_extra))
             .expect("write config");
+        // Private, as an installed file is: a file every local user can read
+        // draws a warning on every reload. A rewrite below keeps the mode.
+        std::fs::set_permissions(
+            &config_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("make the config private");
 
         let config = Config::load(&config_path).expect("the test config must load");
 

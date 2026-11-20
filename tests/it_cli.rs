@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use scripts::{
     loadable_config_text, plant_placeholder_certificates, real_binary, scratch_tree, stderr_of,
-    stdout_of,
+    stdout_of, write_private,
 };
 
 /// A directory of this test's own, standing in for `/etc/volto`.
@@ -54,7 +54,7 @@ fn write_config(dir: &Path, listen: &str, body: &str) -> PathBuf {
         SECRET,
         body,
     );
-    fs::write(&path, text).expect("the config must be writable");
+    write_private(&path, &text);
     path
 }
 
@@ -264,16 +264,15 @@ fn a_key_from_the_future_is_refused_with_its_position_and_no_secret() {
 fn a_malformed_credential_line_is_refused_without_the_secret() {
     let dir = config_dir("malformed-credential");
     let path = dir.join("config.toml");
-    fs::write(
+    write_private(
         &path,
-        format!(
+        &format!(
             "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"{}\"\nkey = \"{}\"\n\n\
              [auth]\nusers = [\"user1:{SECRET}\"]\n",
             dir.join("cert.pem").display(),
             dir.join("key.pem").display(),
         ),
-    )
-    .expect("the config must be writable");
+    );
 
     let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
 
@@ -505,15 +504,14 @@ fn a_sighup_during_startup_is_taken_as_a_reload() {
     fs::write(&key, issued.signing_key.serialize_pem()).expect("the key must be writable");
     // No `[auth]`, so the startup warning about it is the first line written.
     let path = dir.join("config.toml");
-    fs::write(
+    write_private(
         &path,
-        format!(
+        &format!(
             "[server]\nlisten = \"127.0.0.1:0\"\ncert = \"{}\"\nkey = \"{}\"\n",
             cert.display(),
             key.display(),
         ),
-    )
-    .expect("the config must be writable");
+    );
 
     let mut child = Command::new(real_binary())
         .args(["--config", path.to_str().unwrap()])
@@ -592,15 +590,14 @@ fn a_sighup_during_startup_is_taken_as_a_reload() {
 fn a_warning_is_reported_without_failing_the_check() {
     let dir = config_dir("warned");
     let path = dir.join("config.toml");
-    fs::write(
+    write_private(
         &path,
-        format!(
+        &format!(
             "[server]\nlisten = \"127.0.0.1:4433\"\ncert = \"{}\"\nkey = \"{}\"\n",
             dir.join("cert.pem").display(),
             dir.join("key.pem").display(),
         ),
-    )
-    .expect("the config must be writable");
+    );
 
     let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
 
@@ -614,6 +611,27 @@ fn a_warning_is_reported_without_failing_the_check() {
         stderr.contains("authentication is DISABLED"),
         "an empty user list must still be said out loud: {stderr}"
     );
+}
+
+/// A configuration file every local user can read is reported by the check,
+/// without failing it; the group-readable mode an install gives it is not.
+#[test]
+fn a_file_readable_by_others_is_reported_by_the_check() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = config_dir("world-readable");
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    for (mode, warns) in [(0o644, true), (0o640, false)] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("set the mode");
+        let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
+        let stderr = stderr_of(&output);
+        assert!(output.status.success(), "{mode:o}: {stderr}");
+        assert_eq!(
+            stderr.contains(&format!("chmod o-r {}", path.display())),
+            warns,
+            "{mode:o}: {stderr}"
+        );
+    }
 }
 
 /// The support bundle prints what an issue needs and not what it must not carry.

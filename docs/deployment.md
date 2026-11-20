@@ -467,6 +467,12 @@ tarball, so a server started before this edit accepts a credential anybody can
 read. The server warns about both at startup and refuses neither, so the order
 of these two steps is what keeps the port shut until the file is right.
 
+The file holds the passwords in clear text. The server warns at startup, on
+every reload and in `--check-config` when the file is readable by every user on
+the host (a mode with the `o+r` bit, such as 0644 from a copy made under umask
+022); `chmod o-r /etc/volto/config.toml` clears it. The group-readable 0640
+installed above draws no warning.
+
 Start it once that edit is made:
 
 ```sh

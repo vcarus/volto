@@ -64,6 +64,23 @@ impl Config {
             ));
         }
 
+        // The file holds every password in clear text. Group-readable (0640) is
+        // the installed state, where the service reads it through its group; a
+        // file readable by others is usually a copy made under a permissive
+        // umask. `file_mode` is set by `load`, on Unix only.
+        if let Some((path, mode)) = &self.file_mode
+            && mode & 0o004 != 0
+        {
+            warnings.push(format!(
+                "the configuration file {} has mode {:04o}, so every user on this host can \
+                 read it, and it holds the [auth] passwords in clear text. Run chmod o-r {} \
+                 to keep it to its owner and group.",
+                path.display(),
+                mode & 0o7777,
+                path.display()
+            ));
+        }
+
         // `h3` is the identifier HTTP/3 is negotiated under, and HTTP/3 is the
         // only thing this server can serve once a connection is up. A list
         // without it is legal (the key exists for interop debugging), but it
@@ -390,6 +407,47 @@ mod tests {
             key = key.display().to_string(),
         ))
         .expect("parses")
+    }
+
+    /// A configuration file every local user can read is warned about, naming
+    /// the file, its mode and the fix; a group-readable or private one is not.
+    /// The mode is read by `load`, so the file is loaded the way the server
+    /// loads it.
+    #[cfg(unix)]
+    #[test]
+    fn a_configuration_file_readable_by_others_is_warned_about() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (cert, key) = minted_certificate(&["proxy.example"]);
+        let dir = cert.parent().expect("the certificate is in a directory");
+        for (mode, warns) in [(0o644, true), (0o604, true), (0o640, false), (0o600, false)] {
+            let path = dir.join(format!("config-{mode:o}.toml"));
+            std::fs::write(
+                &path,
+                format!(
+                    "[server]\nlisten = \"127.0.0.1:4433\"\ncert = {:?}\nkey = {:?}\n\
+                     [auth]\nusers = [{{ username = \"u\", password = \"a long secret\" }}]\n",
+                    cert.display().to_string(),
+                    key.display().to_string(),
+                ),
+            )
+            .expect("write the configuration");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("set the mode");
+
+            let warnings = Config::load(&path).expect("the file loads").warnings();
+            let about_mode: Vec<_> = warnings.iter().filter(|w| w.contains("chmod")).collect();
+            if warns {
+                assert_eq!(about_mode.len(), 1, "{mode:o}: {warnings:?}");
+                let warning = about_mode[0];
+                assert!(warning.contains(&path.display().to_string()), "{warning}");
+                assert!(warning.contains(&format!("mode 0{mode:o}")), "{warning}");
+                assert!(warning.contains("chmod o-r"), "{warning}");
+                assert!(warning.contains("passwords in clear text"), "{warning}");
+            } else {
+                assert!(about_mode.is_empty(), "{mode:o}: {warnings:?}");
+            }
+        }
     }
 
     /// The gate's one failure mode is silence, so the misconfiguration that

@@ -337,6 +337,10 @@ pub struct Config {
     /// Logging settings.
     #[serde(default)]
     pub log: Log,
+    /// The file [`Config::load`] read this from and its permission bits, on
+    /// Unix, for the warning about a file every local user can read.
+    #[serde(skip)]
+    file_mode: Option<(PathBuf, u32)>,
 }
 
 /// `[auth]`: the accepted credentials.
@@ -774,11 +778,18 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).map_err(|error| parse_error(path, &text, &error))?;
         config
             .validate()
             .with_context(|| format!("invalid config file {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            config.file_mode = std::fs::metadata(path)
+                .ok()
+                .map(|metadata| (path.to_owned(), metadata.permissions().mode()));
+        }
         Ok(config)
     }
 }

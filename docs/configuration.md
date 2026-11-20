@@ -751,8 +751,8 @@ reads the file, validates it and exits. A file that is good exits 0 with one
 line on stdout; a file that is not exits non-zero with the reason on stderr —
 the same error, word for word, that the service would print at startup, because
 it is the same code path. Settings that are legal but worth a word (`[auth].users`
-empty, `log.keylog` on) are printed to stderr as warnings and do not change the
-exit status: they describe a server that runs, not one that refuses to.
+empty, `log.keylog` on, a file every local user can read) are printed to stderr as
+warnings and do not change the exit status: they describe a server that runs, not one that refuses to.
 
 Nothing is bound, started or written, so this needs no privilege beyond reading
 the file it is given — which on a host set up by `install-selfsigned.sh` still
