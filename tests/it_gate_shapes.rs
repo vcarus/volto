@@ -2731,8 +2731,9 @@ async fn without_require_ech_a_flight_without_ech_is_judged_by_its_name() {
 /// A flight that never completes draws nothing: the first packet of two, and
 /// the three shapes that draw an acknowledgement from the stateless gate,
 /// which with a key are held and dropped like any other incomplete flight.
-/// The control sends the same three to a server without the gate, which
-/// acknowledges them.
+/// The controls send the same three to a server without the gate, which
+/// acknowledges them, and the whole flight to the server with the key, which
+/// answers it.
 #[tokio::test]
 async fn a_flight_that_never_completes_draws_nothing() {
     let crypto = nameless_crypto();
@@ -2769,6 +2770,15 @@ async fn a_flight_that_never_completes_draws_nothing() {
     }
 
     let (server, _keys) = ech_server(&key, false, &[]).await;
+    assert!(
+        !answers_to(
+            server.addr,
+            &hold_flight(&*crypto, &[0x77; 8], &[], &hello, 2)
+        )
+        .await
+        .is_empty(),
+        "the same server answers the whole flight"
+    );
     let mut shapes = residue();
     shapes.push((
         "the first packet of two",
