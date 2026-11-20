@@ -299,7 +299,7 @@ for a piped run that installs an unsigned release.
 
 What the signature does not cover is the first run. The one-line bootstrap
 pipes `deploy.sh` from the repository, so on a bare host the key is whatever
-that copy says. From then on the installed copy at
+that copy says, and the timer units it writes come from its own text. From then on the installed copy at
 `/usr/local/sbin/volto-deploy` is owned by root. A run replaces it from a
 release whose signature it has verified, which is also how a new key would
 reach a host, or from the file the run itself was started from; a piped run has
@@ -307,10 +307,8 @@ no such file and replaces nothing.
 
 The script is also its own bootstrap. On a bare host, pipe it straight from the
 repository and let it do the downloading — everything it installs comes out of
-the release tarball, after its signature and checksum have been verified. The
-piped copy still decides which key counts as the release key and writes the
-timer units from its own text, as the paragraph above says. With stdin
-being a pipe it never prompts, so give `--sni` (and friends) explicitly or
+the release tarball, after its signature and checksum have been verified. With
+stdin being a pipe it never prompts, so give `--sni` (and friends) explicitly or
 accept their defaults:
 
 ```sh

@@ -44,9 +44,9 @@ It finishes by printing a ready-to-paste Surge policy line:
 volto = masque, 203.0.113.10, 443, sni=volto.internal, server-cert-fingerprint-sha256=AA:BB:…:FF, username=yourname, password=…
 ```
 
-> **The fingerprint is the trust anchor.** Carry it to the client over a channel you trust and never replace it with `skip-cert-verify`: Basic credentials travel on every request, so a man in the middle collects them at once. For a public-CA certificate instead, see [docs/deployment.md](docs/deployment.md#certificates).
+> **The fingerprint is the trust anchor:** carry it to the client over a channel you trust and never replace it with `skip-cert-verify`, for the reasons under [Self-signed with fingerprint pinning](docs/deployment.md#self-signed-with-fingerprint-pinning). For a public-CA certificate instead, see [Certificates](docs/deployment.md#certificates).
 
-Everything the piped script installs comes out of the release tarball, after its signature and checksum have been verified. The piped copy itself holds the release key it verifies against and writes the timer units, so on a bare host it is trusted as far as the repository is; see [The release signature](docs/deployment.md#the-release-signature). Details and every flag: [Deploying from releases](docs/deployment.md#deploying-from-releases).
+What the signature covers, and why the piped copy is trusted only as far as the repository is, is under [The release signature](docs/deployment.md#the-release-signature); every flag is under [Deploying from releases](docs/deployment.md#deploying-from-releases).
 
 ### 2. From a release tarball
 

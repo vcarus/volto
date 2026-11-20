@@ -13,14 +13,7 @@ This manual covers volto, a MASQUE proxy server written in Rust. One QUIC connec
 
 ## Install
 
-One line on a fresh Ubuntu host downloads the newest release for the architecture, verifies the release key's signature and the checksum, creates the system user, generates a self-signed certificate and a password, writes `/etc/volto/config.toml`, installs the systemd unit and starts it:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/vcarus/volto/main/script/deploy.sh |
-  sudo bash -s -- --enable-timer --username yourname
-```
-
-It finishes by printing a ready-to-paste client policy line. Every flag, the certificate options and the tarball route are in the deployment chapter.
+One command on a fresh Ubuntu host downloads, verifies, installs and starts the newest release, and prints a ready-to-paste client policy line. The command, every flag, the certificate options and the tarball route are under [Deploying from releases](deployment.md#deploying-from-releases).
 
 ## This manual
 
