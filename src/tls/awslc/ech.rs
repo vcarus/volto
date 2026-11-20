@@ -611,7 +611,7 @@ const ENDS_EARLY: &str = "the ECHConfig ends early";
 /// last. AWS-LC's `ssl_is_valid_ech_public_name` applies the same rules, and
 /// `SSL_marshal_ech_config` refuses a name that fails them; this check comes
 /// first so that the error says which rule.
-pub fn check_public_name(name: &str) -> Result<()> {
+fn check_public_name(name: &str) -> Result<()> {
     ensure!(!name.is_empty(), "the ECH public name is empty");
     ensure!(
         name.len() <= 255,

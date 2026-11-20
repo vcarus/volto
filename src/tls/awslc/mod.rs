@@ -76,7 +76,7 @@ use crate::config;
 use crate::gate::Names;
 use crate::hello;
 
-pub use ech::{EchKey, check_public_name};
+pub use ech::EchKey;
 use ffi::{Ssl, SslCtx};
 use keys::{Secret, Suite, Version};
 
