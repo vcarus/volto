@@ -602,13 +602,14 @@ where
                 let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
                 let share =
                     deadline.saturating_duration_since(tokio::time::Instant::now()) / untried;
-                match tokio::time::timeout(share, attempt).await {
-                    Ok(result) => result,
-                    Err(_) => Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "the connect budget expired before the target answered",
-                    )),
-                }
+                tokio::time::timeout(share, attempt)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "the connect budget expired before the target answered",
+                        ))
+                    })
             }
             None => attempt.await,
         };

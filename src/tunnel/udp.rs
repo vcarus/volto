@@ -260,10 +260,10 @@ impl PacketBlock {
 
     /// The packet in hand, without its prefix.
     fn payload(&self) -> &[u8] {
-        match &self.spilled {
-            Some(whole) => &whole[self.room..],
-            None => &self.block[self.room..self.room + self.len],
-        }
+        self.spilled.as_ref().map_or_else(
+            || &self.block[self.room..self.room + self.len],
+            |whole| &whole[self.room..],
+        )
     }
 
     /// The packet in hand with the room in front of it, cut off the block, or
@@ -1366,10 +1366,7 @@ fn grade(value: usize, limit: usize, sampler: &crate::logfmt::Sampler) -> Graded
 /// condition arose: quinn refusing a datagram as too large is that verdict
 /// made under its own lock.
 fn occurrence(sampler: &crate::logfmt::Sampler) -> Graded {
-    match sampler.record() {
-        Some(total) => Graded::Report(total),
-        None => Graded::Quiet,
-    }
+    sampler.record().map_or(Graded::Quiet, Graded::Report)
 }
 
 /// What a failure of the target socket's *read* side costs.
@@ -1575,10 +1572,7 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
         .and_then(|rest| rest.strip_suffix(']'))
         .filter(|literal| !literal.is_empty())
         .map(str::to_owned);
-    let host = match unbracketed {
-        Some(literal) => literal,
-        None => host.into_owned(),
-    };
+    let host = unbracketed.unwrap_or_else(|| host.into_owned());
 
     // A bracket that survived that pair is not part of any host
     // ([`tunnel::stray_bracket`]). The two routes are the same malformation and
