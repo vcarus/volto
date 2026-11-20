@@ -441,7 +441,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "ybux2nd9",
-        file: "tunnel/udp.rs",
+        file: "tunnel/udp/path.rs",
         message: "target packet too large for a QUIC datagram, dropping; further drops on this \
                   session are logged at debug level until the count doubles",
         bound: Bound::Sampled,
@@ -463,7 +463,7 @@ const ACCOUNTED: &[Accounted] = &[
     },
     Accounted {
         id: "zh8bm6bi",
-        file: "tunnel/udp.rs",
+        file: "tunnel/udp/path.rs",
         message: "QUIC datagram send buffer full, older datagrams evicted; further evictions on \
                   this session are logged at debug level until the count doubles",
         bound: Bound::Sampled,
