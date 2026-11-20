@@ -276,9 +276,9 @@ pub const READ_AHEAD_CHUNKS: usize = 32;
 /// worth a counter and how the value was chosen.
 ///
 /// Every request stream's decoder holds the same one, so a share taken on any
-/// of them is a share the others cannot take. Charging happens when a decoder
-/// commits to buffering a frame and releasing when that frame completes or its
-/// decoder is dropped, so the counter reads zero on a connection with nothing
+/// of them is a share the others cannot take. A share is a `Charge`, taken
+/// when a decoder commits to buffering a frame and given back when it is
+/// dropped, so the counter reads zero on a connection with nothing
 /// half-received on it.
 #[derive(Debug, Default)]
 pub struct BufferBudget {
@@ -331,7 +331,7 @@ impl BufferBudget {
     /// leave the counter untouched, or two streams failing at once would each
     /// see the other's rolled-back bytes and the bound would hold only on
     /// average.
-    fn charge(&self, bytes: usize) -> Result<(), Violation> {
+    fn charge(self: &Arc<Self>, bytes: usize) -> Result<Charge, Violation> {
         self.held
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 let wanted = held.saturating_add(bytes);
@@ -344,17 +344,19 @@ impl BufferBudget {
                      {held} are already held"
                 ))
             })?;
-        Ok(())
+        Ok(Charge {
+            budget: Arc::clone(self),
+            bytes,
+        })
     }
 
     /// Gives `bytes` back to the budget.
     ///
     /// Saturating, and asserted in debug builds. Nothing can return more than
-    /// it took: `charged` is written only after a charge succeeds and zeroed by
-    /// the `mem::take` that hands it here. An underflow would wrap the counter
-    /// to near `usize::MAX` and make the connection refuse every request from
-    /// then on. A saturating subtraction limits that to a budget that is wrong,
-    /// which is recoverable.
+    /// it took: only a [`Charge`] calls this, once, with what its own charge
+    /// added. An underflow would wrap the counter to near `usize::MAX` and make
+    /// the connection refuse every request from then on. A saturating
+    /// subtraction limits that to a budget that is wrong, which is recoverable.
     fn release(&self, bytes: usize) {
         if bytes > 0 {
             let held = self
@@ -378,6 +380,29 @@ impl BufferBudget {
     #[cfg(test)]
     fn held(&self) -> usize {
         self.held.load(Ordering::Relaxed)
+    }
+}
+
+/// One frame's share of a connection's [`BufferBudget`], given back when it is
+/// dropped (D77).
+///
+/// It lives in [`State::Buffering`] beside the payload it pays for, so the
+/// share ends when that state does: the frame completes, or the decoder is
+/// dropped with it half-received. A stream can end at any point, mostly by
+/// the peer's choice (a RESET_STREAM, a `STOP_SENDING` answered, the request
+/// deadline of D76, the connection going away), and none of those reaches the
+/// decoding loop. A share not returned on one of them would leak the
+/// connection's allowance until a peer is refused a request it was entitled
+/// to.
+#[derive(Debug)]
+struct Charge {
+    budget: Arc<BufferBudget>,
+    bytes: usize,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
     }
 }
 
@@ -516,7 +541,7 @@ pub enum StreamKind {
 }
 
 /// Where the decoder is in the frame sequence.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 enum State {
     /// Between frames, assembling a type and length.
     Header,
@@ -531,6 +556,11 @@ enum State {
         kind: BufferedKind,
         /// Payload bytes still to arrive.
         remaining: usize,
+        /// What has arrived of the payload.
+        payload: BytesMut,
+        /// The budget share for the whole announced length, held for its
+        /// `Drop`.
+        _charge: Charge,
     },
     /// Discarding the payload of a frame type this server does not know.
     Skipping {
@@ -569,12 +599,6 @@ pub struct FrameDecoder {
     header: [u8; MAX_FRAME_HEADER],
     /// How many bytes of [`Self::header`] have arrived.
     header_len: usize,
-    /// Payload of the frame currently being buffered.
-    ///
-    /// Taken rather than split when the frame completes, so the allocation
-    /// leaves with the frozen payload and this decoder holds nothing between
-    /// frames.
-    payload: BytesMut,
     /// The connection's buffering budget, shared with every other decoder on
     /// it (D77).
     ///
@@ -583,13 +607,6 @@ pub struct FrameDecoder {
     /// connection end in any order. Cloning one is a refcount bump, so
     /// [`Self::new`] still allocates nothing.
     budget: Arc<BufferBudget>,
-    /// Bytes charged to that budget for the frame being buffered, if any.
-    ///
-    /// The full length the frame announced, which is what this decoder has
-    /// committed to holding, not what has arrived so far. Returned by
-    /// [`Self::release`] on the two ways a commitment ends: the frame
-    /// completes, or the decoder is dropped with it half-received.
-    charged: usize,
     /// Which stream's rules this decoder applies to a frame type.
     ///
     /// Not fixed for the life of the decoder: a request stream becomes a tunnel
@@ -629,9 +646,7 @@ impl FrameDecoder {
             chunk: Bytes::new(),
             header: [0; MAX_FRAME_HEADER],
             header_len: 0,
-            payload: BytesMut::new(),
             budget,
-            charged: 0,
             stream,
             settings_seen: false,
             skipped: 0,
@@ -676,19 +691,8 @@ impl FrameDecoder {
                     let Some((kind, length)) = self.take_frame_header() else {
                         return Ok(None);
                     };
-                    let next = begin(self.stream, self.settings_seen, kind, length)?;
-
-                    // Charged on the announcement rather than on arrival: the
-                    // announcement is the moment this decoder commits to
-                    // holding that many bytes, and holding them is what the
-                    // peer gets out of never sending them (D77). The state is
-                    // entered only once the charge is in, so a refused frame
-                    // leaves nothing to release.
-                    if let State::Buffering { remaining, .. } = next {
-                        self.budget.charge(remaining)?;
-                        self.charged = remaining;
-                    }
-                    self.state = next;
+                    self.state =
+                        begin(self.stream, self.settings_seen, kind, length, &self.budget)?;
                 }
 
                 // An empty DATA frame is legal and carries nothing; the two
@@ -718,39 +722,33 @@ impl FrameDecoder {
                     return Ok(Some(Item::Data(data)));
                 }
 
-                State::Buffering { kind, remaining } => {
-                    let take = remaining.min(self.chunk.len());
+                State::Buffering {
+                    kind,
+                    ref mut remaining,
+                    ref mut payload,
+                    ..
+                } => {
+                    let take = (*remaining).min(self.chunk.len());
                     // Allocated once, at the announced length, when the first
                     // payload byte arrives: the allocation then equals what
                     // the budget was charged, where growth by doubling could
                     // reach nearly twice that.
-                    if self.payload.is_empty() && take > 0 {
-                        self.payload.reserve(remaining);
+                    if payload.is_empty() && take > 0 {
+                        payload.reserve(*remaining);
                     }
-                    self.payload.extend_from_slice(&self.chunk[..take]);
+                    payload.extend_from_slice(&self.chunk[..take]);
                     self.chunk.advance(take);
-
-                    if take < remaining {
-                        self.state = State::Buffering {
-                            kind,
-                            remaining: remaining - take,
-                        };
+                    *remaining -= take;
+                    if *remaining > 0 {
                         return Ok(None);
                     }
+
+                    // The whole allocation goes with the frozen payload, and
+                    // leaving the state drops the charge, before the parse,
+                    // which may fail: the frame is held no longer either way,
+                    // and this decoder holds nothing between frames.
+                    let payload = std::mem::take(payload).freeze();
                     self.state = State::Header;
-                    // `take` rather than `split`: `split` would leave this
-                    // decoder holding a second handle on the allocation the
-                    // payload grew into. A decoder that outlives its frame (a
-                    // tunnel's reader, the peer's control stream) would then
-                    // keep up to `MAX_BUFFERED_FRAME` alive after `release`
-                    // below reports it free, outside both the D77 budget and
-                    // the D99 ledger. Taking the buffer hands the whole
-                    // allocation to the frozen half, at the cost of one
-                    // allocation on a stream that buffers a second frame.
-                    let payload = std::mem::take(&mut self.payload).freeze();
-                    // Before the parse, which may fail: the frame is no longer
-                    // being held either way.
-                    self.release();
                     let frame = parse(kind, payload)?;
                     self.settings_seen |= matches!(frame, Frame::Settings(_));
                     return Ok(Some(Item::Frame(frame)));
@@ -828,28 +826,6 @@ impl FrameDecoder {
             }
         }
         Ok(())
-    }
-
-    /// Gives back whatever this decoder had charged to the connection's budget.
-    ///
-    /// Idempotent, because it is called from two places that can both be right:
-    /// the end of a buffered frame, and [`Drop`].
-    fn release(&mut self) {
-        self.budget.release(std::mem::take(&mut self.charged));
-    }
-}
-
-impl Drop for FrameDecoder {
-    /// Returns the budget a half-received frame was holding (D77).
-    ///
-    /// This keeps the accounting sound. A stream can end at any point, mostly
-    /// by the peer's choice: a RESET_STREAM, a `STOP_SENDING` answered, the
-    /// request deadline of D76 expiring, the connection going away. None of
-    /// them reaches the decoding loop. A share not returned on any one of them
-    /// would leak the connection's allowance until a peer is refused a request
-    /// it was entitled to.
-    fn drop(&mut self) {
-        self.release();
     }
 }
 
@@ -1094,7 +1070,18 @@ impl FrameReader {
 /// SETTINGS frame, and the connection would carry on after a MUST-close. The
 /// control stream follows the same ordering with other codes; `misplaced`
 /// states which of its rules are judged from the header.
-fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Result<State, Error> {
+///
+/// A frame to be buffered is charged to `budget` here, on its announcement
+/// rather than on arrival: the announcement is the moment the decoder commits
+/// to holding that many bytes, and holding them is what the peer gets out of
+/// never sending them (D77). A refused frame is charged nothing.
+fn begin(
+    stream: StreamKind,
+    settings_seen: bool,
+    kind: u64,
+    length: u64,
+    budget: &Arc<BufferBudget>,
+) -> Result<State, Error> {
     if RESERVED_HTTP2_TYPES.contains(&kind) {
         //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
         //# These frame types MUST NOT be sent, and their receipt MUST be
@@ -1138,6 +1125,8 @@ fn begin(stream: StreamKind, settings_seen: bool, kind: u64, length: u64) -> Res
     Ok(State::Buffering {
         kind: buffered,
         remaining,
+        payload: BytesMut::new(),
+        _charge: budget.charge(remaining)?,
     })
 }
 
@@ -1682,10 +1671,15 @@ mod tests {
         out.to_vec()
     }
 
+    /// A budget of its own, for the tests that are not about the budget.
+    fn budget() -> Arc<BufferBudget> {
+        Arc::new(BufferBudget::default())
+    }
+
     /// A request stream's decoder with a budget of its own, for the tests that
     /// are not about the budget.
     fn fresh_decoder() -> FrameDecoder {
-        FrameDecoder::new(StreamKind::Request, Arc::new(BufferBudget::default()))
+        FrameDecoder::new(StreamKind::Request, budget())
     }
 
     /// Feeds `wire` to a decoder one byte at a time and collects what comes out.
@@ -1934,7 +1928,9 @@ mod tests {
     #[test]
     fn reserved_http2_frame_types_end_the_connection() {
         for kind in RESERVED_HTTP2_TYPES {
-            let Err(Error::Protocol(violation)) = begin(StreamKind::Control, false, kind, 0) else {
+            let Err(Error::Protocol(violation)) =
+                begin(StreamKind::Control, false, kind, 0, &budget())
+            else {
                 panic!("frame type {kind:#x} must be refused")
             };
             assert_eq!(violation.code(), Code::H3_FRAME_UNEXPECTED);
@@ -1944,9 +1940,13 @@ mod tests {
 
     #[test]
     fn a_frame_past_the_buffer_limit_is_refused_before_it_is_allocated() {
-        let Err(Error::Protocol(violation)) =
-            begin(StreamKind::Request, false, HEADERS, MAX_BUFFERED_FRAME + 1)
-        else {
+        let Err(Error::Protocol(violation)) = begin(
+            StreamKind::Request,
+            false,
+            HEADERS,
+            MAX_BUFFERED_FRAME + 1,
+            &budget(),
+        ) else {
             panic!("an oversized frame must be refused")
         };
         assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
@@ -1955,14 +1955,24 @@ mod tests {
             "one oversized frame is a stream problem, not a connection one"
         );
 
-        assert!(begin(StreamKind::Request, false, HEADERS, MAX_BUFFERED_FRAME).is_ok());
+        assert!(
+            begin(
+                StreamKind::Request,
+                false,
+                HEADERS,
+                MAX_BUFFERED_FRAME,
+                &budget()
+            )
+            .is_ok()
+        );
         // DATA is never buffered, so no declared length can be too large.
         assert!(
             begin(
                 StreamKind::Request,
                 false,
                 DATA,
-                crate::datagram::VARINT_MAX
+                crate::datagram::VARINT_MAX,
+                &budget()
             )
             .is_ok()
         );
@@ -2011,7 +2021,8 @@ mod tests {
         ] {
             for kind in refused {
                 for length in LENGTHS {
-                    let Err(Error::Protocol(violation)) = begin(stream, false, *kind, length)
+                    let Err(Error::Protocol(violation)) =
+                        begin(stream, false, *kind, length, &budget())
                     else {
                         panic!("{stream:?}: frame type {kind:#x} of {length} bytes must be refused")
                     };
@@ -2062,7 +2073,7 @@ mod tests {
         for kind in [HEADERS, PUSH_PROMISE] {
             for length in BUFFERED.iter().copied().chain([PAST]) {
                 let Err(Error::Protocol(violation)) =
-                    begin(StreamKind::ServerControl, false, kind, length)
+                    begin(StreamKind::ServerControl, false, kind, length, &budget())
                 else {
                     panic!("{kind:#x} of {length} bytes before SETTINGS must be refused")
                 };
@@ -2075,7 +2086,7 @@ mod tests {
         for kind in [HEADERS, PUSH_PROMISE] {
             for length in BUFFERED.iter().copied().chain([PAST]) {
                 let Err(Error::Protocol(violation)) =
-                    begin(StreamKind::ServerControl, true, kind, length)
+                    begin(StreamKind::ServerControl, true, kind, length, &budget())
                 else {
                     panic!("{kind:#x} of {length} bytes after SETTINGS must be refused")
                 };
@@ -2088,7 +2099,7 @@ mod tests {
         // type is the offence, so its payload is never parsed.
         for length in BUFFERED.iter().copied().chain([PAST]) {
             let Err(Error::Protocol(violation)) =
-                begin(StreamKind::ServerControl, true, SETTINGS, length)
+                begin(StreamKind::ServerControl, true, SETTINGS, length, &budget())
             else {
                 panic!("a second SETTINGS of {length} bytes must be refused")
             };
@@ -2102,7 +2113,7 @@ mod tests {
         for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
             for length in BUFFERED.iter().copied().chain([PAST]) {
                 let Err(Error::Protocol(violation)) =
-                    begin(StreamKind::ServerControl, false, kind, length)
+                    begin(StreamKind::ServerControl, false, kind, length, &budget())
                 else {
                     panic!("{kind:#x} of {length} bytes before SETTINGS must be refused")
                 };
@@ -2117,7 +2128,7 @@ mod tests {
         for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
             for length in BUFFERED {
                 assert_matches!(
-                    begin(StreamKind::ServerControl, true, kind, length),
+                    begin(StreamKind::ServerControl, true, kind, length, &budget()),
                     Ok(State::Buffering { .. }),
                     "{kind:#x} of {length} bytes after SETTINGS is parsed"
                 );
@@ -2134,7 +2145,8 @@ mod tests {
                 StreamKind::ServerControl,
                 false,
                 SETTINGS,
-                MAX_BUFFERED_FRAME
+                MAX_BUFFERED_FRAME,
+                &budget()
             ),
             Ok(State::Buffering { .. })
         );
@@ -2143,6 +2155,7 @@ mod tests {
             false,
             SETTINGS,
             MAX_BUFFERED_FRAME + 1,
+            &budget(),
         ) else {
             panic!("a first SETTINGS past the cap keeps the load answer")
         };
@@ -2152,9 +2165,13 @@ mod tests {
         // The permissive kind applies no control-stream rule: a HEADERS frame
         // past the cap is still the stream error a 431 answers, which is what
         // the suite's client needs for its own response stream.
-        let Err(Error::Protocol(violation)) =
-            begin(StreamKind::Control, true, HEADERS, MAX_BUFFERED_FRAME + 1)
-        else {
+        let Err(Error::Protocol(violation)) = begin(
+            StreamKind::Control,
+            true,
+            HEADERS,
+            MAX_BUFFERED_FRAME + 1,
+            &budget(),
+        ) else {
             panic!("the permissive kind still applies the cap")
         };
         assert_eq!(violation.code(), Code::H3_EXCESSIVE_LOAD);
@@ -2219,7 +2236,7 @@ mod tests {
     fn answering_the_connect_narrows_what_the_stream_may_carry() {
         let mut decoder = fresh_decoder();
         assert_matches!(
-            begin(decoder.stream, false, HEADERS, 200),
+            begin(decoder.stream, false, HEADERS, 200, &budget()),
             Ok(State::Buffering { .. })
         );
 
@@ -2257,18 +2274,26 @@ mod tests {
         wire.extend_from_slice(&[0x5a; 1200]);
         decoder.push(wire.freeze());
         assert!(decoder.next_item().expect("decodes").is_none());
-        assert_eq!(decoder.payload.capacity(), 38402);
+        assert_eq!(buffered(&decoder).capacity(), 38402);
 
         for _ in 0..31 {
             decoder.push(Bytes::from(vec![0x5a; 1200]));
             assert!(decoder.next_item().expect("decodes").is_none());
         }
-        assert_eq!(decoder.payload.len(), 38400);
+        assert_eq!(buffered(&decoder).len(), 38400);
         assert_eq!(
-            decoder.payload.capacity(),
+            buffered(&decoder).capacity(),
             38402,
             "the payload buffer grew past the announced length"
         );
+    }
+
+    /// The payload a decoder in the middle of a buffered frame holds.
+    fn buffered(decoder: &FrameDecoder) -> &BytesMut {
+        let State::Buffering { payload, .. } = &decoder.state else {
+            panic!("the decoder is not buffering a frame: {:?}", decoder.state)
+        };
+        payload
     }
 
     /// D77: the connection's budget is charged for what a frame *announces*,
