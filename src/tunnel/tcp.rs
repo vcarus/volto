@@ -404,8 +404,14 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// travels with the error, since that is the hop the client is told about.
 ///
 /// `budget` bounds the **whole** loop rather than each address, so a name with
-/// several unreachable addresses cannot multiply the wait by their number. Why
-/// it is bounded at all: the tunnel slot and the file descriptor behind it are
+/// several unreachable addresses cannot multiply the wait by their number.
+/// Within it, each attempt gets an equal share of what is left for the
+/// addresses not yet tried, so an address that drops SYNs cannot spend the
+/// time of the ones after it, and an address that fails early leaves the rest
+/// of its share to them. The shares never add up to more than the budget. The
+/// attempts are still made one at a time, in the order resolution gave
+/// (D58): this is not address racing. Why the walk is bounded at all: the
+/// tunnel slot and the file descriptor behind it are
 /// held for the length of this call, and a target that silently drops SYNs
 /// otherwise holds them for as long as the operating system retries, around two
 /// minutes on Linux. No attacker is needed for that; a handful of black-holed
@@ -440,24 +446,22 @@ where
     let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
     let mut last = None;
 
-    for address in addresses {
+    for (tried, address) in addresses.iter().enumerate() {
         let attempt = connect(*address);
 
         let result = match deadline {
-            Some(deadline) => match tokio::time::timeout_at(deadline, attempt).await {
-                Ok(result) => result,
-                // Reported as the hop that was still in flight, which is the one
-                // the client is waiting on.
-                Err(_) => {
-                    return Err(Unreachable {
-                        next_hop: Some(*address),
-                        error: io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "the connect budget expired before the target answered",
-                        ),
-                    });
+            Some(deadline) => {
+                let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
+                let share =
+                    deadline.saturating_duration_since(tokio::time::Instant::now()) / untried;
+                match tokio::time::timeout(share, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "the connect budget expired before the target answered",
+                    )),
                 }
-            },
+            }
             None => attempt.await,
         };
 
@@ -470,6 +474,12 @@ where
                     error,
                 });
             }
+        }
+
+        // Nothing left to share: the failure just recorded is the answer, and
+        // no address is dialled on a budget that is already spent.
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            break;
         }
     }
 
@@ -1143,12 +1153,14 @@ mod tests {
     /// millisecond short, the timeout on the millisecond itself.
     #[tokio::test(start_paused = true)]
     async fn the_connect_budget_bounds_a_target_that_never_answers() {
-        let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
+        let addresses = [address("192.0.2.1:443")];
         let budget = Duration::from_secs(10);
 
         let mut attempt = Box::pin(connect_any_with(&addresses, Some(budget), |_| {
             std::future::pending::<io::Result<TcpStream>>()
         }));
+        // The deadline is taken at the first poll.
+        assert!(poll_once(attempt.as_mut()).is_none());
 
         // A millisecond short of the budget the target is still being waited for.
         tokio::time::advance(budget - Duration::from_millis(1)).await;
@@ -1168,14 +1180,65 @@ mod tests {
         assert_eq!(failure.next_hop, Some(addresses[0]));
     }
 
+    /// A first address that never answers leaves the next one time to connect.
+    ///
+    /// The dual-stack case `connect_any` tries every address for: a name whose
+    /// first address drops SYNs and whose second works. Each attempt gets an
+    /// equal share of what is left of the budget, so the first is given up on
+    /// at half of it and the second connects at once. With one deadline for
+    /// every attempt, the first spent the whole budget and the second was never
+    /// dialled.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_first_address_leaves_time_for_the_next() {
+        let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
+        let budget = Duration::from_secs(10);
+
+        // A connected loopback stream stands in for the second address
+        // answering, so the clock stays the only thing that moves.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("address")).expect("connect");
+        client.set_nonblocking(true).expect("non-blocking");
+        let working =
+            std::cell::RefCell::new(Some(TcpStream::from_std(client).expect("a tokio stream")));
+
+        let mut attempt = Box::pin(connect_any_with(&addresses, Some(budget), |address| {
+            let answer = if address == addresses[1] {
+                working.borrow_mut().take()
+            } else {
+                None
+            };
+            async move {
+                match answer {
+                    Some(tcp) => Ok(tcp),
+                    None => std::future::pending().await,
+                }
+            }
+        }));
+        // The deadline is taken at the first poll.
+        assert!(poll_once(attempt.as_mut()).is_none());
+
+        tokio::time::advance(budget / 2 - Duration::from_millis(1)).await;
+        assert!(
+            poll_once(attempt.as_mut()).is_none(),
+            "the first address was given up on before its share was spent"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let connected = poll_once(attempt.as_mut())
+            .expect("the second address must be dialled once the first one's share is spent");
+        assert!(connected.is_ok(), "the second address answers");
+    }
+
     /// One budget for the whole list, not one per address: several unreachable
     /// addresses must not multiply the wait by their number.
     ///
-    /// The first address spends three quarters of the budget and fails, the
-    /// second never answers. Shared, that ends at the budget; one budget each
-    /// would end at 1.75 times it. On a paused clock that is not a margin to
-    /// leave room for but an exact edge: nothing at one millisecond short, the
-    /// answer already there at the budget.
+    /// The first address fails after a quarter of the budget, inside its half
+    /// share, and the second never answers. The second is given everything that
+    /// is left, so the walk ends at the budget; one budget each would end at
+    /// 1.25 times it. On a paused clock that is not a margin to leave room for
+    /// but an exact edge: nothing at one millisecond short, the answer already
+    /// there at the budget.
     #[tokio::test(start_paused = true)]
     async fn every_address_draws_on_the_same_budget() {
         let addresses = [address("192.0.2.1:443"), address("192.0.2.2:443")];
@@ -1186,12 +1249,14 @@ mod tests {
             Some(budget),
             |address| async move {
                 if address == addresses[0] {
-                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    tokio::time::sleep(Duration::from_secs(100)).await;
                     return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
                 }
                 std::future::pending().await
             },
         ));
+        // The deadline is taken at the first poll.
+        assert!(poll_once(attempt.as_mut()).is_none());
 
         tokio::time::advance(budget - Duration::from_millis(1)).await;
         assert!(
