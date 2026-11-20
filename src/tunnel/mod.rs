@@ -66,13 +66,14 @@ pub fn route(req: &Request) -> Route<'_> {
 /// The field, if any, that makes `req` malformed under RFC 9114 §4.2.
 ///
 /// RFC 9114 §4.2's rule is that "any message containing connection-specific
-/// fields MUST be treated as malformed". It is quoted in full in
-/// `crate::h3::stream`, where the `Connection` field itself is refused at
-/// decode time. The fields RFC 9110 §7.6.1 names as connection-specific beyond
-/// `Connection` itself are judged here rather than in the codec so that the
-/// answer can be a 400 instead of a reset: RFC 9114 §4.1.2 lets a server "send
-/// an HTTP response indicating the error prior to closing or resetting the
-/// stream", and a client is told more by a status than by `H3_MESSAGE_ERROR`.
+/// fields MUST be treated as malformed". It is quoted in full in the HTTP/3
+/// layer's request decoder (behind [`crate::h3api::Resolver::resolve`]), where
+/// the `Connection` field itself is refused at decode time. The fields RFC 9110
+/// §7.6.1 names as connection-specific beyond `Connection` itself are judged
+/// here rather than in the codec so that the answer can be a 400 instead of a
+/// reset: RFC 9114 §4.1.2 lets a server "send an HTTP response indicating the
+/// error prior to closing or resetting the stream", and a client is told more
+/// by a status than by `H3_MESSAGE_ERROR`.
 ///
 /// Named one at a time so the log says which field was the problem.
 ///
@@ -92,9 +93,10 @@ pub fn connection_specific_field(req: &Request) -> Option<&'static str> {
 ///
 /// Four of the five that section lists. The fifth is `TE`, which RFC 9114 §4.2
 /// exempts when it says `trailers` and nothing else. That sentence is quoted in
-/// `crate::h3::stream`, where the value is checked and where the answer is the
-/// reset a malformed field section gets. So `TE` is not judged here, and its
-/// absence from this list is the exemption rather than an oversight.
+/// the HTTP/3 layer's request decoder, where the value is checked and where the
+/// answer is the reset a malformed field section gets. So `TE` is not judged
+/// here, and its absence from this list is the exemption rather than an
+/// oversight.
 const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
     "proxy-connection",
     "keep-alive",
@@ -250,7 +252,7 @@ pub struct Context {
     /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
     /// sessions fall back to DATAGRAM capsules on the request stream. Shared
     /// with the HTTP/3 connection rather than copied from it, for the reason
-    /// [`crate::h3::connection`] gives.
+    /// [`crate::h3api::Connection::peer_datagrams`] gives.
     pub peer_datagrams: Arc<AtomicBool>,
     /// The configuration generation this connection was accepted under, for
     /// the credentials every request is checked against and the destinations

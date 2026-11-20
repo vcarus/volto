@@ -361,11 +361,11 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // session is about to read from, so a client that opens a tunnel and sends
     // immediately does not lose its first packets to name resolution. The same
     // section says "Receivers that buffer datagrams SHOULD apply buffering
-    // limits", and the limit here is the queue depth, `INBOUND_QUEUE_DEPTH` in
-    // `crate::h3::connection`. Packets that arrived even before this claim,
-    // while the request was being decoded and authenticated, were held by the
-    // connection and are put in the queue by the claim, ahead of later ones
-    // (`EARLY_DATAGRAMS`, D114).
+    // limits", and the limit here is the depth of the queue the
+    // `h3api::DatagramReceiver` reads (D99). Packets that arrived even before
+    // this claim, while the request was being decoded and authenticated, were
+    // held by the connection and are put in the queue by the claim, ahead of
+    // later ones (`EARLY_DATAGRAMS`, D114).
     //
     // Every refusal below returns, dropping the receiver and with it both the
     // queue and the claim, so the packets of a request that fails are not
@@ -680,14 +680,14 @@ impl Session<'_> {
         // peer's SETTINGS_H3_DATAGRAM is never withdrawn once it has arrived,
         // and the transport parameter behind `datagrams` is fixed at the
         // handshake, so a session that starts on the datagram path stays on it.
-        // Nothing is allocated until the target first sends; after that
-        // the session holds one `RECV_BLOCK_SIZE` block, 16 KiB, across every
-        // wait. That block is one of the per-session terms in the memory
-        // product `docs/configuration.md` gives for `max_connections` x
-        // `max_targets_per_conn`; the others are the inbound datagram queue,
-        // `INBOUND_QUEUE_DEPTH` in `crate::h3::connection`, and the capsule
-        // decoder. See [`RECV_BLOCK_SIZE`] for what pieces still in quinn's
-        // queue can add to it.
+        // Nothing is allocated until the target first sends; after that the
+        // session holds one `RECV_BLOCK_SIZE` block, 16 KiB, across every wait.
+        // That block is one of the per-session terms in the memory product
+        // `docs/configuration.md` gives for `max_connections` x
+        // `max_targets_per_conn`; the others are the inbound datagram queue the
+        // `h3api::DatagramReceiver` reads, and the capsule decoder. See
+        // [`RECV_BLOCK_SIZE`] for what pieces still in quinn's queue can add to
+        // it.
         let mut packets = if self.datagrams.is_some() && self.ctx.datagrams_allowed() {
             PacketBlock::new(self.quarter_stream_id)
         } else {

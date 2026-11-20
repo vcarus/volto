@@ -148,8 +148,7 @@ pub async fn handle(
     let mut connection = h3api::Connection::handshake(quic, idle, dropped_datagrams).await?;
 
     // The datagram flag handed to the context is the connection's own rather
-    // than a copy of it; `crate::h3::connection`'s module documentation says
-    // why.
+    // than a copy of it; `h3api::Connection::peer_datagrams` says why.
     let context = Arc::new(Context::new(
         generation,
         for_context,

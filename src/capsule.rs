@@ -46,13 +46,12 @@ pub const CAPSULE_TYPE_DATAGRAM: u64 = 0x00;
 /// first, and a non-zero one names an extension this server has not negotiated.
 ///
 /// It is also this decoder's memory bound, and therefore one of the three
-/// buffers a CONNECT-UDP session holds
-/// ([`crate::h3::connection::INBOUND_QUEUE_DEPTH`] accounts for all three). A
-/// value has to be buffered whole because a UDP payload cannot be forwarded
-/// piecewise, and a peer that declares the largest one allowed and then stops
-/// one byte short is doing nothing RFC 9297 §3.2 forbids. So what is held is
-/// held until the session's idle timeout. One capsule's worth is all of it
-/// ([`CapsuleDecoder`] says what it copies and when).
+/// buffers a CONNECT-UDP session holds (D99's memory ledger accounts for all
+/// three). A value has to be buffered whole because a UDP payload cannot be
+/// forwarded piecewise, and a peer that declares the largest one allowed and
+/// then stops one byte short is doing nothing RFC 9297 §3.2 forbids. So what is
+/// held is held until the session's idle timeout. One capsule's worth is all of
+/// it ([`CapsuleDecoder`] says what it copies and when).
 pub const MAX_DATAGRAM_CAPSULE_VALUE: u64 = 8 + varint::len_u64(MAX_UDP_PAYLOAD);
 
 /// Why a capsule sequence could not be decoded.
