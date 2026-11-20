@@ -509,7 +509,8 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
 ///
 /// One byte at a time to start with, because a stream carries no framing that
 /// would say how many are coming: the first byte's two most significant bits
-/// give the length, and the rest follow.
+/// give the length, and the rest follow. [`decode_varint`] does the decoding,
+/// so what this reads is read independently of the server's own decoder.
 pub async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
     let mut buf = [0u8; 8];
     tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[..1]))
@@ -525,11 +526,31 @@ pub async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
             .expect("varint tail");
     }
 
-    let mut value = u64::from(buf[0] & 0x3f);
+    decode_varint(&buf[..length]).expect("a complete varint").0
+}
+
+/// Decodes a variable-length integer from a buffer, returning its byte length.
+///
+/// Hand-written rather than `volto::datagram::peek_varint`, which is the same
+/// algorithm: what the server sends, its SETTINGS above all (`it_settings`),
+/// must be read independently of the code under test, so a bug in that decoder
+/// cannot make a test agree with it. The same reasoning as
+/// `basic_credentials` in `tests/common`. The `datagram::put_varint` calls in
+/// the tests only *build* client bytes, where a broken encoder fails loudly
+/// instead of passing quietly.
+pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
+    let first = *buf.first()?;
+    let length = 1usize << (first >> 6);
+    if buf.len() < length {
+        return None;
+    }
+
+    let mut value = u64::from(first & 0x3f);
     for byte in &buf[1..length] {
         value = (value << 8) | u64::from(*byte);
     }
-    value
+
+    Some((value, length))
 }
 
 /// The `:status` of a response field section.

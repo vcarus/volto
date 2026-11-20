@@ -15,8 +15,8 @@ use bytes::{Bytes, BytesMut};
 use common::rawstream::{
     self, FRAME_DATA, FRAME_HEADERS, FRAME_SETTINGS, H3_EXCESSIVE_LOAD, H3_MISSING_SETTINGS,
     SETTINGS_ENABLE_CONNECT_PROTOCOL, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
-    STREAM_CONTROL, connect_udp_headers_frame, open_uni_stream, read_frame, status_of,
-    still_serving, stopped_code,
+    STREAM_CONTROL, connect_udp_headers_frame, decode_varint, open_uni_stream, read_frame,
+    read_varint, status_of, still_serving, stopped_code,
 };
 use common::{
     TIMEOUT, TestServer, client_endpoint_with_transport, connect_quic, finish_connect,
@@ -253,55 +253,6 @@ fn parse_settings(payload: &[u8]) -> HashMap<u64, u64> {
     }
 
     settings
-}
-
-/// Reads one QUIC variable-length integer from the control stream (RFC 9000 §16).
-///
-/// Only the length is worked out here -- the first byte's two most significant
-/// bits give it -- and `decode_varint` does the rest, so the SETTINGS this file
-/// asserts on reach [`parse_settings`] through exactly one varint decoder and it
-/// is the independent one. Kept for that path alone: response frames are read
-/// with the shared `rawstream::read_frame`, which is scaffolding rather than the
-/// thing being checked.
-async fn read_varint(recv: &mut quinn::RecvStream) -> u64 {
-    let mut buf = [0u8; 8];
-    tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[..1]))
-        .await
-        .expect("varint arrived")
-        .expect("varint first byte");
-
-    let length = 1usize << (buf[0] >> 6);
-    if length > 1 {
-        tokio::time::timeout(TIMEOUT, recv.read_exact(&mut buf[1..length]))
-            .await
-            .expect("varint tail arrived")
-            .expect("varint tail");
-    }
-
-    decode_varint(&buf[..length]).expect("a complete varint").0
-}
-
-/// Decodes a variable-length integer from a buffer, returning its byte length.
-///
-/// Hand-written rather than `volto::datagram::peek_varint`, which is the same
-/// algorithm: the server's own SETTINGS are the one thing in this file that must
-/// be read independently of the code under test, so a bug in that decoder cannot
-/// make this test agree with it. The same reasoning as `basic_credentials` in
-/// `tests/common`. The `datagram::put_varint` calls elsewhere here only *build*
-/// client bytes, where a broken encoder fails loudly instead of passing quietly.
-fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
-    let first = *buf.first()?;
-    let length = 1usize << (first >> 6);
-    if buf.len() < length {
-        return None;
-    }
-
-    let mut value = u64::from(first & 0x3f);
-    for byte in &buf[1..length] {
-        value = (value << 8) | u64::from(*byte);
-    }
-
-    Some((value, length))
 }
 
 // ---------------------------------------------------------------------------
