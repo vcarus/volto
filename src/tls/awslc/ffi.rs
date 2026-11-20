@@ -1,8 +1,7 @@
 //! Owning wrappers over the AWS-LC objects this provider creates.
 //!
 //! Each type holds one non-null pointer that it frees on drop, so the rest of
-//! the provider never frees anything by hand. The functions here are the only
-//! ones that turn an AWS-LC return code into a Rust `Result`.
+//! the provider never frees anything by hand.
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr::NonNull;
