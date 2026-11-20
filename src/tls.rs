@@ -21,6 +21,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 #[allow(unsafe_code)]
 mod awslc;
 
+pub(crate) use awslc::server_initial_keys;
 pub use awslc::{
     EchKey, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config, server_config,
 };

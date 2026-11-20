@@ -838,7 +838,7 @@ impl crypto::ServerConfig for ServerConfig {
         dst_cid: &ConnectionId,
     ) -> Result<Keys, UnsupportedVersion> {
         let version = Version::from_wire(version).ok_or(UnsupportedVersion)?;
-        Ok(keys::server_initial_keys(version, dst_cid))
+        Ok(keys::initial_keys(version, dst_cid, Side::Server))
     }
 
     fn retry_tag(&self, version: u32, orig_dst_cid: &ConnectionId, packet: &[u8]) -> [u8; 16] {
@@ -1064,7 +1064,7 @@ unsafe fn static_str(ptr: *const c_char) -> Option<&'static str> {
 
 impl crypto::Session for Session {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, dst_cid, side)
+        keys::initial_keys(self.version, dst_cid, side)
     }
 
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
@@ -1287,13 +1287,12 @@ impl crypto::Session for Session {
     }
 }
 
-/// The Initial keys of `dst_cid` for `side`.
-fn initial_keys(version: Version, dst_cid: &ConnectionId, side: Side) -> Keys {
-    let (client, server) = keys::initial_secrets(version, dst_cid);
-    match side {
-        Side::Server => keys::keys(&server, &client),
-        Side::Client => keys::keys(&client, &server),
-    }
+/// The Initial keys a QUIC v1 server derives from a client's Destination
+/// Connection ID (RFC 9001 §5.2), for the socket gate, which opens a first
+/// Initial with them before quinn sees it. The key code is the one every
+/// handshake of the server runs.
+pub(crate) fn server_initial_keys(dst_cid: &[u8]) -> Keys {
+    keys::initial_keys(Version::V1, dst_cid, Side::Server)
 }
 
 /// A session whose SSL could not be created: it fails its first read.
@@ -1304,7 +1303,7 @@ struct FailedSession {
 
 impl crypto::Session for FailedSession {
     fn initial_keys(&self, dst_cid: &ConnectionId, side: Side) -> Keys {
-        initial_keys(self.version, dst_cid, side)
+        keys::initial_keys(self.version, dst_cid, side)
     }
     fn handshake_data(&self) -> Option<Box<dyn Any>> {
         None

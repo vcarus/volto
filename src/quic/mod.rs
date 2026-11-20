@@ -206,11 +206,6 @@ impl Server {
     /// untouched, and a `SIGHUP` can then turn the gate on without a restart.
     pub fn bind(config: Arc<Config>) -> Result<Self> {
         let (quic_config, ech, policy) = server_config(&config)?;
-        // Taken before the configuration moves into the endpoint. The Initial
-        // keys the gate needs are a function of the client's own Destination
-        // Connection ID rather than of the certificate (RFC 9001 §5.2), so this
-        // handle stays good across every reload.
-        let crypto = quic_config.crypto.clone();
         // The other copy, the one every accept runs a connection on. Taken here
         // so the slot and the endpoint start on the same generation, which is
         // the invariant `reload` then maintains. `quinn::ServerConfig` is a set
@@ -230,7 +225,7 @@ impl Server {
             .context("failed to hand the UDP socket to the async runtime")?;
 
         let expected = Expected::new(policy);
-        let socket = Arc::new(Gate::new(socket, expected.clone(), crypto));
+        let socket = Arc::new(Gate::new(socket, expected.clone()));
 
         // quinn's default endpoint configuration, with the one change that
         // the endpoint never sends a Stateless Reset; `cid` says why and how.

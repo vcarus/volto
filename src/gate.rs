@@ -252,7 +252,7 @@ const MIN_INITIAL_DATAGRAM: usize = 1200;
 /// The shortest Destination Connection ID a client's first Initial may carry.
 ///
 /// Applied to every Initial the gate parses, ahead of decryption;
-/// `Judge::classify` says why.
+/// [`classify`] says why.
 ///
 //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
 //# When an Initial packet is sent by a client that has not previously
@@ -536,30 +536,21 @@ impl Expected {
 /// including the capability answers. `max_receive_segments` controls whether
 /// GRO is used at all and `may_fragment` controls whether MTU discovery runs,
 /// so a wrapper that answered them itself would quietly change the transport.
+#[derive(Debug)]
 pub struct Gate {
     inner: Arc<dyn AsyncUdpSocket>,
     expected: Expected,
-    /// The judging half, which is everything that is not the socket.
-    judge: Judge,
 }
 
 impl Gate {
     /// Wraps `inner`, judging against `expected`.
-    pub fn new(
-        inner: Arc<dyn AsyncUdpSocket>,
-        expected: Expected,
-        crypto: Arc<dyn quinn::crypto::ServerConfig>,
-    ) -> Self {
-        Self {
-            inner,
-            expected,
-            judge: Judge { crypto },
-        }
+    pub fn new(inner: Arc<dyn AsyncUdpSocket>, expected: Expected) -> Self {
+        Self { inner, expected }
     }
 
     /// Judges one datagram without the hold and blinds it if it is refused.
     fn screen(&self, remote: SocketAddr, datagram: &mut [u8], expected: &Names) {
-        let Verdict::Refuse(refusal) = self.judge.judge(datagram, expected) else {
+        let Verdict::Refuse(refusal) = judge(datagram, expected) else {
             return;
         };
         log_refusal(remote, &refusal);
@@ -586,7 +577,7 @@ impl Gate {
         held: &mut Option<(MutexGuard<'a, Memory>, Arc<Policy>)>,
         now: &mut Option<Instant>,
     ) {
-        let (dcid, frames) = match self.judge.classify(datagram, true) {
+        let (dcid, frames) = match classify(datagram, true) {
             Classified::Pass => return,
             Classified::Refuse(refusal) => {
                 log_refusal(meta.addr, &refusal);
@@ -760,25 +751,7 @@ fn flight_fragments<'a>(frames: &'a [u8], more: &'a [BytesMut]) -> Option<Vec<(u
     Some(fragments)
 }
 
-/// The half of the gate that judges datagrams, held by [`Gate`] and needing no
-/// socket.
-///
-/// Separate from the socket because none of it reads one: a verdict is a
-/// function of the datagram's bytes, the list in force and the Initial keys.
-/// So judging is reachable without a bound port (through the [`judgement`]
-/// seam, by a fuzz target and by the tests that spell packets), and the receive
-/// path is left as the only thing that has to know about batches, strides and
-/// blinding.
-struct Judge {
-    /// The source of Initial keys.
-    ///
-    /// Held from bind time and never reloaded: the keys depend on the client's
-    /// Destination Connection ID and the version alone (RFC 9001 §5.2, quoted
-    /// at `Judge::decrypt`), and nothing a `SIGHUP` changes is an input to them.
-    crypto: Arc<dyn quinn::crypto::ServerConfig>,
-}
-
-/// What [`Judge::classify`] made of a datagram.
+/// What [`classify`] made of a datagram.
 enum Classified {
     /// Hand it to quinn unchanged.
     Pass,
@@ -790,197 +763,192 @@ enum Classified {
         dcid: ConnectionId,
         frames: BytesMut,
         /// The frames of the Initial packets of the same flight coalesced
-        /// behind it, when [`Judge::classify`] was asked for them.
+        /// behind it, when [`classify`] was asked for them.
         more: Vec<BytesMut>,
     },
 }
 
-impl Judge {
-    /// What should happen to one datagram, as far as it can be said without
-    /// reading its ClientHello: passed, refused, or opened as a first Initial.
-    ///
-    /// `coalesced` asks for the Initial packets of the same flight behind the
-    /// first as well ([`coalesced_frames`]), which only the hold reads.
-    fn classify(&self, datagram: &[u8], coalesced: bool) -> Classified {
-        let Some(&first) = datagram.first() else {
-            return Classified::Pass;
-        };
+/// What should happen to one datagram, as far as it can be said without
+/// reading its ClientHello: passed, refused, or opened as a first Initial.
+///
+/// A function of the datagram's bytes alone, with no socket: the [`judgement`]
+/// and [`Screening`] seams reach it without a bound port, and the receive path
+/// is the only code that knows about batches, strides and blinding.
+///
+/// `coalesced` asks for the Initial packets of the same flight behind the
+/// first as well ([`coalesced_frames`]), which only the hold reads.
+fn classify(datagram: &[u8], coalesced: bool) -> Classified {
+    let Some(&first) = datagram.first() else {
+        return Classified::Pass;
+    };
 
-        // A short header names a connection by its ID, which is state this
-        // module does not have; see the module documentation. It is also, by
-        // RFC 9000 §12.2, only ever the last packet in a datagram, so a
-        // handshake can never be hiding behind one.
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
-        //# A packet with a short header does not include a
-        //# length, so it can only be the last packet included in a UDP datagram.
-        if first & LONG_HEADER_FORM == 0 {
-            return Classified::Pass;
-        }
-
-        let Some(version) = datagram.get(1..5) else {
-            // Too short for quinn to read a version out of, so too short for it
-            // to answer with a Version Negotiation packet.
-            return Classified::Pass;
-        };
-        let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
-
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
-        //# If a server receives a packet that indicates an unsupported version
-        //# and if the packet is large enough to initiate a new connection for
-        //# any supported version, the server SHOULD send a Version Negotiation
-        //# packet as described in Section 6.1.
-        //
-        // A deliberate departure from that SHOULD, and the reason the gate
-        // exists: a Version Negotiation packet is a reply, and a reply is what a
-        // scan is looking for. D106. The module documentation says what refusing
-        // does to the six draft versions quinn also supports.
-        if version != QUIC_V1 {
-            return Classified::Refuse(Refusal::Version(version));
-        }
-
-        // Handshake, 0-RTT and Retry packets for a connection this endpoint does
-        // not hold are dropped by quinn without a reply, and for one it does
-        // hold they belong to a handshake that already passed this gate.
-        if first & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE {
-            return Classified::Pass;
-        }
-
-        if datagram.len() < MIN_INITIAL_DATAGRAM {
-            return Classified::Pass;
-        }
-
-        let Some(header) = InitialHeader::parse(datagram) else {
-            // Not a packet quinn could decode either (a header that runs off
-            // the end of the datagram, a length field that claims more than
-            // arrived), and one it drops without a reply.
-            return Classified::Pass;
-        };
-
-        // Judged on the header alone, ahead of the decryption, because quinn
-        // judges it ahead of its own decryption. `Endpoint::early_validate_first_packet`
-        // runs before `first_decode.finish` and answers a Destination
-        // Connection ID under eight bytes with a CONNECTION_CLOSE carrying
-        // PROTOCOL_VIOLATION, without opening the packet. Its one exemption is
-        // a packet carrying a token whose Destination Connection ID is exactly
-        // the length this endpoint's own generator uses, which is eight, so
-        // nothing under eight bytes is exempt. RFC 9000 §7.2 gives a client's
-        // first Initial a floor of eight bytes, quoted at
-        // `MIN_CLIENT_CONNECTION_ID`, and every later Initial of an admitted
-        // handshake is addressed by the eight bytes this endpoint's own
-        // generator chose, as is the one a Retry supplies. So nothing
-        // legitimate is ever this shape, and the reply quinn would send is one
-        // of the three this gate exists to take away.
-        //
-        // Placed after the decryption, this check would let the shape that costs an
-        // attacker no cryptography at all (a 1200-byte Initial with a four-byte
-        // connection ID and a payload nobody sealed) pass through to that
-        // reply, because a packet that fails decryption is passed.
-        if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
-            return Classified::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
-        }
-
-        let Some((keys, frames)) = self.decrypt(datagram, &header) else {
-            // A later Initial of a flight this gate already judged, as the
-            // module documentation says, or a forgery quinn drops without a
-            // reply. Passed rather than dropped, because the Handshake packet
-            // that carries the client's Finished is often coalesced behind it,
-            // and dropping the datagram would cost every admitted handshake a
-            // probe timeout.
-            //
-            //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
-            //# Upon first receiving an Initial or Retry packet from the server, the
-            //# client uses the Source Connection ID supplied by the server as the
-            //# Destination Connection ID for subsequent packets, including any 0-RTT
-            //# packets.
-            return Classified::Pass;
-        };
-
-        let more = if coalesced {
-            coalesced_frames(&keys, datagram, &header)
-        } else {
-            Vec::new()
-        };
-        Classified::Opened {
-            dcid: ConnectionId::new(&datagram[header.dcid]),
-            frames,
-            more,
-        }
+    // A short header names a connection by its ID, which is state this
+    // module does not have; see the module documentation. It is also, by
+    // RFC 9000 §12.2, only ever the last packet in a datagram, so a
+    // handshake can never be hiding behind one.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-12.2
+    //# A packet with a short header does not include a
+    //# length, so it can only be the last packet included in a UDP datagram.
+    if first & LONG_HEADER_FORM == 0 {
+        return Classified::Pass;
     }
 
-    /// What should happen to one datagram without the hold: its ClientHello is
-    /// judged by its name, from what its first packet holds.
-    fn judge(&self, datagram: &[u8], expected: &Names) -> Verdict {
-        let frames = match self.classify(datagram, false) {
-            Classified::Pass => return Verdict::Pass,
-            Classified::Refuse(refusal) => return Verdict::Refuse(refusal),
-            Classified::Opened { frames, .. } => frames,
-        };
+    let Some(version) = datagram.get(1..5) else {
+        // Too short for quinn to read a version out of, so too short for it
+        // to answer with a Version Negotiation packet.
+        return Classified::Pass;
+    };
+    let version = u32::from_be_bytes([version[0], version[1], version[2], version[3]]);
 
-        let Some(crypto) = crypto_stream_prefix(&frames) else {
-            // No CRYPTO frame at offset 0: an acknowledgement, or a later
-            // fragment of a first flight whose beginning was already judged.
-            return Verdict::Pass;
-        };
-
-        match first_flight(&crypto) {
-            // A ClientHello that does not fit in this packet is judged by the
-            // second gate in the TLS layer instead; see the module
-            // documentation.
-            FirstFlight::Truncated => Verdict::Pass,
-            FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
-            FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
-            FirstFlight::Named(name) if expected.accepts_bytes(name) => Verdict::Pass,
-            // The name is borrowed from the frames this function decrypted and
-            // drops on return, so the refusal takes the copy the pass path
-            // does not need.
-            FirstFlight::Named(name) => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
-        }
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-5.2.2
+    //# If a server receives a packet that indicates an unsupported version
+    //# and if the packet is large enough to initiate a new connection for
+    //# any supported version, the server SHOULD send a Version Negotiation
+    //# packet as described in Section 6.1.
+    //
+    // A deliberate departure from that SHOULD, and the reason the gate
+    // exists: a Version Negotiation packet is a reply, and a reply is what a
+    // scan is looking for. D106. The module documentation says what refusing
+    // does to the six draft versions quinn also supports.
+    if version != QUIC_V1 {
+        return Classified::Refuse(Refusal::Version(version));
     }
 
-    /// Removes header protection and packet protection from an Initial packet,
-    /// returning the Initial keys it opened under and its frames.
-    ///
-    /// `None` is either a packet too short for the keys to be applied (one
-    /// quinn could not read either) or an authentication failure under the
-    /// keys this packet's own Destination Connection ID derives. The caller
-    /// passes both through ([`Judge::classify`] says why).
-    fn decrypt(
-        &self,
-        datagram: &[u8],
-        header: &InitialHeader,
-    ) -> Option<(quinn::crypto::Keys, BytesMut)> {
-        // A header key reads its sample from four bytes past the start of the
-        // packet number and indexes the buffer it is given without a check:
-        // `tls::awslc::keys` in the server, and rustls's key in the test
-        // seams. So a packet too short for that would panic rather than fail.
-        // RFC 9001 §5.4.2 puts the sample there.
-        //
-        // The half of that test which does not need a cipher is asked first,
-        // above the key derivation, because deriving Initial secrets is nearly
-        // the whole cost of judging a packet and a packet with no room for the
-        // four bytes is refused under every cipher there is. No packet changes
-        // verdict: a sample end past the packet end follows from this one.
-        let number_end_limit = header.packet_number_offset.checked_add(4)?;
-        if number_end_limit > header.packet_end {
-            return None;
-        }
-
-        // The keys are a function of the Destination Connection ID and the
-        // version alone, which is what makes this possible at all without any
-        // connection state.
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
-        //# Initial packets apply the packet protection process, but use a secret
-        //# derived from the Destination Connection ID field from the client's
-        //# first Initial packet.
-        let keys = self
-            .crypto
-            .initial_keys(QUIC_V1, &ConnectionId::new(&datagram[header.dcid.clone()]))
-            .ok()?;
-        let frames = open_with(&keys, datagram, header)?;
-        Some((keys, frames))
+    // Handshake, 0-RTT and Retry packets for a connection this endpoint does
+    // not hold are dropped by quinn without a reply, and for one it does
+    // hold they belong to a handshake that already passed this gate.
+    if first & LONG_PACKET_TYPE != INITIAL_PACKET_TYPE {
+        return Classified::Pass;
     }
+
+    if datagram.len() < MIN_INITIAL_DATAGRAM {
+        return Classified::Pass;
+    }
+
+    let Some(header) = InitialHeader::parse(datagram) else {
+        // Not a packet quinn could decode either (a header that runs off
+        // the end of the datagram, a length field that claims more than
+        // arrived), and one it drops without a reply.
+        return Classified::Pass;
+    };
+
+    // Judged on the header alone, ahead of the decryption, because quinn
+    // judges it ahead of its own decryption. `Endpoint::early_validate_first_packet`
+    // runs before `first_decode.finish` and answers a Destination
+    // Connection ID under eight bytes with a CONNECTION_CLOSE carrying
+    // PROTOCOL_VIOLATION, without opening the packet. Its one exemption is
+    // a packet carrying a token whose Destination Connection ID is exactly
+    // the length this endpoint's own generator uses, which is eight, so
+    // nothing under eight bytes is exempt. RFC 9000 §7.2 gives a client's
+    // first Initial a floor of eight bytes, quoted at
+    // `MIN_CLIENT_CONNECTION_ID`, and every later Initial of an admitted
+    // handshake is addressed by the eight bytes this endpoint's own
+    // generator chose, as is the one a Retry supplies. So nothing
+    // legitimate is ever this shape, and the reply quinn would send is one
+    // of the three this gate exists to take away.
+    //
+    // Placed after the decryption, this check would let the shape that costs an
+    // attacker no cryptography at all (a 1200-byte Initial with a four-byte
+    // connection ID and a payload nobody sealed) pass through to that
+    // reply, because a packet that fails decryption is passed.
+    if header.dcid.len() < MIN_CLIENT_CONNECTION_ID {
+        return Classified::Refuse(Refusal::ShortConnectionId(header.dcid.len()));
+    }
+
+    let Some((keys, frames)) = decrypt(datagram, &header) else {
+        // A later Initial of a flight this gate already judged, as the
+        // module documentation says, or a forgery quinn drops without a
+        // reply. Passed rather than dropped, because the Handshake packet
+        // that carries the client's Finished is often coalesced behind it,
+        // and dropping the datagram would cost every admitted handshake a
+        // probe timeout.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-7.2
+        //# Upon first receiving an Initial or Retry packet from the server, the
+        //# client uses the Source Connection ID supplied by the server as the
+        //# Destination Connection ID for subsequent packets, including any 0-RTT
+        //# packets.
+        return Classified::Pass;
+    };
+
+    let more = if coalesced {
+        coalesced_frames(&keys, datagram, &header)
+    } else {
+        Vec::new()
+    };
+    Classified::Opened {
+        dcid: ConnectionId::new(&datagram[header.dcid]),
+        frames,
+        more,
+    }
+}
+
+/// What should happen to one datagram without the hold: its ClientHello is
+/// judged by its name, from what its first packet holds.
+fn judge(datagram: &[u8], expected: &Names) -> Verdict {
+    let frames = match classify(datagram, false) {
+        Classified::Pass => return Verdict::Pass,
+        Classified::Refuse(refusal) => return Verdict::Refuse(refusal),
+        Classified::Opened { frames, .. } => frames,
+    };
+
+    let Some(crypto) = crypto_stream_prefix(&frames) else {
+        // No CRYPTO frame at offset 0: an acknowledgement, or a later
+        // fragment of a first flight whose beginning was already judged.
+        return Verdict::Pass;
+    };
+
+    match first_flight(&crypto) {
+        // A ClientHello that does not fit in this packet is judged by the
+        // second gate in the TLS layer instead; see the module
+        // documentation.
+        FirstFlight::Truncated => Verdict::Pass,
+        FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
+        FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
+        FirstFlight::Named(name) if expected.accepts_bytes(name) => Verdict::Pass,
+        // The name is borrowed from the frames this function decrypted and
+        // drops on return, so the refusal takes the copy the pass path
+        // does not need.
+        FirstFlight::Named(name) => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
+    }
+}
+
+/// Removes header protection and packet protection from an Initial packet,
+/// returning the Initial keys it opened under and its frames.
+///
+/// `None` is either a packet too short for the keys to be applied (one
+/// quinn could not read either) or an authentication failure under the
+/// keys this packet's own Destination Connection ID derives. The caller
+/// passes both through ([`classify`] says why).
+fn decrypt(datagram: &[u8], header: &InitialHeader) -> Option<(quinn::crypto::Keys, BytesMut)> {
+    // The header key (`tls::awslc::keys`) reads its sample from four bytes
+    // past the start of the packet number and indexes the buffer it is given
+    // without a check, so a packet too short for that would panic rather
+    // than fail. RFC 9001 §5.4.2 puts the sample there.
+    //
+    // The half of that test which does not need a cipher is asked first,
+    // above the key derivation, because deriving Initial secrets is nearly
+    // the whole cost of judging a packet and a packet with no room for the
+    // four bytes is refused under every cipher there is. No packet changes
+    // verdict: a sample end past the packet end follows from this one.
+    let number_end_limit = header.packet_number_offset.checked_add(4)?;
+    if number_end_limit > header.packet_end {
+        return None;
+    }
+
+    // The keys are a function of the Destination Connection ID and the
+    // version alone, which is what makes this possible at all without any
+    // connection state.
+    //
+    //= https://www.rfc-editor.org/rfc/rfc9001#section-5.2
+    //# Initial packets apply the packet protection process, but use a secret
+    //# derived from the Destination Connection ID field from the client's
+    //# first Initial packet.
+    // The server's own key code, the one its handshakes run (D115).
+    let keys = crate::tls::server_initial_keys(&datagram[header.dcid.clone()]);
+    let frames = open_with(&keys, datagram, header)?;
+    Some((keys, frames))
 }
 
 /// The frames of every Initial packet coalesced behind the first one of
@@ -1032,7 +1000,7 @@ fn coalesced_frames(
 /// the start of `datagram`, whose header is `header`, under `keys`.
 ///
 /// `None` for a packet too short for the keys to be applied or one that does
-/// not authenticate; [`Judge::decrypt`] says what each means.
+/// not authenticate; [`decrypt`] says what each means.
 fn open_with(
     keys: &quinn::crypto::Keys,
     datagram: &[u8],
@@ -1088,18 +1056,6 @@ fn open_with(
         .decrypt(number, &head[..number_end], &mut frames)
         .ok()?;
     Some(frames)
-}
-
-impl fmt::Debug for Gate {
-    /// Hand-written because neither the crypto configuration the judge holds
-    /// nor the trait object holding it is `Debug`, and `AsyncUdpSocket` requires
-    /// one.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Gate")
-            .field("inner", &self.inner)
-            .field("expected", &self.expected)
-            .finish_non_exhaustive()
-    }
 }
 
 impl AsyncUdpSocket for Gate {
@@ -1479,8 +1435,10 @@ pub use crate::hello::{FirstFlight, first_flight};
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
 // coverage-guided fuzzer is for. Each judging seam calls the functions the
-// socket path calls, except for the Initial key code, which [`judgement`]
-// describes.
+// socket path calls, the server's Initial key code included. Only the packets
+// the seams are fed are sealed with rustls's key code ([`nameless_crypto`]),
+// so the code that builds a packet and the code that opens it are two
+// implementations.
 
 /// The hold's bounds, for the fuzz target and the tests that assert them.
 #[doc(hidden)]
@@ -1489,28 +1447,17 @@ pub use hold::{
     REPLAY_ENTRIES,
 };
 
-/// The judge every seam shares, built once per process.
-fn seam_judge() -> &'static Judge {
-    static JUDGE: OnceLock<Judge> = OnceLock::new();
-    JUDGE.get_or_init(|| Judge {
-        crypto: nameless_crypto(),
-    })
-}
-
 /// The gate's verdict on one datagram, for the fuzz target and the tests.
 ///
-/// This is `Gate::screen`'s own `Judge::judge`, over a judge built once per
-/// process. The socket, the batch walk and the blinding are left out, and
-/// none of them is a parser. The Initial keys are rustls's rather than the
-/// server's provider's (see [`nameless_crypto`]): the same keys, from another
-/// implementation, so the header and packet key code a fuzzer runs here is
-/// not the code a received datagram runs.
+/// This is the `judge` that `Gate::screen` calls, Initial key code included.
+/// The socket, the batch walk and the blinding are left out, and none of them
+/// is a parser.
 ///
 /// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
 /// to call it, and nothing in this crate does.
 #[doc(hidden)]
 pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
-    seam_judge().judge(datagram, expected)
+    judge(datagram, expected)
 }
 
 /// What the gate with the hold did with one datagram.
@@ -1535,12 +1482,10 @@ pub enum Screened {
 /// The gate with the hold, driven one datagram at a time, for the fuzz target
 /// and the tests.
 ///
-/// It runs the receive path's own code: [`Judge::classify`], then the hold
-/// through the function `Gate::screen_holding` calls, under a policy the
-/// caller gives and a clock the caller moves, with the seams' rustls Initial
-/// keys in place of the server's (see [`judgement`]). The socket, the batch
-/// walk, the blinding and the delivery into quinn's buffers are what is left
-/// out.
+/// It runs the receive path's own code: [`classify`], then the hold through
+/// the function `Gate::screen_holding` calls, under a policy the caller gives
+/// and a clock the caller moves. The socket, the batch walk, the blinding and
+/// the delivery into quinn's buffers are what is left out.
 #[doc(hidden)]
 pub struct Screening {
     policy: Policy,
@@ -1570,15 +1515,14 @@ impl Screening {
         datagram: &[u8],
     ) -> (Screened, Vec<(SocketAddr, Dropped)>) {
         let mut drops = Vec::new();
-        let judge = seam_judge();
         if self.policy.ech.is_none() {
-            let screened = match judge.judge(datagram, &self.policy.names) {
+            let screened = match judge(datagram, &self.policy.names) {
                 Verdict::Pass => Screened::Passed,
                 Verdict::Refuse(refusal) => Screened::Refused(refusal),
             };
             return (screened, drops);
         }
-        let screened = match judge.classify(datagram, true) {
+        let screened = match classify(datagram, true) {
             Classified::Pass => Screened::Passed,
             Classified::Refuse(refusal) => Screened::Refused(refusal),
             Classified::Opened { dcid, frames, more } => {
@@ -1655,7 +1599,7 @@ impl Screening {
 /// the hold should have admitted it.
 #[doc(hidden)]
 pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
-    let Classified::Opened { frames, more, .. } = seam_judge().classify(datagram, true) else {
+    let Classified::Opened { frames, more, .. } = classify(datagram, true) else {
         return None;
     };
     let fragments = flight_fragments(&frames, &more)?;
@@ -1667,16 +1611,18 @@ pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     )
 }
 
-/// A TLS configuration with no identity at all, as a source of Initial keys.
+/// A TLS configuration with no identity at all, as a source of Initial keys
+/// for building packets.
 ///
-/// Initial keys never depend on the server's certificate (`Judge::crypto`).
-/// So a configuration carrying no certificate derives exactly the keys the
-/// running server derives, and [`judgement`], the fuzz target and the tests
-/// that spell Initial packets need no key material, no file and no clock to
-/// open or to build the packets the real gate opens. The resolver is never
-/// asked for anything: nothing here starts a TLS session. It derives the keys
-/// with rustls's code, where the server uses its own provider's
-/// (`tls::awslc::keys`): the keys are the same, the code is not.
+/// Initial keys depend on the client's Destination Connection ID alone
+/// (RFC 9001 §5.2), never on the server's certificate. So a configuration
+/// carrying no certificate derives exactly the keys the running server
+/// derives, and the fuzz targets and the tests that spell Initial packets need
+/// no key material, no file and no clock to build the packets the gate opens.
+/// The resolver is never asked for anything: nothing here starts a TLS
+/// session. The keys come from rustls's code, and the gate opens the packets
+/// with the server's own (`tls::awslc::keys`), so a packet is built by one
+/// implementation and judged by the other.
 ///
 /// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
 /// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
@@ -1722,7 +1668,7 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// it could change a held packet's bytes only by breaking its AEAD, and the
 /// hold would never see frames the fuzzer chose. With it, the fuzzer chooses
 /// the frames and this function seals them, with [`nameless_crypto`]'s keys,
-/// which are the keys the gate opens the packet with.
+/// which are the keys the gate derives with the server's own code.
 ///
 /// The header is the plainest a client sends: QUIC v1, no Source Connection
 /// ID, no token, a two-byte Length field and a one-byte packet number
@@ -1730,8 +1676,9 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// and cut at [`SEALED_FRAMES_MAX`] bytes.
 #[doc(hidden)]
 pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
-    let keys = seam_judge()
-        .crypto
+    static CRYPTO: OnceLock<Arc<dyn quinn::crypto::ServerConfig>> = OnceLock::new();
+    let keys = CRYPTO
+        .get_or_init(nameless_crypto)
         .initial_keys(QUIC_V1, &ConnectionId::new(dcid))
         .expect("Initial keys for QUIC v1");
     let tag = keys.packet.remote.tag_len();
@@ -1868,7 +1815,7 @@ mod tests {
         let socket = runtime
             .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"))
             .expect("wrap");
-        let gate = Gate::new(socket, expected.clone(), nameless_crypto());
+        let gate = Gate::new(socket, expected.clone());
         let sent = sealed_initial(&[0x51; 8], 0, &[0x01]);
         let mut datagram = sent.clone();
         let meta = RecvMeta {

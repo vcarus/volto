@@ -68,13 +68,13 @@ rustls = { version = "0.23", default-features = false, features = [
 # parsing above; for webpki's parse of the leaf certificate at startup, on
 # reload and in `--check-config` (`tls::check_leaf`); for the certificate name
 # check behind the `expected_sni` warning (`tls::names_not_covered`); and for
-# the `ServerName` judgement of a `server_name` in the second SNI gate
-# (`dns_name` in `tls::awslc`). `aws_lc_rs` is needed by `gate::nameless_crypto`,
-# the configuration without an identity that the gate's seams derive Initial
-# keys from, and by the tests. `HandshakeData`, which `quic::peer_info` reads, is
-# quinn's type, behind its `rustls-aws-lc-rs` feature above. Every client in
-# the test suite is rustls as well, which keeps the two ends of each test on
-# different TLS implementations.
+# the `DnsName` judgement of a host name in the second SNI gate and the
+# `expected_sni` check (`names::host_name`). `aws_lc_rs` is needed by
+# `gate::nameless_crypto`, the configuration without an identity that the
+# gate's seams build Initial packets with, and by the tests. `HandshakeData`,
+# which `quic::peer_info` reads, is quinn's type, behind its `rustls-aws-lc-rs`
+# feature above. Every client in the test suite is rustls as well, which keeps
+# the two ends of each test on different TLS implementations.
 
 # The server's TLS (D115): volto's own quinn crypto provider in `src/tls/awslc/`
 # runs the handshake on AWS-LC's libssl, which has server-side ECH and

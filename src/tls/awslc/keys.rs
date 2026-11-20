@@ -22,6 +22,7 @@
 use aws_lc_rs::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
 use aws_lc_rs::hkdf;
 use bytes::BytesMut;
+use quinn_proto::Side;
 use quinn_proto::crypto::{CryptoError, HeaderKey, KeyPair, Keys, PacketKey};
 use zeroize::Zeroizing;
 
@@ -285,10 +286,13 @@ pub(crate) fn initial_secrets(version: Version, dst_cid: &[u8]) -> (Secret, Secr
     )
 }
 
-/// The Initial keys a server uses for a connection ID.
-pub(crate) fn server_initial_keys(version: Version, dst_cid: &[u8]) -> Keys {
+/// The Initial keys of `dst_cid` for `side`.
+pub(crate) fn initial_keys(version: Version, dst_cid: &[u8], side: Side) -> Keys {
     let (client, server) = initial_secrets(version, dst_cid);
-    keys(&server, &client)
+    match side {
+        Side::Server => keys(&server, &client),
+        Side::Client => keys(&client, &server),
+    }
 }
 
 /// The Retry Integrity Tag over a Retry pseudo-packet (RFC 9001 §5.8).
@@ -387,6 +391,12 @@ struct AeadHeaderKey(aead::quic::HeaderProtectionKey);
 impl AeadHeaderKey {
     /// Applies or removes the mask; the two differ only in when the packet
     /// number length is read from the first byte.
+    ///
+    /// Indexes `packet` up to `pn_offset + 4 + sample_size()` without a check.
+    /// Both callers make that length certain first: quinn-proto refuses a
+    /// shorter packet before it removes header protection (`decrypt_header`),
+    /// and the socket gate's `open_with` hands over a copy of exactly that
+    /// length.
     fn xor_in_place(&self, pn_offset: usize, packet: &mut [u8], encrypting: bool) {
         let sample_at = pn_offset + 4;
         let sample_len = self.sample_size();
@@ -512,7 +522,7 @@ mod tests {
     /// through the trait objects quinn calls.
     #[test]
     fn server_initial_packet_matches_appendix_a3() {
-        let keys = server_initial_keys(Version::V1, &hex(CID));
+        let keys = initial_keys(Version::V1, &hex(CID), Side::Server);
         let header = hex("c1000000010008f067a5502a4262b50040750001");
         let payload = hex(
             "02000000000600405a020000560303ee fce7f7b37ba1d1632e96677825ddf739
