@@ -1302,7 +1302,7 @@ fn through_load_key(label: &str, der: &[u8]) -> Zeroizing<Vec<u8>> {
     std::fs::write(&path, text).expect("write the key");
     let key = super::super::load_key(&path).expect("load_key reads it");
     let _ = std::fs::remove_file(&path);
-    Zeroizing::new(key.secret_der().to_vec())
+    key
 }
 
 /// An RSA key's PKCS#1 `RSAPrivateKey` form.

@@ -200,7 +200,7 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         .map(Arc::new);
     let mut built = Builder {
         certs: certs.iter().map(|c| c.as_ref().to_vec()).collect(),
-        key: Zeroizing::new(key.secret_der().to_vec()),
+        key,
         alpn: server.alpn_wire(),
         names: Names::new(&config.security.expected_sni),
         ech: ech.as_deref(),

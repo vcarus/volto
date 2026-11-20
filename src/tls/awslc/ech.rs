@@ -166,6 +166,10 @@ impl EchKey {
     }
 
     /// Parses the two PEM blocks and checks that they belong together.
+    ///
+    /// The decoded private key is cleared on drop. The PEM parser's own base64
+    /// buffer, which held it as text, is dropped uncleared by rustls-pki-types
+    /// and cannot be reached from here.
     pub fn from_pem(pem: &[u8]) -> Result<Self> {
         let mut key_der: Option<Zeroizing<Vec<u8>>> = None;
         let mut list: Option<Vec<u8>> = None;

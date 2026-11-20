@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use zeroize::{Zeroize as _, Zeroizing};
 
 // The one module of the crate allowed `unsafe` code: the binding to libssl.
 // `crate` says why the rest of the crate denies it.
@@ -97,14 +98,25 @@ pub(crate) fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-/// Loads the first private key in a PEM file (PKCS#8, PKCS#1 or SEC1).
-fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open server.key = {}", path.display()))?;
+/// Loads the first private key in a PEM file (PKCS#8, PKCS#1 or SEC1), as DER.
+///
+/// The file's text and the parsed key are cleared before they are freed. One
+/// copy is not: the PEM parser's base64 buffer, which rustls-pki-types drops
+/// without clearing and gives no way to reach.
+fn load_key(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
+    let text = Zeroizing::new(
+        std::fs::read(path)
+            .with_context(|| format!("failed to open server.key = {}", path.display()))?,
+    );
     // `PrivateKeyDer` accepts PKCS#8, PKCS#1 and SEC1 sections and skips any
     // other PEM object on the way, so a bundle file works too.
-    match PrivateKeyDer::from_pem_reader(file) {
-        Ok(key) => Ok(key),
+    match PrivateKeyDer::from_pem_slice(&text) {
+        Ok(mut key) => {
+            let der = Zeroizing::new(key.secret_der().to_vec());
+            // `PrivateKeyDer` implements `Zeroize` but not `Drop`.
+            key.zeroize();
+            Ok(der)
+        }
         Err(pem::Error::NoItemsFound) => bail!(
             "server.key = {} contains no PRIVATE KEY block",
             path.display()
