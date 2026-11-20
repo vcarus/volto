@@ -11,11 +11,9 @@
 //! any one of them matching is enough. When the first live Surge connection
 //! settles the question, nothing here needs to change.
 //!
-//! Two values is all that answers for, so [`MAX_CREDENTIAL_VALUES`] is the most
-//! one request may carry and a request carrying more is refused with 400 before
-//! any of them is tried. Every value that *is* tried and refused is charged one
-//! authentication failure, so a request cannot buy more guesses than it pays for
-//! (decision D76, addendum of 2026-09-04).
+//! Two values is all that answers for, so a request may carry at most
+//! [`MAX_CREDENTIAL_VALUES`], and every value tried and refused is charged one
+//! authentication failure.
 //!
 //! # Comparison discipline
 //!
@@ -53,9 +51,9 @@ pub const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"
 /// One per accepted field name, which is every value decision D3 asks for: a
 /// client sends its credentials once, and the open question is only which of the
 /// two names it sends them under. A request carrying more than this is refused
-/// with 400 before any of its values is tried (decision D76, addendum of
-/// 2026-09-04), so the work one request can ask for, and the guesses it can
-/// carry, are both bounded by this number.
+/// with 400 before any of its values is tried, and every value that is tried
+/// and refused is charged one failure (decision D76), so the work one request
+/// can ask for, and the guesses it can carry, are both bounded by this number.
 pub const MAX_CREDENTIAL_VALUES: usize = CREDENTIAL_FIELDS.len();
 
 /// The challenge offered when credentials are missing or wrong.
@@ -120,12 +118,10 @@ impl Denied {
 
 /// Every refusal one request's credentials drew, in the order they were tried.
 ///
-/// There is one entry per credential field value that was tried and refused, and
-/// that is the unit `[security] max_auth_failures` counts (decision D76, addendum
-/// of 2026-09-04). A request carrying no credential value at all draws the single
-/// [`Denied::Missing`] entry, so there is always at least one; a request carrying
-/// more than [`MAX_CREDENTIAL_VALUES`] of them is refused by [`crate::conn`]
-/// before any value is tried, so there are never more than that many.
+/// One entry per credential field value that was tried and refused, the unit
+/// `[security] max_auth_failures` counts. A request carrying no credential value
+/// draws the single [`Denied::Missing`] entry, so there is always at least one,
+/// and never more than [`MAX_CREDENTIAL_VALUES`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Denials {
     /// The refusal the log line names.
@@ -198,18 +194,9 @@ impl Authenticator {
     /// exists goes in that user's own bucket, and a guess at a name nobody has
     /// goes in the one no success ever clears (see [`crate::tunnel::Context`]).
     ///
-    /// Compared the way [`Self::verify`] compares, and for the reason the module
-    /// header gives: [`subtle::ConstantTimeEq`] over every configured user, with
-    /// no early exit from the loop, so *which* configured user-id a guess
-    /// matched is not in how long the refusal took. The response is a 407
-    /// either way, and a name that can be found by timing reveals which
-    /// user-ids exist.
-    ///
-    /// It claims no more than [`Self::verify`] does. `ct_eq` on two slices
-    /// answers immediately when their lengths differ, which is the module
-    /// header's caveat: what a clock can still separate is a guess whose length
-    /// no configured user-id shares from one whose length some user-id has. The
-    /// names themselves stay out of it.
+    /// Compared the way [`Self::verify`] compares, under the module header's
+    /// discipline and with its length caveat: the response is a 407 either way,
+    /// and a name that can be found by timing reveals which user-ids exist.
     pub(crate) fn is_configured(&self, username: &str) -> bool {
         let mut configured = subtle::Choice::from(0u8);
 
@@ -224,8 +211,7 @@ impl Authenticator {
     ///
     /// `Ok(None)` means authentication is disabled, `Ok(Some(username))` names the
     /// user that matched. The error carries one entry per credential value that
-    /// was tried and refused, because that is the unit the failure budget counts
-    /// (decision D76, addendum of 2026-09-04).
+    /// was tried and refused ([`Denials`]).
     ///
     /// A value that matches ends the loop, so the values after it are neither
     /// tried nor charged: this returns what the request *is*, and a request that
@@ -558,10 +544,8 @@ mod tests {
 
     /// One refusal per credential value tried, each naming its own claim.
     ///
-    /// The unit the failure budget counts (decision D76, addendum of
-    /// 2026-09-04): two guesses in one request are two failures, and each is
-    /// charged to the user-id its own value claimed rather than all of them to
-    /// the first.
+    /// Two guesses in one request are two failures, and each is charged to the
+    /// user-id its own value claimed rather than all of them to the first.
     #[test]
     fn every_refused_value_draws_its_own_refusal() {
         let auth = authenticator(&[("user1", "s3cret")]);
