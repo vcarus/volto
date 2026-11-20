@@ -22,6 +22,7 @@
 //!   method, field lines.
 //! * [`connection`]: the connection: SETTINGS, the control stream, GOAWAY,
 //!   and inbound HTTP Datagram routing (RFC 9297).
+//! * [`request`]: a decoded field section checked and turned into a request.
 //! * [`stream`]: one request stream, from its HEADERS to its last byte.
 //!
 //! The integration suite's client is built on these same modules
@@ -50,6 +51,7 @@ pub mod frame;
 pub mod huffman;
 pub mod message;
 pub mod qpack;
+pub mod request;
 pub mod settings;
 pub mod stream;
 
