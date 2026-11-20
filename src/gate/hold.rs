@@ -45,13 +45,11 @@ pub const HOLD_LIFETIME: Duration = Duration::from_secs(2);
 /// hold the table with this many packets every [`HOLD_LIFETIME`]. Our own value.
 pub const HOLD_FLIGHTS: usize = 64;
 
-/// The most CRYPTO stream bytes the hold reassembles for one flight.
-///
-/// libssl's own limit for the Initial level (`SSL_quic_max_handshake_flight_len`
-/// at `ssl_encryption_initial`): `SSL_provide_quic_data` refuses a longer
-/// flight, so no ClientHello libssl reads is longer. A flight whose CRYPTO
-/// bytes reach past it, or whose ClientHello says it is longer, is dropped.
-pub const HOLD_HELLO_BYTES: usize = 16 * 1024;
+/// The most CRYPTO stream bytes the hold reassembles for one flight:
+/// libssl's limit for the Initial level, [`hello::MAX_INITIAL_FLIGHT`], since
+/// no ClientHello libssl reads is longer. A flight whose CRYPTO bytes reach
+/// past it, or whose ClientHello says it is longer, is dropped.
+pub const HOLD_HELLO_BYTES: usize = hello::MAX_INITIAL_FLIGHT;
 
 /// The most bytes one held flight may count: its datagrams as received, plus
 /// the buffer its CRYPTO stream is reassembled in and that buffer's bitmap,

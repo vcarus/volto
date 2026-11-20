@@ -24,6 +24,16 @@ use std::ops::Range;
 /// The TLS `client_hello` handshake message type (RFC 8446 §4).
 pub const CLIENT_HELLO: u8 = 1;
 
+/// The most Initial-level CRYPTO bytes libssl takes, so the longest
+/// ClientHello it reads.
+///
+/// libssl's own limit for that level (`SSL_quic_max_handshake_flight_len`,
+/// 16384 at `ssl_encryption_initial`): `SSL_provide_quic_data` refuses a flight
+/// that would grow past it, so nothing past it can be a ClientHello libssl
+/// reads. The gate's hold reassembles no more than this, and the TLS provider
+/// keeps no more than this for reading the outer ClientHello.
+pub const MAX_INITIAL_FLIGHT: usize = 16 * 1024;
+
 /// The `server_name` extension type. RFC 6066 §1.1: "server_name(0)".
 pub const EXT_SERVER_NAME: u16 = 0;
 
