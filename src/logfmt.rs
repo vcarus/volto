@@ -72,10 +72,8 @@ pub(crate) const MAX_TOKEN: usize = 32;
 /// from a short one, and the cut lands on a character boundary because slicing
 /// a `str` anywhere else panics.
 ///
-/// This bounds **length only**. Escaping is the recording sigil's job: the
-/// result goes into a line as a `str` field or with `?`, never with `%`, or a
-/// newline inside it forges a journal entry exactly as the third rule above
-/// describes.
+/// This bounds **length only**: the result goes into a line as a `str` field
+/// or with `?`, never with `%` (the third rule above).
 ///
 /// ```
 /// # use volto::logfmt::bounded;
@@ -111,17 +109,11 @@ pub fn bounded_bytes(token: &[u8]) -> Cow<'_, str> {
 /// [`bounded_bytes`] with the escaping applied too, for peer bytes that will be
 /// printed with `Display`.
 ///
-/// The rest of this module divides the work: `bounded` cuts, and the recording
-/// sigil escapes. That division needs a *field* to record, and some peer bytes
-/// never get one. A QUIC close reason phrase is inside `quinn`'s error by the
-/// time this server sees it, and the closing line in [`crate::quic`] records the
-/// whole error with `%`. Escaping at the call site is not available there, and
-/// choosing `?` instead would change how every other error on that line reads.
-///
-/// So both rules are applied here instead, once, where the peer's bytes enter
-/// the value: the result is quoted and `Debug`-escaped, so a newline in it stays
-/// on the one line and cannot forge a journal entry, and it carries the same
-/// length bound as everything else a peer writes into a log.
+/// For peer bytes with no field of their own, as the module doc's last
+/// paragraph describes: a QUIC close reason phrase is inside `quinn`'s error,
+/// which the closing line in [`crate::quic`] records whole with `%`, and `?`
+/// there would change how every other error on that line reads. The result is
+/// quoted and `Debug`-escaped, and carries the same length bound.
 ///
 /// ```
 /// # use volto::logfmt::escaped_bytes;
