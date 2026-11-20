@@ -592,7 +592,8 @@ impl Server {
         // second and never authenticates would otherwise hold every slot there
         // is for as long as it wanted. Each one is bounded, but each one that
         // ends is replaced.
-        for victim in self.roster.evict_until_below(ceiling) {
+        let (victims, remaining) = self.roster.evict_until_below(ceiling);
+        for victim in victims {
             // DEBUG, not INFO: this fires once per arrival for as long as a
             // flood lasts, which is exactly the shape the refusal beside it is
             // DEBUG for. The victim's own closing line stays at INFO: that one
@@ -612,10 +613,10 @@ impl Server {
         // told immediately instead of timing out, and nothing per-connection
         // is built on our side. Logged at DEBUG because a flood is exactly
         // when this fires.
-        if self.roster.len() >= ceiling {
+        if remaining >= ceiling {
             debug!(
                 %remote,
-                live = self.roster.len(),
+                live = remaining,
                 max_connections,
                 "refusing a connection: the server is at its connection limit"
             );

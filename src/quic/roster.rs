@@ -118,7 +118,7 @@ impl Roster {
     }
 
     /// Evicts until the roster is below `cap`, naming the victims in the order
-    /// they were taken.
+    /// they were taken and how many connections are left.
     ///
     /// A loop rather than a single eviction, because the cap it is measured
     /// against can move. One victim is all a server that has been sitting at a
@@ -129,8 +129,9 @@ impl Roster {
     /// of those connections.
     ///
     /// It stops when there is nothing left that may be taken, which is the same
-    /// condition the caller's refusal tests: an answer that leaves the roster at
-    /// the cap means every live connection has authenticated.
+    /// condition the caller's refusal tests: a remainder at the cap means every
+    /// live connection has authenticated. The remainder is read under the guard
+    /// the loop already holds, so the caller need not take the lock again.
     ///
     /// A method rather than the loop written out at the accept path, so that
     /// what the unit tests run is what the server runs. Tests that walked a copy
@@ -141,7 +142,7 @@ impl Roster {
     /// connection ending on another thread in that window would leave the
     /// roster below the cap, and the next pass would evict a connection that no
     /// longer had to go (F2 of D96).
-    pub(super) fn evict_until_below(&self, cap: usize) -> Vec<SocketAddr> {
+    pub(super) fn evict_until_below(&self, cap: usize) -> (Vec<SocketAddr>, usize) {
         let mut victims = Vec::new();
         let mut slots = self.slots();
 
@@ -152,7 +153,7 @@ impl Roster {
             victims.push(victim);
         }
 
-        victims
+        (victims, slots.len())
     }
 }
 
@@ -261,12 +262,18 @@ mod tests {
         let roster = Roster::new();
         let _parked = park(&roster, 5);
 
+        let (victims, remaining) = roster.evict_until_below(2);
         assert_eq!(
-            roster.evict_until_below(2),
+            victims,
             vec![peer(0), peer(1), peer(2), peer(3)],
             "the victims must be the oldest four, oldest first"
         );
         assert_eq!(roster.len(), 1, "one slot is left for the newcomer");
+        assert_eq!(
+            remaining,
+            roster.len(),
+            "the remainder is the roster's length"
+        );
     }
 
     /// The loop stops when there is nothing left it may take.
@@ -283,11 +290,13 @@ mod tests {
             held.push(registration);
         }
 
+        let (victims, remaining) = roster.evict_until_below(1);
         assert!(
-            roster.evict_until_below(1).is_empty(),
+            victims.is_empty(),
             "an authenticated connection must never lose its slot"
         );
         assert_eq!(roster.len(), 3, "and must still be on the roster");
+        assert_eq!(remaining, 3, "which is the remainder the caller refuses on");
     }
 
     /// An authenticated slot is skipped even when the scan reaches it first.
@@ -339,7 +348,9 @@ mod tests {
         let roster = Roster::new();
         let _parked = park(&roster, 3);
 
-        assert_eq!(roster.evict_until_below(0), vec![peer(0), peer(1), peer(2)]);
+        let (victims, remaining) = roster.evict_until_below(0);
+        assert_eq!(victims, vec![peer(0), peer(1), peer(2)]);
+        assert_eq!(remaining, 0);
         assert_eq!(
             roster.len(),
             0,
