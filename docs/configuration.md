@@ -765,7 +765,10 @@ range and cross-field rule (`keep_alive_interval` against `max_idle_timeout`,
 `server.cert` and `server.key` exist and are files. When `server.cert` reads as
 a PEM certificate chain, its leaf is parsed and refused in the words startup
 uses if the server's TLS would refuse it. `server.ech_key`, when set, is read
-whole: the same checks startup makes on that file.
+whole: the same checks startup makes on that file. One thing outside the file
+is judged too: `RUST_LOG`, when it is set in the check's environment, by the
+rule startup holds it to, so a value that would stop the start fails the check
+with the same message, and one startup would ignore is a warning.
 
 **What it does not cover** is what only the running service can answer: whether
 the listen address is free, whether a certificate file that does not read as

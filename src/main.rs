@@ -160,7 +160,13 @@ fn start() -> Result<()> {
     // Deliberately the very next thing, and before the runtime is built: what
     // the flag promises is that nothing happens except reading the file.
     if cli.check_config {
-        report_config_check(&path, &config);
+        // `RUST_LOG` belongs to the environment, not the file, but a value
+        // that stops the start is a start failure all the same. It is judged
+        // by the function startup installs the filter with, so the refusal is
+        // the one startup prints.
+        let (_, ignored) =
+            chosen_filter(std::env::var_os("RUST_LOG").as_deref(), &config.log.level)?;
+        report_config_check(&path, &config, ignored.as_deref());
         return Ok(());
     }
 
@@ -249,13 +255,23 @@ fn run_command(command: &Command) -> Result<()> {
 /// `RLIMIT_NOFILE` (a property of the unit, not of the file) leaves room for the
 /// configured quotas. `docs/configuration.md` says so to the operator.
 ///
+/// One thing outside the file is judged: `RUST_LOG`, when it is set in this
+/// process's environment, by the rule startup holds it to. A value that would
+/// stop the start fails the check with startup's message (the `?` in
+/// `start`); one that startup would ignore in favour of `log.level` is
+/// `rust_log_ignored`, reported here as a warning. `script/deploy.sh` runs the
+/// check with the service unit's own `RUST_LOG` for that reason.
+///
 /// The warnings go to stderr and leave the status alone. They are the ones the
 /// service logs at startup on the same file, and none of them describes a
 /// configuration that fails to start, so making them fatal here would refuse to
 /// deploy a host that runs perfectly well.
-fn report_config_check(path: &Path, config: &Config) {
+fn report_config_check(path: &Path, config: &Config, rust_log_ignored: Option<&str>) {
     for warning in config.warnings() {
         eprintln!("warning: {warning}");
+    }
+    if let Some(reason) = rust_log_ignored {
+        eprintln!("warning: RUST_LOG would be ignored at startup and log.level used: {reason}");
     }
 
     println!(

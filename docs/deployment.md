@@ -378,11 +378,13 @@ about to install whether it can load the configuration this host already has:
 volto --check-config --config /etc/volto/config.toml
 ```
 
-If the answer is no, nothing is installed, the running service is not touched,
-and the run fails with the candidate's own message — file, line and column —
-on stderr. Asking before the swap is the only time the answer is worth having:
-afterwards the service is already down, and the guard below has restored the
-release you were trying to leave.
+The check runs with the `RUST_LOG` the service unit sets, or without one when
+the unit sets none (the [systemd](#systemd) section says which values are
+refused). If the answer is no, nothing is installed, the running service is not
+touched, and the run fails with the candidate's own message — file, line and
+column — on stderr. Asking before the swap is the only time the answer is worth
+having: afterwards the service is already down, and the guard below has restored
+the release you were trying to leave.
 
 Whether the candidate can be asked at all is decided by looking for the flag in
 its own `--help`, not by running it and reading how it fails, so a release from
@@ -501,9 +503,26 @@ Environment=RUST_LOG=volto=debug,quinn=info
 `RUST_LOG` is held to the rule `log.level` is held to. A value that turns this
 server's own lines off stops the start with an error filed at `err`, because the
 configuration warnings, the open-proxy warning among them, are among those
-lines: `off` or `0`, `volto=off` or `off` for a module of it, and a list that
-names only other targets, such as a lone `quinn=off`, which matches none of this
-server's lines. Write `info,quinn=off` to silence another crate.
+lines. These values are refused:
+
+- a bare `off` or `0`, in any letter case;
+- `volto=off`, or `off` for a module of it, such as `volto::quic=off`;
+- a directive list with no default level and no `volto` directive, such as
+  `quinn=debug` or a lone `quinn=off`, which matches none of this server's
+  lines.
+
+Write `info,quinn=debug` to raise another crate and keep this server's lines,
+or `info,quinn=off` to silence another crate. Spaces around the value and
+around each directive are removed before the value is judged and applied.
+
+The update check covers the unit's value. `volto-deploy` and
+`install-selfsigned.sh --replace-binary` read the `RUST_LOG` the unit sets
+(from `Environment=` and from the files `EnvironmentFile=` names) and run
+`volto --check-config` with it, so a value the new release refuses stops the
+update before the swap, with the old binary still running. A value that
+systemd prints quoted, or that holds a quote or a backslash, is not read: the
+check then runs without it and the run says so. `volto --check-config` itself
+judges `RUST_LOG` whenever it is set in its environment.
 
 A `RUST_LOG` value that does not parse is reported at startup, and `log.level`
 is used instead. So are two kinds of value that the filter accepts. An empty

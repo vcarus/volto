@@ -61,11 +61,20 @@ fn write_config(dir: &Path, listen: &str, body: &str) -> PathBuf {
 /// A password distinctive enough that finding it in any output is proof.
 const SECRET: &str = "hunter2-TAILSECRET";
 
-/// Runs the binary to its end with `JOURNAL_STREAM` removed, so the text on
-/// stderr does not depend on whether the test runner itself runs under systemd.
+/// Runs the binary to its end with `JOURNAL_STREAM` and `RUST_LOG` removed, so
+/// the text on stderr does not depend on whether the test runner itself runs
+/// under systemd, and `--check-config`, which judges `RUST_LOG`, does not
+/// depend on the runner's own value.
 fn run(args: &[&str]) -> Output {
+    run_in(args, &[])
+}
+
+/// [`run`] with `env` set after the two variables are removed.
+fn run_in(args: &[&str], env: &[(&str, &str)]) -> Output {
     Command::new(real_binary())
         .env_remove("JOURNAL_STREAM")
+        .env_remove("RUST_LOG")
+        .envs(env.iter().copied())
         .args(args)
         .output()
         .expect("the volto binary must be runnable")
@@ -469,6 +478,62 @@ fn a_log_filter_that_silences_the_server_stops_the_start() {
     for needle in ["log.level", "\"volto=off\"", "\"info\""] {
         assert!(stderr.contains(needle), "{needle}: {stderr}");
     }
+}
+
+/// `--check-config` judges `RUST_LOG` when it is set, by the function startup
+/// installs the filter with, so a value that would stop the start fails the
+/// check with startup's message (F3-M2). `script/deploy.sh` runs the check with
+/// the service unit's `RUST_LOG` to see exactly this.
+///
+/// A value startup would ignore in favour of `log.level` is a warning and
+/// leaves the status alone, as it leaves the start alone.
+#[test]
+fn the_check_judges_rust_log_by_the_rule_startup_applies() {
+    let dir = config_dir("check-rust-log");
+    let path = write_config(&dir, "127.0.0.1:0", "");
+    let args = ["--check-config", "--config", path.to_str().unwrap()];
+
+    for value in ["quinn=debug", "off", " volto=off"] {
+        let output = run_in(&args, &[("RUST_LOG", value)]);
+        let stderr = stderr_of(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "RUST_LOG={value:?}: {stderr}"
+        );
+        for needle in ["RUST_LOG", &format!("{:?}", value.trim()), "\"info\""] {
+            assert!(
+                stderr.contains(needle),
+                "RUST_LOG={value:?}: the refusal must be startup's ({needle}): {stderr}"
+            );
+        }
+        assert!(
+            stdout_of(&output).is_empty(),
+            "RUST_LOG={value:?}: a refused check reports no success"
+        );
+    }
+
+    for value in ["info,quinn=debug", "volto=debug", " info"] {
+        let output = run_in(&args, &[("RUST_LOG", value)]);
+        assert!(
+            output.status.success(),
+            "RUST_LOG={value:?} must pass the check: {}",
+            stderr_of(&output)
+        );
+        assert!(
+            !stderr_of(&output).contains("RUST_LOG"),
+            "RUST_LOG={value:?} applies, so nothing is said about it: {}",
+            stderr_of(&output)
+        );
+    }
+
+    let output = run_in(&args, &[("RUST_LOG", "warning")]);
+    let stderr = stderr_of(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("warning: RUST_LOG would be ignored at startup"),
+        "a RUST_LOG startup ignores is reported as a warning: {stderr}"
+    );
 }
 
 /// A `SIGHUP` that arrives while the server is still starting is a reload, not

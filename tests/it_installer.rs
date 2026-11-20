@@ -730,7 +730,9 @@ fn try_real_tool(name: &str) -> Option<PathBuf> {
 /// `systemctl` reports `service_status` for `is-active`: the `--quiet` form
 /// exits 0 only when the status is `active`, the plain form prints the status
 /// and exits 0, and every other invocation exits 0; every call is recorded in
-/// `systemctl.log` beside it. `chown` changes nothing and records its arguments
+/// `systemctl.log` beside it, except `show`, a query, which goes to
+/// `systemctl-show.log` and answers `show -p Environment` from
+/// `unit-environment` beside it. `chown` changes nothing and records its arguments
 /// in `chown.log`. `install` records its arguments in `install.log`, drops its
 /// `-o` and `-g` arguments, which name a user this host does not have, and runs
 /// the real `install`. `mv` counts its calls in `mv-calls` beside it.
@@ -746,6 +748,11 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
         &dir.join("systemctl"),
         &format!(
             "#!/bin/sh\n\
+             if [ \"$1\" = show ]; then\n\
+             \x20 printf '%s\\n' \"$*\" >> '{shown}'\n\
+             \x20 [ \"$3\" = Environment ] && cat '{environment}' 2>/dev/null\n\
+             \x20 exit 0\n\
+             fi\n\
              printf '%s\\n' \"$*\" >> '{log}'\n\
              if [ \"$1\" = is-active ]; then\n\
              \x20 if [ \"$2\" = --quiet ]; then\n\
@@ -757,6 +764,8 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
              fi\n\
              exit 0\n",
             log = dir.join("systemctl.log").display(),
+            shown = dir.join("systemctl-show.log").display(),
+            environment = dir.join("unit-environment").display(),
         ),
     );
     write_executable(&dir.join("apt-get"), "#!/bin/sh\nexit 0\n");
@@ -1245,6 +1254,59 @@ fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
         "",
         "the service must be left alone"
     );
+}
+
+/// `--replace-binary` asks the new binary with the `RUST_LOG` the installed
+/// unit sets, as `deploy.sh` does, so a value the binary refuses at startup
+/// stops the run before anything moves, and one it accepts does not (F3-M2).
+/// The binary is the real one, so its own rule judges the value.
+#[test]
+fn replacing_the_binary_is_checked_with_the_units_rust_log() {
+    for (name, environment, refused) in [
+        ("replace-rust-log-refused", "RUST_LOG=quinn=debug", true),
+        (
+            "replace-rust-log-accepted",
+            "RUST_LOG=info,quinn=debug",
+            false,
+        ),
+    ] {
+        let root = configured_root(name, "");
+        let stubs = plant_root_stubs(&root, 0, "active");
+        fs::write(stubs.join("unit-environment"), format!("{environment}\n"))
+            .expect("the unit's environment must be writable");
+
+        let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
+
+        let stderr = stderr_of(&output);
+        let installed = fs::read_to_string(root.join("usr/local/bin/volto")).ok();
+        if refused {
+            assert!(!output.status.success(), "{name}: {}", stdout_of(&output));
+            assert!(
+                stderr.contains("RUST_LOG = \"quinn=debug\" turns off")
+                    && stderr.contains("over a config it cannot load")
+                    && stderr.contains("the volto unit's RUST_LOG=quinn=debug"),
+                "{name}: the binary's own refusal must reach the operator: {stderr}"
+            );
+            assert_eq!(
+                installed.as_deref(),
+                Some(OLD_BINARY),
+                "{name}: the installed binary must be untouched: {stderr}"
+            );
+            assert!(!root.join("usr/local/bin/volto.prev").exists(), "{name}");
+            assert_eq!(
+                systemctl_calls(&stubs),
+                "",
+                "{name}: the service must be left alone"
+            );
+        } else {
+            assert!(output.status.success(), "{name}: {stderr}");
+            assert_eq!(
+                fs::read(root.join("usr/local/bin/volto")).ok(),
+                fs::read(real_binary()).ok(),
+                "{name}: the new binary must be installed"
+            );
+        }
+    }
 }
 
 /// `--replace-binary` with a binary that loads the config keeps the previous

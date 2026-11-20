@@ -375,6 +375,113 @@ is_older_version() {
     return 1
 }
 
+# Reads the RUST_LOG the $SERVICE_NAME unit starts the service with, so that the
+# config check can be run with it: the service reads RUST_LOG at startup and
+# refuses a value that turns its own log lines off, and this script's own
+# environment is not the unit's. Sets UNIT_RUST_LOG to the value and
+# UNIT_RUST_LOG_STATE to `found`, `none`, or `unreadable`: the unit sets a value
+# this function cannot read safely, and the check then runs without one.
+#
+# systemd's order is followed (systemd.exec(5)): the Environment= assignments
+# as `systemctl show` lists them, the last one winning, then the files
+# EnvironmentFile= names, in order, whose assignments override Environment=.
+# `systemctl show -p Environment --value` prints the assignments as
+# space-separated KEY=value words and puts a word that needs it in double
+# quotes with systemd's own escaping. That is not shell syntax, and nothing
+# here evaluates it: only an unquoted RUST_LOG=value word is read, and a quoted
+# RUST_LOG word, a backslash anywhere in the output, or a quote in the value is
+# `unreadable`. An environment file is read line by line the same way: a
+# RUST_LOG= line, with its value in plain text or inside one pair of quotes
+# with no quote or backslash in it.
+#
+# Not covered: RUST_LOG from systemd's manager environment (DefaultEnvironment=,
+# `systemctl set-environment`) through PassEnvironment=, UnsetEnvironment=, a
+# specifier such as %h or a $VAR reference in the value, and an environment
+# file that ExecStartPre= writes.
+UNIT_RUST_LOG=""
+UNIT_RUST_LOG_STATE=none
+read_unit_rust_log() {
+    local shown word value quotes in_quote=0 files listed path entry key
+    local -a words=()
+
+    UNIT_RUST_LOG=""
+    UNIT_RUST_LOG_STATE=none
+
+    shown="$(systemctl show -p Environment --value "$SERVICE_NAME" 2>/dev/null)" || shown=""
+    case "$shown" in
+        *RUST_LOG=*\\* | *\\*RUST_LOG=*) UNIT_RUST_LOG_STATE=unreadable ;;
+        *RUST_LOG=*)
+            read -r -a words <<<"$shown"
+            for word in "${words[@]}"; do
+                if [ "$in_quote" -eq 0 ]; then
+                    case "$word" in
+                        RUST_LOG=*\"* | RUST_LOG=*\'* | \"RUST_LOG=*)
+                            UNIT_RUST_LOG=""
+                            UNIT_RUST_LOG_STATE=unreadable
+                            ;;
+                        RUST_LOG=*)
+                            UNIT_RUST_LOG="${word#RUST_LOG=}"
+                            UNIT_RUST_LOG_STATE=found
+                            ;;
+                    esac
+                fi
+                # A word inside a quoted assignment is not an assignment.
+                quotes="${word//[^\"]/}"
+                [ $((${#quotes} % 2)) -eq 0 ] || in_quote=$((1 - in_quote))
+            done
+            ;;
+    esac
+
+    files="$(systemctl show -p EnvironmentFiles --value "$SERVICE_NAME" 2>/dev/null)" || files=""
+    while IFS= read -r listed; do
+        # Each line is "PATH (ignore_errors=yes|no)".
+        path="${listed% (ignore_errors=*}"
+        [ -n "$path" ] && [ -r "$path" ] || continue
+        while IFS= read -r entry || [ -n "$entry" ]; do
+            case "$entry" in
+                *=*) ;;
+                *) continue ;;
+            esac
+            key="${entry%%=*}"
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            [ "$key" = RUST_LOG ] || continue
+            value="${entry#*=}"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            case "$value" in
+                \"*\") value="${value#\"}"; value="${value%\"}" ;;
+                \'*\') value="${value#\'}"; value="${value%\'}" ;;
+            esac
+            case "$value" in
+                *\"* | *\'* | *\\*)
+                    UNIT_RUST_LOG=""
+                    UNIT_RUST_LOG_STATE=unreadable
+                    ;;
+                *)
+                    UNIT_RUST_LOG="$value"
+                    UNIT_RUST_LOG_STATE=found
+                    ;;
+            esac
+        done <"$path"
+    done <<<"$files"
+}
+
+# Runs `$1 --check-config --config $2` with the unit's RUST_LOG as
+# read_unit_rust_log left it, exported for this one command, and without
+# RUST_LOG when the unit sets none or one that could not be read: the service
+# does not inherit this script's environment, so neither does its check.
+check_config_as_the_unit() {
+    if [ "$UNIT_RUST_LOG_STATE" = found ]; then
+        RUST_LOG="$UNIT_RUST_LOG" "$1" --check-config --config "$2"
+    else
+        (
+            unset RUST_LOG
+            "$1" --check-config --config "$2"
+        )
+    fi
+}
+
 # Refuses the install when the binary in $1 cannot load this host's config.
 #
 # The hazard this closes is the rollback one: every table in the config file is
@@ -401,6 +508,11 @@ is_older_version() {
 #
 # A candidate that cannot be asked leaves the run exactly as it was before any
 # of this existed: the downgrade advisory above is what the operator gets.
+#
+# The check runs with the RUST_LOG the unit gives the service
+# (read_unit_rust_log), because a value the candidate refuses at startup would
+# otherwise pass here, be swapped in, fail to start and be rolled back, on
+# every timer run.
 check_config_with() {
     local binary="$1" help output
 
@@ -414,7 +526,12 @@ check_config_with() {
             ;;
     esac
 
-    if output="$("$binary" --check-config --config "$CONF" 2>&1)"; then
+    read_unit_rust_log
+    case "$UNIT_RUST_LOG_STATE" in
+        found) note "asking with the RUST_LOG the $SERVICE_NAME unit sets: $UNIT_RUST_LOG" ;;
+        unreadable) note "the $SERVICE_NAME unit's RUST_LOG was not checked: systemd's quoting of it cannot be read safely here" ;;
+    esac
+    if output="$(check_config_as_the_unit "$binary" "$CONF" 2>&1)"; then
         note "$CONF loads on volto $VERSION"
         return 0
     fi
@@ -429,6 +546,10 @@ check_config_with() {
         note "nothing was installed; the $SERVICE_NAME service still runs ${INSTALLED:-what it had}"
         note "the position above names the line to comment out in $CONF"
         note "(docs/configuration.md, version compatibility, says which key arrived when)"
+        if [ "$UNIT_RUST_LOG_STATE" = found ]; then
+            note "a refusal that names RUST_LOG is the $SERVICE_NAME unit's RUST_LOG=$UNIT_RUST_LOG,"
+            note "not $CONF: change it in the unit's drop-in (docs/deployment.md, RUST_LOG)"
+        fi
     } >&2
     die "refusing to install volto $VERSION over a config it cannot load"
 }

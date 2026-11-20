@@ -1726,10 +1726,17 @@ enum Service {
 }
 
 /// How the binary inside a published release answers `--check-config`.
+///
+/// Every candidate records the `RUST_LOG` its check ran with, or `<unset>`,
+/// one line per check, in `logs/check-rust-log`.
 #[derive(Clone, Copy)]
 enum Candidate {
     LoadsTheConfig,
     RefusesTheConfig,
+    /// Loads the config, and refuses `RUST_LOG=quinn=debug` with the real
+    /// binary's message, as the real rule does (`it_cli` holds the real
+    /// binary to that refusal).
+    RefusesASilencingRustLog,
 }
 
 /// A host for a run of the real install path of `script/deploy.sh`.
@@ -1809,10 +1816,19 @@ impl Host {
             Service::RestartFails => (1, 0),
             Service::DiesAfterRestart => (0, 1),
         };
+        // `show` is a query, recorded apart from the calls that act on the
+        // service so that every sequence asserted below stays the sequence of
+        // actions. It answers the unit's Environment= words from
+        // `logs/unit-environment` and its EnvironmentFile= list from
+        // `logs/unit-environment-files`, empty when the file is absent.
         write_executable(
             &host.stubs.join("systemctl"),
             &format!(
                 "#!/bin/sh\n\
+                 case \"$*\" in\n\
+                 \x20 'show -p Environment --value volto') printf '%s\\n' \"$*\" >> '{shown}'; cat '{environment}' 2>/dev/null; exit 0 ;;\n\
+                 \x20 'show -p EnvironmentFiles --value volto') printf '%s\\n' \"$*\" >> '{shown}'; cat '{files}' 2>/dev/null; exit 0 ;;\n\
+                 esac\n\
                  printf '%s\\n' \"$*\" >> '{log}'\n\
                  case \"$*\" in\n\
                  \x20 'restart volto') exit {restart} ;;\n\
@@ -1821,6 +1837,9 @@ impl Host {
                  esac\n\
                  exit 0\n",
                 log = host.logs.join("systemctl").display(),
+                shown = host.logs.join("systemctl-show").display(),
+                environment = host.logs.join("unit-environment").display(),
+                files = host.logs.join("unit-environment-files").display(),
             ),
         );
         write_executable(
@@ -1894,7 +1913,17 @@ impl Host {
                 "echo \"error: failed to parse config file $3: unknown field\" >&2; exit 1"
                     .to_owned()
             }
+            Candidate::RefusesASilencingRustLog => {
+                "if [ \"${RUST_LOG-}\" = quinn=debug ]; then \
+                 echo 'Error: RUST_LOG = \"quinn=debug\" turns off the log lines of this server' >&2; \
+                 exit 1; fi; echo \"$3 loads\"; exit 0"
+                    .to_owned()
+            }
         };
+        let verdict = format!(
+            "printf '%s\\n' \"${{RUST_LOG-<unset>}}\" >> '{}'; {verdict}",
+            self.logs.join("check-rust-log").display()
+        );
         let binary = format!(
             "#!/bin/sh\n\
              # the binary inside the {tag} archive\n\
@@ -1969,11 +1998,36 @@ impl Host {
             .env("PATH", path_with_stubs(&self.stubs))
             .env("VOLTO_DEPLOY_ROOT", &self.root)
             .env("REPO", "example/volto")
+            .env_remove("RUST_LOG")
             .env_remove("TAG")
             .env_remove("VOLTO_DEPLOY_CANDIDATE")
             .env_remove("VOLTO_DEPLOY_SIGNER")
             .output()
             .expect("the deploy script must be runnable")
+    }
+
+    /// [`Host::run`] with `RUST_LOG` set to `rust_log` in the script's own
+    /// environment, as an operator's shell may have it.
+    fn run_with_rust_log(&self, args: &[&str], rust_log: &str) -> Output {
+        Command::new("bash")
+            .arg(deploy_script())
+            .args(args)
+            .current_dir(repo_root())
+            .env("PATH", path_with_stubs(&self.stubs))
+            .env("VOLTO_DEPLOY_ROOT", &self.root)
+            .env("REPO", "example/volto")
+            .env("RUST_LOG", rust_log)
+            .env_remove("TAG")
+            .env_remove("VOLTO_DEPLOY_CANDIDATE")
+            .env_remove("VOLTO_DEPLOY_SIGNER")
+            .output()
+            .expect("the deploy script must be runnable")
+    }
+
+    /// Makes `systemctl show -p Environment --value volto` answer `words`.
+    fn set_unit_environment(&self, words: &str) {
+        fs::write(self.logs.join("unit-environment"), format!("{words}\n"))
+            .expect("the unit's environment must be writable");
     }
 
     /// What one stub recorded, one call per line.
@@ -2307,6 +2361,141 @@ fn the_real_update_path_refuses_a_release_that_cannot_load_the_config() {
         "",
         "the running service must be left alone: {stderr}"
     );
+}
+
+/// The update check runs with the `RUST_LOG` the service unit sets, so a value
+/// the new release refuses at startup stops the update before the swap, with
+/// the old binary still running (F3-M2).
+///
+/// Without it the check ran in the script's own environment, passed, and the
+/// new binary was swapped in, refused to start, and was rolled back, on every
+/// timer run. The unit's value reaches the check from `Environment=` and from
+/// an `EnvironmentFile=`, whose assignment overrides `Environment=` as
+/// systemd's does.
+#[test]
+fn a_unit_rust_log_the_release_refuses_stops_the_update_before_the_swap() {
+    for (name, environment, file) in [
+        (
+            "rust-log-refused",
+            "LANG=C.UTF-8 RUST_LOG=quinn=debug",
+            None,
+        ),
+        (
+            "rust-log-file-refused",
+            "RUST_LOG=info",
+            Some("# set for a QUIC investigation\nRUST_LOG=\"quinn=debug\"\n"),
+        ),
+    ] {
+        let host = Host::new(name, Service::ComesUp);
+        host.plant_install();
+        host.publish(UNSIGNED_TAG, Candidate::RefusesASilencingRustLog);
+        host.set_unit_environment(environment);
+        if let Some(text) = file {
+            let path = host.logs.join("volto.env");
+            fs::write(&path, text).expect("the environment file must be writable");
+            fs::write(
+                host.logs.join("unit-environment-files"),
+                format!("{} (ignore_errors=no)\n", path.display()),
+            )
+            .expect("the file list must be writable");
+        }
+        let previous_binary =
+            fs::read_to_string(host.bin()).expect("the planted binary must be readable");
+        let previous_unit =
+            fs::read_to_string(host.unit()).expect("the planted unit must be readable");
+
+        let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+        let stderr = stderr_of(&output);
+        assert!(
+            !output.status.success(),
+            "{name}: a RUST_LOG the release refuses must stop the update: {}",
+            stdout_of(&output)
+        );
+        assert!(
+            stderr.contains("refusing to install volto 1.3.7 over a config it cannot load")
+                && stderr.contains("RUST_LOG = \"quinn=debug\"")
+                && stderr.contains("the volto unit's RUST_LOG=quinn=debug"),
+            "{name}: the run must pass on the refusal and name the unit's value: {stderr}"
+        );
+        assert_eq!(
+            host.calls("check-rust-log"),
+            "quinn=debug\n",
+            "{name}: the check must run with the unit's RUST_LOG"
+        );
+        assert_eq!(
+            fs::read_to_string(host.bin()).ok(),
+            Some(previous_binary),
+            "{name}: the installed binary must be untouched: {stderr}"
+        );
+        assert_eq!(
+            fs::read_to_string(host.unit()).ok(),
+            Some(previous_unit),
+            "{name}: the installed unit must be untouched: {stderr}"
+        );
+        assert!(
+            !host.root.join("usr/local/bin/volto.prev").exists(),
+            "{name}: the refusal must come before the previous binary is copied aside"
+        );
+        assert_eq!(
+            host.calls("systemctl"),
+            "",
+            "{name}: the running service must be left alone: {stderr}"
+        );
+    }
+}
+
+/// A unit `RUST_LOG` the release accepts, or none, lets the update go on, and
+/// the check sees the unit's value and never the script's own: the shell that
+/// runs the script here sets the refused `RUST_LOG=quinn=debug`. A value
+/// systemd had to quote is not read; the check then runs without it and the
+/// run says so.
+#[test]
+fn a_unit_rust_log_the_release_accepts_or_none_lets_the_update_proceed() {
+    for (name, environment, checked) in [
+        (
+            "rust-log-accepted",
+            "RUST_LOG=info,quinn=debug",
+            "info,quinn=debug",
+        ),
+        ("rust-log-absent", "", "<unset>"),
+        ("rust-log-other", "LANG=C.UTF-8 TZ=UTC", "<unset>"),
+        (
+            "rust-log-quoted",
+            "\"RUST_LOG=info quinn=debug\" LANG=C.UTF-8",
+            "<unset>",
+        ),
+    ] {
+        let host = Host::new(name, Service::ComesUp);
+        host.plant_install();
+        let candidate = host.publish(UNSIGNED_TAG, Candidate::RefusesASilencingRustLog);
+        host.set_unit_environment(environment);
+
+        let output =
+            host.run_with_rust_log(&["--allow-unsigned", "--tag", UNSIGNED_TAG], "quinn=debug");
+
+        let stdout = stdout_of(&output);
+        assert!(
+            output.status.success(),
+            "{name}: the update must go on: {stdout}{}",
+            stderr_of(&output)
+        );
+        assert_eq!(
+            host.calls("check-rust-log"),
+            format!("{checked}\n"),
+            "{name}: the check must run with the unit's RUST_LOG, not the script's"
+        );
+        assert_eq!(
+            fs::read_to_string(host.bin()).ok(),
+            Some(candidate),
+            "{name}: the release's binary must be installed: {stdout}"
+        );
+        assert_eq!(
+            stdout.contains("the volto unit's RUST_LOG was not checked"),
+            name == "rust-log-quoted",
+            "{name}: only a value that cannot be read is reported as not checked: {stdout}"
+        );
+    }
 }
 
 /// A host with no config takes the first-install path on the real run, even
