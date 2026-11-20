@@ -754,7 +754,7 @@ exit status: they describe a server that runs, not one that refuses to.
 
 Nothing is bound, started or written, so this needs no privilege beyond reading
 the file it is given — which on a host set up by `install-selfsigned.sh` still
-means root or `sudo -u volto`, since `/etc/volto` is `0750 volto:volto`.
+means root or `sudo -u volto`, since `/etc/volto` is `0750 root:volto`.
 
 **What it covers** is what startup does with the file before it becomes a
 server: TOML syntax, every table's refusal of a key it does not know, and every

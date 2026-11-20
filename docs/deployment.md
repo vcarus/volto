@@ -76,8 +76,8 @@ than pointing volto at them, have the renewal hook copy the files into
 sudo tee /etc/letsencrypt/renewal-hooks/deploy/volto.sh >/dev/null <<'EOF'
 #!/bin/sh
 set -e
-install -o volto -g volto -m 0644 /etc/letsencrypt/live/example.com/fullchain.pem /etc/volto/fullchain.pem
-install -o volto -g volto -m 0640 /etc/letsencrypt/live/example.com/privkey.pem   /etc/volto/privkey.pem
+install -o root -g volto -m 0644 /etc/letsencrypt/live/example.com/fullchain.pem /etc/volto/fullchain.pem
+install -o root -g volto -m 0640 /etc/letsencrypt/live/example.com/privkey.pem   /etc/volto/privkey.pem
 systemctl reload volto
 EOF
 sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/volto.sh
@@ -180,6 +180,14 @@ binary's own message and nothing written, so the cause can be fixed and the
 installer re-run on a host it left untouched. A binary too old to know the flag
 is not asked, and the install goes ahead as it always did.
 
+`/etc/volto` belongs to root and the service reads it through its group:
+the directory is `root:volto` 0750, the config and the key `root:volto` 0640,
+the certificate `root:volto` 0644. The service user can change nothing in it.
+Releases before this layout gave the directory and its files to the `volto`
+user; `deploy.sh` moves such a host to the new layout on its next run, the
+timer's no-op run included, and leaves a symbolic link or a file with a second
+name where it is and names it.
+
 Re-running is safe: on a host that already has `/etc/volto/config.toml`, the
 config file, the certificate, the user, the binary and the unit are kept, and the
 service is not restarted; only a missing binary or unit is installed.
@@ -204,7 +212,7 @@ sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
   -addext "extendedKeyUsage=serverAuth"
 
-sudo chown volto:volto /etc/volto/cert.pem /etc/volto/key.pem
+sudo chown root:volto /etc/volto/cert.pem /etc/volto/key.pem
 sudo chmod 0644 /etc/volto/cert.pem
 sudo chmod 0640 /etc/volto/key.pem
 
@@ -435,8 +443,8 @@ installation:
 ```sh
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin volto
 sudo install -m 0755 target/release/volto /usr/local/bin/volto
-sudo install -d -o volto -g volto -m 0750 /etc/volto
-sudo install -o volto -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
+sudo install -d -o root -g volto -m 0750 /etc/volto
+sudo install -o root -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
 sudo install -m 0644 script/masque.service /etc/systemd/system/volto.service
 sudo systemctl daemon-reload
 sudo systemctl enable volto
@@ -458,7 +466,7 @@ sudo systemctl start volto
 
 The unit runs as a fixed system user rather than with `DynamicUser=yes` on
 purpose: the private key must be readable by this service and nothing else,
-which needs a stable owner to grant it to (`chown volto:volto`, mode 0640).
+which needs a stable group to grant it to (`root:volto`, mode 0640).
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` is what allows binding a low port
 without root, and the rest of the unit is standard systemd hardening —
 `ProtectSystem=strict` with `ReadOnlyPaths=/etc/volto`, a `@system-service`
@@ -725,10 +733,14 @@ names the relay is judged like any other public address. See
 ECH is optional. Without a key the server runs plain TLS 1.3; with one, a client
 that holds the server's ECHConfigList sends its real server name encrypted, and
 only the key's public name travels in the clear. Generate the key on the host,
-as the user the service runs as, so the private key never leaves it:
+so the private key never leaves it. `/etc/volto` belongs to root, so the key is
+written as root and then given to the service's group, as the other files
+there are:
 
 ```sh
-sudo -u volto volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+sudo volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+sudo chgrp volto /etc/volto/ech.pem
+sudo chmod 0640 /etc/volto/ech.pem
 ```
 
 It prints the ECHConfigList as one base64 line; `volto ech-config

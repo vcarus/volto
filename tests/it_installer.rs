@@ -28,6 +28,7 @@
 mod scripts;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -703,10 +704,10 @@ fn try_real_tool(name: &str) -> Option<PathBuf> {
 /// `systemctl` reports `service_status` for `is-active`: the `--quiet` form
 /// exits 0 only when the status is `active`, the plain form prints the status
 /// and exits 0, and every other invocation exits 0; every call is recorded in
-/// `systemctl.log` beside it. `chown` does nothing.
-/// `install` drops its `-o` and `-g` arguments, which name a user this host does
-/// not have, and runs the real `install`. `mv` counts its calls in `mv-calls`
-/// beside it.
+/// `systemctl.log` beside it. `chown` changes nothing and records its arguments
+/// in `chown.log`. `install` records its arguments in `install.log`, drops its
+/// `-o` and `-g` arguments, which name a user this host does not have, and runs
+/// the real `install`. `mv` counts its calls in `mv-calls` beside it.
 fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBuf {
     let dir = root.join("stubs");
     fs::create_dir_all(&dir).expect("the stub directory must be creatable");
@@ -733,11 +734,18 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
         ),
     );
     write_executable(&dir.join("apt-get"), "#!/bin/sh\nexit 0\n");
-    write_executable(&dir.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_executable(
+        &dir.join("chown"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+            dir.join("chown.log").display()
+        ),
+    );
     write_executable(
         &dir.join("install"),
         &format!(
             "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{log}'\n\
              skip=\n\
              for arg do\n\
              \x20 shift\n\
@@ -746,7 +754,8 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
              \x20 set -- \"$@\" \"$arg\"\n\
              done\n\
              exec '{}' \"$@\"\n",
-            real_tool("install").display()
+            real_tool("install").display(),
+            log = dir.join("install.log").display(),
         ),
     );
     write_executable(
@@ -865,6 +874,11 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
     }
 }
 
+/// A `chown` that fails when it is given the certificate pair, and succeeds on
+/// the directory before it, so the run reaches the certificate transaction.
+const CHOWN_FAILS_ON_THE_PAIR: &str =
+    "#!/bin/sh\ncase \"$*\" in *cert.pem*) exit 1 ;; esac\nexit 0\n";
+
 /// A failure at the ownership change must also put the previous pair back.
 ///
 /// The ERR trap covered the four renames and was disarmed before `chown`. A
@@ -884,7 +898,7 @@ fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
     let old_key = fs::read(&key).expect("the old key must be readable");
 
     let stubs = plant_root_stubs(&root, 0, "active");
-    write_executable(&stubs.join("chown"), "#!/bin/sh\nexit 1\n");
+    write_executable(&stubs.join("chown"), CHOWN_FAILS_ON_THE_PAIR);
 
     let output = run_full_install_with_stubs(&root, &stubs, &["--force"]);
     let stderr = stderr_of(&output);
@@ -947,7 +961,7 @@ fn a_failed_ownership_change_removes_a_new_key_with_no_previous_one() {
         }
 
         let stubs = plant_root_stubs(&root, 0, "active");
-        write_executable(&stubs.join("chown"), "#!/bin/sh\nexit 1\n");
+        write_executable(&stubs.join("chown"), CHOWN_FAILS_ON_THE_PAIR);
 
         let output = run_full_install_with_stubs(&root, &stubs, &[]);
         let stderr = stderr_of(&output);
@@ -1286,6 +1300,101 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
         "the rollback reloads systemd and starts the service: {}",
         systemctl_calls(&stubs)
     );
+}
+
+/// A first install writes the root-owned layout: `/etc/volto` root:volto 0750,
+/// the config and the key root:volto 0640, the certificate root:volto 0644
+/// (R8-M3).
+///
+/// The installer used to give the directory and every file in it to the
+/// service user, and then wrote, renamed, chowned and chmodded by name inside
+/// a directory that user could change. The stand-in `chown` and `install`
+/// record what they were asked, since this host has no `volto` group.
+#[test]
+fn a_first_install_writes_the_root_owned_layout() {
+    let root = scratch_tree(
+        "install",
+        "layout",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let dir = root.join("etc/volto");
+    let chown = fs::read_to_string(stubs.join("chown.log")).unwrap_or_default();
+    assert!(
+        chown.contains(&format!("root:volto {}\n", dir.display()))
+            && chown.contains(&format!(
+                "root:volto {} {}\n",
+                dir.join("cert.pem").display(),
+                dir.join("key.pem").display()
+            ))
+            && !chown.contains("volto:volto"),
+        "the directory and the pair must go to root:volto: {chown}"
+    );
+    let install = fs::read_to_string(stubs.join("install.log")).unwrap_or_default();
+    assert!(
+        install.lines().any(|line| line.starts_with("-o root -g volto -m 0640 ")
+            && line.ends_with(&format!(" {}", dir.join("config.toml").display()))),
+        "the config must be installed root:volto 0640: {install}"
+    );
+    assert!(!install.contains("-o volto"), "{install}");
+    let mode = |name: &str| {
+        fs::metadata(dir.join(name))
+            .expect("installed file")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode("cert.pem"), 0o644);
+    assert_eq!(mode("key.pem"), 0o640);
+    assert_eq!(mode("config.toml"), 0o640);
+    assert_eq!(
+        fs::metadata(&dir).expect("the directory").permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+/// A symbolic link where the key belongs is refused, and the file it points at
+/// is not changed (R8-M3).
+///
+/// While the service user owned `/etc/volto` it could replace `key.pem` with a
+/// link to a file of root's and delete `config.toml`; the next run took the
+/// first-install path, kept the "existing" pair because `test -f` follows the
+/// link, and its `chown` and `chmod` then acted on the link's target.
+#[test]
+fn a_symbolic_link_in_place_of_the_key_is_refused() {
+    let root = scratch_tree(
+        "install",
+        "key-symlink",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system", "outside"],
+    );
+    let dir = root.join("etc/volto");
+    fs::write(dir.join("cert.pem"), "not a certificate\n").expect("plant the certificate");
+    let target = root.join("outside/shadow");
+    fs::write(&target, "root's file\n").expect("plant the link target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+    std::os::unix::fs::symlink(&target, dir.join("key.pem")).expect("plant the link");
+    let stubs = plant_root_stubs(&root, 0, "active");
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("is a symbolic link; refusing to use it"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(
+        fs::metadata(&target).expect("the target").permissions().mode() & 0o777,
+        0o600,
+        "the link's target must keep its mode: {stderr}"
+    );
+    let chown = fs::read_to_string(stubs.join("chown.log")).unwrap_or_default();
+    assert!(!chown.contains("key.pem"), "nothing may chown through the link: {chown}");
+    assert!(!dir.join("config.toml").exists(), "no config may be written");
 }
 
 /// The report must survive a certificate that openssl cannot read.

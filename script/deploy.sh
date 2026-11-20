@@ -85,7 +85,8 @@ CANDIDATE="${VOLTO_DEPLOY_CANDIDATE:-}"
 
 BIN="$ROOT/usr/local/bin/volto"
 SELF_INSTALLED="$ROOT/usr/local/sbin/volto-deploy"
-CONF="$ROOT/etc/volto/config.toml"
+CONF_DIR="$ROOT/etc/volto"
+CONF="$CONF_DIR/config.toml"
 SERVICE_NAME=volto
 UNIT="$ROOT/etc/systemd/system/$SERVICE_NAME.service"
 TIMER_NAME=volto-deploy
@@ -408,6 +409,42 @@ check_config_with() {
     die "refusing to install volto $VERSION over a config it cannot load"
 }
 
+# Moves /etc/volto to the layout install-selfsigned.sh now writes: the
+# directory root:volto 0750, and each file the service user owned root:volto
+# with the group allowed to read it. Releases before that layout made the
+# directory and its files the service user's, and root then wrote, renamed and
+# chowned by name inside a directory that user could change.
+#
+# The directory goes first: once root owns it, the service user can add,
+# rename or remove nothing in it, so the list the loop reads stays true while
+# the loop runs. Only regular files with one link are moved. A symbolic link,
+# or a second name of a file elsewhere, is left as it is and named, because
+# chown and chmod would act on what it points at. Files root already owns are
+# not touched, which is what makes a second run a no-op. The service reads
+# every file either way: through its owner before, through its group after.
+converge_ownership() {
+    local uid file moved=0 kept
+
+    [ -d "$CONF_DIR" ] || return 0
+    uid="$(id -u volto 2>/dev/null)" || return 0
+    [ -n "$uid" ] || return 0
+
+    if [ -n "$(find "$CONF_DIR" -maxdepth 0 -user "$uid")" ]; then
+        chown root:volto "$CONF_DIR"
+        chmod 0750 "$CONF_DIR"
+        moved=1
+    fi
+    while IFS= read -r -d '' file; do
+        chmod g+r,g-w,o-w "$file"
+        chown -h root:volto "$file"
+        moved=1
+    done < <(find "$CONF_DIR" -mindepth 1 -maxdepth 1 -type f -user "$uid" -links 1 -print0)
+
+    [ "$moved" -eq 0 ] || note "moved $CONF_DIR and the files in it from the volto user to root:volto"
+    kept="$(find "$CONF_DIR" -mindepth 1 -maxdepth 1 -user "$uid" ! \( -type f -links 1 \))"
+    [ -z "$kept" ] || note "left to the volto user, since each is not a regular file with one link: ${kept//$'\n'/ }"
+}
+
 # --- arguments ---------------------------------------------------------------
 
 ARGUMENT_COUNT=$#
@@ -543,6 +580,10 @@ fi
 # bash this script has no file, BASH_SOURCE is then empty, and $0 is the word
 # "bash", which names a file whenever the working directory happens to hold one.
 SELF_SOURCE="${BASH_SOURCE[0]:-}"
+
+# Every real run converges the ownership of /etc/volto, the no-op run included,
+# so a host takes the new layout on the first run of a script that knows it.
+[ "$DRY_RUN" -eq 1 ] || converge_ownership
 
 # Converging means the whole install, not just the binary: a deleted config or
 # unit must be regenerated even when the version already matches, and doing so

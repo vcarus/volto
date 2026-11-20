@@ -5,8 +5,8 @@
 # run it, or who already has a certificate.
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin volto
 #   sudo install -m 0755 target/release/volto /usr/local/bin/volto
-#   sudo install -d -o volto -g volto -m 0750 /etc/volto
-#   sudo install -o volto -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
+#   sudo install -d -o root -g volto -m 0750 /etc/volto
+#   sudo install -o root -g volto -m 0640 script/config.example.toml /etc/volto/config.toml
 #   sudo install -m 0644 script/masque.service /etc/systemd/system/volto.service
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable volto
@@ -98,7 +98,7 @@ ProtectProc=invisible
 # Read-only access to the config and the certificates. ProtectSystem=strict makes
 # the rest of the filesystem read-only, so this is the only path that matters.
 #
-# Have certbot's deploy hook copy the renewed files into /etc/volto (owner volto,
+# Have certbot's deploy hook copy the renewed files into /etc/volto (root:volto,
 # key mode 0640) and then `systemctl reload volto`, rather than pointing this at
 # /etc/letsencrypt: the live symlinks there are root-only.
 ReadOnlyPaths=/etc/volto

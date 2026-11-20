@@ -1769,7 +1769,25 @@ impl Host {
             logs: base.join("logs"),
         };
 
-        write_executable(&host.stubs.join("id"), "#!/bin/sh\necho 0\n");
+        // `id -u volto` answers the uid in `logs/volto-uid`, or a uid no file
+        // here belongs to, so the ownership migration finds nothing to move
+        // unless a test asks for it.
+        write_executable(
+            &host.stubs.join("id"),
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$*\" = '-u volto' ]; then cat '{uid}' 2>/dev/null || echo 2147483646; exit 0; fi\n\
+                 echo 0\n",
+                uid = host.logs.join("volto-uid").display(),
+            ),
+        );
+        write_executable(
+            &host.stubs.join("chown"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                host.logs.join("chown").display()
+            ),
+        );
         write_executable(
             &host.stubs.join("uname"),
             "#!/bin/sh\ncase \"$1\" in -m) echo x86_64 ;; *) echo Linux ;; esac\n",
@@ -1949,6 +1967,126 @@ impl Host {
     fn calls(&self, stub: &str) -> String {
         fs::read_to_string(self.logs.join(stub)).unwrap_or_default()
     }
+
+    /// Makes `id -u volto` answer `uid`.
+    fn set_volto_uid(&self, uid: u32) {
+        fs::write(self.logs.join("volto-uid"), format!("{uid}\n"))
+            .expect("the uid answer must be writable");
+    }
+}
+
+/// The permission bits of `path`, without following a final symbolic link.
+fn mode_of(path: &Path) -> u32 {
+    fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777
+}
+
+/// A host on the layout releases before R8-M3 wrote moves to root ownership on
+/// the next run of the script, and the run after that changes nothing.
+///
+/// In the old layout `/etc/volto` and its files belonged to the service user,
+/// and root later wrote, renamed and chowned by name inside it, so a process
+/// running as that user could point one of those names at a file of root's.
+/// The run here is the no-op one (the installed version is the release), which
+/// is what a timer run is on most days, so the migration cannot wait for an
+/// update. The planted files belong to this test's own user, which `id -u
+/// volto` is made to answer.
+///
+/// A symbolic link and a file with a second name elsewhere are left alone, and
+/// the files they point at keep their mode: `chmod` follows a link. The
+/// stand-in `chown` changes nothing on disk, so the second run makes `id -u
+/// volto` answer another uid, which is what a real host looks like after the
+/// first: nothing in the directory belongs to the service user any more.
+#[test]
+fn an_old_layout_moves_to_root_ownership_on_the_next_run_and_stays_there() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let host = Host::new("ownership", Service::ComesUp);
+    host.plant_install();
+    let dir = host.root.join("etc/volto");
+    let outside = host.logs.join("outside");
+    fs::create_dir_all(&outside).expect("the outside directory must be creatable");
+
+    let files = [
+        ("config.toml", 0o640),
+        ("cert.pem", 0o644),
+        ("key.pem", 0o640),
+        ("ech.pem", 0o600),
+    ];
+    for (name, mode) in files {
+        if name != "config.toml" {
+            fs::write(dir.join(name), format!("{name}\n")).expect("plant the file");
+        }
+        fs::set_permissions(dir.join(name), fs::Permissions::from_mode(mode))
+            .expect("set the old mode");
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).expect("set the directory mode");
+
+    let target = outside.join("shadow");
+    fs::write(&target, "root's file\n").expect("plant the link target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("target mode");
+    std::os::unix::fs::symlink(&target, dir.join("evil.pem")).expect("plant the symbolic link");
+    let linked = outside.join("linked");
+    fs::write(&linked, "another name\n").expect("plant the hard link target");
+    fs::set_permissions(&linked, fs::Permissions::from_mode(0o600)).expect("linked mode");
+    fs::hard_link(&linked, dir.join("linked.pem")).expect("plant the hard link");
+
+    host.set_volto_uid(fs::metadata(&dir).expect("the directory").uid());
+    let output = host.run(&["--tag", "v1.3.6"]);
+
+    let stdout = stdout_of(&output);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let mut calls: Vec<String> = host.calls("chown").lines().map(str::to_owned).collect();
+    calls.sort();
+    let mut expected: Vec<String> = files
+        .iter()
+        .map(|(name, _)| format!("-h root:volto {}", dir.join(name).display()))
+        .chain([format!("root:volto {}", dir.display())])
+        .collect();
+    expected.sort();
+    assert_eq!(calls, expected, "the directory and its four regular files move to root: {stdout}");
+    for (name, mode) in [
+        ("config.toml", 0o640),
+        ("cert.pem", 0o644),
+        ("key.pem", 0o640),
+        ("ech.pem", 0o640),
+    ] {
+        assert_eq!(
+            mode_of(&dir.join(name)),
+            mode,
+            "{name}: the group must read it and nobody else write it"
+        );
+    }
+    assert_eq!(mode_of(&dir), 0o750);
+    assert_eq!(mode_of(&target), 0o600, "a link's target must not be changed");
+    assert_eq!(mode_of(&linked), 0o600, "a second name's file must not be changed");
+    assert_eq!(
+        fs::read_to_string(dir.join("config.toml")).ok().as_deref(),
+        Some("# planted\n"),
+        "the configuration must be kept"
+    );
+    assert!(
+        stdout.contains("moved") && stdout.contains("evil.pem") && stdout.contains("linked.pem"),
+        "the run must say what it moved and name what it left: {stdout}"
+    );
+
+    host.set_volto_uid(2_147_483_646);
+    let output = host.run(&["--tag", "v1.3.6"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(
+        host.calls("chown").lines().count(),
+        expected.len(),
+        "a second run must move nothing: {}",
+        host.calls("chown")
+    );
+    assert!(
+        !stdout_of(&output).contains("moved"),
+        "{}",
+        stdout_of(&output)
+    );
 }
 
 /// The end-to-end harness reaches the end of an update, and an unsigned

@@ -437,7 +437,31 @@ else
     note "created system user 'volto'"
 fi
 
-install -d -o volto -g volto -m 0750 "$CONF_DIR"
+# /etc/volto belongs to root, and the service reads it through its group:
+# root:volto 0750 for the directory, 0640 for the config and the key, 0644 for
+# the certificate. The service user can then add, rename or remove nothing in
+# it, so a name this script checks below still names the same file when root
+# writes, renames, chowns or chmods it. Releases before this one made the
+# directory and its files the service user's; the chown and chmod here move a
+# directory from that layout, and deploy.sh moves the rest of its files.
+install -d -m 0750 "$CONF_DIR"
+chown root:volto "$CONF_DIR"
+chmod 0750 "$CONF_DIR"
+
+# Ends the run when the name $1 is anything but missing or a regular file with
+# one link. `test -f`, `chown` and `chmod` follow a symbolic link, and openssl
+# writes through one, so a link planted while the service user still owned the
+# directory would turn the steps below into changes to the file it points at.
+refuse_unsafe_entry() {
+    [ ! -L "$1" ] || die "$1 is a symbolic link; refusing to use it (put the file itself there)"
+    [ -e "$1" ] || return 0
+    [ -f "$1" ] || die "$1 is not a regular file; refusing to use it"
+    [ -z "$(find "$1" -prune -links +1)" ] ||
+        die "$1 has more than one hard link; refusing to use it (copy it to a file of its own)"
+}
+for entry in "$CERT" "$KEY" "$CONF"; do
+    refuse_unsafe_entry "$entry"
+done
 
 # --- certificate ------------------------------------------------------------
 
@@ -447,7 +471,8 @@ install -d -o volto -g volto -m 0750 "$CONF_DIR"
 # Armed as an ERR trap over the four renames of the swap and the ownership and
 # mode that follow them, and disarmed after the chmod block. Without it `set -e`
 # ends the run with the configured pair split, or with the new pair in place and
-# the key possibly root-owned and mode 0640, which the next restart cannot read.
+# the key still root:root and mode 0600 from openssl's umask, which the next
+# restart cannot read.
 # A failure at the key backup leaves the old key with no certificate. A failure
 # at either move into place leaves the new certificate, or no certificate,
 # beside the old key's backup. The running service keeps the pair it loaded, so
@@ -512,6 +537,17 @@ else
     # with the process umask, so without it the new key is world-readable from
     # its creation until the chmod below. The subshell keeps the umask off the
     # rest of the script.
+    #
+    # One timestamp for both backups, so the pair keeps a name that says it is a
+    # pair. Every name the swap writes is cleared or checked first, for the
+    # reason refuse_unsafe_entry gives.
+    stamp="$(date +%Y%m%d%H%M%S)"
+    rm -f "$CERT.new" "$KEY.new"
+    for entry in "$CERT.$stamp.bak" "$KEY.$stamp.bak"; do
+        if [ -e "$entry" ] || [ -L "$entry" ]; then
+            die "$entry already exists; refusing to overwrite it"
+        fi
+    done
     (
         umask 077
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -535,10 +571,7 @@ else
     key_placed=0
     trap restore_previous_pair ERR
 
-    # One timestamp for both backups, so the pair keeps a name that says it is a
-    # pair even when the generation above straddles a second boundary.
     if [ -f "$CERT" ]; then
-        stamp="$(date +%Y%m%d%H%M%S)"
         mv "$CERT" "$CERT.$stamp.bak"
         cert_backup="$CERT.$stamp.bak"
         if [ -f "$KEY" ]; then
@@ -556,7 +589,7 @@ else
     note "generated a self-signed certificate for $SNI, valid $CERT_DAYS days"
 fi
 
-chown volto:volto "$CERT" "$KEY"
+chown root:volto "$CERT" "$KEY"
 chmod 0644 "$CERT"
 chmod 0640 "$KEY"
 # The transaction is complete. restore_previous_pair removes the new pair and
@@ -568,6 +601,9 @@ trap - ERR
 
 if [ -f "$CONF" ]; then
     note "$CONF already exists, keeping it (edit it by hand if you need changes)"
+    # Its content is kept; its owner and mode become those of the new layout.
+    chown root:volto "$CONF"
+    chmod 0640 "$CONF"
 else
     [ -n "$PASSWORD" ] || PASSWORD="$(openssl rand -base64 18)"
 
@@ -585,7 +621,7 @@ else
     # paths in the file exist and are files.
     check_generated_config "$tmp"
 
-    install -o volto -g volto -m 0640 "$tmp" "$CONF"
+    install -o root -g volto -m 0640 "$tmp" "$CONF"
     rm -f "$tmp"
     trap - EXIT
     note "wrote $CONF"
