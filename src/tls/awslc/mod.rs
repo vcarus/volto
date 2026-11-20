@@ -1204,7 +1204,14 @@ impl crypto::Session for Session {
         // Bytes at this level belong to the space whose keys quinn holds, even
         // in the call that returns the next level's keys: quinn reads
         // `highest_space` before it upgrades (`Connection::write_crypto`).
-        buf.append(&mut shared.out[self.level.index()]);
+        // quinn passes an empty buffer on every call, so the queue's allocation
+        // is handed over rather than copied and kept for the connection's life.
+        let out = &mut shared.out[self.level.index()];
+        if buf.is_empty() {
+            std::mem::swap(buf, out);
+        } else {
+            buf.append(out);
+        }
         let next = match self.level {
             Level::Initial => Level::Handshake,
             Level::Handshake => Level::Application,

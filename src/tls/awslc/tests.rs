@@ -1481,6 +1481,45 @@ fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     );
 }
 
+/// The server's flight is handed to quinn's empty buffer rather than copied
+/// into it, so the session's queues keep no allocation once quinn has taken
+/// the bytes.
+#[test]
+fn the_server_flight_is_handed_over_without_a_copy() {
+    let id = identity();
+    let client = Arc::new(client_config(
+        None,
+        pq_first(),
+        Arc::new(Recorder::default()),
+    ));
+    let mut rustls = rustls::quic::ClientConnection::new(
+        client,
+        rustls::quic::Version::V1,
+        ServerName::try_from("localhost").expect("a name"),
+        PARAMS.to_vec(),
+    )
+    .expect("start a client");
+    let mut hello = Vec::new();
+    rustls.write_hs(&mut hello);
+    let mut session =
+        Session::new(server(&id, None, &GROUPS, &[]), Version::V1, &PARAMS).expect("a session");
+    session
+        .read_handshake(&hello)
+        .expect("the server reads the ClientHello");
+    let mut taken = 0;
+    loop {
+        let mut buf = Vec::new();
+        let keys = session.write_handshake(&mut buf);
+        taken += buf.len();
+        if keys.is_none() && buf.is_empty() {
+            break;
+        }
+    }
+    assert!(taken > 0, "the server wrote its flight");
+    let capacities: Vec<usize> = session.lock().out.iter().map(Vec::capacity).collect();
+    assert_eq!(capacities, [0; 4]);
+}
+
 thread_local! {
     /// Makes `session_index` see what `SSL_get_ex_new_index` returns when its
     /// allocation fails, on this test's thread only.
