@@ -375,10 +375,11 @@ initial_rtt_ms = 150
 # Drop every handshake that carries no ECH extension, too. Needs
 # [server] ech_key, and is refused without it.
 #
-# With an ECH key, a handshake whose ECH extension the key opens is admitted
-# whatever expected_sni says, and one whose ECH extension the key does not open
-# is dropped. A handshake with no ECH extension is judged by expected_sni as
-# usual. With this on it is dropped instead, silently, so only a client that
+# With an ECH key, a handshake whose ECH extension the key opens is admitted by
+# the socket gate whatever its outer name is; the TLS layer still refuses, with
+# an alert, an inner name that is not on expected_sni. One whose ECH extension
+# the key does not open is dropped. A handshake with no ECH extension is judged
+# by expected_sni as usual. With this on it is dropped instead, silently, so only a client that
 # holds the ECHConfigList gets any answer from this port. Configure every client
 # with the list first (Surge's `ech-config`): a client without it then times out
 # with no error anywhere but this server's debug log. Reloadable.

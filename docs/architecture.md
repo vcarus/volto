@@ -114,8 +114,8 @@ one of two actions: either abort the handshake by sending a fatal-level
 `unrecognized_name(112)` alert or continue the handshake"; the socket-level check
 does neither, and the second check below takes the first of the two actions.
 
-That second check is in the server's TLS (`tls/awslc/`). The gate reads only
-what arrives in the first Initial packet, and a ClientHello large enough to be
+That second check is in the server's TLS (`tls/awslc/`). Without an ECH key,
+the gate reads only what arrives in the first Initial packet, and a ClientHello large enough to be
 split across several of them is passed through on purpose: refusing a first
 flight whose extensions have not arrived would make a large ClientHello
 unreachable. Such a handshake is stopped by a ClientHello callback that refuses

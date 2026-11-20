@@ -73,9 +73,10 @@ changes it. The file is read at startup, by `--check-config` and on every
 `SIGHUP`, and refused whole if a block is missing or doubled, if the private key
 is not X25519, if the two blocks do not belong together, or if the public name
 is one a client would ignore: it must be a host name of letters, digits and
-hyphens with no empty label, no label over 63 bytes and no all-numeric last
-label (RFC 9849 §6.1.7). A refused file at `SIGHUP` leaves the running key in
-force.
+hyphens with no empty label, no label over 63 bytes, no label that begins or
+ends with a hyphen, and a last label that is neither all digits nor `0x`
+followed by hex digits (RFC 9849 §6.1.7). A refused file at `SIGHUP` leaves
+the running key in force.
 
 **Rotating the key** is a new file and a reload: generate it with
 `ech-keygen`, point `ech_key` at it, `systemctl reload volto`, and give every
@@ -606,10 +607,10 @@ Some details worth knowing before relying on it:
 - **A name is checked twice.** Without an ECH key, the socket-level check reads
   the ClientHello out of the client's first Initial packet, which is where a
   small ClientHello fits whole. One that is split across several packets is
-  deliberately let through — refusing a first flight before its extensions have
-  arrived would make a large ClientHello unreachable — and is stopped a layer up
-  instead, by the TLS layer, which refuses a name it does not know before it
-  sends a certificate. That second refusal is a TLS alert rather than silence,
+  deliberately let through, because refusing a first flight before its
+  extensions have arrived would make a large ClientHello unreachable. It is
+  stopped a layer up instead, by the TLS layer, which refuses a name it does
+  not know before it sends a certificate. That second refusal is a TLS alert rather than silence,
   which is the one case where a probe learns something.
 - **With an ECH key, the whole ClientHello is judged.** The gate holds the first
   packets of a new handshake until its ClientHello is complete, then lets them
