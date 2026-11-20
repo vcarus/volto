@@ -217,16 +217,15 @@ mod tests {
         let quota = Arc::new(Quota::new(4));
         let slot = quota.acquire().expect("slot");
 
-        // Still busy: the wait must not resolve yet.
+        // Still busy: the wait must not resolve yet. The sleep is what lets
+        // the spawned waiter run before it is looked at.
         let idle = quota.clone();
         let waiter = tokio::spawn(async move { idle.wait_until_idle().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), async {})
-                .await
-                .is_ok(),
-            "the timer works"
+            !waiter.is_finished(),
+            "the wait resolved while a slot was held"
         );
-        assert!(!waiter.is_finished());
 
         drop(slot);
         tokio::time::timeout(Duration::from_secs(5), waiter)
