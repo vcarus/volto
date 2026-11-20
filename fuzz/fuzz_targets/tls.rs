@@ -14,6 +14,10 @@
 //!   the client's Finished belongs.
 //! * 5: a whole handshake with a rustls client, then arbitrary bytes at the
 //!   1-RTT level, where post-handshake messages belong.
+//! * 6 and 7: a real ClientHello that draws a HelloRetryRequest, then the
+//!   client's real second ClientHello with fuzzer-chosen bytes flipped (plain,
+//!   and ECH for the server's own key), so the mutations reach libssl's reader
+//!   of a second ClientHello and, with ECH, its second decryption.
 //!
 //! The oracles besides "no panic and no abort": after every read the provider
 //! holds at most `PROBE_HELD_LIMIT` bytes of its own, and a session never moves
@@ -26,6 +30,8 @@ use std::sync::{Arc, OnceLock};
 use libfuzzer_sys::fuzz_target;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{EchConfig, EchMode};
+use rustls::crypto::SupportedKxGroup;
+use rustls::crypto::aws_lc_rs::kx_group;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, EchConfigListBytes, PrivatePkcs8KeyDer, ServerName, UnixTime,
@@ -69,6 +75,10 @@ struct Fixture {
     plain_client: Arc<rustls::ClientConfig>,
     plain_hello: Vec<u8>,
     ech_hello: Vec<u8>,
+    /// A first ClientHello that draws a HelloRetryRequest, and the second
+    /// ClientHello the same client sent after it.
+    plain_retry: (Vec<u8>, Vec<u8>),
+    ech_retry: (Vec<u8>, Vec<u8>),
 }
 
 /// Accepts any certificate: the fuzz target is about the server's parsing.
@@ -112,8 +122,21 @@ impl ServerCertVerifier for AnyCertificate {
     }
 }
 
-fn client_config(ech: Option<&[u8]>) -> Arc<rustls::ClientConfig> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+/// Groups that draw a HelloRetryRequest from the server: SecP256r1MLKEM768,
+/// which it does not accept, with the only key share, then X25519.
+fn retry_groups() -> Vec<&'static dyn SupportedKxGroup> {
+    vec![kx_group::SECP256R1MLKEM768, kx_group::X25519]
+}
+
+fn client_config(
+    ech: Option<&[u8]>,
+    groups: Option<Vec<&'static dyn SupportedKxGroup>>,
+) -> Arc<rustls::ClientConfig> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    if let Some(groups) = groups {
+        provider.kx_groups = groups;
+    }
+    let provider = Arc::new(provider);
     let builder = rustls::ClientConfig::builder_with_provider(provider);
     let builder = match ech {
         Some(list) => builder
@@ -154,6 +177,32 @@ fn first_flight(config: &Arc<rustls::ClientConfig>) -> Vec<u8> {
     buf
 }
 
+/// A first ClientHello that `server` answers with a HelloRetryRequest, and the
+/// client's second ClientHello after reading it.
+fn retry_pair(
+    server: &Arc<ServerConfig>,
+    config: &Arc<rustls::ClientConfig>,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut client = client(config);
+    let mut first = Vec::new();
+    client.write_hs(&mut first);
+    let mut session = ProbeSession::new(server.clone(), &PARAMS).expect("a session");
+    assert!(
+        session.read(&first),
+        "the server reads the first ClientHello"
+    );
+    for (level, bytes) in session.write() {
+        assert_eq!(level, 0, "a HelloRetryRequest is at the Initial level");
+        client
+            .read_hs(&bytes)
+            .expect("the client reads the HelloRetryRequest");
+    }
+    let mut second = Vec::new();
+    client.write_hs(&mut second);
+    assert!(!second.is_empty(), "the client sent a second ClientHello");
+    (first, second)
+}
+
 fn fixture() -> &'static Fixture {
     static FIXTURE: OnceLock<Fixture> = OnceLock::new();
     FIXTURE.get_or_init(|| {
@@ -167,11 +216,14 @@ fn fixture() -> &'static Fixture {
         let ech_key = EchKey::generate("public.example", 1, 0).expect("an ECH key");
         let plain = probe_server_config(&cert, &key, None).expect("a server");
         let ech = probe_server_config(&cert, &key, Some(&ech_key)).expect("an ECH server");
-        let plain_client = client_config(None);
-        let ech_client = client_config(Some(&ech_key.config_list()));
+        let plain_client = client_config(None, None);
+        let ech_list = ech_key.config_list();
+        let ech_client = client_config(Some(&ech_list), None);
         Fixture {
             plain_hello: first_flight(&plain_client),
             ech_hello: first_flight(&ech_client),
+            plain_retry: retry_pair(&plain, &client_config(None, Some(retry_groups()))),
+            ech_retry: retry_pair(&ech, &client_config(Some(&ech_list), Some(retry_groups()))),
             plain,
             ech,
             plain_client,
@@ -284,14 +336,40 @@ fn complete(f: &Fixture) -> (Checked, bool) {
     (session, done)
 }
 
+/// Feeds the real first ClientHello of `pair`, which draws a HelloRetryRequest,
+/// and then its second ClientHello with the flips in `rest`. An unchanged second
+/// ClientHello moves the session to Handshake, which shows that the mode reaches
+/// the reader it is for.
+fn after_retry(config: &Arc<ServerConfig>, pair: &(Vec<u8>, Vec<u8>), rest: &[u8]) {
+    let mut session = Checked::new(config);
+    let (ok, out) = session.step(&pair.0);
+    assert!(
+        ok && !out.is_empty(),
+        "a real ClientHello draws a HelloRetryRequest"
+    );
+    assert_eq!(
+        session.session.level(),
+        0,
+        "a HelloRetryRequest keeps the Initial level"
+    );
+    let second = mutated(&pair.1, rest);
+    let (ok, _) = session.step(&second);
+    if second == pair.1 {
+        assert!(
+            ok && session.session.level() == 2,
+            "the real second ClientHello moves to Handshake"
+        );
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, rest)) = data.split_first() else {
         return;
     };
     let f = fixture();
-    match mode % 6 {
+    match mode % 8 {
         0 | 1 => {
-            let config = if mode % 6 == 0 { &f.plain } else { &f.ech };
+            let config = if mode % 8 == 0 { &f.plain } else { &f.ech };
             let (sizes, payload) = split(rest);
             chunked(&mut Checked::new(config), sizes, payload);
         }
@@ -313,6 +391,9 @@ fuzz_target!(|data: &[u8]| {
                 chunked(&mut session, sizes, payload);
             }
         }
+        6 => after_retry(&f.plain, &f.plain_retry, rest),
+        7 => after_retry(&f.ech, &f.ech_retry, rest),
+        // 5.
         _ => {
             let (mut session, done) = complete(f);
             assert!(
