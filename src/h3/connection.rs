@@ -718,10 +718,11 @@ pub struct DatagramReceiver {
 impl DatagramReceiver {
     /// Waits for the next payload routed to this session.
     ///
-    /// `None` means the connection's router will send nothing further, which on
-    /// a live connection cannot happen: the sending half is in the routing
-    /// table under this receiver's own entry, and that entry is removed only
-    /// when the receiver is dropped.
+    /// Never returns `None` while this receiver exists: the sending half is in
+    /// the routing table under this receiver's own entry, which only the
+    /// receiver's drop removes, and closing the connection leaves it there. So
+    /// once the connection has ended this stays pending, and a session learns
+    /// of the end from its request stream.
     ///
     /// Cancel-safe ([`tokio::sync::mpsc::Receiver::recv`] is), so a session may
     /// poll it inside a `select!` with a timeout. A UDP session does that with
@@ -733,9 +734,8 @@ impl DatagramReceiver {
     /// Takes the next payload routed to this session if one is already queued,
     /// without waiting.
     ///
-    /// `None` means nothing is queued at this moment. The end of the queue is
-    /// not told apart from that here: [`Self::recv`] reports it, so a caller
-    /// that drains the queue with this goes back to `recv` once it sees `None`.
+    /// `None` means nothing is queued at this moment, so a caller that drains
+    /// the queue with this goes back to [`Self::recv`] once it sees `None`.
     pub fn try_recv(&mut self) -> Option<Bytes> {
         self.inbound.try_recv().ok()
     }
