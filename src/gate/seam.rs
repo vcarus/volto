@@ -1,0 +1,291 @@
+//! The gate's entry points for the fuzz targets and the tests (D83).
+//!
+//! Every item here exists for `fuzz/` and `tests/`. Each is public and hidden,
+//! and the gate re-exports it, so its path stays `volto::gate::<name>`.
+
+use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use quinn::ConnectionId;
+use quinn::udp::RecvMeta;
+
+use super::initial::{INITIAL_PACKET_TYPE, LONG_HEADER_FORM, QUIC_V1};
+use super::{
+    Classified, Dropped, MIN_INITIAL_DATAGRAM, Memory, Names, Policy, Screened, Verdict, classify,
+    flight_fragments, follow, judge, screen_one,
+};
+
+/// What a first flight's CRYPTO bytes said, and the reader that says it.
+///
+/// Both live in [`crate::hello`], the one ClientHello parser the gate, the TLS
+/// provider and the tests share. They are re-exported here, hidden and public,
+/// for the fuzz target and `tests/it_gate_shapes.rs`, which hand CRYPTO bytes
+/// to the reader directly, because the only other way to reach it is to spell
+/// a whole Initial packet that authenticates, which a fuzzer cannot do by luck.
+#[doc(hidden)]
+pub use crate::hello::{FirstFlight, first_flight};
+
+// The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
+// `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
+// [`Screening`] and [`held_fragments`], [`first_flight`] above, and
+// [`nameless_crypto`] and [`sealed_initial`] for building the packets they
+// judge.
+//
+// Everything above judges bytes an internet scanner chose, before any peer has
+// authenticated and before quinn has seen them, which is exactly the shape a
+// coverage-guided fuzzer is for. Each judging seam calls the functions the
+// socket path calls, the server's Initial key code included. Only the packets
+// the seams are fed are sealed with rustls's key code ([`nameless_crypto`]),
+// so the code that builds a packet and the code that opens it are two
+// implementations.
+
+/// The hold's bounds, for the fuzz target and the tests that assert them.
+#[doc(hidden)]
+pub use super::hold::{
+    HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME, HOLD_TOTAL_BYTES,
+    REPLAY_ENTRIES,
+};
+
+/// The gate's verdict on one datagram, for the fuzz target and the tests.
+///
+/// This is the `judge` that `Gate::screen` calls, Initial key code included.
+/// The socket, the batch walk and the blinding are left out, and none of them
+/// is a parser.
+///
+/// Hidden rather than API: nothing outside `fuzz/` and `tests/` has any reason
+/// to call it, and nothing in this crate does.
+#[doc(hidden)]
+pub fn judgement(datagram: &[u8], expected: &Names) -> Verdict {
+    judge(datagram, expected)
+}
+
+/// The gate with the hold, driven one datagram at a time, for the fuzz target
+/// and the tests.
+///
+/// It runs `screen_one`, the function the receive path calls for every
+/// datagram, under a policy the caller gives and a clock the caller moves.
+/// The socket, the batch walk, the blinding, the `any` flag and the delivery
+/// into quinn's buffers are what is left out, so a policy that is off is
+/// judged here as a names-only policy with an empty list.
+#[doc(hidden)]
+pub struct Screening {
+    memory: Memory,
+    epoch: Instant,
+}
+
+impl Screening {
+    /// A gate under `policy` with an empty hold.
+    pub fn new(policy: impl Into<Policy>) -> Self {
+        Self {
+            memory: Memory::new(Arc::new(policy.into())),
+            epoch: Instant::now(),
+        }
+    }
+
+    /// Screens `datagram` from `from`, received `after` the screening began.
+    ///
+    /// Returns what became of it and every flight the hold dropped on the
+    /// way, with the address it came from. A policy without an ECH key is the
+    /// stateless gate, as on the socket path.
+    pub fn receive(
+        &mut self,
+        after: Duration,
+        from: SocketAddr,
+        datagram: &[u8],
+    ) -> (Screened, Vec<(SocketAddr, Dropped)>) {
+        let mut drops = Vec::new();
+        let meta = RecvMeta {
+            addr: from,
+            len: datagram.len(),
+            stride: datagram.len(),
+            ..RecvMeta::default()
+        };
+        let screened = screen_one(
+            &mut self.memory,
+            &meta,
+            datagram,
+            &mut Some(self.epoch + after),
+            &mut |from, why| drops.push((from, why)),
+        );
+        (screened, drops)
+    }
+
+    /// Takes the datagrams of admitted flights, in the order quinn would get
+    /// them, with the address each came from.
+    pub fn released(&mut self) -> Vec<(SocketAddr, Vec<u8>)> {
+        std::iter::from_fn(|| self.memory.hold.pop_released())
+            .map(|held| (held.meta.addr, held.bytes))
+            .collect()
+    }
+
+    /// How many flights are held.
+    pub fn flights(&self) -> usize {
+        self.memory.hold.flights()
+    }
+
+    /// Every byte the hold occupies, as its byte bound counts.
+    pub fn held_bytes(&self) -> usize {
+        self.memory.hold.bytes()
+    }
+
+    /// Every byte the hold occupies, summed from what it holds. Equal to
+    /// [`Screening::held_bytes`] after every datagram, or the count has
+    /// drifted.
+    pub fn recounted_bytes(&self) -> usize {
+        self.memory.hold.recount()
+    }
+
+    /// How many `enc` values the replay record holds.
+    pub fn replay_entries(&self) -> usize {
+        self.memory.replay.len()
+    }
+
+    /// Replaces the policy as a reload does, with the same effect on the
+    /// replay record and the hold as [`Expected::set`](super::Expected::set).
+    pub fn set(&mut self, policy: impl Into<Policy>) {
+        follow(&mut self.memory, Arc::new(policy.into()));
+    }
+}
+
+/// The CRYPTO frames the hold reads from `datagram`, as offsets and owned
+/// bytes, or `None` when the gate would not hand it to the hold as an opened
+/// first Initial whose frames all parse.
+///
+/// For the `hold` fuzz target: it reads a released flight's ClientHello again
+/// from these, with a reassembly and a rule check of its own, to say whether
+/// the hold should have admitted it.
+#[doc(hidden)]
+pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
+    let Classified::Opened { frames, more, .. } = classify(datagram, true) else {
+        return None;
+    };
+    let fragments = flight_fragments(&frames, &more)?;
+    Some(
+        fragments
+            .into_iter()
+            .map(|(offset, bytes)| (offset, bytes.to_vec()))
+            .collect(),
+    )
+}
+
+/// A TLS configuration with no identity at all, as a source of Initial keys
+/// for building packets.
+///
+/// Initial keys depend on the client's Destination Connection ID alone
+/// (RFC 9001 §5.2), never on the server's certificate. So a configuration
+/// carrying no certificate derives exactly the keys the running server
+/// derives, and the fuzz targets and the tests that spell Initial packets need
+/// no key material, no file and no clock to build the packets the gate opens.
+/// The resolver is never asked for anything: nothing here starts a TLS
+/// session. The keys come from rustls's code, and the gate opens the packets
+/// with the server's own (`tls::awslc::keys`), so a packet is built by one
+/// implementation and judged by the other.
+///
+/// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
+/// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
+/// asks for.
+#[doc(hidden)]
+pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
+    /// A resolver with nothing to present.
+    #[derive(Debug)]
+    struct NoIdentity;
+
+    impl rustls::server::ResolvesServerCert for NoIdentity {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("the aws-lc-rs crypto provider supports TLS 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(NoIdentity));
+
+    Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+            .expect("a TLS 1.3 configuration carries an initial cipher suite"),
+    )
+}
+
+/// The most frame bytes [`sealed_initial`] carries: what a two-byte Length
+/// field leaves after the one-byte packet number and the AEAD tag.
+#[doc(hidden)]
+pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
+
+/// A first Initial carrying `frames`, sealed under the keys its own
+/// Destination Connection ID `dcid` derives, for the fuzz target `hold` and
+/// the test that writes its seeds.
+///
+/// The fuzz target cannot spell a packet that authenticates, so without this
+/// it could change a held packet's bytes only by breaking its AEAD, and the
+/// hold would never see frames the fuzzer chose. With it, the fuzzer chooses
+/// the frames and this function seals them, with [`nameless_crypto`]'s keys,
+/// which are the keys the gate derives with the server's own code.
+///
+/// The header is the plainest a client sends: QUIC v1, no Source Connection
+/// ID, no token, a two-byte Length field and a one-byte packet number
+/// `number`. The frames are followed by PADDING up to a 1200-byte datagram,
+/// and cut at [`SEALED_FRAMES_MAX`] bytes.
+#[doc(hidden)]
+pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
+    static CRYPTO: OnceLock<Arc<dyn quinn::crypto::ServerConfig>> = OnceLock::new();
+    let keys = CRYPTO
+        .get_or_init(nameless_crypto)
+        .initial_keys(QUIC_V1, &ConnectionId::new(dcid))
+        .expect("Initial keys for QUIC v1");
+    let tag = keys.packet.remote.tag_len();
+    let frames = &frames[..frames.len().min(SEALED_FRAMES_MAX)];
+
+    let mut packet = vec![LONG_HEADER_FORM | 0x40 | INITIAL_PACKET_TYPE];
+    packet.extend_from_slice(&QUIC_V1.to_be_bytes());
+    packet.push(8);
+    packet.extend_from_slice(dcid);
+    packet.push(0); // no Source Connection ID
+    packet.push(0); // no token
+    let number_offset = packet.len() + 2;
+    let payload = frames
+        .len()
+        .max(MIN_INITIAL_DATAGRAM - number_offset - 1 - tag);
+    let length = u16::try_from(1 + payload + tag).expect("at most SEALED_FRAMES_MAX frame bytes");
+    packet.extend_from_slice(&(0x4000 | length).to_be_bytes());
+    packet.push(number);
+    packet.extend_from_slice(frames);
+    packet.resize(number_offset + 1 + payload, 0); // PADDING
+    packet.resize(number_offset + 1 + payload + tag, 0); // room for the tag
+    keys.packet
+        .remote
+        .encrypt(u64::from(number), &mut packet, number_offset + 1);
+    keys.header.remote.encrypt(number_offset, &mut packet);
+    packet
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam the `hold` fuzz target rereads a released flight with gives
+    /// the CRYPTO frames the hold is given, and nothing for a datagram the
+    /// hold is not given or drops for its frames.
+    #[test]
+    fn held_fragments_are_the_crypto_frames_the_hold_reads() {
+        let frames = [0x06, 0x05, 0x03, b'a', b'b', b'c', 0x01];
+        let sealed = sealed_initial(&[0x52; 8], 0, &frames);
+        assert_eq!(held_fragments(&sealed), Some(vec![(5, b"abc".to_vec())]));
+
+        // A STREAM frame, which no Initial packet may carry.
+        let stream = sealed_initial(&[0x52; 8], 0, &[0x08, 0x00, 0x00]);
+        assert_eq!(held_fragments(&stream), None);
+        // A datagram that does not open, and one too short to be judged.
+        let mut forged = sealed.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert_eq!(held_fragments(&forged), None);
+        assert_eq!(held_fragments(&sealed[..1199]), None);
+    }
+}
