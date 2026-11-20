@@ -1015,8 +1015,9 @@ impl Judge {
             FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
             FirstFlight::Named(name) => match std::str::from_utf8(name) {
                 Ok(text) if expected.accepts(text) => Verdict::Pass,
-                // The verdict outlives the datagram it was judged from, so the
-                // refusal takes the copy the pass path does not need.
+                // The name is borrowed from the frames this function decrypted
+                // and drops on return, so the refusal takes the copy the pass
+                // path does not need.
                 _ => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
             },
         }
@@ -1037,9 +1038,11 @@ impl Judge {
         datagram: &[u8],
         header: &InitialHeader,
     ) -> Option<(quinn::crypto::Keys, BytesMut)> {
-        // quinn's header key takes the whole packet and reads its sample from
-        // four bytes past the packet number, so a packet too short for that
-        // would panic rather than fail. RFC 9001 §5.4.2 puts the sample there.
+        // A header key reads its sample from four bytes past the start of the
+        // packet number and indexes the buffer it is given without a check:
+        // `tls::awslc::keys` in the server, and rustls's key in the test
+        // seams. So a packet too short for that would panic rather than fail.
+        // RFC 9001 §5.4.2 puts the sample there.
         //
         // The half of that test which does not need a cipher is asked first,
         // above the key derivation, because deriving Initial secrets is nearly
