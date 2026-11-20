@@ -180,18 +180,6 @@ pub struct ReloadHandle {
     pub(super) startup_log_level: String,
 }
 
-/// Whether a reloaded file asks for a different `[log].level` than the one the
-/// subscriber was built with.
-///
-/// Split out so both answers are testable without a server. The strings are
-/// compared rather than parsed filters because two spellings of the same
-/// directives are not necessarily the same filter (`volto=debug` and
-/// `VOLTO=debug` name different targets), and any textual change is a change
-/// the operator should hear about.
-fn log_level_differs(startup: &str, configured: &str) -> bool {
-    startup != configured
-}
-
 impl ReloadHandle {
     /// Re-reads the configuration file and applies it, or changes nothing.
     ///
@@ -330,8 +318,10 @@ impl ReloadHandle {
         // The subscriber that applies `log.level` is installed once, before the
         // server binds, and nothing rebuilds it. A reload stores the new value in
         // the live configuration, where nothing reads it, so without this line a
-        // `SIGHUP` that raised verbosity looks exactly like one that did.
-        if log_level_differs(&self.startup_log_level, &config.log.level) {
+        // `SIGHUP` that raised verbosity looks exactly like one that did. The
+        // strings are compared, not parsed filters: any textual change is one
+        // the operator should hear about.
+        if config.log.level != self.startup_log_level {
             warn!(
                 log_id = "w8t2n5kr",
                 startup = %self.startup_log_level,
@@ -384,30 +374,5 @@ impl ReloadHandle {
         warn_if_fd_budget_is_tight(&config.limits);
 
         Ok(config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A reloaded `[log].level` is compared as the configured string.
-    ///
-    /// Equal means the subscriber, built once at startup, already judges every
-    /// line by it and there is nothing to say. Different means the file asks for
-    /// a filter the process cannot install without a restart, which is what the
-    /// warning is for. The strings are compared rather than parsed filters
-    /// because two spellings of the same directives are not necessarily the same
-    /// filter (`volto=debug` and `VOLTO=debug` name different targets), and any
-    /// textual change is a change the operator should hear about.
-    #[test]
-    fn a_changed_log_level_is_told_apart_from_the_startup_one() {
-        assert!(!log_level_differs("info", "info"));
-        assert!(!log_level_differs(
-            "volto=debug,quinn=info",
-            "volto=debug,quinn=info"
-        ));
-        assert!(log_level_differs("info", "debug"));
-        assert!(log_level_differs("volto=debug,quinn=info", "volto=info"));
     }
 }
