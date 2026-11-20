@@ -750,12 +750,15 @@ means root or `sudo -u volto`, since `/etc/volto` is `0750 volto:volto`.
 server: TOML syntax, every table's refusal of a key it does not know, and every
 range and cross-field rule (`keep_alive_interval` against `max_idle_timeout`,
 `mtu_upper_bound` against `initial_mtu`, and the rest) — including that
-`server.cert` and `server.key` exist and are files. `server.ech_key`, when set, is read whole: the
-same checks startup makes on that file.
+`server.cert` and `server.key` exist and are files. When `server.cert` reads as
+a PEM certificate chain, its leaf is parsed and refused in the words startup
+uses if the server's TLS would refuse it. `server.ech_key`, when set, is read
+whole: the same checks startup makes on that file.
 
 **What it does not cover** is what only the running service can answer: whether
-the listen address is free, whether the certificate and key parse and form a
-usable pair, and whether `RLIMIT_NOFILE` leaves room for `max_connections` ×
+the listen address is free, whether a certificate file that does not read as
+PEM parses at all, whether the key parses and whether the two form a usable
+pair, and whether `RLIMIT_NOFILE` leaves room for `max_connections` ×
 `max_targets_per_conn`. That last one is a property of the systemd unit rather
 than of the file, so answering it from a shell would answer a different
 question than the one that matters. A file that passes can still fail to serve
