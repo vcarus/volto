@@ -1000,7 +1000,7 @@ impl Judge {
             Vec::new()
         };
         Classified::Opened {
-            dcid: ConnectionId::new(&datagram[header.dcid.clone()]),
+            dcid: ConnectionId::new(&datagram[header.dcid]),
             frames,
             more,
         }

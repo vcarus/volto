@@ -735,7 +735,7 @@ fn judge(
     Some(match ech {
         Ech::Outer(outer) => match policy.ech.as_deref() {
             Some(key) if key.opens(body, &outer) => {
-                if replay.admit(&body[outer.enc.clone()], from) {
+                if replay.admit(&body[outer.enc], from) {
                     Ok(())
                 } else {
                     Err(Dropped::Replayed)
