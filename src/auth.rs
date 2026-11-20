@@ -347,9 +347,9 @@ fn basic_token(value: &str) -> Result<&str, Denied> {
 
 /// Decodes standard base64 (RFC 4648 §4).
 ///
-/// Hand-rolled for the same reason `datagram.rs` is (decision D2): this is the
-/// only base64 in the server, and ~40 lines is a smaller thing to own than
-/// another dependency in the production binary. Deliberately strict about
+/// Hand-rolled (decision D13, by the test D2 applies to `datagram.rs`): this is
+/// the server's only base64 decoder, and ~40 lines is a smaller thing to own
+/// than another dependency in the production binary. Deliberately strict about
 /// framing (length a multiple of four, padding only at the very end), because
 /// the input is an authentication credential, and lenient only about the unused
 /// low bits of a padded quantum, which some encoders leave non-zero.
