@@ -237,20 +237,29 @@ fn find_extension(body: &[u8], kind: u16) -> Option<&[u8]> {
 /// handshake: the first carries no `supported_versions` and no transport
 /// parameters, and libssl refuses the second.
 pub fn extensions(body: &[u8]) -> Option<Vec<(u16, Range<usize>)>> {
+    let mut out = Vec::new();
+    walk_extensions(body, |kind, range| out.push((kind, range)))?;
+    Some(out)
+}
+
+/// Calls `visit` with the type and data range of every extension in `body`,
+/// in order, under the framing rule of [`extensions`], and `None` where that
+/// returns `None`. The one walk both [`extensions`] and [`ech`] make, so the
+/// two cannot judge the framing differently.
+fn walk_extensions(body: &[u8], mut visit: impl FnMut(u16, Range<usize>)) -> Option<()> {
     let (start, block) = extension_block(body)?;
     if start.checked_add(block.len())? != body.len() {
         return None;
     }
     let mut reader = Reader::new(block);
-    let mut out = Vec::new();
     while !reader.is_empty() {
         let kind = reader.u16()?;
         let length = usize::from(reader.u16()?);
         let at = start.checked_add(reader.position())?;
         reader.take(length)?;
-        out.push((kind, at..at.checked_add(length)?));
+        visit(kind, at..at.checked_add(length)?);
     }
-    Some(out)
+    Some(())
 }
 
 /// The `host_name` of a ClientHello body's `server_name` extension, as sent.
@@ -330,14 +339,16 @@ pub enum Ech {
 /// (`decrypt_ech` in `handshake_server.cc`); both are
 /// [`Ech::Malformed`] here, because neither is an extension a key can open.
 pub fn ech(body: &[u8]) -> Option<Ech> {
-    let all = extensions(body)?;
-    let Some((_, range)) = all.into_iter().find(|(kind, _)| *kind == EXT_ECH) else {
+    let mut first = None;
+    walk_extensions(body, |kind, range| {
+        if kind == EXT_ECH && first.is_none() {
+            first = Some(range);
+        }
+    })?;
+    let Some(range) = first else {
         return Some(Ech::Absent);
     };
-    Some(match ech_fields(body, range) {
-        Some(outer) => Ech::Outer(outer),
-        None => Ech::Malformed,
-    })
+    Some(ech_fields(body, range).map_or(Ech::Malformed, Ech::Outer))
 }
 
 /// The outer ECH extension of a ClientHello body, if it carries one that
