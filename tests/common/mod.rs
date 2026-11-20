@@ -462,22 +462,42 @@ pub fn is_version_negotiation(datagram: &[u8]) -> bool {
         && matches!(datagram.get(1..5), Some([0, 0, 0, 0]))
 }
 
-/// Sends `bytes` once from a fresh socket and collects every datagram that
-/// arrives within `patience`.
+/// Sends each of `datagrams` once, in order, from a fresh socket and collects
+/// every datagram that arrives within `patience`.
 ///
 /// Every datagram rather than the first, because "the server answered" and
 /// "the server answered twice" are different facts about how loud a shape is —
 /// and because proving silence takes the whole wait.
-pub async fn udp_answers(addr: SocketAddr, bytes: &[u8], patience: Duration) -> Vec<Vec<u8>> {
+pub async fn udp_answers(
+    addr: SocketAddr,
+    datagrams: &[Vec<u8>],
+    patience: Duration,
+) -> Vec<Vec<u8>> {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind a probing socket");
-    socket.send_to(bytes, addr).await.expect("send the probe");
+    udp_answers_on(&socket, addr, datagrams, patience).await
+}
+
+/// [`udp_answers`] from `socket`, so that a test can send more than once from
+/// one address, or from an address the server already knows.
+pub async fn udp_answers_on(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    datagrams: &[Vec<u8>],
+    patience: Duration,
+) -> Vec<Vec<u8>> {
+    for datagram in datagrams {
+        socket
+            .send_to(datagram, addr)
+            .await
+            .expect("send the probe");
+    }
 
     let deadline = Instant::now() + patience;
     let mut heard = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        let mut buffer = vec![0u8; 2048];
+        let mut buffer = vec![0u8; usize::from(u16::MAX)];
         match tokio::time::timeout(left, socket.recv(&mut buffer)).await {
             Ok(Ok(read)) => {
                 buffer.truncate(read);

@@ -32,10 +32,10 @@ use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, Leg, Relay, Relayed, SharedBuffer, TestServer,
     bulk_alpn, client_endpoint, client_endpoint_with_transport, echoes, finish_connect_as,
     is_version_negotiation, open_tcp_tunnel, open_udp_session, spawn_echo_target,
-    spawn_udp_echo_target, udp_answer, udp_relay, udp_round_trip, version_probe,
+    spawn_udp_echo_target, udp_answer, udp_answers, udp_answers_on, udp_relay, udp_round_trip,
+    version_probe,
 };
 use rustls::pki_types::CertificateDer;
-use tokio::net::UdpSocket;
 
 /// A second name on the test certificate, so a refusal and a mismatch differ.
 const OTHER: &str = "other.example";
@@ -243,17 +243,6 @@ async fn recording_relay(server: SocketAddr) -> (Relay, Arc<Mutex<Vec<Vec<u8>>>>
     (relay, recorded)
 }
 
-/// Every datagram that arrives on `socket` within [`CLIENT_IDLE`].
-async fn heard_on(socket: &UdpSocket) -> Vec<Vec<u8>> {
-    let deadline = tokio::time::Instant::now() + CLIENT_IDLE;
-    let mut heard = Vec::new();
-    let mut buffer = vec![0u8; 65536];
-    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.recv(&mut buffer)).await {
-        heard.push(buffer[..read].to_vec());
-    }
-    heard
-}
-
 /// A short-header packet of a connection the server has forgotten draws
 /// nothing, sent again from the address the connection used or from any
 /// other. quinn would answer it with a Stateless Reset (RFC 9000 §10.3),
@@ -319,19 +308,9 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     relay.task.abort();
     let _ = (&mut relay.task).await;
 
-    relay
-        .socket
-        .send_to(&packet, server.addr)
-        .await
-        .expect("replay from the connection's address");
-    let same = heard_on(&relay.socket).await;
-
-    let elsewhere = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-    elsewhere
-        .send_to(&packet, server.addr)
-        .await
-        .expect("replay from another address");
-    let other = heard_on(&elsewhere).await;
+    let replay = std::slice::from_ref(&packet);
+    let same = udp_answers_on(&relay.socket, server.addr, replay, CLIENT_IDLE).await;
+    let other = udp_answers(server.addr, replay, CLIENT_IDLE).await;
 
     assert!(
         same.is_empty() && other.is_empty(),
@@ -386,7 +365,12 @@ async fn an_initial_during_the_shutdown_grace_draws_no_stateless_reset() {
     initial.extend_from_slice(&0x4400u16.to_be_bytes()); // Length, two bytes
     initial.resize(1200, 0x5a);
 
-    let heard = common::udp_answers(server.addr, &initial, Duration::from_secs(1)).await;
+    let heard = common::udp_answers(
+        server.addr,
+        std::slice::from_ref(&initial),
+        Duration::from_secs(1),
+    )
+    .await;
     assert!(
         heard.is_empty(),
         "an Initial during the grace drew {} datagrams, the first of {} bytes",

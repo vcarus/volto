@@ -48,7 +48,7 @@ use std::time::Duration;
 use bytes::BytesMut;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, SharedBuffer, TempDir, TestServer, bulk_alpn, client_endpoint,
-    is_version_negotiation, udp_answer, udp_answers,
+    is_version_negotiation, udp_answer, udp_answers, udp_answers_on,
 };
 use quinn::ConnectionId;
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
@@ -1484,7 +1484,7 @@ async fn draws_no_reply(what: &str, dcid: &[u8], frames: &[u8]) {
     );
 
     let on = TestServer::start_with(GATE_LOCALHOST).await;
-    let heard = udp_answers(on.addr, &shape, PATIENCE).await;
+    let heard = udp_answers(on.addr, std::slice::from_ref(&shape), PATIENCE).await;
     let described: Vec<String> = heard
         .iter()
         .map(|reply| describe(&*crypto, reply, dcid))
@@ -2545,34 +2545,6 @@ async fn ech_server(key: &EchKey, require_ech: bool, names: &[&str]) -> (TestSer
     (server, keys)
 }
 
-/// Sends `datagrams` from a fresh socket and collects every datagram that
-/// comes back within [`PATIENCE`].
-async fn answers_to(addr: SocketAddr, datagrams: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind a probing socket");
-    answers_on(&socket, addr, datagrams).await
-}
-
-/// [`answers_to`] from `socket`, so that a test can send twice from one
-/// address.
-async fn answers_on(
-    socket: &tokio::net::UdpSocket,
-    addr: SocketAddr,
-    datagrams: &[Vec<u8>],
-) -> Vec<Vec<u8>> {
-    for datagram in datagrams {
-        socket.send_to(datagram, addr).await.expect("send");
-    }
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    let mut heard = Vec::new();
-    let mut buffer = vec![0u8; 65536];
-    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.recv(&mut buffer)).await {
-        heard.push(buffer[..read].to_vec());
-    }
-    heard
-}
-
 /// Sends every flight of `shapes` from a socket of its own, all at once, and
 /// asserts that none of them draws a single datagram.
 #[track_caller]
@@ -2584,7 +2556,7 @@ fn all_silent<'a>(
     async move {
         let mut probes = tokio::task::JoinSet::new();
         for (what, datagrams) in shapes {
-            probes.spawn(async move { (what, answers_to(addr, &datagrams).await) });
+            probes.spawn(async move { (what, udp_answers(addr, &datagrams, PATIENCE).await) });
         }
         while let Some(done) = probes.join_next().await {
             let (what, heard) = done.expect("a probe task");
@@ -2621,17 +2593,17 @@ async fn an_ech_flight_is_answered_and_its_copy_from_elsewhere_draws_nothing() {
     let original = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind");
-    let heard = answers_on(&original, server.addr, &flight).await;
+    let heard = udp_answers_on(&original, server.addr, &flight, PATIENCE).await;
     assert!(!heard.is_empty(), "a flight whose ECH opens is answered");
 
-    let copy = answers_to(server.addr, &rewrapped).await;
+    let copy = udp_answers(server.addr, &rewrapped, PATIENCE).await;
     assert!(
         copy.is_empty(),
         "its copy from another port drew {} datagrams",
         copy.len()
     );
 
-    let again = answers_on(&original, server.addr, &flight).await;
+    let again = udp_answers_on(&original, server.addr, &flight, PATIENCE).await;
     assert!(
         !again.is_empty(),
         "the same flight from its own address is answered"
@@ -2658,7 +2630,9 @@ async fn every_flight_the_rule_table_drops_draws_nothing_either_way() {
     for require_ech in [false, true] {
         let (server, _keys) = ech_server(&key, require_ech, &["localhost"]).await;
         assert!(
-            !answers_to(server.addr, &flight(&ours)).await.is_empty(),
+            !udp_answers(server.addr, &flight(&ours), PATIENCE)
+                .await
+                .is_empty(),
             "require_ech = {require_ech}: the control flight is answered"
         );
         let mut shapes = vec![
@@ -2706,9 +2680,10 @@ async fn without_require_ech_a_flight_without_ech_is_judged_by_its_name() {
     let key = ech_key(7);
     let (server, _keys) = ech_server(&key, false, &["localhost"]).await;
     let hello = rustls_hello(&Offer::Plain, &surge_groups(), "localhost");
-    let heard = answers_to(
+    let heard = udp_answers(
         server.addr,
         &hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2),
+        PATIENCE,
     )
     .await;
     assert!(
@@ -2753,16 +2728,17 @@ async fn a_flight_that_never_completes_draws_nothing() {
     let off = TestServer::start_with(ALLOW_PRIVATE).await;
     for (what, datagrams) in residue() {
         assert!(
-            !answers_to(off.addr, &datagrams).await.is_empty(),
+            !udp_answers(off.addr, &datagrams, PATIENCE).await.is_empty(),
             "{what}: without the gate this draws a reply, or it tests nothing"
         );
     }
 
     let (server, _keys) = ech_server(&key, false, &[]).await;
     assert!(
-        !answers_to(
+        !udp_answers(
             server.addr,
-            &hold_flight(&*crypto, &[0x77; 8], &[], &hello, 2)
+            &hold_flight(&*crypto, &[0x77; 8], &[], &hello, 2),
+            PATIENCE
         )
         .await
         .is_empty(),
@@ -2861,7 +2837,12 @@ async fn a_datagram_that_disagrees_with_itself_leaves_the_server_answering() {
     let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
     let mut frames = crypto_frame_at(0, b"abcd");
     frames.extend_from_slice(&crypto_frame_at(0, b"Xbcd"));
-    let heard = answers_to(server.addr, &[initial(&*crypto, &[0x71; 8], &frames)]).await;
+    let heard = udp_answers(
+        server.addr,
+        &[initial(&*crypto, &[0x71; 8], &frames)],
+        PATIENCE,
+    )
+    .await;
     assert!(heard.is_empty(), "drew {} datagrams", heard.len());
     handshake_with(&server, &Offer::Ech(key.config_list()), &surge_groups())
         .await
