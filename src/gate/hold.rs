@@ -484,22 +484,35 @@ impl Memory {
             return self.drop_flight(index, Dropped::Evicted, report);
         }
 
+        // The only place a held flight's contents change. The count is raised
+        // by what the flight occupies after the writes less what it occupied
+        // before them, on the path that keeps the datagram and on the one that
+        // refuses it, so it is always the sum of what is held. A fragment can
+        // be refused after the fragments ahead of it in the same datagram have
+        // grown the stream, and the flight is then removed with that growth in
+        // it, which `Hold::remove` takes off the count again. `growth` above is
+        // the most this can add: exactly it when every fragment joins, less
+        // when one is refused.
         let flight = &mut self.hold.flights[index];
-        for (offset, bytes) in fragments {
-            if let Err(refused) = flight.stream.insert(*offset, bytes) {
-                let why = match refused {
-                    Refused::TooLong => Dropped::TooLong,
-                    Refused::Conflict => Dropped::Conflict,
-                };
-                return self.drop_flight(index, why, report);
-            }
+        let before = flight.bytes();
+        let written = fragments
+            .iter()
+            .try_for_each(|(offset, bytes)| flight.stream.insert(*offset, bytes));
+        if written.is_ok() {
+            flight.datagrams.push(HeldDatagram {
+                meta,
+                bytes: datagram.to_vec(),
+            });
+            flight.datagram_bytes += datagram.len();
         }
-        flight.datagrams.push(HeldDatagram {
-            meta,
-            bytes: datagram.to_vec(),
-        });
-        flight.datagram_bytes += datagram.len();
-        self.hold.bytes += growth;
+        self.hold.bytes += flight.bytes() - before;
+        if let Err(refused) = written {
+            let why = match refused {
+                Refused::TooLong => Dropped::TooLong,
+                Refused::Conflict => Dropped::Conflict,
+            };
+            return self.drop_flight(index, why, report);
+        }
 
         match judge(
             self.hold.flights[index].stream.contiguous(),

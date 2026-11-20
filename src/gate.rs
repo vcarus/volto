@@ -517,10 +517,19 @@ impl Expected {
 
     /// The hold and the replay record.
     ///
-    /// Poisoning would mean a panic inside the hold's bookkeeping, which takes
-    /// nothing it cannot give back: the guard is taken over and the next datagram
-    /// is judged against whatever the hold then holds, which is bounded either
-    /// way.
+    /// Nothing that runs under this lock may panic on any input, because a
+    /// panic under `poll_recv` is not recovered anywhere. `poll_recv` runs
+    /// inside quinn's endpoint driver, which holds the endpoint's own mutex
+    /// across it (quinn 0.11.12 `src/endpoint.rs`, `EndpointDriver::poll`).
+    /// The panic unwinds out of that function and poisons that mutex. tokio
+    /// drops the driver while it unwinds, and quinn's `Drop for EndpointDriver`
+    /// calls `lock().unwrap()` on the poisoned mutex. A panic in a destructor
+    /// during unwinding aborts the process, so every connection ends with it.
+    /// This was observed on 2026-11-20 with an underflow in the hold's byte
+    /// count. Taking over a poisoned guard here therefore matters only for a
+    /// panic on the reload side, in [`Expected::set`], which would leave the
+    /// next datagram judged against whatever the hold then holds, and that is
+    /// bounded either way.
     fn memory(&self) -> MutexGuard<'_, Memory> {
         self.0.memory.lock().unwrap_or_else(PoisonError::into_inner)
     }

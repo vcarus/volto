@@ -2185,6 +2185,79 @@ fn fragments_that_disagree_drop_the_flight() {
     );
 }
 
+/// One packet whose own fragments cannot all join the stream drops its flight,
+/// and the hold's byte count ends where it started, whatever the fragments
+/// ahead of the refused one had written.
+///
+/// Two shapes: two CRYPTO frames at offset 0 that disagree, and a fragment
+/// that fits followed by an empty CRYPTO frame at an offset past
+/// `HOLD_HELLO_BYTES`. Each is sent once into an empty hold and once beside a
+/// held flight from another address. Before the fix the first fragment's
+/// growth was taken off a count it had never been added to, which underflows
+/// in the empty hold (a panic under `poll_recv`) and leaves the count low
+/// beside another flight.
+#[test]
+fn a_packet_whose_own_fragments_disagree_drops_its_flight_and_every_byte_of_it() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
+    let other = hold_flight(&*crypto, &[0x61; 8], &[], &hello, 2);
+
+    let mut disagree = crypto_frame_at(0, b"abcd");
+    disagree.extend_from_slice(&crypto_frame_at(0, b"Xbcd"));
+    let mut past_the_limit = crypto_frame_at(15_000, &[0x5a; 64]);
+    past_the_limit.push(0x06);
+    put_varint_into(
+        &mut past_the_limit,
+        u64::try_from(HOLD_HELLO_BYTES + 1).expect("small"),
+    );
+    put_varint_into(&mut past_the_limit, 0);
+
+    for (what, frames, why) in [
+        (
+            "two CRYPTO frames at offset 0 that disagree",
+            disagree,
+            Dropped::Conflict,
+        ),
+        (
+            "a fragment, then an empty CRYPTO frame past the limit",
+            past_the_limit,
+            Dropped::TooLong,
+        ),
+    ] {
+        let datagram = initial(&*crypto, &CLIENT_CID, &frames);
+
+        let mut screening = Screening::new(hold_policy(&key, &[], false));
+        dropped_whole(
+            &mut screening,
+            from(1),
+            std::slice::from_ref(&datagram),
+            &why,
+            what,
+        );
+        assert_eq!(screening.held_bytes(), 0, "{what}: an empty hold");
+
+        let mut screening = Screening::new(hold_policy(&key, &[], false));
+        feed(&mut screening, Duration::ZERO, from(2), &other[..1]);
+        let before = screening.held_bytes();
+        assert!(before > 0);
+        let (screened, drops) = feed(&mut screening, Duration::ZERO, from(1), &[datagram]);
+        assert_eq!(screened, vec![Screened::Dropped], "{what}");
+        assert_eq!(drops, vec![(from(1), why.clone())], "{what}");
+        assert_eq!(
+            screening.held_bytes(),
+            before,
+            "{what}: beside another flight"
+        );
+        // The other flight is untouched and still completes.
+        let (screened, drops) = feed(&mut screening, Duration::ZERO, from(2), &other[1..]);
+        assert_eq!(screened, vec![Screened::Released], "{what}");
+        assert!(drops.is_empty(), "{what}");
+        assert_eq!(screening.released().len(), 2, "{what}");
+        assert_eq!(screening.held_bytes(), 0, "{what}");
+    }
+}
+
 /// Whatever is sent, the hold stays inside its bounds: no more flights than
 /// the table holds, no more bytes than the hold may take, a flight that grows
 /// past its own budget dropped, and a ClientHello longer than libssl reads
@@ -2682,6 +2755,27 @@ async fn require_ech_admits_a_client_with_the_list_and_nothing_else() {
     handshake_with(&open, &Offer::Plain, &groups)
         .await
         .expect("without require_ech a client with no list connects");
+}
+
+/// One unauthenticated datagram whose CRYPTO frames disagree with each other
+/// draws nothing, and the server goes on answering: a client with the list
+/// connects after it.
+///
+/// Before the fix of the hold's byte count this datagram underflowed that
+/// count inside `poll_recv`, under quinn's endpoint driver, and the panic
+/// took the endpoint with it.
+#[tokio::test]
+async fn a_datagram_that_disagrees_with_itself_leaves_the_server_answering() {
+    let crypto = nameless_crypto();
+    let key = ech_key(7);
+    let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
+    let mut frames = crypto_frame_at(0, b"abcd");
+    frames.extend_from_slice(&crypto_frame_at(0, b"Xbcd"));
+    let heard = answers_to(server.addr, &[initial(&*crypto, &[0x71; 8], &frames)]).await;
+    assert!(heard.is_empty(), "drew {} datagrams", heard.len());
+    handshake_with(&server, &Offer::Ech(key.config_list()), &surge_groups())
+        .await
+        .expect("a client with the list still connects");
 }
 
 /// A HelloRetryRequest under ECH: the client offers SecP256r1MLKEM768 first

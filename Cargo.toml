@@ -336,9 +336,14 @@ strip = true
 # from it (a buffer budget, a remaining length) becomes a very large number
 # that lets the check it feeds pass. Safe Rust cannot turn that into memory
 # corruption, but it can turn a bounded buffer into an unbounded one. With the
-# check, the overflow panics, and with the default `panic = "unwind"` that ends
-# the one tokio task it happened in (a connection or a tunnel), not the
-# process. The 2026-11-18 NGINX HTTP/2 advisory CVE-2026-123007 began with
+# check, the overflow panics. With the default `panic = "unwind"`, a panic in a
+# task volto spawns for a connection or a tunnel ends that one task and not the
+# process. A panic in code quinn's own driver calls is different. The socket
+# gate (`src/gate.rs`) runs under quinn's endpoint driver, and a panic there
+# aborts the process: the driver unwraps its poisoned mutex in its destructor
+# while the panic unwinds (quinn 0.11.12 `src/endpoint.rs`, `Drop for
+# EndpointDriver`). `Expected::memory` in `src/gate.rs` gives the whole chain.
+# The 2026-11-18 NGINX HTTP/2 advisory CVE-2026-123007 began with
 # exactly such an underflow in a flow-control window check.
 #
 # Scoped to this package. The dependencies keep the profile default (off):
