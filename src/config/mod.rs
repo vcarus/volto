@@ -343,10 +343,13 @@ pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
 
 /// Default number of packets a UDP session may send before the target answers.
 ///
-/// RFC 9298 §7 asks a proxy to limit what an unanswered session can emit, so it
-/// cannot be used as a reflector or a port scanner. The default is deliberately
-/// generous: handshakes that legitimately need several packets before the first
-/// reply (QUIC retransmits, some game protocols) must not break.
+/// The budget is our rule. RFC 9298 §7 mentions it only as an option with a
+/// cost: a proxy "could potentially limit the number of UDP packets it is
+/// willing to forward until it has observed a response from the target", and
+/// "Such a packet limit could also cause issues for valid traffic." So the
+/// default is deliberately generous: handshakes that legitimately need several
+/// packets before the first reply (QUIC retransmits, some game protocols) must
+/// not break.
 pub const DEFAULT_UNANSWERED_PACKET_BUDGET: u32 = 64;
 
 /// The password `script/config.example.toml` ships, which no running server may
@@ -616,9 +619,12 @@ pub struct Limits {
 
 /// `[security]`: destination policy and abuse mitigations.
 ///
-/// The defaults are the ones RFC 9298 §7 asks for: private address space is out
-/// of reach, the classic relay port is closed, and a session that has not heard
-/// from its target cannot be used as an amplifier.
+/// The defaults are our rule: private address space is out of reach, the
+/// classic relay port is closed, and a session that has not heard from its
+/// target can send only a bounded number of packets. RFC 9298 §7 names part of
+/// the first, the targets a proxy exposes unless it disallows them: "the UDP
+/// proxy's own addresses and localhost, link-local, multicast, and broadcast
+/// addresses".
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Security {
