@@ -126,6 +126,17 @@ pub fn random_bytes(out: &mut [u8]) -> Result<()> {
 /// overwriting it would lock every such client out without a word.
 pub fn write_new_key_file(path: &Path, key: &EchKey) -> Result<()> {
     use std::io::Write as _;
+    write_new_file(path, |file| file.write_all(key.to_pem().as_bytes()))
+}
+
+/// Creates `path`, which must not exist yet, readable by its owner only, lets
+/// `fill` write it, and syncs it to disk.
+///
+/// When `fill` or the sync fails (a full disk, say), the file is removed
+/// again. It is ours to remove, because `create_new` made it a moment
+/// earlier, and leaving the partial file would make the next attempt at the
+/// same path fail, since an existing file is never replaced.
+fn write_new_file(path: &Path, fill: impl FnOnce(&mut File) -> std::io::Result<()>) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     let mut file = std::fs::OpenOptions::new()
@@ -139,7 +150,60 @@ pub fn write_new_key_file(path: &Path, key: &EchKey) -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(key.to_pem().as_bytes())
-        .and_then(|()| file.sync_all())
-        .with_context(|| format!("failed to write {}", path.display()))
+    let Err(error) = fill(&mut file).and_then(|()| file.sync_all()) else {
+        return Ok(());
+    };
+    drop(file);
+    let removed = std::fs::remove_file(path);
+    Err(error).with_context(|| match removed {
+        Ok(()) => format!(
+            "failed to write {}, and removed what was written",
+            path.display()
+        ),
+        Err(cause) => format!(
+            "failed to write {}, and failed to remove the partial file: {cause}",
+            path.display()
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// A fresh directory for one test, named by process and a counter.
+    fn scratch() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("volto-tls-test-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the directory");
+        dir
+    }
+
+    /// A write that fails half way leaves no file, so the next attempt at the
+    /// same path is not refused as an existing file.
+    #[test]
+    fn a_failed_write_leaves_no_partial_file_behind() {
+        let dir = scratch();
+        let path = dir.join("ech.pem");
+        let error = write_new_file(&path, |file| {
+            file.write_all(b"-----BEGIN PRIVATE KEY-----\n")?;
+            Err(std::io::Error::other("no space left on the test device"))
+        })
+        .expect_err("the fill failed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("no space left on the test device"),
+            "{message}"
+        );
+        assert!(message.contains("removed what was written"), "{message}");
+        assert!(!path.exists(), "a partial file was left behind");
+
+        let key = EchKey::generate("public.example", 7, 0).expect("a key");
+        write_new_key_file(&path, &key).expect("the next attempt writes the file");
+        assert!(EchKey::load(&path).is_ok());
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
 }
