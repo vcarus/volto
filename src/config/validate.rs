@@ -349,30 +349,149 @@ fn validate_certificate_paths(server: &Server) -> Result<()> {
     Ok(())
 }
 
-/// Levels accepted as a bare `log.level`.
+/// Levels accepted as a bare `log.level` or `RUST_LOG`.
 const LOG_LEVELS: [&str; 5] = ["trace", "debug", "info", "warn", "error"];
+
+/// The target of this server's own log lines. Every module's target is this
+/// followed by `::`.
+const OWN_TARGET: &str = "volto";
 
 /// Validates `log.level`.
 ///
-/// A plain word must name a level. This extra strictness matters because
-/// `EnvFilter` would otherwise read a typo like `"warning"` as a *target* name,
-/// accept it, and then log nothing at all. Anything containing filter syntax is
-/// handed to `EnvFilter` as-is.
+/// Filter syntax is handed to `EnvFilter` first, then the value is held to
+/// [`filter_refusal`], the rule `RUST_LOG` is held to as well.
 fn validate_log_level(level: &str) -> Result<()> {
     if level.contains([',', '=', '[']) {
         tracing_subscriber::EnvFilter::try_new(level)
             .with_context(|| format!("log.level = {level:?} is not a valid filter"))?;
-        return Ok(());
     }
+    match filter_refusal("log.level", level) {
+        Some(refusal) => bail!("{}", refusal.message()),
+        None => Ok(()),
+    }
+}
 
-    if !LOG_LEVELS.iter().any(|l| level.eq_ignore_ascii_case(l)) {
-        bail!(
-            "log.level = {level:?} is not one of {LOG_LEVELS:?}; for anything more \
+/// Why [`filter_refusal`] refuses a log filter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterRefusal {
+    /// The filter turns this server's own lines off, and with them every
+    /// configuration warning, the open-proxy warning among them. Refused at
+    /// startup from either source, so the log cannot be switched off without
+    /// an error.
+    Silences(String),
+    /// Empty, or a single word that is not one of the five level names: a
+    /// typo such as `warning` is read by `EnvFilter` as a target name, and the
+    /// digits `1` to `5` are left to the directive form (`volto=3`).
+    /// `log.level` refuses it; a `RUST_LOG` of this kind is ignored with a
+    /// warning and `log.level` applies.
+    NotALevel(String),
+}
+
+impl FilterRefusal {
+    /// The refusal, naming the source, the value and the accepted values.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Silences(message) | Self::NotALevel(message) => message,
+        }
+    }
+}
+
+/// The rule `log.level` and `RUST_LOG` share, or `None` for a filter it
+/// accepts. `source` names the key or the variable in the message.
+///
+/// A single word must be one of the five level names, in any letter case.
+/// `off` and `0` are [`FilterRefusal::Silences`]; any other word is
+/// [`FilterRefusal::NotALevel`]. A directive list is refused when it turns this
+/// server's own lines off (`silences_own_lines`). The list's syntax is not
+/// judged here: both callers ask `EnvFilter` first.
+pub fn filter_refusal(source: &str, filter: &str) -> Option<FilterRefusal> {
+    let bare = !filter.contains([',', '=', '[']);
+    if bare && filter.is_empty() {
+        return Some(FilterRefusal::NotALevel(format!(
+            "{source} is empty, which enables no log line; use one of {LOG_LEVELS:?}"
+        )));
+    }
+    if bare
+        && LOG_LEVELS
+            .iter()
+            .any(|name| filter.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+    if silences_own_lines(filter) && (!bare || is_off(filter)) {
+        return Some(FilterRefusal::Silences(format!(
+            "{source} = {filter:?} turns off this server's own log lines, and with them \
+             every configuration warning, the open-proxy warning among them; use one of \
+             {LOG_LEVELS:?}, or a directive list that leaves the {OWN_TARGET} target on, \
+             such as \"info,quinn=off\""
+        )));
+    }
+    if bare {
+        return Some(FilterRefusal::NotALevel(format!(
+            "{source} = {filter:?} is not one of {LOG_LEVELS:?}; for anything more \
              specific use a filter directive such as \"volto=debug,quinn=info\""
-        );
+        )));
     }
+    None
+}
 
-    Ok(())
+/// Whether a filter `EnvFilter` accepts disables an ERROR event at
+/// [`OWN_TARGET`] or at one of its modules.
+///
+/// Follows `EnvFilter`'s static directives (tracing-subscriber 0.3.23,
+/// `filter/env/directive.rs` and `filter/directive.rs`): a directive matches an
+/// event whose target starts with the directive's target, the most specific
+/// match decides (a longer target over a shorter one over none, and the later
+/// of two equal ones), and an event that no directive matches is disabled. So
+/// a list that names only other targets, such as a lone `quinn=off`, silences
+/// this server as surely as `volto=off`. A directive with a span or field
+/// filter (`[...]`) is not judged.
+fn silences_own_lines(filter: &str) -> bool {
+    // The specificity and the verdict of the directive that decides for
+    // `OWN_TARGET` itself; `None` when no directive matches it yet.
+    let mut deciding: Option<(Option<usize>, bool)> = None;
+    for directive in filter.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+        if directive.contains('[') {
+            continue;
+        }
+        let (target, off) = match directive.split_once('=') {
+            Some((target, level)) => (Some(target), is_off(level)),
+            None if directive
+                .parse::<tracing::level_filters::LevelFilter>()
+                .is_ok() =>
+            {
+                (None, is_off(directive))
+            }
+            // A bare target, at every level.
+            None => (Some(directive), false),
+        };
+        match target {
+            // More specific than any directive that matches `OWN_TARGET`, so it
+            // decides for the modules it matches.
+            Some(target) if target.starts_with("volto:") => {
+                if off {
+                    return true;
+                }
+            }
+            Some(target) if !OWN_TARGET.starts_with(target) => {}
+            _ => {
+                let specificity = target.map(str::len);
+                if deciding.is_none_or(|(current, _)| specificity >= current) {
+                    deciding = Some((specificity, off));
+                }
+            }
+        }
+    }
+    deciding.is_none_or(|(_, off)| off)
+}
+
+/// Whether a level, as written in a filter, is `off`: the word in any letter
+/// case, or a number `LevelFilter` reads as 0. An empty level is `trace`.
+fn is_off(level: &str) -> bool {
+    !level.is_empty()
+        && level
+            .parse::<tracing::level_filters::LevelFilter>()
+            .is_ok_and(|parsed| parsed == tracing::level_filters::LevelFilter::OFF)
 }
 
 /// Validates one `security.expected_sni` entry.
@@ -1259,6 +1378,81 @@ mod tests {
     fn a_malformed_filter_directive_is_rejected() {
         let err = validate_log_level("volto=notalevel").expect_err("must be rejected");
         assert!(err.to_string().contains("log.level"), "{err}");
+    }
+
+    /// The server's own log cannot be switched off: not as a bare level, not
+    /// for the `volto` target or a module of it, and not by a list that
+    /// matches none of this server's lines. Another crate may be turned off
+    /// beside a level that keeps this server on.
+    #[test]
+    fn a_filter_that_silences_this_server_is_refused() {
+        for level in [
+            "off",
+            "OFF",
+            "Off",
+            "0",
+            "00",
+            "volto=off",
+            "volto=OFF",
+            "volto=0",
+            "vol=off",
+            "volto::quic=off",
+            "info,volto=off",
+            "volto=info,volto::tunnel=off",
+            "volto=off,volto::quic=info",
+            "off,quinn=info",
+            "quinn=off",
+            "quinn=debug,rustls=info",
+            "[handshake]=info",
+        ] {
+            let err = validate_log_level(level)
+                .err()
+                .unwrap_or_else(|| panic!("{level:?} must be refused"));
+            std::assert_matches!(
+                filter_refusal("log.level", level),
+                Some(FilterRefusal::Silences(_)),
+                "{level}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("log.level"), "{message}");
+            assert!(message.contains(&format!("{level:?}")), "{message}");
+            assert!(
+                message.contains(&format!("{LOG_LEVELS:?}")),
+                "the accepted values must be named: {message}"
+            );
+        }
+
+        for level in [
+            "info,quinn=off",
+            "off,volto=info",
+            "volto=info,quinn=off",
+            "volto=",
+            "volto,quinn=off",
+            "volto=3",
+            "warn,volto::tunnel=error",
+            "info,[handshake]=off",
+            "volto_other=off,info",
+        ] {
+            assert_eq!(filter_refusal("log.level", level), None, "{level}");
+        }
+    }
+
+    /// The digits `LevelFilter` reads are refused as a bare `log.level`, as
+    /// they were before the rule was shared with `RUST_LOG`; `0` is refused as
+    /// `off`, and the others as words that are not level names.
+    #[test]
+    fn a_bare_digit_is_not_a_level_name() {
+        std::assert_matches!(
+            filter_refusal("log.level", "0"),
+            Some(FilterRefusal::Silences(_))
+        );
+        for digit in ["1", "2", "3", "4", "5", "6"] {
+            std::assert_matches!(
+                filter_refusal("log.level", digit),
+                Some(FilterRefusal::NotALevel(_)),
+                "{digit}"
+            );
+        }
     }
 
     proptest! {

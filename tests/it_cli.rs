@@ -84,11 +84,21 @@ fn run_expecting_exit(args: &[&str], limit: Duration) -> Output {
 /// runner itself runs under systemd.
 #[track_caller]
 fn run_expecting_exit_with(args: &[&str], journal_stream: Option<&str>, limit: Duration) -> Output {
+    let journal: Vec<(&str, &str)> = journal_stream
+        .map(|value| ("JOURNAL_STREAM", value))
+        .into_iter()
+        .collect();
+    run_expecting_exit_in(args, &journal, limit)
+}
+
+/// [`run_expecting_exit`] with `JOURNAL_STREAM` and `RUST_LOG` removed from
+/// the environment, then `env` set, so the result depends on neither variable
+/// of the test runner's own.
+#[track_caller]
+fn run_expecting_exit_in(args: &[&str], env: &[(&str, &str)], limit: Duration) -> Output {
     let mut command = Command::new(real_binary());
-    match journal_stream {
-        Some(value) => command.env("JOURNAL_STREAM", value),
-        None => command.env_remove("JOURNAL_STREAM"),
-    };
+    command.env_remove("JOURNAL_STREAM").env_remove("RUST_LOG");
+    command.envs(env.iter().copied());
     let mut child = command
         .args(args)
         .stdout(Stdio::piped())
@@ -406,6 +416,59 @@ fn a_failed_start_is_filed_as_an_error_in_the_journal() {
             stderr.starts_with("Error: ") && !stderr.lines().any(|line| line.starts_with('<')),
             "{case}: a terminal must see no priority prefix: {stderr}"
         );
+    }
+}
+
+/// A log filter that would turn this server's own lines off stops the start,
+/// from the environment as from the file, so the startup warnings (the
+/// open-proxy warning among them) cannot be switched off without an error.
+///
+/// The planted certificate does not parse, so a start that gets past the log
+/// filter fails later, in `Server::bind`, for a reason that does not name
+/// `RUST_LOG`. That is what tells the refusal from a start that went on.
+#[test]
+fn a_log_filter_that_silences_the_server_stops_the_start() {
+    let dir = config_dir("silenced-log");
+    let path = write_config(&dir, "127.0.0.1:0", "");
+    let args = ["--config", path.to_str().unwrap()];
+    let limit = Duration::from_secs(20);
+
+    for value in ["off", "OFF", "0", "volto=off", "quinn=off"] {
+        let journal = [("RUST_LOG", value), ("JOURNAL_STREAM", "8:12345")];
+        let output = run_expecting_exit_in(&args, &journal, limit);
+        let stderr = stderr_of(&output);
+        assert_eq!(output.status.code(), Some(1), "RUST_LOG={value}: {stderr}");
+        for needle in ["RUST_LOG", &format!("{value:?}"), "\"info\""] {
+            assert!(
+                stderr.contains(needle),
+                "RUST_LOG={value}: the refusal must name the variable, the value and \
+                 the accepted values ({needle}): {stderr}"
+            );
+        }
+        assert!(
+            stderr.lines().all(|line| line.starts_with("<3>")),
+            "RUST_LOG={value}: the refusal is a start failure, filed at err: {stderr}"
+        );
+    }
+
+    // Another crate turned off beside a level is legal: the start goes on and
+    // fails at the certificate.
+    let output = run_expecting_exit_in(&args, &[("RUST_LOG", "info,quinn=off")], limit);
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains("RUST_LOG"),
+        "info,quinn=off must be applied, not refused: {stderr}"
+    );
+
+    // The same rule for the key, which `--check-config` reports.
+    let dir = config_dir("silenced-level");
+    let path = write_config(&dir, "127.0.0.1:0", "\n[log]\nlevel = \"volto=off\"\n");
+    let output = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    let stderr = stderr_of(&output);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    for needle in ["log.level", "\"volto=off\"", "\"info\""] {
+        assert!(stderr.contains(needle), "{needle}: {stderr}");
     }
 }
 

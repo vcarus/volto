@@ -19,7 +19,7 @@ use tracing::{Event, Level, Subscriber, error, info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
-use volto::config::Config;
+use volto::config::{Config, FilterRefusal};
 use volto::quic::Server;
 use volto::shutdown::Trigger;
 
@@ -721,10 +721,12 @@ const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
 ///
 /// `RUST_LOG` wins over `log.level` so verbosity can be raised without touching
 /// the config file. A `RUST_LOG` value that does not parse, or that parses and
-/// is refused by [`refusal`], is not silently treated as absent:
-/// the subscriber is installed on `log.level` and the reason is reported
+/// is [`FilterRefusal::NotALevel`], is not silently treated as absent: the
+/// subscriber is installed on `log.level` and the reason is reported
 /// immediately after, so the operator can see that the variable did not do what
-/// they meant.
+/// they meant. A value that would turn this server's own lines off
+/// ([`FilterRefusal::Silences`]) is an error, returned before any subscriber
+/// exists, so startup fails the way a refused configuration does.
 ///
 /// Under systemd each line additionally carries a syslog priority prefix; see
 /// [`JournalPriority`]. In a terminal the output is unchanged.
@@ -742,6 +744,7 @@ fn init_tracing(level: &str) -> Result<()> {
             tracing_subscriber::EnvFilter::try_new(level)
                 .with_context(|| format!("log.level = {level:?} is not a valid filter"))?
         }
+        FilterSource::Refused(reason) => anyhow::bail!("{reason}"),
     };
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
@@ -777,75 +780,57 @@ fn init_tracing(level: &str) -> Result<()> {
 
 /// What decides the filter [`init_tracing`] installs.
 ///
-/// Three outcomes, because an unset `RUST_LOG` and a set-but-unparseable one
-/// are not the same thing: the first says nothing and `log.level` is the only
-/// instruction, while the second is an operator's mistake worth a line in the
-/// journal. [`EnvFilter::try_from_default_env`] alone cannot tell them apart,
-/// because it returns `Err` for both. That is why the variable's presence is
-/// read first.
+/// An unset `RUST_LOG` and a set-but-unparseable one are not the same thing:
+/// the first says nothing and `log.level` is the only instruction, while the
+/// second is an operator's mistake worth a line in the journal.
+/// [`EnvFilter::try_from_default_env`] alone cannot tell them apart, because it
+/// returns `Err` for both. That is why the variable's presence is read first.
+/// [`FilterSource::Refused`] is the outcome that stops the start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FilterSource {
     /// `RUST_LOG` is absent: `log.level` applies.
     Config,
     /// `RUST_LOG` is set and parses: it applies, overriding `log.level`.
     RustLog,
-    /// `RUST_LOG` is set and does not parse, or [`refusal`] refuses it:
-    /// `log.level` applies, and this is the reason to report once the
-    /// subscriber exists.
+    /// `RUST_LOG` is set and does not parse, or is
+    /// [`FilterRefusal::NotALevel`]: `log.level` applies, and this is the
+    /// reason to report once the subscriber exists.
     InvalidRustLog(String),
+    /// `RUST_LOG` parses and turns this server's own lines off
+    /// ([`FilterRefusal::Silences`]): startup fails with this reason.
+    Refused(String),
 }
 
 /// Reads `RUST_LOG`'s value, as returned by `std::env::var_os`, into the
 /// decision [`init_tracing`] acts on.
 ///
-/// Split out so all three outcomes are testable without mutating the process
+/// Split out so every outcome is testable without mutating the process
 /// environment, which this binary's tests share across threads. The value is
 /// taken as an argument rather than read here for the same reason.
+///
+/// The rule is `volto::config::filter_refusal`, the one `log.level` is held to,
+/// so a bare word must be one of the five level names and nothing may turn the
+/// `volto` target off. Two things differ, both because the value comes from the
+/// environment: it is trimmed first, and only a value that silences this
+/// server stops the start. Any other refusal falls back to `log.level`, which
+/// has already passed the same rule.
 fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
-    match rust_log {
-        None => FilterSource::Config,
-        Some(raw) => match raw.to_str() {
-            Some(text) => match refusal(text) {
-                Some(reason) => FilterSource::InvalidRustLog(reason),
-                None => match tracing_subscriber::EnvFilter::try_new(text) {
-                    Ok(_) => FilterSource::RustLog,
-                    Err(error) => FilterSource::InvalidRustLog(error.to_string()),
-                },
-            },
-            None => FilterSource::InvalidRustLog("RUST_LOG is not valid UTF-8".to_owned()),
-        },
+    let Some(raw) = rust_log else {
+        return FilterSource::Config;
+    };
+    let Some(text) = raw.to_str() else {
+        return FilterSource::InvalidRustLog("RUST_LOG is not valid UTF-8".to_owned());
+    };
+    let parsed = tracing_subscriber::EnvFilter::try_new(text);
+    match (
+        volto::config::filter_refusal("RUST_LOG", text.trim()),
+        parsed,
+    ) {
+        (Some(FilterRefusal::NotALevel(reason)), _) => FilterSource::InvalidRustLog(reason),
+        (_, Err(error)) => FilterSource::InvalidRustLog(error.to_string()),
+        (Some(FilterRefusal::Silences(reason)), Ok(_)) => FilterSource::Refused(reason),
+        (None, Ok(_)) => FilterSource::RustLog,
     }
-}
-
-/// Why a `RUST_LOG` value that `EnvFilter` accepts is refused, if it is.
-///
-/// Two kinds of value are refused. An empty value is an empty directive set,
-/// whose maximum level is `OFF`, so it enables no log line. A single bare word
-/// that is not a level is read as a target name at `TRACE`, so a typo such as
-/// `warning` enables only a target that no event has. The filter cannot tell
-/// such a typo from a real target name, so a real one such as `volto` is
-/// refused as well, and `volto=trace` says the same thing without doubt.
-/// Everything else is left to the parser: a directive with `=`, `[` or `,`
-/// names its targets on purpose, which is what `RUST_LOG` is for, and `off` is
-/// a level that silences the process on purpose.
-///
-/// `log.level` has a stricter rule of its own (`config::validate`): a bare word
-/// must be one of the five level names, compared without trimming, where this
-/// one trims the value and also takes `off` and the digits `0` to `5` that
-/// `LevelFilter` parses.
-fn refusal(text: &str) -> Option<String> {
-    let word = text.trim();
-    if word.is_empty() {
-        return Some("RUST_LOG is empty, which enables no log line".to_owned());
-    }
-    if word.contains([',', '=', '[']) || word.parse::<tracing::level_filters::LevelFilter>().is_ok()
-    {
-        return None;
-    }
-    Some(format!(
-        "{word:?} is not a level, so the filter would read it as a target name; \
-         name a level, or write a directive such as \"{word}=debug\""
-    ))
 }
 
 /// Whether this process's log output is being read by journald.
@@ -1071,8 +1056,10 @@ mod tests {
         // directive set and enables nothing. A bare word that is not a level is
         // read as a target name, so `warning` means "the target named warning,
         // at trace" and enables nothing either. `volto` is a real target, and
-        // is refused because the filter cannot tell it from such a typo.
-        for value in ["", "  ", "warning", "volto"] {
+        // is refused because the filter cannot tell it from such a typo. A bare
+        // digit is a level to the filter, and refused because `log.level`
+        // refuses it.
+        for value in ["", "  ", "warning", "volto", "3", "5"] {
             match filter_source(Some(OsStr::new(value))) {
                 FilterSource::InvalidRustLog(error) => assert!(
                     !error.trim().is_empty(),
@@ -1082,23 +1069,48 @@ mod tests {
             }
         }
 
-        // A bare level is still a level, in any case and in tracing's numeric
-        // form, and so is `off`, which silences the process on purpose. A
-        // target directive is still accepted, which is the reason RUST_LOG is
-        // more than `log.level`.
+        // A bare level name is still a level, in any case. A target directive
+        // is still accepted, numeric levels included, which is the reason
+        // RUST_LOG is more than a level, and so is one that turns another
+        // crate off while a default keeps this server on.
         for value in [
             "warn",
-            "INFO",
-            "off",
-            "3",
+            " INFO ",
             "volto=debug",
+            "volto=3",
             "volto=trace,quinn=warn",
+            "info,quinn=off",
+            "off,volto=info",
         ] {
             assert_eq!(
                 filter_source(Some(OsStr::new(value))),
                 FilterSource::RustLog,
                 "RUST_LOG={value:?} must still apply"
             );
+        }
+
+        // A value that turns this server's own lines off stops the start, in
+        // any letter case and in tracing's numeric form, and so does a list
+        // that turns the `volto` target or one of its modules off, or names
+        // only other targets and so matches none of this server's lines.
+        for value in [
+            "off",
+            " OFF",
+            "0",
+            "volto=off",
+            "volto=0",
+            "volto::quic=off",
+            "info,volto=off",
+            "quinn=off",
+        ] {
+            match filter_source(Some(OsStr::new(value))) {
+                FilterSource::Refused(reason) => {
+                    assert!(reason.contains("RUST_LOG"), "{reason}");
+                    assert!(reason.contains(value.trim()), "{reason}");
+                    assert!(reason.contains("\"info\""), "{reason}");
+                }
+                other => panic!("RUST_LOG={value:?} must stop the start: {other:?}"),
+            }
         }
 
         // Non-UTF-8 is set but unreadable, not unset: the filter parser needs a

@@ -492,12 +492,20 @@ cannot be executed.
 Environment=RUST_LOG=volto=debug,quinn=info
 ```
 
+`RUST_LOG` is held to the rule `log.level` is held to. A value that turns this
+server's own lines off stops the start with an error filed at `err`, because the
+configuration warnings, the open-proxy warning among them, are among those
+lines: `off` or `0`, `volto=off` or `off` for a module of it, and a list that
+names only other targets, such as a lone `quinn=off`, which matches none of this
+server's lines. Write `info,quinn=off` to silence another crate.
+
 A `RUST_LOG` value that does not parse is reported at startup, and `log.level`
 is used instead. So are two kinds of value that the filter accepts. An empty
-value enables no line at all. A single word that is not a level is read as a
-target name, so a typo such as `warning` enables no line either; a real target
-name alone, such as `volto`, is refused by the same rule. Write a directive such
-as `volto=trace` to raise one target.
+value enables no line at all. A single word that is not one of the five level
+names is refused too: a typo such as `warning` is read as a target name and
+enables no line either, a real target name alone, such as `volto`, is refused by
+the same rule, and so is a bare digit such as `3`. Write a directive such as
+`volto=trace` to raise one target.
 
 Log lines carry a syslog priority when systemd is reading them, so journald's own
 severity filter works rather than needing a text search. The reason a start

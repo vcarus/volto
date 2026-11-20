@@ -139,3 +139,83 @@ async fn inbound_requests_are_logged_with_every_header() {
         "and that line must name the token; line was:\n{line}"
     );
 }
+
+/// The rule `log.level` and `RUST_LOG` share reads a filter's text, and
+/// `EnvFilter` is what applies it, so the two have to agree on the question the
+/// rule asks: whether an ERROR line of this server still gets through, at the
+/// crate's own target and at its modules'.
+///
+/// A filter the rule refuses as silencing has to drop one of those lines, and
+/// a filter it accepts has to let every one through. A filter refused as not a
+/// level name is refused either way, so only the other two verdicts are held
+/// to the real filter here.
+#[test]
+fn the_shared_log_rule_agrees_with_the_filter_that_applies_it() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use volto::config::{FilterRefusal, filter_refusal};
+
+    let filters = [
+        "off",
+        "OFF",
+        "0",
+        "info",
+        "WARN",
+        "error",
+        "trace",
+        "volto=off",
+        "volto=0",
+        "vol=off",
+        "volto::quic=off",
+        "volto::quic::reload=off",
+        "info,volto=off",
+        "volto=info,volto::tunnel=off",
+        "volto=off,volto::quic=info",
+        "off,quinn=info",
+        "off,volto=info",
+        "quinn=off",
+        "quinn=debug,rustls=info",
+        "info,quinn=off",
+        "volto=info,quinn=off",
+        "volto=debug,quinn=info",
+        "volto=",
+        "volto,quinn=off",
+        "volto=3",
+        "volto=info,volto=off",
+        "volto=off,volto=info",
+        "warn,volto::tunnel=error",
+        "[handshake]=info",
+        "info,[handshake]=off",
+        "volto_other=off,info",
+        "volto_other=info",
+    ];
+
+    for filter in filters {
+        let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
+            .unwrap_or_else(|error| panic!("{filter:?} must parse: {error}"));
+        let subscriber = tracing_subscriber::registry().with(env_filter);
+        // A callsite's target is a literal, so the modules are a fixed few:
+        // every module a filter below names, and one below it.
+        let through = tracing::subscriber::with_default(subscriber, || {
+            [
+                tracing::enabled!(target: "volto", tracing::Level::ERROR),
+                tracing::enabled!(target: "volto::quic", tracing::Level::ERROR),
+                tracing::enabled!(target: "volto::quic::reload", tracing::Level::ERROR),
+                tracing::enabled!(target: "volto::tunnel", tracing::Level::ERROR),
+            ]
+        });
+        let silenced = through.contains(&false);
+
+        match filter_refusal("RUST_LOG", filter) {
+            Some(FilterRefusal::Silences(_)) => assert!(
+                silenced,
+                "{filter:?} is refused as silencing, but the filter lets both lines through"
+            ),
+            None => assert!(
+                !silenced,
+                "{filter:?} is accepted, but the filter drops a line of this server: \
+                 {through:?} for volto, volto::quic, volto::quic::reload, volto::tunnel"
+            ),
+            Some(FilterRefusal::NotALevel(_)) => {}
+        }
+    }
+}
