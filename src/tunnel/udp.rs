@@ -1548,8 +1548,9 @@ pub fn validate(req: &Request) -> Result<(), &'static str> {
 /// strict about anything ambiguous. The trailing slash is optional, and an IPv6
 /// literal is accepted both in the RFC 9298 §3 form (bare, only the colons
 /// escaped) and bracketed. What comes out is a host, with the
-/// brackets of the second form already off: [`crate::net::resolve`] resolves
-/// names and literals, not URI components.
+/// brackets of the second form already off:
+/// [`crate::net::ConnectionResolver::lookup`] resolves names and literals, not
+/// URI components.
 pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'static str> {
     // A query string would make the URI something other than the template.
     if query.is_some_and(|query| !query.is_empty()) {
