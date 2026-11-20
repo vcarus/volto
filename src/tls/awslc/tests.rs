@@ -1343,6 +1343,22 @@ fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     );
 }
 
+/// `Builder::new`'s defaults, which `server_config` and `probe_server_config`
+/// build on: with an ECH key the second ECH line is on, so GREASE is refused
+/// before anything is sent, and ALPN `h3` completes a handshake.
+#[test]
+fn the_builder_defaults_keep_the_second_ech_line_on() {
+    let id = identity();
+    let key = ech_key(1);
+    let config = super::probe_server_config(&id.cert, &id.key, Some(&key)).expect("a server");
+    refused_before_anything(&run(config.clone(), Some(grease()), pq_first()), "GREASE");
+    let outcome = run(config, Some(enable(&key.config_list())), pq_first());
+    assert!(
+        outcome.ech_accepted && outcome.server_done && outcome.client_done,
+        "{outcome:?}"
+    );
+}
+
 /// The first ClientHello of a plain client with X25519MLKEM768 first.
 fn client_hello() -> Vec<u8> {
     let client = Arc::new(client_config(
