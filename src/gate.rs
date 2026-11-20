@@ -481,10 +481,15 @@ impl Expected {
     /// `enc` values one key opened. A policy without a key empties the hold,
     /// because nothing would judge what it holds; the clients of those
     /// flights send them again and the gate passes them as it now does. Both
-    /// happen under the hold's lock, with the policy swapped inside it. A
-    /// receive call that read the old policy just before and takes the lock
-    /// just after can still record one `enc` of the old key, whose flight no
-    /// longer opens under the new one, so the entry is never matched.
+    /// happen under the hold's lock, with the policy swapped inside it, and
+    /// `Gate::screen_holding` reads the policy again once it holds that lock.
+    /// So no flight is held, judged or recorded under a policy that is no
+    /// longer in force, however a receive call and a reload interleave: a
+    /// flight held just before the reload is in the hold the reload clears,
+    /// and one that arrives just after is judged by the new policy. Without
+    /// that second read, a receive call that had read the old policy before a
+    /// reload removed the key could hold flights after the reload had cleared
+    /// the hold, and with no key nothing would ever expire them.
     pub fn set(&self, policy: impl Into<Policy>) {
         let policy = Arc::new(policy.into());
         let any = policy.is_on();
@@ -581,12 +586,16 @@ impl Gate {
     /// is what quinn receives, from the next receive call. The hold's lock and
     /// the clock are taken the first time a batch has a first Initial in it,
     /// and not at all for a batch of short headers, which is the data path.
+    ///
+    /// The policy the hold judges by is read again once the lock is held,
+    /// rather than taken from the batch: [`Expected::set`] says why. When the
+    /// policy read then has no key, a reload removed it after this batch began,
+    /// and the datagram is judged as the stateless gate judges it.
     fn screen_holding<'a>(
         &'a self,
         meta: &RecvMeta,
         datagram: &mut [u8],
-        policy: &Policy,
-        memory: &mut Option<MutexGuard<'a, Memory>>,
+        held: &mut Option<(MutexGuard<'a, Memory>, Arc<Policy>)>,
         now: &mut Option<Instant>,
     ) {
         let (dcid, frames) = match self.judge.classify(datagram, true) {
@@ -598,7 +607,16 @@ impl Gate {
             }
             Classified::Opened { dcid, frames, more } => (dcid, (frames, more)),
         };
-        let memory = memory.get_or_insert_with(|| self.expected.memory());
+        let (memory, policy) = held.get_or_insert_with(|| {
+            let memory = self.expected.memory();
+            (memory, self.expected.current())
+        });
+        if policy.ech.is_none() {
+            if policy.is_on() {
+                self.screen(meta.addr, datagram, &policy.names);
+            }
+            return;
+        }
         let now = *now.get_or_insert_with(Instant::now);
         let arrival = Arrival {
             now,
@@ -1139,7 +1157,7 @@ impl AsyncUdpSocket for Gate {
             return Poll::Ready(Ok(count));
         }
 
-        let mut memory = None;
+        let mut held = None;
         let mut now = None;
         for (meta, buf) in metas.iter().zip(bufs.iter_mut()).take(count) {
             // Exactly how quinn's own receive loop walks a GRO run: `len` bytes
@@ -1154,7 +1172,7 @@ impl AsyncUdpSocket for Gate {
                 let end = at.saturating_add(stride).min(len);
                 let datagram = &mut buf[at..end];
                 if policy.ech.is_some() {
-                    self.screen_holding(meta, datagram, &policy, &mut memory, &mut now);
+                    self.screen_holding(meta, datagram, &mut held, &mut now);
                 } else {
                     self.screen(meta.addr, datagram, &policy.names);
                 }
@@ -1823,6 +1841,43 @@ mod tests {
         payload.extend_from_slice(&[0x06, 0x09, 0x02, b'y', b'z']); // offset 9
 
         assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"ab"[..]));
+    }
+
+    /// A receive call that read a policy with a key, interleaved with a reload
+    /// that removes the key before the call takes the hold's lock, holds
+    /// nothing: the hold that reload cleared stays empty, so nothing is left
+    /// that no key would ever expire. With no names either, the new policy is
+    /// the gate switched off, and the datagram goes to quinn untouched.
+    #[tokio::test]
+    async fn a_reload_that_removes_the_key_leaves_no_flight_held() {
+        let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
+        let expected = Expected::new(Policy::new(Names::new(&[]), Some(key), false));
+        // What the receive call read before the reload.
+        let stale = expected.current();
+        assert!(stale.ech.is_some());
+        expected.set(Names::new(&[]));
+
+        let runtime = quinn::default_runtime().expect("a tokio runtime");
+        let socket = runtime
+            .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"))
+            .expect("wrap");
+        let gate = Gate::new(socket, expected.clone(), nameless_crypto());
+        let sent = sealed_initial(&[0x51; 8], 0, &[0x01]);
+        let mut datagram = sent.clone();
+        let meta = RecvMeta {
+            addr: SocketAddr::from(([127, 0, 0, 1], 4433)),
+            len: datagram.len(),
+            stride: datagram.len(),
+            ..RecvMeta::default()
+        };
+        // The batch's branch, taken on the policy read before the reload.
+        if stale.ech.is_some() {
+            let (mut held, mut now) = (None, None);
+            gate.screen_holding(&meta, &mut datagram, &mut held, &mut now);
+        }
+
+        assert_eq!(expected.memory().hold.flights(), 0, "a flight was stranded");
+        assert_eq!(datagram, sent, "the gate is off, so quinn gets it as sent");
     }
 
     #[test]
