@@ -1230,7 +1230,7 @@ async fn serve_peer(handle: Handle) {
                     Ok(datagram) => datagram,
                     // The connection is gone; so is every session on it.
                     Err(error) => {
-                        debug!(%error, "stopped reading QUIC datagrams");
+                        datagrams_stopped(error);
                         return;
                     }
                 };
@@ -1241,6 +1241,18 @@ async fn serve_peer(handle: Handle) {
             }
         }
     }
+}
+
+/// Logs why [`serve_peer`] stopped reading datagrams.
+///
+/// The error can carry the reason phrase of the peer's CONNECTION_CLOSE, so it
+/// goes through [`crate::logfmt::peer_error`] like every other connection
+/// error a peer may have written.
+fn datagrams_stopped(error: quinn::ConnectionError) {
+    debug!(
+        error = %crate::logfmt::peer_error(error),
+        "stopped reading QUIC datagrams"
+    );
 }
 
 /// Decodes one QUIC datagram and delivers it, or ends the connection.
@@ -1932,6 +1944,62 @@ fn missing_settings() -> Violation {
 mod tests {
     use super::*;
     use bytes::{BufMut, Bytes, BytesMut};
+
+    /// The peer writes the reason phrase of its CONNECTION_CLOSE, and the line
+    /// that reports the end of the datagram loop prints the error. A newline in
+    /// the phrase must not start a second line in the log.
+    #[test]
+    fn a_peer_close_reason_cannot_split_the_datagram_line() {
+        #[derive(Clone)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+
+        let reason = Bytes::from_static(b"goodbye\nWARN forged line");
+        tracing::subscriber::with_default(subscriber, || {
+            datagrams_stopped(quinn::ConnectionError::ApplicationClosed(
+                quinn::ApplicationClose {
+                    error_code: quinn::VarInt::from_u32(0x100),
+                    reason: reason.clone(),
+                },
+            ));
+            datagrams_stopped(quinn::ConnectionError::ConnectionClosed(
+                quinn::ConnectionClose {
+                    error_code: quinn::TransportErrorCode::NO_ERROR,
+                    frame_type: None,
+                    reason,
+                },
+            ));
+        });
+
+        let logged = String::from_utf8(sink.0.lock().expect("sink").clone()).expect("utf-8");
+        assert_eq!(
+            logged.lines().count(),
+            2,
+            "one line per call, whatever the peer wrote: {logged:?}"
+        );
+        assert!(
+            logged
+                .lines()
+                .all(|line| line.contains("stopped reading QUIC datagrams")),
+            "{logged:?}"
+        );
+    }
 
     fn settings(datagrams: bool) -> Item {
         Item::Frame(Frame::Settings(frame::Settings { datagrams }))
