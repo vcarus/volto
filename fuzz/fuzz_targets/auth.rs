@@ -26,13 +26,10 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use volto::auth::{Authenticator, MAX_CREDENTIAL_VALUES};
+use volto::auth::{Authenticator, CREDENTIAL_FIELDS, MAX_CREDENTIAL_VALUES};
 use volto::config::{Auth, User};
 use volto::h3api::{FieldValue, Fields};
 use volto::logfmt;
-
-/// The two fields credentials are accepted in (D3).
-const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
 
 /// Longest user-id or password cut out of the input.
 ///

@@ -43,7 +43,10 @@ const PROXY_AUTHENTICATE: &str = "proxy-authenticate";
 
 /// The two fields credentials are accepted in, in the order they are tried
 /// (decision D3).
-const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
+///
+/// Public only so that the `auth` fuzz target drives the same list.
+#[doc(hidden)]
+pub const CREDENTIAL_FIELDS: [&str; 2] = ["proxy-authorization", "authorization"];
 
 /// The most credential field values one request may carry.
 ///
