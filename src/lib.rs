@@ -14,6 +14,8 @@
 //! * [`tls`]: certificate/key loading and the server's TLS, volto's own quinn
 //!   provider on AWS-LC's libssl with optional ECH.
 //! * [`gate`]: the SNI gate: which handshakes reach quinn at all.
+//! * [`names`]: the host-name list both SNI gates accept, and the host-name
+//!   rule.
 //! * [`hello`]: the ClientHello parser the gate, the TLS provider and the
 //!   tests share.
 //! * [`quic`]: the QUIC endpoint, transport parameters and the accept loop.
@@ -82,6 +84,7 @@ pub mod h3;
 pub mod h3api;
 pub mod hello;
 pub mod logfmt;
+pub mod names;
 pub mod net;
 pub mod policy;
 pub mod quic;

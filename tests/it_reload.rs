@@ -1162,7 +1162,7 @@ async fn a_tunnel_abandoned_during_a_reload_storm_still_closes_its_target() {
 /// gate then held a name no ClientHello can carry, so every client was dropped
 /// in silence, and the D106 warning that exists for that failure did not fire
 /// either: `tls::names_not_covered` stripped every trailing dot and found the
-/// name covered. The two spellings are now one helper, `gate::root_relative`,
+/// name covered. The two spellings are now one helper, `names::root_relative`,
 /// and an empty label is refused where a misconfiguration can still be reported.
 #[tokio::test]
 async fn a_reloaded_gate_name_with_an_empty_label_is_refused() {

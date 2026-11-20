@@ -70,8 +70,8 @@ use zeroize::Zeroizing;
 
 use super::UNUSABLE_PAIR;
 use crate::config;
-use crate::gate::Names;
 use crate::hello;
+use crate::names::Names;
 
 pub use ech::EchKey;
 use ffi::{Ssl, SslCtx};
@@ -808,10 +808,7 @@ unsafe fn server_name(ssl: *const sys::SSL) -> Option<String> {
 
 /// `raw` if it is a DNS name, as rustls's server judged a `server_name`.
 fn dns_name(raw: &str) -> Option<String> {
-    match rustls::pki_types::ServerName::try_from(raw) {
-        Ok(rustls::pki_types::ServerName::DnsName(name)) => Some(name.as_ref().to_owned()),
-        _ => None,
-    }
+    crate::names::host_name(raw).map(|name| name.as_ref().to_owned())
 }
 
 /// The file `[log] keylog` writes to, opened once per configuration build.

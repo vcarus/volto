@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use tracing::{info, warn};
 
 use crate::config::Config;
-use crate::gate::{Expected, Names, Policy};
+use crate::gate::{Expected, Policy};
+use crate::names::Names;
 use crate::shutdown::Shutdown;
 use crate::tls;
 

@@ -360,7 +360,7 @@ fn validate_log_level(level: &str) -> Result<()> {
 //# The hostname is represented as a byte
 //# string using ASCII encoding without a trailing dot.
 fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
-    let bare = crate::gate::root_relative(name);
+    let bare = crate::names::root_relative(name);
 
     if bare.is_empty() {
         bail!("security.expected_sni[{index}] is empty, which is not a host name");
@@ -426,14 +426,14 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
         );
     }
 
-    // The second SNI gate reads the client's name through rustls-pki-types'
-    // `DnsName` (`tls::awslc::dns_name`) and treats a name it refuses as no
-    // name, so an entry that judge refuses admits no client. The checks above
-    // refuse a subset of what it refuses and keep their own messages; this is
-    // the judge itself, so the two cannot disagree. What it adds: a label is at
-    // most 63 bytes, no label starts or ends with `-`, and the last label is not
-    // a number (all digits, or `0x` and hex digits).
-    if rustls::pki_types::DnsName::try_from(bare).is_err() {
+    // The second SNI gate reads the client's name through `names::host_name`
+    // and treats a name it refuses as no name, so an entry that judge refuses
+    // admits no client. The checks above refuse a subset of what it refuses and
+    // keep their own messages; this is the judge itself, so the two cannot
+    // disagree. What it adds: a label is at most 63 bytes, no label starts or
+    // ends with `-`, and the last label is not a number (all digits, or `0x`
+    // and hex digits).
+    if crate::names::host_name(bare).is_none() {
         bail!(
             "security.expected_sni[{index}] = {name:?} is not a DNS host name the server's \
              TLS accepts, so the gate would refuse every handshake that names it: a label \
