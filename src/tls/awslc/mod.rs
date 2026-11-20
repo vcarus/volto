@@ -649,29 +649,23 @@ unsafe extern "C" fn select_alpn(
     // (`ssl_is_valid_alpn_list`); it is parsed again here with bounds checks
     // anyway.
     let offered = unsafe { std::slice::from_raw_parts(input, input_len) };
-    let mut list = Vec::new();
-    let mut at = 0;
-    while let Some(&len) = offered.get(at) {
-        let start = at + 1;
-        let Some(protocol) = offered.get(start..start + usize::from(len)) else {
-            return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
-        };
-        list.push((start, protocol));
-        at = start + usize::from(len);
-    }
     for ours in &data.alpn {
-        if let Some((start, protocol)) = list.iter().find(|(_, p)| *p == ours.as_slice()) {
-            let Ok(len) = u8::try_from(protocol.len()) else {
+        let mut list = hello::Reader::new(offered);
+        while let Some(len) = list.u8() {
+            let start = list.position();
+            let Some(protocol) = list.take(usize::from(len)) else {
                 return sys::SSL_TLSEXT_ERR_ALERT_FATAL;
             };
-            // SAFETY: both out-pointers are valid for writes. The pointer
-            // written points into AWS-LC's own buffer, at an offset inside it,
-            // which is what `ssl.h` requires of `*out`.
-            unsafe {
-                *out = input.add(*start);
-                *out_len = len;
+            if protocol == ours.as_slice() {
+                // SAFETY: both out-pointers are valid for writes. The pointer
+                // written points into AWS-LC's own buffer, at an offset inside
+                // it, which is what `ssl.h` requires of `*out`.
+                unsafe {
+                    *out = input.add(start);
+                    *out_len = len;
+                }
+                return sys::SSL_TLSEXT_ERR_OK;
             }
-            return sys::SSL_TLSEXT_ERR_OK;
         }
     }
     sys::SSL_TLSEXT_ERR_ALERT_FATAL
