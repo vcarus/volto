@@ -652,7 +652,6 @@ pub fn check_public_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Appends one PEM block, 64 base64 characters to a line.
 /// How many bytes [`pem_block`] writes for `der_len` bytes under `label`: the
 /// two boundary lines, and the base64 text in lines of 64 characters, each
 /// with its newline.
@@ -662,6 +661,7 @@ fn pem_block_len(label: &str, der_len: usize) -> usize {
     boundaries + text + text.div_ceil(64)
 }
 
+/// Appends one PEM block, 64 base64 characters to a line.
 pub(super) fn pem_block(out: &mut String, label: &str, der: &[u8]) {
     let text = Zeroizing::new(base64(der));
     out.push_str("-----BEGIN ");
@@ -704,8 +704,6 @@ pub(crate) fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    /// RFC 4648 §10: "BASE64("") = """, "BASE64("f") = "Zg=="" and the rest
-    /// of that list.
     /// The key file's text is written into a string sized for it before the
     /// first byte, so it is never moved to a larger buffer and no copy of the
     /// private key's base64 is left in a freed one.
@@ -718,6 +716,8 @@ mod tests {
         }
     }
 
+    /// RFC 4648 §10: "BASE64("") = """, "BASE64("f") = "Zg=="" and the rest
+    /// of that list.
     #[test]
     fn base64_matches_rfc_4648() {
         for (input, output) in [
