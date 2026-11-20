@@ -47,8 +47,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, TempDir, TestServer, bulk_alpn, client_endpoint,
-    is_version_negotiation, udp_answer, udp_answers,
+    ALLOW_PRIVATE, GATE_LOCALHOST, SharedBuffer, TempDir, TestServer, bulk_alpn,
+    client_endpoint, is_version_negotiation, udp_answer, udp_answers,
 };
 use quinn::ConnectionId;
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
@@ -2799,14 +2799,26 @@ async fn a_datagram_that_disagrees_with_itself_leaves_the_server_answering() {
 /// travels in Initial packets addressed to the server's connection ID, which
 /// the gate cannot open and passes, and ECH is kept across both (the
 /// provider's `a_hello_retry_request_keeps_ech`). Under `require_ech`.
+///
+/// The server's "TLS handshake complete" line says the retry happened: the
+/// group it names is X25519, which the client sent no share of in its first
+/// ClientHello. The key's config_id, 43, is used by no other test here, which
+/// is how the line is told apart from the lines of the tests beside it.
 #[tokio::test]
 async fn a_hello_retry_request_under_ech_completes_through_the_hold() {
-    let key = ech_key(7);
+    let log = SharedBuffer::shared("volto::tls=debug");
+    let key = ech_key(43);
     let (server, _keys) = ech_server(&key, true, &["localhost"]).await;
     let groups = [kx_group::SECP256R1MLKEM768, kx_group::X25519];
+    let mark = log.mark();
     handshake_with(&server, &Offer::Ech(key.config_list()), &groups)
         .await
         .expect("a handshake with a HelloRetryRequest completes under the hold");
+    let line = log
+        .wait_for_line(mark, &["TLS handshake complete", "ech_config_id=43 "])
+        .await;
+    assert!(line.contains("group=X25519 "), "{line}");
+    assert!(line.contains("ech_accepted=true"), "{line}");
 }
 
 /// `require_ech` is reloadable, like `expected_sni`: turning it on drops a

@@ -1616,6 +1616,18 @@ impl SharedBuffer {
         buffer
     }
 
+    /// [`Self::install`] for a binary in which more than one test reads the
+    /// log while the others run beside them.
+    ///
+    /// The first call installs the subscriber at `filter` and every call
+    /// returns that one buffer, so every caller in a binary passes the same
+    /// filter. Lines from every test of the binary land in it, so a test finds
+    /// its own by a field only its own server or client can produce.
+    pub fn shared(filter: &str) -> Self {
+        static SHARED: std::sync::OnceLock<SharedBuffer> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| Self::install(filter)).clone()
+    }
+
     /// Everything logged so far.
     pub fn contents(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("buffer lock")).into_owned()
