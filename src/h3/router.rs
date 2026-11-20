@@ -8,7 +8,6 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
@@ -20,7 +19,7 @@ use tracing::debug;
 
 use crate::datagram;
 
-use super::connection::{Handle, Shared};
+use super::connection::Shared;
 use super::error::{Code, Violation};
 
 /// Which way an inbound HTTP Datagram was dropped, and so which of [`Shared`]'s
@@ -572,7 +571,8 @@ impl Drop for DatagramReceiver {
     }
 }
 
-/// Decodes one QUIC datagram and delivers it, or ends the connection.
+/// Decodes one QUIC datagram and delivers it, or returns the violation that
+/// ends the connection.
 ///
 /// What happens to a datagram that cannot be delivered depends on *why*, and
 /// RFC 9297 §2.1 draws the lines:
@@ -599,7 +599,7 @@ impl Drop for DatagramReceiver {
 /// so a Quarter Stream ID past it cannot be told apart from a session that has
 /// already closed. For the same reason the hold cannot refuse such an id: it
 /// is bounded by its count and its hold time instead ([`EARLY_DATAGRAMS`]).
-pub(super) fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
+pub(super) fn route_datagram(shared: &Shared, datagram: Bytes) -> Result<(), Violation> {
     //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
     //# The largest legal QUIC stream ID value is 2^62-1, so the largest legal
     //# value of the Quarter Stream ID field is 2^60-1. Receipt of an HTTP/3
@@ -616,28 +616,26 @@ pub(super) fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()
     // acted on, so this is the one copy of them (D79).
     match datagram::decode(datagram) {
         Ok(decoded) => {
-            handle.shared.deliver(decoded);
-            ControlFlow::Continue(())
+            shared.deliver(decoded);
+            Ok(())
         }
 
-        // The two conditions RFC 9297 §2.1 states as MUST-close. Reported
-        // through `fail` like every other connection error in this layer, so
-        // the code on the wire and the reason the caller is given cannot
-        // disagree, and a datagram violation racing with a stream one ends the
-        // connection once, with whichever was first.
-        Err(error) if error.is_connection_error() => {
-            handle.fail(Violation::connection(
-                Code::H3_DATAGRAM_ERROR,
-                format!("an unusable HTTP datagram: {error}"),
-            ));
-            ControlFlow::Break(())
-        }
+        // The two conditions RFC 9297 §2.1 states as MUST-close. Returned
+        // for `serve_peer` to report through `fail` like every other
+        // connection error in this layer, so the code on the wire and the
+        // reason the caller is given cannot disagree, and a datagram violation
+        // racing with a stream one ends the connection once, with whichever
+        // was first.
+        Err(error) if error.is_connection_error() => Err(Violation::connection(
+            Code::H3_DATAGRAM_ERROR,
+            format!("an unusable HTTP datagram: {error}"),
+        )),
 
         Err(error) => {
             // The one malformation §2.1 does not make a connection error: a
             // datagram cut short of its Context ID. Dropped like the routing
             // misses in [`Shared::deliver`], and counted with them.
-            handle.shared.count_drop(DropKind::Malformed, |drops| {
+            shared.count_drop(DropKind::Malformed, |drops| {
                 debug!(
                     %error,
                     drops,
@@ -645,7 +643,7 @@ pub(super) fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()
                      count doubles"
                 )
             });
-            ControlFlow::Continue(())
+            Ok(())
         }
     }
 }

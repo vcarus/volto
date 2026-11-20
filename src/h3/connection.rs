@@ -637,7 +637,8 @@ async fn serve_peer(handle: Handle) {
                     }
                 };
 
-                if route_datagram(&handle, datagram).is_break() {
+                if let Err(violation) = route_datagram(&handle.shared, datagram) {
+                    handle.fail(violation);
                     return;
                 }
             }
