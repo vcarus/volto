@@ -29,7 +29,8 @@
 //! * [`capsule`]: the Capsule Protocol (RFC 9297 §3) incremental decoder.
 //! * [`datagram`]: HTTP Datagram payload coding (RFC 9297) and QUIC varints.
 //! * [`net`]: explicit name resolution and UDP socket setup.
-//! * [`logfmt`]: how an optional value is spelled in a log field.
+//! * [`logfmt`]: how a log field spells a value, and the bounds, escaping and
+//!   sampling applied to what a peer can put in a log line.
 //! * [`tunnel`]: request routing, the per-connection context and the tunnels.
 //!
 //! # Security status

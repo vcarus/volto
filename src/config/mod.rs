@@ -864,7 +864,7 @@ const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 pub const MAX_EXPECTED_SNI: usize = 253;
 
 impl Server {
-    /// The ALPN identifiers in the byte-vector form rustls expects.
+    /// The ALPN identifiers as byte vectors, the form the TLS provider takes.
     pub fn alpn_wire(&self) -> Vec<Vec<u8>> {
         self.alpn.iter().map(|p| p.as_bytes().to_vec()).collect()
     }
