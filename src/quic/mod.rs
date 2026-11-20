@@ -9,7 +9,7 @@ mod transport;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::gate::{Expected, Gate};
 use crate::shutdown::{self, Shutdown, Trigger};
-use crate::{conn, h3api};
+use crate::{conn, h3api, tunnel};
 
 pub use reload::ReloadHandle;
 pub use socket::FD_HEADROOM;
@@ -150,6 +150,9 @@ pub struct Server {
     /// time and never reloaded, because it is sized against the runtime the
     /// process was started with, which a `SIGHUP` cannot resize.
     resolver: crate::net::ResolverBudget,
+    /// The newest configuration generation a connection was accepted under,
+    /// so that [`Server::generation`] builds each one once.
+    generation: Mutex<Option<Arc<tunnel::Generation>>>,
     /// The host names the SNI gate admits, shared with the socket wrapper.
     ///
     /// Held here so [`Server::reload_handle`] can hand it on: the gate lives
@@ -259,6 +262,7 @@ impl Server {
             quic_config: Arc::new(RwLock::new(accepted_with)),
             roster: Roster::new(),
             resolver,
+            generation: Mutex::new(None),
             expected,
             swap: ConfigSwap::new(),
             trigger,
@@ -636,6 +640,23 @@ impl Server {
         (self.config(), incoming.accept_with(self.quic_config()))
     }
 
+    /// The [`tunnel::Generation`] of `config`: the one the previous accept
+    /// built when `config` is the same generation, else a new one, kept for
+    /// the next accept. Only the accept loop calls this, so the lock is never
+    /// contended.
+    fn generation(&self, config: Arc<Config>) -> Arc<tunnel::Generation> {
+        let mut newest = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(generation) = &*newest
+            && Arc::ptr_eq(&generation.config, &config)
+        {
+            return Arc::clone(generation);
+        }
+        Arc::clone(newest.insert(Arc::new(tunnel::Generation::new(config))))
+    }
+
     /// Runs one accepted connection to completion.
     ///
     /// Split out of the accept loop so it can be a `'static` future for the
@@ -690,11 +711,12 @@ impl Server {
         // credentials and policy it started with for its whole life. Anything else
         // would mean a tunnel's rules changing under it mid-transfer.
         let (config, accepted) = self.accept_under_the_swap(incoming);
+        let generation = self.generation(config);
 
         let shutdown = self.shutdown.clone();
-        let resolver = self.resolver.clone();
+        let resolver = self.resolver.per_connection();
 
-        let handshake_deadline = config.limits.max_idle_timeout();
+        let handshake_deadline = generation.config.limits.max_idle_timeout();
 
         // Entered here rather than inside the future: the accept loop decides
         // on the roster's length, and a slot that only appeared when the task
@@ -795,9 +817,9 @@ impl Server {
                     // would be logged as an error.
                     let handled = conn::handle(
                         quic,
-                        config,
+                        generation,
                         shutdown,
-                        &resolver,
+                        resolver,
                         tunnels.clone(),
                         dropped_datagrams.clone(),
                         authenticated,
@@ -1161,6 +1183,25 @@ pub(crate) mod tests {
         has_started.recv().expect("the reload thread started");
         std::thread::sleep(SETTLE);
         reloading
+    }
+
+    /// Connections accepted under one configuration generation share its
+    /// credentials and destination rules, and a reload's generation gets its
+    /// own.
+    #[tokio::test]
+    async fn a_generation_is_built_once_and_a_reload_builds_the_next() {
+        let bound = bound_server("");
+        let first = bound.server.generation(bound.server.config());
+        let again = bound.server.generation(bound.server.config());
+        assert!(Arc::ptr_eq(&first, &again), "one generation, one value");
+
+        bound
+            .server
+            .reload_handle()
+            .reload(&bound.config_path)
+            .expect("the reload succeeds");
+        let next = bound.server.generation(bound.server.config());
+        assert!(!Arc::ptr_eq(&first, &next), "a reload builds the next one");
     }
 
     /// The grace a reload raises is the grace the exit bound gets.

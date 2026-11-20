@@ -252,8 +252,10 @@ pub struct Context {
     /// with the HTTP/3 connection rather than copied from it, for the reason
     /// [`crate::h3::connection`] gives.
     pub peer_datagrams: Arc<AtomicBool>,
-    /// The credentials every request is checked against.
-    pub auth: Authenticator,
+    /// The configuration generation this connection was accepted under, for
+    /// the credentials every request is checked against and the destinations
+    /// this proxy may reach.
+    pub generation: Arc<Generation>,
     /// Authentication failures seen on this connection so far, bucketed by who
     /// they were aimed at.
     ///
@@ -293,8 +295,6 @@ pub struct Context {
     pub authenticated: AuthGate,
     /// The peer's address, for logs that a fail2ban rule can act on.
     pub remote: std::net::SocketAddr,
-    /// Which destinations this proxy may reach.
-    pub policy: Policy,
     /// How many tunnels this connection may hold open at once.
     pub quota: Quota,
     /// The bidirectional stream allowance this connection is granted once it
@@ -387,22 +387,50 @@ pub struct Context {
     datagram_room: quota::DatagramRoom,
 }
 
+/// One configuration generation as its connections use it: the configuration,
+/// and the credentials and destination rules built from it.
+///
+/// Built once per generation by [`crate::quic`] and shared by every connection
+/// accepted under it, so a server with many connections holds one copy of each
+/// configured password and of the denied-port list, not one per connection.
+pub struct Generation {
+    /// The configuration.
+    pub config: Arc<Config>,
+    /// The credentials every request is checked against.
+    pub auth: Authenticator,
+    /// Which destinations this proxy may reach.
+    pub policy: Policy,
+}
+
+impl Generation {
+    /// The generation of `config`.
+    pub fn new(config: Arc<Config>) -> Self {
+        Self {
+            auth: Authenticator::new(&config.auth),
+            policy: Policy::new(&config.security),
+            config,
+        }
+    }
+}
+
 impl Context {
     /// Builds the context for one accepted connection.
     ///
     /// `peer_datagrams` comes from the HTTP/3 connection, which keeps writing
-    /// to it. `tunnels` is the connection's tunnel counter and `authenticated`
-    /// its authentication flag, both created by [`crate::quic`] so that they
-    /// outlive this context: the first is read once the connection is over, the
-    /// second while it runs.
+    /// to it. `resolver` is this connection's own view of the server's
+    /// blocking-pool allowance. `tunnels` is the connection's tunnel counter
+    /// and `authenticated` its authentication flag, both created by
+    /// [`crate::quic`] so that they outlive this context: the first is read
+    /// once the connection is over, the second while it runs.
     pub fn new(
-        config: &Config,
+        generation: Arc<Generation>,
         quic: quinn::Connection,
         peer_datagrams: Arc<AtomicBool>,
-        resolver: &crate::net::ResolverBudget,
+        resolver: crate::net::ConnectionResolver,
         tunnels: Arc<AtomicU64>,
         authenticated: AuthGate,
     ) -> Self {
+        let config = &generation.config;
         Self {
             remote: quic.remote_address(),
             auth_failures: Mutex::new(AuthFailures::default()),
@@ -410,20 +438,19 @@ impl Context {
             authenticated,
             quic,
             peer_datagrams,
-            auth: Authenticator::new(&config.auth),
-            policy: Policy::new(&config.security),
             quota: Quota::new(config.limits.max_targets_per_conn),
             max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
             stall_budget: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
-            resolver: resolver.per_connection(),
+            resolver,
             ip_family_preference: config.limits.ip_family_preference,
             unanswered: quota::Unanswered::new(config.security.unanswered_packet_budget),
             policy_refusals: crate::logfmt::Sampler::new(),
             limit_refusals: crate::logfmt::Sampler::new(),
             unanswered_closures: crate::logfmt::Sampler::new(),
             datagram_room: quota::DatagramRoom::default(),
+            generation,
         }
     }
 
@@ -435,7 +462,7 @@ impl Context {
     /// [`Self::mark_authenticated`] and [`AuthFailures::record`].
     pub(crate) fn record_auth_failure(&self, username: Option<&str>) -> bool {
         self.auth_failures()
-            .record(&self.auth, username, self.max_auth_failures)
+            .record(&self.generation.auth, username, self.max_auth_failures)
     }
 
     /// Poisoning would mean a panic between the bucket writes in
@@ -786,7 +813,7 @@ pub(crate) async fn admit_target(
 ) -> Option<Vec<std::net::SocketAddr>> {
     let stream_id = stream.id();
 
-    if !ctx.policy.allows_port(port) {
+    if !ctx.generation.policy.allows_port(port) {
         debug!(stream_id, host, port, "target port denied by policy");
         refuse_because(stream, ProxyError::HttpRequestDenied).await;
         return None;
@@ -810,7 +837,7 @@ pub(crate) async fn admit_target(
         }
     };
 
-    let mut allowed = ctx.policy.allowed_addresses(&addresses);
+    let mut allowed = ctx.generation.policy.allowed_addresses(&addresses);
     let judged = allowed.len();
     allowed.retain(|address| !is_the_proxys_own(*address));
     if allowed.len() < judged {

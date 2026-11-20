@@ -20,7 +20,6 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::auth;
-use crate::config::Config;
 use crate::h3api::{self, FieldValue, Request, Status};
 use crate::logfmt::bounded;
 use crate::quic::AuthGate;
@@ -102,9 +101,10 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// is bounded by the stream clamp `quic::INITIAL_BIDI_STREAMS`, lifted by the
 /// same request.
 ///
-/// `resolver` is the server's blocking-pool allowance; the connection takes its
-/// own view of it here, which is what bounds the threads its name lookups can
-/// hold (D90).
+/// `generation` is the configuration the connection was accepted under, with
+/// the credentials and destination rules built from it. `resolver` is the
+/// connection's own view of the server's blocking-pool allowance, which bounds
+/// the threads its name lookups can hold (D90).
 ///
 /// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
 /// reason `tunnels` does: the accept loop reads it after this has been handed
@@ -114,9 +114,9 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// connection, whose datagram router is the thing that drops.
 pub async fn handle(
     quic: quinn::Connection,
-    config: Arc<Config>,
+    generation: Arc<tunnel::Generation>,
     mut shutdown: Shutdown,
-    resolver: &crate::net::ResolverBudget,
+    resolver: crate::net::ConnectionResolver,
     tunnels: Arc<AtomicU64>,
     dropped_datagrams: Arc<AtomicU64>,
     authenticated: AuthGate,
@@ -144,15 +144,14 @@ pub async fn handle(
     // `quic/transport.rs` puts in this connection's transport parameters. Why a
     // handshake needs a deadline of its own is on
     // `h3api::Connection::handshake`.
-    let mut connection =
-        h3api::Connection::handshake(quic, config.limits.max_idle_timeout(), dropped_datagrams)
-            .await?;
+    let idle = generation.config.limits.max_idle_timeout();
+    let mut connection = h3api::Connection::handshake(quic, idle, dropped_datagrams).await?;
 
     // The datagram flag handed to the context is the connection's own rather
     // than a copy of it; `crate::h3::connection`'s module documentation says
     // why.
     let context = Arc::new(Context::new(
-        &config,
+        generation,
         for_context,
         connection.peer_datagrams(),
         resolver,
@@ -163,8 +162,8 @@ pub async fn handle(
     let mut going_away = false;
     // The one idle timeout every peer-dependent write in this server gets; see
     // the GOAWAY arm below.
-    let goaway_within = config.limits.max_idle_timeout();
-    let silence = config.limits.max_idle_timeout() * SILENCE_FACTOR;
+    let goaway_within = idle;
+    let silence = idle * SILENCE_FACTOR;
     // Armed here and never again: the clock the peer is racing runs from the
     // moment it could first have sent a request.
     let deadline = tokio::time::Instant::now() + silence;
@@ -529,7 +528,7 @@ async fn authenticate(req: &Request, context: &Context, stream: &mut h3api::Stre
     // Before routing, not after: an unauthenticated client should not be able to
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT, TCP or UDP, has to pass through here.
-    match context.auth.authenticate(&req.fields) {
+    match context.generation.auth.authenticate(&req.fields) {
         // `None` is an open proxy (no users configured, as warned about at
         // startup): there is no check to pass, so the first request past this
         // point counts as having passed it. Otherwise every connection to an

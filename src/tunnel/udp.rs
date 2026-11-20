@@ -2029,10 +2029,11 @@ mod tests {
             crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
 
         let ctx = Context::new(
-            &config,
+            std::sync::Arc::new(crate::tunnel::Generation::new(std::sync::Arc::new(config))),
             ours,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
+            crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS)
+                .per_connection(),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             crate::quic::AuthGate::closed(),
         );

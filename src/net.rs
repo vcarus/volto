@@ -204,9 +204,10 @@ pub const fn blocking_pool_size(max_connections: u32) -> usize {
 
 /// The server's share of the blocking pool, handed out one connection at a time.
 ///
-/// Cloned into every connection, which is the whole design: what one connection
-/// can take away from the others is bounded, and what it keeps for itself
-/// cannot be taken by another connection. See [`ConnectionResolver`].
+/// Every connection gets its own view of it ([`ResolverBudget::per_connection`]),
+/// which is the whole design: what one connection can take away from the
+/// others is bounded, and what it keeps for itself cannot be taken by another
+/// connection. See [`ConnectionResolver`].
 #[derive(Clone, Debug)]
 pub struct ResolverBudget {
     /// The reserved allowance, [`reserved_lookups`] permits.
