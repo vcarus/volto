@@ -47,12 +47,19 @@ quinn = { version = "0.11", default-features = false, features = [
 # selects them.
 quinn-proto = { version = "0.11", default-features = false }
 # The crypto backend is aws-lc-rs rather than ring (D102). It is what rustls
-# enables by default upstream and the only provider that carries ML-KEM, so a
-# hybrid key exchange becomes a client-side question rather than a server
-# rebuild -- see D101. `prefer-post-quantum` is deliberately *not* enabled: it
-# only reorders the key exchange list, and a server picks from what the client
-# offers rather than proposing an order of its own, so enabling it would change
-# nothing here. X25519MLKEM768 is in `DEFAULT_KX_GROUPS` either way.
+# enables by default upstream and the only rustls provider that carries ML-KEM,
+# which the test clients need to offer X25519MLKEM768 the way Surge does.
+#
+# `prefer-post-quantum` is deliberately *not* enabled. It only reorders the
+# provider's `DEFAULT_KX_GROUPS`, and since D115 no handshake of the server reads
+# that list: the server's groups are `GROUPS` in `src/tls/awslc/mod.rs`, and
+# libssl takes the first of them in the client's own order. What the feature
+# would change is the test suite: every rustls client on the default provider
+# would offer X25519MLKEM768 first and send its key share, where it now offers
+# X25519 first. A test that wants the post-quantum order asks for it (`pq_first`
+# in `src/tls/awslc/tests.rs`), and `gate::nameless_crypto`, which builds the
+# gate tests' Initial packets, never reaches a key exchange. X25519MLKEM768 is
+# in `DEFAULT_KX_GROUPS` either way.
 #
 # `default-features = false` also keeps `tls12` off, which QUIC requires anyway;
 # with it off both providers reduce to the same three TLS 1.3 suites.
