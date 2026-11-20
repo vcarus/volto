@@ -1,4 +1,5 @@
-//! Property tests over the three hand-rolled parsers that read untrusted bytes.
+//! Property tests over the three hand-rolled parsers that read untrusted bytes,
+//! and over the destination policy's IPv6 forms that carry an IPv4 address.
 //!
 //! `datagram`, `capsule` and `tunnel::udp::parse_target` all decode input a peer
 //! controls, and all three are small enough that the interesting failures are
@@ -27,6 +28,7 @@
 mod props;
 
 use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use proptest::prelude::*;
@@ -39,6 +41,7 @@ use volto::capsule::{
 use volto::datagram::{
     self, CONTEXT_ID_UDP_PAYLOAD, DecodeError, MAX_QUARTER_STREAM_ID, MAX_UDP_PAYLOAD, VARINT_MAX,
 };
+use volto::policy::Policy;
 use volto::tunnel::udp::parse_target;
 
 /// The RFC 9298 §2 default template prefix.
@@ -981,4 +984,81 @@ fn template_ish_path() -> impl Strategy<Value = String> {
             }
         ),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// The destination policy over the IPv6 forms that carry an IPv4 address
+// ---------------------------------------------------------------------------
+
+/// The default policy and the one with private space open.
+fn policies() -> [Policy; 2] {
+    [false, true].map(|allow_private_networks| {
+        Policy::new(&volto::config::Security {
+            allow_private_networks,
+            ..Default::default()
+        })
+    })
+}
+
+/// The IPv4 addresses no setting opens, spelled out rather than read from the
+/// server: unspecified, broadcast and multicast.
+fn never_a_destination(v4: Ipv4Addr) -> bool {
+    v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast()
+}
+
+proptest! {
+    #![proptest_config(config(1024))]
+
+    /// The IPv4-mapped form and the well-known NAT64 prefix get exactly the
+    /// verdict of the IPv4 address they carry, under both settings. Both lie
+    /// inside `::/8`, and its row must not shadow either (R6-L5).
+    #[test]
+    fn the_mapped_form_and_nat64_are_judged_as_their_ipv4(octets in any::<[u8; 4]>()) {
+        let v4 = Ipv4Addr::from(octets);
+        let [a, b, c, d] = octets.map(u16::from);
+        let mapped = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, (a << 8) | b, (c << 8) | d);
+        let nat64 = Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, (a << 8) | b, (c << 8) | d);
+
+        for policy in policies() {
+            let expected = policy.allows_address(IpAddr::V4(v4));
+            prop_assert_eq!(policy.allows_address(IpAddr::V6(mapped)), expected, "{}", mapped);
+            prop_assert_eq!(policy.allows_address(IpAddr::V6(nat64)), expected, "{}", nat64);
+        }
+    }
+
+    /// The IPv4-translated form of RFC 2765, `::ffff:0:a.b.c.d`, is refused by
+    /// default whatever it carries, and with private space open it is refused
+    /// exactly when what it carries is never a destination (R6-L5).
+    #[test]
+    fn the_translated_form_is_private_and_keeps_the_never_bucket(octets in any::<[u8; 4]>()) {
+        let v4 = Ipv4Addr::from(octets);
+        let [a, b, c, d] = octets.map(u16::from);
+        let translated = Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, (a << 8) | b, (c << 8) | d);
+        let [strict, permissive] = policies();
+
+        prop_assert!(!strict.allows_address(IpAddr::V6(translated)), "{}", translated);
+        prop_assert_eq!(
+            permissive.allows_address(IpAddr::V6(translated)),
+            !never_a_destination(v4),
+            "{} carries {}", translated, v4
+        );
+    }
+
+    /// Every other address in `::/8` is refused by default: the first octet is
+    /// zero, and the address is neither IPv4-mapped nor in `64:ff9b::/96`.
+    #[test]
+    fn the_rest_of_the_reserved_block_is_refused_by_default(
+        segments in any::<[u16; 8]>().prop_map(|mut segments| {
+            segments[0] &= 0x00ff;
+            segments
+        })
+    ) {
+        let address = Ipv6Addr::from(segments);
+        let mapped = segments[..5] == [0; 5] && segments[5] == 0xffff;
+        let nat64 = segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0];
+        prop_assume!(!mapped && !nat64);
+
+        let [strict, _] = policies();
+        prop_assert!(!strict.allows_address(IpAddr::V6(address)), "{}", address);
+    }
 }

@@ -242,6 +242,30 @@ async fn special_purpose_and_transition_addresses_are_prohibited_by_default() {
     }
 }
 
+/// The IPv4-translated form of RFC 2765 (`::ffff:0:a.b.c.d`) and the rest of
+/// `::/8` are refused by default, at the wire (R6-L5).
+///
+/// `::ffff:0:7f00:1` is 127.0.0.1 in the translated form, which
+/// `to_canonical` does not unwrap. The connect budget is pinned low so that,
+/// should the policy let one through, the answer is a prompt gateway error and
+/// not the 403 asserted here.
+#[tokio::test]
+async fn the_translated_form_and_the_reserved_block_are_prohibited_by_default() {
+    let server = TestServer::start_with("[limits]\nconnect_timeout = 1\n").await;
+    let target = spawn_echo_target().await;
+    let mut client = H3Client::connect(&server).await;
+
+    for authority in [
+        format!("[::ffff:0:7f00:1]:{}", target.port()),
+        format!("[::ffff:0:127.0.0.1]:{}", target.port()),
+        "[::1:0:0:0]:443".to_owned(),
+        "[64:ff9b:2::1]:443".to_owned(),
+    ] {
+        let response = respond_to(&mut client, connect_request(&authority)).await;
+        assert_refused(&response, Status::FORBIDDEN, "destination_ip_prohibited");
+    }
+}
+
 /// The other half: the switch reaches them like any other private range.
 ///
 /// "Reachable" is asserted as "not refused by this proxy", and deliberately no

@@ -16,7 +16,9 @@
 //! 127.0.0.1, while a naive matcher sees an IPv6 address that matches none of the
 //! IPv4 rules. Every check therefore starts by canonicalizing
 //! ([`canonical`]). The deprecated `::/96` compatible range is not canonicalized:
-//! its row in `PRIVATE_PREFIXES` refuses it whole.
+//! its row in `PRIVATE_PREFIXES` refuses it whole. Nor is the IPv4-translated
+//! `::ffff:0:0:0/96`, which its row refuses whole by default; see
+//! `translated_ipv4`.
 //!
 //! # Two buckets
 //!
@@ -160,10 +162,42 @@ pub fn canonical(ip: IpAddr) -> IpAddr {
 ///
 /// Not affected by `allow_private_networks`: these are not unicast destinations,
 /// and a proxy that forwards to them is an amplifier (RFC 9298 §7).
+///
+/// An IPv4-translated address is judged here by the IPv4 address it names as
+/// well, so the switch cannot open one that names a multicast, broadcast or
+/// unspecified address; [`translated_ipv4`] says why it is not unwrapped.
 fn is_never_allowed(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast(),
-        IpAddr::V6(v6) => v6.is_unspecified() || v6.is_multicast(),
+        IpAddr::V4(v4) => is_never_allowed_v4(v4),
+        IpAddr::V6(v6) => {
+            v6.is_unspecified()
+                || v6.is_multicast()
+                || translated_ipv4(v6).is_some_and(is_never_allowed_v4)
+        }
+    }
+}
+
+/// The IPv4 half of [`is_never_allowed`].
+fn is_never_allowed_v4(v4: Ipv4Addr) -> bool {
+    v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast()
+}
+
+/// The IPv4 address an IPv4-translated address (RFC 2765 §2.1) names, if `v6`
+/// is one.
+///
+/// The form is `::ffff:0:a.b.c.d`, segments `[0, 0, 0, 0, 0xffff, 0, hi, lo]`,
+/// one segment along from the IPv4-mapped form that [`canonical`] unwraps. It
+/// is not unwrapped like the transition forms in [`routed_form`], because its
+/// row in [`PRIVATE_PREFIXES`] refuses it whole by default, a public address
+/// included, and judging it by the address it names would let that one
+/// through. Only [`is_never_allowed`] reads it, which is the one verdict where
+/// the address it names is the stricter judge.
+fn translated_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    match v6.segments() {
+        [0, 0, 0, 0, 0xffff, 0, hi, lo] => {
+            Some(Ipv4Addr::from_bits((u32::from(hi) << 16) | u32::from(lo)))
+        }
+        _ => None,
     }
 }
 
@@ -287,14 +321,17 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// multicast, which no switch opens), and the transition forms [`routed_form`]
 /// unwraps before this table is consulted (IPv4-mapped, the well-known NAT64
 /// prefix, 6to4 and Teredo), since those are judged by the IPv4 address they
-/// carry rather than matched as a prefix.
+/// carry rather than matched as a prefix. The order of the rows does not
+/// decide a verdict, since every row gives the same one; the more specific rows
+/// come first so that a reader meets the reason for an address before the
+/// `::/8` row that covers it as well.
 const PRIVATE_PREFIXES: &[Prefix] = &[
     // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from RFC 1122).
     // Only the all-zero address at the bottom of the block is
     // `is_never_allowed`, and that check runs first; the rest of it is a source
     // address a host uses before it has one, never a destination.
     v4([0, 0, 0, 0], 8, "This host on this network", "RFC 1122"),
-    // Loopback. `::1` also lies inside the `::/96` row below.
+    // Loopback. `::1` also lies inside the `::/96` and `::/8` rows below.
     v4([127, 0, 0, 0], 8, "Loopback", "RFC 1122"),
     v6(
         &[0, 0, 0, 0, 0, 0, 0, 1],
@@ -471,6 +508,23 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // unspecified address is in here too, but `is_never_allowed` has already
     // claimed it.
     v6(&[], 96, "IPv4-compatible (deprecated)", "RFC 4291"),
+    // `::ffff:0:0:0/96`, the IPv4-translated form, RFC 2765 §2.1: "An address
+    // of the form 0::ffff:0:a.b.c.d which refers to an IPv6-enabled node."
+    // Segments `[0, 0, 0, 0, 0xffff, 0, hi, lo]`, so `to_canonical`, which
+    // needs `0xffff` in segment 5, leaves it as IPv6. Nothing routes it to
+    // IPv4 unless a translator is configured with that prefix, so it is
+    // refused whole, whatever it carries; `translated_ipv4` says how the
+    // never-allowed bucket still reads what it carries.
+    v6(&[0, 0, 0, 0, 0xffff], 96, "IPv4-translated", "RFC 2765"),
+    // `::/8`, which the IANA IPv6 address space registry lists as "Reserved by
+    // IETF" (RFC 4291). Last, because everything in it that has a meaning is
+    // decided by a more specific rule: `::` by `is_never_allowed`, `::1`,
+    // `::/96`, `::ffff:0:0:0/96` and `64:ff9b:1::/48` by their rows above, and
+    // the IPv4-mapped `::ffff:0:0/96` and the well-known NAT64 `64:ff9b::/96`
+    // by `routed_form`, which turns them into IPv4 before this table is read,
+    // so this row never meets them. The rest is unallocated, and nothing
+    // routes it.
+    v6(&[], 8, "Reserved by IETF", "RFC 4291"),
 ];
 
 /// The IPv4 address an IPv6 transition address carries, if it carries one.
@@ -1155,6 +1209,78 @@ mod tests {
                 !policy.allows_address(ip(address)),
                 "{address} is deprecated IPv4-compatible space and must be denied"
             );
+        }
+    }
+
+    /// The IPv4-translated form of RFC 2765 §2.1, `::ffff:0:a.b.c.d`, and the
+    /// rest of `::/8` are private (R6-L5).
+    ///
+    /// The translated form is segments `[0, 0, 0, 0, 0xffff, 0, hi, lo]`:
+    /// `to_canonical` leaves it alone because segment 4, not segment 5, is
+    /// `0xffff`. It is refused whatever it carries, a public address included,
+    /// and under the switch an address it carries that is never a destination
+    /// stays refused, as for the forms `routed_form` unwraps.
+    #[test]
+    fn the_translated_form_and_the_rest_of_the_reserved_block_are_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for address in [
+            "::ffff:0:7f00:1",                       // translated 127.0.0.1
+            "::ffff:0:127.0.0.1",                    // the same, dotted
+            "::ffff:0:a00:1",                        // translated 10.0.0.1
+            "::ffff:0:5db8:d822",                    // translated 93.184.216.34
+            "::1:0:0:0",                             // outside ::/96, inside ::/8
+            "64:ff9b:2::1",                          // outside both NAT64 prefixes
+            "ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", // the last address of ::/8
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is inside ::/8 and must be refused by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+
+        for address in [
+            "::ffff:0:0:0",       // translated 0.0.0.0
+            "::ffff:0:e000:1",    // translated 224.0.0.1
+            "::ffff:0:ffff:ffff", // translated 255.255.255.255
+        ] {
+            for policy in [&strict, &permissive] {
+                assert!(
+                    !policy.allows_address(ip(address)),
+                    "{address} carries an address that is never a destination"
+                );
+            }
+        }
+    }
+
+    /// The new rows shadow neither the mapped form nor the well-known NAT64
+    /// prefix, which both lie inside `::/8` and are judged by the IPv4 address
+    /// they carry before the table is read.
+    #[test]
+    fn the_reserved_block_shadows_neither_the_mapped_form_nor_nat64() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for (address, carried) in [
+            ("::ffff:93.184.216.34", "93.184.216.34"),
+            ("::ffff:5db8:d822", "93.184.216.34"),
+            ("64:ff9b::5db8:d822", "93.184.216.34"),
+            ("64:ff9b::808:808", "8.8.8.8"),
+        ] {
+            assert_eq!(routed_form(ip(address)), ip(carried), "{address}");
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} carries the public {carried} and must stay reachable"
+            );
+        }
+        for address in ["::ffff:127.0.0.1", "64:ff9b::7f00:1"] {
+            assert!(!strict.allows_address(ip(address)), "{address}");
+            assert!(permissive.allows_address(ip(address)), "{address}");
         }
     }
 

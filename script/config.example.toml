@@ -296,8 +296,9 @@ initial_rtt_ms = 150
 # 203.0.113.0/24, 2001:db8::/32 and 3fff::/20), 6to4 relay anycast
 # (192.88.99.0/24), reserved space (240.0.0.0/4), the discard-only prefix
 # 100::/64, the dummy prefix 100:0:0:1::/64, the SRv6 SID block (5f00::/16), the
-# local-use NAT64 prefix 64:ff9b:1::/48 and the deprecated IPv4-compatible ::/96
-# (stacks that still honour it route ::127.0.0.1 to loopback).
+# local-use NAT64 prefix 64:ff9b:1::/48, the deprecated IPv4-compatible ::/96
+# (stacks that still honour it route ::127.0.0.1 to loopback), the
+# IPv4-translated ::ffff:0:0:0/96 and the rest of the IETF-reserved ::/8.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust

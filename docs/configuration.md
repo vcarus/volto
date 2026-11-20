@@ -556,7 +556,7 @@ family, an IP literal above all, is unaffected by any of the three.
 
 ### Ranges refused unless `allow_private_networks` is on
 
-Each range is refused with a 403 while `allow_private_networks` is `false`. An IPv6 transition address (IPv4-mapped, the well-known NAT64 prefix, 6to4, Teredo) is first replaced by the IPv4 address it carries and then judged by these rows.
+Each range is refused with a 403 while `allow_private_networks` is `false`. An IPv6 transition address (IPv4-mapped, the well-known NAT64 prefix, 6to4, Teredo) is first replaced by the IPv4 address it carries and then judged by these rows, so the `::/8` row below never meets the IPv4-mapped `::ffff:0:0/96` or the well-known `64:ff9b::/96` inside it.
 
 | Range | What it is | Source | Note |
 |---|---|---|---|
@@ -580,6 +580,8 @@ Each range is refused with a 403 while `allow_private_networks` is `false`. An I
 | `5f00::/16` | SRv6 SIDs | RFC 9602 |  |
 | `64:ff9b:1::/48` | Local-use NAT64 | RFC 8215 | Refused whole, because the position of the embedded IPv4 address is the operator's choice |
 | `::/96` | IPv4-compatible, deprecated | RFC 4291 | Stacks that still honour it route `::127.0.0.1` to loopback, which would otherwise be a second way around the IPv4 rules |
+| `::ffff:0:0:0/96` | IPv4-translated | RFC 2765 | `::ffff:0:a.b.c.d`, one segment along from the IPv4-mapped form. Refused whole, whatever it carries; with `allow_private_networks` on, one that carries an unspecified, broadcast or multicast address is still refused |
+| `::/8` | Reserved by IETF | RFC 4291 | The rest of the block, after the rows above and the transition forms that are judged as IPv4 |
 
 ### The SNI gate
 
