@@ -699,6 +699,35 @@ fn an_unknown_argument_fails_differently_from_an_unknown_key() {
     );
 }
 
+/// `ech-keygen` with the public name `public.example`, writing its key to
+/// `out`.
+fn keygen(out: &Path) -> Output {
+    run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--out",
+        out.to_str().unwrap(),
+    ])
+}
+
+/// Adds `server.ech_key = key` to the configuration file at `config`, which
+/// [`write_config`] wrote.
+fn add_ech_key(config: &Path, key: &Path) {
+    let text = fs::read_to_string(config).expect("the config");
+    let text = text.replacen(
+        "\n\n[auth]",
+        &format!("\nech_key = \"{}\"\n\n[auth]", key.display()),
+        1,
+    );
+    assert_ne!(
+        fs::read_to_string(config).expect("the config"),
+        text,
+        "the config has an [auth] table to put the key ahead of"
+    );
+    fs::write(config, text).expect("rewrite the config");
+}
+
 /// Standard padded base64 (RFC 4648 §4), decoded by hand: this binary links
 /// the standard library and nothing of volto's.
 fn base64_decode(text: &str) -> Vec<u8> {
@@ -793,13 +822,7 @@ fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
     assert_eq!(printed.status.code(), Some(0), "{}", stderr_of(&printed));
     assert_eq!(stdout_of(&printed).trim(), list);
 
-    let again = run(&[
-        "ech-keygen",
-        "--public-name",
-        "public.example",
-        "--out",
-        key_arg,
-    ]);
+    let again = keygen(&key);
     assert_eq!(again.status.code(), Some(1));
     assert!(
         stderr_of(&again).contains("never replaced"),
@@ -833,38 +856,17 @@ fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
 fn the_check_refuses_a_bad_ech_key_file_by_the_name_of_its_key() {
     let dir = config_dir("ech-check");
     let key = dir.join("ech.pem");
-    let written = run(&[
-        "ech-keygen",
-        "--public-name",
-        "public.example",
-        "--out",
-        key.to_str().unwrap(),
-    ]);
+    let written = keygen(&key);
     assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
 
     let path = write_config(&dir, "127.0.0.1:4433", "");
-    let with_key = |file: &Path| {
-        let text = fs::read_to_string(&path).expect("the config");
-        let text = text.replacen(
-            "\n\n[auth]",
-            &format!("\nech_key = \"{}\"\n\n[auth]", file.display()),
-            1,
-        );
-        fs::write(&path, text).expect("rewrite the config");
-    };
-    with_key(&key);
+    add_ech_key(&path, &key);
     let checked = run(&["--check-config", "--config", path.to_str().unwrap()]);
     assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
 
     // The private key of one file with the ECHConfig of another.
     let other = dir.join("other.pem");
-    let generated = run(&[
-        "ech-keygen",
-        "--public-name",
-        "public.example",
-        "--out",
-        other.to_str().unwrap(),
-    ]);
+    let generated = keygen(&other);
     assert_eq!(generated.status.code(), Some(0));
     let mine = fs::read_to_string(&key).expect("key");
     let theirs = fs::read_to_string(&other).expect("other");
@@ -880,7 +882,7 @@ fn the_check_refuses_a_bad_ech_key_file_by_the_name_of_its_key() {
     fs::write(&mixed, format!("{private}{config}")).expect("write the mixed file");
 
     let path = write_config(&dir, "127.0.0.1:4433", "");
-    with_key(&mixed);
+    add_ech_key(&path, &mixed);
     let refused = run(&["--check-config", "--config", path.to_str().unwrap()]);
     assert_eq!(refused.status.code(), Some(1), "{}", stdout_of(&refused));
     let stderr = stderr_of(&refused);
@@ -946,21 +948,9 @@ fn the_check_refuses_require_ech_without_an_ech_key() {
     );
 
     let key = dir.join("ech.pem");
-    let written = run(&[
-        "ech-keygen",
-        "--public-name",
-        "public.example",
-        "--out",
-        key.to_str().unwrap(),
-    ]);
+    let written = keygen(&key);
     assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
-    let text = fs::read_to_string(&path).expect("the config");
-    let text = text.replacen(
-        "\n\n[auth]",
-        &format!("\nech_key = \"{}\"\n\n[auth]", key.display()),
-        1,
-    );
-    fs::write(&path, text).expect("rewrite the config");
+    add_ech_key(&path, &key);
     let checked = run(&["--check-config", "--config", path.to_str().unwrap()]);
     assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
 }
