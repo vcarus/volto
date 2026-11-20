@@ -338,6 +338,14 @@ impl Names {
             .iter()
             .any(|held| held.eq_ignore_ascii_case(name))
     }
+
+    /// Whether `name`, as a ClientHello carried it, is one of them: a name
+    /// that is not UTF-8 is on no list, and any other is judged by
+    /// [`Names::accepts`]. The rule both of the gate's judgements apply to a
+    /// `server_name`.
+    pub fn accepts_bytes(&self, name: &[u8]) -> bool {
+        std::str::from_utf8(name).is_ok_and(|text| self.accepts(text))
+    }
 }
 
 /// `name` without its trailing root dot, which is the same name spelled
@@ -1020,13 +1028,11 @@ impl Judge {
             FirstFlight::Truncated => Verdict::Pass,
             FirstFlight::NotAClientHello => Verdict::Refuse(Refusal::NotClientHello),
             FirstFlight::Anonymous => Verdict::Refuse(Refusal::Anonymous),
-            FirstFlight::Named(name) => match std::str::from_utf8(name) {
-                Ok(text) if expected.accepts(text) => Verdict::Pass,
-                // The name is borrowed from the frames this function decrypted
-                // and drops on return, so the refusal takes the copy the pass
-                // path does not need.
-                _ => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
-            },
+            FirstFlight::Named(name) if expected.accepts_bytes(name) => Verdict::Pass,
+            // The name is borrowed from the frames this function decrypted and
+            // drops on return, so the refusal takes the copy the pass path
+            // does not need.
+            FirstFlight::Named(name) => Verdict::Refuse(Refusal::OtherName(name.to_vec())),
         }
     }
 
@@ -1866,6 +1872,17 @@ mod tests {
         assert!(!names.accepts("www.example.com"));
         assert!(!names.accepts("example.co"));
         assert!(!names.accepts(""));
+    }
+
+    /// A name as a ClientHello carried it is judged as text, and a name that
+    /// is not UTF-8 is on no list.
+    #[test]
+    fn a_name_in_bytes_is_judged_as_the_same_text() {
+        let names = Names::new(&["example.com".to_owned()]);
+        assert!(names.accepts_bytes(b"EXAMPLE.com."));
+        assert!(!names.accepts_bytes(b"www.example.com"));
+        assert!(!names.accepts_bytes(b"example.com\xff"));
+        assert!(!names.accepts_bytes(b""));
     }
 
     /// One dot and no more, which is what makes the four callers agree.

@@ -748,10 +748,8 @@ fn judge(
         Ech::Absent if policy.names.is_empty() => Ok(()),
         Ech::Absent => match hello::server_name(body) {
             None => Err(Dropped::Anonymous),
-            Some(name) => match std::str::from_utf8(name) {
-                Ok(text) if policy.names.accepts(text) => Ok(()),
-                _ => Err(Dropped::OtherName(name.to_vec())),
-            },
+            Some(name) if policy.names.accepts_bytes(name) => Ok(()),
+            Some(name) => Err(Dropped::OtherName(name.to_vec())),
         },
     })
 }
