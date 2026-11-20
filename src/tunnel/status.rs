@@ -421,23 +421,15 @@ pub(crate) async fn refuse_unreachable(stream: &mut Stream, failure: &Unreachabl
 /// The write is bounded by one QUIC idle timeout and a lapsed one is abandoned
 /// with a reset; [`respond`] carries the reasoning.
 pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fields) {
-    let stream_id = stream.id();
-    stream.stop_receiving(h3api::NO_ERROR);
-
-    if !respond(stream, status, fields, "failed to send error response")
-        .await
-        .landed(
-            stream_id,
-            status,
-            "gave up on an error response the peer would not take",
-        )
-    {
-        return;
-    }
-
-    if let Err(error) = stream.finish() {
-        debug!(stream_id, %error, "failed to finish error response");
-    }
+    answer_then_finish(
+        stream,
+        status,
+        fields,
+        "failed to send error response",
+        "gave up on an error response the peer would not take",
+        "failed to finish error response",
+    )
+    .await;
 }
 
 /// Accepts a request with a 200 and closes the tunnel again immediately.
@@ -484,27 +476,43 @@ pub(crate) async fn refuse_with(stream: &mut Stream, status: Status, fields: Fie
 /// comparison showed it resets within a round trip either way. That fault is
 /// on the client's side and does not depend on what this close sends.
 pub(crate) async fn accept_then_close(stream: &mut Stream, fields: Fields) {
-    let stream_id = stream.id();
-    stream.stop_receiving(h3api::NO_ERROR);
-
-    let sent = respond(
+    answer_then_finish(
         stream,
         Status::OK,
         fields,
         "failed to send 200 for a tunnel closed on the spot",
+        "gave up on a 200 the peer would not take for a tunnel closed on the spot",
+        "failed to close a tunnel after its 200",
     )
     .await;
+}
 
-    if !sent.landed(
-        stream_id,
-        Status::OK,
-        "gave up on a 200 the peer would not take for a tunnel closed on the spot",
-    ) {
+/// Tells the client to stop sending, answers with `status` and `fields`, and
+/// finishes the stream: the close [`refuse_with`] and [`accept_then_close`]
+/// share.
+///
+/// The three strings are the caller's debug lines for a write that failed, a
+/// write that lapsed, and a FIN that could not be queued.
+async fn answer_then_finish(
+    stream: &mut Stream,
+    status: Status,
+    fields: Fields,
+    failed: &'static str,
+    gave_up: &'static str,
+    unfinished: &'static str,
+) {
+    let stream_id = stream.id();
+    stream.stop_receiving(h3api::NO_ERROR);
+
+    if !respond(stream, status, fields, failed)
+        .await
+        .landed(stream_id, status, gave_up)
+    {
         return;
     }
 
     if let Err(error) = stream.finish() {
-        debug!(stream_id, %error, "failed to close a tunnel after its 200");
+        debug!(stream_id, %error, "{unfinished}");
     }
 }
 
