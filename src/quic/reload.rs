@@ -29,13 +29,10 @@ use super::transport::transport_config;
 /// reads and hands a copy to `Endpoint::set_server_config`, so the new numbers
 /// apply to every connection this process accepts from then on.
 ///
-/// The endpoint's copy governs a different thing. quinn-proto 0.11.x reads it as
-/// a connection's first Initial arrives, to derive the Initial keys and to
-/// validate an address-validation token, and copies it into the buffer it keeps
-/// for that pending `Incoming`, where it is what seals a Retry. It is not what
-/// the handshake runs on: `Incoming::accept_with` replaces it with the one the
-/// slot holds, which is what keeps the transport parameters and the live
-/// [`Config`] on one side of a reload (D22).
+/// The endpoint's copy governs the pending path: quinn-proto reads it as a
+/// connection's first Initial arrives, for the Initial keys, token validation
+/// and the Retry seal. The handshake runs on the slot's copy instead; see
+/// [`Server::accept_under_the_swap`].
 ///
 /// Connections already open keep the transport parameters they negotiated at
 /// handshake time. QUIC has no way to renegotiate them mid-connection, so this
@@ -73,17 +70,12 @@ pub(super) type LiveConfig = Arc<RwLock<Arc<Config>>>;
 ///
 /// The transport parameters and the TLS identity, kept beside the endpoint's own
 /// copy rather than read back out of it, because quinn exposes no getter and
-/// because the endpoint's copy is not what an accept has to use: since
-/// quinn-proto 0.11.18 a pending `Incoming` carries the configuration the
-/// endpoint held when its first Initial arrived, which is one generation too old
-/// whenever a `SIGHUP` lands in between. [`Server::accept_under_the_swap`] reads
-/// this slot and hands what it finds to `Incoming::accept_with`, so the accepted
-/// connection runs on the same generation as the live [`Config`] beside it.
+/// because the endpoint's copy may be a generation old by the time a connection
+/// is accepted ([`Server::accept_under_the_swap`] says why).
 ///
-/// The same `RwLock` shape as [`LiveConfig`], for the same reasons: one read per
-/// accepted connection, one write per `SIGHUP`, and the guard held only long
-/// enough to clone the `Arc`. `quinn::ServerConfig` is a set of `Arc`s, so both
-/// the clone into this slot and the clone out of it are a few reference counts.
+/// The same `RwLock` shape as [`LiveConfig`], for the same reasons.
+/// `quinn::ServerConfig` is a set of `Arc`s, so both clones are a few reference
+/// counts.
 pub(super) type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
 
 /// Serialises everything that decides what a new connection is accepted with.
@@ -106,13 +98,7 @@ pub(super) type LiveQuicConfig = Arc<RwLock<Arc<quinn::ServerConfig>>>;
 /// Three callers take it. `reload` holds it across the latch read and all four
 /// writes, `drain` across its own `set_server_config(None)`, and
 /// [`Server::accept_under_the_swap`] across the pair of reads that decide what
-/// one new connection runs on. The third closes the second race rather than
-/// narrowing it, because both of those reads are reads this process makes.
-/// The first is the live [`Config`]. The second is [`LiveQuicConfig`], which
-/// `Incoming::accept_with` then uses in place of the copy quinn-proto 0.11.x
-/// pinned to the connection when its first Initial arrived. Nothing about the
-/// accepted connection is decided by a read the endpoint driver makes on its own
-/// (D22, addendum of 2026-09-17).
+/// one new connection runs on, which closes the second race (D22).
 ///
 /// A `std::sync::Mutex<()>` because there is nothing to protect but the order:
 /// the values themselves each have their own lock. It is never held across an
@@ -202,12 +188,8 @@ impl ReloadHandle {
         // it accepts. The strings are logged after the swap.
         let warnings = config.warnings();
 
-        // One value, two homes. `Server::accept_under_the_swap` reads the slot
-        // and `Incoming::accept_with` uses what it finds, while the endpoint's
-        // own copy governs the pending path: as a first Initial arrives it
-        // derives the Initial keys and validates an address-validation token,
-        // and quinn-proto 0.11.x pins it to that connection, where it seals a
-        // Retry. Built here so the two cannot be two different configurations.
+        // One value for the slot and the endpoint's copy (see
+        // `server_config`), so the two cannot be two different configurations.
         let accepted_with = Arc::new(quic_config);
 
         // Everything from the latch read to the last write is one step, and the
@@ -254,26 +236,15 @@ impl ReloadHandle {
         // libssl sends retry configs only when it holds ECH keys, so that
         // handshake carries no ECHConfigList either.
         //
-        // No connection depends on the order of the live `Config` and the slot:
-        // `Server::accept_under_the_swap` takes this lock across both of the
-        // reads a new connection makes, so an accept cannot land between the
-        // two writes. New users go before new transport parameters so the order
-        // reads the same way as the gate's: the half that decides who gets in
-        // goes first.
-        //
-        // Two of the four writes are read in the endpoint driver, which never
-        // takes the swap: `Gate::poll_recv` reads the gate's list on every
-        // receive batch, and quinn-proto reads the endpoint's configuration
-        // when a first Initial arrives. Their order is the one a connection can
-        // see, and it is the order the first paragraph gives: the list before
-        // the endpoint's configuration. The slot is read only under the swap, so
-        // its place between them changes nothing a connection sees.
-        // `set_server_config` goes after it so that the endpoint never holds a
-        // configuration the slot does not hold yet. The live `Config` is also
-        // read outside the swap, by `admit` for the connection cap and by
-        // `Server::shutdown_grace`, but each of those reads one key and does
-        // not compare it with any of the other three values, so the order of
-        // the writes does not change what they see.
+        // The live `Config` and the slot are read only under the swap, so their
+        // order changes nothing a connection sees; users go first so the order
+        // reads like the gate's. `set_server_config` goes after the slot so the
+        // endpoint never holds a configuration the slot does not hold yet.
+        // Outside the swap, `Gate::poll_recv` and quinn-proto's first-Initial
+        // read see the gate's list before the endpoint's configuration, the
+        // order the first paragraph gives. `admit` and `Server::shutdown_grace`
+        // each read one key of the live `Config` and compare it with nothing
+        // else, so the order does not change what they see.
         self.expected.set(policy);
         *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
         *self
