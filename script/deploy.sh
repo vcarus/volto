@@ -238,7 +238,7 @@ cleanup() {
 # step instead: the directory holds the pid of the run that made it, and a
 # directory whose run no longer exists is taken over. An empty pid file counts
 # as held, since it is what a run that has made the directory and not yet
-# written its pid leaves.
+# written its pid leaves, and so does a pid file that is not a number.
 acquire_lock() {
     local holder
 
@@ -250,6 +250,7 @@ acquire_lock() {
     fi
     if ! mkdir "$LOCK.d" 2>/dev/null; then
         holder="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
+        case "$holder" in ''|*[!0-9]*) holder="" ;; esac
         if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
             die "another run of this script holds $LOCK.d -- wait for it to finish, or remove the directory if no run is active"
         fi
