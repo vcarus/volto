@@ -47,8 +47,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, SharedBuffer, TempDir, TestServer, bulk_alpn,
-    client_endpoint, is_version_negotiation, udp_answer, udp_answers,
+    ALLOW_PRIVATE, GATE_LOCALHOST, SharedBuffer, TempDir, TestServer, bulk_alpn, client_endpoint,
+    is_version_negotiation, udp_answer, udp_answers,
 };
 use quinn::ConnectionId;
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
@@ -2877,6 +2877,65 @@ const HOLD_FUZZ_DCIDS: [[u8; 8]; 4] = [CLIENT_CID, [0xa1; 8], [0xa2; 8], [0xa3; 
 /// The record header bit that makes a record's body frames to seal.
 const HOLD_FUZZ_SEALED: u8 = 0x04;
 
+/// One step of a record's time field, in milliseconds.
+const HOLD_FUZZ_STEP_MS: u64 = 100;
+
+/// The source port of address index 0; the other three follow it.
+const HOLD_FUZZ_PORT_BASE: u16 = 40_000;
+
+/// The input format above is a copy of the one `fuzz/fuzz_targets/hold.rs`
+/// reads, and a seed is only worth what that copy agrees with. So the
+/// target's source must still carry every line the copy depends on: its key,
+/// its connection IDs, its header bits, its time step, its source ports, its
+/// policy bits and its length field. Whitespace is ignored, so a reflow by
+/// rustfmt changes nothing; any other change to one of these lines in the
+/// target has to be made here too.
+///
+/// Our own pin, because the fuzz crate and this binary share no code for the
+/// format. A decoder in `src/gate.rs` that both called would make it
+/// unnecessary.
+#[test]
+fn the_hold_seed_format_is_the_one_the_fuzz_target_reads() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/fuzz_targets/hold.rs");
+    let squeezed = |text: &str| -> String { text.split_whitespace().collect() };
+    let target = squeezed(&std::fs::read_to_string(&path).expect("the hold fuzz target"));
+
+    assert!(HOLD_FUZZ_KEY.iter().all(|byte| *byte == HOLD_FUZZ_KEY[0]));
+    assert_eq!(HOLD_FUZZ_PORT_BASE, 40_000, "the port the line below names");
+    let dcids: Vec<String> = HOLD_FUZZ_DCIDS
+        .iter()
+        .map(|dcid| {
+            assert!(dcid.iter().all(|byte| *byte == dcid[0]));
+            format!("[{:#04x}; 8]", dcid[0])
+        })
+        .collect();
+    let lines = [
+        format!(
+            "const FUZZ_KEY: [u8; 32] = [{:#04x}; 32];",
+            HOLD_FUZZ_KEY[0]
+        ),
+        format!("EchKey::from_private_bytes(&FUZZ_KEY, \"{PUBLIC_NAME}\", 7, 0)"),
+        format!("const DCIDS: [[u8; 8]; 4] = [{}];", dcids.join(", ")),
+        format!("const SEALED: u8 = {HOLD_FUZZ_SEALED:#04x};"),
+        "40_000 + u16::from(index & 0x03)".to_owned(),
+        "if header & SEALED == 0 {".to_owned(),
+        "gate::sealed_initial(&DCIDS[usize::from(selector & 0x03)], selector >> 2, frames)"
+            .to_owned(),
+        "let length = usize::from(u16::from_be_bytes([*high, *low]))".to_owned(),
+        format!("Duration::from_millis({HOLD_FUZZ_STEP_MS} * u64::from(header >> 3))"),
+        "let names: Vec<String> = if policy & 0x02 != 0 {".to_owned(),
+        "vec![\"localhost\".to_owned()]".to_owned(),
+        "let require_ech = policy & 0x01 != 0;".to_owned(),
+    ];
+    for line in lines {
+        assert!(
+            target.contains(&squeezed(&line)),
+            "{} no longer carries `{line}`, which the seed format here copies",
+            path.display()
+        );
+    }
+}
+
 /// What one record of a hold fuzz input carries.
 enum Body {
     /// A datagram, as it arrived.
@@ -2932,7 +2991,7 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
         let length = usize::from(u16::from_be_bytes([*high, *low]));
         let (body, next) = tail.split_at(length);
         rest = next;
-        after += Duration::from_millis(100 * u64::from(header >> 3));
+        after += Duration::from_millis(HOLD_FUZZ_STEP_MS * u64::from(header >> 3));
         let datagram = if header & HOLD_FUZZ_SEALED == 0 {
             body.to_vec()
         } else {
@@ -2944,7 +3003,11 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
             )
         };
         last = screening
-            .receive(after, from(40_000 + u16::from(header & 0x03)), &datagram)
+            .receive(
+                after,
+                from(HOLD_FUZZ_PORT_BASE + u16::from(header & 0x03)),
+                &datagram,
+            )
             .0;
         assert_eq!(screening.recounted_bytes(), screening.held_bytes());
         screening.released();
