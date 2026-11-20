@@ -989,12 +989,19 @@ impl Connection {
 
         let opened = tokio::time::timeout(within, handle.open_critical_streams()).await;
 
-        // Our own rule, not the RFC's: nothing in RFC 9114 says what to do
-        // about a peer that will not let these streams be created, because
-        // nothing in it obliges a peer to allow them. H3_STREAM_CREATION_ERROR
-        // is the closest registered code, since §8.1 gives it for a stream that
-        // could not be created. It tells the peer which half of the handshake
-        // it failed.
+        // A peer that does not let these streams be created breaks this MUST:
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
+        //# Therefore, the transport parameters sent by both clients
+        //# and servers MUST allow the peer to create at least three
+        //# unidirectional streams.
+        //
+        // RFC 9114 names no code for it, so the code is our own choice.
+        // §8.1 defines H3_STREAM_CREATION_ERROR for the other direction, a
+        // stream the peer created that this endpoint will not accept (quoted
+        // on `serve_stream`). It is used here because it is the registered
+        // code about stream creation, so it tells the peer which half of the
+        // handshake failed.
         let [control, encoder, decoder] = match opened {
             Ok(streams) => streams?,
             Err(_) => {
@@ -1326,11 +1333,16 @@ fn route_datagram(handle: &Handle, datagram: Bytes) -> ControlFlow<()> {
 ///
 /// One idle timeout bounds it, as `Handle::idle` describes. What
 /// follows is a `stop`, not a connection error: nothing was violated, and the
-/// peer keeps every stream it has underway. H3_STREAM_CREATION_ERROR is this
-/// endpoint's own choice of code, not the RFC's. RFC 9114 §8.1 gives it for a
-/// stream that could not be created, which is the nearest registered code for
-/// a stream that never declared its type. It is also the code an unknown
-/// stream type is aborted with three arms below.
+/// peer keeps every stream it has underway. The code is our own choice. A
+/// stream that never declares its type is one this endpoint will not accept,
+/// which is how RFC 9114 §8.1 defines it:
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-8.1
+//# H3_STREAM_CREATION_ERROR (0x0103):  The endpoint detected that its
+//# peer created a stream that it will not accept.
+///
+/// It is also the code §6.2 recommends for aborting an unknown stream type,
+/// three arms below.
 async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
     let typed = tokio::time::timeout(handle.idle, read_stream_type(&mut recv)).await;
 
@@ -1384,9 +1396,11 @@ async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
 
         //= https://www.rfc-editor.org/rfc/rfc9114#section-6.2
         //# Recipients of unknown stream types MUST either abort reading of the
-        //# stream or discard incoming data without further processing. [...]
-        //# The recipient MUST NOT consider unknown stream types to be a
-        //# connection error of any kind.
+        //# stream or discard incoming data without further processing.  If
+        //# reading is aborted, the recipient SHOULD use the
+        //# H3_STREAM_CREATION_ERROR error code or a reserved error code
+        //# (Section 8.1).  The recipient MUST NOT consider unknown stream types
+        //# to be a connection error of any kind.
         other => {
             debug!(
                 stream_type = other,
