@@ -79,12 +79,13 @@ rustls = { version = "0.23", default-features = false, features = [
 # It implies `bindgen` and `all-bindings`, so the bindings are generated at
 # build time with libclang instead of taken from the pregenerated crypto-only
 # files, and the build goes through cmake: every builder now needs cmake and
-# libclang (`docs/deployment.md`). bindgen pulls `prettyplease`, which is held
-# at 0.2.37 in `Cargo.lock`: 0.3.0 depends on syn 3 while bindgen 0.73.2
-# unifies on the syn 2 in this tree and then fails to compile. A plain
-# `cargo update` tries 0.3 again; put it back with
-# `cargo update -p prettyplease --precise 0.2.37` until a bindgen release
-# accepts 0.3.
+# libclang (`docs/deployment.md`). bindgen 0.73.2 and the `prettyplease` it
+# pulls must build against the same syn: bindgen accepts syn 2 or 3,
+# `prettyplease` 0.3 needs syn 3, and with bindgen on syn 2 beside
+# `prettyplease` 0.3 bindgen fails to compile. `Cargo.lock` has both on syn 3
+# since 2026-11-20. After a `cargo update`, read bindgen's syn edge in the
+# lock diff; if it went back to syn 2 while `prettyplease` stayed on 0.3, run
+# `cargo update -p prettyplease --precise 0.2.37`.
 aws-lc-sys = { version = "0.47", default-features = false, features = ["ssl"] }
 # Packet protection, header protection and the Initial and Retry keys of the
 # provider (`src/tls/awslc/keys.rs`) are safe code over aws-lc-rs's AEAD, HKDF
