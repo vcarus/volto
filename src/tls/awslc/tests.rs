@@ -34,7 +34,10 @@ use zeroize::Zeroizing;
 
 use super::ech::pem_block;
 use super::ffi::{self, OpensslBytes};
-use super::{Builder, EchKey, GROUPS, Names, OP_NO_TICKET, ServerConfig, Session, Version, keys};
+use super::{
+    Builder, EchKey, GROUPS, Names, OP_NO_TICKET, ProbeSession, ServerConfig, Session, Version,
+    keys,
+};
 use crate::hello::{self, EXT_ECH};
 
 /// A certificate for `localhost` and its key, as DER.
@@ -109,15 +112,11 @@ fn built(
 ) -> Arc<ServerConfig> {
     Arc::new(
         Builder {
-            certs: vec![id.cert.clone()],
-            key: Zeroizing::new(id.key.clone()),
-            alpn: vec![b"h3".to_vec()],
             names: Names::new(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>()),
-            ech,
             refuse_unaccepted_ech,
             require_ech,
             groups,
-            keylog: None,
+            ..Builder::new(vec![id.cert.clone()], Zeroizing::new(id.key.clone()), ech)
         }
         .build()
         .expect("build the provider"),
@@ -315,6 +314,14 @@ fn ticket_extensions(body: &[u8]) -> Vec<u16> {
     extension_types(&body[at + 2 + ticket_len..])
 }
 
+/// One in-memory handshake: what it showed, the server session after it, and
+/// the client's next 1-RTT secrets, for the tests that go on from there.
+struct Ran {
+    outcome: Outcome,
+    session: Session,
+    client_next: Option<rustls::quic::Secrets>,
+}
+
 /// Runs one handshake in memory. `tamper` may rewrite each ClientHello before
 /// the server reads it.
 fn handshake(
@@ -322,9 +329,11 @@ fn handshake(
     client: Arc<rustls::ClientConfig>,
     recorder: &Recorder,
     tamper: &dyn Fn(&mut [u8]),
-) -> Outcome {
+) -> Ran {
     let mut out = Outcome::default();
-    let mut session = Session::new(server, Version::V1, &PARAMS).expect("start a session");
+    // `ProbeSession::write` takes what the server has to send as quinn does.
+    let mut session =
+        ProbeSession(Session::new(server, Version::V1, &PARAMS).expect("start a session"));
     let mut rustls = rustls::quic::ClientConnection::new(
         client,
         rustls::quic::Version::V1,
@@ -335,13 +344,14 @@ fn handshake(
     // Each side runs its write loop right after each read, as quinn does, so
     // the bytes a write returns ahead of a key change belong to the old level.
     let mut client_level = 0usize;
-    let mut server_level = 0usize;
+    let mut client_next = None;
     let mut to_server: std::collections::VecDeque<(usize, Vec<u8>)> = Default::default();
     let mut to_client: std::collections::VecDeque<(usize, Vec<u8>)> = Default::default();
 
     fn drain_client(
         rustls: &mut rustls::quic::ClientConnection,
         level: &mut usize,
+        next: &mut Option<rustls::quic::Secrets>,
         queue: &mut std::collections::VecDeque<(usize, Vec<u8>)>,
     ) {
         loop {
@@ -353,43 +363,31 @@ fn handshake(
             }
             match change {
                 Some(KeyChange::Handshake { .. }) => *level = 2,
-                Some(KeyChange::OneRtt { .. }) => *level = 3,
+                Some(KeyChange::OneRtt { next: secrets, .. }) => {
+                    *level = 3;
+                    *next = Some(secrets);
+                }
                 None if empty => return,
                 None => {}
             }
         }
     }
 
-    fn drain_server(
-        session: &mut Session,
-        level: &mut usize,
-        queue: &mut std::collections::VecDeque<(usize, Vec<u8>)>,
-    ) {
-        loop {
-            let mut buf = Vec::new();
-            let keys = session.write_handshake(&mut buf);
-            let empty = buf.is_empty();
-            if !empty {
-                queue.push_back((*level, buf));
-            }
-            match keys {
-                Some(_) => *level = if *level == 0 { 2 } else { 3 },
-                None if empty => return,
-                None => {}
-            }
-        }
-    }
-
-    drain_client(&mut rustls, &mut client_level, &mut to_server);
+    drain_client(
+        &mut rustls,
+        &mut client_level,
+        &mut client_next,
+        &mut to_server,
+    );
     for _step in 0..64 {
         if let Some((level, mut buf)) = to_server.pop_front() {
             if level == 0 {
                 tamper(&mut buf);
                 out.client_hellos.push(buf.clone());
             }
-            let result = session.read_handshake(&buf);
+            let result = session.0.read_handshake(&buf);
             if out.handshake_data.is_none()
-                && let Some(data) = session.handshake_data()
+                && let Some(data) = session.0.handshake_data()
             {
                 let data = data.downcast::<HandshakeData>().expect("quinn's type");
                 out.handshake_data = Some((data.protocol, data.server_name));
@@ -398,7 +396,9 @@ fn handshake(
                 out.server_error = Some(format!("{error}"));
                 break;
             }
-            drain_server(&mut session, &mut server_level, &mut to_client);
+            for (level, buf) in session.write() {
+                to_client.push_back((usize::from(level), buf));
+            }
             continue;
         }
         if let Some((level, buf)) = to_client.pop_front() {
@@ -421,19 +421,51 @@ fn handshake(
                 out.client_error = Some(error);
                 break;
             }
-            drain_client(&mut rustls, &mut client_level, &mut to_server);
+            drain_client(
+                &mut rustls,
+                &mut client_level,
+                &mut client_next,
+                &mut to_server,
+            );
             continue;
         }
         break;
     }
 
+    let session = session.0;
     out.ech_accepted = session.ech_accepted();
     out.server_done = !session.is_handshaking();
     out.client_done = !rustls.is_handshaking();
     out.verified = recorder.seen.lock().expect("recorder lock").clone();
     // SAFETY: the session's SSL is valid; the getter only reads.
     out.group = unsafe { sys::SSL_get_group_id(session.ssl.as_ptr()) };
-    out
+    Ran {
+        outcome: out,
+        session,
+        client_next,
+    }
+}
+
+/// One handshake against `server` from a fresh client with `ech`, `groups` and
+/// ALPN `h3`.
+fn run(
+    server: Arc<ServerConfig>,
+    ech: Option<EchMode>,
+    groups: Vec<&'static dyn SupportedKxGroup>,
+) -> Outcome {
+    run_tampered(server, ech, groups, &untouched)
+}
+
+/// [`run`], with `tamper` rewriting each ClientHello before the server reads it.
+fn run_tampered(
+    server: Arc<ServerConfig>,
+    ech: Option<EchMode>,
+    groups: Vec<&'static dyn SupportedKxGroup>,
+    tamper: &dyn Fn(&mut [u8]),
+) -> Outcome {
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(ech, groups, recorder.clone());
+    handshake(server, Arc::new(client), &recorder, tamper).outcome
 }
 
 fn retry_configs_in(error: &Option<rustls::Error>) -> Option<bool> {
@@ -456,6 +488,7 @@ fn plain(client: rustls::ClientConfig, recorder: &Recorder) -> Outcome {
         recorder,
         &untouched,
     )
+    .outcome
 }
 
 /// (a) The right ECHConfig: accepted, the inner name, our certificate, no
@@ -464,17 +497,10 @@ fn plain(client: rustls::ClientConfig, recorder: &Recorder) -> Outcome {
 fn ech_with_the_right_config_is_accepted() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        server(&id, Some(&key), &GROUPS, &[]),
         Some(enable(&key.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(
         outcome.ech_accepted && outcome.server_done && outcome.client_done,
@@ -497,14 +523,7 @@ fn ech_with_the_right_config_is_accepted() {
 fn a_client_without_ech_gets_an_ordinary_handshake() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(None, pq_first(), recorder.clone());
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
-    );
+    let outcome = run(server(&id, Some(&key), &GROUPS, &[]), None, pq_first());
     assert!(
         !outcome.ech_accepted && outcome.server_done && outcome.client_done,
         "{outcome:?}"
@@ -520,13 +539,10 @@ fn a_client_without_ech_gets_an_ordinary_handshake() {
 fn grease_ech_is_answered_on_the_outer_hello_with_retry_configs() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(Some(grease()), pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run(
         libssl_alone(&id, &key, &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
+        Some(grease()),
+        pq_first(),
     );
     assert!(
         !outcome.ech_accepted && outcome.server_done && outcome.client_done,
@@ -543,17 +559,10 @@ fn ech_under_another_key_is_answered_on_the_outer_hello() {
     let id = identity();
     let key = ech_key(1);
     let other = ech_key(2);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        libssl_alone(&id, &key, &GROUPS, &[]),
         Some(enable(&other.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        libssl_alone(&id, &key, &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     // The client aborts after reading the server's flight, so the server never
     // sees a Finished.
@@ -586,16 +595,10 @@ fn corrupt_ech_payload(message: &mut [u8]) {
 fn a_damaged_ech_payload_is_answered_on_the_outer_hello() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run_tampered(
+        libssl_alone(&id, &key, &GROUPS, &[]),
         Some(enable(&key.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        libssl_alone(&id, &key, &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
         &corrupt_ech_payload,
     );
     assert!(
@@ -628,17 +631,10 @@ fn ech_opens_exactly_when_libssl_accepts_it() {
     let id = identity();
     let key = ech_key(1);
     let other = ech_key(2);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        server(&id, Some(&key), &GROUPS, &[]),
         Some(enable(&key.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(outcome.ech_accepted, "libssl accepted ECH: {outcome:?}");
     let (body, ech) = outer_hello(&outcome);
@@ -665,30 +661,20 @@ fn ech_opens_exactly_when_libssl_accepts_it() {
     }
 
     // GREASE: an extension under a key nobody holds.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(Some(grease()), pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run(
         server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
+        Some(grease()),
+        pq_first(),
     );
     assert!(!outcome.ech_accepted, "{outcome:?}");
     let (body, ech) = outer_hello(&outcome);
     assert!(!key.opens(&body, &ech), "GREASE does not open");
 
     // A list for another key, which libssl does not accept either.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        server(&id, Some(&key), &GROUPS, &[]),
         Some(enable(&other.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(!outcome.ech_accepted, "{outcome:?}");
     let (body, ech) = outer_hello(&outcome);
@@ -713,17 +699,10 @@ fn x25519_first() -> Vec<&'static dyn SupportedKxGroup> {
 fn a_hello_retry_request_keeps_ech() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        server(&id, Some(&key), &[0x11ec, 0x0017], &[]),
         Some(enable(&key.config_list())),
         x25519_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &[0x11ec, 0x0017], &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(outcome.hello_retry);
     assert_eq!(outcome.client_hellos.len(), 2);
@@ -778,28 +757,15 @@ fn the_second_ech_line_refuses_ech_it_did_not_accept_before_anything_is_sent() {
         ),
     ];
     for (what, ech, groups, server_groups) in cases {
-        let recorder = Arc::new(Recorder::default());
-        let client = client_config(ech, groups, recorder.clone());
-        let outcome = handshake(
-            server(&id, Some(&key), server_groups, &[]),
-            Arc::new(client),
-            &recorder,
-            &untouched,
-        );
+        let outcome = run(server(&id, Some(&key), server_groups, &[]), ech, groups);
         refused_before_anything(&outcome, what);
     }
 
     // A damaged payload under the right key.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run_tampered(
+        server(&id, Some(&key), &GROUPS, &[]),
         Some(enable(&key.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
         &corrupt_ech_payload,
     );
     refused_before_anything(&outcome, "a damaged payload");
@@ -809,14 +775,7 @@ fn the_second_ech_line_refuses_ech_it_did_not_accept_before_anything_is_sent() {
         ("the right list", Some(enable(&key.config_list()))),
         ("no ECH", None),
     ] {
-        let recorder = Arc::new(Recorder::default());
-        let client = client_config(ech, pq_first(), recorder.clone());
-        let outcome = handshake(
-            server(&id, Some(&key), &GROUPS, &[]),
-            Arc::new(client),
-            &recorder,
-            &untouched,
-        );
+        let outcome = run(server(&id, Some(&key), &GROUPS, &[]), ech, pq_first());
         assert!(
             outcome.server_done && outcome.client_done,
             "{what}: {outcome:?}"
@@ -832,27 +791,13 @@ fn under_require_ech_the_second_line_refuses_a_client_hello_without_ech() {
     let id = identity();
     let key = ech_key(1);
     for (what, ech) in [("no ECH", None), ("GREASE", Some(grease()))] {
-        let recorder = Arc::new(Recorder::default());
-        let client = client_config(ech, pq_first(), recorder.clone());
-        let outcome = handshake(
-            requiring(&id, &key),
-            Arc::new(client),
-            &recorder,
-            &untouched,
-        );
+        let outcome = run(requiring(&id, &key), ech, pq_first());
         refused_before_anything(&outcome, what);
     }
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        requiring(&id, &key),
         Some(enable(&key.config_list())),
         pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        requiring(&id, &key),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(
         outcome.ech_accepted && outcome.server_done && outcome.client_done,
@@ -892,17 +837,10 @@ fn refused_before_anything(outcome: &Outcome, what: &str) {
 fn a_client_offering_secp256r1mlkem768_first_draws_a_hello_retry_request() {
     let id = identity();
     let key = ech_key(1);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        server(&id, Some(&key), &GROUPS, &[]),
         Some(enable(&key.config_list())),
         vec![kx_group::SECP256R1MLKEM768, kx_group::X25519],
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(outcome.hello_retry, "{outcome:?}");
     assert_eq!(outcome.group, 0x001d, "X25519 after the retry");
@@ -918,17 +856,10 @@ fn a_hello_retry_request_keeps_a_rejection() {
     let id = identity();
     let key = ech_key(1);
     let other = ech_key(2);
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
+    let outcome = run(
+        libssl_alone(&id, &key, &[0x11ec, 0x0017], &[]),
         Some(enable(&other.config_list())),
         x25519_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(
-        libssl_alone(&id, &key, &[0x11ec, 0x0017], &[]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
     );
     assert!(outcome.hello_retry && !outcome.ech_accepted, "{outcome:?}");
     assert_eq!(retry_configs_in(&outcome.client_error), Some(true));
@@ -945,31 +876,17 @@ fn the_second_gate_judges_the_inner_name_when_ech_is_accepted() {
 
     // Accepted: inner `localhost` is judged, although the outer name is the
     // public name, which is not on the list.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
-        Some(enable(&key.config_list())),
-        pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(gated.clone(), Arc::new(client), &recorder, &untouched);
+    let outcome = run(gated.clone(), Some(enable(&key.config_list())), pq_first());
     assert!(outcome.ech_accepted && outcome.server_done, "{outcome:?}");
 
     // GREASE keeps the real name in the outer ClientHello, which is on the
     // list.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(Some(grease()), pq_first(), recorder.clone());
-    let outcome = handshake(gated.clone(), Arc::new(client), &recorder, &untouched);
+    let outcome = run(gated.clone(), Some(grease()), pq_first());
     assert!(outcome.server_done, "{outcome:?}");
 
     // Another key: the outer ClientHello carries the public name, which is off
     // the list, so the handshake is refused before any certificate.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(
-        Some(enable(&other.config_list())),
-        pq_first(),
-        recorder.clone(),
-    );
-    let outcome = handshake(gated, Arc::new(client), &recorder, &untouched);
+    let outcome = run(gated, Some(enable(&other.config_list())), pq_first());
     assert!(!outcome.certificate_sent, "{outcome:?}");
     assert!(
         outcome
@@ -985,13 +902,10 @@ fn the_second_gate_judges_the_inner_name_when_ech_is_accepted() {
 #[test]
 fn the_second_gate_refuses_a_name_off_the_list_without_a_certificate() {
     let id = identity();
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(None, pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run(
         server(&id, None, &GROUPS, &["other.example"]),
-        Arc::new(client),
-        &recorder,
-        &untouched,
+        None,
+        pq_first(),
     );
     assert!(!outcome.certificate_sent);
     assert!(
@@ -1032,12 +946,10 @@ fn sni_byte(to: u8) -> impl Fn(&mut [u8]) {
 fn a_server_name_that_is_not_a_dns_name_counts_as_none() {
     let id = identity();
 
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(None, pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run_tampered(
         server(&id, None, &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
+        None,
+        pq_first(),
         &sni_byte(b'\n'),
     );
     let (alpn, name) = outcome.handshake_data.expect("the ClientHello was read");
@@ -1045,12 +957,10 @@ fn a_server_name_that_is_not_a_dns_name_counts_as_none() {
     assert_eq!(name, None, "a newline must never reach the log line");
 
     // `lxcalhost` is a DNS name, so the same rewrite with a letter is read.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(None, pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run_tampered(
         server(&id, None, &GROUPS, &[]),
-        Arc::new(client),
-        &recorder,
+        None,
+        pq_first(),
         &sni_byte(b'x'),
     );
     assert_eq!(
@@ -1059,12 +969,10 @@ fn a_server_name_that_is_not_a_dns_name_counts_as_none() {
     );
 
     // With the gate on, no name is not a name on the list.
-    let recorder = Arc::new(Recorder::default());
-    let client = client_config(None, pq_first(), recorder.clone());
-    let outcome = handshake(
+    let outcome = run_tampered(
         server(&id, None, &GROUPS, &["localhost", "l\ncalhost"]),
-        Arc::new(client),
-        &recorder,
+        None,
+        pq_first(),
         &sni_byte(b'\n'),
     );
     assert!(
@@ -1193,7 +1101,7 @@ fn a_ticket_would_not_offer_early_data_either() {
     client.enable_early_data = true;
     let client = Arc::new(client);
 
-    let first = handshake(server.clone(), client.clone(), &recorder, &untouched);
+    let first = handshake(server.clone(), client.clone(), &recorder, &untouched).outcome;
     assert!(first.server_done && first.client_done, "{first:?}");
     assert_eq!(first.tickets.len(), 2, "the forced tickets were sent");
     for ticket in &first.tickets {
@@ -1205,7 +1113,7 @@ fn a_ticket_would_not_offer_early_data_either() {
 
     // The client resumes with one of them and, since the ticket allows no
     // early data, offers none.
-    let second = handshake(server, client, &recorder, &untouched);
+    let second = handshake(server, client, &recorder, &untouched).outcome;
     let body = hello::client_hello_body(&second.client_hellos[0]).expect("a ClientHello");
     let offered: Vec<u16> = hello::extensions(body)
         .expect("extensions")
@@ -1229,44 +1137,14 @@ fn next_1rtt_keys_follow_quic_ku() {
     let id = identity();
     let config = server(&id, None, &GROUPS, &[]);
     let recorder = Arc::new(Recorder::default());
-    let client_cfg = Arc::new(client_config(None, pq_first(), recorder));
-    let mut session = Session::new(config, Version::V1, &PARAMS).expect("session");
-    let mut client = rustls::quic::ClientConnection::new(
-        client_cfg,
-        rustls::quic::Version::V1,
-        ServerName::try_from("localhost").expect("name"),
-        PARAMS.to_vec(),
-    )
-    .expect("client");
-    let mut client_next = None;
-    let mut server_one_rtt = false;
-    for _ in 0..4 {
-        loop {
-            let mut buf = Vec::new();
-            let change = client.write_hs(&mut buf);
-            if !buf.is_empty() {
-                session.read_handshake(&buf).expect("server reads");
-            }
-            if let Some(KeyChange::OneRtt { next, .. }) = change {
-                client_next = Some(next);
-            } else if change.is_none() && buf.is_empty() {
-                break;
-            }
-        }
-        loop {
-            let mut buf = Vec::new();
-            let keys = session.write_handshake(&mut buf);
-            if !buf.is_empty() {
-                client.read_hs(&buf).expect("client reads");
-            }
-            if keys.is_some() {
-                server_one_rtt = !session.is_handshaking();
-            } else if buf.is_empty() {
-                break;
-            }
-        }
-    }
-    assert!(server_one_rtt);
+    let client = Arc::new(client_config(None, pq_first(), recorder.clone()));
+    let Ran {
+        outcome,
+        mut session,
+        client_next,
+    } = handshake(config, client, &recorder, &untouched);
+    // The server holds its 1-RTT keys once its handshake is done.
+    assert!(outcome.server_done, "{outcome:?}");
     // libssl freed the handshake configuration when the handshake completed,
     // and the calls made after it still work.
     // SAFETY: the session's SSL is valid. With a length of 0 the call copies
@@ -1387,14 +1265,7 @@ fn every_promised_key_type_and_format_signs_a_handshake() {
             cert: identity_for(key),
             key: through_load_key(label, &der).to_vec(),
         };
-        let recorder = Arc::new(Recorder::default());
-        let client = client_config(None, pq_first(), recorder.clone());
-        let outcome = handshake(
-            server(&id, None, &GROUPS, &[]),
-            Arc::new(client),
-            &recorder,
-            &untouched,
-        );
+        let outcome = run(server(&id, None, &GROUPS, &[]), None, pq_first());
         assert!(
             outcome.server_done && outcome.client_done,
             "{what}: {outcome:?}"
@@ -1442,17 +1313,11 @@ fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
     );
     let x509 = ffi::x509_from_der(&cert).expect("AWS-LC reads it");
     drop(x509);
-    let error = Builder {
-        certs: vec![cert.to_vec()],
-        key: Zeroizing::new(key.secret_pkcs8_der().to_vec()),
-        alpn: vec![b"h3".to_vec()],
-        names: Names::new(&[]),
-        ech: None,
-        refuse_unaccepted_ech: false,
-        require_ech: false,
-        groups: &GROUPS,
-        keylog: None,
-    }
+    let error = Builder::new(
+        vec![cert.to_vec()],
+        Zeroizing::new(key.secret_pkcs8_der().to_vec()),
+        None,
+    )
     .build()
     .expect_err("a leaf webpki cannot parse");
     assert!(
@@ -1468,19 +1333,9 @@ fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
 fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
     let id = identity();
     let stray = identity();
-    let error = Builder {
-        certs: vec![id.cert],
-        key: Zeroizing::new(stray.key),
-        alpn: vec![b"h3".to_vec()],
-        names: Names::new(&[]),
-        ech: None,
-        refuse_unaccepted_ech: false,
-        require_ech: false,
-        groups: &GROUPS,
-        keylog: None,
-    }
-    .build()
-    .expect_err("a mismatched pair");
+    let error = Builder::new(vec![id.cert], Zeroizing::new(stray.key), None)
+        .build()
+        .expect_err("a mismatched pair");
     assert!(
         format!("{error:#}")
             .contains("server.cert and server.key do not form a usable certificate/key pair"),
@@ -1572,19 +1427,9 @@ fn a_failed_ex_data_index_is_an_error_and_not_an_abort() {
     let config = server(&id, None, &GROUPS, &[]);
     EX_INDEX_FAILS.set(true);
     let session = Session::new(config.clone(), Version::V1, &PARAMS).err();
-    let build = Builder {
-        certs: vec![id.cert.clone()],
-        key: Zeroizing::new(id.key.clone()),
-        alpn: vec![b"h3".to_vec()],
-        names: Names::new(&[]),
-        ech: None,
-        refuse_unaccepted_ech: false,
-        require_ech: false,
-        groups: &GROUPS,
-        keylog: None,
-    }
-    .build()
-    .err();
+    let build = Builder::new(vec![id.cert.clone()], Zeroizing::new(id.key.clone()), None)
+        .build()
+        .err();
     EX_INDEX_FAILS.set(false);
     for (what, error) in [("Session::new", session), ("Builder::build", build)] {
         let error = error.unwrap_or_else(|| panic!("{what} succeeded without an index"));

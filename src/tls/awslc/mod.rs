@@ -199,15 +199,15 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         .transpose()?
         .map(Arc::new);
     let mut built = Builder {
-        certs: certs.iter().map(|c| c.as_ref().to_vec()).collect(),
-        key,
         alpn: server.alpn_wire(),
         names: Names::new(&config.security.expected_sni),
-        ech: ech.as_deref(),
-        refuse_unaccepted_ech: ech.is_some(),
         require_ech: config.security.require_ech,
-        groups: &GROUPS,
         keylog: config.log.keylog.then(KeyLog::from_env).flatten(),
+        ..Builder::new(
+            certs.iter().map(|c| c.as_ref().to_vec()).collect(),
+            key,
+            ech.as_deref(),
+        )
     }
     .build()?;
     built.ech_key = ech;
@@ -227,7 +227,24 @@ struct Builder<'a> {
     keylog: Option<Arc<KeyLog>>,
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
+    /// A builder for `certs`, `key` and `ech` with everything else at its
+    /// default: ALPN `h3`, no gate list, the second ECH line on whenever there
+    /// is an ECH key, no `require_ech`, [`GROUPS`] and no keylog.
+    fn new(certs: Vec<Vec<u8>>, key: Zeroizing<Vec<u8>>, ech: Option<&'a EchKey>) -> Self {
+        Self {
+            certs,
+            key,
+            alpn: vec![b"h3".to_vec()],
+            names: Names::new(&[]),
+            ech,
+            refuse_unaccepted_ech: ech.is_some(),
+            require_ech: false,
+            groups: &GROUPS,
+            keylog: None,
+        }
+    }
+
     fn build(self) -> Result<ServerConfig> {
         ensure!(!self.certs.is_empty(), "no certificate to present");
         // Before libssl reads it, because libssl reads leaves webpki does not.
@@ -1394,19 +1411,9 @@ pub fn probe_server_config(
     key: &[u8],
     ech: Option<&EchKey>,
 ) -> Result<Arc<ServerConfig>> {
-    Builder {
-        certs: vec![cert.to_vec()],
-        key: Zeroizing::new(key.to_vec()),
-        alpn: vec![b"h3".to_vec()],
-        names: Names::new(&[]),
-        ech,
-        refuse_unaccepted_ech: ech.is_some(),
-        require_ech: false,
-        groups: &GROUPS,
-        keylog: None,
-    }
-    .build()
-    .map(Arc::new)
+    Builder::new(vec![cert.to_vec()], Zeroizing::new(key.to_vec()), ech)
+        .build()
+        .map(Arc::new)
 }
 
 /// One server handshake driven by hand rather than by quinn.
