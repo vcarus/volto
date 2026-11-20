@@ -26,10 +26,10 @@ use bytes::Bytes;
 use common::Response;
 use common::rawstream::{connect_headers_frame, read_frame, status_of};
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
-    auth_section, authorized_connect, close_and_drain, connect_request, echoes,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, Leg, Relayed, STOP_TIMEOUT, SharedBuffer, TIMEOUT,
+    TestServer, auth_section, authorized_connect, close_and_drain, connect_request, echoes,
     is_version_negotiation, open_tcp_tunnel, open_tcp_tunnel_as, open_udp_session, read_at_least,
-    respond_to, spawn_echo_target, spawn_end_reporting_target, spawn_udp_echo_target,
+    respond_to, spawn_echo_target, spawn_end_reporting_target, spawn_udp_echo_target, udp_relay,
     udp_round_trip, version_probe,
 };
 use tokio::sync::oneshot;
@@ -269,44 +269,28 @@ struct ArrivalRelay {
 /// The Version Negotiation packet is not passed on to the client, which has no
 /// use for an answer to a probe it did not send.
 async fn arrival_reporting_relay(server: SocketAddr) -> ArrivalRelay {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind the relay socket");
-    let addr = socket.local_addr().expect("the relay's address");
     let (report, handled) = oneshot::channel();
-
-    tokio::spawn(async move {
-        let probe = version_probe();
-        let mut report = Some(report);
-        let mut buf = vec![0u8; usize::from(u16::MAX)];
-        // Learned from the first datagram that is not the server's, so the
-        // answers have somewhere to go.
-        let mut client: Option<SocketAddr> = None;
-
-        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
-            let datagram = &buf[..read];
-
-            if from == server {
-                if is_version_negotiation(datagram) {
-                    if let Some(report) = report.take() {
-                        let _ = report.send(());
-                    }
-                } else if let Some(client) = client {
-                    let _ = socket.send_to(datagram, client).await;
-                }
-                continue;
+    let mut report = Some(report);
+    let mut probed = false;
+    let relay = udp_relay(server, move |leg, datagram| match leg {
+        Leg::FromServer if is_version_negotiation(datagram) => {
+            if let Some(report) = report.take() {
+                let _ = report.send(());
             }
-
-            let first = client.is_none();
-            client = Some(from);
-            let _ = socket.send_to(datagram, server).await;
-            if first {
-                let _ = socket.send_to(&probe, server).await;
-            }
+            Relayed::Drop
         }
-    });
-
-    ArrivalRelay { addr, handled }
+        Leg::FromServer => Relayed::Forward,
+        Leg::FromClient if !probed => {
+            probed = true;
+            Relayed::ForwardThenToServer(version_probe())
+        }
+        Leg::FromClient => Relayed::Forward,
+    })
+    .await;
+    ArrivalRelay {
+        addr: relay.addr,
+        handled,
+    }
 }
 
 /// A handshake that arrived before a reload is accepted on the reloaded

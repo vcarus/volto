@@ -32,9 +32,9 @@ use common::rawstream::{
     still_serving,
 };
 use common::{
-    ALLOW_PRIVATE, H3Client, IMPATIENT, TIMEOUT, TestServer, auth_section, basic_credentials,
-    client_endpoint, client_endpoint_with_transport, echoes, finish_connect, open_tcp_tunnel,
-    open_tcp_tunnel_as, silent_peer, spawn_echo_target,
+    ALLOW_PRIVATE, H3Client, IMPATIENT, Leg, Relayed, TIMEOUT, TestServer, auth_section,
+    basic_credentials, client_endpoint, client_endpoint_with_transport, echoes, finish_connect,
+    open_tcp_tunnel, open_tcp_tunnel_as, silent_peer, spawn_echo_target, udp_relay,
 };
 use quinn::crypto::rustls::QuicClientConfig;
 use rustls::NamedGroup;
@@ -1078,24 +1078,14 @@ impl ClientSessionStore for CountingSessionStore {
 /// to it, since that is the address its packets came from — so the direction is
 /// decided by who a packet came from.
 async fn one_way_relay(server: SocketAddr) -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind the relay socket");
-    let addr = socket.local_addr().expect("the relay's address");
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
-            if from == server {
-                // The server's half of the handshake goes nowhere, which is
-                // what leaves it half-finished.
-                continue;
-            }
-            let _ = socket.send_to(&buf[..read], server).await;
-        }
-    });
-
-    addr
+    // The server's half of the handshake goes nowhere, which is what leaves it
+    // half-finished.
+    udp_relay(server, |leg, _| match leg {
+        Leg::FromClient => Relayed::Forward,
+        Leg::FromServer => Relayed::Drop,
+    })
+    .await
+    .addr
 }
 
 /// Carries the client's first datagram to `server` and nothing after it, while
@@ -1107,35 +1097,17 @@ async fn one_way_relay(server: SocketAddr) -> SocketAddr {
 /// direction is left open because the client is the observer here — a peer that
 /// cannot hear the server cannot report what the server did.
 async fn deaf_after_the_first_packet(server: SocketAddr) -> SocketAddr {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind the relay socket");
-    let addr = socket.local_addr().expect("the relay's address");
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        let mut client: Option<SocketAddr> = None;
-        let mut forwarded = 0usize;
-
-        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
-            let datagram = &buf[..read];
-
-            if from == server {
-                if let Some(client) = client {
-                    let _ = socket.send_to(datagram, client).await;
-                }
-                continue;
-            }
-
-            client = Some(from);
-            if forwarded == 0 {
-                forwarded += 1;
-                let _ = socket.send_to(datagram, server).await;
-            }
+    let mut forwarded = false;
+    udp_relay(server, move |leg, _| match leg {
+        Leg::FromServer => Relayed::Forward,
+        Leg::FromClient if !forwarded => {
+            forwarded = true;
+            Relayed::Forward
         }
-    });
-
-    addr
+        Leg::FromClient => Relayed::Drop,
+    })
+    .await
+    .addr
 }
 
 /// Carries packets both ways between one client and `server`, counting the
@@ -1146,38 +1118,16 @@ async fn deaf_after_the_first_packet(server: SocketAddr) -> SocketAddr {
 /// server's own state — and it has to be observed here, because quinn's client
 /// answers a Retry without telling the application anything at all.
 async fn retry_counting_relay(server: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind the relay socket");
-    let addr = socket.local_addr().expect("the relay's address");
-
     let retries = Arc::new(AtomicUsize::new(0));
     let counter = retries.clone();
-
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 2048];
-        // Learned from the first packet that is not the server's, so the
-        // answers have somewhere to go.
-        let mut client: Option<SocketAddr> = None;
-
-        while let Ok((read, from)) = socket.recv_from(&mut buf).await {
-            let datagram = &buf[..read];
-
-            if from == server {
-                if is_retry(datagram) {
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(client) = client {
-                    let _ = socket.send_to(datagram, client).await;
-                }
-            } else {
-                client = Some(from);
-                let _ = socket.send_to(datagram, server).await;
-            }
+    let relay = udp_relay(server, move |leg, datagram| {
+        if leg == Leg::FromServer && is_retry(datagram) {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
-    });
-
-    (addr, retries)
+        Relayed::Forward
+    })
+    .await;
+    (relay.addr, retries)
 }
 
 /// Whether `datagram` starts with a QUIC version 1 Retry packet.

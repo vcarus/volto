@@ -29,10 +29,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, SharedBuffer, TestServer, bulk_alpn, client_endpoint,
-    client_endpoint_with_transport, echoes, finish_connect_as, is_version_negotiation,
-    open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_answer,
-    udp_round_trip, version_probe,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, Leg, Relay, Relayed, SharedBuffer, TestServer,
+    bulk_alpn, client_endpoint, client_endpoint_with_transport, echoes, finish_connect_as,
+    is_version_negotiation, open_tcp_tunnel, open_udp_session, spawn_echo_target,
+    spawn_udp_echo_target, udp_answer, udp_relay, udp_round_trip, version_probe,
 };
 use rustls::pki_types::CertificateDer;
 use tokio::net::UdpSocket;
@@ -228,64 +228,19 @@ async fn an_empty_probe_draws_nothing_either_way() {
     }
 }
 
-/// A UDP relay between one client and the server, which records every
-/// short-header datagram the client sends through it.
-struct Recorder {
-    /// Where the client sends.
-    addr: SocketAddr,
-    /// The socket the server sees the client at.
-    upstream: Arc<UdpSocket>,
-    /// Every short-header datagram from the client, in the order it came.
-    recorded: Arc<Mutex<Vec<Vec<u8>>>>,
-    relay: tokio::task::JoinHandle<()>,
-}
-
-impl Recorder {
-    /// A relay to `server`.
-    async fn start(server: SocketAddr) -> Self {
-        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
-        let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
-        upstream
-            .connect(server)
-            .await
-            .expect("connect to the server");
-        let addr = downstream.local_addr().expect("the relay's address");
-        let recorded = Arc::new(Mutex::new(Vec::new()));
-        let relay = {
-            let upstream = upstream.clone();
-            let recorded = recorded.clone();
-            tokio::spawn(async move {
-                let mut client = None;
-                let mut from_client = vec![0u8; 65536];
-                let mut from_server = vec![0u8; 65536];
-                loop {
-                    tokio::select! {
-                        read = downstream.recv_from(&mut from_client) => {
-                            let Ok((read, peer)) = read else { return };
-                            client = Some(peer);
-                            let datagram = &from_client[..read];
-                            if datagram.first().is_some_and(|first| first & 0x80 == 0) {
-                                recorded.lock().expect("the record").push(datagram.to_vec());
-                            }
-                            let _ = upstream.send(datagram).await;
-                        }
-                        read = upstream.recv(&mut from_server) => {
-                            let Ok(read) = read else { return };
-                            if let Some(client) = client {
-                                let _ = downstream.send_to(&from_server[..read], client).await;
-                            }
-                        }
-                    }
-                }
-            })
-        };
-        Self {
-            addr,
-            upstream,
-            recorded,
-            relay,
+/// A UDP relay between one client and `server`, and the record of every
+/// short-header datagram the client sends through it, in the order it came.
+async fn recording_relay(server: SocketAddr) -> (Relay, Arc<Mutex<Vec<Vec<u8>>>>) {
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let record = recorded.clone();
+    let relay = udp_relay(server, move |leg, datagram| {
+        if leg == Leg::FromClient && datagram.first().is_some_and(|first| first & 0x80 == 0) {
+            record.lock().expect("the record").push(datagram.to_vec());
         }
-    }
+        Relayed::Forward
+    })
+    .await;
+    (relay, recorded)
 }
 
 /// Every datagram that arrives on `socket` within [`CLIENT_IDLE`].
@@ -320,13 +275,13 @@ async fn heard_on(socket: &UdpSocket) -> Vec<Vec<u8>> {
 async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     let log = SharedBuffer::shared(LOG_FILTER);
     let server = TestServer::start_with(GATE_OFF).await;
-    let recorder = Recorder::start(server.addr).await;
-    let seen_as = recorder.upstream.local_addr().expect("the relay's address");
+    let (mut relay, recorded) = recording_relay(server.addr).await;
+    let seen_as = relay.addr;
     let mark = log.mark();
 
     let endpoint = client_endpoint(&server.ca, &["h3"]);
     let connection = endpoint
-        .connect(recorder.addr, "localhost")
+        .connect(relay.addr, "localhost")
         .expect("start connecting")
         .await
         .expect("a handshake through the relay");
@@ -338,12 +293,7 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
         .expect("the server's control stream");
     let deadline = tokio::time::Instant::now() + common::TIMEOUT;
     let packet = loop {
-        let first = recorder
-            .recorded
-            .lock()
-            .expect("the record")
-            .first()
-            .cloned();
+        let first = recorded.lock().expect("the record").first().cloned();
         if let Some(packet) = first {
             break packet;
         }
@@ -365,14 +315,16 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     log.wait_for_line(mark, &["connection closed", &format!("remote={seen_as} ")])
         .await;
     tokio::time::sleep(Duration::from_secs(1)).await;
-    recorder.relay.abort();
+    // Stopped, so that what comes back to the relay's socket is read here.
+    relay.task.abort();
+    let _ = (&mut relay.task).await;
 
-    recorder
-        .upstream
-        .send(&packet)
+    relay
+        .socket
+        .send_to(&packet, server.addr)
         .await
         .expect("replay from the connection's address");
-    let same = heard_on(&recorder.upstream).await;
+    let same = heard_on(&relay.socket).await;
 
     let elsewhere = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
     elsewhere

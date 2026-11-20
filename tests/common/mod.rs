@@ -490,6 +490,84 @@ pub async fn udp_answers(addr: SocketAddr, bytes: &[u8], patience: Duration) -> 
     heard
 }
 
+/// Which way a datagram is crossing a [`udp_relay`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leg {
+    /// From the client, on its way to the server.
+    FromClient,
+    /// From the server, on its way to the client.
+    FromServer,
+}
+
+/// What a [`udp_relay`]'s hook does with one datagram.
+pub enum Relayed {
+    /// Carries it on.
+    Forward,
+    /// Drops it.
+    Drop,
+    /// Carries it on, then sends these bytes to the server from the same
+    /// socket, right behind it.
+    ForwardThenToServer(Vec<u8>),
+}
+
+/// A running [`udp_relay`].
+pub struct Relay {
+    /// Where the client sends.
+    pub addr: SocketAddr,
+    /// The relay's one socket: the server sees the client at its address, so a
+    /// test can send from there once `task` has stopped.
+    pub socket: Arc<UdpSocket>,
+    /// The loop carrying datagrams.
+    pub task: JoinHandle<()>,
+}
+
+/// A UDP relay between one client and `server`, on one loopback socket, with
+/// `hook` deciding the fate of every datagram.
+///
+/// The direction is decided by the source address: a datagram from `server` is
+/// on its way to the client, and any other is the client's. The client is the
+/// source of the latest datagram that was not the server's, so nothing from the
+/// server goes anywhere before the client has sent once.
+pub async fn udp_relay(
+    server: SocketAddr,
+    mut hook: impl FnMut(Leg, &[u8]) -> Relayed + Send + 'static,
+) -> Relay {
+    let socket = Arc::new(
+        UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind the relay socket"),
+    );
+    let addr = socket.local_addr().expect("the relay's address");
+    let task = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            let mut buffer = vec![0u8; usize::from(u16::MAX)];
+            let mut client: Option<SocketAddr> = None;
+            while let Ok((read, from)) = socket.recv_from(&mut buffer).await {
+                let datagram = &buffer[..read];
+                let (leg, to) = if from == server {
+                    (Leg::FromServer, client)
+                } else {
+                    client = Some(from);
+                    (Leg::FromClient, Some(server))
+                };
+                let then = match hook(leg, datagram) {
+                    Relayed::Drop => continue,
+                    Relayed::Forward => None,
+                    Relayed::ForwardThenToServer(bytes) => Some(bytes),
+                };
+                if let Some(to) = to {
+                    let _ = socket.send_to(datagram, to).await;
+                }
+                if let Some(bytes) = then {
+                    let _ = socket.send_to(&bytes, server).await;
+                }
+            }
+        }
+    });
+    Relay { addr, socket, task }
+}
+
 /// A QUIC client endpoint that trusts `ca` and offers `alpn`.
 pub fn client_endpoint(ca: &CertificateDer<'static>, alpn: &[&str]) -> quinn::Endpoint {
     client_endpoint_with(ca, alpn, None)
