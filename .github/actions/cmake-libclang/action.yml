@@ -1,0 +1,55 @@
+name: cmake and libclang
+description: Install cmake and libclang-dev on an Ubuntu runner, from the Actions cache when it has them.
+
+# AWS-LC's libssl, which runs the server's TLS (D115), builds through cmake,
+# and its Rust bindings are generated at build time by bindgen, which loads
+# libclang. The runner image carries neither, so every job that builds the
+# crate installs both: six packages, 47 MB.
+#
+# From the Ubuntu mirror that download usually takes a few seconds. On
+# 2026-11-20 it took 590 s in one job and 812 s in another, at 59.5 kB/s, and
+# in the second the cargo cache had made the build itself 8 s. So the packages
+# are kept in the Actions cache, which restores at tens of MB/s from GitHub's
+# own storage, and the mirror is used only to fill it: when the cache has no
+# entry for this runner image, or when installing from it fails.
+#
+# The key carries the runner image's name and version, because the packages
+# are that image's: a new image starts a new entry rather than installing
+# another release's packages. A cache written by a run on `main` is readable
+# by every pull request; one written by a pull request is readable by that
+# pull request only.
+
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: echo "key=cmake-libclang-${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - id: packages
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/volto-debs
+        key: ${{ steps.key.outputs.key }}
+
+    - shell: bash
+      env:
+        CACHE_HIT: ${{ steps.packages.outputs.cache-hit }}
+      run: |
+        set -euo pipefail
+        debs="$HOME/.cache/volto-debs"
+        if [ "$CACHE_HIT" = true ] && sudo dpkg -i "$debs"/*.deb >/dev/null; then
+          echo "installed $(ls "$debs" | wc -l) packages from the Actions cache"
+          cmake --version | head -1
+          exit 0
+        fi
+        # No entry for this image, or one that no longer installs on it. The
+        # packages apt downloads are kept and become the entry; a hit that
+        # failed keeps its entry, which is immutable, and pays this path
+        # until the image version moves the key.
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          -o APT::Keep-Downloaded-Packages=true cmake libclang-dev
+        mkdir -p "$debs"
+        find /var/cache/apt/archives -maxdepth 1 -name '*.deb' -exec cp {} "$debs"/ \;
+        echo "kept $(ls "$debs" | wc -l) packages for the Actions cache"

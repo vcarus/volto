@@ -54,11 +54,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
       # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. Installed rather than
-      # assumed from the runner image, so the job states what it needs.
+      # build time by bindgen, which loads libclang. The runner image carries
+      # neither; `.github/actions/cmake-libclang` says where they come from.
       # `cargo doc` runs the build scripts too.
       - name: Install cmake and libclang
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake libclang-dev
+        uses: ./.github/actions/cmake-libclang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable

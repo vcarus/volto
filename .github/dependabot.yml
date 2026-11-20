@@ -32,8 +32,12 @@ updates:
 
   # Actions are pinned to commit SHAs with the release in a trailing comment;
   # Dependabot updates the SHA and the comment together.
+  # `/` is the workflows; the second entry is the composite action they
+  # share, which pins an action of its own and is not found under `/`.
   - package-ecosystem: github-actions
-    directory: "/"
+    directories:
+      - "/"
+      - "/.github/actions/cmake-libclang"
     schedule:
       interval: weekly
 
