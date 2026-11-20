@@ -83,12 +83,12 @@ use keys::{Secret, Suite, Version};
 /// The groups this server accepts.
 ///
 /// The set the rustls server accepted (aws-lc-rs's `DEFAULT_KX_GROUPS`
-/// without `prefer-post-quantum`, D102), with X25519MLKEM768 moved to the
-/// front. The order matters only when the client lists none of them first:
+/// without `prefer-post-quantum`, D102). The order here decides nothing:
 /// libssl, like rustls, takes the first group in the client's
-/// `supported_groups` that is also here (`tls1_get_shared_group`, without
-/// `SSL_OP_CIPHER_SERVER_PREFERENCE`), and asks for a new key share with a
-/// HelloRetryRequest when the client sent none for it.
+/// `supported_groups` that is in this set (`tls1_get_shared_group`, which
+/// walks the client's list first unless `SSL_OP_CIPHER_SERVER_PREFERENCE` is
+/// set, and it is not), and asks for a new key share with a HelloRetryRequest
+/// when the client sent none for it.
 const GROUPS: [u16; 4] = [
     0x11ec, // X25519MLKEM768
     0x001d, // X25519
