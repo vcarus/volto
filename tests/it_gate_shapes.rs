@@ -58,8 +58,8 @@ use rustls::pki_types::EchConfigListBytes;
 use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
-    HOLD_TOTAL_BYTES, Names, Policy, Refusal, Screened, Screening, Verdict, first_flight,
-    judgement, nameless_crypto,
+    HOLD_TOTAL_BYTES, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening, Verdict,
+    first_flight, judgement, nameless_crypto,
 };
 use volto::tls::EchKey;
 
@@ -2266,6 +2266,23 @@ fn a_packet_whose_own_fragments_disagree_drops_its_flight_and_every_byte_of_it()
         assert_eq!(screening.released().len(), 2, "{what}");
         assert_eq!(screening.held_bytes(), 0, "{what}");
     }
+}
+
+/// The hold's bounds, by value.
+///
+/// Every other hold test reads these constants from the code they bound, so
+/// they stay green whatever the values are. These are what an unauthenticated
+/// peer can make the server keep, in time, in flights and in bytes, so a change
+/// to any of them has to be a deliberate edit of this test, with its reason in
+/// the commit.
+#[test]
+fn the_hold_bounds_are_the_values_they_are_documented_as() {
+    assert_eq!(HOLD_LIFETIME, Duration::from_secs(2));
+    assert_eq!(HOLD_FLIGHTS, 64);
+    assert_eq!(HOLD_HELLO_BYTES, 16 * 1024);
+    assert_eq!(HOLD_FLIGHT_BYTES, 64 * 1024);
+    assert_eq!(HOLD_TOTAL_BYTES, 4 << 20);
+    assert_eq!(REPLAY_ENTRIES, 1 << 20);
 }
 
 /// Whatever is sent, the hold stays inside its bounds: no more flights than
