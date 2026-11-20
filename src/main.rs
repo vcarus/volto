@@ -131,9 +131,12 @@ fn failure_report(error: &anyhow::Error, journal: bool) -> String {
     if !journal {
         return text + "\n";
     }
-    text.lines()
-        .map(|line| format!("{}{line}\n", syslog_prefix(&Level::ERROR)))
-        .collect()
+    text.lines().fold(String::new(), |mut report, line| {
+        use std::fmt::Write as _;
+        // Writing into a `String` cannot fail.
+        let _ = writeln!(report, "{}{line}", syslog_prefix(&Level::ERROR));
+        report
+    })
 }
 
 /// Everything `main` does, with its error returned for [`main`] to report.
