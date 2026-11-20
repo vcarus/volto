@@ -2,25 +2,11 @@
 #
 # Deploy or update volto from a GitHub release.
 #
-# One script for both days. On a host with no existing install it downloads the
-# newest release, verifies its signature and checksum and hands the bundled binary to
-# install-selfsigned.sh, which does the full first-time setup. On a host that
-# already runs volto it swaps the binary, refreshes the systemd unit and
-# restarts the service -- after keeping the previous binary, so a release that
-# fails to start is rolled back automatically. When the installed version
-# already matches the release and config and unit are in place, nothing is
-# touched at all.
-#
-# That no-op path is what makes the script safe to run on a schedule:
-# --enable-timer installs a systemd timer that re-runs it daily.
-#
-# The version string is the whole of that test, which is why --force exists. A
-# release deleted and published again under the same tag leaves a host whose
-# volto --version matches the tag and whose binary is not the release's, and
-# nothing here can tell the two apart. --force takes the download, verify,
-# install and restart path anyway, rollback guard included, and needs --tag for
-# the same reason --dry-run does: the point is to put one named release's bytes
-# on this host.
+# What a run does on a bare host, on an installed host and on a host that is
+# already current, and every option, are in the usage text below (--help) and in
+# docs/deployment.md. The reason for each step is in the comment beside it: the
+# config check at check_config_with, the rollback at put_back, the lock at
+# acquire_lock, the ownership of /etc/volto at converge_ownership.
 #
 # A release is trusted for one reason: its SHA256SUMS carries a signature made
 # with the release key, whose public half is RELEASE_SIGNER below. The private
@@ -37,22 +23,6 @@
 # signature that is present and wrong is refused either way. The installed copy
 # of this script is never replaced from an unsigned release, because the copy
 # such a release carries verifies nothing.
-#
-# Rolling back by hand is the same flow pinned to an older release:
-#   sudo volto-deploy --tag v1.4.0
-#   sudo volto-deploy --tag v1.3.7 --allow-unsigned   # from before signing
-#
-# Before the binary is swapped, the one that is about to replace it is asked
-# whether it can even read this host's /etc/volto/config.toml -- `volto
-# --check-config`. A "no" refuses the install outright and leaves the running
-# service alone, which is the only useful moment to say it: afterwards the
-# service is already down and the rollback guard below has restored the release
-# the operator was trying to leave. That path still prints an advisory too,
-# because it has two hazards the everyday direction does not: the config file is
-# never rewritten and an older volto refuses the whole file over one key it does
-# not know, and --tag is not a pin -- the update timer, if enabled, converges
-# forward again. On a candidate too old to know the flag, the advisory is all
-# there is, and the run continues.
 #
 # --dry-run is the test seam, in the spirit of install-selfsigned.sh's
 # --print-config: it skips the preflight, prints the convergence decision it

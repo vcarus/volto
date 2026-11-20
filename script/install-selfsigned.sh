@@ -19,12 +19,7 @@
 # the service does not stay up.
 #
 # The config this generates is not installed until the volto binary has been
-# asked whether it can load it -- `volto --check-config`, the same question
-# deploy.sh puts to a release before it swaps the binary on an existing host.
-# This is the other half of that: on a first install the file is brand new, and
-# the only thing that decides whether the service comes up is whether the
-# generator and the shipped example still agree with the binary. A volto too old
-# to know the flag is not asked, and the install proceeds as it always did.
+# asked whether it can load it (check_generated_config).
 #
 # --print-config and --check-config are the test seams: both stop after
 # generating the config, neither needs root, and between them they put
@@ -152,8 +147,7 @@ note() {
 # not carry as written.
 #
 # Called from the two flags that stop after generating a config as well as from
-# the preflight, because they run the same generator and --print-config used to
-# reach it with no check at all.
+# the preflight, because they run the same generator.
 check_credentials() {
     # A username with a colon cannot be expressed in HTTP Basic (RFC 7617), and
     # volto rejects one at startup. Catch it here, where the message can be
@@ -640,9 +634,6 @@ if [ -f "$CONF" ]; then
 else
     [ -n "$PASSWORD" ] || PASSWORD="$(openssl rand -base64 18)"
 
-    # Built from the shipped example so the generated file keeps every comment
-    # explaining what the other keys do. Only four things are substituted, each
-    # anchored to the start of its line so a value cannot match a comment.
     tmp="$(mktemp)"
     # shellcheck disable=SC2064  # $tmp must expand now, not at trap time.
     trap "rm -f '$tmp'" EXIT
