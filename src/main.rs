@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{Event, Level, Subscriber, error, info, warn};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
@@ -27,13 +27,22 @@ use volto::shutdown::Trigger;
 #[global_allocator]
 static GLOBAL: volto::alloc::Global = volto::alloc::GLOBAL;
 
+// Serving takes `--config`; the two ECH subcommands take none, because they
+// read or write one key file and touch nothing else. `subcommand_negates_reqs`
+// is what lets `--config` be required everywhere except there.
 /// Command line arguments.
 #[derive(Debug, Parser)]
-#[command(name = "volto", version, about = "MASQUE proxy server")]
+#[command(
+    name = "volto",
+    version,
+    about = "MASQUE proxy server",
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
 struct Cli {
     /// Path to the TOML configuration file.
-    #[arg(short, long, value_name = "FILE")]
-    config: PathBuf,
+    #[arg(short, long, value_name = "FILE", required = true)]
+    config: Option<PathBuf>,
 
     /// Load and validate the configuration, then exit without serving.
     ///
@@ -50,6 +59,45 @@ struct Cli {
     /// one of them being silently ignored.
     #[arg(long, conflicts_with = "check_config")]
     diagnostics: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// The subcommands, which manage the ECH key file instead of serving.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Generate a new ECH key file and print its ECHConfigList.
+    ///
+    /// The file holds the X25519 private key and the one ECHConfig made from
+    /// it, which fixes the config_id, the public name and the HPKE suites. Point
+    /// `server.ech_key` at it. The ECHConfigList printed on stdout, in base64,
+    /// is the value a client's `ech-config` takes. An existing file is never
+    /// overwritten.
+    EchKeygen {
+        /// The ECHConfig's public name: the name an ECH client sends in the
+        /// clear, and checks the certificate against when ECH is rejected.
+        #[arg(long, value_name = "NAME")]
+        public_name: String,
+        /// Where to write the key file. Created with mode 0600.
+        #[arg(long, value_name = "FILE")]
+        out: PathBuf,
+        /// The ECHConfig's config_id. Random when left out.
+        #[arg(long, value_name = "ID")]
+        config_id: Option<u8>,
+        /// The ECHConfig's maximum_name_length, which only steers how much a
+        /// client pads its encrypted ClientHello.
+        #[arg(long, value_name = "N", default_value_t = 0)]
+        max_name_length: u8,
+    },
+    /// Print the ECHConfigList of an existing ECH key file.
+    ///
+    /// The same base64 value `ech-keygen` printed when it wrote the file.
+    EchConfig {
+        /// The key file, as `server.ech_key` names it.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+    },
 }
 
 /// Runs [`start`] and reports its error the way the standard library would,
@@ -92,25 +140,31 @@ fn failure_report(error: &anyhow::Error, journal: bool) -> String {
 fn start() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(command) = &cli.command {
+        return run_command(command);
+    }
+    // clap requires `--config` whenever no subcommand is given.
+    let path = cli.config.clone().context("--config is required")?;
+
     // Loaded and validated before logging exists, so configuration errors are
     // reported by returning them to `main`. It is also before the runtime
     // exists, which the hand-built runtime below needs: the blocking pool is
     // sized from `max_connections` rather than left at tokio's 512, so that
     // every connection's reserved name-lookup slot has a thread to run on
     // (D90). `#[tokio::main]` cannot express that.
-    let config = Config::load(&cli.config)?;
+    let config = Config::load(&path)?;
 
     // Deliberately the very next thing, and before the runtime is built: what
     // the flag promises is that nothing happens except reading the file.
     if cli.check_config {
-        report_config_check(&cli.config, &config);
+        report_config_check(&path, &config);
         return Ok(());
     }
 
     // The same place and the same promise. The two cannot both be set (clap
     // refuses that command line), so the order between them does not matter.
     if cli.diagnostics {
-        report_diagnostics(&cli.config, &config);
+        report_diagnostics(&path, &config);
         return Ok(());
     }
 
@@ -128,7 +182,7 @@ fn start() -> Result<()> {
     // on is the right answer.
     let startup_grace = config.server.shutdown_grace();
 
-    let served = runtime.block_on(run(cli, config));
+    let served = runtime.block_on(run(path, config));
     let grace = served.as_ref().copied().unwrap_or(startup_grace);
 
     // Deliberately not an implicit drop: tokio's `Runtime::drop` waits without
@@ -137,6 +191,43 @@ fn start() -> Result<()> {
     volto::shutdown::stop_runtime(runtime, grace);
 
     served.map(|_| ())
+}
+
+/// Runs one of the ECH subcommands.
+///
+/// Like `--check-config`, these come before any runtime or subscriber exists
+/// and print to stdout, so nothing goes through `tracing`. The key file's
+/// private half is written once, to the file, and never printed.
+fn run_command(command: &Command) -> Result<()> {
+    match command {
+        Command::EchKeygen {
+            public_name,
+            out,
+            config_id,
+            max_name_length,
+        } => {
+            let config_id = match config_id {
+                Some(id) => *id,
+                None => {
+                    let mut byte = [0u8; 1];
+                    volto::tls::random_bytes(&mut byte)?;
+                    byte[0]
+                }
+            };
+            let key = volto::tls::EchKey::generate(public_name, config_id, *max_name_length)?;
+            volto::tls::write_new_key_file(out, &key)?;
+            eprintln!(
+                "wrote {}: config_id {config_id}, public name {public_name}",
+                out.display()
+            );
+            println!("{}", key.config_list_base64());
+        }
+        Command::EchConfig { file } => {
+            let key = volto::tls::EchKey::load(file)?;
+            println!("{}", key.config_list_base64());
+        }
+    }
+    Ok(())
 }
 
 /// Says that the file loaded, and repeats what starting on it would warn about.
@@ -401,7 +492,7 @@ fn uname() -> String {
 /// what bounds the blocking pool once the runtime's own work is over. A reload
 /// can move that key, and `Server::drain` reads the same live value, which is
 /// the invariant [`volto::shutdown::blocking_grace`] states.
-async fn run(cli: Cli, config: Config) -> Result<Duration> {
+async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     // First, and synchronously: a signal stream records a signal from the
     // moment it is created, and until then `SIGHUP` and `SIGTERM` keep their
     // default action, which ends the process. A stream created inside a spawned
@@ -435,7 +526,7 @@ async fn run(cli: Cli, config: Config) -> Result<Duration> {
         tokio::spawn(watch_for_reload(
             signals.hangup,
             server.reload_handle(),
-            cli.config.clone(),
+            path.clone(),
         ));
     }
     #[cfg(not(unix))]

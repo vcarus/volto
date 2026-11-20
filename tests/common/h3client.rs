@@ -307,6 +307,16 @@ impl H3Client {
         Self::from_quic(endpoint, connection, false).await
     }
 
+    /// [`H3Client::connect`] over an endpoint the caller built, for a client
+    /// TLS configuration no constructor here builds (rustls with ECH in
+    /// `it_tls`). The handshake asks for `localhost`, as the others do.
+    pub async fn connect_on(endpoint: quinn::Endpoint, server: &TestServer) -> Self {
+        let connection = finish_connect(&endpoint, server.addr)
+            .await
+            .expect("handshake");
+        Self::from_quic(endpoint, connection, true).await
+    }
+
     async fn connect_with_datagrams(server: &TestServer, datagrams: bool) -> Self {
         let (endpoint, connection) = connect_quic(server).await;
         Self::from_quic(endpoint, connection, datagrams).await

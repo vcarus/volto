@@ -594,8 +594,8 @@ restart. `0` hands the size back to the operating system.
 ## Reloading
 
 `systemctl reload volto` sends SIGHUP. volto re-reads the configuration file and
-applies it to connections accepted from then on: a renewed certificate, a changed
-user list, a raised or lowered `limits.max_connections`, changed transport
+applies it to connections accepted from then on: a renewed certificate, a new
+ECH key file, a changed user list, a raised or lowered `limits.max_connections`, changed transport
 parameters. Established connections keep the
 configuration they were accepted with — a tunnel's rules must not change
 mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
@@ -619,8 +619,8 @@ restart, and the reload warns saying so. For `log.level` the tracing subscriber
 is built once at startup, so only a restart applies it; `RUST_LOG`, when set,
 overrides it.
 
-A reload is all-or-nothing. Parsing, validation and certificate loading all
-happen before anything is swapped in, so there is no state where a new
+A reload is all-or-nothing. Parsing, validation, certificate loading and ECH
+key loading all happen before anything is swapped in, so there is no state where a new
 certificate is paired with an old user list. If the file is broken, volto logs
 the error and **keeps running on the previous configuration**; it never exits.
 That property is the point: the process sending this signal is usually a renewal
@@ -699,6 +699,41 @@ A second one: the rule that refuses a tunnel to one of this host's own addresses
 cannot see the relay's, because no interface here carries it, so a target that
 names the relay is judged like any other public address. See
 [`[security]`](configuration.md#security).
+
+## Encrypted Client Hello
+
+ECH is optional. Without a key the server runs plain TLS 1.3; with one, a client
+that holds the server's ECHConfigList sends its real server name encrypted, and
+only the key's public name travels in the clear. Generate the key on the host,
+as the user the service runs as, so the private key never leaves it:
+
+```sh
+sudo -u volto volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+```
+
+It prints the ECHConfigList as one base64 line; `volto ech-config
+/etc/volto/ech.pem` prints it again later. Point `server.ech_key` at the file
+and reload. The startup line `accepting QUIC connections` then carries
+`ech=true` with the key's `ech_config_id` and `ech_public_name`.
+
+The public name is what an observer sees, so choose a name that says nothing
+about this server. It must be a plain host name (letters, digits, hyphens and
+dots, not ending in a number); `ech-keygen` refuses anything else. If
+`[security].expected_sni` is set, add the public name to it, because the
+socket-level SNI gate sees only the name in the clear. The full rules are under
+[Encrypted Client Hello](configuration.md#encrypted-client-hello).
+
+In Surge, the list goes into the policy's `ech-config`. `sni` then names the
+real server and travels inside the encryption, while the public name is what
+goes on the wire:
+
+```
+volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
+```
+
+A client whose list no longer matches the key, after a rotation for example, is
+answered on the outer ClientHello and fails its handshake. Give every client the
+new list when the key changes.
 
 ## Apple's relay client
 

@@ -34,6 +34,13 @@ key = "/etc/volto/privkey.pem"
 # Default: 5
 #shutdown_grace = 5
 
+# ECH key file, written by `volto ech-keygen --public-name <name> --out <file>`,
+# which also prints the ECHConfigList a client's `ech-config` takes
+# (`volto ech-config <file>` prints it again). Without it the server is plain
+# TLS 1.3. With the SNI gate on, list the key's public name in
+# [security] expected_sni too. Not set by default.
+#ech_key = "/etc/volto/ech.pem"
+
 [auth]
 # Credentials accepted on every CONNECT request, as HTTP Basic.
 #

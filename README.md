@@ -77,9 +77,10 @@ A commented example configuration is [script/config.example.toml](script/config.
 | **Capsules & datagrams** | RFC 9297 Capsule Protocol on the request stream; unknown capsules are skipped. QUIC DATAGRAM is the fast path, the DATAGRAM capsule the fallback when datagrams are unavailable. |
 | **Authentication** | HTTP Basic on every CONNECT, compared in constant time; `Proxy-Authorization` and `Authorization` both accepted; 407 on failure, with a per-connection failure budget. |
 | **Open-proxy defences** | Private, loopback and multicast ranges refused by default (IPv4-mapped bypasses included), port 25 denied, tunnels capped per connection, unanswered UDP sessions bounded, name-lookup budget per connection. |
+| **TLS** | TLS 1.3 on AWS-LC's libssl with X25519MLKEM768 first, 1-RTT only with no session tickets, and optional Encrypted Client Hello: `volto ech-keygen` writes the key and prints the ECHConfigList a client's `ech-config` takes. See [Encrypted Client Hello](docs/configuration.md#encrypted-client-hello). |
 | **QUIC transport** | Stream limits, idle timeout, keep-alive, initial MTU, PMTU probing, congestion controller (BBR by default) and initial RTT are configuration, not constants. |
 | **Operations** | `SIGHUP` reload that rejects a bad configuration whole and keeps serving; graceful shutdown with GOAWAY and a grace period; systemd unit, installer and self-updating deploy script included. |
-| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which runs the same configuration loading as startup but does not parse the certificate or key ([what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
+| **Diagnostics** | Per-request debug logging with redacted credentials, `SSLKEYLOGFILE` for frame-level analysis, `--check-config`, which runs the same configuration loading as startup, including the ECH key file, but does not parse the certificate or key ([what it covers](docs/configuration.md#checking-a-file-without-starting-the-server)), and `--diagnostics`, which prints a support bundle with the passwords redacted. |
 
 **Explicit non-goals:** CONNECT-IP (RFC 9484), traffic obfuscation, and a web admin panel.
 

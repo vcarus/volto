@@ -283,7 +283,8 @@ fn validate_security(security: &Security) -> Result<()> {
     Ok(())
 }
 
-/// Checks that `server.cert` and `server.key` name files. The only check that
+/// Checks that `server.cert` and `server.key` name files, and that
+/// `server.ech_key`, when set, is a usable ECH key file. The only check that
 /// touches the filesystem, so [`Config::validate`] runs it last.
 fn validate_certificate_paths(server: &Server) -> Result<()> {
     if !server.cert.is_file() {
@@ -297,6 +298,14 @@ fn validate_certificate_paths(server: &Server) -> Result<()> {
             "server.key = {} is not a readable file",
             server.key.display()
         );
+    }
+    // Read and checked whole, not only found: the private key, the ECHConfig,
+    // the public name and that the two halves belong together. A client holds
+    // this ECHConfigList as typed in, so a file the server would refuse at
+    // startup is refused here too, which is what `--check-config` and a
+    // reload promise.
+    if let Some(path) = &server.ech_key {
+        crate::tls::EchKey::load(path)?;
     }
 
     Ok(())

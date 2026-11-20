@@ -86,3 +86,32 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
         }
     }
 }
+
+/// Fills `out` from AWS-LC's random number generator.
+pub fn random_bytes(out: &mut [u8]) -> Result<()> {
+    aws_lc_rs::rand::fill(out).map_err(|_| anyhow::anyhow!("the random number generator failed"))
+}
+
+/// Writes `key` to a new file at `path`, readable by its owner only.
+///
+/// Refuses a path that exists: the file is a credential a client was given, and
+/// overwriting it would lock every such client out without a word.
+pub fn write_new_key_file(path: &Path, key: &EchKey) -> Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "failed to create {} (an existing file is never replaced)",
+                path.display()
+            )
+        })?;
+    file.write_all(key.to_pem().as_bytes())
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to write {}", path.display()))
+}

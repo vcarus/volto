@@ -40,12 +40,19 @@ use super::transport::transport_config;
 /// Connections already open keep the transport parameters they negotiated at
 /// handshake time. QUIC has no way to renegotiate them mid-connection, so this
 /// is a property of the protocol rather than a shortcut.
-pub(super) fn server_config(config: &Config) -> Result<quinn::ServerConfig> {
+///
+/// It also returns the ECH state the TLS layer was built with, for the startup
+/// and reload lines. That is taken from the TLS configuration that was built
+/// rather than from the file again, so the line reports the key in force.
+pub(super) fn server_config(
+    config: &Config,
+) -> Result<(quinn::ServerConfig, Option<tls::EchSummary>)> {
     let crypto = tls::server_config(config)?;
+    let ech = crypto.ech().cloned();
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     server_config.transport_config(Arc::new(transport_config(&config.limits)?));
 
-    Ok(server_config)
+    Ok((server_config, ech))
 }
 
 /// The live configuration, swapped wholesale on reload.
@@ -189,8 +196,9 @@ impl ReloadHandle {
         let config = Arc::new(Config::load(path)?);
 
         // Loads and parses the certificate and key, which is the step most likely
-        // to fail during a renewal. Done before anything is swapped.
-        let quic_config = server_config(&config)
+        // to fail during a renewal, and the ECH key. Done before anything is
+        // swapped.
+        let (quic_config, ech) = server_config(&config)
             .context("the new configuration's certificate and key are not usable")?;
 
         // Rendered before the guard is taken, because it opens and parses
@@ -276,6 +284,11 @@ impl ReloadHandle {
             path = %path.display(),
             users = config.auth.users.len(),
             cert = %config.server.cert.display(),
+            // The ECH key in force from now on. The public name is one the key
+            // file's check accepted, an LDH host name, so `Display` is safe.
+            ech = ech.is_some(),
+            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.config_id)),
+            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.public_name.as_str())),
             "configuration reloaded; new connections will use it"
         );
 

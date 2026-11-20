@@ -178,6 +178,9 @@ pub struct Server {
     /// reloaded value already there and say nothing. The subscriber itself is
     /// installed once, in `main`, before this type exists; see [`ReloadHandle`].
     startup_log_level: String,
+    /// The ECH state the server was bound with, for the startup line. A reload
+    /// reports its own in the reload line.
+    ech: Option<crate::tls::EchSummary>,
 }
 
 impl Server {
@@ -198,7 +201,7 @@ impl Server {
     /// the socket is not: with an empty list every datagram passes through
     /// untouched, and a `SIGHUP` can then turn the gate on without a restart.
     pub fn bind(config: Arc<Config>) -> Result<Self> {
-        let quic_config = server_config(&config)?;
+        let (quic_config, ech) = server_config(&config)?;
         // Taken before the configuration moves into the endpoint. The Initial
         // keys the gate needs are a function of the client's own Destination
         // Connection ID rather than of the certificate (RFC 9001 §5.2), so this
@@ -250,6 +253,7 @@ impl Server {
             },
             listen: config.server.listen,
             startup_log_level: config.log.level.clone(),
+            ech,
             config: Arc::new(RwLock::new(config)),
             quic_config: Arc::new(RwLock::new(accepted_with)),
             roster: Roster::new(),
@@ -354,6 +358,13 @@ impl Server {
             // say, which is why they are `Option`s rather than a sentinel.
             so_rcvbuf = self.socket_buffers.recv,
             so_sndbuf = self.socket_buffers.send,
+            // Whether ECH is on, and under which config_id and public name.
+            // Nothing secret: both are in the ECHConfigList a client holds and
+            // in every ClientHello it sends. The public name passed the key
+            // file's LDH check, so `Display` is safe.
+            ech = self.ech.is_some(),
+            ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.config_id)),
+            ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.public_name.as_str())),
             "accepting QUIC connections"
         );
 
@@ -1325,8 +1336,11 @@ pub(crate) mod tests {
             // The two writes the reload makes to what an accept reads, while the
             // accept waits for the rest of them.
             let reloaded = Config::load(&bound.config_path).expect("the new configuration loads");
-            let reloaded_quic =
-                Arc::new(server_config(&reloaded).expect("the new certificate is usable"));
+            let reloaded_quic = Arc::new(
+                server_config(&reloaded)
+                    .expect("the new certificate is usable")
+                    .0,
+            );
             *bound
                 .server
                 .config

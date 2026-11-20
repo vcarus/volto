@@ -52,7 +52,9 @@ exchange groups X25519MLKEM768, X25519, P-256 and P-384 in the client's order of
 preference, and the ALPN identifiers of `server.alpn`. A client that shares no
 ALPN identifier with the server is refused with `no_application_protocol`. It
 issues no session tickets and accepts no 0-RTT data, so every connection is a
-full handshake. The provider is the one module of the crate that uses
+full handshake. An ECH key (`server.ech_key`) is optional; without one the
+server is plain TLS 1.3, and with one it also accepts Encrypted Client Hello.
+The provider is the one module of the crate that uses
 `unsafe`, and the reason is stated where the crate denies it, in `lib.rs`.
 
 ### The SNI gate

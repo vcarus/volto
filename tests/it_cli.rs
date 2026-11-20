@@ -691,3 +691,147 @@ fn an_unknown_argument_fails_differently_from_an_unknown_key() {
         "which must not read like a configuration failure: {stderr}"
     );
 }
+
+/// `ech-keygen` writes a key file and prints its ECHConfigList, `ech-config`
+/// prints the same list from the file, and an existing file is not replaced.
+#[test]
+fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
+    let dir = config_dir("ech-keygen");
+    let key = dir.join("ech.pem");
+    let key_arg = key.to_str().unwrap();
+
+    let written = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--config-id",
+        "5",
+        "--out",
+        key_arg,
+    ]);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
+    let list = stdout_of(&written);
+    let list = list.trim();
+    assert!(
+        list.len() > 60
+            && list
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)),
+        "stdout is one base64 ECHConfigList: {list:?}"
+    );
+    let text = fs::read_to_string(&key).expect("the key file was written");
+    assert!(text.starts_with("-----BEGIN PRIVATE KEY-----\n"), "{text}");
+    assert!(text.contains("-----BEGIN ECHCONFIG-----\n"));
+    assert!(!list.is_empty() && !stderr_of(&written).contains(text.lines().nth(1).unwrap()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(&key).expect("metadata").permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the key file is readable by its owner only"
+        );
+    }
+
+    let printed = run(&["ech-config", key_arg]);
+    assert_eq!(printed.status.code(), Some(0), "{}", stderr_of(&printed));
+    assert_eq!(stdout_of(&printed).trim(), list);
+
+    let again = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--out",
+        key_arg,
+    ]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(
+        stderr_of(&again).contains("never replaced"),
+        "{}",
+        stderr_of(&again)
+    );
+    assert_eq!(fs::read_to_string(&key).expect("the key file"), text);
+
+    let refused = run(&[
+        "ech-keygen",
+        "--public-name",
+        "192.0.2.1",
+        "--out",
+        dir.join("other.pem").to_str().unwrap(),
+    ]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr_of(&refused).contains("numeric label"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(
+        !dir.join("other.pem").exists(),
+        "nothing is written for a refused name"
+    );
+}
+
+/// `--check-config` reads the ECH key file whole, and refuses one the server
+/// would refuse at startup, by the key's name.
+#[test]
+fn the_check_refuses_a_bad_ech_key_file_by_the_name_of_its_key() {
+    let dir = config_dir("ech-check");
+    let key = dir.join("ech.pem");
+    let written = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--out",
+        key.to_str().unwrap(),
+    ]);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
+
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    let with_key = |file: &Path| {
+        let text = fs::read_to_string(&path).expect("the config");
+        let text = text.replacen(
+            "\n\n[auth]",
+            &format!("\nech_key = \"{}\"\n\n[auth]", file.display()),
+            1,
+        );
+        fs::write(&path, text).expect("rewrite the config");
+    };
+    with_key(&key);
+    let checked = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
+
+    // The private key of one file with the ECHConfig of another.
+    let other = dir.join("other.pem");
+    let generated = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--out",
+        other.to_str().unwrap(),
+    ]);
+    assert_eq!(generated.status.code(), Some(0));
+    let mine = fs::read_to_string(&key).expect("key");
+    let theirs = fs::read_to_string(&other).expect("other");
+    let private: String = mine
+        .split_inclusive('\n')
+        .take_while(|l| !l.starts_with("-----BEGIN ECHCONFIG"))
+        .collect();
+    let config: String = theirs
+        .split_inclusive('\n')
+        .skip_while(|l| !l.starts_with("-----BEGIN ECHCONFIG"))
+        .collect();
+    let mixed = dir.join("mixed.pem");
+    fs::write(&mixed, format!("{private}{config}")).expect("write the mixed file");
+
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    with_key(&mixed);
+    let refused = run(&["--check-config", "--config", path.to_str().unwrap()]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stdout_of(&refused));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("server.ech_key"),
+        "the refusal names the key: {stderr}"
+    );
+    assert!(stderr.contains("do not form a usable ECH key"), "{stderr}");
+}

@@ -31,6 +31,65 @@ whole and the running configuration keeps serving; see
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging. A list that does not offer `h3` starts a server no client can reach — HTTP/3 is the only protocol volto serves, so TLS ends every handshake with `no_application_protocol`, an alert that says nothing about why — and volto warns about it at startup |
 | `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. Kept short because a client that keeps using a connection after GOAWAY (Surge does) has its new requests fail for the whole drain. The tunnels get one grace period. The exit can take up to `2 * shutdown_grace + 3` seconds at the shipped constants, because after the grace period and a 1 s close flush, a name lookup still running on the blocking pool gets a second grace period plus 2 s (`getaddrinfo` cannot be cancelled), so systemd's `TimeoutStopSec` must be above that. The ceiling is there because the value is a bound: a drain longer than an hour has outlived any service manager's patience, so it would only replace the graceful ending with a `SIGKILL` |
+| `ech_key` | path | none | ECH key file written by `volto ech-keygen`. Without it the server is plain TLS 1.3; with it the server also accepts Encrypted Client Hello. See [Encrypted Client Hello](#encrypted-client-hello) |
+
+### Encrypted Client Hello
+
+With `ech_key` set, a client that holds the server's ECHConfigList can encrypt
+its ClientHello, so the name it asks for travels inside the encryption and only
+the ECHConfig's public name is in the clear. A client without the list still
+connects as before: ECH is accepted, not required.
+
+**Generating the key.**
+
+```sh
+volto ech-keygen --public-name public.example --out /etc/volto/ech.pem
+```
+
+writes the key file with mode 0600 and prints the ECHConfigList on stdout, in
+standard base64. That value is what a client takes, for example Surge's
+`ech-config`. `--config-id` picks the ECHConfig's config_id (random when left
+out), and `--max-name-length` its `maximum_name_length`, which only steers how
+much a client pads (default 0). An existing file is never overwritten. To print
+the list again from the file:
+
+```sh
+volto ech-config /etc/volto/ech.pem
+```
+
+**The key file** holds two PEM blocks: `PRIVATE KEY`, the X25519 private key as
+PKCS#8, and `ECHCONFIG`, the ECHConfigList with its one ECHConfig. Because the
+ECHConfig itself is stored, the file fixes the private key, the config_id, the
+public name, the HPKE suites (HKDF-SHA256 with AES-128-GCM or
+ChaCha20-Poly1305) and the maximum name length together, and the list a client
+holds stays the same across restarts and reloads. Nothing in `config.toml`
+changes it. The file is read at startup, by `--check-config` and on every
+`SIGHUP`, and refused whole if a block is missing or doubled, if the private key
+is not X25519, if the two blocks do not belong together, or if the public name
+is one a client would ignore: it must be a host name of letters, digits and
+hyphens with no empty label, no label over 63 bytes and no all-numeric last
+label (RFC 9849 §6.1.7). A refused file at `SIGHUP` leaves the running key in
+force.
+
+**Rotating the key** is a new file and a reload: generate it with
+`ech-keygen`, point `ech_key` at it, `systemctl reload volto`, and give every
+client the new list. A client with the old list is then answered on the outer
+ClientHello and fails its handshake.
+
+**What a client without the right key sees.** The server never refuses a
+handshake for an ECH reason, as RFC 9849 §7.1 requires. A ClientHello whose
+ECH extension the key does not open (an older key, GREASE, a damaged payload)
+is answered on its outer ClientHello, with the certificate, and the server's
+encrypted reply carries this server's ECHConfigList as `retry_configs`, which
+RFC 9849 §7.1 also requires and AWS-LC does not let a server leave out. A
+ClientHello with no ECH extension gets no ECH extension back.
+
+**With the SNI gate on**, list the public name in
+`[security].expected_sni` as well as the real name: the socket-level gate reads
+the name in the clear, which for an ECH client is the public name, and drops
+the handshake if that name is not listed. volto warns at startup when it is not.
+The second gate then judges the name inside the encrypted ClientHello when ECH
+is accepted, and the name in the clear otherwise.
 
 ## `[auth]`
 
@@ -652,7 +711,8 @@ means root or `sudo -u volto`, since `/etc/volto` is `0750 volto:volto`.
 server: TOML syntax, every table's refusal of a key it does not know, and every
 range and cross-field rule (`keep_alive_interval` against `max_idle_timeout`,
 `mtu_upper_bound` against `initial_mtu`, and the rest) — including that
-`server.cert` and `server.key` exist and are files.
+`server.cert` and `server.key` exist and are files. `server.ech_key`, when set, is read whole: the
+same checks startup makes on that file.
 
 **What it does not cover** is what only the running service can answer: whether
 the listen address is free, whether the certificate and key parse and form a
@@ -771,6 +831,7 @@ with the table below and the line number in the journal.
 | `[limits].ip_family_preference` | v0.2.9 |
 | `[limits].mtu_upper_bound` | v0.4.5 |
 | `[security].expected_sni` | v0.9.0 |
+| `[server].ech_key` | the release after v1.5.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
 bites in practice, because the shipped example sets it and every install made by

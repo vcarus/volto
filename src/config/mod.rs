@@ -667,6 +667,16 @@ pub struct Server {
     /// a bound, which is why it has a ceiling of its own.
     #[serde(default = "default_shutdown_grace")]
     pub shutdown_grace: u64,
+    /// The ECH key file, or none for plain TLS 1.3.
+    ///
+    /// Written by `volto ech-keygen`: the X25519 private key and the one
+    /// ECHConfig made from it, as two PEM blocks, so the ECHConfigList a client
+    /// holds is the same on every start and can be printed again with
+    /// `volto ech-config`. The file is read at startup, by `--check-config` and
+    /// on every reload, and refused whole if anything in it is wrong. See
+    /// [`crate::tls::EchKey`].
+    #[serde(default)]
+    pub ech_key: Option<PathBuf>,
 }
 
 /// `[log]`: logging settings.
@@ -1395,17 +1405,25 @@ pub(crate) mod tests {
         assert_eq!(keylog, log.keylog);
 
         // `listen`, `cert` and `key` are the operator's own and have no default
-        // to be compared against; the other two `[server]` keys do.
+        // to be compared against; `alpn` and `shutdown_grace` do, and `ech_key`
+        // defaults to none.
         let Server {
             listen: _,
             cert: _,
             key: _,
             alpn,
             shutdown_grace,
+            ech_key,
         } = cfg.server.clone();
 
         assert_eq!(alpn, default_alpn());
         assert_eq!(shutdown_grace, DEFAULT_SHUTDOWN_GRACE);
+        // No default to compare a path against: the example names a path and
+        // the default is none. What is pinned is that the key exists at all.
+        assert!(
+            ech_key.is_some(),
+            "the example documents server.ech_key with a path"
+        );
     }
 
     /// Both socket buffer keys parse, and `0` is a legal value rather than a
