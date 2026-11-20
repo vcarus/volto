@@ -1304,16 +1304,11 @@ fn next_1rtt_keys_follow_quic_ku() {
 fn through_load_key(label: &str, der: &[u8]) -> Zeroizing<Vec<u8>> {
     let mut text = String::new();
     pem_block(&mut text, label, der);
-    let dir = std::env::temp_dir().join(format!(
-        "volto-tls-key-{}-{}",
-        std::process::id(),
-        label.replace(' ', "-")
-    ));
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    let path = dir.join(format!("{:p}.pem", der.as_ptr()));
+    let dir = super::super::tests::scratch();
+    let path = dir.join("server.key");
     std::fs::write(&path, text).expect("write the key");
     let key = super::super::load_key(&path).expect("load_key reads it");
-    let _ = std::fs::remove_file(&path);
+    std::fs::remove_dir_all(&dir).expect("clean up");
     key
 }
 
@@ -1686,7 +1681,9 @@ async fn first_flight(
     drop(connecting);
     endpoint.close(0u32.into(), b"");
 
-    let first = &datagrams[0];
+    let first = datagrams
+        .first()
+        .expect("the client sent no Initial within 150 ms");
     let dcid_len = usize::from(first[5]);
     let dcid = &first[6..6 + dcid_len];
     let (client, server) = keys::initial_secrets(Version::V1, dcid);

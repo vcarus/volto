@@ -181,8 +181,9 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
-    /// A fresh directory for one test, named by process and a counter.
-    fn scratch() -> std::path::PathBuf {
+    /// A fresh directory for one test, named by process and a counter. The
+    /// test removes it. `awslc`'s tests use it too.
+    pub(super) fn scratch() -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
