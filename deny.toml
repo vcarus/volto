@@ -1,0 +1,61 @@
+# cargo-deny, run by the `deny` job in `.github/workflows/ci.yml` on the root
+# workspace and on `fuzz/`. Two checks only: where a dependency comes from and
+# under what licence. Advisories are the `audit` job's (cargo-audit), and there
+# is no ban list.
+
+[graph]
+# Every target, so a dependency that only a Windows or wasm build pulls is
+# judged as well. Both lock files hold those entries whether or not they are
+# ever built here.
+all-features = true
+
+[sources]
+# Every dependency comes from crates.io. A git dependency or a second registry
+# fails the check: cargo-audit skips a lock entry from any other source without
+# saying so, the three-day minimum publish age in `.cargo/config.toml` applies
+# to registry versions only, and D60 and D70 keep `quinn-proto` unpatched for
+# the same reason.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[licenses]
+# The licences the dependency graph carries today, each compatible with
+# shipping a statically linked MIT binary. A dependency under any other licence
+# fails the check and is then read before it is added here. Where a crate
+# offers a choice, one allowed licence is enough.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "NCSA",
+    "CC0-1.0",
+    "Unlicense",
+]
+# A crate whose licence cargo-deny has to guess from its files must match a
+# known text this closely.
+confidence-threshold = 0.9
+# `NCSA` is carried by the fuzz workspace only (libfuzzer-sys), so the root
+# workspace does not meet it, and that is not worth a warning.
+unused-allowed-license = "allow"
+
+[licenses.private]
+# `fuzz/` is a workspace member that is never published and states no licence
+# of its own; it is covered by the repository's.
+ignore = true
+
+[advisories]
+# Not run here; see the top of this file. The table is present so that a bare
+# `cargo deny check` without arguments still reads the same advisory database
+# the `audit` job does and nothing else.
+
+[bans]
+# No bans. Two versions of one crate are reported as a warning, not an error:
+# the graph has a few and each comes from an upstream that has not moved yet.
+multiple-versions = "warn"

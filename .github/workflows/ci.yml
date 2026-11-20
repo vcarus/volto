@@ -262,6 +262,41 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  deny:
+    # Where every dependency comes from and under what licence, for both lock
+    # files (`deny.toml`). The `audit` job above reads advisories and nothing
+    # else, and it skips a lock entry that is not from crates.io without saying
+    # so; this job is what fails when such an entry appears. cargo-deny reads
+    # `cargo metadata` and builds nothing.
+    name: deny (sources and licences)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # cargo-deny 0.21.0 (2026-11-16), pinned by version and by the digest of
+      # the exact asset, as docs.yml pins mdBook and for the same reason: a
+      # release tarball can be replaced in place.
+      CARGO_DENY_VERSION: "0.21.0"
+      CARGO_DENY_SHA256: "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        run: |
+          set -euo pipefail
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL -o "${name}.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  ${name}.tar.gz" | sha256sum --check --strict -
+          mkdir -p "$HOME/.local/bin"
+          tar xzf "${name}.tar.gz" -C "$HOME/.local/bin" --strip-components=1 "${name}/cargo-deny"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check the root workspace
+        run: cargo deny --manifest-path Cargo.toml --locked check licenses sources
+      - name: Check the fuzz workspace
+        run: cargo deny --manifest-path fuzz/Cargo.toml --locked check licenses sources
+
   test:
     # macOS is the development host and Linux the deployment target; both have to
     # stay green, so the suite runs on both rather than on one of them.
