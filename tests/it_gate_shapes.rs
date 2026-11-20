@@ -1811,22 +1811,6 @@ fn an_ech_flight_is_held_until_its_client_hello_is_whole_and_released_in_order()
     }
 }
 
-/// A client that sends its first flight again, after a loss or because the
-/// server's answer was lost, keeps its ClientHello and so its HPKE `enc`, from
-/// the same address, and is admitted again.
-#[test]
-fn a_first_flight_sent_again_from_its_own_address_is_admitted_again() {
-    let crypto = nameless_crypto();
-    let key = ech_key(7);
-    let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
-    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
-
-    let mut screening = Screening::new(hold_policy(&key, &[], true));
-    released_whole(&mut screening, from(1), &flight, "the first time");
-    released_whole(&mut screening, from(1), &flight, "sent again");
-    assert_eq!(screening.replay_entries(), 1);
-}
-
 /// The flight after a Retry: the same ClientHello, so the same `enc`, from
 /// the same address, but addressed to the connection ID the Retry chose,
 /// carrying its token, and keyed by that connection ID (RFC 9001 §5.2), so
@@ -1853,7 +1837,10 @@ fn the_flight_after_a_retry_is_admitted() {
 
 /// The same flight from another address is a copy of somebody else's, and is
 /// dropped; the copy cannot be told from the original by anything but where
-/// it came from.
+/// it came from. A client that sends its first flight again, after a loss or
+/// because the server's answer was lost, keeps its ClientHello and so its HPKE
+/// `enc`, from the same address, and is admitted again, with one entry in the
+/// replay record for both.
 #[test]
 fn the_same_ech_from_another_address_is_a_replay() {
     let crypto = nameless_crypto();
@@ -1881,6 +1868,7 @@ fn the_same_ech_from_another_address_is_a_replay() {
         );
         // The original's address is still admitted.
         released_whole(&mut screening, from(1), &flight, "the original again");
+        assert_eq!(screening.replay_entries(), 1, "one ClientHello, one entry");
     }
 }
 
