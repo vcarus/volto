@@ -148,11 +148,12 @@ async fn inbound_requests_are_logged_with_every_header() {
 /// A filter the rule refuses as silencing has to drop one of those lines, and
 /// a filter it accepts has to let every one through. A filter refused as not a
 /// level name is refused either way, so only the other two verdicts are held
-/// to the real filter here.
+/// to the real filter here. Each filter is first normalised, as both callers
+/// do before they judge and install it.
 #[test]
 fn the_shared_log_rule_agrees_with_the_filter_that_applies_it() {
     use tracing_subscriber::layer::SubscriberExt as _;
-    use volto::config::{FilterRefusal, filter_refusal};
+    use volto::config::{FilterRefusal, filter_refusal, normalise_filter};
 
     let filters = [
         "off",
@@ -187,9 +188,23 @@ fn the_shared_log_rule_agrees_with_the_filter_that_applies_it() {
         "info,[handshake]=off",
         "volto_other=off,info",
         "volto_other=info",
+        // Spaces around the value or a directive: `EnvFilter` keeps them in
+        // the target, so each is judged and installed after normalisation.
+        " info",
+        "info ",
+        " INFO ",
+        " off",
+        "quinn=info, info",
+        "quinn=info ,info",
+        " volto=off",
+        "info, volto=off",
+        "quinn=debug, ",
     ];
 
-    for filter in filters {
+    for written in filters {
+        // What both callers do: normalise once, judge that text, install it.
+        let filter = normalise_filter(written);
+        let filter = filter.as_str();
         let env_filter = tracing_subscriber::EnvFilter::try_new(filter)
             .unwrap_or_else(|error| panic!("{filter:?} must parse: {error}"));
         let subscriber = tracing_subscriber::registry().with(env_filter);
@@ -208,11 +223,11 @@ fn the_shared_log_rule_agrees_with_the_filter_that_applies_it() {
         match filter_refusal("RUST_LOG", filter) {
             Some(FilterRefusal::Silences(_)) => assert!(
                 silenced,
-                "{filter:?} is refused as silencing, but the filter lets both lines through"
+                "{written:?} is refused as silencing, but the filter lets both lines through"
             ),
             None => assert!(
                 !silenced,
-                "{filter:?} is accepted, but the filter drops a line of this server: \
+                "{written:?} is accepted, but the filter drops a line of this server: \
                  {through:?} for volto, volto::quic, volto::quic::reload, volto::tunnel"
             ),
             Some(FilterRefusal::NotALevel(_)) => {}

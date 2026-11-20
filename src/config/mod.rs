@@ -33,7 +33,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use parse_error::parse_error;
-pub use validate::{FilterRefusal, filter_refusal};
+pub use validate::{FilterRefusal, filter_refusal, normalise_filter};
 
 /// ALPN protocol identifiers advertised when the config does not say otherwise.
 ///

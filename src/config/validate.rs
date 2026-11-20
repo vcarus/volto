@@ -358,14 +358,17 @@ const OWN_TARGET: &str = "volto";
 
 /// Validates `log.level`.
 ///
-/// Filter syntax is handed to `EnvFilter` first, then the value is held to
-/// [`filter_refusal`], the rule `RUST_LOG` is held to as well.
+/// The value is normalised by [`normalise_filter`], which is also what the
+/// server installs. Filter syntax is handed to `EnvFilter` first, then the
+/// normalised value is held to [`filter_refusal`], the rule `RUST_LOG` is held
+/// to as well.
 fn validate_log_level(level: &str) -> Result<()> {
+    let level = normalise_filter(level);
     if level.contains([',', '=', '[']) {
-        tracing_subscriber::EnvFilter::try_new(level)
+        tracing_subscriber::EnvFilter::try_new(&level)
             .with_context(|| format!("log.level = {level:?} is not a valid filter"))?;
     }
-    match filter_refusal("log.level", level) {
+    match filter_refusal("log.level", &level) {
         Some(refusal) => bail!("{}", refusal.message()),
         None => Ok(()),
     }
@@ -396,8 +399,31 @@ impl FilterRefusal {
     }
 }
 
+/// A log filter as both [`filter_refusal`] and the installed `EnvFilter` see
+/// it: the whole value and each comma-separated directive trimmed, and empty
+/// directives dropped.
+///
+/// `EnvFilter` does not trim (tracing-subscriber 0.3.23, `Directive::parse`
+/// keeps the spaces around a directive in its target), so `" info"` is the
+/// target `" info"` at TRACE, which matches no event. Judging a trimmed copy
+/// while installing the raw text would accept a value that silences the
+/// server. So both callers normalise once, judge the result, and install the
+/// same result. `EnvFilter` splits on every comma and drops empty pieces as
+/// well, so rejoining the trimmed pieces with commas changes nothing else.
+pub fn normalise_filter(filter: &str) -> String {
+    filter
+        .split(',')
+        .map(str::trim)
+        .filter(|directive| !directive.is_empty())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The rule `log.level` and `RUST_LOG` share, or `None` for a filter it
 /// accepts. `source` names the key or the variable in the message.
+///
+/// `filter` is judged as given, so a caller passes what [`normalise_filter`]
+/// returned and installs that same text.
 ///
 /// A single word must be one of the five level names, in any letter case.
 /// `off` and `0` are [`FilterRefusal::Silences`]; any other word is
@@ -450,7 +476,7 @@ fn silences_own_lines(filter: &str) -> bool {
     // The specificity and the verdict of the directive that decides for
     // `OWN_TARGET` itself; `None` when no directive matches it yet.
     let mut deciding: Option<(Option<usize>, bool)> = None;
-    for directive in filter.split(',').map(str::trim).filter(|d| !d.is_empty()) {
+    for directive in filter.split(',').filter(|d| !d.is_empty()) {
         if directive.contains('[') {
             continue;
         }
@@ -1434,6 +1460,33 @@ mod tests {
             "volto_other=off,info",
         ] {
             assert_eq!(filter_refusal("log.level", level), None, "{level}");
+        }
+    }
+
+    /// Spaces around the value or around a directive are removed before the
+    /// rule judges it, and the same text is what the server installs, so the
+    /// verdict is the verdict on the filter that applies.
+    #[test]
+    fn a_filter_is_judged_without_the_spaces_the_filter_would_keep() {
+        for (written, normalised) in [
+            (" info", "info"),
+            ("INFO ", "INFO"),
+            ("quinn=info, info", "quinn=info,info"),
+            (" volto=debug , quinn=info ,", "volto=debug,quinn=info"),
+            (",,info,,", "info"),
+            ("  ", ""),
+        ] {
+            assert_eq!(normalise_filter(written), normalised, "{written:?}");
+        }
+
+        for level in [" info", "quinn=info, info", " volto=debug , quinn=info"] {
+            validate_log_level(level).unwrap_or_else(|e| panic!("{level:?} should be valid: {e}"));
+        }
+        for level in [" off", "quinn=info, ", " quinn=debug ,rustls=info"] {
+            let err = validate_log_level(level)
+                .err()
+                .unwrap_or_else(|| panic!("{level:?} must be refused"));
+            assert!(err.to_string().contains("turns off"), "{err}");
         }
     }
 

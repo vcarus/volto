@@ -726,21 +726,7 @@ const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
 /// Under systemd each line additionally carries a syslog priority prefix; see
 /// [`JournalPriority`]. In a terminal the output is unchanged.
 fn init_tracing(level: &str) -> Result<()> {
-    let rust_log = std::env::var_os("RUST_LOG");
-
-    let mut invalid_rust_log = None;
-    let filter = match filter_source(rust_log.as_deref()) {
-        FilterSource::Config => tracing_subscriber::EnvFilter::try_new(level)
-            .with_context(|| format!("log.level = {level:?} is not a valid filter"))?,
-        FilterSource::RustLog => tracing_subscriber::EnvFilter::try_from_default_env()
-            .context("RUST_LOG is set and parses, but could not be read back")?,
-        FilterSource::InvalidRustLog(error) => {
-            invalid_rust_log = Some(error);
-            tracing_subscriber::EnvFilter::try_new(level)
-                .with_context(|| format!("log.level = {level:?} is not a valid filter"))?
-        }
-        FilterSource::Refused(reason) => anyhow::bail!("{reason}"),
-    };
+    let (filter, invalid_rust_log) = chosen_filter(std::env::var_os("RUST_LOG").as_deref(), level)?;
 
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
 
@@ -773,6 +759,32 @@ fn init_tracing(level: &str) -> Result<()> {
     Ok(())
 }
 
+/// The filter [`init_tracing`] installs, from `RUST_LOG`'s value and
+/// `log.level`, with the reason to report when a set `RUST_LOG` was ignored.
+///
+/// Either text is installed as [`volto::config::normalise_filter`] returns it,
+/// which is the text the shared rule judged. Split from [`init_tracing`] so a
+/// test can ask the filter what it enables without installing it.
+fn chosen_filter(
+    rust_log: Option<&OsStr>,
+    level: &str,
+) -> Result<(tracing_subscriber::EnvFilter, Option<String>)> {
+    let configured = || {
+        tracing_subscriber::EnvFilter::try_new(volto::config::normalise_filter(level))
+            .with_context(|| format!("log.level = {level:?} is not a valid filter"))
+    };
+    match filter_source(rust_log) {
+        FilterSource::Config => Ok((configured()?, None)),
+        FilterSource::RustLog(text) => Ok((
+            tracing_subscriber::EnvFilter::try_new(text)
+                .context("RUST_LOG is set and parses, but could not be read back")?,
+            None,
+        )),
+        FilterSource::InvalidRustLog(error) => Ok((configured()?, Some(error))),
+        FilterSource::Refused(reason) => anyhow::bail!("{reason}"),
+    }
+}
+
 /// What decides the filter [`init_tracing`] installs.
 ///
 /// An unset `RUST_LOG` and a set-but-unparseable one are not the same thing:
@@ -785,8 +797,9 @@ fn init_tracing(level: &str) -> Result<()> {
 enum FilterSource {
     /// `RUST_LOG` is absent: `log.level` applies.
     Config,
-    /// `RUST_LOG` is set and parses: it applies, overriding `log.level`.
-    RustLog,
+    /// `RUST_LOG` is set and parses: it applies, overriding `log.level`. The
+    /// text is the normalised value, the one the rule judged.
+    RustLog(String),
     /// `RUST_LOG` is set and does not parse, or is
     /// [`FilterRefusal::NotALevel`]: `log.level` applies, and this is the
     /// reason to report once the subscriber exists.
@@ -805,10 +818,11 @@ enum FilterSource {
 ///
 /// The rule is `volto::config::filter_refusal`, the one `log.level` is held to,
 /// so a bare word must be one of the five level names and nothing may turn the
-/// `volto` target off. Two things differ, both because the value comes from the
-/// environment: it is trimmed first, and only a value that silences this
-/// server stops the start. Any other refusal falls back to `log.level`, which
-/// has already passed the same rule.
+/// `volto` target off. The value is normalised first, as `log.level` is, and
+/// the normalised text is what is parsed, judged and installed. One thing
+/// differs, because the value comes from the environment: only a value that
+/// silences this server stops the start. Any other refusal falls back to
+/// `log.level`, which has already passed the same rule.
 fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
     let Some(raw) = rust_log else {
         return FilterSource::Config;
@@ -816,15 +830,13 @@ fn filter_source(rust_log: Option<&OsStr>) -> FilterSource {
     let Some(text) = raw.to_str() else {
         return FilterSource::InvalidRustLog("RUST_LOG is not valid UTF-8".to_owned());
     };
-    let parsed = tracing_subscriber::EnvFilter::try_new(text);
-    match (
-        volto::config::filter_refusal("RUST_LOG", text.trim()),
-        parsed,
-    ) {
+    let text = volto::config::normalise_filter(text);
+    let parsed = tracing_subscriber::EnvFilter::try_new(&text);
+    match (volto::config::filter_refusal("RUST_LOG", &text), parsed) {
         (Some(FilterRefusal::NotALevel(reason)), _) => FilterSource::InvalidRustLog(reason),
         (_, Err(error)) => FilterSource::InvalidRustLog(error.to_string()),
         (Some(FilterRefusal::Silences(reason)), Ok(_)) => FilterSource::Refused(reason),
-        (None, Ok(_)) => FilterSource::RustLog,
+        (None, Ok(_)) => FilterSource::RustLog(text),
     }
 }
 
@@ -1034,7 +1046,7 @@ mod tests {
         assert_eq!(filter_source(None), FilterSource::Config);
         assert_eq!(
             filter_source(Some(OsStr::new("volto=debug,quinn=info"))),
-            FilterSource::RustLog
+            FilterSource::RustLog("volto=debug,quinn=info".to_owned())
         );
 
         match filter_source(Some(OsStr::new("volto=notalevel"))) {
@@ -1067,19 +1079,23 @@ mod tests {
         // A bare level name is still a level, in any case. A target directive
         // is still accepted, numeric levels included, which is the reason
         // RUST_LOG is more than a level, and so is one that turns another
-        // crate off while a default keeps this server on.
-        for value in [
-            "warn",
-            " INFO ",
-            "volto=debug",
-            "volto=3",
-            "volto=trace,quinn=warn",
-            "info,quinn=off",
-            "off,volto=info",
+        // crate off while a default keeps this server on. Spaces around the
+        // value or a directive are removed, and the text without them is the
+        // one that applies.
+        for (value, applied) in [
+            ("warn", "warn"),
+            (" INFO ", "INFO"),
+            ("volto=debug", "volto=debug"),
+            ("volto=3", "volto=3"),
+            ("volto=trace,quinn=warn", "volto=trace,quinn=warn"),
+            ("info,quinn=off", "info,quinn=off"),
+            ("off,volto=info", "off,volto=info"),
+            ("quinn=info, info", "quinn=info,info"),
+            (" volto=debug ,quinn=info,", "volto=debug,quinn=info"),
         ] {
             assert_eq!(
                 filter_source(Some(OsStr::new(value))),
-                FilterSource::RustLog,
+                FilterSource::RustLog(applied.to_owned()),
                 "RUST_LOG={value:?} must still apply"
             );
         }
@@ -1117,6 +1133,46 @@ mod tests {
                 filter_source(Some(OsStr::from_bytes(b"volto=\xff"))),
                 FilterSource::InvalidRustLog(_)
             );
+        }
+    }
+
+    /// A value the rule accepts is a value whose installed filter lets this
+    /// crate's INFO lines through, with spaces around the value or a directive.
+    ///
+    /// `EnvFilter` does not trim: given `" INFO "` itself it reads the target
+    /// `" INFO "` at TRACE and enables none of this server's lines. The filter
+    /// is asked here, not the rule, for each source: `RUST_LOG`, and
+    /// `log.level` when `RUST_LOG` is unset or ignored.
+    #[test]
+    fn an_accepted_filter_with_spaces_enables_this_servers_lines() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let enables_own_info = |filter: tracing_subscriber::EnvFilter| {
+            let subscriber = tracing_subscriber::registry().with(filter);
+            tracing::subscriber::with_default(
+                subscriber,
+                || tracing::enabled!(target: "volto", tracing::Level::INFO),
+            )
+        };
+
+        for rust_log in [" INFO ", " info", "info ", "quinn=info, info"] {
+            let (filter, ignored) =
+                chosen_filter(Some(OsStr::new(rust_log)), "error").expect("RUST_LOG applies");
+            assert_eq!(ignored, None, "RUST_LOG={rust_log:?}");
+            assert!(
+                enables_own_info(filter),
+                "RUST_LOG={rust_log:?} is accepted but turns this server's INFO lines off"
+            );
+        }
+
+        for level in [" info", "quinn=info, info"] {
+            for rust_log in [None, Some(OsStr::new("warning"))] {
+                let (filter, _) = chosen_filter(rust_log, level).expect("log.level applies");
+                assert!(
+                    enables_own_info(filter),
+                    "log.level = {level:?} is accepted but turns this server's INFO lines off"
+                );
+            }
         }
     }
 
