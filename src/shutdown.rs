@@ -113,16 +113,12 @@ impl Shutdown {
     /// number of times: the latch is sticky, unlike a oneshot that a lost race
     /// would consume.
     pub async fn fired(&mut self) {
-        loop {
-            if *self.receiver.borrow_and_update() {
-                return;
-            }
-            // Errors mean the trigger is gone, which cannot un-fire the latch but
-            // also means it can never fire: wait forever rather than reporting a
-            // shutdown that was never asked for.
-            if self.receiver.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
+        // `wait_for` checks the current value first, seen or not, and fails only
+        // when every trigger is gone and the last value was `false`: the signal
+        // can then never fire, so this waits forever rather than reporting a
+        // shutdown that was never asked for.
+        if self.receiver.wait_for(|&fired| fired).await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 }
