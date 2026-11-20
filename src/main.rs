@@ -243,11 +243,12 @@ fn run_command(command: &Command) -> Result<()> {
 /// What it therefore covers is exactly what `Config::load` covers: the TOML
 /// itself, every table's refusal of a key it does not know, and every range and
 /// cross-field rule in `Config::validate`, the certificate and key existing as
-/// files included. What it cannot cover is everything that is only decidable
-/// once the process is the service: whether the port is free, whether the
-/// certificate and key parse and match, whether `RLIMIT_NOFILE` (a property of
-/// the unit, not of the file) leaves room for the configured quotas. Those stay
-/// startup's business, and `docs/configuration.md` says so to the operator.
+/// files and the leaf certificate, when the file reads as PEM, being one the
+/// server's TLS takes included. What it does not cover is left to startup:
+/// whether the port is free, a certificate file that does not read as PEM,
+/// whether the private key parses and matches the certificate, and whether
+/// `RLIMIT_NOFILE` (a property of the unit, not of the file) leaves room for the
+/// configured quotas. `docs/configuration.md` says so to the operator.
 ///
 /// The warnings go to stderr and leave the status alone. They are the ones the
 /// service logs at startup on the same file, and none of them describes a
