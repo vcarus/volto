@@ -310,50 +310,9 @@ fn sf_string(value: &str) -> String {
     quoted
 }
 
-/// What became of a response written under [`h3api::Stream::respond_within`]'s
-/// bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Responded {
-    /// The response is on the stream.
-    Sent,
-    /// The write failed outright, and [`respond`] has already reported it.
-    Failed,
-    /// The write did not complete within its bound, and the stream has already
-    /// been reset with H3_REQUEST_CANCELLED.
-    ///
-    /// [`Responded::landed`] is the follow-up all four callers share: it writes
-    /// the line and answers that the write did not land. What a caller has left
-    /// to clean up stays with the caller; `tcp::run` aborts the target
-    /// connection RFC 9114 section 4.4 asks it to, for a lapse and for an
-    /// outright failure alike.
-    Expired,
-}
-
-impl Responded {
-    /// Whether the response reached the stream, reporting a lapse as `gave_up`.
-    ///
-    /// The follow-up is the same at every call site: a sent response is what
-    /// the caller asked for, a failed one has already been reported by
-    /// [`respond`], and a lapsed one owes one line. Written here so a fifth
-    /// caller cannot answer it a fifth way.
-    ///
-    /// What a lapse leaves behind is still the caller's business. `false` says
-    /// to stop; anything past that stays where the thing to undo is.
-    pub(crate) fn landed(self, stream_id: u64, status: Status, gave_up: &'static str) -> bool {
-        match self {
-            Self::Sent => true,
-            Self::Failed => false,
-            Self::Expired => {
-                debug!(stream_id, status = status.as_str(), "{gave_up}");
-                false
-            }
-        }
-    }
-}
-
 /// Sends `status` with `fields` under the bound
-/// [`h3api::Stream::respond_within`] carries, reporting a write that fails
-/// outright.
+/// [`h3api::Stream::respond_within`] carries, and answers whether it reached
+/// the stream.
 ///
 /// Every response this server sends with no tunnel behind it is written this
 /// way, for the reason the bound exists: a peer that grants no flow-control
@@ -363,23 +322,32 @@ impl Responded {
 /// authentication failures, which is meant to cost a guesser a handshake, is
 /// recorded by the caller before this call rather than after it.
 ///
-/// `failed` is the caller's own wording for a write that failed, kept a literal
-/// at the call site so what this server can say still reads out of `src/`.
+/// A write that fails outright is reported as `failed`, and one that lapses,
+/// after which the stream has already been reset with H3_REQUEST_CANCELLED, as
+/// `gave_up`. Both are the caller's own wording, kept a literal at the call
+/// site so what this server can say still reads out of `src/`. `false` says to
+/// stop; what a write that did not land leaves behind stays with the caller,
+/// so `tcp::run` aborts the target connection RFC 9114 §4.4 asks it to, for a
+/// lapse and for an outright failure alike.
 pub(crate) async fn respond(
     stream: &mut Stream,
     status: Status,
     fields: Fields,
     failed: &'static str,
-) -> Responded {
+    gave_up: &'static str,
+) -> bool {
     let stream_id = stream.id();
 
     match stream.respond_within(status, fields).await {
-        Ok(()) => Responded::Sent,
+        Ok(()) => true,
         Err(RespondError::Failed(error)) => {
             debug!(stream_id, %error, "{failed}");
-            Responded::Failed
+            false
         }
-        Err(RespondError::Expired) => Responded::Expired,
+        Err(RespondError::Expired) => {
+            debug!(stream_id, status = status.as_str(), "{gave_up}");
+            false
+        }
     }
 }
 
@@ -504,10 +472,7 @@ async fn answer_then_finish(
     let stream_id = stream.id();
     stream.stop_receiving(h3api::NO_ERROR);
 
-    if !respond(stream, status, fields, failed)
-        .await
-        .landed(stream_id, status, gave_up)
-    {
+    if !respond(stream, status, fields, failed, gave_up).await {
         return;
     }
 

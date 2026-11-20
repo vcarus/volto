@@ -349,6 +349,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         Status::OK,
         Fields::new(),
         "failed to send 200 for CONNECT",
+        "gave up on a 200 for CONNECT the peer would not take",
     )
     .await;
 
@@ -365,11 +366,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     // abortive close the SHOULD asks for, so a target is not left believing it
     // was finished politely. One check covers both cases, so they cannot
     // differ.
-    if !sent.landed(
-        stream_id,
-        Status::OK,
-        "gave up on a 200 for CONNECT the peer would not take",
-    ) {
+    if !sent {
         abort_target(&tcp);
         return;
     }

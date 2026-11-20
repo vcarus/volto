@@ -1630,7 +1630,7 @@ async fn the_target_of_a_200_the_peer_will_not_take_is_reset_too() {
 /// client has reset the stream or aborted reading from the stream, it MUST
 /// close the TCP connection. [...] In all these cases, if the underlying TCP
 /// implementation permits it, the proxy SHOULD send a TCP segment with the RST
-/// bit set." The `Responded::Failed` arm of `tcp::run` returned without the
+/// bit set." A 200 that failed outright used to make `tcp::run` return without the
 /// reset, so a target that had already accepted the connection was told it was
 /// finished politely (review L8). `the_target_of_a_200_the_peer_will_not_take_is_reset_too`
 /// above is the other half, where the write lapses rather than fails.

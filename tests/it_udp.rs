@@ -1361,9 +1361,8 @@ async fn a_session_200_the_peer_will_not_take_is_reset() {
 /// And no packet is forwarded for a session that 200 was going to open.
 ///
 /// The reset above is what the peer sees. This is what the *target* sees, and
-/// it is the other half of the same rule: `tunnel::respond` answers whether the
-/// 200 reached the stream, `Responded::landed` reports the lapse and returns
-/// `false`, and the whole meaning of that `false` is that `udp::run` stops
+/// it is the other half of the same rule: `tunnel::respond` reports the lapse
+/// and answers `false`, and the whole meaning of that `false` is that `udp::run` stops
 /// before the session loop. A caller that read the lapse and carried on would
 /// open the session anyway, and the only place that shows is a target receiving
 /// traffic on behalf of a client that was never told it had a tunnel.

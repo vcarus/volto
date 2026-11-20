@@ -430,14 +430,10 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         Status::OK,
         capsule_fields(),
         "failed to send 200 for connect-udp",
+        "gave up on a 200 for connect-udp the peer would not take",
     )
     .await;
-
-    if !sent.landed(
-        stream_id,
-        Status::OK,
-        "gave up on a 200 for connect-udp the peer would not take",
-    ) {
+    if !sent {
         return;
     }
 
