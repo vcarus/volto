@@ -109,7 +109,7 @@ impl Resolver {
 
         let mut stream = Stream {
             handle,
-            send,
+            writer: Writer { send },
             frames,
         };
 
@@ -166,7 +166,7 @@ impl Resolver {
             Err(error) => Err(answer(
                 &stream.handle,
                 &mut stream.frames,
-                Some(&mut stream.send),
+                Some(&mut stream.writer.send),
                 error,
             )),
         }
@@ -755,7 +755,8 @@ fn frame_header(kind: u64, payload_len: usize) -> Bytes {
 /// A bidirectional request stream.
 pub struct Stream {
     handle: Handle,
-    send: quinn::SendStream,
+    /// The sending side, already in the form [`Self::split`] hands out.
+    writer: Writer,
     frames: FrameReader,
 }
 
@@ -764,7 +765,7 @@ impl Stream {
     ///
     /// The Quarter Stream ID of RFC 9297 is this value divided by four.
     pub fn id(&self) -> u64 {
-        u64::from(self.send.id())
+        u64::from(self.writer.send.id())
     }
 
     /// Claims this stream's inbound HTTP Datagrams (RFC 9297 §2.1).
@@ -829,7 +830,7 @@ impl Stream {
         );
 
         let mut chunks = [frame_header(frame::HEADERS, block.len()), block.freeze()];
-        self.send.write_all_chunks(&mut chunks).await?;
+        self.writer.send.write_all_chunks(&mut chunks).await?;
         Ok(())
     }
 
@@ -876,8 +877,7 @@ impl Stream {
     /// There is nothing to wait for, and a caller that wants the peer's
     /// acknowledgement is asking a different question.
     pub fn finish(&mut self) -> Result<(), StreamError> {
-        self.send.finish()?;
-        Ok(())
+        self.writer.finish()
     }
 
     /// Asks the peer to stop sending on this stream.
@@ -895,9 +895,7 @@ impl Stream {
     /// reading. Abandoning it ends the stream and returns the peer's stream
     /// allowance.
     pub fn reset(&mut self, code: Code) {
-        // Fails only if the stream is already finished or reset, which needs no
-        // reporting: either way nothing more will be sent on it.
-        let _ = self.send.reset(varint(code));
+        self.writer.reset(code);
     }
 
     /// Splits the stream so each direction can be pumped independently.
@@ -915,7 +913,7 @@ impl Stream {
         frames.connect_completed();
 
         (
-            Writer { send: self.send },
+            self.writer,
             Reader {
                 handle: self.handle,
                 frames,
