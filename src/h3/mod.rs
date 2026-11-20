@@ -16,6 +16,8 @@
 //! * [`qpack`]: RFC 9204 field sections against the static table.
 //! * [`frame`]: RFC 9114 §7 framing, incremental and copy-free for DATA, with
 //!   one bounded read-ahead on a tunnel ([`frame::READ_AHEAD_CHUNKS`]).
+//! * [`settings`]: the SETTINGS payload this server sends and the parser of
+//!   the peer's (RFC 9114 §7.2.4).
 //! * [`message`]: what a request and a response are made of: a status, a
 //!   method, field lines.
 //! * [`connection`]: the connection: SETTINGS, the control stream, GOAWAY,
@@ -48,6 +50,7 @@ pub mod frame;
 pub mod huffman;
 pub mod message;
 pub mod qpack;
+pub mod settings;
 pub mod stream;
 
 use error::Code;
