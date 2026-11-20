@@ -186,7 +186,8 @@ pub fn first_flight(crypto: &[u8]) -> FirstFlight<'_> {
 /// The fields ahead of it are skipped by their own length prefixes, which is
 /// the layout of RFC 8446 §4.1.2: `legacy_version`, `random`,
 /// `legacy_session_id`, `cipher_suites`, `legacy_compression_methods`, then
-/// `extensions`. A ClientHello that ends before the block has none.
+/// `extensions`. A ClientHello that ends before the block has none, and is
+/// `None` here.
 fn extension_block(body: &[u8]) -> Option<(usize, &[u8])> {
     let mut reader = Reader::new(body);
     reader.take(2)?; // legacy_version
@@ -225,7 +226,16 @@ fn find_extension(body: &[u8], kind: u16) -> Option<&[u8]> {
 /// body does and every extension in it has to parse, which is what libssl
 /// requires of a ClientHello before it reads any extension
 /// (`ssl_parse_client_hello_with_trailing_data` and the `CBS_len(&cbs) != 0`
-/// test after it). `None` is a ClientHello libssl refuses to parse.
+/// test after it).
+///
+/// `None` is a block that is absent or whose framing does not parse. That is
+/// not the same set as the ClientHellos libssl refuses, in either direction.
+/// libssl reads a ClientHello that ends after `legacy_compression_methods` as
+/// one without extensions, and this returns `None` for it. libssl refuses a
+/// ClientHello that repeats an extension type (`tls1_check_duplicate_extensions`),
+/// and this returns both entries. Neither ClientHello can complete a QUIC
+/// handshake: the first carries no `supported_versions` and no transport
+/// parameters, and libssl refuses the second.
 pub fn extensions(body: &[u8]) -> Option<Vec<(u16, Range<usize>)>> {
     let (start, block) = extension_block(body)?;
     if start.checked_add(block.len())? != body.len() {
@@ -312,7 +322,8 @@ pub enum Ech {
 }
 
 /// What `body`'s `encrypted_client_hello` extension is, or `None` when the
-/// ClientHello itself is one libssl refuses to parse ([`extensions`]).
+/// ClientHello's extension block is absent or its framing does not parse
+/// ([`extensions`]).
 ///
 /// libssl ignores an extension of the inner type in a ClientHello it reads as
 /// the outer one and alerts on an outer one it cannot parse

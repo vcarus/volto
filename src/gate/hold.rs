@@ -103,10 +103,10 @@ pub(super) struct HeldDatagram {
 pub enum Dropped {
     /// The first handshake message is not a ClientHello.
     NotClientHello,
-    /// A whole ClientHello whose extension block libssl would refuse: it does
-    /// not end where the ClientHello ends, or an extension in it does not fit.
-    /// Only the framing is checked; the other things libssl refuses in a
-    /// ClientHello are left to libssl.
+    /// A whole ClientHello with no extension block, or one whose block libssl
+    /// would refuse: it does not end where the ClientHello ends, or an
+    /// extension in it does not fit. Only the framing is checked; the other
+    /// things libssl refuses in a ClientHello are left to libssl.
     UnreadableExtensions,
     /// CRYPTO bytes, or a ClientHello length, past [`HOLD_HELLO_BYTES`].
     TooLong,
@@ -600,10 +600,13 @@ impl Memory {
 /// A whole ClientHello whose extension block libssl would refuse to parse is
 /// dropped before any of that, because this gate cannot then say whether it
 /// carries an ECH extension, and libssl, which would read it differently or
-/// not at all, is the parser the rule protects. Only the block's framing is
-/// checked: a ClientHello libssl refuses for another reason (a session ID
-/// over 32 bytes, an odd cipher suite list, a duplicated extension, bytes
-/// after the message) is judged like any other, and libssl refuses it.
+/// not at all, is the parser the rule protects. A ClientHello with no
+/// extension block is dropped there too: libssl reads it as one without
+/// extensions, and it cannot complete a QUIC handshake, since it carries no
+/// transport parameters. Only the block's framing is checked: a ClientHello
+/// libssl refuses for another reason (a session ID over 32 bytes, an odd
+/// cipher suite list, a duplicated extension, bytes after the message) is
+/// judged like any other, and libssl refuses it.
 fn judge(
     contiguous: &[u8],
     policy: &Policy,
