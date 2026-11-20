@@ -812,12 +812,6 @@ fn log_drop(remote: SocketAddr, dropped: Dropped) {
 
 /// What the hold made of one opened first Initial, shared by the socket path
 /// and [`Screening`].
-///
-/// `frames` are those of the datagram's first packet and `more` those of the
-/// Initial packets of the same flight coalesced behind it. A packet whose
-/// frames do not parse, or carry a type no Initial packet may, makes the whole
-/// flight one the hold drops: quinn would close the connection over it, which
-/// is a reply.
 fn hold_opened(
     memory: &mut Memory,
     arrival: &Arrival<'_>,
@@ -826,16 +820,27 @@ fn hold_opened(
     policy: &Policy,
     report: &mut dyn FnMut(SocketAddr, Dropped),
 ) -> Screened {
+    let fragments = flight_fragments(frames, more);
+    memory.take(arrival, fragments.as_deref(), policy, report)
+}
+
+/// The CRYPTO frames the hold reads from one datagram: those of its first
+/// packet, `frames`, and those of the Initial packets of the same flight
+/// coalesced behind it, `more`, in that order.
+///
+/// `None` when a packet's frames do not parse, or carry a type no Initial
+/// packet may, which makes the whole flight one the hold drops: quinn would
+/// close the connection over it, which is a reply.
+fn flight_fragments<'a>(frames: &'a [u8], more: &'a [BytesMut]) -> Option<Vec<(u64, &'a [u8])>> {
     let mut fragments = Vec::new();
-    let mut whole = true;
     for payload in std::iter::once(frames).chain(more.iter().map(|m| &m[..])) {
-        match crypto_frames(payload) {
-            Some(walk) if walk.whole => fragments.extend(walk.fragments),
-            _ => whole = false,
+        let walk = crypto_frames(payload)?;
+        if !walk.whole {
+            return None;
         }
+        fragments.extend(walk.fragments);
     }
-    let fragments = whole.then_some(fragments.as_slice());
-    memory.take(arrival, fragments, policy, report)
+    Some(fragments)
 }
 
 /// The half of the gate that judges datagrams, held by [`Gate`] and needing no
@@ -1740,6 +1745,27 @@ impl Screening {
     }
 }
 
+/// The CRYPTO frames the hold reads from `datagram`, as offsets and owned
+/// bytes, or `None` when the gate would not hand it to the hold as an opened
+/// first Initial whose frames all parse.
+///
+/// For the `hold` fuzz target: it reads a released flight's ClientHello again
+/// from these, with a reassembly and a rule check of its own, to say whether
+/// the hold should have admitted it.
+#[doc(hidden)]
+pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
+    let Classified::Opened { frames, more, .. } = seam_judge().classify(datagram, true) else {
+        return None;
+    };
+    let fragments = flight_fragments(&frames, &more)?;
+    Some(
+        fragments
+            .into_iter()
+            .map(|(offset, bytes)| (offset, bytes.to_vec()))
+            .collect(),
+    )
+}
+
 /// A TLS configuration with no identity at all, as a source of Initial keys.
 ///
 /// Initial keys come from the client's Destination Connection ID and a salt
@@ -1998,6 +2024,26 @@ mod tests {
 
         assert_eq!(expected.memory().hold.flights(), 0, "a flight was stranded");
         assert_eq!(datagram, sent, "the gate is off, so quinn gets it as sent");
+    }
+
+    /// The seam the `hold` fuzz target rereads a released flight with gives
+    /// the CRYPTO frames the hold is given, and nothing for a datagram the
+    /// hold is not given or drops for its frames.
+    #[test]
+    fn held_fragments_are_the_crypto_frames_the_hold_reads() {
+        let frames = [0x06, 0x05, 0x03, b'a', b'b', b'c', 0x01];
+        let sealed = sealed_initial(&[0x52; 8], 0, &frames);
+        assert_eq!(held_fragments(&sealed), Some(vec![(5, b"abc".to_vec())]));
+
+        // A STREAM frame, which no Initial packet may carry.
+        let stream = sealed_initial(&[0x52; 8], 0, &[0x08, 0x00, 0x00]);
+        assert_eq!(held_fragments(&stream), None);
+        // A datagram that does not open, and one too short to be judged.
+        let mut forged = sealed.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 0x01;
+        assert_eq!(held_fragments(&forged), None);
+        assert_eq!(held_fragments(&sealed[..1199]), None);
     }
 
     /// The closed gate's rule reads the header form and the packet type and

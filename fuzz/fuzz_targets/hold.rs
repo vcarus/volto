@@ -30,9 +30,14 @@
 //! never exceed their bounds; the byte total, summed again from what the hold
 //! holds, equals the running count after every record; the replay record
 //! never holds more entries than flights were admitted; a datagram passed or
-//! refused gets the verdict the stateless gate gives it; and every datagram
+//! refused gets the verdict the stateless gate gives it; every datagram
 //! released is one that was held, from the address it came from, byte for
-//! byte.
+//! byte; and every flight released is one the rule table admits. That last
+//! one reads the flight's ClientHello again from the CRYPTO frames of its
+//! released datagrams ([`gate::held_fragments`]), with a reassembly and a rule
+//! check of its own: no two values at one offset, a whole ClientHello within
+//! `HOLD_HELLO_BYTES`, and then an ECH extension the key opens, or none with
+//! `require_ech` off and the name on the list when there is one.
 //!
 //! The ECH key is fixed (`FUZZ_KEY`), and the seeds written by a test in
 //! `tests/it_gate_shapes.rs` carry ECH that opens under it, in both record
@@ -46,9 +51,10 @@ use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use volto::gate::{
-    self, HOLD_FLIGHTS, HOLD_TOTAL_BYTES, Names, Policy, REPLAY_ENTRIES, Screened, Screening,
-    Verdict,
+    self, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_TOTAL_BYTES, Names, Policy, REPLAY_ENTRIES,
+    Screened, Screening, Verdict,
 };
+use volto::hello::{self, Ech};
 use volto::tls::EchKey;
 
 /// The X25519 private key of the target's ECH key. The seed test in
@@ -84,6 +90,73 @@ fn datagram(header: u8, body: &[u8]) -> Vec<u8> {
     gate::sealed_initial(&DCIDS[usize::from(selector & 0x03)], selector >> 2, frames)
 }
 
+/// Checks that the flight whose released datagrams are `flight` is one the
+/// rule table admits, reading its ClientHello again from their CRYPTO frames.
+///
+/// The reassembly here is a plain vector of optional bytes, not the hold's
+/// stream and bitmap, and the rules are written out from the table in the
+/// gate's module documentation rather than called, so the hold's own
+/// judgement is not the oracle. The replay rule is not checked: a replay is a
+/// drop, and this looks only at what was admitted.
+fn admitted_by_the_rules(flight: &[(SocketAddr, Vec<u8>)], require_ech: bool, names: &[String]) {
+    let mut stream: Vec<Option<u8>> = Vec::new();
+    for (_, datagram) in flight {
+        let fragments =
+            gate::held_fragments(datagram).expect("a released datagram is one the hold read");
+        for (offset, bytes) in fragments {
+            if bytes.is_empty() {
+                continue;
+            }
+            let start = usize::try_from(offset).expect("an offset the hold accepted");
+            let end = start + bytes.len();
+            assert!(
+                end <= HOLD_HELLO_BYTES,
+                "a released flight reaches past the limit"
+            );
+            if stream.len() < end {
+                stream.resize(end, None);
+            }
+            for (slot, byte) in stream[start..end].iter_mut().zip(bytes) {
+                assert!(
+                    slot.is_none_or(|held| held == byte),
+                    "a released flight carries two values at one offset"
+                );
+                *slot = Some(byte);
+            }
+        }
+    }
+    let contiguous: Vec<u8> = stream.iter().map_while(|byte| *byte).collect();
+    let body =
+        hello::client_hello_body(&contiguous).expect("a released flight holds a whole ClientHello");
+    assert!(
+        body.len() + 4 <= HOLD_HELLO_BYTES,
+        "a released ClientHello past the limit"
+    );
+    match hello::ech(body) {
+        Some(Ech::Outer(outer)) => assert!(
+            KEY.opens(body, &outer),
+            "a released ECH the key does not open"
+        ),
+        Some(Ech::Absent) => {
+            assert!(
+                !require_ech,
+                "a flight without ECH released under require_ech"
+            );
+            if !names.is_empty() {
+                let name =
+                    hello::server_name(body).expect("a released flight without ECH names a host");
+                let text = std::str::from_utf8(name).expect("a released name is text");
+                let relative = text.strip_suffix('.').unwrap_or(text);
+                assert!(
+                    names.iter().any(|held| held.eq_ignore_ascii_case(relative)),
+                    "a released flight names {text:?}, off the list {names:?}"
+                );
+            }
+        }
+        other => panic!("a released flight whose ECH is {other:?}"),
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&policy, mut rest)) = data.split_first() else {
         return;
@@ -94,10 +167,11 @@ fuzz_target!(|data: &[u8]| {
         Vec::new()
     };
     let list = Names::new(&names);
+    let require_ech = policy & 0x01 != 0;
     let mut screening = Screening::new(Policy::new(
         Names::new(&names),
         Some(KEY.clone()),
-        policy & 0x01 != 0,
+        require_ech,
     ));
 
     let mut after = Duration::ZERO;
@@ -130,7 +204,16 @@ fuzz_target!(|data: &[u8]| {
             screening.held_bytes(),
             "the byte count is what the hold holds"
         );
-        for released in screening.released() {
+        let released = screening.released();
+        if screened == Screened::Released {
+            admitted_by_the_rules(&released, require_ech, &names);
+        } else {
+            assert!(
+                released.is_empty(),
+                "datagrams released by a record that released nothing"
+            );
+        }
+        for released in released {
             let Some(at) = held.iter().position(|entry| *entry == released) else {
                 panic!("a released datagram was never held from that address");
             };
