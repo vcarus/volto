@@ -659,8 +659,8 @@ stream makes for the same race.
 HTTP Datagrams are hand-rolled in `src/datagram.rs`, over the varints of
 `src/varint.rs`. That started as a way around `h3-datagram` 0.0.2, which tagged
 every datagram with Quarter Stream ID 0 and so misrouted every session after the
-first on a connection; it is simply ours now —
-about 120 lines of varint and Context ID work with no dependency behind them.
+first on a connection. It is simply ours now: about 120 lines of varint and
+Context ID work with no dependency behind them.
 
 ## The h3api facade
 
