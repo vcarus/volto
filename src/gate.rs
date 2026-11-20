@@ -547,35 +547,21 @@ impl Gate {
         now: &mut Option<Instant>,
     ) {
         let memory = held.get_or_insert_with(|| self.expected.memory());
-        if memory.policy.ech.is_none() {
-            if memory.policy.is_on()
-                && let Verdict::Refuse(refusal) = judge(datagram, &memory.policy.names)
-            {
-                log_refusal(meta.addr, &refusal);
-                blind(datagram);
-            }
+        if !memory.policy.is_on() {
             return;
         }
-        let (dcid, frames, more) = match classify(datagram, true) {
-            Classified::Pass => return,
-            Classified::Refuse(refusal) => {
+        match screen_one(memory, meta, datagram, now, &mut log_drop) {
+            Screened::Passed => {}
+            Screened::Refused(refusal) => {
                 log_refusal(meta.addr, &refusal);
                 blind(datagram);
-                return;
             }
-            Classified::Opened { dcid, frames, more } => (dcid, frames, more),
-        };
-        let now = *now.get_or_insert_with(Instant::now);
-        let arrival = Arrival {
-            now,
-            meta: *meta,
-            datagram,
-            dcid,
-        };
-        if hold_opened(memory, &arrival, &frames, &more, &mut log_drop) == Screened::Released {
-            self.expected.0.releasing.store(true, Ordering::Release);
+            Screened::Released => {
+                self.expected.0.releasing.store(true, Ordering::Release);
+                blind(datagram);
+            }
+            Screened::Held | Screened::Dropped => blind(datagram),
         }
-        blind(datagram);
     }
 
     /// Hands quinn the datagrams of admitted flights, one per buffer, and says
@@ -679,17 +665,40 @@ fn log_drop(remote: SocketAddr, dropped: Dropped) {
     }
 }
 
-/// What the hold made of one opened first Initial, shared by the socket path
-/// and [`Screening`].
-fn hold_opened(
+/// What the gate makes of one datagram under `memory`'s policy, which is on:
+/// without an ECH key the stateless judgement, with one the hold.
+///
+/// The one screening function, called by the socket path and by
+/// [`Screening`]. `now` is the arrival time, read from the clock the first
+/// time it is needed when it is `None`. Every flight the hold drops is
+/// reported once through `report`.
+fn screen_one(
     memory: &mut Memory,
-    arrival: &Arrival<'_>,
-    frames: &[u8],
-    more: &[BytesMut],
+    meta: &RecvMeta,
+    datagram: &[u8],
+    now: &mut Option<Instant>,
     report: &mut dyn FnMut(SocketAddr, Dropped),
 ) -> Screened {
-    let fragments = flight_fragments(frames, more);
-    memory.take(arrival, fragments.as_deref(), report)
+    if memory.policy.ech.is_none() {
+        return match judge(datagram, &memory.policy.names) {
+            Verdict::Pass => Screened::Passed,
+            Verdict::Refuse(refusal) => Screened::Refused(refusal),
+        };
+    }
+    match classify(datagram, true) {
+        Classified::Pass => Screened::Passed,
+        Classified::Refuse(refusal) => Screened::Refused(refusal),
+        Classified::Opened { dcid, frames, more } => {
+            let arrival = Arrival {
+                now: *now.get_or_insert_with(Instant::now),
+                meta: *meta,
+                datagram,
+                dcid,
+            };
+            let fragments = flight_fragments(&frames, &more);
+            memory.take(&arrival, fragments.as_deref(), report)
+        }
+    }
 }
 
 /// The CRYPTO frames the hold reads from one datagram: those of its first
@@ -1433,10 +1442,11 @@ pub enum Screened {
 /// The gate with the hold, driven one datagram at a time, for the fuzz target
 /// and the tests.
 ///
-/// It runs the receive path's own code: [`classify`], then the hold through
-/// the function `Gate::screen_holding` calls, under a policy the caller gives
-/// and a clock the caller moves. The socket, the batch walk, the blinding and
-/// the delivery into quinn's buffers are what is left out.
+/// It runs `screen_one`, the function the receive path calls for every
+/// datagram, under a policy the caller gives and a clock the caller moves.
+/// The socket, the batch walk, the blinding, the `any` flag and the delivery
+/// into quinn's buffers are what is left out, so a policy that is off is
+/// judged here as a names-only policy with an empty list.
 #[doc(hidden)]
 pub struct Screening {
     memory: Memory,
@@ -1464,38 +1474,19 @@ impl Screening {
         datagram: &[u8],
     ) -> (Screened, Vec<(SocketAddr, Dropped)>) {
         let mut drops = Vec::new();
-        if self.memory.policy.ech.is_none() {
-            let screened = match judge(datagram, &self.memory.policy.names) {
-                Verdict::Pass => Screened::Passed,
-                Verdict::Refuse(refusal) => Screened::Refused(refusal),
-            };
-            return (screened, drops);
-        }
-        let screened = match classify(datagram, true) {
-            Classified::Pass => Screened::Passed,
-            Classified::Refuse(refusal) => Screened::Refused(refusal),
-            Classified::Opened { dcid, frames, more } => {
-                let meta = RecvMeta {
-                    addr: from,
-                    len: datagram.len(),
-                    stride: datagram.len(),
-                    ..RecvMeta::default()
-                };
-                let arrival = Arrival {
-                    now: self.epoch + after,
-                    meta,
-                    datagram,
-                    dcid,
-                };
-                hold_opened(
-                    &mut self.memory,
-                    &arrival,
-                    &frames,
-                    &more,
-                    &mut |from, why| drops.push((from, why)),
-                )
-            }
+        let meta = RecvMeta {
+            addr: from,
+            len: datagram.len(),
+            stride: datagram.len(),
+            ..RecvMeta::default()
         };
+        let screened = screen_one(
+            &mut self.memory,
+            &meta,
+            datagram,
+            &mut Some(self.epoch + after),
+            &mut |from, why| drops.push((from, why)),
+        );
         (screened, drops)
     }
 
@@ -1741,6 +1732,20 @@ mod tests {
         payload.extend_from_slice(&[0x06, 0x09, 0x02, b'y', b'z']); // offset 9
 
         assert_eq!(crypto_stream_prefix(&payload).as_deref(), Some(&b"ab"[..]));
+    }
+
+    /// Under an ECH key the header rules still refuse a datagram before the
+    /// hold sees it, as they do without one.
+    #[test]
+    fn the_header_rules_refuse_under_a_key_too() {
+        let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
+        let mut screening = Screening::new(Policy::new(Names::new(&[]), Some(key), false));
+        let mut datagram = sealed_initial(&[0x51; 8], 0, &[0x01]);
+        datagram[1..5].copy_from_slice(&2u32.to_be_bytes());
+        let from = SocketAddr::from(([127, 0, 0, 1], 4433));
+        let (screened, drops) = screening.receive(Duration::ZERO, from, &datagram);
+        assert_eq!(screened, Screened::Refused(Refusal::Version(2)));
+        assert!(drops.is_empty() && screening.flights() == 0);
     }
 
     /// A receive call that read a policy with a key, interleaved with a reload
