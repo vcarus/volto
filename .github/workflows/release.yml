@@ -116,6 +116,7 @@ jobs:
       # target. The runner does not: the action would otherwise build the
       # x86_64 target on the runner with musl-gcc, where no musl C++ compiler
       # exists and bindgen finds no C headers for a musl target.
+      # `Cross.toml` names each target's image by tag and digest.
       # `strip: true` is the action's own input and it is a no-op for a target
       # this action cross-builds, which is how the first v0.10.0 release shipped
       # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`

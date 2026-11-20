@@ -1,12 +1,14 @@
-# Dependabot only touches registry dependencies and action versions.
+# Dependabot only touches registry dependencies, action versions and the
+# release build images.
 #
-# Five entries are watched below: the crates in `Cargo.toml`, the crates in
+# Six entries are watched below: the crates in `Cargo.toml`, the crates in
 # `fuzz/Cargo.toml` (its own workspace, so its own entry -- one manifest per
-# `directory`), the pinned GitHub Actions, and the Go and Python modules the
-# `interop` job drives the server with. The last two matter as much as the
-# first: masque-go and aioquic are the independent implementations this
-# project is checked against, so an unwatched copy of either would quietly age
-# into agreeing with us by being too old to disagree.
+# `directory`), the pinned GitHub Actions, the images the release binaries are
+# built in, and the Go and Python modules the `interop` job drives the server
+# with. The last two matter as much as the first: masque-go and aioquic are
+# the independent implementations this project is checked against, so an
+# unwatched copy of either would quietly age into agreeing with us by being
+# too old to disagree.
 #
 # One thing stays outside its reach: transitive-only crates. Dependabot proposes
 # bumps for the dependencies a manifest names, never for the ones they pull in,
@@ -40,6 +42,19 @@ updates:
       - "/.github/actions/cmake-libclang"
     schedule:
       interval: weekly
+
+  # The cross images the release binaries are built in (Cross.toml), each
+  # named by tag and digest in a Dockerfile of its own. A new tag, or a new
+  # digest behind the same tag, arrives as a pull request, and cross.yml runs
+  # on it. The two targets move together, so one group holds both.
+  - package-ecosystem: docker
+    directory: "/.github/cross"
+    schedule:
+      interval: weekly
+    groups:
+      cross-images:
+        patterns:
+          - "*"
 
   # The masque-go client behind the `interop` job. This go.mod is also where
   # that job reads its Go toolchain version from (`go-version-file:

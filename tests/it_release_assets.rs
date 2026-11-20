@@ -707,6 +707,114 @@ fn the_cached_packages_are_saved_before_the_job_runs_anything_else() {
     );
 }
 
+/// Where the Dockerfile that pins the build image of `target` lives.
+fn cross_dockerfile(target: &str) -> String {
+    format!(".github/cross/{target}.Dockerfile")
+}
+
+/// The release binaries are built in images pinned by digest (R8-L3).
+///
+/// Without `Cross.toml`, cross runs its default image for each target by tag,
+/// and a tag can be moved. Each target's image is named by tag and digest in a
+/// Dockerfile of its own, which Dependabot's `docker` entry watches, so an
+/// update arrives as a pull request that runs cross.yml. The digest is not
+/// checked here, only its form: a test that ran offline could not look it up.
+#[test]
+fn every_release_target_is_built_in_an_image_pinned_by_digest() {
+    let root = repo_root();
+    let cross_toml = read_text(&root.join("Cross.toml"));
+    let cross_toml: toml::Table = cross_toml
+        .parse()
+        .unwrap_or_else(|error| panic!("Cross.toml does not parse: {error}"));
+
+    for target in matrix_targets("release.yml") {
+        let dockerfile = cross_dockerfile(&target);
+        let table = cross_toml
+            .get("target")
+            .and_then(|targets| targets.get(&target))
+            .and_then(|table| table.get("dockerfile"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "Cross.toml sets no `dockerfile` for {target}, so cross runs its image by tag"
+                )
+            });
+        assert_eq!(
+            table.get("file").and_then(toml::Value::as_str),
+            Some(dockerfile.as_str()),
+            "Cross.toml builds {target} from another Dockerfile than {dockerfile}"
+        );
+        assert_eq!(
+            table.get("context").and_then(toml::Value::as_str),
+            Some(".github/cross"),
+            "Cross.toml sends another build context than .github/cross for {target}"
+        );
+        assert!(
+            cross_toml
+                .get("target")
+                .and_then(|targets| targets.get(&target))
+                .and_then(|table| table.get("image"))
+                .is_none(),
+            "Cross.toml sets an `image` for {target}, which Dependabot does not watch"
+        );
+
+        let text = read_text(&root.join(&dockerfile));
+        let froms: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("FROM "))
+            .collect();
+        assert_eq!(
+            froms.len(),
+            1,
+            "{dockerfile} carries {} `FROM` lines where one is expected",
+            froms.len()
+        );
+        let image = froms[0].trim_start_matches("FROM ").trim();
+        let (name, digest) = image
+            .split_once("@sha256:")
+            .unwrap_or_else(|| panic!("{dockerfile} names its image without a digest: {image}"));
+        let prefix = format!("ghcr.io/cross-rs/{target}:");
+        let tag = name.strip_prefix(&prefix).unwrap_or_else(|| {
+            panic!("{dockerfile} builds from {name}, which is not cross's image for {target}")
+        });
+        assert!(
+            !tag.is_empty() && tag.chars().all(|c| c.is_ascii_digit() || c == '.'),
+            "{dockerfile} names the tag {tag:?}; Dependabot moves a version tag, not a \
+             name like `main` or `latest`"
+        );
+        assert!(
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{dockerfile} carries a malformed digest: {digest}"
+        );
+    }
+
+    let dependabot = read_text(&root.join(".github/dependabot.yml"));
+    assert!(
+        dependabot.contains("- package-ecosystem: docker\n    directory: \"/.github/cross\""),
+        ".github/dependabot.yml does not watch /.github/cross, so the pinned images \
+         would never be updated"
+    );
+
+    // An image bump changes only these two paths, so cross.yml has to run on
+    // them to build the release targets in the new image.
+    let cross_yml = read_text(&root.join(".github/workflows/cross.yml"));
+    let (under_push, under_pull_request) = cross_yml
+        .split_once("\n  pull_request:")
+        .expect("cross.yml carries no `pull_request:` trigger");
+    for entry in ["- Cross.toml", "- .github/cross/**"] {
+        for (key, half) in [("push", under_push), ("pull_request", under_pull_request)] {
+            assert_eq!(
+                half.matches(entry).count(),
+                1,
+                "cross.yml must list `{entry}` once in its `{key}` paths filter"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ci.yml and cross.yml give every push to main its own concurrency group
 // ---------------------------------------------------------------------------

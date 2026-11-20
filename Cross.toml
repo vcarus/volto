@@ -1,0 +1,20 @@
+# The images the release binaries are built in, for cross.yml and release.yml.
+#
+# Without this file, cross runs `ghcr.io/cross-rs/<target>:<its version>` by
+# tag, and a tag can be moved. Each target here builds a local image from a
+# Dockerfile whose `FROM` names cross's image by tag and digest. Dependabot's
+# `docker` entry for `.github/cross` watches those lines, so a new tag or a
+# replaced one arrives as a pull request, and cross.yml runs on that pull
+# request because these paths are in its filter. Nothing is pushed to a
+# registry: cross runs `docker build` on the runner and then uses the result.
+#
+# The context is the Dockerfiles' own directory, so `docker build` is not sent
+# the whole repository. Keep the tag at the cross release the build action
+# installs (the latest one); `tests/it_release_assets.rs` checks the form of
+# each pin.
+
+[target.x86_64-unknown-linux-musl]
+dockerfile = { file = ".github/cross/x86_64-unknown-linux-musl.Dockerfile", context = ".github/cross" }
+
+[target.aarch64-unknown-linux-musl]
+dockerfile = { file = ".github/cross/aarch64-unknown-linux-musl.Dockerfile", context = ".github/cross" }

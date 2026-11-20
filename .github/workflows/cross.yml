@@ -14,6 +14,8 @@ name: Cross
 # `release.yml` is in the filter because the build step below is a copy of its
 # own: a change to that step is exactly the change this workflow exists to run,
 # and without the entry it would be the one change that runs nothing.
+# `Cross.toml` and `.github/cross/` are in it because they choose the image
+# that step builds in, and a Dependabot bump of that image changes nothing else.
 on:
   push:
     branches: [main]
@@ -22,12 +24,16 @@ on:
       - Cargo.lock
       - .github/workflows/cross.yml
       - .github/workflows/release.yml
+      - Cross.toml
+      - .github/cross/**
   pull_request:
     paths:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/cross.yml
       - .github/workflows/release.yml
+      - Cross.toml
+      - .github/cross/**
 
 # As in ci.yml: a new push to a pull request supersedes its running check, and
 # on main every commit keeps its own run. A push keys on its commit, because
@@ -71,6 +77,7 @@ jobs:
       # target. The runner does not: the action would otherwise build the
       # x86_64 target on the runner with musl-gcc, where no musl C++ compiler
       # exists and bindgen finds no C headers for a musl target.
+      # `Cross.toml` names each target's image by tag and digest.
       # `strip: true` is the action's own input and it is a no-op for a target
       # this action cross-builds, which is how the first v0.10.0 release shipped
       # an 8.62 MB aarch64 asset against 2.98 MB. What strips is `strip = true`
