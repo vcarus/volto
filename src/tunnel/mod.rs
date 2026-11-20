@@ -153,6 +153,11 @@ pub(crate) fn is_port(text: &str) -> bool {
 ///
 /// so a bracket left inside a host, once the pair that delimits an IP literal
 /// has been taken off, is not part of the address or the name it sits in.
+///
+/// Both routes take that pair off whatever it holds, so `[example.com]:443`
+/// and `%5Bexample.com%5D` are dialled as `example.com`, although the grammar
+/// above gives the brackets only an IPv6address or an IPvFuture. This rule
+/// refuses a bracket that is left over; it does not check what the pair held.
 /// Refused rather than tolerated because the host is what gets dialled and what
 /// gets logged, and `example.com]` must not quietly become `example.com`, nor
 /// `[a[b]:443` be dialled as `a[b`.

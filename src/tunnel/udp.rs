@@ -1588,7 +1588,9 @@ pub fn parse_target(path: &str, query: Option<&str>) -> Result<(String, u16), &'
     // A bracket that survived that pair is not part of any host
     // ([`tunnel::stray_bracket`]). The two routes are the same malformation and
     // get the same 400. Without this check `example.com%5D` would reach the
-    // resolver and come back a 502 dns_error.
+    // resolver and come back a 502 dns_error. A colon is not checked here, so
+    // a host the authority route refuses for an unbracketed colon reaches the
+    // resolver on this one; see `tcp::split_authority`.
     if tunnel::stray_bracket(&host) {
         return Err("stray bracket in host");
     }

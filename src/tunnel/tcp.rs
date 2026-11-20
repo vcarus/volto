@@ -1074,6 +1074,13 @@ async fn torn_down(teardown_rx: &mut watch::Receiver<State>) -> Teardown {
 /// comes out of either is what gets dialled, and reaching one through a live
 /// tunnel costs a QUIC connection per input. `fuzz/fuzz_targets/authority.rs`
 /// holds both to the same invariants.
+///
+/// The two agree on brackets and on the port, and differ on one shape: a host
+/// with a colon outside brackets is refused here, while the template route
+/// decodes `example.com%3A80` to a host with a colon in it and hands that to
+/// the resolver, which answers 502 `dns_error`. The template has to let colons
+/// through, because RFC 9298 §3 writes an IPv6 literal bare with its colons
+/// percent-encoded.
 pub fn split_authority(authority: &str) -> Result<(String, u16), &'static str> {
     if authority.contains('@') {
         return Err("userinfo is not allowed in a CONNECT authority");
