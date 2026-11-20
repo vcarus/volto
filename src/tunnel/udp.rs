@@ -463,7 +463,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         decoder: CapsuleDecoder::new(),
         // Zero is the operator's way of switching the mitigation off, so it means
         // "uncapped" rather than "nothing may be sent".
-        amplification: match ctx.unanswered_packet_budget {
+        amplification: match ctx.unanswered.per_session() {
             0 => Amplification::Uncounted,
             budget => Amplification::Unanswered {
                 remaining: budget,
@@ -494,7 +494,7 @@ enum Amplification {
         /// Packets this session may still send before the target answers.
         remaining: u32,
         /// Packets this session has charged to the connection's total so far.
-        /// [`Context::refund_unanswered`] returns them when the target first
+        /// [`super::quota::Unanswered::refund`] returns them when the target first
         /// answers, so an answered session has cost the connection nothing.
         charged: u32,
     },
@@ -527,7 +527,7 @@ struct Session<'a> {
     ///
     /// This half is per session and is recreated by opening one, so it bounds a
     /// conversation and not a client. The connection's own total
-    /// ([`Context::unanswered_connection_budget`]) is what a new session does
+    /// ([`super::quota::Unanswered`]) is what a new session does
     /// not restore. It is charged from here, and repaid only by this session's
     /// own target answering, through the `charged` count of
     /// [`Amplification::Unanswered`].
@@ -913,13 +913,13 @@ impl Session<'_> {
             }
 
             // The connection's own total, which a new session does not restore
-            // (`Context::unanswered_connection_budget`). Exhausting it ends this
+            // (`quota::Unanswered`). Exhausting it ends this
             // session rather than muting it: a client that has spent the whole
             // connection's allowance on targets that never answered has said
             // what it is doing, and a muted session would hold a socket, a
             // routing entry and a stream until the idle timeout while the next
             // one costs it nothing to open.
-            if !self.ctx.charge_unanswered() {
+            if !self.ctx.unanswered.charge() {
                 match self.ctx.unanswered_closures.record() {
                     Some(closures) => warn!(
                         log_id = "xc3zqhh7",
@@ -978,7 +978,7 @@ impl Session<'_> {
         if let Amplification::Unanswered { charged, .. } =
             std::mem::replace(&mut self.amplification, Amplification::Uncounted)
         {
-            self.ctx.refund_unanswered(charged);
+            self.ctx.unanswered.refund(charged);
         }
         self.touch();
 
@@ -1169,7 +1169,7 @@ impl DatagramPath {
     /// The two readings are taken only when the cached answer does not cover
     /// the packet. A packet over the last limit read is checked against a
     /// fresh limit, and dropped if it is over that too. A packet for which
-    /// [`Context::claim_datagram_room`] shows no room has the room read and
+    /// [`super::quota::DatagramRoom::claim`] shows no room has the room read and
     /// graded. A packet under the limit with room goes straight to
     /// `send_datagram`, and a limit that has fallen since the last reading is
     /// caught there, as `TooLarge`.
@@ -1199,7 +1199,7 @@ impl DatagramPath {
             }
         }
 
-        if !ctx.claim_datagram_room(encoded_len) {
+        if !ctx.datagram_room.claim(encoded_len) {
             // quinn's `send_datagram` is `send(data, drop = true)`: when the
             // outgoing queue would grow past `datagram_send_buffer_size` it
             // silently drops the *oldest* queued datagrams to make room, saying
@@ -1214,7 +1214,7 @@ impl DatagramPath {
             // only decides what is logged.
             //
             // The reading is taken only here, when the connection's lower bound
-            // of the room ([`Context::claim_datagram_room`]) does not cover the
+            // of the room ([`super::quota::DatagramRoom::claim`]) does not cover the
             // packet. A packet the bound covers fits, so it is graded clear with
             // no reading, and with a queue that keeps up the bound covers about
             // 1 MiB of datagrams per reading.
@@ -1230,7 +1230,7 @@ impl DatagramPath {
             // way the loss is already decided by the time anything here could
             // react to it, which is why only how loudly to say so is graded.
             let space = ctx.quic.datagram_send_buffer_space();
-            ctx.reset_datagram_room(space, encoded_len);
+            ctx.datagram_room.reset(space, encoded_len);
             let len = encoded_len;
             match grade(len, space, &self.evictions) {
                 Graded::Clear => {}
@@ -1606,7 +1606,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::tunnel::QUEUED_DATAGRAM_COST;
+    use crate::tunnel::quota::QUEUED_DATAGRAM_COST;
 
     fn parse(path: &str) -> Result<(String, u16), &'static str> {
         parse_target(path, None)
@@ -2091,7 +2091,7 @@ mod tests {
         // next one goes straight to quinn.
         landed(&mut packets, &[1; 100]);
         path.send(&ctx, &mut packets);
-        assert!(ctx.datagram_room() > limit);
+        assert!(ctx.datagram_room.get() > limit);
 
         // The reading as it stood before the path MTU fell.
         path.limit = usize::MAX;
@@ -2158,7 +2158,7 @@ mod tests {
                 "packet {nth}: graded differently from a reading of {space}"
             );
             assert!(
-                ctx.datagram_room() <= ctx.quic.datagram_send_buffer_space(),
+                ctx.datagram_room.get() <= ctx.quic.datagram_send_buffer_space(),
                 "packet {nth}: the bound passed the room it bounds"
             );
         }
@@ -2186,7 +2186,7 @@ mod tests {
 
         landed(&mut packets, &payload);
         path.send(&ctx, &mut packets);
-        let after_first = ctx.datagram_room();
+        let after_first = ctx.datagram_room.get();
 
         // Long enough for quinn to send the one queued datagram.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2198,7 +2198,7 @@ mod tests {
         landed(&mut packets, &payload);
         path.send(&ctx, &mut packets);
         assert_eq!(
-            ctx.datagram_room(),
+            ctx.datagram_room.get(),
             after_first - cost,
             "the second packet read the room although the bound covered it"
         );

@@ -12,7 +12,7 @@ mod status;
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ use crate::h3api::{Fields, Method, Request, Stream};
 use crate::policy::{self, Policy};
 use crate::quic::{AuthGate, MarkOutcome};
 
-pub use quota::{Pending, Quota, Slot};
+pub use quota::{AuthFailures, Pending, Quota, Slot};
 pub use status::ProxyError;
 pub(crate) use status::{
     ResolveFailure, Unreachable, accept_then_close, refuse, refuse_because, refuse_unreachable,
@@ -218,85 +218,6 @@ const _: () = assert!(
         .is_some()
 );
 
-/// The authentication failures one connection has run up, in buckets.
-///
-/// Which bucket a failure lands in is what makes clearing them on success
-/// honest. `auth.users` is a list, so a peer can hold one valid credential and
-/// guess at another user's password with it: with one counter cleared by any
-/// success, it interleaves a good request between guesses and never reaches
-/// `max_auth_failures`. One counter *per user-id guessed at* closes that, and
-/// keeps the case the clearing exists for: one client, one credential, an app
-/// that drops the header now and then.
-///
-/// A single counter charged to the first failure that named somebody is not
-/// enough either: the peer opens each cycle with a deliberate failure as
-/// *itself*, which claims the counter, and its success as itself then clears
-/// the whole thing, guesses at everybody else included.
-///
-/// The cap is on the **total** across the buckets, not on any one of them. A
-/// per-bucket cap would hand a guesser `max_auth_failures - 1` free guesses for
-/// every configured user rather than that many for the whole connection.
-///
-/// One connection holds at most `|configured users| + 2` counters, and every key
-/// is a copy of a name from the configuration file, so a peer cannot grow this
-/// by inventing user-ids however many it invents.
-#[derive(Default)]
-pub struct AuthFailures {
-    /// One counter per configured user-id a failure has named, created when
-    /// that name is first guessed at.
-    ///
-    /// A success as that user clears its counter and nothing else. Keyed by a
-    /// name that compared equal to a configured one, so the key's length comes
-    /// from the configuration file rather than from the peer. A user-id too
-    /// long to log is truncated by [`crate::auth::Denied::username`] and
-    /// therefore matches nothing here, so its guesses land in `unconfigured`
-    /// below.
-    configured: std::collections::HashMap<String, u32>,
-    /// Failures naming a user-id nobody has.
-    ///
-    /// One bucket for all of them, and no success ever clears it: succeeding as
-    /// a user that does not exist is not a thing that can happen, so a success
-    /// says nothing about these at all. This is where a scan lands.
-    unconfigured: u32,
-    /// Failures that named nobody.
-    ///
-    /// They carried no user-id this server could read (no credentials field at
-    /// all, or one it could not parse), so they are the benign case: the app
-    /// that dropped the header, not the peer that guessed. Any success clears
-    /// this one, because any success is a client proving it is that client.
-    ///
-    /// It cannot be used to hide a guess: a guess names somebody and is
-    /// charged to that name's bucket however many credential-less requests are
-    /// sent around it.
-    anonymous: u32,
-}
-
-impl AuthFailures {
-    /// Failures across every bucket, which is what the cap is measured against.
-    ///
-    /// Saturating rather than wrapping: `max_auth_failures = 0` disables the cap
-    /// and nothing then ever clears a bucket, so a connection left open long
-    /// enough could otherwise overflow the sum. Saturated is the correct answer:
-    /// a total that large is over any cap there could be.
-    fn total(&self) -> u32 {
-        self.configured
-            .values()
-            .copied()
-            .chain([self.unconfigured, self.anonymous])
-            .fold(0u32, u32::saturating_add)
-    }
-}
-
-/// What one queued datagram costs quinn's datagram send buffer beyond its own
-/// bytes, or more.
-///
-/// quinn charges `size_of` its frame struct per queued datagram, which wraps
-/// one `Bytes` and is 32 bytes on a 64-bit target. The struct is private to
-/// quinn, so twice that is used: a cost counted too high leaves
-/// [`Context::claim_datagram_room`]'s bound lower than the room, which costs a
-/// reading and never a wrong grade.
-const QUEUED_DATAGRAM_COST: usize = 2 * std::mem::size_of::<bytes::Bytes>();
-
 /// Everything a request handler needs from the connection it arrived on.
 ///
 /// Built once per connection and held in an `Arc`, so sharing it with a request
@@ -433,46 +354,11 @@ pub struct Context {
     /// changes what connections accepted from then on do and leaves a running
     /// one alone.
     pub ip_family_preference: IpFamilyPreference,
-    /// Packets a UDP session may send before its target has answered.
-    pub unanswered_packet_budget: u32,
-    /// Packets *this connection* may still send towards targets that have never
-    /// answered, across every session it opens.
-    ///
-    /// The per-session budget above is what RFC 9298 §7 asks for and it is
-    /// recreated by opening a session, which is free: a client that spends one
-    /// session's allowance closes the stream and opens another, and the
-    /// mitigation becomes a constant factor rather than a bound. Stream turnover
-    /// is not bounded by anything (`max_streams_bidi` bounds how many are open
-    /// at once and quinn issues fresh credit as streams complete), so this is
-    /// the counter an attacker cannot recreate: it is created with the
-    /// connection and it is only ever spent.
-    ///
-    /// **A session whose target answers repays what that session spent**, and
-    /// nothing else does (D84, the 2026-09-05 addendum). The repayment is that
-    /// session's own `charged` count, kept while its target has not answered,
-    /// and it is capped at the total the connection was created with, so no
-    /// sequence of sessions can lift the counter above where it started. A
-    /// client cannot keep one consenting target on the side to buy back, packet
-    /// for packet, the allowance it spends on a silent one: the refund is per
-    /// session, so a silent session's spend stays spent, and the bound on
-    /// packets to targets that never answer holds.
-    ///
-    /// A connection that spends the total with nothing outstanding to repay it
-    /// keeps it spent for its own life, and a client that wants another
-    /// allowance pays for another handshake (D84, the 2026-09-07 addendum).
-    ///
-    /// Zero means uncapped, the same way `unanswered_packet_budget = 0` does:
-    /// the operator switched the mitigation off.
-    pub unanswered_connection_budget: AtomicU32,
-    /// What the counter above was created with, which is the ceiling every
-    /// refund is capped at.
-    ///
-    /// Stored rather than recomputed from `unanswered_packet_budget` on each
-    /// refund: the seed and the cap are one number and must not be two
-    /// expressions that can drift apart.
-    unanswered_connection_total: u32,
-    /// How many sessions this connection has lost to that total, and when that
-    /// is worth saying out loud again.
+    /// Packets this connection's UDP sessions may send towards targets that
+    /// have never answered, per session and in total (RFC 9298 §7, D84).
+    pub(crate) unanswered: quota::Unanswered,
+    /// How many sessions this connection has lost to the unanswered total, and
+    /// when that is worth saying out loud again.
     ///
     /// One line per closed session would be one line per stream a peer opens,
     /// which is the flood [`crate::logfmt::Sampler`] exists to stop.
@@ -498,18 +384,9 @@ pub struct Context {
     /// Staying there costs it nothing, and without sampling every further
     /// request would be a warning for as long as it kept asking.
     pub limit_refusals: crate::logfmt::Sampler,
-    /// A lower bound of the room left in quinn's outgoing datagram queue, in
-    /// the units `quinn::Connection::datagram_send_buffer_space` reports.
-    ///
-    /// The UDP path reads that room only to say when a send evicts older
-    /// datagrams (`udp::DatagramPath`), and reading it takes the connection's
-    /// lock. This holds the last reading less what every session on the
-    /// connection has queued since, which stays a lower bound because quinn
-    /// only ever adds room: by sending, by evicting, or by dropping what no
-    /// longer fits the path. A datagram the bound already covers fits, so it is
-    /// graded without a reading. Shared by the connection's sessions because
-    /// they share the queue. Starts at zero, so the first datagram reads.
-    datagram_room: AtomicUsize,
+    /// A lower bound of the room left in quinn's outgoing datagram queue,
+    /// shared by the connection's sessions because they share the queue.
+    datagram_room: quota::DatagramRoom,
 }
 
 impl Context {
@@ -528,15 +405,6 @@ impl Context {
         tunnels: Arc<AtomicU64>,
         authenticated: AuthGate,
     ) -> Self {
-        // The connection's whole unanswered allowance, computed once: the
-        // counter below is seeded with it and `refund_unanswered` caps every
-        // repayment at it, and two spellings of one number are two things that
-        // have to agree.
-        let total = config
-            .security
-            .unanswered_packet_budget
-            .saturating_mul(CONNECTION_UNANSWERED_MULTIPLIER);
-
         Self {
             remote: quic.remote_address(),
             auth_failures: Mutex::new(AuthFailures::default()),
@@ -553,116 +421,12 @@ impl Context {
             connect_timeout: config.limits.connect_timeout(),
             resolver: resolver.per_connection(),
             ip_family_preference: config.limits.ip_family_preference,
-            unanswered_packet_budget: config.security.unanswered_packet_budget,
-            unanswered_connection_total: total,
-            unanswered_connection_budget: AtomicU32::new(total),
+            unanswered: quota::Unanswered::new(config.security.unanswered_packet_budget),
             policy_refusals: crate::logfmt::Sampler::new(),
             limit_refusals: crate::logfmt::Sampler::new(),
             unanswered_closures: crate::logfmt::Sampler::new(),
-            datagram_room: AtomicUsize::new(0),
+            datagram_room: quota::DatagramRoom::default(),
         }
-    }
-
-    /// Counts a datagram of `len` bytes against [`Self::datagram_room`] if the
-    /// bound shows room for it, reporting whether it did.
-    ///
-    /// `true` means quinn's queue has room for the datagram, by the same
-    /// `len <= space` comparison quinn makes, and the bound is lowered by what
-    /// queuing it costs. `false` changes nothing: the caller reads the real
-    /// room and hands the reading to [`Self::reset_datagram_room`].
-    ///
-    /// `Relaxed`, for the reason the unanswered budget gives: the bound is
-    /// ordered against nothing but itself, and the compare-and-swap is what
-    /// makes two sessions' claims both count.
-    pub(crate) fn claim_datagram_room(&self, len: usize) -> bool {
-        self.datagram_room
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |room| {
-                (len <= room).then(|| room.saturating_sub(len.saturating_add(QUEUED_DATAGRAM_COST)))
-            })
-            .is_ok()
-    }
-
-    /// Replaces [`Self::datagram_room`] with `space`, read from quinn just
-    /// before a datagram of `len` bytes is queued, less what queuing it costs.
-    ///
-    /// One reading and one queued datagram are not one step, here or in
-    /// quinn's own API, so a datagram another session queues between this
-    /// session's reading and its store is not counted. The bound can then be
-    /// that datagram's cost too high, and a later datagram can be graded as
-    /// fitting by that much when it did not. A single session is exact. Two
-    /// separate lock acquisitions for the reading and the send would have the
-    /// same interleaving.
-    pub(crate) fn reset_datagram_room(&self, space: usize, len: usize) {
-        self.datagram_room.store(
-            space.saturating_sub(len.saturating_add(QUEUED_DATAGRAM_COST)),
-            Ordering::Relaxed,
-        );
-    }
-
-    /// The current lower bound, for tests.
-    #[cfg(test)]
-    pub(crate) fn datagram_room(&self) -> usize {
-        self.datagram_room.load(Ordering::Relaxed)
-    }
-
-    /// Spends one packet of the connection's unanswered allowance, reporting
-    /// whether there was one to spend.
-    ///
-    /// `false` is the end of the session that asked, not of the packet: a
-    /// session that finds this empty is closed rather than muted. Muting it
-    /// would leave a socket, a routing entry and a stream in place until the
-    /// idle timeout for a client that has already shown what it is doing with
-    /// them, and it would let the next session pay nothing to be created.
-    ///
-    /// Charged only where the per-session budget is charged, so a session whose
-    /// target has answered spends nothing here, and neither does a session whose
-    /// own budget is already spent: a muted session attempts no packet, and
-    /// this counts packets a session attempted towards a target that had not
-    /// answered. Attempted rather than sent, deliberately: the charge is taken
-    /// before `sendto`, so a payload the socket refuses per packet (EMSGSIZE,
-    /// EPERM, EACCES, ENOBUFS) is counted without leaving the host. The
-    /// direction is the safe one for a counter that bounds reflection.
-    ///
-    /// `Relaxed` throughout: the counter is ordered against nothing but itself,
-    /// and `try_update`'s compare-and-swap is what makes two sessions racing
-    /// for the last packet give it to exactly one of them.
-    pub(crate) fn charge_unanswered(&self) -> bool {
-        if self.unanswered_packet_budget == 0 {
-            return true;
-        }
-
-        self.unanswered_connection_budget
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok()
-    }
-
-    /// Gives back what one session charged, once its target has answered.
-    ///
-    /// The total bounds packets sent to targets that never answer. A session
-    /// whose target did answer was not one of those, so what it spent on the
-    /// way there is returned, and only that: `charged` is the session's own
-    /// count, so a client keeping a consenting target on the side can recover
-    /// no more than that side session's own packets, never what another
-    /// session spent into silence. Without the refund every session's first
-    /// packet is a charge that nothing repays, and a long-lived connection
-    /// opening short answered sessions one after another, which is what DNS
-    /// through the tunnel is, spends the total by session count alone.
-    ///
-    /// Capped at the connection's total so a refund can never exceed what was
-    /// created with the connection, whatever the caller's count.
-    pub(crate) fn refund_unanswered(&self, charged: u32) {
-        if self.unanswered_packet_budget == 0 || charged == 0 {
-            return;
-        }
-
-        let total = self.unanswered_connection_total;
-        let _ = self.unanswered_connection_budget.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |remaining| Some(remaining.saturating_add(charged).min(total)),
-        );
     }
 
     /// Records an authentication failure, reporting whether that was one too many.
@@ -670,40 +434,16 @@ impl Context {
     /// Counts across the whole connection, so opening more streams does not reset
     /// the budget, and the answer is about the *total* of every bucket. A request
     /// that succeeds *as `username`* clears one of them; see
-    /// [`Self::mark_authenticated`] and [`AuthFailures`].
-    ///
-    /// `username` is the user-id the failing request claimed, or `None` when it
-    /// carried none this server could read. Which of the three kinds of bucket
-    /// it lands in is decided here, by asking the connection's own
-    /// [`Authenticator`] whether that name is one the operator configured.
+    /// [`Self::mark_authenticated`] and [`AuthFailures::record`].
     pub(crate) fn record_auth_failure(&self, username: Option<&str>) -> bool {
-        let mut failures = self.auth_failures();
-
-        match username {
-            // A name that exists: its own bucket, which only a success as that
-            // user clears.
-            // Looked up before it is inserted, so only the first failure as a
-            // name copies it.
-            Some(username) if self.auth.is_configured(username) => {
-                match failures.configured.get_mut(username) {
-                    Some(bucket) => *bucket = bucket.saturating_add(1),
-                    None => {
-                        failures.configured.insert(username.to_owned(), 1);
-                    }
-                }
-            }
-            // A name nobody has, so nobody can ever succeed as it.
-            Some(_) => failures.unconfigured = failures.unconfigured.saturating_add(1),
-            // Nobody named at all: the benign case, cleared by any success.
-            None => failures.anonymous = failures.anonymous.saturating_add(1),
-        }
-
-        self.max_auth_failures > 0 && failures.total() >= self.max_auth_failures
+        self.auth_failures()
+            .record(&self.auth, username, self.max_auth_failures)
     }
 
-    /// Poisoning would mean a panic between the bucket writes above; every one
-    /// of them is a plain counter with nothing to observe half-written, and the
-    /// alternative is a panic on a path whose job is to answer 407.
+    /// Poisoning would mean a panic between the bucket writes in
+    /// [`AuthFailures::record`]; every one of them is a plain counter with
+    /// nothing to observe half-written, and the alternative is a panic on a
+    /// path whose job is to answer 407.
     fn auth_failures(&self) -> MutexGuard<'_, AuthFailures> {
         self.auth_failures
             .lock()
@@ -764,16 +504,7 @@ impl Context {
             MarkOutcome::Evicted => return false,
         }
 
-        let mut failures = self.auth_failures();
-
-        // The request that forgot its header rather than the one that guessed:
-        // any success answers for those.
-        failures.anonymous = 0;
-
-        if let Some(username) = username {
-            failures.configured.remove(username);
-        }
-
+        self.auth_failures().clear_for(username);
         true
     }
 
@@ -1156,7 +887,6 @@ pub(crate) async fn admit_target(
 mod tests {
     use super::*;
     use crate::h3api::{FieldValue, Status};
-    use crate::quic::tests::loopback_pair;
     use std::assert_matches;
 
     fn connect_with_protocol(protocol: Option<&str>) -> Request {
@@ -1422,211 +1152,6 @@ mod tests {
             );
         }
     }
-    /// A context whose authenticator knows exactly one user.
-    ///
-    /// Parsed rather than assembled so the `[auth]` section is the one the
-    /// server itself would read. The certificate paths are never opened —
-    /// nothing here binds a listener — and the cap is set well above what the
-    /// test records, so every failure below answers "not yet" and the buckets
-    /// are the only subject.
-    async fn one_user_context() -> Context {
-        let config: Config = toml::from_str(
-            r#"
-                [server]
-                listen = "127.0.0.1:0"
-                cert = "unused.pem"
-                key = "unused.pem"
-
-                [security]
-                max_auth_failures = 100
-
-                [[auth.users]]
-                username = "user1"
-                password = "s3cret"
-            "#,
-        )
-        .expect("the test configuration must parse");
-
-        Context::new(
-            &config,
-            loopback_pair(quinn::TransportConfig::default()).await.0,
-            Arc::new(AtomicBool::new(false)),
-            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
-            Arc::new(AtomicU64::new(0)),
-            AuthGate::closed(),
-        )
-    }
-
-    /// A context whose `[security]` says how much silence this connection is
-    /// worth, and nothing else worth reading.
-    async fn context_with_budget(budget: u32) -> Context {
-        let config: Config = toml::from_str(&format!(
-            r#"
-                [server]
-                listen = "127.0.0.1:0"
-                cert = "unused.pem"
-                key = "unused.pem"
-
-                [security]
-                unanswered_packet_budget = {budget}
-            "#
-        ))
-        .expect("the test configuration must parse");
-
-        Context::new(
-            &config,
-            loopback_pair(quinn::TransportConfig::default()).await.0,
-            Arc::new(AtomicBool::new(false)),
-            &crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS),
-            Arc::new(AtomicU64::new(0)),
-            AuthGate::closed(),
-        )
-    }
-
-    /// A refund returns exactly what one session charged, and never lifts the
-    /// counter past the total the connection was created with.
-    ///
-    /// The three things D84's 2026-09-05 addendum promises, in order: a spent
-    /// total buys nothing, a refund of two buys two and no third, and a refund
-    /// of everything an attacker could ask for stops at the total. The last one
-    /// is the cap `refund_unanswered` applies; without it a connection could
-    /// end up with more allowance than it was created with.
-    #[tokio::test]
-    async fn a_refund_returns_a_sessions_own_charge_and_no_more() {
-        const BUDGET: u32 = 3;
-        const TOTAL: u32 = BUDGET * CONNECTION_UNANSWERED_MULTIPLIER;
-
-        let context = context_with_budget(BUDGET).await;
-        for _ in 0..TOTAL {
-            assert!(context.charge_unanswered());
-        }
-        assert!(!context.charge_unanswered(), "the total is spent");
-
-        // One answered session hands back the two packets it sent into silence
-        // before the answer, and exactly two more packets fit.
-        context.refund_unanswered(2);
-        assert!(context.charge_unanswered());
-        assert!(context.charge_unanswered());
-        assert!(
-            !context.charge_unanswered(),
-            "a refund of two must buy exactly two"
-        );
-
-        // A refund past the total is capped at it: the counter is what the
-        // connection was created with, never more.
-        context.refund_unanswered(u32::MAX);
-        for packet in 0..TOTAL {
-            assert!(
-                context.charge_unanswered(),
-                "packet {packet} after a full refund"
-            );
-        }
-        assert!(
-            !context.charge_unanswered(),
-            "a refund cannot lift the counter past the connection's total"
-        );
-
-        // Uncapped stays uncapped, and a refund of nothing changes nothing.
-        let uncapped = context_with_budget(0).await;
-        uncapped.refund_unanswered(5);
-        assert!(uncapped.charge_unanswered());
-    }
-
-    /// The connection's allowance is spent once and, with nothing outstanding
-    /// to repay it, never given back; and the operator's off switch turns it
-    /// off too.
-    ///
-    /// Charged one packet at a time because that is how a session spends it, and
-    /// the number that has to be exact is the last one: the packet after the
-    /// total is the one whose session is closed.
-    #[tokio::test]
-    async fn the_connections_unanswered_total_is_spent_exactly_once() {
-        const BUDGET: u32 = 3;
-
-        let context = context_with_budget(BUDGET).await;
-        for packet in 0..BUDGET * CONNECTION_UNANSWERED_MULTIPLIER {
-            assert!(
-                context.charge_unanswered(),
-                "packet {packet} is inside the connection's total"
-            );
-        }
-
-        assert!(
-            !context.charge_unanswered(),
-            "the packet after the total must find nothing left"
-        );
-        assert!(
-            !context.charge_unanswered(),
-            "and a second session opened afterwards finds the same"
-        );
-
-        // Zero is the operator switching the mitigation off, which has to switch
-        // off both halves of it: a session that is never capped must never be
-        // closed for having reached a cap.
-        let uncapped = context_with_budget(0).await;
-        for _ in 0..1000 {
-            assert!(uncapped.charge_unanswered());
-        }
-    }
-
-    /// A guess at a user-id nobody has must not become a key.
-    ///
-    /// The buckets are what make clearing failures on success honest, and this
-    /// is the half of them whose input a peer chooses: a failure naming a
-    /// configured user gets that user's own counter, and every other name is
-    /// charged to the one counter no success clears. One connection therefore
-    /// holds at most `|configured users| + 2` counters however many names are
-    /// tried against it.
-    #[tokio::test]
-    async fn a_guess_at_a_name_nobody_has_never_grows_the_buckets() {
-        let context = one_user_context().await;
-
-        // Near misses included: what decides the bucket is the comparison
-        // `Authenticator` makes, not how close the name looks.
-        for guess in ["admin", "root", "user1 ", "USER1", ""] {
-            assert!(
-                !context.record_auth_failure(Some(guess)),
-                "{guess:?} must not reach the cap"
-            );
-        }
-
-        {
-            let failures = context.auth_failures();
-            assert_eq!(failures.unconfigured, 5);
-            assert!(
-                failures.configured.is_empty(),
-                "a name nobody has became a key: {:?}",
-                failures.configured.keys().collect::<Vec<_>>()
-            );
-            assert_eq!(failures.anonymous, 0);
-        }
-
-        // The other two buckets, so the assertions above can only hold for the
-        // right reason: a configured name does get a counter of its own, and a
-        // failure that named nobody at all gets the third.
-        assert!(!context.record_auth_failure(Some("user1")));
-        assert!(!context.record_auth_failure(None));
-
-        let failures = context.auth_failures();
-        assert_eq!(failures.configured.len(), 1);
-        assert_eq!(failures.configured.get("user1").copied(), Some(1));
-        assert_eq!(failures.unconfigured, 5);
-        assert_eq!(failures.anonymous, 1);
-    }
-
-    /// Failures as one configured user add up in that user's one bucket.
-    #[tokio::test]
-    async fn failures_as_one_user_add_up_in_its_bucket() {
-        let context = one_user_context().await;
-        for _ in 0..3 {
-            assert!(!context.record_auth_failure(Some("user1")));
-        }
-
-        let failures = context.auth_failures();
-        assert_eq!(failures.configured.len(), 1);
-        assert_eq!(failures.configured.get("user1").copied(), Some(3));
-    }
-
     /// A resolver that never answers costs the request its budget and no more,
     /// and is reported as the timeout it is rather than as an ordinary lookup
     /// failure — the two carry different statuses.
