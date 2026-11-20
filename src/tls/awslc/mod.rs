@@ -1222,3 +1222,96 @@ impl crypto::Session for FailedSession {
         Err(ExportKeyingMaterialError)
     }
 }
+
+/// The ceiling on what one probed handshake may hold in this provider's own
+/// buffers: the outer ClientHello copy, bounded by libssl's 16384-byte Initial
+/// flight limit, plus
+/// the handshake bytes libssl queued and quinn has not taken, which are the
+/// server's own flight (a certificate chain and a few small messages).
+pub const PROBE_HELD_LIMIT: usize = OUTER_HELLO_LIMIT + 64 * 1024;
+
+/// A server configuration for [`ProbeSession`]: the certificate and key as
+/// DER, ALPN `h3`, no gate list, and the ECH key if given. Everything else is
+/// what [`server_config`] builds.
+pub fn probe_server_config(
+    cert: &[u8],
+    key: &[u8],
+    ech: Option<&EchKey>,
+) -> Result<Arc<ServerConfig>> {
+    Builder {
+        certs: vec![cert.to_vec()],
+        key: Zeroizing::new(key.to_vec()),
+        alpn: vec![b"h3".to_vec()],
+        names: Names::new(&[]),
+        ech,
+        groups: &GROUPS,
+        keylog: None,
+    }
+    .build()
+    .map(Arc::new)
+}
+
+/// One server handshake driven by hand rather than by quinn.
+///
+/// This is how `fuzz/fuzz_targets/tls.rs` reaches the provider: it reads CRYPTO
+/// bytes at the level whose keys quinn would hold, and writes the way quinn's
+/// `Connection::write_crypto` does, so the session moves through its levels as
+/// it would on a real connection. Nothing here is used by the server itself.
+pub struct ProbeSession(Session);
+
+impl ProbeSession {
+    /// A fresh server session on `config`, for QUIC version 1, with
+    /// `transport_parameters` as the server's own encoded parameters.
+    pub fn new(config: Arc<ServerConfig>, transport_parameters: &[u8]) -> Result<Self> {
+        Session::new(config, Version::V1, transport_parameters).map(Self)
+    }
+
+    /// Hands `bytes` to the session at its current level, as quinn hands the
+    /// bytes of one CRYPTO frame. `false` when the session refused them, which
+    /// ends a real connection.
+    pub fn read(&mut self, bytes: &[u8]) -> bool {
+        crypto::Session::read_handshake(&mut self.0, bytes).is_ok()
+    }
+
+    /// Takes everything the session has to send, as quinn does after every
+    /// read: one `(level, bytes)` entry per level that had bytes, where the
+    /// level is 0 for Initial, 2 for Handshake and 3 for 1-RTT.
+    pub fn write(&mut self) -> Vec<(u8, Vec<u8>)> {
+        let mut out = Vec::new();
+        loop {
+            let level = self.level();
+            let mut buf = Vec::new();
+            let keys = crypto::Session::write_handshake(&mut self.0, &mut buf);
+            let empty = buf.is_empty();
+            if !empty {
+                out.push((level, buf));
+            }
+            if keys.is_none() && empty {
+                return out;
+            }
+        }
+    }
+
+    /// The level the session reads at: 0 Initial, 2 Handshake, 3 1-RTT.
+    pub fn level(&self) -> u8 {
+        match self.0.level {
+            Level::Initial => 0,
+            Level::EarlyData => 1,
+            Level::Handshake => 2,
+            Level::Application => 3,
+        }
+    }
+
+    /// Whether the handshake is still running.
+    pub fn is_handshaking(&self) -> bool {
+        self.0.handshaking
+    }
+
+    /// The bytes this provider holds for the session in its own buffers: the
+    /// outer ClientHello copy and the queued handshake bytes. At most
+    /// [`PROBE_HELD_LIMIT`] if buffering is bounded.
+    pub fn held_bytes(&self) -> usize {
+        let queued: usize = self.0.lock().out.iter().map(Vec::len).sum();
+        self.0.initial.len() + queued
+    }
+}

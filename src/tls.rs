@@ -20,7 +20,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 #[allow(unsafe_code)]
 mod awslc;
 
-pub use awslc::{EchKey, EchSummary, ServerConfig, check_public_name, server_config};
+pub use awslc::{
+    EchKey, EchSummary, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, check_public_name,
+    probe_server_config, server_config,
+};
 
 /// The names in `names` that the leaf certificate `cert` is not valid for.
 ///
