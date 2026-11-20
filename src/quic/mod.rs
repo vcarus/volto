@@ -1,5 +1,6 @@
 //! The QUIC endpoint: transport parameters, the accept loop and peer metadata.
 
+mod cid;
 mod reload;
 mod roster;
 mod socket;
@@ -192,7 +193,10 @@ impl Server {
     /// so the socket would keep the kernel's default (D56; see
     /// [`crate::config::DEFAULT_SOCKET_RECV_BUFFER`]). Everything passed to
     /// [`quinn::Endpoint::new_with_abstract_socket`] below is what the helper
-    /// passes internally, and none of it may be dropped.
+    /// passes internally, and none of it may be dropped. The one difference is
+    /// the endpoint configuration, which is quinn's default with the connection
+    /// ID generator of `cid`, so that the endpoint never sends a Stateless
+    /// Reset.
     ///
     /// The second reason for expanding it is [`Gate`], which wraps the socket
     /// the runtime hands back so that a datagram quinn would *answer* can be
@@ -228,8 +232,10 @@ impl Server {
         let expected = Expected::new(policy);
         let socket = Arc::new(Gate::new(socket, expected.clone(), crypto));
 
+        // quinn's default endpoint configuration, with the one change that
+        // the endpoint never sends a Stateless Reset; `cid` says why and how.
         let endpoint = quinn::Endpoint::new_with_abstract_socket(
-            quinn::EndpointConfig::default(),
+            cid::endpoint_config(),
             Some(quic_config),
             socket,
             runtime,

@@ -632,13 +632,18 @@ Some details worth knowing before relying on it:
   ack-eliciting frame whether or not a name is in it. Sending one means building
   a QUIC Initial packet on purpose, which is a probe aimed at this server rather
   than a scan of the address.
-- **Stateless resets are not covered.** A short-header packet for a connection
-  this server does not hold can still draw one (RFC 9000 §10.3), because telling
-  a live connection's packets from a stranger's needs state the gate does not
-  have, and filtering on the address instead would break the connection migration
-  a phone behind a relay's NAT depends on. The residue is narrow: the packet has
-  to be at least 22 bytes, start with the bits `01`, and carry eight bytes that
-  pass the endpoint's own keyed connection-ID check. A scanner's probe does not.
+- **No Stateless Reset.** A short-header packet for a connection this server
+  does not hold draws nothing, with the gate on or off. RFC 9000 §10.3 lets an
+  endpoint send a Stateless Reset for one and does not require it, and volto
+  does not send one, even for a recorded packet of a connection it once held.
+  The cost is that a client whose connection the server has forgotten, and that
+  missed the server's `CONNECTION_CLOSE`, finds out from its own idle timeout.
+  The gate itself passes every short-header packet, because telling a live
+  connection's packets from a stranger's needs state the gate does not have,
+  and filtering on the address instead would break the connection migration a
+  phone behind a relay's NAT depends on. One exception remains: during the
+  shutdown grace, after the server stops accepting new connections, quinn
+  answers an Initial the gate lets through with a Stateless Reset.
 - **Rejected names.** A name that no ClientHello could carry is refused at
   startup rather than accepted and never matched — an empty string, a wildcard, a
   name over 253 bytes, anything outside the ASCII letters, digits, `-`, `.` and

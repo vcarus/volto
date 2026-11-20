@@ -6,14 +6,16 @@
 //! Connection ID is shorter than the eight bytes RFC 9000 §7.2 requires draws a
 //! CONNECTION_CLOSE, and a short-header packet for no live connection can draw a
 //! Stateless Reset. Each of those is a correct answer to a QUIC peer and an
-//! answer to a scanner as well.
+//! answer to a scanner as well. The third is not this module's: the endpoint
+//! is built with a connection ID generator that makes quinn drop such a packet
+//! instead (`quic::cid`), with the gate on or off.
 //!
 //! This module puts a filter *under* quinn, at the socket, so that a datagram
 //! quinn would answer never reaches it. It is off unless `[security]
 //! expected_sni` names at least one host or `[server] ech_key` names an ECH
 //! key: with neither, which is the shipped default, every datagram passes
 //! through untouched. Without a key the gate keeps no state and judges each
-//! datagram on its own, as the next three sections describe. A key adds the
+//! datagram on its own, as the next four sections describe. A key adds the
 //! hold of the section after them.
 //!
 //! # What passes
@@ -26,7 +28,7 @@
 //!
 //! * **Short header**: passes. It belongs to a connection this endpoint may
 //!   already hold, and the gate keeps no connection state to judge it with; see
-//!   *What is left uncovered* below.
+//!   *Short headers* below.
 //! * **Long header, version not 1**: refused, whatever the version is. What
 //!   that removes depends on the version. quinn's default `EndpointConfig`,
 //!   which [`crate::quic::Server::bind`] takes unchanged, supports seven:
@@ -97,20 +99,20 @@
 //! probe aimed at this server rather than the scan of an address the gate is
 //! for.
 //!
-//! A short-header packet for a connection this endpoint does not hold can still
-//! draw a Stateless Reset (RFC 9000 §10.3), and this module deliberately does
-//! not try to stop it: telling a live connection's packets from a stranger's
-//! needs the set of live connection IDs, which lives inside quinn, and filtering
-//! on the four-tuple instead would break the connection migration a mobile
-//! client behind a relay's NAT depends on. What it costs is small enough to
-//! state exactly: quinn answers only a packet of at least 22 bytes whose first
-//! two bits are `01`, and only when the eight bytes after them pass the
-//! endpoint's own keyed connection-ID check, which random payload does with
-//! probability 2^-40. A scanner's empty or fixed probe gets nothing.
-//!
 //! Nor is any of this traffic obfuscation. The gate hides that a *service* is
 //! here from somebody who does not know the name to ask for; it does nothing
 //! about what a connection looks like once one is open.
+//!
+//! # Short headers
+//!
+//! The gate passes every short-header packet. Telling a live connection's
+//! packets from a stranger's needs the set of live connection IDs, which lives
+//! inside quinn, and filtering on the four-tuple instead would break the
+//! connection migration a mobile client behind a relay's NAT depends on. A
+//! short-header packet for a connection the endpoint does not hold draws no
+//! Stateless Reset (RFC 9000 §10.3) all the same, because the connection ID
+//! generator in `quic::cid` makes quinn drop it without a reply; that module
+//! says how, and what it costs a client.
 //!
 //! # The hold, with an ECH key
 //!
@@ -149,7 +151,7 @@
 //! An Initial that carries no ClientHello (a PING, a lone CRYPTO frame past
 //! offset 0, a ClientHello cut short) is held like any other and, when nothing
 //! completes it, dropped. So the acknowledgements of *What is left uncovered*
-//! are not sent while a key is configured; Stateless Resets still are.
+//! are not sent while a key is configured.
 //!
 //! **Bounds.** Everything held came from a peer that has not authenticated,
 //! so the hold is bounded in time, in number and in bytes at once, each by a

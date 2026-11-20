@@ -71,7 +71,10 @@ Initial whose Destination Connection ID is shorter than the eight bytes RFC 9000
 §7.2 requires draws a `CONNECTION_CLOSE`; a short-header packet for no live
 connection can draw a Stateless Reset. All three are correct answers to a QUIC
 peer, and all three are answers to a port scan. With the gate open, a datagram
-that would draw one is discarded first.
+that would draw one of the first two is discarded first. The third is never
+sent, gate or no gate: the endpoint's connection ID generator (`quic/cid.rs`)
+fails quinn's check on every connection ID, and quinn sends a Stateless Reset
+only for a packet whose connection ID passes it, so it drops the packet instead.
 
 The judgement is made on the first packet in the datagram, which is enough for
 the whole of it: RFC 9000 §12.2 both lets a receiver "route based on the
@@ -150,14 +153,12 @@ with a `handshake_failure` alert and before the server writes any handshake
 message, so a defect in the gate costs an answer rather than the
 ECHConfigList.
 
-Stateless resets are deliberately left uncovered — see D106 and the
-[configuration reference](configuration.md#the-sni-gate) for what that leaves
-visible and why filtering on the address instead would break connection
-migration. Without an ECH key, so is the acknowledgement quinn returns for an
-Initial the gate passes that carries an ack-eliciting frame and no name — a PING
-on its own, or a ClientHello the gate could not finish reading — because
-refusing those means refusing a large first flight, which the stateless gate
-will not do. With a key, those packets are held like any other first flight and
+Without an ECH key, the acknowledgement quinn returns for an Initial the gate
+passes that carries an ack-eliciting frame and no name is left uncovered: a
+PING on its own, or a ClientHello the gate could not finish reading. Refusing
+those means refusing a large first flight, which the stateless gate will not do.
+The [configuration reference](configuration.md#the-sni-gate) says what that
+leaves visible. With a key, those packets are held like any other first flight and
 dropped when nothing completes them. None of this is
 traffic obfuscation, which stays a non-goal: the gate hides that a service is
 here from somebody who does not know the name to ask for, and says nothing about

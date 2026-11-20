@@ -25,14 +25,17 @@ mod common;
 use std::assert_matches;
 use std::net::SocketAddr;
 use std::panic::Location;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint_with_transport,
-    echoes, finish_connect_as, is_version_negotiation, open_tcp_tunnel, open_udp_session,
-    spawn_echo_target, spawn_udp_echo_target, udp_answer, udp_round_trip, version_probe,
+    ALLOW_PRIVATE, GATE_LOCALHOST, H3Client, TestServer, bulk_alpn, client_endpoint,
+    client_endpoint_with_transport, echoes, finish_connect_as, is_version_negotiation,
+    open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_answer,
+    udp_round_trip, version_probe,
 };
 use rustls::pki_types::CertificateDer;
+use tokio::net::UdpSocket;
 
 /// A second name on the test certificate, so a refusal and a mismatch differ.
 const OTHER: &str = "other.example";
@@ -219,6 +222,146 @@ async fn an_empty_probe_draws_nothing_either_way() {
             "a short arbitrary datagram must draw no reply"
         );
     }
+}
+
+/// A UDP relay between one client and the server, which records every
+/// short-header datagram the client sends through it.
+struct Recorder {
+    /// Where the client sends.
+    addr: SocketAddr,
+    /// The socket the server sees the client at.
+    upstream: Arc<UdpSocket>,
+    /// Every short-header datagram from the client, in the order it came.
+    recorded: Arc<Mutex<Vec<Vec<u8>>>>,
+    relay: tokio::task::JoinHandle<()>,
+}
+
+impl Recorder {
+    /// A relay to `server`.
+    async fn start(server: SocketAddr) -> Self {
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        upstream
+            .connect(server)
+            .await
+            .expect("connect to the server");
+        let addr = downstream.local_addr().expect("the relay's address");
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let relay = {
+            let upstream = upstream.clone();
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                let mut client = None;
+                let mut from_client = vec![0u8; 65536];
+                let mut from_server = vec![0u8; 65536];
+                loop {
+                    tokio::select! {
+                        read = downstream.recv_from(&mut from_client) => {
+                            let Ok((read, peer)) = read else { return };
+                            client = Some(peer);
+                            let datagram = &from_client[..read];
+                            if datagram.first().is_some_and(|first| first & 0x80 == 0) {
+                                recorded.lock().expect("the record").push(datagram.to_vec());
+                            }
+                            let _ = upstream.send(datagram).await;
+                        }
+                        read = upstream.recv(&mut from_server) => {
+                            let Ok(read) = read else { return };
+                            if let Some(client) = client {
+                                let _ = downstream.send_to(&from_server[..read], client).await;
+                            }
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            addr,
+            upstream,
+            recorded,
+            relay,
+        }
+    }
+}
+
+/// Every datagram that arrives on `socket` within [`CLIENT_IDLE`].
+async fn heard_on(socket: &UdpSocket) -> Vec<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + CLIENT_IDLE;
+    let mut heard = Vec::new();
+    let mut buffer = vec![0u8; 65536];
+    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.recv(&mut buffer)).await {
+        heard.push(buffer[..read].to_vec());
+    }
+    heard
+}
+
+/// A short-header packet of a connection the server has forgotten draws
+/// nothing, sent again from the address the connection used or from any
+/// other. quinn would answer it with a Stateless Reset (RFC 9000 §10.3),
+/// because its connection ID is one the endpoint issued and passes the
+/// default generator's `validate`; `quic::cid` makes that check fail for every
+/// connection ID, which turns the reset into a silent drop.
+///
+/// The client's packets are recorded by a relay, the client closes the
+/// connection, and the server drops it after its draining period, which on
+/// loopback is a few tens of milliseconds. The gate is off, because a short
+/// header passes the gate whether it is on or not.
+#[tokio::test]
+async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
+    let server = TestServer::start_with(GATE_OFF).await;
+    let recorder = Recorder::start(server.addr).await;
+
+    let endpoint = client_endpoint(&server.ca, &["h3"]);
+    let connection = endpoint
+        .connect(recorder.addr, "localhost")
+        .expect("start connecting")
+        .await
+        .expect("a handshake through the relay");
+    // The server's HTTP/3 control stream arrives in 1-RTT packets, which the
+    // client acknowledges in short-header packets of its own.
+    connection
+        .accept_uni()
+        .await
+        .expect("the server's control stream");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let packet = recorder
+        .recorded
+        .lock()
+        .expect("the record")
+        .first()
+        .cloned()
+        .expect("the client sent a short-header packet");
+    // quinn-proto answers nothing shorter than 22 bytes with a reset, so a
+    // shorter packet would prove nothing.
+    assert!(packet.len() >= 22, "{} bytes", packet.len());
+    connection.close(0u32.into(), b"done");
+    endpoint.wait_idle().await;
+
+    // The server's draining period is three probe timeouts, a few tens of
+    // milliseconds on loopback; a second is ample.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    recorder.relay.abort();
+
+    recorder
+        .upstream
+        .send(&packet)
+        .await
+        .expect("replay from the connection's address");
+    let same = heard_on(&recorder.upstream).await;
+
+    let elsewhere = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+    elsewhere
+        .send_to(&packet, server.addr)
+        .await
+        .expect("replay from another address");
+    let other = heard_on(&elsewhere).await;
+
+    assert!(
+        same.is_empty() && other.is_empty(),
+        "replayed, it drew {} datagrams at the connection's own address and {} at another",
+        same.len(),
+        other.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
