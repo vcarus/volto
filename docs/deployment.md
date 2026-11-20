@@ -210,7 +210,7 @@ sudo openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -subj "/CN=volto.internal" \
   -addext "subjectAltName=DNS:volto.internal" \
   -addext "basicConstraints=critical,CA:FALSE" \
-  -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+  -addext "keyUsage=critical,digitalSignature" \
   -addext "extendedKeyUsage=serverAuth"
 
 sudo chown root:volto /etc/volto/cert.pem /etc/volto/key.pem

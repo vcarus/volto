@@ -551,6 +551,11 @@ else
     # The SAN is what actually gets matched -- a bare CN has not been accepted for
     # years -- so it must be present even though the name is fictional.
     #
+    # keyUsage names digitalSignature alone. RFC 8446 section 4.4.2.2: "the
+    # digitalSignature bit MUST be set if the Key Usage extension is present".
+    # keyEncipherment is the bit for RSA key transport, which an EC key cannot
+    # perform.
+    #
     # `umask 077` in a subshell around the generation: openssl creates -keyout
     # with the process umask, so without it the new key is world-readable from
     # its creation until the chmod below. The subshell keeps the umask off the
@@ -574,7 +579,7 @@ else
             -subj "/CN=$SNI" \
             -addext "subjectAltName=DNS:$SNI" \
             -addext "basicConstraints=critical,CA:FALSE" \
-            -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+            -addext "keyUsage=critical,digitalSignature" \
             -addext "extendedKeyUsage=serverAuth" \
             >/dev/null 2>&1
     ) || {

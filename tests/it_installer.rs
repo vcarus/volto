@@ -1453,6 +1453,39 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
     }
 }
 
+/// The generated EC certificate asserts digitalSignature and not
+/// keyEncipherment (R8-L9).
+///
+/// RFC 8446 section 4.4.2.2 asks that "the digitalSignature bit MUST be set if
+/// the Key Usage extension is present". keyEncipherment is the RSA key
+/// transport bit, which a P-256 key cannot perform.
+#[test]
+fn the_generated_certificate_asserts_only_digital_signature() {
+    let root = scratch_tree(
+        "install",
+        "key-usage",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "active");
+    let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+
+    let text = Command::new("openssl")
+        .args(["x509", "-noout", "-text", "-in"])
+        .arg(root.join("etc/volto/cert.pem"))
+        .output()
+        .expect("openssl must be runnable");
+    let text = stdout_of(&text);
+    assert!(
+        text.contains("Digital Signature"),
+        "the certificate must assert digitalSignature:\n{text}"
+    );
+    assert!(
+        !text.contains("Key Encipherment"),
+        "an EC certificate must not assert keyEncipherment:\n{text}"
+    );
+}
+
 /// The report must survive a certificate that openssl cannot read.
 ///
 /// Under `set -euo pipefail` the plain assignments that read the fingerprint and
