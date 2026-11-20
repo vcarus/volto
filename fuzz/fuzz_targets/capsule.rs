@@ -10,6 +10,7 @@
 #![no_main]
 
 use std::assert_matches;
+use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use volto::capsule::{self, Capsule, CapsuleDecoder};
 use volto::datagram::VARINT_MAX;
@@ -22,14 +23,16 @@ fuzz_target!(|data: &[u8]| {
     if mode & 1 == 0 {
         let mut decoder = CapsuleDecoder::new();
         let mut chunk_len = 1 + usize::from(mode) % 16;
-        let mut input = rest;
-        while !input.is_empty() {
-            let take = chunk_len.min(input.len());
-            let (chunk, tail) = input.split_at(take);
-            input = tail;
+        // One copy of the input, sliced per chunk, as the frame target does.
+        let all = Bytes::copy_from_slice(rest);
+        let mut offset = 0;
+        while offset < all.len() {
+            let take = chunk_len.min(all.len() - offset);
+            let chunk = all.slice(offset..offset + take);
+            offset += take;
             chunk_len = (chunk_len % 16) + 1;
 
-            decoder.push(chunk.to_vec().into());
+            decoder.push(chunk);
             loop {
                 match decoder.next_capsule() {
                     Ok(Some(Capsule::Datagram { .. })) => continue,

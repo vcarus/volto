@@ -18,13 +18,17 @@ fuzz_target!(|data: &[u8]| {
     let Some((&control, rest)) = data.split_first() else {
         return;
     };
-    let kind = match control % 3 {
+    // `ServerControl` is the kind an unauthenticated peer's control stream gets;
+    // the decoder records its own SETTINGS, so no harness state is needed.
+    let kind = match control % 4 {
         0 => StreamKind::Control,
         1 => StreamKind::Request,
-        _ => StreamKind::Tunnel,
+        2 => StreamKind::Tunnel,
+        _ => StreamKind::ServerControl,
     };
     // On a request stream, optionally narrow to tunnel rules after the first
-    // HEADERS, the way `conn.rs` does once a CONNECT is answered.
+    // HEADERS, the way `h3::stream::Stream::split` does once a CONNECT is
+    // answered.
     let promote = kind == StreamKind::Request && control & 0x80 != 0;
 
     let budget = Arc::new(BufferBudget::default());
