@@ -485,7 +485,8 @@ fn uri_scheme(scheme: &[u8]) -> Result<&str, Violation> {
 ///
 /// The characters an authority is made of and no others: unreserved (§2.3),
 /// percent-encoding, sub-delims (§2.2), and ":", "@", "[", "]": the union of
-/// what a userinfo, a host and a port may contain. Only the *syntax* is judged
+/// what a userinfo, a host and a port may contain, which is every `pchar` and
+/// the two brackets of an IP literal. Only the *syntax* is judged
 /// here, not the shape. `tunnel::tcp` splits the host from the port and
 /// refuses a userinfo, an unbracketed IPv6 literal and a port that is not a
 /// port. It answers each of them with a 400 rather than a stream error, which
@@ -504,7 +505,7 @@ fn uri_authority(authority: &[u8]) -> Result<&str, Violation> {
 
     if !authority
         .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || AUTHORITY_PUNCTUATION.contains(byte))
+        .all(|byte| is_pchar(*byte) || matches!(byte, b'[' | b']'))
     {
         return Err(invalid());
     }
@@ -568,12 +569,6 @@ fn split_target(target: &[u8], extended: bool) -> Result<(&str, Option<&str>), V
 fn ascii(bytes: &[u8], invalid: impl Fn() -> Violation) -> Result<&str, Violation> {
     std::str::from_utf8(bytes).map_err(|_| invalid())
 }
-
-/// The punctuation an authority may contain, beside letters and digits.
-///
-/// Unreserved (RFC 3986 §2.3), the "%" of percent-encoding, sub-delims (§2.2),
-/// and the delimiters §3.2 gives the authority itself.
-const AUTHORITY_PUNCTUATION: &[u8] = b"-._~%!$&'()*+,;=:@[]";
 
 /// Whether `byte` is an RFC 3986 §3.3 `pchar`, or the "%" one begins with.
 ///
