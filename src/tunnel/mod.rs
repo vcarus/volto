@@ -400,8 +400,11 @@ pub struct Context {
     /// Budget for reaching a target, or `None` when it is disabled.
     ///
     /// Spent twice per request and separately: once on name resolution, once on
-    /// the whole list of addresses it resolved to. So the worst case a tunnel
-    /// slot is held before any byte flows is twice this.
+    /// the whole list of addresses it resolved to. The slot is taken before
+    /// either, and the 200 that follows them is written under
+    /// [`crate::h3api::Stream::respond_within`]'s bound of one connection idle
+    /// timeout. So the worst case a tunnel slot is held before any byte flows
+    /// is twice this plus one idle timeout.
     pub connect_timeout: Option<Duration>,
     /// This connection's share of the blocking pool, spent on name resolution.
     ///
