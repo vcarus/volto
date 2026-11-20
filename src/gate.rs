@@ -78,8 +78,10 @@
 //! the middle would mean rewriting the run. Instead the refused datagram is left
 //! in place with its Destination Connection ID *length* byte overwritten by a
 //! value no connection ID may have (RFC 9000 §17.2 caps it at 20 bytes), which
-//! is a header quinn's own decoder rejects before it looks at the version, the
-//! type or anything else. It rejects it by returning, not by answering.
+//! is a header quinn's own decoder rejects before it acts on the version, the
+//! type or anything else. The decoder reads the four version bytes first and
+//! the connection IDs next, so the rejection needs only the first six bytes to
+//! be there. It rejects it by returning, not by answering.
 //!
 //! The obvious alternative, clearing the fixed bit, does not work here: quinn
 //! accepts either value for it unless `EndpointConfig::grease_quic_bit` is
@@ -1348,11 +1350,12 @@ fn starts_with_an_initial(datagram: &[u8]) -> bool {
 ///
 /// Overwrites the Destination Connection ID Length field with a value RFC 9000
 /// §17.2 obliges every version-1 endpoint to drop the packet over (quoted at
-/// [`MAX_CONNECTION_ID`]). That field is read before the version, the packet
-/// type, the token or the payload, so the rejection does not depend on anything
-/// else in the packet being well formed, and quinn's own decoder answers it by
-/// returning rather than by replying. A datagram too short to hold that byte is
-/// one quinn already drops without a reply.
+/// [`MAX_CONNECTION_ID`]). quinn's decoder reads that field right after the
+/// four version bytes, and rejects it before it acts on the version or reads
+/// the packet type, the token or the payload, so the rejection does not depend
+/// on anything else in the packet being well formed, and the decoder answers
+/// it by returning rather than by replying. A datagram too short to hold that
+/// byte is one quinn already drops without a reply.
 fn blind(datagram: &mut [u8]) {
     if let Some(length) = datagram.get_mut(DCID_LENGTH_OFFSET) {
         *length = IMPOSSIBLE_CID_LENGTH;
