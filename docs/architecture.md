@@ -143,7 +143,12 @@ time, in the number of flights and in bytes, each by a named constant in
 `gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
 `enc` values is bounded by count rather than time, emptied by a reload that
 changes the key, and lost at a restart; only a flight the key opened can add to
-it.
+it. The TLS layer keeps a second line under this one: with a key configured, its
+ClientHello callback refuses a ClientHello that carried an ECH extension libssl
+did not accept, and under `require_ech` one that libssl accepted no ECH on,
+with a `handshake_failure` alert and before the server writes any handshake
+message, so a defect in the gate costs an answer rather than the
+ECHConfigList.
 
 Stateless resets are deliberately left uncovered — see D106 and the
 [configuration reference](configuration.md#the-sni-gate) for what that leaves

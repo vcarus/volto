@@ -10,7 +10,12 @@
 //!
 //! The D106 second SNI gate is a ClientHello callback here. AWS-LC calls it
 //! after ECH has been decided, so the name it judges is the inner one when ECH
-//! is accepted and the outer one when it is not.
+//! is accepted and the outer one when it is not. The same callback is the
+//! second line behind the socket gate's ECH rules (D115, batch 2): with an ECH
+//! key it refuses a ClientHello whose ECH extension libssl did not accept, and
+//! under `require_ech` one that libssl accepted no ECH on, so that a defect in
+//! the socket gate is answered with an alert rather than with this server's
+//! ECHConfigList.
 //!
 //! This is the one module of the crate that may use `unsafe` (`crate` says
 //! why). The rule inside it: every `unsafe` block carries a `SAFETY:` comment
@@ -107,6 +112,13 @@ const _: () = assert!(sys::SSL_OP_NO_TICKET == 0x4000);
 const ALERT_INTERNAL_ERROR: u8 = 80;
 const _: () = assert!(sys::SSL_AD_INTERNAL_ERROR == 80);
 const ALERT_UNRECOGNIZED_NAME: c_int = sys::SSL_AD_UNRECOGNIZED_NAME;
+/// The alert the second ECH line refuses with. RFC 8446 §6.2:
+/// "handshake_failure: Receipt of a "handshake_failure" alert message
+/// indicates that the sender was unable to negotiate an acceptable set of
+/// security parameters given the options available." Our choice: RFC 9849
+/// defines no alert for a server that will not go on without ECH, and this one
+/// says nothing about which parameter it was.
+const ALERT_HANDSHAKE_FAILURE: c_int = sys::SSL_AD_HANDSHAKE_FAILURE;
 
 /// The most Initial-level CRYPTO bytes kept for reading the outer ClientHello.
 ///
@@ -121,6 +133,12 @@ struct CtxData {
     alpn: Vec<Vec<u8>>,
     /// The D106 list; empty means every name.
     names: Names,
+    /// Whether to refuse a ClientHello that carried an ECH extension libssl did
+    /// not accept. On whenever an ECH key is configured.
+    refuse_unaccepted_ech: bool,
+    /// `[security] require_ech`: refuse every ClientHello libssl accepted no
+    /// ECH on.
+    require_ech: bool,
     /// Where the keylog callback writes, when `[log] keylog` is on.
     keylog: Option<Arc<KeyLog>>,
 }
@@ -191,6 +209,8 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         alpn: server.alpn_wire(),
         names: Names::new(&config.security.expected_sni),
         ech: ech.as_deref(),
+        refuse_unaccepted_ech: ech.is_some(),
+        require_ech: config.security.require_ech,
         groups: &GROUPS,
         keylog: config.log.keylog.then(KeyLog::from_env).flatten(),
     }
@@ -206,6 +226,8 @@ struct Builder<'a> {
     alpn: Vec<Vec<u8>>,
     names: Names,
     ech: Option<&'a EchKey>,
+    refuse_unaccepted_ech: bool,
+    require_ech: bool,
     groups: &'a [u16],
     keylog: Option<Arc<KeyLog>>,
 }
@@ -223,6 +245,8 @@ impl Builder<'_> {
         let data = Arc::new(CtxData {
             alpn: self.alpn,
             names: self.names,
+            refuse_unaccepted_ech: self.refuse_unaccepted_ech,
+            require_ech: self.require_ech,
             keylog: self.keylog,
         });
 
@@ -641,7 +665,21 @@ unsafe extern "C" fn select_alpn(
     sys::SSL_TLSEXT_ERR_ALERT_FATAL
 }
 
-/// The D106 second gate, run after ECH has been decided.
+/// The D106 second gate and the second ECH line, run after ECH has been
+/// decided.
+///
+/// The ECH line comes first. With an ECH key configured, a ClientHello that
+/// carried an ECH extension libssl did not accept is refused, and under
+/// `require_ech` so is every ClientHello libssl accepted no ECH on. The socket
+/// gate drops both before libssl sees them, so neither should ever fire; they
+/// are here so that a defect in the gate costs an alert and not the
+/// ECHConfigList, which libssl would otherwise send as `retry_configs` in
+/// EncryptedExtensions (RFC 9849 §7.1). The callback runs before the server
+/// writes any handshake message, so a refusal here sends no ServerHello and no
+/// EncryptedExtensions. When ECH was not accepted, libssl reports the outer
+/// ClientHello, so `SSL_client_hello_get0_ext` finds the outer extension; when
+/// it was, the inner one, whose extension is the inner variant, and the rule
+/// does not ask.
 ///
 /// `SSL_get_servername` reports the inner ClientHello's name when ECH was
 /// accepted and the outer one otherwise (`ssl.h`, `SSL_CTX_set1_ech_keys`: "If
@@ -669,6 +707,28 @@ unsafe extern "C" fn judge_client_hello(
     };
     // SAFETY: `ssl` is the SSL being handshaken; both getters only read it.
     let (name, ech_accepted) = unsafe { (server_name(ssl), sys::SSL_ech_accepted(ssl) == 1) };
+    // SAFETY: as above. `SSL_client_hello_get0_ext` only looks the extension up
+    // in the ClientHello libssl holds for this handshake, and with null
+    // out-pointers it writes nothing.
+    let ech_offered = unsafe {
+        sys::SSL_client_hello_get0_ext(
+            ssl,
+            std::ffi::c_uint::from(hello::EXT_ECH),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) == 1
+    };
+    if !ech_accepted && (data.require_ech || (data.refuse_unaccepted_ech && ech_offered)) {
+        debug!(
+            ech_offered,
+            require_ech = data.require_ech,
+            "TLS: refused a ClientHello whose ECH was not accepted, which the socket gate should \
+             have dropped"
+        );
+        // SAFETY: AWS-LC passes a writable alert slot.
+        unsafe { *alert = ALERT_HANDSHAKE_FAILURE };
+        return sys::SSL_CLIENT_HELLO_ERROR;
+    }
     let admitted = data.names.is_empty() || name.as_deref().is_some_and(|n| data.names.accepts(n));
     debug!(
         name = %crate::logfmt::or_dash(name.as_deref()),
@@ -1270,6 +1330,8 @@ pub fn probe_server_config(
         alpn: vec![b"h3".to_vec()],
         names: Names::new(&[]),
         ech,
+        refuse_unaccepted_ech: ech.is_some(),
+        require_ech: false,
         groups: &GROUPS,
         keylog: None,
     }

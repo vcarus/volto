@@ -100,6 +100,12 @@ first came from is admitted, which is a client retransmitting its first
 packets. The record of admitted ECH handshakes lives in memory, is emptied by a
 reload that changes the key, and is lost at a restart.
 
+The TLS layer refuses the same ClientHellos a second time, in case the gate
+ever lets one through: a ClientHello whose ECH extension libssl did not accept,
+and under `require_ech` one with no ECH at all, is refused with a
+`handshake_failure` alert before the server writes anything, so even then no
+ECHConfigList is sent.
+
 **`expected_sni` and the public name.** A ClientHello whose ECH the key opens
 is admitted without its public name being looked at, so the public name does
 not belong in `expected_sni`; listing it would make it a second name a probe

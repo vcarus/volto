@@ -70,12 +70,42 @@ fn ech_key(config_id: u8) -> EchKey {
     EchKey::generate(PUBLIC_NAME, config_id, 32).expect("generate an ECH key")
 }
 
-/// A server on `id`, with ECH under `ech` and the second gate's list `names`.
+/// A server on `id`, with ECH under `ech` and the second gate's list `names`,
+/// built as `server_config` builds one: with a key, the second ECH line on.
 fn server(
     id: &Identity,
     ech: Option<&EchKey>,
     groups: &[u16],
     names: &[&str],
+) -> Arc<ServerConfig> {
+    built(id, ech, groups, names, ech.is_some(), false)
+}
+
+/// The same server with `require_ech` on.
+fn requiring(id: &Identity, ech: &EchKey) -> Arc<ServerConfig> {
+    built(id, Some(ech), &GROUPS, &[], true, true)
+}
+
+/// A server whose second ECH line is off, which is libssl's own ECH behaviour
+/// with nothing of this provider's in front of it.
+///
+/// The spike's behaviour table, kept as regression tests here, is about what
+/// AWS-LC does with an ECH extension it cannot use: it never refuses, and
+/// answers on the outer ClientHello with `retry_configs`. That is the
+/// behaviour the socket gate and the second line exist to keep from anybody
+/// without the key, and those tests keep pinning it on this server, which is
+/// the configuration batch 1 built.
+fn libssl_alone(id: &Identity, ech: &EchKey, groups: &[u16], names: &[&str]) -> Arc<ServerConfig> {
+    built(id, Some(ech), groups, names, false, false)
+}
+
+fn built(
+    id: &Identity,
+    ech: Option<&EchKey>,
+    groups: &[u16],
+    names: &[&str],
+    refuse_unaccepted_ech: bool,
+    require_ech: bool,
 ) -> Arc<ServerConfig> {
     Arc::new(
         Builder {
@@ -84,6 +114,8 @@ fn server(
             alpn: vec![b"h3".to_vec()],
             names: Names::new(&names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>()),
             ech,
+            refuse_unaccepted_ech,
+            require_ech,
             groups,
             keylog: None,
         }
@@ -491,7 +523,7 @@ fn grease_ech_is_answered_on_the_outer_hello_with_retry_configs() {
     let recorder = Arc::new(Recorder::default());
     let client = client_config(Some(grease()), pq_first(), recorder.clone());
     let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
+        libssl_alone(&id, &key, &GROUPS, &[]),
         Arc::new(client),
         &recorder,
         &untouched,
@@ -518,7 +550,7 @@ fn ech_under_another_key_is_answered_on_the_outer_hello() {
         recorder.clone(),
     );
     let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
+        libssl_alone(&id, &key, &GROUPS, &[]),
         Arc::new(client),
         &recorder,
         &untouched,
@@ -561,7 +593,7 @@ fn a_damaged_ech_payload_is_answered_on_the_outer_hello() {
         recorder.clone(),
     );
     let outcome = handshake(
-        server(&id, Some(&key), &GROUPS, &[]),
+        libssl_alone(&id, &key, &GROUPS, &[]),
         Arc::new(client),
         &recorder,
         &corrupt_ech_payload,
@@ -701,6 +733,157 @@ fn a_hello_retry_request_keeps_ech() {
     );
 }
 
+/// One client of the test below: what it is, its ECH mode, its groups, and
+/// the groups the server offers.
+type Case = (
+    &'static str,
+    Option<EchMode>,
+    Vec<&'static dyn SupportedKxGroup>,
+    &'static [u16],
+);
+
+/// The second ECH line: with a key configured, a ClientHello whose ECH
+/// extension libssl did not accept is refused with `handshake_failure(40)`
+/// before the server writes anything, so neither EncryptedExtensions nor its
+/// `retry_configs` leave the server. GREASE, another key, another key under
+/// our config_id, a damaged payload, and the same across a HelloRetryRequest
+/// are each refused; the right list and no ECH extension at all are not.
+///
+/// The socket gate drops every one of these before libssl sees it, so this is
+/// the line that holds if the gate is wrong.
+#[test]
+fn the_second_ech_line_refuses_ech_it_did_not_accept_before_anything_is_sent() {
+    let id = identity();
+    let key = ech_key(1);
+    const HRR_GROUPS: [u16; 2] = [0x11ec, 0x0017];
+    let cases: Vec<Case> = vec![
+        ("GREASE", Some(grease()), pq_first(), &GROUPS),
+        (
+            "another key",
+            Some(enable(&ech_key(2).config_list())),
+            pq_first(),
+            &GROUPS,
+        ),
+        (
+            "another key under our config_id",
+            Some(enable(&ech_key(1).config_list())),
+            pq_first(),
+            &GROUPS,
+        ),
+        (
+            "another key across a HelloRetryRequest",
+            Some(enable(&ech_key(2).config_list())),
+            x25519_first(),
+            &HRR_GROUPS,
+        ),
+    ];
+    for (what, ech, groups, server_groups) in cases {
+        let recorder = Arc::new(Recorder::default());
+        let client = client_config(ech, groups, recorder.clone());
+        let outcome = handshake(
+            server(&id, Some(&key), server_groups, &[]),
+            Arc::new(client),
+            &recorder,
+            &untouched,
+        );
+        refused_before_anything(&outcome, what);
+    }
+
+    // A damaged payload under the right key.
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(
+        Some(enable(&key.config_list())),
+        pq_first(),
+        recorder.clone(),
+    );
+    let outcome = handshake(
+        server(&id, Some(&key), &GROUPS, &[]),
+        Arc::new(client),
+        &recorder,
+        &corrupt_ech_payload,
+    );
+    refused_before_anything(&outcome, "a damaged payload");
+
+    // The right list, and no ECH extension at all, are not refused.
+    for (what, ech) in [
+        ("the right list", Some(enable(&key.config_list()))),
+        ("no ECH", None),
+    ] {
+        let recorder = Arc::new(Recorder::default());
+        let client = client_config(ech, pq_first(), recorder.clone());
+        let outcome = handshake(
+            server(&id, Some(&key), &GROUPS, &[]),
+            Arc::new(client),
+            &recorder,
+            &untouched,
+        );
+        assert!(
+            outcome.server_done && outcome.client_done,
+            "{what}: {outcome:?}"
+        );
+        assert!(!outcome.retry_configs_sent, "{what}");
+    }
+}
+
+/// Under `require_ech` the second line also refuses a ClientHello with no ECH
+/// extension, and GREASE, before anything is sent; the right list completes.
+#[test]
+fn under_require_ech_the_second_line_refuses_a_client_hello_without_ech() {
+    let id = identity();
+    let key = ech_key(1);
+    for (what, ech) in [("no ECH", None), ("GREASE", Some(grease()))] {
+        let recorder = Arc::new(Recorder::default());
+        let client = client_config(ech, pq_first(), recorder.clone());
+        let outcome = handshake(
+            requiring(&id, &key),
+            Arc::new(client),
+            &recorder,
+            &untouched,
+        );
+        refused_before_anything(&outcome, what);
+    }
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(
+        Some(enable(&key.config_list())),
+        pq_first(),
+        recorder.clone(),
+    );
+    let outcome = handshake(
+        requiring(&id, &key),
+        Arc::new(client),
+        &recorder,
+        &untouched,
+    );
+    assert!(
+        outcome.ech_accepted && outcome.server_done && outcome.client_done,
+        "{outcome:?}"
+    );
+}
+
+/// Asserts that the server refused with `handshake_failure(40)` and wrote no
+/// handshake message at all: no ServerHello, so no EncryptedExtensions and no
+/// `retry_configs`.
+#[track_caller]
+fn refused_before_anything(outcome: &Outcome, what: &str) {
+    assert!(!outcome.ech_accepted, "{what}: {outcome:?}");
+    assert!(
+        outcome.server_messages.is_empty(),
+        "{what}: the server wrote {:?}",
+        outcome.server_messages
+    );
+    assert!(
+        !outcome.retry_configs_sent && !outcome.certificate_sent,
+        "{what}"
+    );
+    assert!(
+        outcome
+            .server_error
+            .as_deref()
+            .is_some_and(|e| e.contains("error 40")),
+        "{what}: {outcome:?}"
+    );
+}
+
 /// The client shape `it_gate_shapes::a_hello_retry_request_under_ech_completes_through_the_hold`
 /// uses draws a HelloRetryRequest from the production group list: it offers
 /// SecP256r1MLKEM768 first, which this server does not accept, and X25519
@@ -742,7 +925,7 @@ fn a_hello_retry_request_keeps_a_rejection() {
         recorder.clone(),
     );
     let outcome = handshake(
-        server(&id, Some(&key), &[0x11ec, 0x0017], &[]),
+        libssl_alone(&id, &key, &[0x11ec, 0x0017], &[]),
         Arc::new(client),
         &recorder,
         &untouched,
@@ -758,7 +941,7 @@ fn the_second_gate_judges_the_inner_name_when_ech_is_accepted() {
     let id = identity();
     let key = ech_key(1);
     let other = ech_key(2);
-    let gated = server(&id, Some(&key), &GROUPS, &["localhost"]);
+    let gated = libssl_alone(&id, &key, &GROUPS, &["localhost"]);
 
     // Accepted: inner `localhost` is judged, although the outer name is the
     // public name, which is not on the list.
@@ -1225,6 +1408,8 @@ fn a_key_that_does_not_match_the_certificate_is_refused_by_that_name() {
         alpn: vec![b"h3".to_vec()],
         names: Names::new(&[]),
         ech: None,
+        refuse_unaccepted_ech: false,
+        require_ech: false,
         groups: &GROUPS,
         keylog: None,
     }
