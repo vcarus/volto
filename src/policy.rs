@@ -178,7 +178,7 @@ pub(crate) fn routed_form(ip: IpAddr) -> IpAddr {
 pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_canonical(),
-        v4 => v4,
+        v4 @ IpAddr::V4(_) => v4,
     }
 }
 
