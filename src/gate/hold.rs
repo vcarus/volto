@@ -103,8 +103,11 @@ pub(super) struct HeldDatagram {
 pub enum Dropped {
     /// The first handshake message is not a ClientHello.
     NotClientHello,
-    /// A whole ClientHello that libssl would refuse to parse.
-    Unreadable,
+    /// A whole ClientHello whose extension block libssl would refuse: it does
+    /// not end where the ClientHello ends, or an extension in it does not fit.
+    /// Only the framing is checked; the other things libssl refuses in a
+    /// ClientHello are left to libssl.
+    UnreadableExtensions,
     /// CRYPTO bytes, or a ClientHello length, past [`HOLD_HELLO_BYTES`].
     TooLong,
     /// Two packets of the flight carried different bytes at one offset.
@@ -270,8 +273,15 @@ impl Replay {
     /// The same `enc` from the same address is admitted: that is a client
     /// sending its first flight again, after a loss or after a Retry, which
     /// keeps the ClientHello and so its `enc`. The same `enc` from another
-    /// address is a copy of somebody else's flight. Our own rule; RFC 9849
-    /// leaves replay of a ClientHelloOuter to the TLS layer, which answers it.
+    /// address is a copy of somebody else's flight. Our own rule.
+    ///
+    /// It protects against a copy that arrives after the original, not one
+    /// that overtakes it: whichever copy completes its flight first is
+    /// admitted and recorded. A copy that reaches the server from another
+    /// address before the client's own last packet is admitted, and the
+    /// client's flight is then dropped as the replay. The two cannot be told
+    /// apart without a freshness field in the first flight, which this
+    /// ClientHello does not carry.
     fn admit(&mut self, enc: &[u8], from: SocketAddr) -> bool {
         let tag = self.keys.hash_one(enc);
         let place = self.keys.hash_one(from);
@@ -587,10 +597,13 @@ impl Memory {
 ///    its name exactly as the stateless gate judges one, with an empty list
 ///    admitting every name.
 ///
-/// A whole ClientHello that libssl would refuse to parse is dropped before
-/// any of that, because this gate cannot say whether it carries an ECH
-/// extension, and libssl, which would read it differently or not at all, is
-/// the parser the rule protects.
+/// A whole ClientHello whose extension block libssl would refuse to parse is
+/// dropped before any of that, because this gate cannot then say whether it
+/// carries an ECH extension, and libssl, which would read it differently or
+/// not at all, is the parser the rule protects. Only the block's framing is
+/// checked: a ClientHello libssl refuses for another reason (a session ID
+/// over 32 bytes, an odd cipher suite list, a duplicated extension, bytes
+/// after the message) is judged like any other, and libssl refuses it.
 fn judge(
     contiguous: &[u8],
     policy: &Policy,
@@ -609,7 +622,7 @@ fn judge(
         Message::ClientHello(body) => body,
     };
     let Some(ech) = hello::ech(body) else {
-        return Some(Err(Dropped::Unreadable));
+        return Some(Err(Dropped::UnreadableExtensions));
     };
     Some(match ech {
         Ech::Outer(outer) => match policy.ech.as_deref() {

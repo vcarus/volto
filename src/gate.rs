@@ -176,6 +176,20 @@
 //! time. Only a flight the key opened adds to it, so a peer without the key
 //! cannot grow it. A reload that changes the key empties it, and it is not kept
 //! across a restart.
+//!
+//! **Limits.** Two are known and not handled. First, the replay record admits
+//! whichever copy of a flight completes first. A copy that reaches the server
+//! from another address before the client's own last packet is admitted, and
+//! the client's flight is then dropped as the replay. The two cannot be told
+//! apart without a freshness field, which a first flight does not carry, and
+//! the copy has to come from a position on the path that can get ahead of the
+//! original. Second, a flight is keyed by its source address, so a client
+//! whose source port changes between two packets of one first flight leaves
+//! two halves that never complete; the flight completes when the client sends
+//! it again from the new port. A port change between an admitted flight and
+//! its retransmission makes the retransmission look like a replay, and it is
+//! dropped until the client makes a new attempt, which carries a new `enc`.
+//! Both end in silence rather than in an error.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -278,8 +292,9 @@ const FRAME_CONNECTION_CLOSE: u64 = 0x1c;
 ///
 /// Held as normalised strings (lowercased, with a trailing root dot removed),
 /// so that the normalisation happens once at load rather than once per
-/// Initial packet, and so that both gates ([`Names::accepts`] here and the
-/// certificate resolver in [`crate::tls`]) can only ever agree.
+/// Initial packet, and so that both gates can only ever agree: this one, and
+/// the ClientHello callback of the server's TLS (`tls::awslc`), which calls
+/// [`Names::accepts`] too.
 #[derive(Debug)]
 pub struct Names {
     names: Vec<String>,
@@ -710,7 +725,7 @@ fn log_refusal(remote: SocketAddr, refusal: &Refusal) {
 fn log_drop(remote: SocketAddr, dropped: Dropped) {
     let why = match &dropped {
         Dropped::NotClientHello => "its first handshake message is not a ClientHello",
-        Dropped::Unreadable => "its ClientHello does not parse",
+        Dropped::UnreadableExtensions => "its ClientHello's extension block does not parse",
         Dropped::TooLong => "its ClientHello is longer than libssl reads",
         Dropped::Conflict => "two of its packets carry different bytes at one offset",
         Dropped::Frames => "a packet of it carries frames an Initial packet may not",
@@ -1225,7 +1240,7 @@ pub enum Verdict {
 /// Why a datagram was refused, and what the refusal was about.
 ///
 /// The values are the parser's own, not the logger's: a peer-chosen name is
-/// carried raw and is bounded and escaped in [`Gate::screen`], inside the
+/// carried raw and is bounded and escaped in [`log_refusal`], inside the
 /// `debug!` that prints it. Nothing is rendered for a build that is not logging
 /// at DEBUG, which a flood of refused handshakes is the reason to care about.
 ///
@@ -1639,9 +1654,9 @@ impl Screening {
 /// clock to open or to build the packets the real gate opens. The resolver is
 /// never asked for anything: nothing here starts a TLS session.
 ///
-/// The panics are unreachable in the builds that call this. One would need a
-/// crypto provider without TLS 1.3, the same condition [`crate::tls`] turns
-/// into a startup error.
+/// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
+/// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
+/// asks for.
 #[doc(hidden)]
 pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
     /// A resolver with nothing to present.
