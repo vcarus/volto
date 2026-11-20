@@ -892,7 +892,7 @@ impl crypto::ServerConfig for ServerConfig {
 }
 
 /// One server handshake and the connection's TLS state after it.
-pub struct Session {
+struct Session {
     // Field order is drop order: the SSL goes first, while `shared` (which its
     // ex_data points at) and `config` (whose SSL_CTX and callback data it uses)
     // are still alive. `SSL_free` calls none of the callbacks either way.
@@ -986,9 +986,12 @@ impl Session {
     /// The transport error for a failed AWS-LC call.
     fn failure(&self, what: &str) -> TransportError {
         let errors = ffi::error_stack();
-        let shared = self.lock();
-        let alert = shared.alert.unwrap_or(ALERT_INTERNAL_ERROR);
-        let detail = shared.failure.clone().unwrap_or(errors);
+        let (alert, failure) = {
+            let shared = self.lock();
+            (shared.alert, shared.failure.clone())
+        };
+        let alert = alert.unwrap_or(ALERT_INTERNAL_ERROR);
+        let detail = failure.unwrap_or(errors);
         TransportError {
             code: TransportErrorCode::crypto(alert),
             frame: None,

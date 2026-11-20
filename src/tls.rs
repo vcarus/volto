@@ -69,12 +69,9 @@ pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> 
             // check does not take one. The same helper, so the two cannot judge
             // the same string differently; see `gate::root_relative`.
             let bare = crate::gate::root_relative(name);
-            match rustls::pki_types::ServerName::try_from(bare) {
-                Ok(server_name) => {
-                    rustls::client::verify_server_name(&parsed, &server_name).is_err()
-                }
-                Err(_) => true,
-            }
+            !rustls::pki_types::ServerName::try_from(bare).is_ok_and(|server_name| {
+                rustls::client::verify_server_name(&parsed, &server_name).is_ok()
+            })
         })
         .cloned()
         .collect()
