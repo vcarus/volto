@@ -754,11 +754,8 @@ impl Handle {
         self.shared.buffered.clone()
     }
 
-    /// Claims a Quarter Stream ID for a session on this connection.
-    ///
-    /// The stream's own call, forwarded: only [`super::stream::Stream`] knows
-    /// the stream id this is derived from, and only [`Shared`] holds the table
-    /// it goes into.
+    /// Claims a Quarter Stream ID for a session on this connection
+    /// ([`Shared::register_datagrams`]).
     pub(crate) fn register_datagrams(&self, quarter_stream_id: u64) -> Option<DatagramReceiver> {
         self.shared.register_datagrams(quarter_stream_id)
     }
@@ -771,11 +768,8 @@ impl Handle {
     pub(crate) fn fail(&self, violation: Violation) -> ConnectionError {
         debug!(%violation, "closing the connection on a protocol violation");
 
-        // Only the first violation is kept: it is the one that caused the
-        // close, and anything after it is a consequence. Everything below uses
-        // the violation that was *stored* rather than the one passed in, so the
-        // code on the wire, the reason in the log and the error this returns
-        // cannot disagree when two tasks fail at once.
+        // The *stored* violation, not the one passed in ([`Shared::record`]),
+        // is what goes on the wire and what this returns.
         let stored = self.shared.record(violation);
         self.quic
             .close(varint(stored.code()), stored.to_string().as_bytes());
@@ -1102,10 +1096,8 @@ impl Connection {
     /// The error is returned rather than logged here to keep that grading in
     /// one place (D50).
     ///
-    /// It is `Handle::close_for` with that code, so the close is recorded as
-    /// every other close of this endpoint is. If a violation was recorded
-    /// first, that violation closed the connection, and it is what goes on the
-    /// wire and what is returned.
+    /// It is `Handle::close_for` with that code, so a violation recorded first
+    /// is what goes on the wire and what is returned.
     pub fn close_quietly(&self, reason: &'static str) -> ConnectionError {
         self.handle.close_for(Code::H3_NO_ERROR, reason)
     }
@@ -1380,9 +1372,7 @@ async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
 
 /// Reads the peer's control stream until the connection ends.
 async fn serve_control(handle: &Handle, recv: quinn::RecvStream) {
-    // Not the connection's budget: one control stream buffering one frame at a
-    // time is already bounded, and a refusal here could not be the stream-class
-    // one that budget hands out (see [`BufferBudget::unshared`]).
+    // Not the connection's budget; [`BufferBudget::unshared`] says why.
     let mut frames = FrameReader::on_server_control(recv, BufferBudget::unshared());
     let mut control = Control::default();
 
@@ -1716,10 +1706,8 @@ impl QpackProgress {
 /// [`QpackProgress`] as the state.
 ///
 /// RFC 9204 §4.2 also makes the *peer* closing one of these streams a
-/// connection error of type H3_CLOSED_CRITICAL_STREAM. [`critical_stream_closed`]
-/// reports it, with the same exemption as for the control stream: a connection
-/// that has already ended is not disturbed. A clean finish and a reset both
-/// count, as §4.2 says.
+/// connection error; [`critical_stream_closed`] reports it, under the same
+/// rules as for the control stream.
 async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
     if kind.seen(&handle.shared).swap(true, Ordering::Relaxed) {
         handle.fail(duplicate("a second QPACK stream of the same kind"));
