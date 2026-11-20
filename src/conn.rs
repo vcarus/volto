@@ -486,7 +486,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
     // tell from the response which `:protocol` values this proxy implements, and
     // every CONNECT, TCP or UDP, has to pass through here.
     match context.auth.authenticate(&req.fields) {
-        Ok(Some(username)) => {
+        // `None` is an open proxy (no users configured, as warned about at
+        // startup): there is no check to pass, so the first request past this
+        // point counts as having passed it. Otherwise every connection to an
+        // unauthenticated proxy would live under D76's bound, tunnels and all.
+        Ok(user) => {
             // Lifts D76's bound for the rest of this connection's life: the peer
             // has proved who it is, and may now hold the connection idle for as
             // long as the transport allows. On the first request to get here it
@@ -495,18 +499,11 @@ async fn handle_request(resolver: h3api::Resolver, context: Arc<Context>) {
             // check, so both are done in one place. `false` means an eviction
             // claimed the connection first: the accept loop is already closing
             // it, and the request must not be routed or answered.
-            if !context.mark_authenticated(Some(username)) {
+            if !context.mark_authenticated(user) {
                 return;
             }
-            debug!(stream_id, username, "request authenticated");
-        }
-        // No users configured: an open proxy, as warned about at startup. There
-        // is no check to pass, so the first request past this point counts as
-        // having passed it. Otherwise every connection to an unauthenticated
-        // proxy would live under D76's bound, tunnels and all.
-        Ok(None) => {
-            if !context.mark_authenticated(None) {
-                return;
+            if let Some(username) = user {
+                debug!(stream_id, username, "request authenticated");
             }
         }
         Err(denials) => {
