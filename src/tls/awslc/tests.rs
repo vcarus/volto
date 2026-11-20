@@ -572,6 +572,98 @@ fn a_damaged_ech_payload_is_answered_on_the_outer_hello() {
     );
 }
 
+/// The outer ClientHello body and its ECH extension, from the first ClientHello
+/// an in-memory handshake carried.
+fn outer_hello(outcome: &Outcome) -> (Vec<u8>, hello::EchOuter) {
+    let body = hello::client_hello_body(&outcome.client_hellos[0])
+        .expect("a whole ClientHello")
+        .to_vec();
+    let ech = hello::ech_outer(&body).expect("an outer ECH extension");
+    (body, ech)
+}
+
+/// `EchKey::opens` says yes to exactly the ClientHellos libssl accepts ECH on.
+///
+/// A ClientHello that libssl took the inner ClientHello from is one the
+/// function opens, and the same ClientHello with any one byte changed is one it
+/// does not: a byte of the payload fails the AEAD tag, a byte of `enc` changes
+/// the HPKE shared secret, the config_id or the suite fails the checks ahead of
+/// HPKE, a length field changes what the extension is, and every other byte is
+/// part of the associated data. GREASE and an ECHConfig the server does not
+/// hold are not opened either.
+#[test]
+fn ech_opens_exactly_when_libssl_accepts_it() {
+    let id = identity();
+    let key = ech_key(1);
+    let other = ech_key(2);
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(
+        Some(enable(&key.config_list())),
+        pq_first(),
+        recorder.clone(),
+    );
+    let outcome = handshake(
+        server(&id, Some(&key), &GROUPS, &[]),
+        Arc::new(client),
+        &recorder,
+        &untouched,
+    );
+    assert!(outcome.ech_accepted, "libssl accepted ECH: {outcome:?}");
+    let (body, ech) = outer_hello(&outcome);
+    assert!(
+        key.opens(&body, &ech),
+        "the ClientHello libssl accepted opens"
+    );
+    assert!(
+        !ech_key(1).opens(&body, &ech),
+        "another key under the same config_id does not open it"
+    );
+
+    for at in 0..body.len() {
+        let mut changed = body.clone();
+        changed[at] ^= 0x01;
+        // A change to a length field can move the extension or make it
+        // unreadable; either way the ClientHello does not open.
+        let opens = hello::ech_outer(&changed).is_some_and(|ech| key.opens(&changed, &ech));
+        assert!(
+            !opens,
+            "byte {at} of {} changed and it still opens",
+            body.len()
+        );
+    }
+
+    // GREASE: an extension under a key nobody holds.
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(Some(grease()), pq_first(), recorder.clone());
+    let outcome = handshake(
+        server(&id, Some(&key), &GROUPS, &[]),
+        Arc::new(client),
+        &recorder,
+        &untouched,
+    );
+    assert!(!outcome.ech_accepted, "{outcome:?}");
+    let (body, ech) = outer_hello(&outcome);
+    assert!(!key.opens(&body, &ech), "GREASE does not open");
+
+    // A list for another key, which libssl does not accept either.
+    let recorder = Arc::new(Recorder::default());
+    let client = client_config(
+        Some(enable(&other.config_list())),
+        pq_first(),
+        recorder.clone(),
+    );
+    let outcome = handshake(
+        server(&id, Some(&key), &GROUPS, &[]),
+        Arc::new(client),
+        &recorder,
+        &untouched,
+    );
+    assert!(!outcome.ech_accepted, "{outcome:?}");
+    let (body, ech) = outer_hello(&outcome);
+    assert!(!key.opens(&body, &ech), "another key's ECH does not open");
+    assert!(other.opens(&body, &ech), "but it opens under its own key");
+}
+
 /// The client lists X25519 first and sends only its share; a server that does
 /// not offer X25519 picks X25519MLKEM768, the first group both support, and
 /// asks for its share with a HelloRetryRequest.

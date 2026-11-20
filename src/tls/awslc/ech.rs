@@ -23,8 +23,8 @@ use aws_lc_sys as sys;
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use zeroize::Zeroizing;
 
-use super::ffi::{self, EchKeys, HpkeKey, OpensslBytes};
-use crate::hello::Reader;
+use super::ffi::{self, EchKeys, HpkeCtx, HpkeKey, OpensslBytes};
+use crate::hello::{EchOuter, Reader};
 
 /// The ECHConfig version this server writes and reads. RFC 9849 §4:
 /// "case 0xfe0d: ECHConfigContents contents;".
@@ -53,6 +53,13 @@ const X25519_PKCS8_PREFIX: [u8; 16] = [
 /// An X25519 private key is 32 bytes.
 const X25519_KEY_LEN: usize = 32;
 
+/// The label the HPKE `info` starts with, including the zero byte after it.
+///
+//= https://www.rfc-editor.org/rfc/rfc9849#section-7.1
+//# The info parameter to SetupBaseR is the concatenation
+//# "tls ech", a zero byte, and the serialized ECHConfig.
+const INFO_LABEL: &[u8; 8] = b"tls ech\0";
+
 /// The ECH key and its ECHConfig, read from a key file or freshly generated.
 pub struct EchKey {
     hpke: HpkeKey,
@@ -62,6 +69,8 @@ pub struct EchKey {
     config: Vec<u8>,
     config_id: u8,
     public_name: String,
+    /// The ECHConfig's HPKE suites, as (KDF, AEAD) pairs.
+    suites: Vec<(u16, u16)>,
 }
 
 impl std::fmt::Debug for EchKey {
@@ -96,6 +105,7 @@ impl EchKey {
         )?;
         let private = raw_private_key(&hpke)?;
         let config = marshal_config(&hpke, config_id, public_name, max_name_length)?;
+        let fields = ConfigFields::parse(&config)?;
 
         let key = Self {
             hpke,
@@ -103,6 +113,7 @@ impl EchKey {
             config,
             config_id,
             public_name: public_name.to_owned(),
+            suites: fields.suites,
         };
         // The same check `from_pem` makes, so a generated key is one this
         // server will load.
@@ -174,6 +185,7 @@ impl EchKey {
             config,
             config_id: fields.config_id,
             public_name: fields.public_name,
+            suites: fields.suites,
         };
         // AWS-LC's own check of the pair: the version, the KEM, every HPKE
         // suite, every extension, and that the ECHConfig's public key is the
@@ -225,6 +237,106 @@ impl EchKey {
         &self.public_name
     }
 
+    /// Whether the outer ECH extension `ech` of the ClientHello body `body`
+    /// opens under this key.
+    ///
+    /// This is the decryption libssl runs on the same bytes, done for the socket
+    /// gate before libssl sees them. The checks that cost nothing come first:
+    /// the config_id has to be this ECHConfig's, and the (KDF, AEAD) pair has
+    /// to be one the ECHConfig lists, which RFC 9849 §7.1 puts ahead of the
+    /// decryption: "The server verifies that the ECHConfig supports the cipher
+    /// suite indicated by the ECHClientHello.cipher_suite and that the version
+    /// of ECH indicated by the client matches the ECHConfig.version. If not,
+    /// the server continues to the next candidate ECHConfig." The extension
+    /// names no KEM; the KEM is the ECHConfig's, and the key file is refused at
+    /// load unless it is DHKEM(X25519, HKDF-SHA256). Only then does HPKE run, as
+    /// RFC 9849 §7.1 gives it:
+    ///
+    /// ```text
+    /// context = SetupBaseR(ECHClientHello.enc, skR,
+    ///                      "tls ech" || 0x00 || ECHConfig)
+    /// EncodedClientHelloInner = context.Open(ClientHelloOuterAAD,
+    ///                                        ECHClientHello.payload)
+    /// ```
+    ///
+    /// where the associated data is the body with the payload zeroed, RFC 9849
+    /// §5.2: "The ClientHelloOuterAAD is a serialized ClientHello structure,
+    /// defined in Section 4.1.2 of \[RFC8446\] for TLS and Section 5.3 of
+    /// \[RFC9147\] for DTLS, which matches the ClientHelloOuter except that the
+    /// payload field of the "encrypted_client_hello" is replaced with a byte
+    /// string of the same length but whose contents are zeros. This value does
+    /// not include the Handshake structure's four-byte header in TLS nor the
+    /// twelve-byte header in DTLS." AWS-LC builds both the same way:
+    /// `ECHServerConfig::SetupContext` writes the label with its NUL and then
+    /// the raw ECHConfig as `info`, and `ssl_client_hello_decrypt` copies the
+    /// ClientHello body and zeroes the payload span for the AAD
+    /// (`ssl/encrypted_client_hello.cc`). The serialized ECHConfig here is the
+    /// one the key file holds, version and length included, which is the
+    /// `raw` AWS-LC keeps for the same key.
+    ///
+    /// The inner ClientHello is decrypted into a buffer that is cleared on
+    /// drop and is not returned: what the gate needs is whether the client
+    /// holds this key. libssl decrypts it again when the handshake runs.
+    pub fn opens(&self, body: &[u8], ech: &EchOuter) -> bool {
+        if ech.config_id != self.config_id || !self.suites.contains(&(ech.kdf, ech.aead)) {
+            return false;
+        }
+        let (Some(kdf), Some(aead)) = (hpke_kdf(ech.kdf), hpke_aead(ech.aead)) else {
+            return false;
+        };
+        let (Some(enc), Some(payload)) = (body.get(ech.enc.clone()), body.get(ech.payload.clone()))
+        else {
+            return false;
+        };
+
+        let mut aad = body.to_vec();
+        aad[ech.payload.clone()].fill(0);
+        let mut info = Vec::with_capacity(INFO_LABEL.len() + self.config.len());
+        info.extend_from_slice(INFO_LABEL);
+        info.extend_from_slice(&self.config);
+
+        // SAFETY: EVP_HPKE_CTX_new takes no arguments and returns a new context
+        // or null, which `from_ptr` turns into an error.
+        let Ok(ctx) = HpkeCtx::from_ptr(unsafe { sys::EVP_HPKE_CTX_new() }, "EVP_HPKE_CTX_new")
+        else {
+            return false;
+        };
+        let mut inner = Zeroizing::new(vec![0u8; payload.len()]);
+        let mut written = 0usize;
+        // SAFETY: `ctx` is a fresh context owned here; `self.hpke` is an
+        // initialised key that AWS-LC only reads; `kdf` and `aead` are static
+        // tables; `enc`, `info`, `payload` and `aad` are readable for the
+        // lengths passed beside them, and `inner` is writable for its length,
+        // which is the `max_out_len` passed. `written` receives the length
+        // AWS-LC wrote. The context is freed on drop on every path.
+        let opened = unsafe {
+            sys::EVP_HPKE_CTX_setup_recipient(
+                ctx.as_ptr(),
+                self.hpke.as_ptr(),
+                kdf,
+                aead,
+                enc.as_ptr(),
+                enc.len(),
+                info.as_ptr(),
+                info.len(),
+            ) == 1
+                && sys::EVP_HPKE_CTX_open(
+                    ctx.as_ptr(),
+                    inner.as_mut_ptr(),
+                    &mut written,
+                    inner.len(),
+                    payload.as_ptr(),
+                    payload.len(),
+                    aad.as_ptr(),
+                    aad.len(),
+                ) == 1
+        };
+        // A failure leaves its reason on this thread's error queue, which a
+        // later failure on the same thread would otherwise report as its own.
+        ffi::clear_errors();
+        opened
+    }
+
     /// The keys object an `SSL_CTX` takes, holding this one ECHConfig.
     ///
     /// The config is added with `is_retry_config = 1`. AWS-LC refuses a set
@@ -256,6 +368,34 @@ impl EchKey {
         };
         ffi::check(rc, "SSL_ECH_KEYS_add")?;
         Ok(keys)
+    }
+}
+
+/// AWS-LC's KDF table for an HPKE KDF id, if it is the one ECH uses.
+///
+/// HKDF-SHA256 alone, as in `ECHServerConfig::Init`, which refuses an
+/// ECHConfig naming any other KDF. The id is compared with AWS-LC's own
+/// rather than with a number written here.
+fn hpke_kdf(id: u16) -> Option<*const sys::EVP_HPKE_KDF> {
+    // SAFETY: both functions return or read a static KDF table.
+    let kdf = unsafe { sys::EVP_hpke_hkdf_sha256() };
+    // SAFETY: as above.
+    (unsafe { sys::EVP_HPKE_KDF_id(kdf) } == id).then_some(kdf)
+}
+
+/// AWS-LC's AEAD table for an HPKE AEAD id: the three `get_ech_aead` in
+/// `ssl/encrypted_client_hello.cc` accepts.
+fn hpke_aead(id: u16) -> Option<*const sys::EVP_HPKE_AEAD> {
+    // SAFETY: each function returns a pointer to a static AEAD table, and
+    // `EVP_HPKE_AEAD_id` only reads one.
+    unsafe {
+        [
+            sys::EVP_hpke_aes_128_gcm(),
+            sys::EVP_hpke_aes_256_gcm(),
+            sys::EVP_hpke_chacha20_poly1305(),
+        ]
+        .into_iter()
+        .find(|aead| sys::EVP_HPKE_AEAD_id(*aead) == id)
     }
 }
 
@@ -358,6 +498,8 @@ fn single_config(list: &[u8]) -> Result<&[u8]> {
 struct ConfigFields {
     config_id: u8,
     public_name: String,
+    /// `HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>`, as (KDF, AEAD).
+    suites: Vec<(u16, u16)>,
 }
 
 impl ConfigFields {
@@ -381,7 +523,13 @@ impl ConfigFields {
             "the ECHConfig names KEM {kem:#06x}, and this server serves only {KEM_X25519_HKDF_SHA256:#06x}"
         );
         r.vec16().context(ENDS_EARLY)?; // public_key
-        r.vec16().context(ENDS_EARLY)?; // cipher_suites
+        let mut list = Reader::new(r.vec16().context(ENDS_EARLY)?);
+        let mut suites = Vec::new();
+        while !list.is_empty() {
+            let kdf = list.u16().context(ENDS_EARLY)?;
+            let aead = list.u16().context(ENDS_EARLY)?;
+            suites.push((kdf, aead));
+        }
         r.u8().context(ENDS_EARLY)?; // maximum_name_length
         let name = r.vec8().context(ENDS_EARLY)?;
         r.vec16().context(ENDS_EARLY)?; // extensions
@@ -391,6 +539,7 @@ impl ConfigFields {
         Ok(Self {
             config_id,
             public_name,
+            suites,
         })
     }
 }

@@ -114,6 +114,12 @@ owned!(
     sys::EVP_HPKE_KEY_free
 );
 owned!(
+    /// An HPKE context, set up for one decryption and dropped after it.
+    HpkeCtx,
+    sys::EVP_HPKE_CTX,
+    sys::EVP_HPKE_CTX_free
+);
+owned!(
     /// A set of ECH configurations and their keys, as `SSL_CTX_set1_ech_keys`
     /// takes it.
     EchKeys,
@@ -131,6 +137,20 @@ owned!(
 unsafe impl Send for SslCtx {}
 // SAFETY: as above.
 unsafe impl Sync for SslCtx {}
+
+// SAFETY: an `EVP_HPKE_KEY` is written only by `EVP_HPKE_KEY_init` and
+// `EVP_HPKE_KEY_generate`, which `ech.rs` calls on a key it has just created
+// and that nothing else can reach yet. Every function the provider passes it to
+// afterwards takes it as `const EVP_HPKE_KEY *` and only reads it
+// (`EVP_HPKE_KEY_private_key`, `SSL_marshal_ech_config`, `SSL_ECH_KEYS_add`,
+// which takes its own copy, and `EVP_HPKE_CTX_setup_recipient`), as `hpke.h`
+// and `ssl.h` declare them. What it holds (`struct evp_hpke_key_st` in `hpke.h`)
+// is a pointer to a static KEM table and key buffers it owns on the heap, none
+// of it per-thread. So it may move to another thread, and several threads may
+// read it at once.
+unsafe impl Send for HpkeKey {}
+// SAFETY: as above.
+unsafe impl Sync for HpkeKey {}
 
 // SAFETY: `ssl.h`, section "SSL connections": "an |SSL| is not thread-safe and
 // may only be used on one thread at a time". It is not tied to the thread that
