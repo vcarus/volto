@@ -461,9 +461,9 @@ family, an IP literal above all, is unaffected by any of the three.
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `allow_private_networks` | bool | `false` | Allow tunnels to the special-purpose address space listed in the IANA registries that RFC 6890 set up: loopback, RFC 1918, link-local, shared address space, the IETF protocol assignment blocks and the rest of the table under [Ranges refused unless `allow_private_networks` is on](#ranges-refused-unless-allow_private_networks-is-on). Keep it off on a public deployment |
-| `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53** (see below) |
+| `denied_ports` | array of integers | `[25]` | Target ports refused regardless of address, answered with 403. **Do not add 53 or 123** (see below) |
 | `unanswered_packet_budget` | integer | `64` | Packets a UDP session may send before its target has answered; `0` disables the mitigation |
-| `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. One failure is one credential value tried and refused, so a single request may spend more than one. Failures are counted in buckets — one per configured user-id that is guessed at, one shared by every user-id that is not configured, one for the requests that named nobody — and the connection goes when the **total** across them reaches this value. A request that authenticates clears **its own user's bucket and the credential-less one**, so failures cannot add up over the life of a working connection; it clears nothing else, so a peer holding one valid credential cannot buy back its guesses at a second user's password by interleaving a good request, and a scan for user-ids that do not exist is never cleared by anything |
+| `max_auth_failures` | integer | `5` | Authentication failures tolerated on one connection before it is dropped; `0` disables it. What one failure is, and what clears it, is under the table |
 | `require_ech` | bool | `false` | Drop every handshake that carries no ECH extension, without any reply, so only a client holding the ECHConfigList reaches TLS. Needs `[server].ech_key` and is refused without it, at startup, by `--check-config` and on reload. Reloadable. Configure every client with the list before turning it on: a client without it then sees the port as closed. See [Encrypted Client Hello](#encrypted-client-hello) |
 | `expected_sni` | array of strings | `[]` | Host names this server answers to. **An empty list answers to any name**, which is the default. A non-empty list turns on the SNI gate, and a handshake whose ClientHello names none of these hosts is refused, as a rule with no reply at all. Every client must then send the name as SNI (in Surge, the `sni=` parameter), so change this key and the clients together. How names are matched, which are refused at startup and what the gate does are under [The SNI gate](#the-sni-gate) |
 
@@ -539,8 +539,16 @@ family, an IP literal above all, is unaffected by any of the three.
   accepted field names spends two. A request carrying more than two credential
   values is answered `400` before any of them is tried, and costs nothing,
   because two is all that accepting both field names asks for. N is therefore a
-  number of guesses whatever shape they arrive in. Pair it with fail2ban for
-  actual banning — see [deployment.md](deployment.md#fail2ban).
+  number of guesses whatever shape they arrive in. Failures are counted in
+  buckets: one per configured user-id that is guessed at, one shared by every
+  user-id that is not configured, and one for the requests that named nobody.
+  The connection goes when the **total** across them reaches N. A request that
+  authenticates clears **its own user's bucket and the credential-less one**, so
+  failures cannot add up over the life of a working connection. It clears
+  nothing else, so a peer holding one valid credential cannot buy back its
+  guesses at a second user's password by interleaving a good request, and a scan
+  for user-ids that do not exist is never cleared by anything. Pair it with
+  fail2ban for actual banning; see [deployment.md](deployment.md#fail2ban).
 
 ### Ranges refused unless `allow_private_networks` is on
 
