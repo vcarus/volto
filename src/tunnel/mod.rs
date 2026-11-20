@@ -122,6 +122,12 @@ const CONNECTION_SPECIFIC_FIELDS: [&str; 4] = [
 /// §9.3.6 asks a server to "reject a CONNECT request that targets an empty or
 /// invalid port number".
 ///
+/// That argument is about the sign, which the grammar does not allow. Leading
+/// zeros are another matter: `*DIGIT` allows them, so `example.com:0443` is a
+/// valid spelling, is accepted, and is dialled as 443. Its log line spells the
+/// port differently from the number dialled, and this rule does not prevent
+/// that.
+///
 /// The empty string is refused here as well, which is not what `*DIGIT` says on
 /// its own. RFC 9298 §3 requires `target_port` to "represent an integer between
 /// 1 and 65535 inclusive" and RFC 9110 §9.3.6 names an empty port beside an
