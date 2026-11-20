@@ -78,18 +78,12 @@ impl Config {
             ));
         }
 
-        // The SNI gate admits exactly the names in `expected_sni`, and a name the
-        // certificate does not cover is one no client that verifies the
-        // certificate by it can complete a handshake under: the gate was told to
-        // expect a name nobody will send. A typo here makes the server silent,
-        // and silence is what the gate is for, so this is the one place the
-        // mistake can be noticed. The certificate is read here rather than
-        // threaded through because this runs before the TLS configuration
-        // exists at startup and again on every reload; one that cannot be read
-        // is left for the bind to refuse, loudly.
-        //
-        // `load_certs` refuses an empty chain, so the leaf is always there;
-        // asking for it rather than indexing at zero keeps that reliance local.
+        // A typo in `expected_sni` makes the server silent, and silence is what
+        // the gate is for, so this is the one place the mistake can be noticed.
+        // The certificate is read here because this runs before the TLS
+        // configuration exists; one that cannot be read is left for the bind to
+        // refuse, loudly. `first()` rather than an index keeps the reliance on
+        // `load_certs` refusing an empty chain local.
         if !self.security.expected_sni.is_empty()
             && let Ok(certs) = crate::tls::load_certs(&self.server.cert)
             && let Some(leaf) = certs.first()
