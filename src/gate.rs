@@ -190,15 +190,6 @@ const IMPOSSIBLE_CID_LENGTH: u8 = 0xff;
 /// One byte of flags plus four of version (RFC 9000 §17.2).
 const DCID_LENGTH_OFFSET: usize = 5;
 
-/// The TLS `client_hello` handshake message type (RFC 8446 §4).
-const CLIENT_HELLO: u8 = 1;
-
-/// The TLS `server_name` extension type (RFC 6066 §3).
-const SERVER_NAME_EXTENSION: u16 = 0;
-
-/// The `host_name` NameType of a `server_name` entry (RFC 6066 §3).
-const HOST_NAME: u8 = 0;
-
 /// The QUIC frame types an Initial packet may carry (RFC 9000 §17.2.2).
 const FRAME_PADDING: u64 = 0x00;
 const FRAME_PING: u64 = 0x01;
@@ -932,159 +923,16 @@ fn skip_varints(payload: &[u8], mut at: usize, count: usize) -> Option<usize> {
     Some(at)
 }
 
-/// What a first flight's CRYPTO bytes said about the name being asked for.
+/// What a first flight's CRYPTO bytes said, and the reader that says it.
 ///
-/// Hidden, and public for the same reason [`Verdict`] is: [`first_flight`] hands
-/// it to a fuzz target.
+/// Both live in [`crate::hello`], the one ClientHello parser the gate, the TLS
+/// provider and the tests share. They are re-exported here, hidden and public,
+/// for the callers that reached them through this module before: the fuzz
+/// target and `tests/it_gate_shapes.rs` hand CRYPTO bytes to the reader
+/// directly, because the only other way to reach it is to spell a whole
+/// Initial packet that authenticates, which a fuzzer cannot do by luck.
 #[doc(hidden)]
-#[derive(Debug, PartialEq, Eq)]
-pub enum FirstFlight<'a> {
-    /// The ClientHello is not all here yet.
-    Truncated,
-    /// The first handshake message is something other than a ClientHello.
-    NotAClientHello,
-    /// A whole ClientHello with no `server_name` extension.
-    Anonymous,
-    /// The host name it asked for, as it arrived, borrowed out of the CRYPTO
-    /// bytes it was read from. A name only reaches an allocation when the
-    /// verdict is a refusal, which is where [`Refusal::OtherName`] takes a copy
-    /// that outlives the datagram.
-    Named(&'a [u8]),
-}
-
-/// Reads the `server_name` a ClientHello carries.
-///
-/// The one judgement that has to be made carefully is between "no name" and "not
-/// all here": a ClientHello may be spread over several Initial packets, and
-/// refusing one because its extensions had not arrived would turn a large first
-/// flight into an unreachable server. So every read that runs off the end of the
-/// message *length* is [`FirstFlight::Truncated`], and only a message whose declared
-/// length is entirely present can be [`FirstFlight::Anonymous`].
-///
-/// Hidden, and public for the fuzz target: this and the `Reader` under it are
-/// the hand-written TLS parsing in this module, and the only way to reach them
-/// through [`judgement`] is to spell a whole Initial packet that authenticates,
-/// which a fuzzer cannot do by luck. So the CRYPTO bytes can be handed over
-/// directly.
-#[doc(hidden)]
-pub fn first_flight(crypto: &[u8]) -> FirstFlight<'_> {
-    let mut reader = Reader::new(crypto);
-
-    let Some(kind) = reader.byte() else {
-        return FirstFlight::Truncated;
-    };
-    if kind != CLIENT_HELLO {
-        return FirstFlight::NotAClientHello;
-    }
-    let Some(length) = reader.u24() else {
-        return FirstFlight::Truncated;
-    };
-    let Some(body) = reader.take(length) else {
-        return FirstFlight::Truncated;
-    };
-
-    // From here the whole message is present, so anything that does not parse is
-    // a malformed ClientHello rather than an unfinished one, and a malformed one
-    // names nobody.
-    match server_name(body) {
-        Some(name) => FirstFlight::Named(name),
-        None => FirstFlight::Anonymous,
-    }
-}
-
-/// The `host_name` of a complete ClientHello body, if it has one.
-fn server_name(body: &[u8]) -> Option<&[u8]> {
-    let mut reader = Reader::new(body);
-
-    reader.take(2)?; // legacy_version
-    reader.take(32)?; // random
-    reader.vector8()?; // legacy_session_id
-    reader.vector16()?; // cipher_suites
-    reader.vector8()?; // legacy_compression_methods
-    let extensions = reader.vector16()?;
-
-    let mut reader = Reader::new(extensions);
-    while !reader.is_empty() {
-        let kind = reader.u16()?;
-        let data = reader.vector16()?;
-        if kind == SERVER_NAME_EXTENSION {
-            return host_name(data);
-        }
-    }
-
-    None
-}
-
-/// The first `host_name` entry of a `server_name` extension body.
-///
-//= https://www.rfc-editor.org/rfc/rfc6066#section-3
-//# The ServerNameList MUST NOT contain more than one name of the same
-//# name_type.
-fn host_name(extension: &[u8]) -> Option<&[u8]> {
-    let mut reader = Reader::new(extension);
-    let list = reader.vector16()?;
-
-    let mut reader = Reader::new(list);
-    while !reader.is_empty() {
-        let kind = reader.byte()?;
-        let name = reader.vector16()?;
-        if kind == HOST_NAME {
-            return Some(name);
-        }
-    }
-
-    None
-}
-
-/// A cursor over bytes that never panics and never wraps.
-///
-/// TLS structures are length-prefixed all the way down and every one of those
-/// lengths is peer-chosen, so each read is an `Option` and a `None` propagates.
-struct Reader<'a> {
-    bytes: &'a [u8],
-}
-
-impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    fn take(&mut self, count: usize) -> Option<&'a [u8]> {
-        let (head, rest) = self.bytes.split_at_checked(count)?;
-        self.bytes = rest;
-        Some(head)
-    }
-
-    fn byte(&mut self) -> Option<u8> {
-        Some(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        let bytes = self.take(2)?;
-        Some(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn u24(&mut self) -> Option<usize> {
-        let bytes = self.take(3)?;
-        Some((usize::from(bytes[0]) << 16) | (usize::from(bytes[1]) << 8) | usize::from(bytes[2]))
-    }
-
-    /// A vector with a one-byte length prefix.
-    fn vector8(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.byte()?);
-        self.take(length)
-    }
-
-    /// A vector with a two-byte length prefix.
-    fn vector16(&mut self) -> Option<&'a [u8]> {
-        let length = usize::from(self.u16()?);
-        self.take(length)
-    }
-}
+pub use crate::hello::{FirstFlight, first_flight};
 
 // The seams `fuzz/fuzz_targets/gate.rs` and `tests/it_gate_shapes.rs` reach
 // this module through (D83): [`judgement`], [`first_flight`] above, and
@@ -1162,44 +1010,6 @@ mod tests {
     use super::*;
     use std::assert_matches;
 
-    /// A ClientHello body with the given extensions block appended.
-    fn client_hello(extensions: &[u8]) -> Vec<u8> {
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-        body.extend_from_slice(&[0x00; 32]); // random
-        body.push(0); // legacy_session_id
-        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher_suites
-        body.extend_from_slice(&[0x01, 0x00]); // legacy_compression_methods
-        body.extend_from_slice(&u16::try_from(extensions.len()).unwrap().to_be_bytes());
-        body.extend_from_slice(extensions);
-
-        let mut message = vec![CLIENT_HELLO];
-        let length = body.len();
-        message.extend_from_slice(&[
-            u8::try_from(length >> 16).unwrap(),
-            u8::try_from((length >> 8) & 0xff).unwrap(),
-            u8::try_from(length & 0xff).unwrap(),
-        ]);
-        message.extend_from_slice(&body);
-        message
-    }
-
-    /// A `server_name` extension naming `host`.
-    fn sni_extension(host: &str) -> Vec<u8> {
-        let host = host.as_bytes();
-        let mut entry = vec![HOST_NAME];
-        entry.extend_from_slice(&u16::try_from(host.len()).unwrap().to_be_bytes());
-        entry.extend_from_slice(host);
-
-        let mut list = u16::try_from(entry.len()).unwrap().to_be_bytes().to_vec();
-        list.extend_from_slice(&entry);
-
-        let mut extension = SERVER_NAME_EXTENSION.to_be_bytes().to_vec();
-        extension.extend_from_slice(&u16::try_from(list.len()).unwrap().to_be_bytes());
-        extension.extend_from_slice(&list);
-        extension
-    }
-
     #[test]
     fn a_name_is_matched_case_insensitively_and_without_its_root_dot() {
         let names = Names::new(&["Example.COM.".to_owned()]);
@@ -1268,81 +1078,6 @@ mod tests {
             Expected::new(Names::new(&["proxy.example".to_owned()])).any(),
             "a handle built on a non-empty list starts open"
         );
-    }
-
-    #[test]
-    fn a_client_hello_naming_a_host_is_read_back() {
-        let hello = client_hello(&sni_extension("proxy.example"));
-        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
-    }
-
-    /// The extension is found even when it is not the first one.
-    #[test]
-    fn extensions_are_walked_rather_than_assumed_to_be_in_any_order() {
-        let mut extensions = vec![0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]; // supported_versions
-        extensions.extend_from_slice(&sni_extension("proxy.example"));
-        let hello = client_hello(&extensions);
-
-        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
-    }
-
-    #[test]
-    fn a_complete_client_hello_without_the_extension_names_nobody() {
-        let hello = client_hello(&[]);
-        assert_eq!(first_flight(&hello), FirstFlight::Anonymous);
-    }
-
-    /// The fail-open branch: a first flight larger than one Initial packet.
-    ///
-    /// Every prefix that stops before the message is complete has to read as
-    /// truncated, whichever field the cut lands in — that is what stops a large
-    /// ClientHello from being refused for a name it had not got to yet.
-    #[test]
-    fn a_client_hello_cut_short_is_truncated_not_anonymous() {
-        let hello = client_hello(&sni_extension("proxy.example"));
-
-        for cut in 0..hello.len() {
-            assert_eq!(
-                first_flight(&hello[..cut]),
-                FirstFlight::Truncated,
-                "a ClientHello cut at {cut} of {} bytes must fail open",
-                hello.len()
-            );
-        }
-
-        assert_eq!(first_flight(&hello), FirstFlight::Named(b"proxy.example"));
-    }
-
-    /// A cut inside the *extensions* is the case the design argument is about,
-    /// and it is only truncated because the message length said so.
-    #[test]
-    fn extensions_cut_before_the_server_name_fail_open() {
-        let mut extensions = vec![0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04];
-        extensions.extend_from_slice(&sni_extension("proxy.example"));
-        let hello = client_hello(&extensions);
-
-        // Anywhere inside the extensions block, which is the tail of the message.
-        let inside = hello.len() - 4;
-        assert_eq!(first_flight(&hello[..inside]), FirstFlight::Truncated);
-    }
-
-    #[test]
-    fn a_first_message_that_is_not_a_client_hello_is_refused() {
-        // A ServerHello (2) is not something a client's first flight opens with.
-        assert_eq!(first_flight(&[0x02, 0, 0, 0]), FirstFlight::NotAClientHello);
-    }
-
-    /// A `server_name` list whose declared lengths do not fit its own extension
-    /// is malformed rather than truncated: the message length already said the
-    /// whole ClientHello was here.
-    #[test]
-    fn a_malformed_server_name_extension_names_nobody() {
-        let mut extension = SERVER_NAME_EXTENSION.to_be_bytes().to_vec();
-        extension.extend_from_slice(&[0x00, 0x04]); // extension length
-        extension.extend_from_slice(&[0xff, 0xff, 0x00, 0x00]); // list length lies
-        let hello = client_hello(&extension);
-
-        assert_eq!(first_flight(&hello), FirstFlight::Anonymous);
     }
 
     #[test]

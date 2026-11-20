@@ -14,6 +14,8 @@
 //! * [`tls`]: certificate/key loading and the server's TLS, volto's own quinn
 //!   provider on AWS-LC's libssl with optional ECH.
 //! * [`gate`]: the SNI gate: which handshakes reach quinn at all.
+//! * [`hello`]: the ClientHello parser the gate, the TLS provider and the
+//!   tests share.
 //! * [`quic`]: the QUIC endpoint, transport parameters and the accept loop.
 //! * [`congestion`]: the default `bbr` controller, quinn's BBR with its window
 //!   held to 1.25 times the bandwidth-delay product it measures.
@@ -83,6 +85,7 @@ pub mod datagram;
 pub mod gate;
 pub mod h3;
 pub mod h3api;
+pub mod hello;
 pub mod logfmt;
 pub mod net;
 pub mod policy;

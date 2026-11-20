@@ -24,6 +24,7 @@ use rustls::pki_types::pem::{PemObject, SectionKind};
 use zeroize::Zeroizing;
 
 use super::ffi::{self, EchKeys, HpkeKey, OpensslBytes};
+use crate::hello::Reader;
 
 /// The ECHConfig version this server writes and reads. RFC 9849 §4:
 /// "case 0xfe0d: ECHConfigContents contents;".
@@ -364,27 +365,27 @@ impl ConfigFields {
     /// config_id and the public name. AWS-LC checks the rest when the key is
     /// added (`EchKey::keys`).
     fn parse(config: &[u8]) -> Result<Self> {
-        let mut r = Reader(config);
-        let version = r.u16()?;
+        let mut r = Reader::new(config);
+        let version = r.u16().context(ENDS_EARLY)?;
         ensure!(
             version == ECH_VERSION,
             "the ECHConfig has version {version:#06x}, and this server reads {ECH_VERSION:#06x}"
         );
-        let contents = r.vec16()?;
-        ensure!(r.0.is_empty(), "bytes follow the ECHConfig");
-        let mut r = Reader(contents);
-        let config_id = r.u8()?;
-        let kem = r.u16()?;
+        let contents = r.vec16().context(ENDS_EARLY)?;
+        ensure!(r.is_empty(), "bytes follow the ECHConfig");
+        let mut r = Reader::new(contents);
+        let config_id = r.u8().context(ENDS_EARLY)?;
+        let kem = r.u16().context(ENDS_EARLY)?;
         ensure!(
             kem == KEM_X25519_HKDF_SHA256,
             "the ECHConfig names KEM {kem:#06x}, and this server serves only {KEM_X25519_HKDF_SHA256:#06x}"
         );
-        r.vec16()?; // public_key
-        r.vec16()?; // cipher_suites
-        r.u8()?; // maximum_name_length
-        let name = r.vec8()?;
-        r.vec16()?; // extensions
-        ensure!(r.0.is_empty(), "bytes follow the ECHConfig's extensions");
+        r.vec16().context(ENDS_EARLY)?; // public_key
+        r.vec16().context(ENDS_EARLY)?; // cipher_suites
+        r.u8().context(ENDS_EARLY)?; // maximum_name_length
+        let name = r.vec8().context(ENDS_EARLY)?;
+        r.vec16().context(ENDS_EARLY)?; // extensions
+        ensure!(r.is_empty(), "bytes follow the ECHConfig's extensions");
         let public_name =
             String::from_utf8(name.to_vec()).context("the ECHConfig's public name is not text")?;
         Ok(Self {
@@ -394,36 +395,8 @@ impl ConfigFields {
     }
 }
 
-/// A cursor over a borrowed byte string.
-struct Reader<'a>(&'a [u8]);
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        ensure!(len <= self.0.len(), "the ECHConfig ends early");
-        let (head, tail) = self.0.split_at(len);
-        self.0 = tail;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16> {
-        let bytes = self.take(2)?;
-        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
-    }
-
-    fn vec8(&mut self) -> Result<&'a [u8]> {
-        let len = self.u8()?;
-        self.take(usize::from(len))
-    }
-
-    fn vec16(&mut self) -> Result<&'a [u8]> {
-        let len = self.u16()?;
-        self.take(usize::from(len))
-    }
-}
+/// What a read off the end of an ECHConfig is reported as.
+const ENDS_EARLY: &str = "the ECHConfig ends early";
 
 /// Refuses a public name a client would ignore the ECHConfig for.
 ///

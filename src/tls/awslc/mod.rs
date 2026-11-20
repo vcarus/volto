@@ -15,7 +15,10 @@
 //! This is the one module of the crate that may use `unsafe` (`crate` says
 //! why). The rule inside it: every `unsafe` block carries a `SAFETY:` comment
 //! naming what makes it sound, every `unsafe fn` a `# Safety` section, and the
-//! files that need none (`keys.rs`, `hello.rs`) forbid it.
+//! file that needs none (`keys.rs`) forbids it. The ClientHello parser the
+//! provider reads the outer ClientHello with is [`crate::hello`], outside this
+//! module, so it is held to the crate's `deny(unsafe_code)` as well as its own
+//! `forbid`.
 //!
 //! # Callbacks and the state they share
 //!
@@ -41,7 +44,6 @@
 
 mod ech;
 mod ffi;
-pub(crate) mod hello;
 mod keys;
 
 #[cfg(test)]
@@ -66,6 +68,7 @@ use zeroize::Zeroizing;
 
 use crate::config;
 use crate::gate::Names;
+use crate::hello;
 
 pub use ech::{EchKey, check_public_name};
 use ffi::{Ssl, SslCtx};
@@ -889,7 +892,9 @@ impl Session {
         self.initial.extend_from_slice(buf);
         if let Some(body) = hello::client_hello_body(&self.initial) {
             self.outer = Some(OuterHello {
-                server_name: hello::server_name(body).as_deref().and_then(dns_name),
+                server_name: hello::server_name(body)
+                    .and_then(|name| std::str::from_utf8(name).ok())
+                    .and_then(dns_name),
                 ech: hello::ech_outer(body),
             });
             self.initial = Vec::new();

@@ -34,8 +34,8 @@ use zeroize::Zeroizing;
 
 use super::ech::pem_block;
 use super::ffi::{self, OpensslBytes};
-use super::hello::{self, EXT_ECH};
 use super::{Builder, EchKey, GROUPS, Names, OP_NO_TICKET, ServerConfig, Session, Version, keys};
+use crate::hello::{self, EXT_ECH};
 
 /// A certificate for `localhost` and its key, as DER.
 struct Identity {
