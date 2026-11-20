@@ -281,26 +281,17 @@ mod tests {
 
     /// A parse error must name where it is, and must not quote what is there.
     ///
-    /// The `toml` crate renders a parse error as the offending source line under
-    /// a caret, so a typo on a `password = ...` line used to print the password
-    /// on stderr at startup and into the journal on every `SIGHUP` reload — and
-    /// `Restart=on-failure` makes the startup path repeat every few seconds.
+    /// Ways of getting the quotes wrong, because they fail at different depths.
+    /// A bare word is rejected by the lexer, which never sees a value and so
+    /// cannot quote one. An integer and a boolean are *valid* TOML values of the
+    /// wrong type, and there serde is the one that objects, with the value in
+    /// its message (``invalid type: integer `8675309`, expected a string``):
+    /// the password on stderr by a route the caret block never touched.
     ///
-    /// Six ways of getting the quotes wrong, because they fail at different
-    /// depths and only one of them was covered before. A bare word is rejected
-    /// by the lexer, which never sees a value and so cannot quote one. An
-    /// integer and a boolean are *valid* TOML values of the wrong type, and
-    /// there serde is the one that objects — with the value in its message
-    /// (``invalid type: integer `8675309`, expected a string``), which is the
-    /// password on stderr by a route the caret block never touched.
-    ///
-    /// The last three are the same objection about a value serde reads as a
-    /// *string*, which it renders in double quotes rather than backticks:
-    /// `invalid type: string "user1:hunter2", expected struct User`. A
-    /// redaction that knew only about backticks left every one of them
-    /// untouched, whatever section the mistake was in — and the third of them is
-    /// the case that decides where a segment ends, a secret with a backtick of
-    /// its own inside a double-quoted rendering.
+    /// The rest are the same objection about a value serde renders in double
+    /// quotes (`invalid type: string "user1:hunter2", expected struct User`)
+    /// or, for an enum value, in backticks, most of them with a quote character
+    /// or a phrase of the parser's own inside the secret.
     ///
     /// Both renderings of an `anyhow` error are checked because the two print
     /// different things: `{:#}` walks the chain of messages, `{:?}` adds the
@@ -336,9 +327,8 @@ mod tests {
                 &["correct-horse-battery-staple"],
                 true,
             ),
-            // A backtick inside the secret. With only backticks redacted, the
-            // one in the middle opened a segment that never closed and the
-            // message kept everything in front of it -- `hunter2` included.
+            // A backtick inside a double-quoted secret belongs to the
+            // redaction rather than opening a segment of its own.
             (
                 "backticked-string",
                 config_with_raw_user("\"user1:hunter2`x\""),
@@ -346,10 +336,8 @@ mod tests {
                 true,
             ),
             // A double quote inside the secret, which serde renders escaped
-            // (`{:?}`) and a scan for the closing quote used to stop on: the
-            // segment closed inside the secret and its tail went to stderr as
-            // if it were part of the parser's sentence. Written as a TOML
-            // literal string, which needs no escaping of its own to carry one.
+            // (`{:?}`). Written as a TOML literal string, which needs no
+            // escaping of its own to carry one.
             (
                 "quote-in-secret",
                 config_with_raw_user("'user1:hun\"ter2-TAILSECRET'"),
@@ -375,11 +363,9 @@ mod tests {
                 &["hunter2", "TAILSECRET"],
                 true,
             ),
-            // A backtick inside a value serde quotes in backticks. A segment
-            // that ended at the first backtick closed after `a` and put the
-            // rest of the value in the sentence. The three cases are the
-            // characters a closing backtick is followed by in a real message:
-            // a word, a space and a comma.
+            // A backtick inside a value serde quotes in backticks. The three
+            // cases are the characters a closing backtick is followed by in a
+            // real message: a word, a space and a comma.
             (
                 "backtick-in-enum-value",
                 config_with_raw_congestion_control("\"a`hunter2-TAILSECRET\""),
@@ -471,7 +457,6 @@ mod tests {
     /// stepped over whole — a scan that read its second half as an escape
     /// would run past the real closing quote and redact the `expected` clause,
     /// which is the half of the message the operator fixes the typo by.
-    /// (Both halves were unpinned when the batch-10 verification mutated them.)
     #[test]
     fn each_quote_kind_is_scanned_by_its_own_rules() {
         assert_eq!(
@@ -534,11 +519,8 @@ mod tests {
         );
     }
 
-    /// A span the text cannot place must cost the position, not the message.
-    ///
-    /// `line_and_column` used to answer line 1, column 1 for an offset past the
-    /// end of the file or one landing inside a multi-byte character, which sends
-    /// the operator to a line that is not the one at fault.
+    /// A span the text cannot place must cost the position, not the message,
+    /// and must not become a line the fault is not on.
     #[test]
     fn an_unplaceable_offset_has_no_position() {
         let text = "a = \"é\"\n";
