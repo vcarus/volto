@@ -52,10 +52,7 @@ jobs:
       MDBOOK_SHA256: "5222beabd3e37dc5be0d18ff99b79058469354db5c220153a1b92db5ba12be89"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       # `cargo doc` runs the build scripts too.
       - name: Install cmake and libclang
         uses: ./.github/actions/cmake-libclang

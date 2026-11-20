@@ -91,10 +91,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
         uses: ./.github/actions/cmake-libclang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -135,10 +132,7 @@ jobs:
       MSRV: "1.100"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
         uses: ./.github/actions/cmake-libclang
       - name: Assert the pin matches Cargo.toml
@@ -204,10 +198,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
         uses: ./.github/actions/cmake-libclang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -310,10 +301,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
         if: runner.os == 'Linux'
         uses: ./.github/actions/cmake-libclang
@@ -373,10 +361,7 @@ jobs:
       VOLTO_ECH_ADDR: 127.0.0.1:14444
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # cmake and libclang: AWS-LC's libssl, which runs the server's TLS
-      # (D115), builds through cmake, and its Rust bindings are generated at
-      # build time by bindgen, which loads libclang. The runner image carries
-      # neither; `.github/actions/cmake-libclang` says where they come from.
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
         uses: ./.github/actions/cmake-libclang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
