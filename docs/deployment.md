@@ -358,7 +358,10 @@ so a powered-off day is caught up). Every later deploy refreshes the installed
 copy of the script from the release it just verified, so the timer keeps pace
 with the repository. `journalctl -u volto-deploy.service` shows what each run
 did; a failed update leaves `volto-deploy.service` in a failed state while the
-timer stays active, which is the signal to go look.
+timer stays active, which is the signal to go look. Every run except a dry run
+and `--verify-signature` holds a lock on `/run/volto-deploy.lock` (with `flock`,
+or a directory beside it where `flock` is missing), so a run started by hand
+while the timer's run is going fails at once and changes nothing.
 
 ### Before the swap
 

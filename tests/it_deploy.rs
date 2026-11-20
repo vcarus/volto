@@ -18,8 +18,8 @@
 //! `curl` first on `PATH`, and serves a local archive in place of the release
 //! page. It installs a release from before signing with `--allow-unsigned`,
 //! because no test holds the release key. The signed half of `verify_release`
-//! therefore runs on its own, with a test key, as do `restore_previous` and
-//! `refuse_automatic_downgrade`.
+//! therefore runs on its own, with a test key, as do `put_back`,
+//! `acquire_lock` and `refuse_automatic_downgrade`.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -688,9 +688,14 @@ fn shell_function_body(script: &str, name: &str) -> String {
 /// `die` is defined as a recorder that exits nonzero, so a test can read what
 /// the function reported. The function runs under `set -eE`, as in the script.
 fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> Output {
+    run_shell_call(script, name, "", stubs, prelude)
+}
+
+/// [`run_shell_function`], with `args` after the function's name in the call.
+fn run_shell_call(script: &str, name: &str, args: &str, stubs: &Path, prelude: &str) -> Output {
     let body = shell_function_body(script, name);
     let program = format!(
-        "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name}\n"
+        "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\nnote() {{ printf 'note: %s\\n' \"$*\"; }}\n{body}\n}}\n{prelude}\n{name} {args}\n"
     );
 
     Command::new("bash")
@@ -703,7 +708,7 @@ fn run_shell_function(script: &str, name: &str, stubs: &Path, prelude: &str) -> 
 /// The rollback puts the previous files back, reloads systemd, and starts the
 /// service without restarting it.
 ///
-/// `restore_previous` is the ERR trap of the swap window. A failure before the
+/// `put_back start` is the ERR trap of the swap window. A failure before the
 /// restart, in the binary or unit `install` or in `daemon-reload`, leaves the
 /// old process running and serving its tunnels. A failure of the restart itself
 /// can leave the unit inactive. `systemctl start` covers both: it does nothing
@@ -741,27 +746,33 @@ fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
         bin.display(),
         unit.display()
     );
-    let output = run_shell_function("script/deploy.sh", "restore_previous", &stubs, &prelude);
+    let output = run_shell_call(
+        "script/deploy.sh",
+        "put_back",
+        "start",
+        &stubs,
+        &prelude,
+    );
 
     let stderr = stderr_of(&output);
     assert!(
         !output.status.success() && stderr.contains("restored the previous binary and unit"),
-        "restore_previous must report what it restored and fail the run: {stderr}"
+        "put_back start must report what it restored and fail the run: {stderr}"
     );
     assert_eq!(
         fs::read_to_string(&bin).ok().as_deref(),
         Some("the previous binary\n"),
-        "restore_previous must copy the previous binary over the failed one: {stderr}"
+        "put_back start must copy the previous binary over the failed one: {stderr}"
     );
     assert_eq!(
         fs::read_to_string(&unit).ok().as_deref(),
         Some("the previous unit\n"),
-        "restore_previous must copy the previous unit over the failed one: {stderr}"
+        "put_back start must copy the previous unit over the failed one: {stderr}"
     );
     let calls = fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(
         calls, "daemon-reload\nstart volto\n",
-        "restore_previous must reload systemd and then start the service, never \
+        "put_back start must reload systemd and then start the service, never \
          restart it: systemctl saw\n{calls}"
     );
 }
@@ -1755,6 +1766,7 @@ impl Host {
                 "root/usr/local/sbin",
                 "root/etc/volto",
                 "root/etc/systemd/system",
+                "root/run",
                 "stubs",
                 "release",
                 "staging",
@@ -2147,7 +2159,7 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
 /// A failure inside the swap window puts the previous binary and unit back,
 /// reloads systemd and starts the service.
 ///
-/// `restore_previous` is armed as an ERR trap once both `.prev` copies exist.
+/// `put_back start` is armed as an ERR trap once both `.prev` copies exist.
 /// Here the restart fails after the new binary and unit are in place, which
 /// leaves the old files as the only ones that can serve. Without the trap,
 /// `set -e` ends the run with the new files installed and the service down.
@@ -2330,6 +2342,208 @@ fn a_host_without_a_config_runs_the_bundled_installer() {
     assert!(
         calls.starts_with("is-active --quiet volto\n") && !calls.contains("restart"),
         "the first install must check the service once and restart nothing: {calls}"
+    );
+}
+
+/// A `.prev` left by an earlier update is never restored as if it were the
+/// release this run replaced (R8-L5).
+///
+/// `.prev` was written only for a file that was there to copy, so on a host
+/// with a deleted unit, or no executable binary, an older run's copy stayed and
+/// both rollback paths restored it: the host went back past the release it was
+/// running, and the run said it had rolled back to the previous release.
+#[test]
+fn a_stale_prev_from_an_earlier_update_is_never_restored() {
+    // The unit was deleted; the ERR path restores the binary only.
+    let host = Host::new("stale-unit-prev", Service::RestartFails);
+    plant_binary(&host.root, INSTALLED_VERSION);
+    plant_config(&host.root);
+    fs::write(host.root.join("etc/systemd/system/volto.service.prev"), "a stale unit\n")
+        .expect("plant the stale unit");
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert_ne!(
+        fs::read_to_string(host.unit()).ok().as_deref(),
+        Some("a stale unit\n"),
+        "the stale unit must not be restored: {stderr}"
+    );
+    assert!(
+        stderr.contains("installing volto 1.3.7 failed; restored the previous binary --"),
+        "the run must say it restored the binary alone: {stderr}"
+    );
+
+    // No executable binary; the health check finds nothing to roll back to.
+    let host = Host::new("stale-binary-prev", Service::DiesAfterRestart);
+    plant_config(&host.root);
+    plant_unit(&host.root);
+    write_executable(
+        &host.root.join("usr/local/bin/volto.prev"),
+        "#!/bin/sh\necho 'volto 1.0.0'\n",
+    );
+    let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(candidate),
+        "the stale binary must not be restored: {stderr}"
+    );
+    assert!(
+        stderr.contains("volto 1.3.7 failed to start and there is no previous binary to roll back to"),
+        "{stderr}"
+    );
+}
+
+/// The binary is replaced by a rename, so its name never holds a partial copy
+/// (R8-L7).
+///
+/// `install` writes under the name it is given. Over `/usr/local/bin/volto`
+/// that left the name missing or partial until it finished, which a restart
+/// under `Restart=on-failure` in that moment would execute.
+#[test]
+fn the_binary_is_replaced_by_a_rename() {
+    let host = Host::new("atomic-swap", Service::ComesUp);
+    host.plant_install();
+    let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    let real_install = Command::new("sh")
+        .args(["-c", "command -v install"])
+        .output()
+        .expect("sh must be runnable");
+    write_executable(
+        &host.stubs.join("install"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            host.logs.join("install").display(),
+            stdout_of(&real_install).trim()
+        ),
+    );
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert_eq!(fs::read_to_string(host.bin()).ok(), Some(candidate));
+    let bin = host.bin().display().to_string();
+    let installs = host.calls("install");
+    assert!(
+        installs.lines().all(|line| !line.ends_with(&format!(" {bin}"))),
+        "nothing may be installed straight over {bin}: {installs}"
+    );
+    assert!(
+        installs.lines().any(|line| line.ends_with(&format!(" {bin}.new"))),
+        "the new binary is written beside the old one: {installs}"
+    );
+}
+
+/// A run that finds the lock held stops before it does anything (R8-L6).
+///
+/// systemd starts no second `volto-deploy.service`, but `sudo volto-deploy`
+/// runs outside that service, and two runs inside the same few seconds copied
+/// each other's new binary into `.prev`.
+#[test]
+fn a_run_stops_when_another_run_holds_the_lock() {
+    let host = Host::new("lock-held", Service::ComesUp);
+    host.plant_install();
+    host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+    write_executable(&host.stubs.join("flock"), "#!/bin/sh\nexit 1\n");
+
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        stderr.contains("another run of this script holds"),
+        "the refusal must say why: {stderr}"
+    );
+    assert_eq!(host.calls("curl"), "", "nothing may be downloaded");
+    assert_eq!(host.calls("systemctl"), "", "the service must be left alone");
+    assert_eq!(
+        fs::read_to_string(host.bin()).ok(),
+        Some(format!("#!/bin/sh\necho \"volto {INSTALLED_VERSION}\"\n")),
+        "the binary must be left alone"
+    );
+
+    // The same run with the lock free goes ahead.
+    write_executable(&host.stubs.join("flock"), "#!/bin/sh\nexit 0\n");
+    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+}
+
+/// Where `flock` is missing, a directory holding the pid of the run that made
+/// it is the lock, and a directory whose run is gone is taken over.
+///
+/// The function runs with a `PATH` of its own that has no `flock`, which is the
+/// only way to reach this branch on a host that has one.
+#[test]
+fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
+    let dir = scratch_tree("deploy", "lock-fallback", &["tools", "run"]);
+    let tools = dir.join("tools");
+    for tool in ["mkdir", "cat", "rm"] {
+        let real = Command::new("sh")
+            .args(["-c", &format!("command -v {tool}")])
+            .output()
+            .expect("sh must be runnable");
+        std::os::unix::fs::symlink(stdout_of(&real).trim(), tools.join(tool))
+            .expect("link the tool");
+    }
+    let lock = dir.join("run/volto-deploy.lock");
+    let held = dir.join("run/volto-deploy.lock.d");
+    let acquire = |name: &str| {
+        let body = shell_function_body("script/deploy.sh", "acquire_lock");
+        let program = format!(
+            "set -eE\ndie() {{ printf 'die: %s\\n' \"$*\" >&2; exit 1; }}\n{body}\n}}\n\
+             LOCK='{}'\nLOCK_DIR=\nacquire_lock\necho \"took $LOCK_DIR\"\n",
+            lock.display()
+        );
+        let output = Command::new("/bin/bash")
+            .args(["-c", &program])
+            .env("PATH", &tools)
+            .output()
+            .expect("bash must be runnable");
+        (name.to_owned(), output)
+    };
+
+    // A free lock is taken, and the pid file names the run that took it.
+    let (_, output) = acquire("free");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    assert!(stdout_of(&output).contains(&format!("took {}", held.display())));
+    assert!(
+        fs::read_to_string(held.join("pid")).is_ok_and(|pid| !pid.trim().is_empty()),
+        "the pid of the run must be recorded"
+    );
+
+    // Held by a live process: refused.
+    fs::write(held.join("pid"), format!("{}\n", std::process::id())).expect("plant a live pid");
+    let (_, output) = acquire("live");
+    assert!(!output.status.success(), "a live holder must stop the run");
+    assert!(stderr_of(&output).contains("another run of this script holds"));
+
+    // An empty pid file: a run between mkdir and its pid write. Refused.
+    fs::write(held.join("pid"), "").expect("empty the pid file");
+    let (_, output) = acquire("empty");
+    assert!(!output.status.success(), "an empty pid file counts as held");
+
+    // Held by a process that has exited: taken over.
+    let mut gone = Command::new("true").spawn().expect("spawn a process");
+    let gone_pid = gone.id();
+    gone.wait().expect("wait for it");
+    fs::write(held.join("pid"), format!("{gone_pid}\n")).expect("plant a dead pid");
+    let (_, output) = acquire("stale");
+    assert!(
+        output.status.success(),
+        "a lock whose run is gone must be taken over: {}",
+        stderr_of(&output)
+    );
+    assert_ne!(
+        fs::read_to_string(held.join("pid")).ok(),
+        Some(format!("{gone_pid}\n")),
+        "the new run's pid must replace the old one"
     );
 }
 

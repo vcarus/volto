@@ -92,6 +92,11 @@ UNIT="$ROOT/etc/systemd/system/$SERVICE_NAME.service"
 TIMER_NAME=volto-deploy
 TIMER_SERVICE="$ROOT/etc/systemd/system/$TIMER_NAME.service"
 TIMER_UNIT="$ROOT/etc/systemd/system/$TIMER_NAME.timer"
+# Held for the whole of a real run, so a run started by hand and one started by
+# the timer cannot interleave. /run is a tmpfs, emptied at boot.
+LOCK="$ROOT/run/volto-deploy.lock"
+LOCK_DIR=""
+TMP=""
 ENABLE_TIMER=0
 DRY_RUN=0
 FORCE=0
@@ -201,41 +206,89 @@ note() {
     echo "  $*"
 }
 
-# Puts the previous binary and unit back, then ends the run.
+# Puts the previous binary and unit back, reloads systemd, runs `systemctl $1`
+# on the service, and ends the run. Both rollback paths of the update call it.
 #
-# Armed as an ERR trap over the window between the `.prev` copies and the health
-# check, and disarmed once the service is up. Without it `set -e` ends the run
-# with whatever the failure left behind: an `install` that truncated its target
-# before failing leaves no usable binary, and a failure between the binary copy
-# and the unit copy leaves the new binary under the old unit. The rollback
-# branch further down answers neither, because it runs only after `systemctl
-# is-active` has been asked, which is past this window.
+# The ERR trap over the swap window calls it with `start`. Before the health
+# check the service is normally still running the release it was running, or
+# systemd is bringing it back under Restart=on-failure, and `start` does nothing
+# to an active unit, so the old process keeps serving its tunnels. When the
+# restart itself failed after stopping the unit, `start` brings it up on the
+# restored files. The health check calls it with `restart`, because the release
+# that failed is what is running or being restarted. daemon-reload comes first
+# in both: without it systemd runs the service from the unit it parsed last,
+# which is the one being rolled back. `|| true` on both, so a failed reload or
+# start does not hide the failure `die` reports.
 #
-# The service is started here as well. Before the health check it is normally
-# still running the release it was already running, or systemd is bringing it
-# back under Restart=on-failure. That assumption does not hold when the restart
-# itself failed after stopping the unit: the restored files are in place and the
-# unit is inactive, so it is started here. `start` rather than `restart`,
-# because `start` does nothing to an active unit: when the failure came before
-# the restart, the old process keeps serving its tunnels. `|| true` because a
-# failed start must not mask the original failure, which `die` reports either
-# way.
-restore_previous() {
+# The binary and the unit go back together. A unit's .prev without a binary's,
+# from a host that had no executable binary, is not restored: it would put the
+# new binary under the old unit and report a rollback that did not happen.
+put_back() {
     trap - ERR
     local restored=""
 
-    if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN"; then
+    rm -f "$BIN.new"
+    if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
         restored="binary"
+        if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+            restored="binary and unit"
+        fi
     fi
-    if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
-        restored="${restored:+$restored and }unit"
+    if [ -n "$restored" ] || [ "$1" = start ]; then
+        systemctl daemon-reload || true
+        systemctl "$1" "$SERVICE_NAME" || true
     fi
-    systemctl daemon-reload || true
-    systemctl start "$SERVICE_NAME" || true
 
+    if [ "$1" = start ]; then
+        [ -n "$restored" ] ||
+            die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
+        die "installing volto $VERSION failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+    fi
     [ -n "$restored" ] ||
-        die "installing volto $VERSION failed and there was nothing to restore -- see: journalctl -u $SERVICE_NAME -e"
-    die "installing volto $VERSION failed; restored the previous $restored -- see: journalctl -u $SERVICE_NAME -e"
+        die "volto $VERSION failed to start and there is no previous binary to roll back to -- see: journalctl -u $SERVICE_NAME -e"
+    die "volto $VERSION failed to start; rolled the $restored back to ${INSTALLED:-the previous release} -- see: journalctl -u $SERVICE_NAME -e"
+}
+
+# Removes what this run created outside the install: the download directory and
+# the fallback lock. The EXIT trap, set once the lock is held.
+cleanup() {
+    [ -z "$TMP" ] || rm -rf "$TMP"
+    [ -z "$LOCK_DIR" ] || rm -rf "$LOCK_DIR"
+}
+
+# Takes the lock, or ends the run when another run holds it.
+#
+# Without it two runs inside the same few seconds, one from `sudo volto-deploy`
+# and one from the timer, copy each other's new binary into .prev and can end
+# with one release's binary under the other's unit. systemd starts no second
+# volto-deploy.service, but a run by hand is not that service.
+#
+# flock(1) holds the lock on an open descriptor, so the kernel releases it when
+# the run ends however it ends. Where flock is missing, mkdir is the atomic
+# step instead: the directory holds the pid of the run that made it, and a
+# directory whose run no longer exists is taken over. An empty pid file counts
+# as held, since it is what a run that has made the directory and not yet
+# written its pid leaves.
+acquire_lock() {
+    local holder
+
+    [ -d "${LOCK%/*}" ] || die "there is no directory ${LOCK%/*} to hold the lock $LOCK"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$LOCK" || die "could not open the lock file $LOCK"
+        flock -n 9 || die "another run of this script holds $LOCK -- wait for it to finish"
+        return 0
+    fi
+    if ! mkdir "$LOCK.d" 2>/dev/null; then
+        holder="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
+        if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
+            die "another run of this script holds $LOCK.d -- wait for it to finish, or remove the directory if no run is active"
+        fi
+        rm -rf "$LOCK.d"
+        mkdir "$LOCK.d" 2>/dev/null ||
+            die "another run of this script took $LOCK.d first -- wait for it to finish"
+    fi
+    LOCK_DIR="$LOCK.d"
+    echo "$$" >"$LOCK_DIR/pid"
 }
 
 # True when the file $3 is a signature over the file $2 made by the key $1.
@@ -517,6 +570,11 @@ if [ "$DRY_RUN" -eq 0 ]; then
         aarch64|arm64) TARGET=aarch64-unknown-linux-musl ;;
         *)             die "no release build for this architecture: $(uname -m)" ;;
     esac
+
+    # Before the first network call and the first change. A dry run and
+    # --verify-signature change nothing and take no lock.
+    trap cleanup EXIT
+    acquire_lock
 fi
 
 if [ -n "$TAG" ]; then
@@ -622,8 +680,8 @@ else
     NAME="volto-${VERSION}-${TARGET}"
     BASE="https://github.com/$REPO/releases/download/$TAG"
 
+    # Removed by cleanup, the EXIT trap.
     TMP="$(mktemp -d)"
-    trap 'rm -rf "$TMP"' EXIT
 
     # Every network call fits inside the timer service's TimeoutStartSec=15min
     # (900 s), so systemd cannot stop the run inside the binary swap window
@@ -699,6 +757,10 @@ else
             echo "==> updating volto ${INSTALLED:-(unknown)} -> $VERSION"
         fi
 
+        # A .prev left by an earlier update, when this host had no executable
+        # binary or no unit to copy, would otherwise be restored below as if it
+        # were the release this run replaced.
+        rm -f "$BIN.prev" "$UNIT.prev" "$BIN.new"
         if [ -x "$BIN" ]; then
             install -m 0755 "$BIN" "$BIN.prev"
             note "previous binary kept at $BIN.prev"
@@ -714,12 +776,19 @@ else
             note "previous unit kept at $UNIT.prev"
         fi
         # Both `.prev` copies exist from here on, so every failure until the
-        # service answers is a failure this can undo. A command inside the `if`
+        # service answers is a failure put_back can undo. Without the trap,
+        # `set -e` would end the run with the new binary under the old unit, or
+        # with both new files and the service down. A command inside the `if`
         # below is a tested command and does not fire the trap, which is what
-        # leaves the rollback branch reachable for a service that comes up and
-        # then dies.
-        trap restore_previous ERR
-        install -m 0755 "$SRC/volto" "$BIN"
+        # leaves the health check's rollback reachable for a service that comes
+        # up and then dies.
+        #
+        # The binary is written beside its target and renamed over it, so the
+        # name /usr/local/bin/volto holds the old file or the new one and never
+        # a partial copy.
+        trap 'put_back start' ERR
+        install -m 0755 "$SRC/volto" "$BIN.new"
+        mv -f "$BIN.new" "$BIN"
         install -m 0644 "$SRC/script/masque.service" "$UNIT"
         systemctl daemon-reload
         systemctl restart "$SERVICE_NAME"
@@ -730,21 +799,8 @@ else
         if systemctl is-active --quiet "$SERVICE_NAME"; then
             trap - ERR
             note "volto $VERSION is running"
-        elif [ -x "$BIN.prev" ]; then
-            install -m 0755 "$BIN.prev" "$BIN"
-            RESTORED="binary"
-            if [ -f "$UNIT.prev" ]; then
-                install -m 0644 "$UNIT.prev" "$UNIT"
-                RESTORED="binary and unit"
-            fi
-            # daemon-reload before the restart, not after: without it systemd
-            # starts the service from the unit it has already parsed, which is
-            # the one being rolled back.
-            systemctl daemon-reload || true
-            systemctl restart "$SERVICE_NAME" || true
-            die "volto $VERSION failed to start; rolled the $RESTORED back to ${INSTALLED:-the previous release} -- see: journalctl -u $SERVICE_NAME -e"
         else
-            die "volto $VERSION failed to start and there is no previous binary to roll back to -- see: journalctl -u $SERVICE_NAME -e"
+            put_back restart
         fi
     fi
 fi
@@ -752,8 +808,10 @@ fi
 # --- timer -------------------------------------------------------------------
 
 # The installed copy under /usr/local/sbin is what the timer executes; keep it
-# in step with the release just deployed. `install` truncates its target, which
-# must never hit the file bash is currently reading, hence the copy-then-rename.
+# in step with the release just deployed. It is written beside its target and
+# renamed over it: `install` writes under the name it is given, so until it
+# finishes that name holds a partial copy or none, and a rename replaces the
+# name in one step.
 refresh_self() {
     local resolved
     [ -n "$SELF_SOURCE" ] || return 0
