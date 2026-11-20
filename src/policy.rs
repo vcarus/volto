@@ -36,9 +36,7 @@
 //! `64:ff9b::7f00:1` therefore reaches 127.0.0.1, and letting it past
 //! because it is syntactically a global IPv6 address would undo the
 //! whole IPv4 half of this module. `embedded_ipv4` unwraps them before any rule
-//! is applied. Teredo (`2001::/32`) lies inside `2001::/23`, which is refused
-//! whole, and is still judged by the IPv4 address it carries, because the
-//! unwrapping comes first.
+//! is applied.
 //!
 //! The local-use NAT64 prefix `64:ff9b:1::/48` (RFC 8215) is the one transition
 //! form that is not unwrapped. Its operator chooses the layout, RFC 8215 §5
@@ -111,44 +109,21 @@ impl Policy {
 
 /// Whether every resolved address is the unspecified address (`0.0.0.0` / `::`).
 ///
-/// This is the shape a filtering resolver uses to say "no": ad and telemetry
-/// blockers answer a blocked name with the unspecified address rather than with
-/// NXDOMAIN. Those answers are refused by [`Policy::allows_address`] like any
-/// other unroutable target, but the refusal is routine housekeeping rather than
-/// evidence of anything. On a host whose resolver filters, it is the bulk of
-/// all refusals.
-///
-/// Callers use this to decide two things (decision D49). It picks the log line:
-/// a blackhole gets an unsampled INFO line of its own, and every other refusal
-/// gets the policy-refusal line, which is INFO on a doubling schedule. And it
-/// picks the answer:
-/// a blackholed name gets a 200 whose stream closes immediately, so the client
-/// sees a tunnel that opened and closed at once. That is what a transport
-/// without an in-band refusal channel shows it. Every other refusal keeps its
-/// 403 and its RFC 9209 `destination_ip_prohibited` reason. The split exists because
-/// the blackhole decision was made by the resolver upstream, not by this proxy,
-/// and a refusal from this proxy would misattribute it.
-///
-/// The test is deliberately all-or-nothing, and deliberately narrow to the
-/// unspecified address:
+/// This is how a filtering resolver answers a blocked name. The callers give
+/// such a name its own log line and a 200 whose stream closes at once, instead
+/// of the policy refusal's 403, because the resolver upstream refused it and
+/// not this proxy (decision D49).
 ///
 /// * **All**, because a name resolving to `0.0.0.0` *and* `10.0.0.1` is not a
-///   blackhole. The private address is a real target that the policy just
-///   refused, which is exactly the SSRF-shaped evidence worth keeping.
-/// * **Unspecified only**, because loopback, RFC 1918 and the rest of the private
-///   space are what an attacker aims at, and a probe of them must stay visible.
-///   The unspecified address is the one entry in the deny list that reaches
-///   nothing at all.
+///   blackhole: the private address is a real target the policy refused.
+/// * **Unspecified only**, because loopback, RFC 1918 and the rest of the
+///   private space are what an attacker aims at, and a probe of them must stay
+///   visible.
 ///
-/// The unspecified address is judged in its routed form (`routed_form`), so a
-/// NAT64, 6to4 or Teredo address whose embedded IPv4 address is `0.0.0.0` is the
-/// same blackhole as `0.0.0.0` itself. On a DNS64 network that is the ordinary
-/// shape of a blocked name: the resolver answers the A query with `0.0.0.0` and
-/// DNS64 synthesizes `64:ff9b::`.
-///
-/// An empty list is not a blackhole. It cannot arise on the paths that call this
-/// (resolution either fails or yields addresses), and "no addresses at all" is no
-/// reason to take the blackhole branch.
+/// Judged in the routed form, so a NAT64, 6to4 or Teredo address carrying
+/// `0.0.0.0` is the same blackhole: on a DNS64 network the resolver answers the
+/// A query with `0.0.0.0` and DNS64 synthesizes `64:ff9b::`. An empty list is
+/// not a blackhole.
 pub fn is_dns_blackhole(addresses: &[SocketAddr]) -> bool {
     !addresses.is_empty()
         && addresses
@@ -172,9 +147,8 @@ pub(crate) fn routed_form(ip: IpAddr) -> IpAddr {
 /// Normalizes an address into the form the kernel will actually route.
 ///
 /// IPv4-mapped IPv6 (`::ffff:a.b.c.d`) becomes the IPv4 address it stands for.
-/// The deprecated IPv4-compatible range (`::a.b.c.d`, RFC 4291 §2.5.5.1) is left
-/// as IPv6 on purpose and handled by `is_private`, because mapping it to IPv4
-/// would turn `::1` into `0.0.0.1` and quietly lose the loopback meaning.
+/// The deprecated IPv4-compatible range (`::a.b.c.d`) is left as IPv6; its row in
+/// `PRIVATE_PREFIXES` says why.
 pub fn canonical(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_canonical(),
@@ -313,8 +287,7 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// multicast, which no switch opens), and the transition forms [`routed_form`]
 /// unwraps before this table is consulted (IPv4-mapped, the well-known NAT64
 /// prefix, 6to4 and Teredo), since those are judged by the IPv4 address they
-/// carry rather than matched as a prefix. Teredo lies inside the `2001::/23`
-/// row and is still judged that way, because the unwrapping runs first.
+/// carry rather than matched as a prefix.
 const PRIVATE_PREFIXES: &[Prefix] = &[
     // 0.0.0.0/8, "this host on this network" (RFC 6890 Table 1, from RFC 1122).
     // Only the all-zero address at the bottom of the block is
@@ -392,10 +365,9 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // The IANA registry marks both globally reachable. RFC 7450 Section 4.1.4
     // says how they are used: "a gateway sends a message to an anycast IP
     // address within that prefix. This message is routed to the topologically
-    // nearest relay that has advertised the prefix." Through this proxy the
-    // sender is the proxy, so a client reaches the multicast relay of the
-    // proxy's own network. That is the same reason the PCP and TURN anycast
-    // addresses are refused.
+    // nearest relay that has advertised the prefix." So a client reaches the
+    // relay of the proxy's own network, for the reason given above for the PCP
+    // and TURN anycast addresses.
     v4([192, 52, 193, 0], 24, "AMT", "RFC 7450"),
     // The AS112 prefixes. `192.31.196.0/24` and `2001:4:112::/48` serve DNAME
     // redirection (RFC 7535), and `192.175.48.0/24` and `2620:4f:8000::/48`
@@ -405,10 +377,8 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // The IANA registries mark all four globally reachable. RFC 7534 Section 1
     // says how they are reached: "Each nameserver functions as a single node in
     // an AS112 anycast cloud [RFC4786] and is configured to answer
-    // authoritatively for a particular set of nominated zones." Through this
-    // proxy the sender is the proxy, so a client reaches the AS112 node nearest
-    // the proxy. The same rule refuses the AMT relay discovery prefixes and the
-    // anycast service addresses (D111).
+    // authoritatively for a particular set of nominated zones." So a client
+    // reaches the AS112 node nearest the proxy, the anycast rule above (D111).
     v4([192, 31, 196, 0], 24, "AS112-v4", "RFC 7535"),
     v4(
         [192, 175, 48, 0],
@@ -482,14 +452,11 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // `allow_private_networks` is meant to gate.
     v6(&[0x5f00], 16, "Segment Routing (SRv6) SIDs", "RFC 9602"),
     // `64:ff9b:1::/48`, the local-use NAT64 prefix (RFC 8215), is here because
-    // its contents cannot be read. An address here is a translation of some
-    // IPv4 address, and the operator chooses where in the address that IPv4
-    // address sits. RFC 8215 §5 says a reader must not guess: "they must not
-    // make any assumptions regarding the syntax or properties of those
-    // addresses (e.g., the existence and location of embedded IPv4 addresses)".
-    // So the whole prefix is private, and it is `allow_private_networks` that
-    // decides whether it may be dialled. See `embedded_ipv4` for what reading a
-    // layout would cost.
+    // its contents cannot be read: the operator chooses where the IPv4 address
+    // sits, and RFC 8215 §5 forbids a reader guessing. So the whole prefix is
+    // private, and `allow_private_networks` decides whether it may be dialled.
+    // `embedded_ipv4` quotes the section and says what reading a layout would
+    // cost.
     v6(
         &[0x64, 0xff9b, 1],
         48,
@@ -521,8 +488,7 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
 ///   last 32 bits with every bit inverted, which is the one this proxy would
 ///   reach.
 ///
-/// The deprecated `::/96` IPv4-compatible range is deliberately **not** here:
-/// unwrapping it would turn `::1` into 0.0.0.1 and lose the loopback meaning, so
+/// The deprecated `::/96` IPv4-compatible range is deliberately **not** here;
 /// its row in [`PRIVATE_PREFIXES`] claims it whole instead.
 ///
 /// # The local-use prefix is refused whole rather than read
@@ -919,13 +885,8 @@ mod tests {
     }
 
     /// `192.0.0.0/24` is refused whole, its two anycast service addresses
-    /// and the NAT64 discovery addresses included.
-    ///
-    /// The registry marks `192.0.0.9` (PCP anycast) and `192.0.0.10` (TURN
-    /// anycast) globally reachable. Through this proxy an anycast address
-    /// reaches the instance nearest the proxy, which is a service of the
-    /// proxy's own network, so both stay private with the rest of the block,
-    /// and both still follow the switch.
+    /// (`192.0.0.9`, `192.0.0.10`) and the NAT64 discovery addresses included,
+    /// and all of them still follow the switch. The row says why.
     #[test]
     fn the_protocol_anycast_addresses_stay_inside_the_ietf_block() {
         let strict = policy(false, &[]);
@@ -1141,11 +1102,7 @@ mod tests {
     }
 
     /// Teredo, `2001::/32`, is judged by the IPv4 address it carries under both
-    /// policies, whatever else the table refuses around it.
-    ///
-    /// The prefix lies inside `2001::/23`. [`Policy::allows_address`] unwraps a
-    /// Teredo address with [`routed_form`] before any row is consulted, so a row
-    /// covering the /23 never sees one.
+    /// policies, although it lies inside the `2001::/23` row.
     #[test]
     fn teredo_follows_its_embedded_address_inside_the_ietf_block() {
         let strict = policy(false, &[]);
