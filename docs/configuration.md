@@ -38,7 +38,10 @@ whole and the running configuration keeps serving; see
 With `ech_key` set, a client that holds the server's ECHConfigList can encrypt
 its ClientHello, so the name it asks for travels inside the encryption and only
 the ECHConfig's public name is in the clear. A client without the list still
-connects as before, unless [`[security].require_ech`](#security) is on.
+connects as before, unless [`[security].require_ech`](#security) is on. A client
+that cannot be given the list, such as
+[Apple's relay client](deployment.md#apples-relay-client), connects only while
+it is off.
 
 The server never publishes the ECHConfigList: an operator hands it to each
 client. That makes the key a credential the server can check before it answers

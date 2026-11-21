@@ -844,7 +844,9 @@ in this order:
 
 A client without `ech-config` then times out without an error message on
 either side, except this server's debug log, which names the reason for each
-dropped handshake. `require_ech` without `server.ech_key` is refused at startup,
+dropped handshake. That includes every client that cannot be given the list at
+all, such as [Apple's relay client](#apples-relay-client): leave `require_ech`
+off while one of those uses the server. `require_ech` without `server.ech_key` is refused at startup,
 by `--check-config` and on reload, and so is a reload that removes the key while
 it is on. A rotation under `require_ech` cuts clients off exactly as described
 above.
@@ -873,6 +875,19 @@ by a CONNECT-UDP session. A configuration profile on a device was not tested.
   client use `/.well-known/masque/udp/{host}/{port}/`, which volto accepts.
 - **The client offers `proxy-quic-forwarding: ?1`.** volto does not implement
   that extension and ignores the field, and the client carries on without it.
+- **It works only with `require_ech = false`.** A relay configuration has no
+  setting for an ECHConfigList, and the client sends no ECH extension. With a
+  [`server.ech_key`](configuration.md#encrypted-client-hello) set and
+  `require_ech` off it connects as before, judged by `expected_sni`. With
+  `require_ech = true` every handshake of it is dropped without a reply, and
+  the device reports only a timeout. A server that serves this client and
+  Surge together therefore keeps `require_ech` off. Should a version of the
+  client send an ECH extension of its own, such as GREASE, the gate drops that
+  handshake too, because the key does not open it, whatever `require_ech` says.
+- **Pin a certificate, not a raw public key.** With raw public keys set, the
+  client accepts only the raw public key certificate type of RFC 7250, which
+  volto's TLS does not offer, and the handshake fails. Use a certificate the
+  device trusts.
 
 This client sends the first UDP payload in the same flight as its CONNECT-UDP
 request. volto holds that datagram until the session exists; see

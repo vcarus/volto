@@ -89,7 +89,7 @@ A commented example configuration is [script/config.example.toml](script/config.
 | | |
 |---|---|
 | **Client** | Surge (iOS / macOS) `masque` policy. Auth is HTTP Basic; add `sni=` and `server-cert-verify-name=` when the server sits behind a relay IP. |
-| **Other clients** | Apple's relay client (`NERelay`, `ProxyConfiguration(relayHops:)`) works for CONNECT and CONNECT-UDP; tested through `Network.framework` on macOS 15, not with a device profile. See [Apple's relay client](docs/deployment.md#apples-relay-client). |
+| **Other clients** | Apple's relay client (`NERelay`, `ProxyConfiguration(relayHops:)`) works for CONNECT and CONNECT-UDP; tested through `Network.framework` on macOS 15, not with a device profile. It sends no ECH, so it needs `require_ech` off. See [Apple's relay client](docs/deployment.md#apples-relay-client). |
 | **Server** | Linux (`x86_64`, `aarch64`); static musl binaries, no runtime dependencies. Listens on **UDP only**: open the QUIC port in your firewall, there is no TCP listener. |
 | **Behind a relay** | Works behind a plain L4 UDP DNAT relay; TLS terminates only on volto. See [Running behind a UDP relay](docs/deployment.md#running-behind-a-udp-relay). |
 | **Development** | macOS or Linux, Rust 1.100+. The test suite is green on both. |
