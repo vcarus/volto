@@ -31,14 +31,13 @@ exclude_re = [
 
     # Operator-facing text only: these Display strings are logged, never
     # parsed, and no test pins their wording.
-    'Display for (Denied|Error|DecodeError|ResolveFailure|RespondError)>::fmt',
+    'Display for (Denied|Error|DecodeError|ResolveFailure)>::fmt',
     # Debug on the message vocabulary exists so a failing assertion is
     # readable; nothing parses it.
     'Debug for (Status|FieldValue)>::fmt',
     # Error::source is log-chain visibility with no behavioral edge.
     'ConnectionError>::source',
     'StreamError>::source',
-    'RespondError>::source',
 
     # D56: socket buffer requests are best-effort hygiene; acceptance is the
     # so_rcvbuf journal line on Linux, and macOS clamps silently, so no
@@ -73,8 +72,12 @@ exclude_re = [
     # The body already is Arc::new(Self::default()); the mutation respells it.
     'replace BufferBudget::unshared',
     # DATA in the tunnel branch falls through to the same None; the order of a
-    # request's frames is judged by Resolver::resolve, where it is tested.
-    'delete match arm DATA in misplaced',
+    # request's frames is judged by Resolver::resolve, where it is tested. Only
+    # that arm: the control stream's DATA arm, one level deeper, refuses DATA
+    # after SETTINGS from its header, and deleting it is a real mutant. The two
+    # arms have the same name, so the column (13, the tunnel arm's indentation)
+    # is what tells them apart; re-check it if `misplaced` is re-indented.
+    'src/h3/frame\.rs:[0-9]+:13: delete match arm DATA in misplaced',
 
     # quinn's SendStream sends the FIN from Drop as well, and every caller
     # drops the stream on the next line, so a skipped finish() changes only
@@ -87,12 +90,6 @@ exclude_re = [
     # branches agree at the boundary -- at exactly the ceiling both give the
     # ceiling -- so the mutant is equivalent, not uncovered.
     'replace > with >= in reserved_lookups',
-
-    # The capsule decoder copies at most MAX_HEADER_LEN bytes of a split header
-    # into its private buffer. With `+` it may copy up to 15 more, which the
-    # header parse ignores and the next line discards: the same capsules come
-    # out, and nothing outside the function can see the longer copy.
-    'replace - with \+ in CapsuleDecoder::take_header',
 
     # A full queue refuses the payload in the copying arm as well, because
     # `try_send` fails there too. The `0` arm only spares the copy.
