@@ -238,6 +238,14 @@ pub struct H3Client {
 }
 
 impl H3Client {
+    /// The client's own address, which is the `remote` the server's lines about
+    /// this connection carry.
+    pub fn local_addr(&self) -> std::net::SocketAddr {
+        self.endpoint
+            .local_addr()
+            .expect("the client endpoint's address")
+    }
+
     /// Connects and completes the HTTP/3 handshake, advertising datagram support.
     pub async fn connect(server: &TestServer) -> Self {
         Self::connect_with_datagrams(server, true).await

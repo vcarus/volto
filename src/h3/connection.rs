@@ -210,9 +210,25 @@ impl Handle {
     }
 
     /// Claims a Quarter Stream ID for a session on this connection
-    /// ([`Shared::register_datagrams`]).
+    /// ([`Shared::claim`]).
+    ///
+    /// When the claim takes datagrams that arrived before it, a debug line
+    /// says how many, with the peer's address, which is the `remote` of the
+    /// connection's other lines unless the peer has migrated since. The
+    /// address is read only when that line is enabled and written.
     pub(crate) fn register_datagrams(&self, quarter_stream_id: u64) -> Option<DatagramReceiver> {
-        self.shared.register_datagrams(quarter_stream_id)
+        let (inbound, released) = self
+            .shared
+            .claim(quarter_stream_id, tokio::time::Instant::now)?;
+        if released > 0 {
+            debug!(
+                remote = %self.quic.remote_address(),
+                quarter_stream_id,
+                released,
+                "delivering datagrams that arrived before their session"
+            );
+        }
+        Some(inbound)
     }
 
     /// Ends the connection because the peer broke a rule (RFC 9114 §8).

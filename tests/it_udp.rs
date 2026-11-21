@@ -196,6 +196,10 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
     assert_eq!(&echoed[..], b"somewhere");
 }
 
+/// The log the test below reads: the debug line a claim writes when it takes
+/// held datagrams, through [`common::SharedBuffer::shared`].
+const HELD_LOG_FILTER: &str = "volto::h3::connection=debug";
+
 /// A datagram that reaches the server before the request stream it names is
 /// held and delivered once the session claims it (D114).
 ///
@@ -203,16 +207,20 @@ async fn datagrams_for_unknown_sessions_are_dropped() {
 /// and exactly one echo comes back: a held datagram is delivered once.
 ///
 /// The pause between the datagram and the request is what puts the datagram
-/// first. It is a bounded wait and not a certainty: the client cannot see when
-/// the server routes a datagram, so on a slow machine the stream could be
-/// claimed first and this would pass on the ordinary path. The pause is well
-/// inside `EARLY_DATAGRAM_HOLD`, so the datagram is still held when the session
+/// first. The client cannot see when the server routes a datagram, so the
+/// test reads the server's debug line for the claim, found by this client's
+/// address: `released=1` says the claim took the datagram from the hold. On a
+/// machine slow enough that the stream is claimed first, the test fails there
+/// rather than passing on the ordinary path. The pause is well inside
+/// `EARLY_DATAGRAM_HOLD`, so the datagram is still held when the session
 /// claims its Quarter Stream ID.
 #[tokio::test]
 async fn a_datagram_sent_before_its_request_reaches_the_target() {
+    let log = common::SharedBuffer::shared(HELD_LOG_FILTER);
     let server = TestServer::start().await;
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
+    let mark = log.mark();
 
     // The first request stream on a fresh connection is stream 0, and so
     // Quarter Stream ID 0.
@@ -228,6 +236,20 @@ async fn a_datagram_sent_before_its_request_reaches_the_target() {
         &answer.payload[..],
         b"early",
         "the datagram sent before the request must reach the target"
+    );
+    let remote = format!("remote={} ", client.local_addr());
+    let held = log
+        .wait_for_line(
+            mark,
+            &[
+                "delivering datagrams that arrived before their session",
+                &remote,
+            ],
+        )
+        .await;
+    assert!(
+        held.trim_end().ends_with("quarter_stream_id=0 released=1"),
+        "the claim must take the one held datagram: {held}"
     );
     let again = tokio::time::timeout(Duration::from_millis(300), client.quic.read_datagram()).await;
     assert!(

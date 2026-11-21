@@ -42,7 +42,8 @@ enum DropKind {
 }
 
 impl Shared {
-    /// Claims `quarter_stream_id` for a session, or reports that it is taken.
+    /// Claims `quarter_stream_id` for a session, or reports that it is taken,
+    /// and says how many held datagrams the claim took.
     ///
     /// `None` means an entry already exists, which is a caller asking twice for
     /// one stream: the receiver was handed out once and a second one would
@@ -51,21 +52,19 @@ impl Shared {
     ///
     /// The datagrams held for this Quarter Stream ID go into the new queue
     /// here, in the order they arrived, before the lock is released. So they
-    /// are ahead of every datagram the router delivers after the claim.
-    pub(super) fn register_datagrams(
-        self: &Arc<Self>,
-        quarter_stream_id: u64,
-    ) -> Option<DatagramReceiver> {
-        self.register_datagrams_at(quarter_stream_id, Instant::now)
-    }
-
-    /// [`Self::register_datagrams`] with the clock passed in, so a test can
-    /// step it. `now` is read only if something is held.
-    fn register_datagrams_at(
+    /// are ahead of every datagram the router delivers after the claim. The
+    /// count is for the debug line [`Handle::register_datagrams`] writes,
+    /// which names the connection as well.
+    ///
+    /// The clock is passed in, so a test can step it. `now` is read only if
+    /// something is held.
+    ///
+    /// [`Handle::register_datagrams`]: super::connection::Handle::register_datagrams
+    pub(super) fn claim(
         self: &Arc<Self>,
         quarter_stream_id: u64,
         now: impl FnOnce() -> Instant,
-    ) -> Option<DatagramReceiver> {
+    ) -> Option<(DatagramReceiver, usize)> {
         let (sink, inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
 
         let mut routes = self.lock();
@@ -82,18 +81,22 @@ impl Shared {
         drop(routes);
 
         self.count_expired(expired);
-        if released > 0 {
-            debug!(
+        Some((
+            DatagramReceiver {
+                shared: Arc::clone(self),
                 quarter_stream_id,
-                released, "delivering datagrams that arrived before their session"
-            );
-        }
+                inbound,
+            },
+            released,
+        ))
+    }
 
-        Some(DatagramReceiver {
-            shared: Arc::clone(self),
-            quarter_stream_id,
-            inbound,
-        })
+    /// [`Self::claim`] on the real clock, without the count, for the tests
+    /// below.
+    #[cfg(test)]
+    fn register_datagrams(self: &Arc<Self>, quarter_stream_id: u64) -> Option<DatagramReceiver> {
+        self.claim(quarter_stream_id, Instant::now)
+            .map(|(inbound, _)| inbound)
     }
 
     /// Hands one decoded datagram to the session that claimed its Quarter
@@ -346,7 +349,7 @@ pub(super) struct Routes {
     ///
     /// The whole of the connection's datagram routing: an entry is a live
     /// session's claim on one Quarter Stream ID, put there by
-    /// [`Shared::register_datagrams`] and taken out again when the
+    /// [`Shared::claim`] and taken out again when the
     /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
     /// never asks, such as every TCP tunnel, never appears here.
     sessions: HashMap<u64, mpsc::Sender<Bytes>>,
@@ -1184,8 +1187,8 @@ mod tests {
             "neither has been held for the whole hold time yet"
         );
 
-        let mut inbound = shared
-            .register_datagrams_at(5, || start + EARLY_DATAGRAM_HOLD)
+        let (mut inbound, _) = shared
+            .claim(5, || start + EARLY_DATAGRAM_HOLD)
             .expect("a free id");
         assert_eq!(
             inbound.try_recv().as_deref(),
@@ -1388,7 +1391,7 @@ mod tests {
                         sent += 1;
                     }
                     Step::Claim { id } => {
-                        if let Some(inbound) = shared.register_datagrams_at(id, || now) {
+                        if let Some((inbound, _)) = shared.claim(id, || now) {
                             receivers.insert(id, inbound);
                             touched = true;
                         }
