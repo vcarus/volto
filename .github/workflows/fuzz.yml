@@ -7,14 +7,20 @@ name: Fuzz
 # that runs before authentication and calls into C.
 #
 # Not a required check and not in release.yml's gate. A finding fails the
-# scheduled run, which GitHub reports to the repository owner; it does not
-# hold a pull request, because the same tree can pass on one day and fail on
-# the next.
+# scheduled run. GitHub sends the notice of a failed scheduled run to the user
+# who last changed the `cron` line below, and it disables a schedule after 60
+# days without activity in the repository. A finding does not hold a pull
+# request, because the same tree can pass on one day and fail on the next.
 #
-# A crash input is uploaded as an artifact of the failed run, and libFuzzer
-# prints it in the log. Both are public, as this repository is. The targets
-# and their seeds are public too, so the run finds nothing that another reader
-# of this repository cannot find by running the same command.
+# The log and the artifacts of a run are public, as this repository is. For
+# most targets the failing input is uploaded and libFuzzer prints it. For the
+# targets in `WITHHELD` below it is neither uploaded nor printed: they cover
+# code that runs before authentication, where a failing input can be a
+# datagram that stops a deployed server, and their corpus is in the Actions
+# cache, which is not public, so a finding can rest on days of runs that a
+# reader cannot repeat at once. The stack trace stays in the log. Reproducing
+# such a finding means running the target locally (fuzz/README.md) from the
+# trace.
 on:
   schedule:
     # 19:17 UTC, a quiet minute. GitHub delays scheduled runs that start on
@@ -30,9 +36,12 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: Seconds of fuzzing for each target
+        # The job's limit is 45 minutes, and a run that reaches it saves no
+        # corpus. The build takes up to ten of them.
+        description: Seconds of fuzzing for each target, at most 1800
+        type: number
         required: false
-        default: "600"
+        default: 600
 
 concurrency:
   group: fuzz-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
@@ -50,6 +59,8 @@ env:
   # Dependabot does not read this line.
   CARGO_FUZZ_VERSION: 0.13.2
   SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
+  # The targets whose failing input is kept out of the log and the artifacts.
+  WITHHELD: gate hold tls
 
 jobs:
   fuzz:
@@ -88,7 +99,12 @@ jobs:
           workspaces: |
             .
             fuzz
-          key: fuzz-${{ matrix.target }}
+          # One entry for the eleven jobs, written by the job that builds both
+          # workspaces. An entry for each job would be eleven copies of the
+          # same dependencies, and a full Actions cache evicts its oldest
+          # entries, the corpus among them, without failing anything.
+          shared-key: fuzz
+          save-if: ${{ matrix.target == 'hold' && github.ref == 'refs/heads/main' }}
           # rust-cache keeps `~/.cargo/bin`, so the install below is a no-op
           # on a warm cache.
           cache-bin: true
@@ -110,16 +126,42 @@ jobs:
       # `gate` and `hold` need seeds no fuzzer produces by chance: Initial
       # packets that open under their own keys, and ECH that opens under the
       # target's key. Two tests write them and assert what each one reaches.
+      # Both tests by their full names with `--exact`, and their count
+      # checked: a filter that matches no test runs none and exits 0.
       - name: Write the seed corpus
         if: matrix.target == 'gate' || matrix.target == 'hold'
-        run: cargo test --locked --test it_gate_shapes fuzz_seed_corpus_is_written
+        run: |
+          set -euo pipefail
+          cargo test --locked --test it_gate_shapes -- --exact \
+            the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for \
+            the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for |
+            tee seeds.log
+          grep -q '^test result: ok. 2 passed' seeds.log
+          [ -n "$(ls -A "fuzz/corpus/${{ matrix.target }}")" ]
 
       - name: Fuzz
         run: |
           set -euo pipefail
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
-          cargo fuzz run "${{ matrix.target }}" -- \
-            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=60
+          [ "$SECONDS_PER_TARGET" -le 1800 ] ||
+            { echo "::error::$SECONDS_PER_TARGET seconds is past the 1800 this job's time limit allows" >&2; exit 1; }
+          run() {
+            cargo fuzz run "${{ matrix.target }}" -- \
+              -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=60
+          }
+          case " $WITHHELD " in
+            *" ${{ matrix.target }} "*)
+              # libFuzzer prints a failing input after its `MS:` line, as
+              # bytes, as text and as base64, up to the line that names the
+              # file it wrote. Those lines are dropped; `pipefail` keeps the
+              # run's own exit status.
+              run 2>&1 | awk '
+                /^artifact_prefix=/ { skip = 0 }
+                /^MS: / { skip = 1; print "(the failing input is withheld)"; next }
+                /^Base64: / { next }
+                !skip' ;;
+            *) run ;;
+          esac
 
       # Drops every input that adds no coverage, so the saved corpus does not
       # grow by one day's run each day.
@@ -138,7 +180,7 @@ jobs:
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
 
       - name: Upload the failing input
-        if: failure()
+        if: failure() && !contains(format(' {0} ', env.WITHHELD), format(' {0} ', matrix.target))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts-${{ matrix.target }}
