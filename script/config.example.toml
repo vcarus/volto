@@ -1,12 +1,15 @@
-# volto — example configuration.
+# volto example configuration.
 #
 # Only the [server] section is required; every other section and key has a
 # default, shown after each key below. Unknown keys are rejected at startup, so a
-# typo fails loudly rather than being silently ignored.
+# misspelled key stops the start instead of being ignored.
 #
 # Reload with `systemctl reload volto` (SIGHUP) after changing this file. A file
 # that fails to parse or validate is rejected whole and the running configuration
 # is kept, so a mistake here cannot take the service down.
+#
+# docs/configuration.md is the reference for every key: its range, its reasons
+# and the measurements behind a default. A pointer under a key names the section.
 
 [server]
 # UDP address to listen on. QUIC is UDP; there is no TCP listener.
@@ -15,7 +18,7 @@ listen = "0.0.0.0:443"
 # Certificate chain (leaf first) and its private key, both PEM.
 #
 # These must be the *domain* certificate even when clients connect to a relay's
-# IP: TLS terminates only here. Issue with ACME DNS-01 — HTTP-01 and TLS-ALPN-01
+# IP: TLS terminates only here. Issue with ACME DNS-01; HTTP-01 and TLS-ALPN-01
 # cannot validate when the domain's A record points at the relay.
 cert = "/etc/volto/fullchain.pem"
 key = "/etc/volto/privkey.pem"
@@ -25,29 +28,28 @@ key = "/etc/volto/privkey.pem"
 #alpn = ["h3"]
 
 # Seconds to let established tunnels finish after SIGTERM before closing anyway.
-# Short by default: a client that keeps using a connection after GOAWAY (Surge
-# does) has its new requests fail for the whole drain, so this is also how long
-# each restart looks broken from the client. Raise it if in-flight transfers
-# matter more. The exit can take up to 2 * shutdown_grace + 3 seconds, so keep
-# systemd's TimeoutStopSec above that bound, not above this value alone.
+# Surge keeps using a connection after GOAWAY, so its new requests fail for this
+# long at every restart. The exit can take up to 2 * shutdown_grace + 3 seconds,
+# so keep systemd's TimeoutStopSec above that bound, not above this value alone.
+# docs/deployment.md#graceful-shutdown
 # Range: 0..3600, where 0 closes every tunnel at once.
 # Default: 5
 #shutdown_grace = 5
 
 # ECH key file, written by `volto ech-keygen --public-name <name> --out <file>`,
 # which also prints the ECHConfigList a client's `ech-config` takes
-# (`volto ech-config <file>` prints it again). Without it the server is plain
-# TLS 1.3. With it, the gate opens every ECH extension with the key before the
-# TLS layer sees it, and drops a handshake whose ECH extension the key does not
-# open without any reply. Keep the list private: it is what lets a client in.
-# The public name does not go in [security] expected_sni. Not set by default.
+# (`volto ech-config <file>` prints it again). Keep the list private: it is what
+# lets a client in. A handshake whose ECH extension this key does not open is
+# dropped without any reply, so change the key and the clients' list together.
+# The public name does not go in [security] expected_sni. Not set by default,
+# which is plain TLS 1.3. docs/configuration.md#encrypted-client-hello
 #ech_key = "/etc/volto/ech.pem"
 
 [auth]
 # Credentials accepted on every CONNECT request, as HTTP Basic.
 #
 # An EMPTY OR ABSENT list disables authentication entirely, which makes this an
-# open proxy — anyone who can reach the port can use it. volto logs a warning at
+# open proxy: anyone who can reach the port can use it. volto logs a warning at
 # startup when that is the case. Never expose it to the internet that way.
 #
 # The username may not contain a colon (RFC 7617) and may not be longer than
@@ -66,23 +68,20 @@ users = [
 #udp_session_timeout = 180
 
 # Concurrent tunnels allowed on ONE QUIC connection, TCP and UDP together.
-# Each costs one file descriptor, so this and systemd's LimitNOFILE are two halves
-# of the same budget: volto warns at startup if RLIMIT_NOFILE leaves no margin.
 # Requests beyond it get 503 with `Proxy-Status: volto; error=connection_limit_reached`.
-# Range 1..65536, the same ceiling max_streams_bidi has: one tunnel is one
-# bidirectional stream. A value outside it is refused at startup.
+# Each tunnel costs one file descriptor; see max_connections below.
+# Range 1..65536. A value outside it is refused at startup.
 # Default: 256
 #max_targets_per_conn = 256
 
 # Simultaneously open QUIC connections; 0 removes the limit.
 #
-# At the limit a new connection whose address QUIC has validated takes the slot
-# of the oldest connection that has never authenticated; an unvalidated one is
-# answered with a Retry, and when no connection can be evicted the newcomer is
-# refused before any per-connection state exists on this side. The default is sized against the rest
-# of the budget: what volto checks at startup is 256 connections x 256 tunnels plus
-# 64 descriptors of headroom = 65600, and the shipped systemd unit grants
-# LimitNOFILE=131072. Raising either limit past that means raising LimitNOFILE too.
+# At the limit a new connection takes the slot of the oldest connection that has
+# never authenticated, and is refused when there is none. volto needs
+# max_connections x max_targets_per_conn + 64 descriptors, 65600 at the
+# defaults, and the shipped unit sets LimitNOFILE=131072. Raising either key
+# past that means raising LimitNOFILE too, or volto warns at startup and on
+# reload. docs/deployment.md#file-descriptor-budget
 # Default: 256
 #max_connections = 256
 
@@ -91,7 +90,7 @@ users = [
 # Spent twice per request and separately: once on name resolution, once on the
 # whole list of addresses it resolved to. Both happen while the request already
 # holds a tunnel slot and a file descriptor, and without a budget a target that
-# silently drops SYNs holds them for as long as the kernel keeps retrying --
+# silently drops SYNs holds them for as long as the kernel keeps retrying,
 # around two minutes on Linux. That is enough for ordinary browsing to spend a
 # connection's whole max_targets_per_conn on tunnels that will never open.
 #
@@ -110,8 +109,8 @@ users = [
 # Which address family a resolved target name is tried on first:
 # "ipv4", "ipv6" or "system".
 #
-# Not a resolver detail but an operator policy. getaddrinfo -- glibc and musl
-# alike -- orders its answers by RFC 6724, which puts a global IPv6 address ahead
+# Not a resolver detail but an operator policy. getaddrinfo, glibc and musl
+# alike, orders its answers by RFC 6724, which puts a global IPv6 address ahead
 # of every IPv4 one whenever the host has a usable IPv6 route. On a VPS whose
 # IPv6 egress is tunnelled, or simply worse peered than its native IPv4, that
 # sends every dual-stack target down the weaker path first: a TCP tunnel waits
@@ -123,7 +122,7 @@ users = [
 # one, and "system" to hand the ordering back to the resolver (which on glibc
 # can then be shaped through /etc/gai.conf). The reordering is a stable
 # partition, so RFC 6724 still decides the order within a family, and a target
-# that resolves to a single family -- an IP literal above all -- is unaffected.
+# that resolves to a single family (an IP literal above all) is unaffected.
 # Like connect_timeout above, this is snapshotted per connection: a reload
 # applies it to connections accepted after it.
 # Default: "ipv4"
@@ -134,8 +133,8 @@ users = [
 # them to new connections; connections already open keep what they negotiated at
 # handshake time, because QUIC cannot renegotiate transport parameters.
 
-# Concurrent bidirectional streams one QUIC connection may open — one per tunnel
-# — once a request on it has passed the credentials check.
+# Concurrent bidirectional streams one QUIC connection may open, one per tunnel,
+# once a request on it has passed the credentials check.
 # quinn's own default of 100 runs out during ordinary browsing, since Surge
 # multiplexes every proxied TCP connection onto a single QUIC connection.
 # This is not what the handshake advertises. A connection is accepted on a fixed
@@ -143,9 +142,9 @@ users = [
 # authenticated request, so a peer that has proved nothing cannot open a thousand
 # request streams and draw a refusal on each.
 # Raise it with care: a stream slot is reserved for every unit of the credit when
-# the allowance is granted, not when a stream is opened, so this is work paid in
-# one go — about 11 ms at 1024 and 7 seconds at a million — by the connection's
-# first authenticated request rather than by every handshake.
+# the allowance is granted, not when a stream is opened. That work is done at
+# once by the connection's first authenticated request: about 11 ms at 1024 and
+# 7 seconds at a million.
 # Range: 1..65536
 # Default: 1024
 #max_streams_bidi = 1024
@@ -153,7 +152,7 @@ users = [
 # Seconds a connection may go without traffic before it is closed.
 #
 # Deliberately longer than a relay's UDP conntrack entry (30s by default), so that
-# the keep-alive below — not this timeout — decides whether a connection is alive.
+# the keep-alive below, not this timeout, decides whether a connection is alive.
 # Accepted range: 1..3600.
 # Default: 60
 #max_idle_timeout = 60
@@ -170,67 +169,48 @@ users = [
 # Default: 20
 #keep_alive_interval = 20
 
-# Size of the first QUIC packets, in bytes. Must be at least 1200 (RFC 9000 §14);
-# volto refuses to start below that rather than silently rounding up. The
-# program default is the conservative 1200; this file ships 1242, which keeps
-# the handshake inside a 1270-byte IPv4 packet — under the 1280 bytes any
-# practical path carries, and below what Chromium (1250) and quic-go (1280)
-# send everywhere. Two cautions: over IPv6 the same packets are 1290 bytes,
-# past the protocol's 1280-byte guarantee, so prefer 1200 if clients reach you
-# over IPv6; and unlike mtu_upper_bound this value is sent blind in the
-# handshake — a size the path cannot carry kills the connection with nothing
-# to fall back to, so raise it further only from a measurement.
+# Size of the first QUIC packets, in bytes, at least 1200 (RFC 9000 §14); a
+# smaller value is refused. The program default is the conservative 1200. This
+# file ships 1242, which keeps the handshake inside a 1270-byte IPv4 packet,
+# under the 1280 bytes any practical path carries. Over IPv6 the same packets
+# are 1290 bytes, so prefer 1200 if clients reach you over IPv6. This size is
+# sent without probing, and a size the path cannot carry fails the connection,
+# so raise it further only from a measurement.
+# docs/configuration.md#notes-that-matter-in-practice
 # Default: 1200
 initial_mtu = 1242
 
 # Probe for a path MTU larger than initial_mtu (RFC 8899 DPLPMTUD).
 #
-# Leave it on unless the path black-holes large packets — the symptom is a
-# handshake that succeeds while large transfers stall. Turning it off stops the
-# upward search: packets start at initial_mtu and are never probed larger. It is
-# not a hard pin — quinn's black-hole detector still runs, and if it fires the
-# packet size drops to the 1200-byte floor for the rest of the connection, with
+# Leave it on unless the path drops large packets: the symptom is a handshake
+# that succeeds while large transfers stall. Turning it off stops the upward
+# search: packets start at initial_mtu and are never probed larger. It is not a
+# hard pin. quinn's black-hole detector still runs, and if it fires the packet
+# size drops to the 1200-byte floor for the rest of the connection, with
 # nothing left to probe it back up. Slower, but predictable.
 # Default: true
 #mtu_discovery = true
 
-# Ceiling for path MTU discovery, in bytes. It is a UDP payload size like
-# initial_mtu. 1436 is the largest payload whose IPv4 packet (1464 bytes)
-# crossed a measured relay path with DF set. Above that size the path cleared
-# DF and still delivered single probes, so discovery adopted the larger size,
-# and at bulk rate 62 to 89 percent of those packets were lost until the
-# black-hole detector fired. A probe that gets through does not show that the
-# path carries the size under load. Over IPv6, 1452 is the value safe on
-# Ethernet, and 1436 is below it. Raise this only after measuring your own path
-# at bulk rate; 1472 (clean Ethernet over IPv4) is the most volto accepts. Bulk
-# connections that close with a non-zero mtu_black_holes on the connection
-# close line are the sign of a ceiling above what the path carries under load.
-# No effect when mtu_discovery is off.
+# Ceiling for path MTU discovery, in bytes, a UDP payload size like initial_mtu.
+# 1436 is the largest payload whose IPv4 packet (1464 bytes) crossed a measured
+# relay path with DF set. Above it the path still delivered single probes but
+# lost most packets at bulk rate. Raise this only after measuring your own path
+# at bulk rate; 1472 is the most volto accepts. A non-zero mtu_black_holes on
+# the close line of bulk connections means the ceiling is above what the path
+# carries. No effect when mtu_discovery is off.
+# docs/configuration.md#notes-that-matter-in-practice
 # Default: 1436
 mtu_upper_bound = 1436
 
 # QUIC congestion controller: "bbr", "bbr-uncapped", "cubic" or "newreno".
 #
-# BBR by default, and it should usually stay that way. Over a long, lossy
-# international path a loss-based controller (cubic/newreno) treats every dropped
-# packet as congestion and collapses the window — downloads stall to near-zero
-# while a co-located TCP proxy (which the kernel runs on BBR) is unaffected. BBR
-# models bandwidth and RTT instead, so it holds throughput on exactly these
-# paths. Switch to cubic only on a clean path, or as a fallback.
-#
-# "bbr" is quinn's BBR with its window held to 1.25 times the bandwidth-delay
-# product it measures, and never below the 240 kB a new connection starts with.
-# quinn's BBR overestimates the bottleneck, so a bulk download sends faster than
-# the path carries and loses the difference; the cap removes most of that loss
-# and keeps BBR's response to random loss. A new connection uses a higher cap
-# until its measured rate stops growing, and so does a connection whose rate
-# climbs back after falling below half of its highest value, as it does after a
-# burst of loss. It measures the minimum RTT again 10 s after the last
-# measurement, or later while the sender is app-limited, so a lasting RTT rise
-# costs throughput for about that long plus a few seconds. It is the default
-# since 1.2.0; its 1.1.x name "bbr-capped" is not accepted since 1.3.0.
-# "bbr-uncapped" is quinn's BBR as it ships, which "bbr" selected before 1.2.0.
-# See docs/configuration.md for the measurements.
+# Keep BBR on a long, lossy path: a loss-based controller (cubic, newreno) takes
+# every lost packet for congestion, and its downloads stall there. Use cubic only
+# on a clean path, or as a fallback. "bbr" is quinn's BBR with its window capped
+# at 1.25 times the bandwidth-delay product it measures, which removes most of
+# the loss quinn's BBR causes on a bulk download. "bbr-uncapped" is quinn's BBR
+# as it ships. The 1.1.x name "bbr-capped" is not accepted since 1.3.0.
+# docs/configuration.md#notes-that-matter-in-practice
 # Default: "bbr"
 #congestion_control = "bbr"
 
@@ -239,43 +219,33 @@ mtu_upper_bound = 1436
 # Seeds the handshake retransmission timers: until the first ACK arrives there
 # is no RTT sample, and a lost handshake packet waits roughly three times this
 # value before it is resent. This file ships 150, sized with margin for the
-# ~60–100 ms long-haul paths a fronted deployment typically serves; it cuts the
+# ~60-100 ms long-haul paths a fronted deployment typically serves; it cuts the
 # worst-case handshake stall from ~1 s to a few hundred ms. When the key is
 # absent volto falls back to 333 (RFC 9002's conservative kInitialRtt). Tune to
-# 1.5–2x the RTT that volto's connection logs report as rtt_ms, and keep the
-# margin: a value below the real RTT retransmits packets that were never lost.
+# 1.5 to 2 times the RTT that volto's connection logs report as rtt_ms, and keep
+# the margin: a value below the real RTT retransmits packets that were never lost.
 # Range 10..10000. Server default when unset: 333
 initial_rtt_ms = 150
 
 # --- UDP socket buffers (startup only) ---------------------------------------
-# Unlike the transport parameters above, these two are applied to the UDP socket
-# at the moment it is created. A reload does not rebind that socket, so changing
-# either one needs a restart.
+# Applied when the socket is created. A reload does not rebind the socket, so
+# changing either key needs a restart. docs/deployment.md#udp-socket-buffers
 
 # UDP socket receive buffer to request, in bytes; 0 leaves the OS default alone.
 #
-# quinn never asks the kernel for a socket buffer of its own, so a server that
-# leaves this to the system gets net.core.rmem_default -- around 208 KiB -- no
-# matter how high net.core.rmem_max is: that sysctl is a ceiling on what an
-# application may request, not an allocation. volto asks for this many bytes when
-# it creates the socket, which is also the only moment it can: a reload does not
-# rebind the socket, so changing this needs a restart.
-#
-# If the host's ceiling is lower than the value here, the kernel caps the request
-# and volto warns at startup naming the sysctl to raise. Linux reports a granted
-# buffer as double its size, so a satisfied 2 MiB request reads as rb 4194304 in
-# `ss -uanpm` and as so_rcvbuf=4194304 in the startup line.
+# Without a request the kernel gives net.core.rmem_default, around 208 KiB, no
+# matter how high net.core.rmem_max is. The kernel caps the request at
+# rmem_max, and volto then warns at startup naming the sysctl to raise. Linux
+# reports a granted buffer as double its size, so a satisfied 2 MiB request
+# reads as rb 4194304 in `ss -uanpm` and as so_rcvbuf=4194304 in the startup line.
 # Default: 2097152
 #socket_recv_buffer = 2097152
 
 # UDP socket send buffer to request, in bytes; 0 leaves the OS default alone.
 #
-# The same knob in the outbound direction, capped by net.core.wmem_max, and
-# equally a startup-time setting. What it prevents is milder than a drop: when
-# packets are handed to the kernel faster than the interface takes them, the
-# send stalls until the buffer drains (the kernel counts each stall as a
-# `send buffer error` in `netstat -su`); a larger buffer lets a burst go out in
-# one go.
+# Capped by net.core.wmem_max. When packets arrive faster than the interface
+# sends them, a small buffer makes the send wait, which the kernel counts as a
+# `send buffer error` in `netstat -su`.
 # Default: 2097152
 #socket_send_buffer = 2097152
 
@@ -311,86 +281,62 @@ initial_rtt_ms = 150
 # chooses where the IPv4 address sits inside it.
 #
 # Multicast, broadcast and the unspecified address are refused regardless of this
-# setting — they are amplification primitives, not destinations.
+# setting: they are amplification primitives, not destinations.
 # Default: false
 #allow_private_networks = false
 
 # Target ports refused regardless of address, answered with 403.
 #
-# 25 is the classic open-relay abuse vector. Ports 123 and 53 must stay
-# reachable. Surge's UDP availability test is an NTP query to port 123 through
-# the tunnel, so denying 123 makes Surge report the policy as broken. Denying 53
-# refuses every DNS query a client sends through the tunnel, which breaks name
-# resolution for a client that resolves names that way. volto warns if 53 or 123
-# is on this list.
+# 25 is the classic open-relay abuse vector. Do not add 123 or 53: Surge's UDP
+# test is an NTP query to port 123 through the tunnel, and denying 53 breaks
+# clients that resolve names through the tunnel. volto warns if either is
+# listed. docs/configuration.md#security
 # Default: [25]
 #denied_ports = [25]
 
 # Packets a UDP session may send before its target has answered (RFC 9298 §7).
 #
-# Stops a client using the proxy as a reflector or a port scanner. The first reply
-# from the target lifts the limit for the rest of the session, so this only ever
-# bites on one-way floods. 0 disables the mitigation entirely (warned about).
-#
-# The CONNECTION carries a total of its own, `CONNECTION_UNANSWERED_MULTIPLIER` = 8
-# times this value (512 packets at the default), spent by every session on it that
-# sends into silence and given back only by a session whose target answers; a
-# session that finds the total spent is closed rather than left running and muted.
-# 0 switches both halves off.
+# Stops a client using the proxy as a reflector or a port scanner. The first
+# reply from the target lifts the limit for the rest of the session. The
+# connection also has a total of `CONNECTION_UNANSWERED_MULTIPLIER` = 8 times
+# this value (512 packets at the default) for all its sessions, and a session
+# that finds that total spent is closed. 0 switches both off, and is warned
+# about. docs/configuration.md#security
 # Default: 64
 #unanswered_packet_budget = 64
 
-# Authentication failures tolerated on one connection before it is dropped.
-#
-# Not a rate limit and not a ban: it raises the cost of guessing from "one
-# handshake, then unlimited attempts" to "one handshake per N attempts", without
-# any cross-connection state to keep or evict. Pair it with fail2ban on the
-# "authentication failed" log lines for actual banning. 0 disables it.
+# Authentication failures tolerated on one connection before it is dropped;
+# 0 disables it. It is not a rate limit or a ban: pair it with fail2ban on the
+# "authentication failed" log lines. docs/configuration.md#security
 # Default: 5
 #max_auth_failures = 5
 
 # Host names this server answers to. An EMPTY LIST (the default) answers to any.
 #
-# Non-empty turns on the SNI gate: a handshake whose ClientHello does not name
-# one of these hosts is dropped at the socket, before the QUIC layer sees it, so
-# a port scan of this address gets nothing back at all — no Version Negotiation
-# packet, no CONNECTION_CLOSE, no TLS alert. It is what makes the port invisible
-# to somebody who does not already know the name to ask for. It is NOT traffic
-# obfuscation: it says nothing about what a connection looks like once one is
-# open, and it does not defend against a probe that already knows the name.
-#
-# Set it to the domain on your certificate. Every client must then send that
-# name as SNI — in Surge that is the `sni=` parameter on the policy line, which
-# you already need when the policy points at a relay's IP rather than the
-# domain. A client that sends no SNI, or the wrong one, sees the port as closed:
-# there is no error message anywhere but this server's own debug log, so change
-# this key and the client together.
-#
-# Matching is name for name, ASCII case-insensitive, with a trailing dot
-# ignored. No wildcards: list each host. No IP address literals either, which
-# RFC 6066 section 3 does not permit in a server_name. Names are checked at
-# startup and a reload, and the new list applies to handshakes from then on.
+# A non-empty list turns on the SNI gate: a handshake whose ClientHello names
+# none of these hosts is dropped at the socket with no reply, so the port looks
+# closed. It hides the port from a scan, not what an open connection looks like.
+# Set it to the domain on your certificate and give every client that name as
+# SNI (in Surge, `sni=` on the policy line). A client that sends no SNI, or the
+# wrong one, gets no error anywhere but this server's debug log, so change this
+# key and the clients together. Names match exactly, ASCII case-insensitive,
+# with no wildcards and no IP addresses. docs/configuration.md#the-sni-gate
 # Default: []
 #expected_sni = []
 
 # Drop every handshake that carries no ECH extension, too. Needs
 # [server] ech_key, and is refused without it.
 #
-# With an ECH key, a handshake whose ECH extension the key opens is admitted by
-# the socket gate whatever its outer name is; the TLS layer still refuses, with
-# an alert, an inner name that is not on expected_sni. One whose ECH extension
-# the key does not open is dropped. A handshake with no ECH extension is judged
-# by expected_sni as usual. With this on it is dropped instead, silently, so only a client that
-# holds the ECHConfigList gets any answer from this port. Configure every client
-# with the list first (Surge's `ech-config`): a client without it then times out
-# with no error anywhere but this server's debug log. Reloadable.
+# Give every client the ECHConfigList first (Surge's `ech-config`): a client
+# without it then times out with no error anywhere but this server's debug log.
+# Reloadable. docs/configuration.md#encrypted-client-hello
 # Default: false
 #require_ech = false
 
 [log]
 # A tracing filter: a bare level (trace/debug/info/warn/error) or a directive list
 # such as "volto=debug,quinn=info". RUST_LOG overrides this without editing the
-# file. `debug` logs every inbound request, including its header lines — the
+# file. `debug` logs every inbound request, including its header lines: the
 # credential values are redacted, the header names are not.
 # Default: "info"
 level = "info"
