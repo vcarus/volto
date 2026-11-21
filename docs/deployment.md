@@ -185,9 +185,13 @@ is not asked, and the install goes ahead as it always did.
 the directory is `root:volto` 0750, the config and the key `root:volto` 0640,
 the certificate `root:volto` 0644. The service user can change nothing in it.
 Releases before this layout gave the directory and its files to the `volto`
-user; `deploy.sh` moves such a host to the new layout on its next run, the
-timer's no-op run included, and leaves a symbolic link or a file with a second
-name where it is and names it.
+user; `deploy.sh` moves such a host to the new layout, and leaves a symbolic
+link or a file with a second name where it is and names it. The move is made by
+a `deploy.sh` that knows the layout, which on an updated host is the copy the
+first update installs at its end: the first update itself runs the old copy, so
+the move lands on the next run after it, the timer's no-op run included, about a
+day later. A host whose update was refused or rolled back keeps the old copy and
+the old layout, which still works.
 
 Re-running is safe: on a host that already has `/etc/volto/config.toml`, the
 config file, the certificate, the user, the binary and the unit are kept, and the
