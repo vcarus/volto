@@ -137,6 +137,15 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# @system-service includes @resources: the calls that set scheduling policy,
+# priority, CPU affinity, NUMA memory policy and resource limits. volto makes
+# none of them. It reads RLIMIT_NOFILE with prlimit64, which systemd puts in
+# @default and not in @resources, so the startup descriptor check still works.
+# This line must come after the allow list above: when the first
+# SystemCallFilter= line is a ~ list, systemd allows every call it does not name.
+SystemCallFilter=~@resources
+# A refused call returns EPERM instead of killing the process with SIGSYS, so
+# code that handles the error keeps running. The kernel logs nothing for it.
 SystemCallErrorNumber=EPERM
 
 # --- Logging ----------------------------------------------------------------

@@ -494,7 +494,8 @@ stable group to grant them to; each file would have to be passed with
 `LoadCredential=` instead. `AmbientCapabilities=CAP_NET_BIND_SERVICE` is what
 allows binding a low port without root, and the rest of the unit is standard
 systemd hardening — `ProtectSystem=strict` with no writable path, `UMask=0077`,
-`ProcSubset=pid`, a `@system-service` syscall filter, no new privileges.
+`ProcSubset=pid`, a `@system-service` syscall filter without `@resources`, no
+new privileges.
 `Type=exec` makes `systemctl start` and `restart` fail at once when the binary
 cannot be executed.
 

@@ -1274,9 +1274,13 @@ fn unit_directives() -> Vec<String> {
 /// `UMask=0077` keeps any file it creates to its user, `ProcSubset=pid` hides
 /// the `/proc` entries only `--diagnostics` reads, and `RemoveIPC=yes` removes
 /// IPC objects it never makes. `ReadOnlyPaths=/etc/volto` added nothing under
-/// `ProtectSystem=strict`. The directives that would break the binary
-/// (`PrivateUsers=`, `PrivateNetwork=`, `IPAddressDeny=`, `SocketBindDeny=`)
-/// stay out.
+/// `ProtectSystem=strict`. `SystemCallFilter=~@resources` removes the calls that
+/// set scheduling, affinity, memory policy and limits, which a trace of the
+/// release binary on systemd 255 and 259 showed it never makes; the
+/// `RLIMIT_NOFILE` read is `prlimit64`, which systemd keeps in `@default`.
+/// `SystemCallErrorNumber=EPERM` makes a refused call fail rather than kill the
+/// process. The directives that would break the binary (`PrivateUsers=`,
+/// `PrivateNetwork=`, `IPAddressDeny=`, `SocketBindDeny=`) stay out.
 #[test]
 fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
     let directives = unit_directives();
@@ -1294,6 +1298,8 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
         "RestartForceExitStatus=SIGHUP",
         "ExecReload=/bin/kill -HUP $MAINPID",
         "SystemCallFilter=@system-service",
+        "SystemCallFilter=~@resources",
+        "SystemCallErrorNumber=EPERM",
     ] {
         assert!(
             directives.iter().any(|line| line == expected),
@@ -1315,6 +1321,21 @@ fn the_unit_carries_the_safe_hardening_and_nothing_that_breaks_the_binary() {
             "script/masque.service must not set {absent}: {directives:#?}"
         );
     }
+
+    // systemd takes the default action from the first `SystemCallFilter=`
+    // line. If that line is a `~` list, every call it does not name is
+    // allowed, and the `@system-service` line after it only removes names from
+    // the deny list: the filter is gone.
+    let filters: Vec<&String> = directives
+        .iter()
+        .filter(|line| line.starts_with("SystemCallFilter="))
+        .collect();
+    assert_eq!(
+        filters.first().map(|line| line.as_str()),
+        Some("SystemCallFilter=@system-service"),
+        "the first SystemCallFilter= line must be the allow list, or the unit allows \
+         every call: {filters:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
