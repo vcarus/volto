@@ -675,7 +675,7 @@ restart. `0` hands the size back to the operating system.
 
 `systemctl reload volto` sends SIGHUP. volto re-reads the configuration file and
 applies it to connections accepted from then on: a renewed certificate, a new
-ECH key file, a changed user list, a raised or lowered `limits.max_connections`, changed transport
+or previous ECH key file, a changed user list, a raised or lowered `limits.max_connections`, changed transport
 parameters. Established connections keep the
 configuration they were accepted with — a tunnel's rules must not change
 mid-transfer, and QUIC cannot renegotiate transport parameters anyway.
@@ -801,7 +801,8 @@ sudo chmod 0640 /etc/volto/ech.pem
 It prints the ECHConfigList as one base64 line; `volto ech-config
 /etc/volto/ech.pem` prints it again later. Point `server.ech_key` at the file
 and reload. The startup line `accepting QUIC connections` then carries
-`ech=true` with the key's `ech_config_id` and `ech_public_name`.
+`ech=true` with the key's `ech_config_id` and `ech_public_name`, and
+`ech_previous_config_id=-`, because no previous key is configured.
 
 The public name is what an observer sees, so choose a name that says nothing
 about this server. It does not go into `[security].expected_sni`, and the real
@@ -820,17 +821,42 @@ goes on the wire:
 volto = masque, 203.0.113.10, 443, sni=example.com, server-cert-verify-name=example.com, ech-config=AEX+DQBB…, username=user1, password=…
 ```
 
-**Rotating the key** is a new file and a reload: generate it with the three
-commands above, with `--out` and the two following lines naming a new file,
-point `ech_key` at it, `systemctl reload volto`, and give every client the new
-list. A key the service cannot read is refused by the reload, which keeps the
-old key and logs `configuration reload failed`, so look for `configuration
-reloaded` in the journal before the clients are changed. A client whose list no
-longer matches the key gets no reply at all and times out, with or without
-`require_ech`. The server holds one key at a time, so a client with the old list
-is cut off from the reload on, and a client given the new list before the reload
-is cut off until it. A key change is therefore a change to every client's
-configuration: make both in the same window.
+### Rotating the ECH key
+
+The server accepts a previous key beside the current one,
+[`[server].ech_previous_key`](configuration.md#rotating-the-key), so a rotation
+changes the server first and the clients after it, and no client is cut off
+in between:
+
+1. Generate the new key with a config_id other than the current key's. The
+   current key's is the `ech_config_id` of the startup or reload line. The
+   server picks the key by the config_id a ClientHello names, so two keys with
+   one config_id are refused.
+
+   ```sh
+   sudo volto ech-keygen --public-name public.example --config-id 8 --out /etc/volto/ech-new.pem
+   sudo chgrp volto /etc/volto/ech-new.pem
+   sudo chmod 0640 /etc/volto/ech-new.pem
+   ```
+
+2. In `[server]`, set `ech_key` to the new file and `ech_previous_key` to the
+   old one, and run `systemctl reload volto`. Check that the journal says
+   `configuration reloaded` with the new key's `ech_config_id` and the old
+   key's `ech_previous_config_id`. A key the service cannot read, or a
+   config_id used twice, is refused by the reload, which keeps the keys in force
+   and logs `configuration reload failed`.
+3. Give every client the new list, the line `ech-keygen` printed or
+   `volto ech-config /etc/volto/ech-new.pem`. A client with the old list keeps
+   connecting in the meantime.
+4. When no client with the old list connects any more, or at a deadline of
+   your own, remove `ech_previous_key` and reload. The reload line then reports
+   `ech_previous_config_id=-`. The `connection established` line does not say
+   which key a handshake used; at debug level the line `TLS handshake complete`
+   carries the `ech_config_id` the client named.
+
+A client whose list matches neither key gets no reply at all and times out, with
+or without `require_ech`, so a client still holding the old list after step 4 is
+cut off from that reload on.
 
 ### Requiring ECH
 
@@ -852,8 +878,8 @@ dropped handshake. That includes every client that cannot be given the list at
 all, such as [Apple's relay client](#apples-relay-client): leave `require_ech`
 off while one of those uses the server. `require_ech` without `server.ech_key` is refused at startup,
 by `--check-config` and on reload, and so is a reload that removes the key while
-it is on. A rotation under `require_ech` cuts clients off exactly as described
-above.
+it is on. A rotation under `require_ech` follows the same steps, and a client
+holding either key's list connects throughout it.
 
 ## Apple's relay client
 

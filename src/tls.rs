@@ -1,7 +1,7 @@
 //! TLS identity and the server's TLS.
 //!
 //! The handshake runs on AWS-LC's libssl through volto's own quinn crypto
-//! provider in `tls/awslc/` (D115), which also carries the ECH key. This module
+//! provider in `tls/awslc/` (D115), which also carries the ECH keys. This module
 //! holds what the provider and the configuration checks share: reading the
 //! certificate chain and the private key, and judging which names the
 //! certificate covers. Those call rustls-pki-types for the PEM parser and
@@ -23,7 +23,8 @@ use zeroize::{Zeroize as _, Zeroizing};
 mod awslc;
 
 pub use awslc::{
-    EchKey, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config, server_config,
+    EchKey, EchKeySet, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config,
+    server_config,
 };
 pub(crate) use awslc::{HandshakeData, server_initial_keys};
 

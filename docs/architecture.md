@@ -57,6 +57,8 @@ ALPN identifier with the server is refused with `no_application_protocol`. It
 issues no session tickets and accepts no 0-RTT data, so every connection is a
 full handshake. An ECH key (`server.ech_key`) is optional; without one the
 server is plain TLS 1.3, and with one it also accepts Encrypted Client Hello.
+During a key rotation `server.ech_previous_key` names the key being replaced,
+which libssl still decrypts with and never sends as a retry config.
 The provider is the one module of the crate that uses
 `unsafe`, and the reason is stated where the crate denies it, in `lib.rs`.
 
@@ -133,9 +135,12 @@ Initial packets. An Initial that opens under its own connection ID's keys is the
 start of a new handshake, and the gate copies it out of the batch, blinds it in
 place as above, and holds the copy under its connection ID and source address
 together with the CRYPTO bytes it carried. Once the held bytes make a whole
-ClientHello, the flight is judged. An ECH extension the key opens is admitted
-without its outer name being looked at, unless the same HPKE `enc` was admitted
-before from another address. An ECH extension the key does not open is dropped,
+ClientHello, the flight is judged. The config_id the ECH extension names picks
+the key, the current one or the previous one of a rotation, which have
+different config_ids, so a flight costs one HPKE open at most. An ECH extension
+that key opens is admitted without its outer name being looked at, unless the
+same HPKE `enc` was admitted before from another address. An ECH extension no
+configured key opens is dropped,
 which departs from RFC 9849 §7.1 on purpose, for the reason given under
 [Encrypted Client Hello](configuration.md#encrypted-client-hello). A ClientHello
 without ECH is dropped under `[security] require_ech` and otherwise judged by
@@ -145,9 +150,9 @@ endpoint driver polls again after every batch, so this needs no timer. A
 dropped flight is discarded whole and nothing is sent. The hold is bounded in
 time, in the number of flights and in bytes, each by a named constant in
 `gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
-`enc` values is bounded by count rather than time, emptied by a reload that
-changes the key, and lost at a restart; only a flight the key opened can add to
-it. The TLS layer's ClientHello callback refuses the same ClientHellos a second
+`enc` values is bounded by count rather than time, kept by a reload whose keys
+include one of the old ones, emptied by a reload after which none of them is
+accepted, and lost at a restart; only a flight a key opened can add to it. The TLS layer's ClientHello callback refuses the same ClientHellos a second
 time, so a defect in the gate costs a `handshake_failure` alert rather than the
 ECHConfigList; [Encrypted Client Hello](configuration.md#encrypted-client-hello)
 says which.

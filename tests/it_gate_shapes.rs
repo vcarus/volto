@@ -61,7 +61,7 @@ use volto::gate::{
     HOLD_TOTAL_BYTES, HoldInput, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening,
     Verdict, first_flight, hold_input_key, judgement, sealed_initial,
 };
-use volto::tls::EchKey;
+use volto::tls::{EchKey, EchKeySet};
 
 /// How long a server is given to prove it is not answering.
 ///
@@ -1635,10 +1635,15 @@ fn ech_key(config_id: u8) -> Arc<EchKey> {
     Arc::new(EchKey::generate(PUBLIC_NAME, config_id, 0).expect("generate an ECH key"))
 }
 
-/// The gate's policy with `key`, the name list `names` and `require_ech`.
+/// The gate's policy with `key` alone, the name list `names` and
+/// `require_ech`.
 fn hold_policy(key: &Arc<EchKey>, names: &[&str], require_ech: bool) -> Policy {
     let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    Policy::new(Names::new(&names), Some(key.clone()), require_ech)
+    Policy::new(
+        Names::new(&names),
+        Some(Arc::new(EchKeySet::new(key.clone()))),
+        require_ech,
+    )
 }
 
 /// X25519MLKEM768 first, as Surge orders its groups. An ECH ClientHello with

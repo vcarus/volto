@@ -22,6 +22,7 @@ impl Config {
         validate_auth(&self.auth)?;
         validate_security(&self.security)?;
         validate_require_ech(&self.security, &self.server)?;
+        validate_ech_previous_key(&self.server)?;
         validate_certificate_paths(&self.server)?;
 
         Ok(())
@@ -39,6 +40,24 @@ fn validate_require_ech(security: &Security, server: &Server) -> Result<()> {
         bail!(
             "security.require_ech = true needs server.ech_key: without an ECH key no \
              handshake can carry ECH, so every client would be dropped without a reply"
+        );
+    }
+    Ok(())
+}
+
+/// `server.ech_previous_key` needs `server.ech_key`.
+///
+/// The previous key is the one a rotation still accepts beside the current
+/// one, so without a current key there is nothing for the clients to move to
+/// and no ECHConfigList to send as retry configs. Checked on the configuration,
+/// so startup, `--check-config` and a reload all refuse it. That the two keys
+/// differ in config_id needs both files, and [`validate_certificate_paths`]
+/// checks it with them (`EchKeySet::load`).
+fn validate_ech_previous_key(server: &Server) -> Result<()> {
+    if server.ech_previous_key.is_some() && server.ech_key.is_none() {
+        bail!(
+            "server.ech_previous_key needs server.ech_key: the previous key is accepted beside \
+             the current one during a rotation, and there is no current key"
         );
     }
     Ok(())
@@ -319,9 +338,10 @@ fn validate_security(security: &Security) -> Result<()> {
 }
 
 /// Checks that `server.cert` and `server.key` name files, that the leaf
-/// certificate is one the server's TLS takes, and that `server.ech_key`, when
-/// set, is a usable ECH key file. The only check that touches the filesystem,
-/// so [`Config::validate`] runs it last.
+/// certificate is one the server's TLS takes, and that `server.ech_key` and
+/// `server.ech_previous_key`, when set, are usable ECH key files with
+/// different config_ids. The only check that touches the filesystem, so
+/// [`Config::validate`] runs it last.
 fn validate_certificate_paths(server: &Server) -> Result<()> {
     if !server.cert.is_file() {
         bail!("server.cert = {} is not a file", server.cert.display());
@@ -343,7 +363,7 @@ fn validate_certificate_paths(server: &Server) -> Result<()> {
     // startup is refused here too, which is what `--check-config` and a
     // reload promise.
     if let Some(path) = &server.ech_key {
-        crate::tls::EchKey::load(path)?;
+        crate::tls::EchKeySet::load(path, server.ech_previous_key.as_deref())?;
     }
 
     Ok(())
@@ -656,6 +676,22 @@ mod tests {
         assert_valid_apart_from_certs(
             &parse("ech_key = \"/tmp/ech.pem\"\n[security]\nrequire_ech = true"),
             "require_ech with a key",
+        );
+    }
+
+    /// A previous ECH key without a current one is refused, naming both keys;
+    /// beside a current key it is not.
+    #[test]
+    fn a_previous_ech_key_without_a_current_one_is_refused() {
+        let message = rejected(
+            "ech_previous_key = \"/tmp/ech-old.pem\"",
+            "server.ech_previous_key",
+        );
+        assert!(message.contains("server.ech_key"), "{message}");
+
+        assert_valid_apart_from_certs(
+            &parse("ech_key = \"/tmp/ech.pem\"\nech_previous_key = \"/tmp/ech-old.pem\""),
+            "a previous key beside a current one",
         );
     }
 
