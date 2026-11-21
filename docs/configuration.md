@@ -130,8 +130,8 @@ have different config_ids, and a first flight is still opened with one key at
 most. libssl holds the previous key as a key it decrypts with and never sends:
 its `retry_configs` would carry the current key's ECHConfigList alone, and the
 gate and the TLS layer keep every ClientHello that would draw them from getting
-that far, as the paragraphs above say. The steps are under [Rotating the ECH key](deployment.md#rotating-the-ech-key) in
-deployment.md.
+that far, as the paragraphs above say. The steps are under
+[Rotating the ECH key](deployment.md#rotating-the-ech-key) in deployment.md.
 
 ## `[auth]`
 

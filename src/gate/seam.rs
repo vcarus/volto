@@ -298,7 +298,7 @@ impl<'a> HoldInput<'a> {
         })
     }
 
-    /// The ECH keys the input's policy byte asks for: `current` alone, or
+    /// The ECH keys the input's policy byte selects: `current` alone, or
     /// `current` with `previous` beside it.
     pub fn keys(&self, current: &Arc<EchKey>, previous: &Arc<EchKey>) -> Arc<EchKeySet> {
         let set = EchKeySet::new(current.clone());
@@ -310,7 +310,7 @@ impl<'a> HoldInput<'a> {
         })
     }
 
-    /// The gate policy the input's policy byte asks for, under `keys`.
+    /// The gate policy the input's policy byte selects, under `keys`.
     pub fn policy(&self, keys: Arc<EchKeySet>) -> Policy {
         Policy::new(Names::new(&self.names), Some(keys), self.require_ech)
     }

@@ -800,9 +800,10 @@ sudo chmod 0640 /etc/volto/ech.pem
 
 It prints the ECHConfigList as one base64 line; `volto ech-config
 /etc/volto/ech.pem` prints it again later. Point `server.ech_key` at the file
-and reload. The startup line `accepting QUIC connections` then carries
-`ech=true` with the key's `ech_config_id` and `ech_public_name`, and
-`ech_previous_config_id=-`, because no previous key is configured.
+and reload. The reload line `configuration reloaded` then carries `ech=true`
+with the key's `ech_config_id` and `ech_public_name`, and
+`ech_previous_config_id=-`, because no previous key is configured. The startup
+line `accepting QUIC connections` carries the same fields after a restart.
 
 The public name is what an observer sees, so choose a name that says nothing
 about this server. It does not go into `[security].expected_sni`, and the real
@@ -831,7 +832,10 @@ in between:
 1. Generate the new key with a config_id other than the current key's. The
    current key's is the `ech_config_id` of the startup or reload line. The
    server picks the key by the config_id a ClientHello names, so two keys with
-   one config_id are refused.
+   one config_id are refused. Give it the current key's `--public-name`, which
+   `volto ech-config` prints for the current file, unless the name is meant to
+   change: the public name is sent in the clear, and with two names an
+   observer sees both during the rotation.
 
    ```sh
    sudo volto ech-keygen --public-name public.example --config-id 8 --out /etc/volto/ech-new.pem
@@ -846,8 +850,8 @@ in between:
    config_id used twice, is refused by the reload, which keeps the keys in force
    and logs `configuration reload failed`.
 3. Give every client the new list, the line `ech-keygen` printed or
-   `volto ech-config /etc/volto/ech-new.pem`. A client with the old list keeps
-   connecting in the meantime.
+   `volto ech-config /etc/volto/ech-new.pem`. A client with the old list still
+   connects until step 4.
 4. When no client with the old list connects any more, or at a deadline of
    your own, remove `ech_previous_key` and reload. The reload line then reports
    `ech_previous_config_id=-`. The `connection established` line does not say
@@ -913,7 +917,8 @@ by a CONNECT-UDP session. A configuration profile on a device was not tested.
   the device reports only a timeout. A server that serves this client and
   Surge together therefore keeps `require_ech` off. Should a version of the
   client send an ECH extension of its own, such as GREASE, the gate drops that
-  handshake too, because the key does not open it, whatever `require_ech` says.
+  handshake too, because no configured key opens it, whatever `require_ech`
+  says.
 - **Pin a certificate, not a raw public key.** With raw public keys set, the
   client accepts only the raw public key certificate type of RFC 7250, which
   volto's TLS does not offer, and the handshake fails. Use a certificate the
