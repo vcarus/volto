@@ -148,6 +148,13 @@
 //! by `require_ech` and by its name, against the whole ClientHello rather than
 //! one packet.
 //!
+//! During a key rotation the server holds two keys, the current one and the
+//! previous one (`server.ech_previous_key`), with different config_ids. The
+//! key is picked by the config_id the ECH extension names, and only that key
+//! tries to open it, so a flight costs at most one HPKE open with either
+//! number of keys. An extension that names neither config_id is not opened at
+//! all, and one the named key does not open is dropped as before.
+//!
 //! An Initial that carries no ClientHello (a PING, a lone CRYPTO frame past
 //! offset 0, a ClientHello cut short) is held like any other and, when nothing
 //! completes it, dropped. So the acknowledgements of *What is left uncovered*
@@ -167,11 +174,13 @@
 //! with a stride of its own length, before it reads the socket again, and
 //! with no waker of its own (`poll_recv` says why).
 //!
-//! **The replay record** keeps every `enc` the key opened, with its address,
+//! **The replay record** keeps every `enc` a key opened, with its address,
 //! for the life of the process up to `REPLAY_ENTRIES`, and does not expire by
-//! time. Only a flight the key opened adds to it, so a peer without the key
-//! cannot grow it. A reload that changes the key empties it, and it is not kept
-//! across a restart.
+//! time. Only a flight a key opened adds to it, so a peer without a key cannot
+//! grow it. A reload keeps it while the new keys include one of the old ones,
+//! so a rotation keeps it, and empties it when none of the old keys is
+//! accepted any more ([`Expected::set`] says why). It is not kept across a
+//! restart.
 //!
 //! **Limits.** Two are known and not handled. First, the replay record admits
 //! whichever copy of a flight completes first. A copy that reaches the server
@@ -203,7 +212,7 @@ use tracing::debug;
 
 use crate::logfmt::escaped_bytes;
 pub use crate::names::Names;
-use crate::tls::EchKey;
+use crate::tls::EchKeySet;
 
 mod hold;
 mod initial;
@@ -267,27 +276,28 @@ const MIN_CLIENT_CONNECTION_ID: usize = 8;
 /// rather than as an off-by-one against one version's ceiling.
 const IMPOSSIBLE_CID_LENGTH: u8 = 0xff;
 
-/// What the gate enforces: the names a ClientHello may carry, the ECH key,
+/// What the gate enforces: the names a ClientHello may carry, the ECH keys,
 /// and whether ECH is required.
 ///
-/// Built from `[security] expected_sni`, `[security] require_ech` and the key
-/// `server.ech_key` names, at bind and on every reload. The gate is on when the
-/// list holds a name or there is a key; with neither, every datagram passes
-/// untouched. A key turns on the hold the module documentation describes.
+/// Built from `[security] expected_sni`, `[security] require_ech` and the keys
+/// `server.ech_key` and `server.ech_previous_key` name, at bind and on every
+/// reload. The gate is on when the list holds a name or there is a key; with
+/// neither, every datagram passes untouched. A key turns on the hold the
+/// module documentation describes.
 #[derive(Debug)]
 pub struct Policy {
     names: Names,
-    ech: Option<Arc<EchKey>>,
+    ech: Option<Arc<EchKeySet>>,
     require_ech: bool,
 }
 
 impl Policy {
-    /// The policy of `names`, the ECH key `ech` and `require_ech`.
+    /// The policy of `names`, the ECH keys `ech` and `require_ech`.
     ///
     /// `require_ech` is read only where there is a key: the configuration
     /// refuses it without one at startup, by `--check-config` and on reload,
     /// so no running server holds that pair.
-    pub fn new(names: Names, ech: Option<Arc<EchKey>>, require_ech: bool) -> Self {
+    pub fn new(names: Names, ech: Option<Arc<EchKeySet>>, require_ech: bool) -> Self {
         Self {
             names,
             ech,
@@ -314,25 +324,15 @@ impl From<Names> for Policy {
     }
 }
 
-/// Whether `a` and `b` are the same ECH key.
-///
-/// Compared by the ECHConfigList each one prints, which holds the public key,
-/// so two files with the same list hold the same key. A reload re-reads the
-/// file every time, so the two are never the same allocation even when the
-/// key did not change.
-fn same_key(a: Option<&EchKey>, b: Option<&EchKey>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => a.config_list() == b.config_list(),
-        _ => false,
-    }
-}
-
 /// Puts `new` in force, with what the change does to the hold and the replay
-/// record: a new ECH key empties the record, and no key empties the hold.
-/// [`Expected::set`] says why.
+/// record: a set of ECH keys that holds none of the old set's keys empties the
+/// record, and no key empties the hold. [`Expected::set`] says why.
 fn follow(memory: &mut Memory, new: Arc<Policy>) {
-    if !same_key(memory.policy.ech.as_deref(), new.ech.as_deref()) {
+    let keeps_a_key = match (memory.policy.ech.as_deref(), new.ech.as_deref()) {
+        (Some(old), Some(new)) => new.shares_a_key_with(old),
+        _ => false,
+    };
+    if !keeps_a_key {
         memory.replay.clear();
     }
     if new.ech.is_none() {
@@ -348,9 +348,10 @@ fn follow(memory: &mut Memory, new: Arc<Policy>) {
 /// without being rebuilt, since rebuilding it would mean rebinding the port.
 ///
 /// The policy sits under one lock with the hold and the replay record, which
-/// live here rather than in [`Gate`] because a reload has to reach them: a new
-/// ECH key clears the replay record, and a policy without a key clears the
-/// hold. A receive batch takes the lock once and reads the policy under it.
+/// live here rather than in [`Gate`] because a reload has to reach them: a set
+/// of ECH keys with none of the old keys in it clears the replay record, and a
+/// policy without a key clears the hold. A receive batch takes the lock once
+/// and reads the policy under it.
 ///
 /// The flag beside it answers "is the gate on at all" without taking the lock,
 /// because a gate that is off is the shipped default. A gate that is off then
@@ -408,10 +409,23 @@ impl Expected {
     /// the new one, which is a judgement made against a policy no
     /// configuration ever asked for.
     ///
-    /// A new ECH key empties the replay record, because the record is the
-    /// `enc` values one key opened. A policy without a key empties the hold,
-    /// because nothing would judge what it holds; the clients of those
-    /// flights send them again and the gate passes them as it now does. Both
+    /// The replay record is kept while the new policy accepts any key the old
+    /// one accepted, and emptied otherwise. An entry is the `enc` of a flight
+    /// one of the old keys opened, and the copy it guards against is that
+    /// flight sent again from another address, which still opens under the
+    /// same key after the reload. So the usual rotation, where the old current
+    /// key becomes the previous key, keeps every entry, and a recorded first
+    /// flight under the old key stays a replay. Emptying is correct only when
+    /// no old key is accepted any more, because then no recorded flight opens.
+    /// One record for all the keys rather than one per key, so its bound
+    /// stays `REPLAY_ENTRIES` in all. The entries of a previous key that a
+    /// reload removed while the current key stayed are kept: they match only
+    /// a copy of a flight under that key, which no longer opens, and they
+    /// leave the record as older entries do, oldest first at the bound.
+    ///
+    /// A policy without a key empties the hold, because nothing would judge
+    /// what it holds; the clients of those flights send them again and the
+    /// gate passes them as it now does. Both
     /// happen under the lock the policy itself sits under, and a receive batch
     /// reads the policy only under that lock. So no flight is held, judged or
     /// recorded under a policy that is no longer in force, however a receive
@@ -631,7 +645,9 @@ fn log_drop(remote: SocketAddr, dropped: Dropped) {
         Dropped::TooLong => "its ClientHello is longer than libssl reads",
         Dropped::Conflict => "two of its packets carry different bytes at one offset",
         Dropped::Frames => "a packet of it carries frames an Initial packet may not",
-        Dropped::EchNotOpened => "its ECH extension does not open under this server's key",
+        Dropped::EchNotOpened => {
+            "its ECH extension does not open under the server key its config_id names"
+        }
         Dropped::Replayed => "its ECH was already admitted from another address",
         Dropped::EchRequired => "it carries no ECH extension and security.require_ech is on",
         Dropped::Anonymous => "its ClientHello carries no server_name",
@@ -1057,7 +1073,13 @@ pub enum Screened {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::EchKey;
     use std::time::Duration;
+
+    /// A policy with the one ECH key `key` and no names.
+    fn keyed(key: Arc<EchKey>) -> Policy {
+        Policy::new(Names::new(&[]), Some(Arc::new(EchKeySet::new(key))), false)
+    }
 
     #[test]
     fn a_replaced_list_is_what_the_next_datagram_is_judged_against() {
@@ -1094,7 +1116,7 @@ mod tests {
     #[test]
     fn the_header_rules_refuse_under_a_key_too() {
         let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
-        let mut screening = Screening::new(Policy::new(Names::new(&[]), Some(key), false));
+        let mut screening = Screening::new(keyed(key));
         let mut datagram = sealed_initial(&[0x51; 8], 0, &[0x01]);
         datagram[1..5].copy_from_slice(&2u32.to_be_bytes());
         let from = SocketAddr::from(([127, 0, 0, 1], 4433));
@@ -1116,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn a_reload_that_removes_the_key_leaves_no_flight_held() {
         let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
-        let expected = Expected::new(Policy::new(Names::new(&[]), Some(key), false));
+        let expected = Expected::new(keyed(key));
         let runtime = quinn::default_runtime().expect("a tokio runtime");
         let socket = runtime
             .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"))

@@ -644,6 +644,16 @@ pub struct Server {
     /// [`crate::tls::EchKey`].
     #[serde(default)]
     pub ech_key: Option<PathBuf>,
+    /// The previous ECH key file during a key rotation, or none.
+    ///
+    /// The same file format as [`Server::ech_key`], read at the same times.
+    /// The server still accepts a handshake under this key and no longer hands
+    /// its ECHConfigList out, so the server can change before its clients do.
+    /// Needs `ech_key`, and a config_id other than its key's, because the
+    /// config_id a ClientHello names is what picks the key. See
+    /// [`crate::tls::EchKeySet`].
+    #[serde(default)]
+    pub ech_previous_key: Option<PathBuf>,
 }
 
 /// `[log]`: logging settings.
@@ -1340,7 +1350,7 @@ pub(crate) mod tests {
 
         // `listen`, `cert` and `key` are the operator's own and have no default
         // to be compared against; `alpn` and `shutdown_grace` do, and `ech_key`
-        // defaults to none.
+        // and `ech_previous_key` default to none.
         let Server {
             listen: _,
             cert: _,
@@ -1348,6 +1358,7 @@ pub(crate) mod tests {
             alpn,
             shutdown_grace,
             ech_key,
+            ech_previous_key,
         } = cfg.server.clone();
 
         assert_eq!(alpn, default_alpn());
@@ -1357,6 +1368,10 @@ pub(crate) mod tests {
         assert!(
             ech_key.is_some(),
             "the example documents server.ech_key with a path"
+        );
+        assert!(
+            ech_previous_key.is_some() && ech_previous_key != ech_key,
+            "the example documents server.ech_previous_key with a path of its own"
         );
     }
 
@@ -1491,7 +1506,8 @@ pub(crate) mod tests {
     /// so a rename cannot pass unnoticed, and it deliberately does *not*
     /// mention the keys added since: `mtu_upper_bound` (v0.4.5),
     /// `security.expected_sni` (v0.9.0), `server.ech_key` and
-    /// `security.require_ech` (both v1.6.0). An upgrade never rewrites
+    /// `security.require_ech` (both v1.6.0), and `server.ech_previous_key`
+    /// (v1.7.0). An upgrade never rewrites
     /// `/etc/volto/config.toml`, so this is the file the new binary actually
     /// gets handed.
     #[test]
@@ -1541,6 +1557,8 @@ pub(crate) mod tests {
         // defaults rather than leaving the file half-applied.
         assert!(cfg.security.expected_sni.is_empty());
         assert!(!cfg.security.require_ech);
+        assert_eq!(cfg.server.ech_key, None);
+        assert_eq!(cfg.server.ech_previous_key, None);
         assert_eq!(cfg.limits.mtu_upper_bound, None);
         assert_eq!(cfg.limits.mtu_upper_bound(), DEFAULT_MTU_UPPER_BOUND);
         assert_eq!(cfg.limits.mtu_upper_bound(), 1436);

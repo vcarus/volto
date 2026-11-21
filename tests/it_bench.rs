@@ -1384,7 +1384,7 @@ fn rustls_quic_session(config: &Arc<rustls::ClientConfig>) -> rustls::quic::Clie
 fn bench_gate_cost_per_first_flight() {
     use rustls::crypto::aws_lc_rs::kx_group;
     use volto::gate::{Names, Policy, Screened, Screening};
-    use volto::tls::{EchKey, ProbeSession, probe_server_config};
+    use volto::tls::{EchKey, EchKeySet, ProbeSession, probe_server_config};
 
     let flights = env_u64("VOLTO_BENCH_FLIGHTS", 20_000);
     let handshakes = env_u64("VOLTO_BENCH_HANDSHAKES", 2_000);
@@ -1402,7 +1402,8 @@ fn bench_gate_cost_per_first_flight() {
 
     let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
     let other = EchKey::generate("public.example", 7, 0).expect("another key");
-    let with_key = || Policy::new(Names::new(&[]), Some(key.clone()), false);
+    let keys = Arc::new(EchKeySet::new(key.clone()));
+    let with_key = || Policy::new(Names::new(&[]), Some(keys.clone()), false);
     let listed = || Policy::from(Names::new(&["localhost".to_owned()]));
     let dcid = [0x5e; 8];
     let from = SocketAddr::from(([127, 0, 0, 1], 40_000));

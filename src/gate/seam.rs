@@ -11,9 +11,10 @@ use quinn::udp::RecvMeta;
 
 use super::initial::{INITIAL_PACKET_TYPE, LONG_HEADER_FORM, QUIC_V1};
 use super::{
-    Classified, Dropped, EchKey, MIN_INITIAL_DATAGRAM, Memory, Names, Policy, Screened, Verdict,
-    classify, flight_fragments, follow, judge, screen_one,
+    Classified, Dropped, MIN_INITIAL_DATAGRAM, Memory, Names, Policy, Screened, Verdict, classify,
+    flight_fragments, follow, judge, screen_one,
 };
+use crate::tls::{EchKey, EchKeySet};
 
 /// What a first flight's CRYPTO bytes said, and the reader that says it.
 ///
@@ -285,7 +286,11 @@ impl<'a> HoldInput<'a> {
 
     /// The gate policy the input's policy byte asks for, under `key`.
     pub fn policy(&self, key: Arc<EchKey>) -> Policy {
-        Policy::new(Names::new(&self.names), Some(key), self.require_ech)
+        Policy::new(
+            Names::new(&self.names),
+            Some(Arc::new(EchKeySet::new(key))),
+            self.require_ech,
+        )
     }
 }
 

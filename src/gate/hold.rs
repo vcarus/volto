@@ -1,5 +1,5 @@
 //! The state the gate keeps while an ECH key is configured: first flights held
-//! until their ClientHello is whole, and the record of every ECH flight the key
+//! until their ClientHello is whole, and the record of every ECH flight a key
 //! opened.
 //!
 //! Everything here is fed by datagrams nobody has authenticated, so every part
@@ -91,8 +91,9 @@ pub const HOLD_TOTAL_BYTES: usize = HOLD_FLIGHTS * HOLD_FLIGHT_BYTES;
 /// a copy of that flight, sent from another address, draw a ServerHello. It is
 /// bounded by count instead, at 2^20 entries. At the limit the oldest entry
 /// goes, so a copy of a flight older than the last 2^20 admitted ones is no
-/// longer recognised. Only a flight the key opened adds an entry. Our own
-/// value.
+/// longer recognised. Only a flight a key opened adds an entry. One record
+/// serves the current and the previous key together, so this bound is the
+/// whole record's with one key or two. Our own value.
 ///
 /// An entry is two 64-bit tags in the map and one in the order queue. A full
 /// record is a map of 2^21 buckets of 17 bytes (the two tags and a control
@@ -133,9 +134,10 @@ pub enum Dropped {
     /// A packet of the flight carried frames that do not parse, or a frame no
     /// Initial packet may carry.
     Frames,
-    /// An ECH extension this server's key does not open.
+    /// An ECH extension that names neither key's config_id, or that the key it
+    /// names does not open.
     EchNotOpened,
-    /// An ECH extension the key opened, already admitted from another address.
+    /// An ECH extension a key opened, already admitted from another address.
     Replayed,
     /// No ECH extension, with `security.require_ech` on.
     EchRequired,
@@ -261,7 +263,7 @@ impl Stream {
     }
 }
 
-/// The record of every ECH flight the key opened: its HPKE `enc` and the
+/// The record of every ECH flight a key opened: its HPKE `enc` and the
 /// address it came from, both as keyed 64-bit tags.
 ///
 /// Tags rather than the values: an X25519 `enc` is 32 bytes and an address up
@@ -314,7 +316,8 @@ impl Replay {
         true
     }
 
-    /// Forgets every entry, for a reload that changed the key.
+    /// Forgets every entry, for a reload after which none of the keys that
+    /// opened them is accepted.
     pub(super) fn clear(&mut self) {
         self.seen = HashMap::new();
         self.order = VecDeque::new();
@@ -683,12 +686,15 @@ impl Memory {
 ///
 /// The rule table of D115's batch 2, in the order a ClientHello answers it:
 ///
-/// 1. An ECH extension that opens under the key is admitted, unless the
-///    replay record holds its `enc` from another address. The outer name is
-///    not consulted: the name a client asks for is the inner one, and the TLS
-///    layer judges that one against `expected_sni`.
-/// 2. An ECH extension that does not open, or is not a well-formed outer one,
-///    is dropped, whether or not `require_ech` is on. Our own rule and a
+/// 1. An ECH extension that opens under the key its config_id names is
+///    admitted, unless the replay record holds its `enc` from another address.
+///    The key is the current one or, during a rotation, the previous one; the
+///    two have different config_ids, so one ClientHello costs at most one HPKE
+///    open. The outer name is not consulted: the name a client asks for is the
+///    inner one, and the TLS layer judges that one against `expected_sni`.
+/// 2. An ECH extension that names neither key's config_id, that the named key
+///    does not open, or that is not a well-formed outer one, is dropped,
+///    whether or not `require_ech` is on. Our own rule and a
 ///    deviation from RFC 9849 §7.1, which has the server go on with the outer
 ///    ClientHello: "Otherwise, if all candidate ECHConfig values fail to
 ///    decrypt the extension, the client-facing server MUST ignore the extension
@@ -730,7 +736,11 @@ fn judge(
         return Some(Err(Dropped::UnreadableExtensions));
     };
     Some(match ech {
-        Ech::Outer(outer) => match policy.ech.as_deref() {
+        Ech::Outer(outer) => match policy
+            .ech
+            .as_deref()
+            .and_then(|keys| keys.by_config_id(outer.config_id))
+        {
             Some(key) if key.opens(body, &outer) => {
                 if replay.admit(&body[outer.enc], from) {
                     Ok(())

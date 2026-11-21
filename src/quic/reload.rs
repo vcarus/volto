@@ -39,14 +39,14 @@ use super::transport::transport_config;
 /// handshake time. QUIC has no way to renegotiate them mid-connection, so this
 /// is a property of the protocol rather than a shortcut.
 ///
-/// It also returns the ECH state the TLS layer was built with, for the startup
+/// It also returns the ECH keys the TLS layer was built with, for the startup
 /// and reload lines, and the gate's policy. Both are taken from the TLS
-/// configuration that was built rather than from the file again, so the line
-/// reports the key in force and the socket gate opens ECH extensions with the
-/// very key libssl holds.
+/// configuration that was built rather than from the files again, so the line
+/// reports the keys in force and the socket gate opens ECH extensions with the
+/// very keys libssl holds.
 pub(super) fn server_config(
     config: &Config,
-) -> Result<(quinn::ServerConfig, Option<Arc<tls::EchKey>>, Policy)> {
+) -> Result<(quinn::ServerConfig, Option<Arc<tls::EchKeySet>>, Policy)> {
     let crypto = tls::server_config(config)?;
     let ech = crypto.ech().cloned();
     let policy = Policy::new(
@@ -248,11 +248,16 @@ impl ReloadHandle {
             path = %path.display(),
             users = config.auth.users.len(),
             cert = %config.server.cert.display(),
-            // The ECH key in force from now on. The public name is one the key
-            // file's check accepted, an LDH host name, so `Display` is safe.
+            // The ECH keys in force from now on: the current key, and the
+            // previous key a rotation still accepts. The public name is one
+            // the key file's check accepted, an LDH host name, so `Display`
+            // is safe.
             ech = ech.is_some(),
-            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.config_id())),
-            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.public_name())),
+            ech_config_id = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.current().config_id())),
+            ech_previous_config_id = %crate::logfmt::or_dash(
+                ech.as_ref().and_then(|e| e.previous()).map(|e| e.config_id())
+            ),
+            ech_public_name = %crate::logfmt::or_dash(ech.as_ref().map(|e| e.current().public_name())),
             // Whether the gate drops every handshake without ECH (D115).
             require_ech = config.security.require_ech,
             "configuration reloaded; new connections will use it"

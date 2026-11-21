@@ -72,7 +72,7 @@ use crate::config;
 use crate::hello;
 use crate::names::Names;
 
-pub use ech::EchKey;
+pub use ech::{EchKey, EchKeySet};
 use ffi::{Ssl, SslCtx};
 use keys::{Secret, Suite, Version};
 
@@ -148,10 +148,10 @@ struct CtxData {
 pub struct ServerConfig {
     ctx: SslCtx,
     data: Arc<CtxData>,
-    /// The ECH key the context holds. The startup line reports it and the
-    /// socket gate opens ECH extensions with it before libssl sees them, so
-    /// all three use the one key loaded per build.
-    ech: Option<Arc<EchKey>>,
+    /// The ECH keys the context holds. The startup line reports them and the
+    /// socket gate opens ECH extensions with them before libssl sees them, so
+    /// all three use the one set loaded per build.
+    ech: Option<Arc<EchKeySet>>,
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -164,8 +164,8 @@ impl std::fmt::Debug for ServerConfig {
 }
 
 impl ServerConfig {
-    /// The ECH key this configuration was built with, if ECH is on.
-    pub fn ech(&self) -> Option<&Arc<EchKey>> {
+    /// The ECH keys this configuration was built with, if ECH is on.
+    pub fn ech(&self) -> Option<&Arc<EchKeySet>> {
         self.ech.as_ref()
     }
 }
@@ -174,7 +174,8 @@ impl ServerConfig {
 ///
 /// Called again on `SIGHUP`, which is how a renewed certificate or a new ECH
 /// key is picked up: the files are re-read here and the result is handed to
-/// `Endpoint::set_server_config`.
+/// `Endpoint::set_server_config`. `server.ech_previous_key` is read only beside
+/// `server.ech_key`; the configuration refuses it alone (`Config::validate`).
 pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
     let server = &config.server;
     let certs = super::load_certs(&server.cert)?;
@@ -182,7 +183,7 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
     let ech = server
         .ech_key
         .as_deref()
-        .map(EchKey::load)
+        .map(|current| EchKeySet::load(current, server.ech_previous_key.as_deref()))
         .transpose()?
         .map(Arc::new);
     Builder {
@@ -193,7 +194,7 @@ pub fn server_config(config: &config::Config) -> Result<ServerConfig> {
         ..Builder::new(
             certs.iter().map(|c| c.as_ref().to_vec()).collect(),
             key,
-            ech.as_ref(),
+            ech,
         )
     }
     .build()
@@ -205,7 +206,7 @@ struct Builder<'a> {
     key: Zeroizing<Vec<u8>>,
     alpn: Vec<Vec<u8>>,
     names: Names,
-    ech: Option<&'a Arc<EchKey>>,
+    ech: Option<Arc<EchKeySet>>,
     refuse_unaccepted_ech: bool,
     require_ech: bool,
     groups: &'a [u16],
@@ -216,14 +217,14 @@ impl<'a> Builder<'a> {
     /// A builder for `certs`, `key` and `ech` with everything else at its
     /// default: ALPN `h3`, no gate list, the second ECH line on whenever there
     /// is an ECH key, no `require_ech`, [`GROUPS`] and no keylog.
-    fn new(certs: Vec<Vec<u8>>, key: Zeroizing<Vec<u8>>, ech: Option<&'a Arc<EchKey>>) -> Self {
+    fn new(certs: Vec<Vec<u8>>, key: Zeroizing<Vec<u8>>, ech: Option<Arc<EchKeySet>>) -> Self {
         Self {
             certs,
             key,
             alpn: vec![b"h3".to_vec()],
             names: Names::new(&[]),
-            ech,
             refuse_unaccepted_ech: ech.is_some(),
+            ech,
             require_ech: false,
             groups: &GROUPS,
             keylog: None,
@@ -335,9 +336,10 @@ impl<'a> Builder<'a> {
             }
         }
 
-        if let Some(key) = self.ech {
-            let keys = key.keys()?;
-            // SAFETY: `keys` holds one ECHConfig marked as a retry config;
+        if let Some(set) = &self.ech {
+            let keys = set.ssl_keys()?;
+            // SAFETY: `keys` holds the current key's ECHConfig marked as a
+            // retry config, and the previous key's after it when there is one;
             // SSL_CTX_set1_ech_keys takes its own reference to it, and the
             // context is still unshared.
             ffi::check(
@@ -349,7 +351,7 @@ impl<'a> Builder<'a> {
         Ok(ServerConfig {
             ctx,
             data,
-            ech: self.ech.cloned(),
+            ech: self.ech,
         })
     }
 }
@@ -1362,13 +1364,14 @@ impl crypto::Session for FailedSession {
 pub const PROBE_HELD_LIMIT: usize = hello::MAX_INITIAL_FLIGHT + 64 * 1024;
 
 /// A server configuration for [`ProbeSession`]: the certificate and key as
-/// DER, ALPN `h3`, no gate list, and the ECH key if given. Everything else is
-/// what [`server_config`] builds.
+/// DER, ALPN `h3`, no gate list, and the ECH key if given, as the only key of
+/// its set. Everything else is what [`server_config`] builds.
 pub fn probe_server_config(
     cert: &[u8],
     key: &[u8],
     ech: Option<&Arc<EchKey>>,
 ) -> Result<Arc<ServerConfig>> {
+    let ech = ech.map(|key| Arc::new(EchKeySet::new(key.clone())));
     Builder::new(vec![cert.to_vec()], Zeroizing::new(key.to_vec()), ech)
         .build()
         .map(Arc::new)

@@ -118,7 +118,7 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     tcp_and_udp(&mut client, &server).await;
     let start = one_line(&buffer, mark, "accepting QUIC connections");
     assert!(
-        start.contains("ech=false ech_config_id=- ech_public_name=-"),
+        start.contains("ech=false ech_config_id=- ech_previous_config_id=- ech_public_name=-"),
         "{start}"
     );
     let line = one_line(&buffer, mark, "TLS handshake complete");
@@ -145,7 +145,7 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     let start = one_line(&buffer, mark, "accepting QUIC connections");
     assert!(
         start.contains(&format!(
-            "ech=true ech_config_id=7 ech_public_name={PUBLIC_NAME}"
+            "ech=true ech_config_id=7 ech_previous_config_id=- ech_public_name={PUBLIC_NAME}"
         )),
         "{start}"
     );
@@ -189,7 +189,7 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     let reloaded = one_line(&buffer, mark, "configuration reloaded");
     assert!(
         reloaded.contains(&format!(
-            "ech=true ech_config_id=9 ech_public_name={PUBLIC_NAME}"
+            "ech=true ech_config_id=9 ech_previous_config_id=- ech_public_name={PUBLIC_NAME}"
         )),
         "{reloaded}"
     );

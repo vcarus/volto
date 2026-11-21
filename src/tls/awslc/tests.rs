@@ -33,8 +33,8 @@ use zeroize::Zeroizing;
 use super::ech::pem_block;
 use super::ffi::{self, OpensslBytes};
 use super::{
-    Builder, EchKey, GROUPS, HandshakeData, Names, OP_NO_TICKET, ProbeSession, ServerConfig,
-    Session, Version, keys,
+    Builder, EchKey, EchKeySet, GROUPS, HandshakeData, Names, OP_NO_TICKET, ProbeSession,
+    ServerConfig, Session, Version, keys,
 };
 use crate::hello::{self, EXT_ECH};
 
@@ -71,6 +71,20 @@ fn ech_key(config_id: u8) -> Arc<EchKey> {
     Arc::new(EchKey::generate(PUBLIC_NAME, config_id, 32).expect("generate an ECH key"))
 }
 
+/// The key set of `key` alone.
+fn alone(key: &Arc<EchKey>) -> Arc<EchKeySet> {
+    Arc::new(EchKeySet::new(key.clone()))
+}
+
+/// The key set of `current` with `previous` beside it.
+fn rotating(current: &Arc<EchKey>, previous: &Arc<EchKey>) -> Arc<EchKeySet> {
+    Arc::new(
+        EchKeySet::new(current.clone())
+            .with_previous(previous.clone())
+            .expect("two config_ids"),
+    )
+}
+
 /// A server on `id`, with ECH under `ech` and the second gate's list `names`,
 /// built as `server_config` builds one: with a key, the second ECH line on.
 fn server(
@@ -79,12 +93,12 @@ fn server(
     groups: &[u16],
     names: &[&str],
 ) -> Arc<ServerConfig> {
-    built(id, ech, groups, names, ech.is_some(), false)
+    built(id, ech.map(alone), groups, names, ech.is_some(), false)
 }
 
 /// The same server with `require_ech` on.
 fn requiring(id: &Identity, ech: &Arc<EchKey>) -> Arc<ServerConfig> {
-    built(id, Some(ech), &GROUPS, &[], true, true)
+    built(id, Some(alone(ech)), &GROUPS, &[], true, true)
 }
 
 /// A server whose second ECH line is off, which is libssl's own ECH behaviour
@@ -99,12 +113,12 @@ fn libssl_alone(
     groups: &[u16],
     names: &[&str],
 ) -> Arc<ServerConfig> {
-    built(id, Some(ech), groups, names, false, false)
+    built(id, Some(alone(ech)), groups, names, false, false)
 }
 
 fn built(
     id: &Identity,
-    ech: Option<&Arc<EchKey>>,
+    ech: Option<Arc<EchKeySet>>,
     groups: &[u16],
     names: &[&str],
     refuse_unaccepted_ech: bool,
@@ -262,6 +276,8 @@ struct Outcome {
     /// Whether the server's EncryptedExtensions carried an ECH extension
     /// (the `retry_configs`).
     retry_configs_sent: bool,
+    /// That extension's body, which is the ECHConfigList the server sent.
+    retry_configs: Option<Vec<u8>>,
     /// Whether the server sent a Certificate message.
     certificate_sent: bool,
     server_error: Option<String>,
@@ -302,6 +318,22 @@ fn extension_types(block: &[u8]) -> Vec<u16> {
         at += 4 + usize::from(u16::from_be_bytes([block[at + 2], block[at + 3]]));
     }
     out
+}
+
+/// The body of the extension of type `wanted` in an extension block
+/// `<0..2^16-1>` at `block`.
+fn extension_body(block: &[u8], wanted: u16) -> Option<&[u8]> {
+    let mut at = 2;
+    while at + 4 <= block.len() {
+        let kind = u16::from_be_bytes([block[at], block[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([block[at + 2], block[at + 3]]));
+        let body = block.get(at + 4..at + 4 + len)?;
+        if kind == wanted {
+            return Some(body);
+        }
+        at += 4 + len;
+    }
+    None
 }
 
 /// The extensions of a NewSessionTicket body: ticket_lifetime (4),
@@ -409,8 +441,11 @@ fn handshake(
                 if kind == SERVER_HELLO && body.get(2..34) == Some(&HRR_RANDOM[..]) {
                     out.hello_retry = true;
                 }
-                if kind == ENCRYPTED_EXTENSIONS && extension_types(body).contains(&EXT_ECH) {
+                if kind == ENCRYPTED_EXTENSIONS
+                    && let Some(list) = extension_body(body, EXT_ECH)
+                {
                     out.retry_configs_sent = true;
+                    out.retry_configs = Some(list.to_vec());
                 }
                 if kind == CERTIFICATE {
                     out.certificate_sent = true;
@@ -784,6 +819,49 @@ fn the_second_ech_line_refuses_ech_it_did_not_accept_before_anything_is_sent() {
         );
         assert!(!outcome.retry_configs_sent, "{what}");
     }
+}
+
+/// With a previous key beside the current one, libssl accepts ECH under
+/// either, and the retry configs it sends to a ClientHello that neither key
+/// opens are the current key's ECHConfigList and nothing else, because the
+/// previous key is added with `is_retry_config = 0`.
+///
+/// The last row runs libssl with the second ECH line off, which is the only
+/// way to see the retry configs: with it on, that ClientHello is refused
+/// before anything is sent.
+#[test]
+fn a_previous_key_is_accepted_and_is_never_sent_as_a_retry_config() {
+    let id = identity();
+    let previous = ech_key(1);
+    let current = ech_key(2);
+    let keys = rotating(&current, &previous);
+    for (what, key) in [
+        ("the current key", &current),
+        ("the previous key", &previous),
+    ] {
+        let outcome = run(
+            built(&id, Some(keys.clone()), &GROUPS, &[], true, false),
+            Some(enable(&key.config_list())),
+            pq_first(),
+        );
+        assert!(
+            outcome.ech_accepted && outcome.server_done && outcome.client_done,
+            "{what}: {outcome:?}"
+        );
+        assert!(!outcome.retry_configs_sent, "{what}");
+    }
+
+    let outcome = run(
+        built(&id, Some(keys), &GROUPS, &[], false, false),
+        Some(enable(&ech_key(3).config_list())),
+        pq_first(),
+    );
+    assert!(!outcome.ech_accepted, "{outcome:?}");
+    assert_eq!(
+        outcome.retry_configs.as_deref(),
+        Some(&current.config_list()[..]),
+        "the retry configs are the current key's list alone"
+    );
 }
 
 /// Under `require_ech` the second line also refuses a ClientHello with no ECH
@@ -1369,7 +1447,12 @@ fn a_probe_configuration_reports_its_ech_key() {
     let id = identity();
     let key = ech_key(7);
     let config = super::probe_server_config(&id.cert, &id.key, Some(&key)).expect("a server");
-    assert!(config.ech().is_some_and(|held| Arc::ptr_eq(held, &key)));
+    assert!(
+        config
+            .ech()
+            .is_some_and(|held| Arc::ptr_eq(held.current(), &key))
+    );
+    assert!(config.ech().is_some_and(|held| held.previous().is_none()));
 }
 
 /// The first ClientHello of a plain client with X25519MLKEM768 first.

@@ -39,11 +39,21 @@ key = "/etc/volto/privkey.pem"
 # ECH key file, written by `volto ech-keygen --public-name <name> --out <file>`,
 # which also prints the ECHConfigList a client's `ech-config` takes
 # (`volto ech-config <file>` prints it again). Keep the list private: it is what
-# lets a client in. A handshake whose ECH extension this key does not open is
-# dropped without any reply, so change the key and the clients' list together.
-# The public name does not go in [security] expected_sni. Not set by default,
-# which is plain TLS 1.3. docs/configuration.md#encrypted-client-hello
+# lets a client in. A handshake whose ECH extension no configured key opens is
+# dropped without any reply; ech_previous_key below lets a key change reach the
+# server before the clients. The public name does not go in [security]
+# expected_sni. Not set by default, which is plain TLS 1.3.
+# docs/configuration.md#encrypted-client-hello
 #ech_key = "/etc/volto/ech.pem"
+
+# The previous ECH key file, during a key rotation: the key ech_key replaced.
+# A handshake under it is still accepted and its list is no longer sent to
+# anyone, so the clients can move to the new list after the server has. Same
+# file format as ech_key. Needs ech_key, and a config_id other than that key's,
+# because the config_id a client names picks the key. Remove it and reload once
+# no client uses the old list. Not set by default. Reloadable.
+# docs/deployment.md#rotating-the-ech-key
+#ech_previous_key = "/etc/volto/ech-old.pem"
 
 [auth]
 # Credentials accepted on every CONNECT request, as HTTP Basic.

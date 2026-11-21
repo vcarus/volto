@@ -31,7 +31,8 @@ whole and the running configuration keeps serving; see
 | `key` | path | required | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `alpn` | array of strings | `["h3"]` | ALPN identifiers to advertise, in preference order. Change only for interop debugging. A list that does not offer `h3` starts a server no client can reach — HTTP/3 is the only protocol volto serves, so TLS ends every handshake with `no_application_protocol`, an alert that says nothing about why — and volto warns about it at startup |
 | `shutdown_grace` | seconds | `5` | How long established tunnels may finish after SIGTERM. Range 0..3600, where `0` closes every tunnel at once. [Graceful shutdown](deployment.md#graceful-shutdown) gives why the default is short, how long the whole exit can take and the `TimeoutStopSec` that needs |
-| `ech_key` | path | none | ECH key file written by `volto ech-keygen`. Without it the server is plain TLS 1.3; with it the server also accepts Encrypted Client Hello, and drops a handshake whose ECH extension the key does not open without any reply. See [Encrypted Client Hello](#encrypted-client-hello) |
+| `ech_key` | path | none | ECH key file written by `volto ech-keygen`. Without it the server is plain TLS 1.3; with it the server also accepts Encrypted Client Hello, and drops a handshake whose ECH extension no configured key opens without any reply. See [Encrypted Client Hello](#encrypted-client-hello) |
+| `ech_previous_key` | path | none | The previous ECH key file during a key rotation, in the format `ech_key` takes. A handshake under this key is still accepted, and its ECHConfigList is not sent to anyone. Needs `ech_key` and a config_id other than that key's, and is refused otherwise, at startup, by `--check-config` and on reload. Reloadable. See [Rotating the key](#rotating-the-key) |
 
 ### Encrypted Client Hello
 
@@ -89,17 +90,13 @@ digits nor `0x` followed by hex digits (RFC 9849 §6.1.7). `ech-keygen` applies
 the same rule to `--public-name`. A refused file at `SIGHUP` leaves the running
 key in force.
 
-**Rotating the key** is a new file and a reload, and the server holds one key at
-a time; the steps are under
-[Encrypted Client Hello](deployment.md#encrypted-client-hello) in deployment.md.
-
 **What each ClientHello gets**, with a key configured:
 
 | ClientHello | `require_ech = false` | `require_ech = true` |
 |---|---|---|
 | no ECH extension | judged by `expected_sni` as usual | dropped without a reply |
-| an ECH extension the key opens | admitted; the name in the clear is not looked at | admitted; the name in the clear is not looked at |
-| an ECH extension the key does not open (an older key, GREASE, a damaged payload) | dropped without a reply | dropped without a reply |
+| an ECH extension the key its config_id names opens, `ech_key` or `ech_previous_key` | admitted; the name in the clear is not looked at | admitted; the name in the clear is not looked at |
+| an ECH extension no configured key opens (a key no longer configured, GREASE, a damaged payload) | dropped without a reply | dropped without a reply |
 | the ECH of a handshake already admitted, sent again from another address | dropped without a reply | dropped without a reply |
 
 A dropped ClientHello gets nothing back, not even a QUIC acknowledgement, and
@@ -108,8 +105,11 @@ purpose: the RFC has a server go on with the outer ClientHello and send its
 ECHConfigList back as `retry_configs`, which would hand the list to anyone who
 sends an ECH extension at all. The same ECH sent again from the address it
 first came from is admitted, which is a client retransmitting its first
-packets. The record of admitted ECH handshakes lives in memory, is emptied by a
-reload that changes the key, and is lost at a restart.
+packets. The record of admitted ECH handshakes lives in memory. A reload keeps
+it while the new keys include one of the old ones, which is the case in every
+step of a rotation, so a first flight recorded under the old key stays a replay
+from another address. A reload after which none of the old keys is accepted
+empties it, and a restart loses it.
 
 The TLS layer refuses the same ClientHellos a second time, in case the gate
 ever lets one through: a ClientHello whose ECH extension libssl did not accept,
@@ -122,6 +122,18 @@ is admitted without its public name being looked at, so the public name does
 not belong in `expected_sni`; listing it would make it a second name a probe
 could copy. The TLS layer still judges the name inside the encrypted
 ClientHello against `expected_sni`, so the real name stays on the list.
+
+#### Rotating the key
+
+`ech_previous_key` names the key a rotation replaces, so the server can change
+first and the clients after it. The server then accepts ECH under either key.
+It picks the key by the config_id the ClientHello names, so the two keys must
+have different config_ids, and a first flight is still opened with one key at
+most. libssl holds the previous key as a key it decrypts with and never sends:
+its `retry_configs` would carry the current key's ECHConfigList alone, and the
+gate and the TLS layer keep every ClientHello that would draw them from getting
+that far, as the paragraphs above say. The steps are under [Rotating the ECH key](deployment.md#rotating-the-ech-key) in
+deployment.md.
 
 ## `[auth]`
 
@@ -775,7 +787,9 @@ range and cross-field rule (`keep_alive_interval` against `max_idle_timeout`,
 `server.cert` and `server.key` exist and are files. When `server.cert` reads as
 a PEM certificate chain, its leaf is parsed and refused in the words startup
 uses if the server's TLS would refuse it. `server.ech_key`, when set, is read
-whole: the same checks startup makes on that file. One thing outside the file
+whole: the same checks startup makes on that file. So is
+`server.ech_previous_key`, together with the check that its config_id differs
+from the current key's. One thing outside the file
 is judged too: `RUST_LOG`, when it is set in the check's environment, by the
 rule startup holds it to, so a value that would stop the start fails the check
 with the same message, and one startup would ignore is a warning.
@@ -902,6 +916,7 @@ with the table below and the line number in the journal.
 | `[security].expected_sni` | v0.9.0 |
 | `[server].ech_key` | v1.6.0 |
 | `[security].require_ech` | v1.6.0 |
+| `[server].ech_previous_key` | v1.7.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
 matters in practice, because the shipped example sets it and every install made by

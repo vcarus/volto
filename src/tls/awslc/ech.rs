@@ -1,5 +1,6 @@
-//! The server's ECH key: one X25519 HPKE key and the one ECHConfig made from
-//! it, kept together in one file.
+//! The server's ECH keys: each is one X25519 HPKE key and the one ECHConfig
+//! made from it, kept together in one file, and [`EchKeySet`] is the current
+//! key with the previous one a rotation still accepts.
 //!
 //! A client holds the ECHConfigList as something an operator typed in
 //! (Surge's `ech-config`), so the list has to be the same on every start and
@@ -17,6 +18,7 @@
 //! second key or a second list is refused rather than ignored.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use aws_lc_sys as sys;
@@ -141,7 +143,13 @@ impl EchKey {
     /// Errors name the file, prefixed `server.ech_key = <path>`, because that is
     /// where an operator has to look.
     pub fn load(path: &Path) -> Result<Self> {
-        let what = || format!("server.ech_key = {}", path.display());
+        Self::load_as("server.ech_key", path)
+    }
+
+    /// [`EchKey::load`], with errors prefixed by `setting`, the configuration
+    /// key that names the file.
+    fn load_as(setting: &str, path: &Path) -> Result<Self> {
+        let what = || format!("{setting} = {}", path.display());
         let text = Zeroizing::new(
             std::fs::read(path).with_context(|| format!("failed to read {}", what()))?,
         );
@@ -349,34 +357,165 @@ impl EchKey {
         opened
     }
 
-    /// The keys object an `SSL_CTX` takes, holding this one ECHConfig.
+    /// A keys object holding this one ECHConfig as a retry config, which is
+    /// AWS-LC's check of the key: the version, the KEM, every HPKE suite,
+    /// every extension, and that the ECHConfig's public key is the public half
+    /// of the private key (`ECHServerConfig::Init`). [`EchKeySet::ssl_keys`]
+    /// builds the object the server's `SSL_CTX` takes.
+    fn keys(&self) -> Result<EchKeys> {
+        let keys = new_keys()?;
+        self.add_to(&keys, true)?;
+        Ok(keys)
+    }
+
+    /// Appends this ECHConfig and its key to `keys`, as a retry config when
+    /// `retry` is set.
     ///
-    /// The config is added with `is_retry_config = 1`. AWS-LC refuses a set
-    /// with no retry config (`SSL_CTX_set1_ech_keys` fails with
-    /// `ECH_SERVER_WOULD_HAVE_NO_RETRY_CONFIGS`), and RFC 9849 §7.1 asks the
-    /// same: "If the server is configured with any ECHConfigs, it MUST include
-    /// the "encrypted_client_hello" extension in its EncryptedExtensions with
-    /// the "retry_configs" field set to one or more ECHConfig structures with
-    /// up-to-date keys." So libssl on its own would send this ECHConfigList to
-    /// a ClientHello whose ECH extension this key does not open; the socket
-    /// gate and `judge_client_hello` keep that from happening.
-    pub(super) fn keys(&self) -> Result<EchKeys> {
-        // SAFETY: SSL_ECH_KEYS_new takes no arguments and returns a new set or
-        // null, which `from_ptr` turns into an error.
-        let keys = EchKeys::from_ptr(unsafe { sys::SSL_ECH_KEYS_new() }, "SSL_ECH_KEYS_new")?;
-        // SAFETY: `keys` is a fresh set nothing else holds yet; the config
-        // buffer and the HPKE key are valid for the call. AWS-LC parses and
-        // copies the config and takes its own copy of the key.
+    /// `ssl.h`, `SSL_ECH_KEYS_add`: "If |is_retry_config| is non-zero, this
+    /// config will be returned to the client on configuration mismatch."
+    fn add_to(&self, keys: &EchKeys, retry: bool) -> Result<()> {
+        // SAFETY: `keys` is a set no `SSL_CTX` holds yet, which is the state
+        // `SSL_ECH_KEYS_add` requires ("This configuration must be completed
+        // before setting |keys| on an |SSL_CTX|"); the config buffer and the
+        // HPKE key are valid for the call. AWS-LC parses and copies the config
+        // and takes its own copy of the key.
         let rc = unsafe {
             sys::SSL_ECH_KEYS_add(
                 keys.as_ptr(),
-                1,
+                std::ffi::c_int::from(retry),
                 self.config.as_ptr(),
                 self.config.len(),
                 self.hpke.as_ptr(),
             )
         };
-        ffi::check(rc, "SSL_ECH_KEYS_add")?;
+        ffi::check(rc, "SSL_ECH_KEYS_add")
+    }
+
+    /// Whether `self` and `other` are the same key.
+    ///
+    /// Compared by the ECHConfigList each one prints, which holds the public
+    /// key, so two files with the same list hold the same key. A reload reads
+    /// the files again, so the two are never the same allocation even when the
+    /// key did not change.
+    fn same_as(&self, other: &EchKey) -> bool {
+        self.config == other.config
+    }
+}
+
+/// A new, empty keys object.
+fn new_keys() -> Result<EchKeys> {
+    // SAFETY: SSL_ECH_KEYS_new takes no arguments and returns a new set or
+    // null, which `from_ptr` turns into an error.
+    EchKeys::from_ptr(unsafe { sys::SSL_ECH_KEYS_new() }, "SSL_ECH_KEYS_new")
+}
+
+/// The ECH keys the server accepts: the current key, whose ECHConfigList the
+/// clients are given, and during a rotation the previous one, which is still
+/// accepted and is no longer handed out.
+///
+/// The two keys have different config_ids, which [`EchKeySet::with_previous`]
+/// checks. So the config_id a ClientHello names picks at most one key, the
+/// socket gate opens an ECH extension with that key alone, and a first flight
+/// costs at most one HPKE open with one key or with two (D115).
+#[derive(Debug)]
+pub struct EchKeySet {
+    current: Arc<EchKey>,
+    previous: Option<Arc<EchKey>>,
+}
+
+impl EchKeySet {
+    /// The set of `current` alone.
+    pub fn new(current: Arc<EchKey>) -> Self {
+        Self {
+            current,
+            previous: None,
+        }
+    }
+
+    /// This set with `previous` accepted beside its current key.
+    ///
+    /// Refused when the two keys share a config_id, because the config_id is
+    /// what picks the key.
+    pub fn with_previous(self, previous: Arc<EchKey>) -> Result<Self> {
+        let id = self.current.config_id;
+        ensure!(
+            previous.config_id != id,
+            "server.ech_key and server.ech_previous_key both have config_id {id}, and the \
+             server picks the key by its config_id: generate the new key with another \
+             config_id (volto ech-keygen --config-id)"
+        );
+        Ok(Self {
+            previous: Some(previous),
+            ..self
+        })
+    }
+
+    /// Reads the key file `current` and, when given, the key file `previous`,
+    /// and checks that they form a set.
+    ///
+    /// Errors name the file by the configuration key that names it:
+    /// `server.ech_key` or `server.ech_previous_key`.
+    pub fn load(current: &Path, previous: Option<&Path>) -> Result<Self> {
+        let set = Self::new(Arc::new(EchKey::load(current)?));
+        match previous {
+            Some(path) => {
+                set.with_previous(Arc::new(EchKey::load_as("server.ech_previous_key", path)?))
+            }
+            None => Ok(set),
+        }
+    }
+
+    /// The key whose ECHConfigList the clients are given.
+    pub fn current(&self) -> &Arc<EchKey> {
+        &self.current
+    }
+
+    /// The key still accepted during a rotation, if there is one.
+    pub fn previous(&self) -> Option<&Arc<EchKey>> {
+        self.previous.as_ref()
+    }
+
+    /// Every key of the set, the current one first.
+    fn all(&self) -> impl Iterator<Item = &EchKey> {
+        std::iter::once(&*self.current).chain(self.previous.as_deref())
+    }
+
+    /// The key whose ECHConfig has `config_id`, if the set holds one.
+    pub fn by_config_id(&self, config_id: u8) -> Option<&EchKey> {
+        self.all().find(|key| key.config_id == config_id)
+    }
+
+    /// Whether `self` and `other` hold at least one key in common.
+    pub fn shares_a_key_with(&self, other: &EchKeySet) -> bool {
+        self.all()
+            .any(|ours| other.all().any(|theirs| ours.same_as(theirs)))
+    }
+
+    /// The keys object an `SSL_CTX` takes: the current key as a retry config,
+    /// and the previous key, when there is one, as a key libssl decrypts with
+    /// and never sends.
+    ///
+    /// The current key is added first. `ssl.h`, `SSL_ECH_KEYS_add`: "This
+    /// function should be called successively to register each ECHConfig in
+    /// decreasing order of preference." The previous key is added with
+    /// `is_retry_config = 0`, because a retry config is the list "returned to
+    /// the client on configuration mismatch" (the same comment), and the list
+    /// a client is to move to is the current one. `SSL_CTX_set1_ech_keys`
+    /// refuses a set without a retry config: "If |keys| does not contain any
+    /// retry configs, this function will fail." The current key is always one,
+    /// and RFC 9849 §7.1 asks for it: "If the server is configured with any
+    /// ECHConfigs, it MUST include the "encrypted_client_hello" extension in
+    /// its EncryptedExtensions with the "retry_configs" field set to one or
+    /// more ECHConfig structures with up-to-date keys." So libssl on its own
+    /// would send the current ECHConfigList to a ClientHello whose ECH
+    /// extension neither key opens; the socket gate and `judge_client_hello`
+    /// keep that from happening.
+    pub(super) fn ssl_keys(&self) -> Result<EchKeys> {
+        let keys = new_keys()?;
+        self.current.add_to(&keys, true)?;
+        if let Some(previous) = &self.previous {
+            previous.add_to(&keys, false)?;
+        }
         Ok(keys)
     }
 }
@@ -862,6 +1001,76 @@ mod tests {
         pem_block(&mut text, "PRIVATE KEY", &p256.serialize_der());
         pem_block(&mut text, "ECHCONFIG", &key.config_list());
         refused(&text, "not an X25519 key");
+    }
+
+    /// A set picks its key by config_id, refuses a previous key that shares
+    /// the current key's, and shares a key with another set exactly when one
+    /// of its keys is the same key as one of the other's.
+    #[test]
+    fn a_key_set_picks_by_config_id_and_refuses_one_config_id_twice() {
+        let current = Arc::new(EchKey::generate("public.example", 2, 0).expect("a key"));
+        let previous = Arc::new(EchKey::generate("public.example", 1, 0).expect("a key"));
+        let alone = EchKeySet::new(current.clone());
+        let both = EchKeySet::new(current.clone())
+            .with_previous(previous.clone())
+            .expect("two config_ids");
+        assert!(alone.by_config_id(1).is_none());
+        assert!(
+            both.by_config_id(1)
+                .is_some_and(|key| key.same_as(&previous))
+        );
+        assert!(
+            both.by_config_id(2)
+                .is_some_and(|key| key.same_as(&current))
+        );
+        assert!(both.by_config_id(3).is_none());
+
+        let twin = Arc::new(EchKey::generate("public.example", 2, 0).expect("a key"));
+        let error = EchKeySet::new(current.clone())
+            .with_previous(twin.clone())
+            .expect_err("one config_id twice");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("config_id 2") && message.contains("another config_id"),
+            "{message}"
+        );
+
+        // The same key read again from its file is the same key.
+        let reread = Arc::new(EchKey::from_pem(current.to_pem().as_bytes()).expect("read back"));
+        let rotated = EchKeySet::new(Arc::new(
+            EchKey::generate("public.example", 3, 0).expect("a key"),
+        ))
+        .with_previous(reread)
+        .expect("two config_ids");
+        assert!(rotated.shares_a_key_with(&alone));
+        assert!(alone.shares_a_key_with(&both));
+        assert!(!EchKeySet::new(twin).shares_a_key_with(&both));
+    }
+
+    /// A previous key file that does not load is reported under its own
+    /// configuration key.
+    #[test]
+    fn a_bad_previous_key_file_is_named_by_its_own_key() {
+        let dir = crate::tls::tests::scratch();
+        let current = dir.join("ech.pem");
+        let previous = dir.join("ech-old.pem");
+        std::fs::write(
+            &current,
+            EchKey::generate("public.example", 2, 0)
+                .expect("a key")
+                .to_pem()
+                .as_bytes(),
+        )
+        .expect("write the current key");
+        std::fs::write(&previous, "not a key file\n").expect("write the previous key");
+        let error = EchKeySet::load(&current, Some(&previous)).expect_err("a bad previous key");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with(&format!("server.ech_previous_key = {}", previous.display())),
+            "{message}"
+        );
+        assert!(EchKeySet::load(&current, None).is_ok());
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     /// The public name rules of RFC 9849 §6.1.7, each one red on its own row.

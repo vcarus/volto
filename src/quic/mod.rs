@@ -179,9 +179,9 @@ pub struct Server {
     /// reloaded value already there and say nothing. The subscriber itself is
     /// installed once, in `main`, before this type exists; see [`ReloadHandle`].
     startup_log_level: String,
-    /// The ECH state the server was bound with, for the startup line. A reload
+    /// The ECH keys the server was bound with, for the startup line. A reload
     /// reports its own in the reload line.
-    ech: Option<Arc<crate::tls::EchKey>>,
+    ech: Option<Arc<crate::tls::EchKeySet>>,
 }
 
 impl Server {
@@ -368,13 +368,17 @@ impl Server {
             // say, which is why they are `Option`s rather than a sentinel.
             so_rcvbuf = self.socket_buffers.recv,
             so_sndbuf = self.socket_buffers.send,
-            // Whether ECH is on, and under which config_id and public name.
-            // Nothing secret: both are in the ECHConfigList a client holds and
+            // Whether ECH is on, under which config_id and public name, and
+            // the config_id of the previous key a rotation still accepts.
+            // Nothing secret: each is in the ECHConfigList a client holds and
             // in every ClientHello it sends. The public name passed the key
             // file's LDH check, so `Display` is safe.
             ech = self.ech.is_some(),
-            ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.config_id())),
-            ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.public_name())),
+            ech_config_id = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.current().config_id())),
+            ech_previous_config_id = %crate::logfmt::or_dash(
+                self.ech.as_ref().and_then(|e| e.previous()).map(|e| e.config_id())
+            ),
+            ech_public_name = %crate::logfmt::or_dash(self.ech.as_ref().map(|e| e.current().public_name())),
             // Whether the gate drops every handshake without ECH (D115).
             require_ech = config.security.require_ech,
             "accepting QUIC connections"
