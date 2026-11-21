@@ -150,9 +150,8 @@ endpoint driver polls again after every batch, so this needs no timer. A
 dropped flight is discarded whole and nothing is sent. The hold is bounded in
 time, in the number of flights and in bytes, each by a named constant in
 `gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
-`enc` values is bounded by count rather than time, kept by a reload whose keys
-include one of the old ones, emptied by a reload after which none of them is
-accepted, and lost at a restart; only a flight a key opened can add to it. The TLS layer's ClientHello callback refuses the same ClientHellos a second
+`enc` values is bounded by count rather than time, kept by every reload and
+lost at a restart; only a flight a key opened can add to it. The TLS layer's ClientHello callback refuses the same ClientHellos a second
 time, so a defect in the gate costs a `handshake_failure` alert rather than the
 ECHConfigList; [Encrypted Client Hello](configuration.md#encrypted-client-hello)
 says which.

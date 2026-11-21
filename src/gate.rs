@@ -177,10 +177,8 @@
 //! **The replay record** keeps every `enc` a key opened, with its address,
 //! for the life of the process up to `REPLAY_ENTRIES`, and does not expire by
 //! time. Only a flight a key opened adds to it, so a peer without a key cannot
-//! grow it. A reload keeps it while the new keys include one of the old ones,
-//! so a rotation keeps it, and empties it when none of the old keys is
-//! accepted any more ([`Expected::set`] says why). It is not kept across a
-//! restart.
+//! grow it. No reload empties it, whatever it does to the keys
+//! ([`Expected::set`] says why). It is not kept across a restart.
 //!
 //! **Limits.** Two are known and not handled. First, the replay record admits
 //! whichever copy of a flight completes first. A copy that reaches the server
@@ -325,17 +323,9 @@ impl From<Names> for Policy {
     }
 }
 
-/// Puts `new` in force, with what the change does to the hold and the replay
-/// record: a set of ECH keys that holds none of the old set's keys empties the
-/// record, and no key empties the hold. [`Expected::set`] says why.
+/// Puts `new` in force, with what the change does to the hold: no key empties
+/// it. The replay record is left as it is. [`Expected::set`] says why.
 fn follow(memory: &mut Memory, new: Arc<Policy>) {
-    let keeps_a_key = match (memory.policy.ech.as_deref(), new.ech.as_deref()) {
-        (Some(old), Some(new)) => new.shares_a_key_with(old),
-        _ => false,
-    };
-    if !keeps_a_key {
-        memory.replay.clear();
-    }
     if new.ech.is_none() {
         memory.hold.clear();
     }
@@ -349,10 +339,9 @@ fn follow(memory: &mut Memory, new: Arc<Policy>) {
 /// without being rebuilt, since rebuilding it would mean rebinding the port.
 ///
 /// The policy sits under one lock with the hold and the replay record, which
-/// live here rather than in [`Gate`] because a reload has to reach them: a set
-/// of ECH keys with none of the old keys in it clears the replay record, and a
-/// policy without a key clears the hold. A receive batch takes the lock once
-/// and reads the policy under it.
+/// live here rather than in [`Gate`] because a reload has to reach the hold: a
+/// policy without a key clears it. A receive batch takes the lock once and
+/// reads the policy under it.
 ///
 /// The flag beside it answers "is the gate on at all" without taking the lock,
 /// because a gate that is off is the shipped default. A gate that is off then
@@ -410,24 +399,22 @@ impl Expected {
     /// the new one, which is a judgement made against a policy no
     /// configuration ever asked for.
     ///
-    /// The replay record is kept while the new policy accepts any key the old
-    /// one accepted, and emptied otherwise. An entry is the `enc` of a flight
-    /// one of the old keys opened, and the copy it guards against is that
-    /// flight sent again from another address, which still opens under the
-    /// same key after the reload. So the usual rotation, where the old current
-    /// key becomes the previous key, keeps every entry, and a recorded first
-    /// flight under the old key stays a replay. Emptying is correct only when
-    /// no old key is accepted any more, because then no recorded flight opens.
-    /// One record for all the keys rather than one per key, so its bound
-    /// stays `REPLAY_ENTRIES` in all. The entries of a previous key that a
-    /// reload removed while the current key stayed are kept: they match only
-    /// a copy of a flight under that key, which no longer opens, and they
-    /// leave the record as older entries do, oldest first at the bound.
+    /// The replay record is never emptied by a reload. An entry is the `enc`
+    /// of a flight some key opened, and the copy it guards against is that
+    /// flight sent again from another address, which opens for as long as the
+    /// server accepts that key. A rotation, where the old current key becomes
+    /// the previous key, therefore has to keep every entry. A key that a
+    /// reload removes can come back in a later reload, and its recorded
+    /// flights open again then, so its entries are kept as well. While the key
+    /// is not accepted they match nothing, because a flight under it does not
+    /// open and never reaches the record. They leave as every entry does,
+    /// oldest first at the bound. One record for all the keys rather than one
+    /// per key, so its bound stays `REPLAY_ENTRIES` in all.
     ///
     /// A policy without a key empties the hold, because nothing would judge
     /// what it holds; the clients of those flights send them again and the
-    /// gate passes them as it now does. Both
-    /// happen under the lock the policy itself sits under, and a receive batch
+    /// gate passes them as it now does. That
+    /// happens under the lock the policy itself sits under, and a receive batch
     /// reads the policy only under that lock. So no flight is held, judged or
     /// recorded under a policy that is no longer in force, however a receive
     /// call and a reload interleave (D115): a flight held just before the

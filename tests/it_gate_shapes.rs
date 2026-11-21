@@ -2438,12 +2438,13 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
     );
 }
 
-/// A reload that keeps the key keeps the replay record, a reload to a key that
-/// was not accepted before empties the record, and a policy without a key
-/// empties the hold. `a_rotation_keeps_the_replay_record` covers a reload that
-/// keeps the old key as the previous one.
+/// No reload empties the replay record: not one that keeps the key, not one
+/// to a key that was not accepted before, and not one that brings a removed
+/// key back, after which a flight recorded under it is still a replay. A
+/// policy without a key empties the hold. `a_rotation_keeps_the_replay_record`
+/// covers a reload that keeps the old key as the previous one.
 #[test]
-fn a_new_key_empties_the_replay_record_and_no_key_empties_the_hold() {
+fn no_reload_empties_the_replay_record_and_no_key_empties_the_hold() {
     let crypto = nameless_crypto();
     let key = ech_key(7);
     let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
@@ -2472,8 +2473,23 @@ fn a_new_key_empties_the_replay_record_and_no_key_empties_the_hold() {
     screening.set(hold_policy(&ech_key(7), &[], false));
     assert_eq!(
         screening.replay_entries(),
-        0,
-        "a new key starts a new record"
+        1,
+        "a new key keeps the record of the old one"
+    );
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &flight,
+        &Dropped::EchNotOpened,
+        "a flight under the removed key",
+    );
+    screening.set(hold_policy(&same, &[], false));
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &flight,
+        &Dropped::Replayed,
+        "the removed key is back, and its recorded flight is still a replay",
     );
 
     let mut screening = Screening::new(hold_policy(&key, &[], false));
