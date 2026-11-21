@@ -518,7 +518,7 @@ async fn a_batch_of_stalled_requests_is_reset_stream_by_stream() {
 #[tokio::test]
 async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
     let server = TestServer::start_with(&format!("{IMPATIENT}{ONE_SLOT}")).await;
-    let relay = one_way_relay(server.addr).await;
+    let (relay, unanswered) = one_way_relay(server.addr).await;
 
     let mut transport = quinn::TransportConfig::default();
     // Retransmit briskly, so the server keeps receiving Initials and its idle
@@ -531,13 +531,28 @@ async fn a_quic_handshake_that_never_completes_gives_its_slot_back() {
     // Started and deliberately not awaited: this handshake cannot complete.
     // Dropping the `Connecting` would close it, which is exactly what must not
     // happen while the server is being watched.
-    let _stalled = endpoint
+    let mut stalled = endpoint
         .connect(relay, "localhost")
         .expect("start a handshake that cannot finish");
 
     // Comfortably past the server's 1s deadline, and comfortably short of the
     // idle timeout the retransmissions above keep pushing out.
     tokio::time::sleep(Duration::from_millis(1_600)).await;
+
+    // The relay is one way, or the handshake completes and the slot is freed
+    // by the idle timeout instead: the server answered the client's Initial,
+    // and none of the answer reached the client, whose handshake is still
+    // waiting. A zero timeout polls it once.
+    assert!(
+        unanswered.load(Ordering::Relaxed) > 0,
+        "the server must have answered the stalled client into the relay"
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut stalled)
+            .await
+            .is_err(),
+        "the stalled client must have heard nothing from the server"
+    );
 
     let (counted, retries) = retry_counting_relay(server.addr).await;
     let admitted = client_endpoint(&server.ca, &["h3"]);
@@ -1072,20 +1087,26 @@ impl ClientSessionStore for CountingSessionStore {
     }
 }
 
-/// Carries packets one way only: client to `server`, and nothing back.
+/// Carries packets one way only: client to `server`, and nothing back. Also
+/// returns how many datagrams the server sent that were not carried.
 ///
 /// The socket hears both ends — the client sends to it, and the server answers
 /// to it, since that is the address its packets came from — so the direction is
 /// decided by who a packet came from.
-async fn one_way_relay(server: SocketAddr) -> SocketAddr {
+async fn one_way_relay(server: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let count = dropped.clone();
     // The server's half of the handshake goes nowhere, which is what leaves it
     // half-finished.
-    udp_relay(server, |leg, _| match leg {
+    let relay = udp_relay(server, move |leg, _| match leg {
         Leg::FromClient => Relayed::Forward,
-        Leg::FromServer => Relayed::Drop,
+        Leg::FromServer => {
+            count.fetch_add(1, Ordering::Relaxed);
+            Relayed::Drop
+        }
     })
-    .await
-    .addr
+    .await;
+    (relay.addr, dropped)
 }
 
 /// Carries the client's first datagram to `server` and nothing after it, while
