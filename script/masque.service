@@ -11,12 +11,11 @@
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable volto
 #
-# Enable without --now on purpose: the service is not started yet. Edit
-# /etc/volto/config.toml first, setting the cert/key paths and [auth].users. The
-# password the example ships is a placeholder published in this repository and in
-# every release tarball, so a server started before that edit accepts a
-# credential anybody can read. Start it once the edit is made:
+# No --now: edit /etc/volto/config.toml first (cert, key and [auth].users). The
+# example's password is published, so a server started before that edit accepts
+# a credential anybody can read. Then:
 #   sudo systemctl start volto
+# The procedure with its reasons: docs/deployment.md#systemd
 #
 # Reload after a certificate renewal or a credential change (never drops
 # established tunnels; a broken config file is rejected and the running one kept):
@@ -42,16 +41,10 @@ ExecStart=/usr/local/bin/volto --config /etc/volto/config.toml
 # keep the configuration they were accepted with.
 ExecReload=/bin/kill -HUP $MAINPID
 
-# SIGTERM starts the graceful shutdown: no new connections, GOAWAY on the existing
-# ones, then up to server.shutdown_grace for their tunnels to finish and
-# CLOSE_FLUSH_TIMEOUT for the endpoint to flush its CLOSE. A name lookup still
-# running on the blocking pool then gets up to shutdown_grace +
-# CLOSE_FLUSH_TIMEOUT + EXIT_SLACK more, because getaddrinfo cannot be
-# cancelled. The tunnels get one grace period, and the second one applies only
-# while a lookup is still running. The worst case is 2 * shutdown_grace +
-# 2 * CLOSE_FLUSH_TIMEOUT + EXIT_SLACK, which is 2 * shutdown_grace + 3 seconds
-# at the shipped constants. The default grace of 5 gives 13 seconds, so 45
-# covers it.
+# SIGTERM starts the graceful shutdown. The exit takes at most
+# 2 * server.shutdown_grace + 3 seconds, 13 at the default grace of 5. Keep
+# TimeoutStopSec above that bound if you raise shutdown_grace, or systemd sends
+# SIGKILL during the drain. docs/deployment.md#graceful-shutdown
 KillSignal=SIGTERM
 TimeoutStopSec=45
 
@@ -65,23 +58,18 @@ RestartSec=5s
 RestartForceExitStatus=SIGHUP
 
 # --- File descriptors -------------------------------------------------------
-# Every tunnel costs one descriptor, and one client multiplexes many onto a single
-# QUIC connection. What volto checks at startup is limits.max_connections times
-# limits.max_targets_per_conn plus 64 descriptors of headroom, against RLIMIT_NOFILE;
-# the shipped defaults need 65600, so this leaves room for them. Raise either limit
-# past this and raise LimitNOFILE with a drop-in too, or expect the startup warning.
+# volto needs limits.max_connections x limits.max_targets_per_conn + 64
+# descriptors, 65600 at the defaults. If that number passes the value below,
+# raise LimitNOFILE with a drop-in, or volto warns at startup and on reload.
+# docs/deployment.md#file-descriptor-budget
 LimitNOFILE=131072
 
 # --- Privileges -------------------------------------------------------------
 # Runs unprivileged. Binding 443 needs a capability rather than root: this grants
 # exactly that one and nothing else.
 #
-# A fixed system user rather than DynamicUser=yes: the files in /etc/volto are
-# granted to its group (root:volto, key mode 0640), and the paths the config
-# names are the files a reload reads again. A dynamic user has no stable group
-# to grant them to; each file would have to be passed with LoadCredential=
-# (systemd 247 and later) and the config would have to name the credential
-# paths instead.
+# A fixed system user rather than DynamicUser=yes, because the files in
+# /etc/volto are granted to its group (root:volto). docs/deployment.md#systemd
 User=volto
 Group=volto
 AmbientCapabilities=CAP_NET_BIND_SERVICE

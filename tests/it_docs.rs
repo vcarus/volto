@@ -24,9 +24,10 @@
 //!    quotes a constant as `` `IDENT` = value `` -- backticked
 //!    SCREAMING_SNAKE identifier, ` = `, then the value -- and this gate reads
 //!    those pairs back and compares them with the items themselves.
-//! 3. **Anchors resolve.** Every `docs/<page>.md#<anchor>` named in `src/` or
-//!    `tests/`, and every `](...#anchor)` link inside `docs/` and `README.md`,
-//!    has to name a heading that exists, judged by GitHub's own slug rules.
+//! 3. **Anchors resolve.** Every `docs/<page>.md#<anchor>` named in `src/`,
+//!    `tests/`, `script/` or the release workflows, and every `](...#anchor)`
+//!    link inside `docs/` and `README.md`, has to name a heading that exists,
+//!    judged by GitHub's own slug rules.
 //! 4. **A procedure written twice is written once.** The manual installation
 //!    appears in `docs/deployment.md`'s `## systemd` section and again in
 //!    `script/masque.service`'s header comment, and the two command sequences
@@ -910,7 +911,30 @@ struct Reference {
     anchor: String,
 }
 
-/// The `docs/<page>.md#<anchor>` references written in `src/` and `tests/`.
+/// The files outside `src/` and `tests/` whose comments point at a doc
+/// section: every file in `script/`, which ships in the release tarball and
+/// keeps one line per key or directive plus a pointer (R8-D3), and the two
+/// workflows that build that tarball.
+fn asset_files() -> Vec<PathBuf> {
+    let root = repo_root();
+    let mut files: Vec<PathBuf> = fs::read_dir(root.join("script"))
+        .expect("script/ must be readable")
+        .map(|entry| entry.expect("an entry of script/").path())
+        .filter(|path| path.is_file())
+        .collect();
+    files.sort();
+    files.extend(
+        [
+            ".github/workflows/release.yml",
+            ".github/workflows/cross.yml",
+        ]
+        .map(|path| root.join(path)),
+    );
+    files
+}
+
+/// The `docs/<page>.md#<anchor>` references written in `src/`, `tests/` and
+/// [`asset_files`].
 ///
 /// A comment that points a reader at a section is a promise like any other, and
 /// the one thing about it a machine can check is that the section is still
@@ -919,36 +943,37 @@ fn code_references() -> Vec<Reference> {
     let root = repo_root();
     let mut found = Vec::new();
 
-    for directory in ["src", "tests"] {
-        for file in rust_files(&root.join(directory)) {
-            let text = read_text(&file);
-            let source = file
-                .strip_prefix(&root)
-                .unwrap_or(&file)
-                .display()
-                .to_string();
+    let files = ["src", "tests"]
+        .into_iter()
+        .flat_map(|directory| rust_files(&root.join(directory)))
+        .chain(asset_files());
 
-            for (number, line) in text.lines().enumerate() {
-                let mut rest = line;
-                while let Some(at) = rest.find("docs/") {
-                    let tail = &rest[at + "docs/".len()..];
-                    if let Some((page, after)) = tail.split_once(".md#") {
-                        let anchor: String = after
-                            .chars()
-                            .take_while(|c| {
-                                c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-'
-                            })
-                            .collect();
-                        if !page.is_empty() && !anchor.is_empty() {
-                            found.push(Reference {
-                                source: format!("{source}:{}", number + 1),
-                                page: format!("docs/{page}.md"),
-                                anchor,
-                            });
-                        }
+    for file in files {
+        let text = read_text(&file);
+        let source = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+
+        for (number, line) in text.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("docs/") {
+                let tail = &rest[at + "docs/".len()..];
+                if let Some((page, after)) = tail.split_once(".md#") {
+                    let anchor: String = after
+                        .chars()
+                        .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+                        .collect();
+                    if !page.is_empty() && !anchor.is_empty() {
+                        found.push(Reference {
+                            source: format!("{source}:{}", number + 1),
+                            page: format!("docs/{page}.md"),
+                            anchor,
+                        });
                     }
-                    rest = tail;
                 }
+                rest = tail;
             }
         }
     }
