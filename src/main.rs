@@ -508,6 +508,8 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     for warning in config.warnings() {
         tracing::warn!(log_id = "f9be058r", "{warning}");
     }
+    #[cfg(debug_assertions)]
+    pause_after_the_warnings();
 
     let server = Server::bind(Arc::new(config))?;
 
@@ -539,6 +541,26 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
 
     info!(log_id = "fle471bm", "volto stopped");
     Ok(grace)
+}
+
+/// The variable that makes a debug build wait after its startup warnings.
+#[cfg(debug_assertions)]
+const PAUSE_AFTER_THE_WARNINGS: &str = "VOLTO_DEBUG_PAUSE_AFTER_THE_WARNINGS";
+
+/// In a debug build, with [`PAUSE_AFTER_THE_WARNINGS`] set, waits for one line
+/// on stdin (or its end) after the startup warnings and before
+/// `Server::bind`.
+///
+/// For `tests/it_cli.rs`, which sends `SIGHUP` inside that wait to show that
+/// the signal streams exist by the time the warnings are written. Without the
+/// wait that window lasts microseconds, and a signal sent when the test reads
+/// the warning line arrives after it. A release build compiles neither the
+/// variable nor the wait, so the binary that is deployed has no such input.
+#[cfg(debug_assertions)]
+fn pause_after_the_warnings() {
+    if std::env::var_os(PAUSE_AFTER_THE_WARNINGS).is_some() {
+        let _ = std::io::stdin().read_line(&mut String::new());
+    }
 }
 
 /// The signal streams [`run`] creates before it does anything else.

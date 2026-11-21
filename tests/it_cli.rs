@@ -547,15 +547,18 @@ fn the_check_judges_rust_log_by_the_rule_startup_applies() {
 /// The handler has to exist by then, so the signal sent at that line must come
 /// back as a reload, and the process must still stop cleanly on `SIGTERM`.
 ///
-/// What this catches is a handler created after `Server::bind`, which reads
-/// and parses the certificate. It does not catch one created between the
-/// warning line and `Server::bind`: that window is microseconds, and the
-/// signal sent here reaches the process only after the line has crossed a
-/// pipe, a reader thread and a channel. Catching that would need the binary
-/// to pause at the warning line on request, which it has no hook for.
+/// Without help the window between the warning line and `Server::bind` lasts
+/// microseconds, and the signal sent here reaches the process only after the
+/// line has crossed a pipe, a reader thread and a channel; a handler created
+/// inside that window would pass. So a debug build run with
+/// `VOLTO_DEBUG_PAUSE_AFTER_THE_WARNINGS` waits for a line on stdin after the
+/// warnings, the signal is sent during that wait, and the line is written
+/// after it. A release build has no such wait (`cfg(debug_assertions)` in
+/// `src/main.rs`), so under `cargo test --release` this catches only a handler
+/// created after `Server::bind`.
 #[test]
 fn a_sighup_during_startup_is_taken_as_a_reload() {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::sync::mpsc;
 
     use rustix::process::{Pid, Signal, kill_process};
@@ -582,11 +585,14 @@ fn a_sighup_during_startup_is_taken_as_a_reload() {
         .args(["--config", path.to_str().unwrap()])
         .env_remove("JOURNAL_STREAM")
         .env_remove("RUST_LOG")
+        .env("VOLTO_DEBUG_PAUSE_AFTER_THE_WARNINGS", "1")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("the volto binary must be runnable");
     let pid = Pid::from_child(&child);
+    let mut stdin = child.stdin.take().expect("stdin is piped");
 
     let (lines, received) = mpsc::channel();
     let stdout = child.stdout.take().expect("stdout is piped");
@@ -629,7 +635,11 @@ fn a_sighup_during_startup_is_taken_as_a_reload() {
     };
 
     wait_for("authentication is DISABLED", &mut child);
+    // The process is now waiting for this line, before `Server::bind`. A
+    // signal whose action is still the default ends it at once, before the
+    // line can be read.
     kill_process(pid, Signal::HUP).expect("SIGHUP must be deliverable");
+    writeln!(stdin, "go").expect("the paused process must read its stdin");
     wait_for("received SIGHUP", &mut child);
 
     kill_process(pid, Signal::TERM).expect("SIGTERM must be deliverable");
