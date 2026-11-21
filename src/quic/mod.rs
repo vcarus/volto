@@ -43,8 +43,10 @@ pub struct PeerInfo {
     pub remote: SocketAddr,
     /// The negotiated ALPN identifier, lossily decoded for display.
     pub alpn: Option<String>,
-    /// The SNI the client sent.
+    /// The SNI the client sent. The inner name when ECH was accepted.
     pub server_name: Option<String>,
+    /// Whether the handshake ran on an accepted ECH extension.
+    pub ech: bool,
 }
 
 /// Extracts loggable handshake metadata from an established connection.
@@ -53,7 +55,7 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
         .handshake_data()
         .and_then(|data| data.downcast::<HandshakeData>().ok());
 
-    let (alpn, server_name) = match handshake {
+    let (alpn, server_name, ech) = match handshake {
         Some(data) => (
             data.protocol
                 .as_deref()
@@ -62,14 +64,16 @@ pub fn peer_info(conn: &quinn::Connection) -> PeerInfo {
             // borrowing `data` by the time this one is evaluated, and this is
             // one `String` per accepted connection.
             data.server_name,
+            data.ech_accepted,
         ),
-        None => (None, None),
+        None => (None, None, false),
     };
 
     PeerInfo {
         remote: conn.remote_address(),
         alpn,
         server_name,
+        ech,
     }
 }
 
@@ -770,6 +774,9 @@ impl Server {
                         remote = %peer.remote,
                         alpn = %crate::logfmt::or_dash(peer.alpn.as_deref()),
                         server_name = %crate::logfmt::or_dash(peer.server_name.as_deref()),
+                        // Whether this handshake used ECH. The startup line's
+                        // `ech=` says whether a key is loaded.
+                        ech = peer.ech,
                         // At this point the estimate comes from the handshake
                         // samples alone; the close logs below carry the lifetime
                         // smoothed value.

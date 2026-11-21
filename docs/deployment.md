@@ -839,8 +839,10 @@ is dropped too, so the port answers nobody who does not hold the list. Turn it o
 in this order:
 
 1. Configure every client with `ech-config` and check that each one connects.
-   The startup and reload lines report `ech=true`, and with debug logging each
-   handshake line reports `ech_accepted=true`.
+   The startup and reload lines report `ech=true` once the key is loaded, and
+   each `connection established` line reports `ech=true` for a client that
+   used the list and `ech=false` for one that did not. Wait until no
+   `ech=false` line is left.
 2. Set `require_ech = true` and reload. The reload line then reports
    `require_ech=true`.
 

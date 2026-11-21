@@ -79,15 +79,18 @@ use keys::{Secret, Suite, Version};
 /// What a finished handshake reports to `quic::peer_info`, which downcasts
 /// `Session::handshake_data` to this type.
 ///
-/// The two fields quinn's rustls provider reports in its own `HandshakeData`,
-/// under the same names. That type exists only when quinn is built with a
-/// rustls feature, and the server's quinn is not.
+/// The first two fields are the ones quinn's rustls provider reports in its
+/// own `HandshakeData`, under the same names. That type exists only when quinn
+/// is built with a rustls feature, and the server's quinn is not.
 #[derive(Debug)]
 pub(crate) struct HandshakeData {
     /// The negotiated ALPN identifier.
     pub(crate) protocol: Option<Vec<u8>>,
-    /// The SNI the client sent, if it is a DNS name (see `server_name`).
+    /// The SNI the client sent, if it is a DNS name (see `server_name`). The
+    /// inner ClientHello's name when ECH was accepted.
     pub(crate) server_name: Option<String>,
+    /// Whether libssl accepted ECH on this handshake.
+    pub(crate) ech_accepted: bool,
 }
 
 /// The groups this server accepts.
@@ -1077,19 +1080,21 @@ impl crypto::Session for Session {
         let mut len = 0u32;
         // SAFETY: `self.ssl` is valid; AWS-LC writes a pointer into its own
         // buffer (or null) and a length, and the bytes are copied at once.
-        let (protocol, server_name) = unsafe {
-            sys::SSL_get0_alpn_selected(self.ssl.as_ptr(), &mut protocol, &mut len);
+        let (protocol, server_name, ech_accepted) = unsafe {
+            let ssl = self.ssl.as_ptr();
+            sys::SSL_get0_alpn_selected(ssl, &mut protocol, &mut len);
             let protocol = match usize::try_from(len) {
                 Ok(len) if !protocol.is_null() && len > 0 => {
                     Some(std::slice::from_raw_parts(protocol, len).to_vec())
                 }
                 _ => None,
             };
-            (protocol, server_name(self.ssl.as_ptr()))
+            (protocol, server_name(ssl), sys::SSL_ech_accepted(ssl) == 1)
         };
         Some(Box::new(HandshakeData {
             protocol,
             server_name,
+            ech_accepted,
         }))
     }
 
