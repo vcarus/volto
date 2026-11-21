@@ -57,9 +57,9 @@ quinn-proto = { version = "0.11", default-features = false }
 # would change is the test suite: every rustls client on the default provider
 # would offer X25519MLKEM768 first and send its key share, where it now offers
 # X25519 first. A test that wants the post-quantum order asks for it (`pq_first`
-# in `src/tls/awslc/tests.rs`), and `gate::nameless_crypto`, which builds the
-# gate tests' Initial packets, never reaches a key exchange. X25519MLKEM768 is
-# in `DEFAULT_KX_GROUPS` either way.
+# in `src/tls/awslc/tests.rs`), and `nameless_crypto` in `tests/common`, which
+# builds the gate tests' Initial packets, never reaches a key exchange.
+# X25519MLKEM768 is in `DEFAULT_KX_GROUPS` either way.
 #
 # `default-features = false` also keeps `tls12` off, which QUIC requires anyway;
 # with it off both providers reduce to the same three TLS 1.3 suites.
@@ -70,10 +70,9 @@ rustls = { version = "0.23", default-features = false, features = [
 # rustls is no longer the server's TLS (D115), and the server's own code no
 # longer calls it: the PEM parser, the certificate checks and the `DnsName`
 # rule come from the two crates below, which rustls calls for the same
-# judgements. What still names it is `gate::nameless_crypto`, the
-# configuration without an identity that the gate's seams build Initial
-# packets with, and the tests. Every client in the test suite is rustls, which
-# keeps the two ends of each test on different TLS implementations.
+# judgements. Nothing but the tests names it. Every client in the test suite is
+# rustls, which keeps the two ends of each test on different TLS
+# implementations.
 
 # The certificate and key types and the PEM parser (`tls::load_certs`,
 # `tls::load_key`, `EchKey::from_pem`), and the `DnsName` rule for a host name

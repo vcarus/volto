@@ -465,6 +465,49 @@ pub fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
     (endpoint, certificate)
 }
 
+/// A rustls TLS configuration with no identity at all, as a source of Initial
+/// keys for building packets.
+///
+/// Initial keys depend on the client's Destination Connection ID alone
+/// (RFC 9001 §5.2), never on the server's certificate. So a configuration
+/// carrying no certificate derives exactly the keys the running server
+/// derives, and the tests that spell Initial packets need no key material, no
+/// file and no clock to build the packets the gate opens. The resolver is
+/// never asked for anything: nothing here starts a TLS session. The keys come
+/// from rustls's code, and the gate opens the packets with the server's own
+/// (`tls::awslc::keys`), so a packet is built by one implementation and
+/// judged by the other.
+///
+/// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
+/// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
+/// asks for.
+pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
+    /// A resolver with nothing to present.
+    #[derive(Debug)]
+    struct NoIdentity;
+
+    impl rustls::server::ResolvesServerCert for NoIdentity {
+        fn resolve(
+            &self,
+            _: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            None
+        }
+    }
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("the aws-lc-rs crypto provider supports TLS 1.3")
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(NoIdentity));
+
+    Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
+            .expect("a TLS 1.3 configuration carries an initial cipher suite"),
+    )
+}
+
 /// Sends `bytes` once from a fresh socket and returns the first datagram back,
 /// or `None` if nothing arrives within `patience`.
 ///

@@ -4,10 +4,9 @@
 //! and the gate re-exports it, so its path stays `volto::gate::<name>`.
 
 use std::net::SocketAddr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::ConnectionId;
 use quinn::udp::RecvMeta;
 
 use super::initial::{INITIAL_PACKET_TYPE, LONG_HEADER_FORM, QUIC_V1};
@@ -29,17 +28,19 @@ pub use crate::hello::{FirstFlight, first_flight};
 // The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
 // `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
 // [`Screening`] and [`held_fragments`], [`first_flight`] above,
-// [`nameless_crypto`] and [`sealed_initial`] for building the packets they
-// judge, and [`HoldInput`] and [`hold_input_key`], the `hold` target's input
-// format.
+// [`sealed_initial`] for building the packets the `hold` target judges, and
+// [`HoldInput`] and [`hold_input_key`], that target's input format.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
 // coverage-guided fuzzer is for. Each judging seam calls the functions the
-// socket path calls, the server's Initial key code included. Only the packets
-// the seams are fed are sealed with rustls's key code ([`nameless_crypto`]),
-// so the code that builds a packet and the code that opens it are two
-// implementations.
+// socket path calls, the server's Initial key code included. The packets
+// `tests/it_gate_shapes.rs` builds are sealed with rustls's Initial key code
+// (`nameless_crypto` in `tests/common`), so for those the code that builds a
+// packet and the code that opens it are two implementations. [`sealed_initial`]
+// seals with the server's own key code, which RFC 9001 Appendix A pins
+// (`tls::awslc::keys`), and a test in `tests/it_gate_shapes.rs` opens what it
+// seals with rustls's keys.
 
 /// The hold's bounds, for the fuzz target and the tests that assert them.
 #[doc(hidden)]
@@ -170,50 +171,6 @@ pub fn held_fragments(datagram: &[u8]) -> Option<Vec<(u64, Vec<u8>)>> {
     )
 }
 
-/// A TLS configuration with no identity at all, as a source of Initial keys
-/// for building packets.
-///
-/// Initial keys depend on the client's Destination Connection ID alone
-/// (RFC 9001 §5.2), never on the server's certificate. So a configuration
-/// carrying no certificate derives exactly the keys the running server
-/// derives, and the fuzz targets and the tests that spell Initial packets need
-/// no key material, no file and no clock to build the packets the gate opens.
-/// The resolver is never asked for anything: nothing here starts a TLS
-/// session. The keys come from rustls's code, and the gate opens the packets
-/// with the server's own (`tls::awslc::keys`), so a packet is built by one
-/// implementation and judged by the other.
-///
-/// The two `expect`s cannot fail: rustls's aws-lc-rs provider supports TLS
-/// 1.3, and a TLS 1.3 configuration carries the initial cipher suite quinn
-/// asks for.
-#[doc(hidden)]
-pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
-    /// A resolver with nothing to present.
-    #[derive(Debug)]
-    struct NoIdentity;
-
-    impl rustls::server::ResolvesServerCert for NoIdentity {
-        fn resolve(
-            &self,
-            _: rustls::server::ClientHello<'_>,
-        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-            None
-        }
-    }
-
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("the aws-lc-rs crypto provider supports TLS 1.3")
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(NoIdentity));
-
-    Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
-            .expect("a TLS 1.3 configuration carries an initial cipher suite"),
-    )
-}
-
 /// The most frame bytes [`sealed_initial`] carries: what a two-byte Length
 /// field leaves after the one-byte packet number and the AEAD tag.
 #[doc(hidden)]
@@ -226,8 +183,11 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// The fuzz target cannot spell a packet that authenticates, so without this
 /// it could change a held packet's bytes only by breaking its AEAD, and the
 /// hold would never see frames the fuzzer chose. With it, the fuzzer chooses
-/// the frames and this function seals them, with [`nameless_crypto`]'s keys,
-/// which are the keys the gate derives with the server's own code.
+/// the frames and this function seals them. The keys are the client's Initial
+/// keys, from the server's own key code (`tls::server_initial_keys`, whose
+/// `remote` half is what a client seals with). That code is checked against
+/// RFC 9001 Appendix A in both directions, and `tests/it_gate_shapes.rs`
+/// opens a packet sealed here with rustls's keys.
 ///
 /// The header is the plainest a client sends: QUIC v1, no Source Connection
 /// ID, no token, a two-byte Length field and a one-byte packet number
@@ -235,11 +195,7 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// and cut at [`SEALED_FRAMES_MAX`] bytes.
 #[doc(hidden)]
 pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
-    static CRYPTO: OnceLock<Arc<dyn quinn::crypto::ServerConfig>> = OnceLock::new();
-    let keys = CRYPTO
-        .get_or_init(nameless_crypto)
-        .initial_keys(QUIC_V1, &ConnectionId::new(dcid))
-        .expect("Initial keys for QUIC v1");
+    let keys = crate::tls::server_initial_keys(dcid);
     let tag = keys.packet.remote.tag_len();
     let frames = &frames[..frames.len().min(SEALED_FRAMES_MAX)];
 

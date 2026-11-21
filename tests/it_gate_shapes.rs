@@ -4,7 +4,7 @@
 //! clients. This binary spells Initial packets by hand and asks three questions
 //! around that, all through the [`judgement`] seam the socket path itself calls,
 //! which opens each packet with the server's own Initial key code.
-//! [`nameless_crypto`] only builds the packets.
+//! [`nameless_crypto`], rustls's Initial key code, only builds the packets.
 //!
 //! **Is a first flight judged by its name and by nothing else?** A client has a
 //! great deal of freedom in how its first packet is laid out, and none of it may
@@ -49,8 +49,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, Offer, SharedBuffer, TempDir, TestServer, bulk_alpn,
-    client_endpoint, endpoint_from, is_version_negotiation, roots_of, rustls_client, udp_answer,
-    udp_answers, udp_answers_on,
+    client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
+    rustls_client, udp_answer, udp_answers, udp_answers_on,
 };
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
@@ -59,7 +59,7 @@ use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
     HOLD_TOTAL_BYTES, HoldInput, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening,
-    Verdict, first_flight, hold_input_key, judgement, nameless_crypto,
+    Verdict, first_flight, hold_input_key, judgement, sealed_initial,
 };
 use volto::tls::EchKey;
 
@@ -387,6 +387,46 @@ fn a_first_initial_is_opened_under_its_own_keys() {
         &crypto_frame_at(0, &named_hello("localhost")),
     );
     assert_eq!(judgement(&ours, &names), Verdict::Pass);
+}
+
+/// A packet [`sealed_initial`] builds opens under rustls's Initial keys.
+///
+/// `sealed_initial` seals with the server's own key code, the code the gate
+/// opens with, so the `hold` fuzz target and its seeds would pass whatever
+/// that code derived. Here rustls's code, through [`nameless_crypto`], removes
+/// the header protection and opens the payload, which judges the seal with a
+/// second implementation.
+#[test]
+fn a_sealed_initial_opens_under_rustls_initial_keys() {
+    let frames = crypto_frame_at(0, &named_hello("localhost"));
+    let number = 3;
+    let mut packet = sealed_initial(&CLIENT_CID, number, &frames);
+    assert_eq!(packet.len(), MIN_INITIAL_DATAGRAM);
+
+    let keys = nameless_crypto()
+        .initial_keys(QUIC_V1, &ConnectionId::new(&CLIENT_CID))
+        .expect("Initial keys for QUIC v1");
+    // The first byte, the version, the connection ID with its length, the
+    // empty Source Connection ID and token, and the two-byte Length field.
+    let number_offset = 1 + 4 + 1 + CLIENT_CID.len() + 1 + 1 + 2;
+    keys.header.remote.decrypt(number_offset, &mut packet);
+    assert_eq!(
+        packet[0], 0xc0,
+        "a long-header Initial with a one-byte packet number"
+    );
+    assert_eq!(packet[number_offset], number);
+
+    let header = packet[..=number_offset].to_vec();
+    let mut payload = BytesMut::from(&packet[number_offset + 1..]);
+    keys.packet
+        .remote
+        .decrypt(u64::from(number), &header, &mut payload)
+        .expect("rustls's keys open the packet");
+    assert_eq!(&payload[..frames.len()], &frames[..]);
+    assert!(
+        payload[frames.len()..].iter().all(|&byte| byte == 0),
+        "PADDING after the frames"
+    );
 }
 
 /// A later Initial of an admitted handshake cannot be opened here, and must

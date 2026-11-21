@@ -1511,7 +1511,7 @@ fn bench_gate_cost_per_first_flight() {
 
     // One Initial key derivation on its own, which is what a datagram with
     // bytes after its first packet used to cost a second time.
-    let crypto = volto::gate::nameless_crypto();
+    let crypto = common::nameless_crypto();
     let derive = |count: u64| {
         for _ in 0..count {
             std::hint::black_box(
