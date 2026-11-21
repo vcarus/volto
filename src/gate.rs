@@ -1103,41 +1103,52 @@ mod tests {
         assert!(drops.is_empty() && screening.flights() == 0);
     }
 
-    /// A receive call that read a policy with a key, interleaved with a reload
-    /// that removes the key before the call takes the hold's lock, holds
-    /// nothing: the hold that reload cleared stays empty, so nothing is left
-    /// that no key would ever expire. With no names either, the new policy is
-    /// the gate switched off, and the datagram goes to quinn untouched.
+    /// A reload that removes the key leaves no flight held, on the socket
+    /// path: a flight the receive path put in the hold under the key is gone
+    /// once [`Expected::set`] installs a policy without one, and the next
+    /// datagram is judged under the new policy, which with no names either is
+    /// the gate switched off, so quinn gets it untouched.
+    ///
+    /// The receive path reads the policy only under the lock `set` swaps it
+    /// under, so no receive call can screen under a key the reload has
+    /// already removed. What can strand a flight is a `set` that swaps the
+    /// policy and leaves the hold as it was, which this drives.
     #[tokio::test]
     async fn a_reload_that_removes_the_key_leaves_no_flight_held() {
         let key = Arc::new(EchKey::generate("public.example", 7, 0).expect("a key"));
         let expected = Expected::new(Policy::new(Names::new(&[]), Some(key), false));
-        // What the receive call read before the reload.
-        let stale = expected.current();
-        assert!(stale.ech.is_some());
-        expected.set(Names::new(&[]));
-
         let runtime = quinn::default_runtime().expect("a tokio runtime");
         let socket = runtime
             .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").expect("bind"))
             .expect("wrap");
         let gate = Gate::new(socket, expected.clone());
-        let sent = sealed_initial(&[0x51; 8], 0, &[0x01]);
-        let mut datagram = sent.clone();
-        let meta = RecvMeta {
+        let meta = |datagram: &[u8]| RecvMeta {
             addr: SocketAddr::from(([127, 0, 0, 1], 4433)),
             len: datagram.len(),
             stride: datagram.len(),
             ..RecvMeta::default()
         };
-        // The batch's branch, taken on the policy read before the reload.
-        if stale.ech.is_some() {
-            let (mut held, mut now) = (None, None);
-            gate.screen_holding(&meta, &mut datagram, &mut held, &mut now);
-        }
 
+        // The first four bytes of a ClientHello that declares 256: a flight
+        // the hold keeps until the rest arrives.
+        let first = sealed_initial(&[0x51; 8], 0, &[0x06, 0x00, 0x04, 0x01, 0x00, 0x01, 0x00]);
+        let mut datagram = first.clone();
+        let (mut held, mut now) = (None, None);
+        gate.screen_holding(&meta(&first), &mut datagram, &mut held, &mut now);
+        drop(held);
+        assert_eq!(expected.memory().hold.flights(), 1, "the flight is held");
+        assert_ne!(datagram, first, "a held datagram is blinded in the batch");
+
+        expected.set(Names::new(&[]));
         assert_eq!(expected.memory().hold.flights(), 0, "a flight was stranded");
-        assert_eq!(datagram, sent, "the gate is off, so quinn gets it as sent");
+
+        let next = sealed_initial(&[0x52; 8], 0, &[0x06, 0x00, 0x04, 0x01, 0x00, 0x01, 0x00]);
+        let mut datagram = next.clone();
+        let (mut held, mut now) = (None, None);
+        gate.screen_holding(&meta(&next), &mut datagram, &mut held, &mut now);
+        drop(held);
+        assert_eq!(datagram, next, "the gate is off, so quinn gets it as sent");
+        assert_eq!(expected.memory().hold.flights(), 0);
     }
 
     /// The closed gate's rule reads the header form and the packet type and
