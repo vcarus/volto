@@ -30,7 +30,8 @@ pub use crate::hello::{FirstFlight, first_flight};
 // `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
 // [`Screening`] and [`held_fragments`], [`first_flight`] above,
 // [`sealed_initial`] for building the packets the `hold` target judges, and
-// [`HoldInput`] and [`hold_input_key`], that target's input format.
+// [`HoldInput`], [`hold_input_key`] and [`hold_input_previous_key`], that
+// target's input format.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
@@ -230,6 +231,15 @@ pub fn hold_input_key() -> EchKey {
     EchKey::from_private_bytes(&[0x42; 32], "public.example", 7, 0).expect("the hold input key")
 }
 
+/// The previous ECH key of the `hold` fuzz target, which an input's policy
+/// byte may put beside [`hold_input_key`]: other fixed bytes and config_id 8,
+/// so the two keys differ in config_id as a server's two keys must.
+#[doc(hidden)]
+pub fn hold_input_previous_key() -> EchKey {
+    EchKey::from_private_bytes(&[0x43; 32], "public.example", 8, 0)
+        .expect("the hold input previous key")
+}
+
 /// The Destination Connection IDs a sealed record of a hold input may be
 /// addressed to.
 const HOLD_INPUT_DCIDS: [[u8; 8]; 4] = [[0xaa; 8], [0xa1; 8], [0xa2; 8], [0xa3; 8]];
@@ -251,6 +261,9 @@ pub struct HoldInput<'a> {
     pub require_ech: bool,
     /// `localhost` when bit 1 of the policy byte is set, else empty.
     pub names: Vec<String>,
+    /// Bit 2 of the policy byte: the server holds a previous key beside its
+    /// current one.
+    pub previous: bool,
     rest: &'a [u8],
     after: Duration,
 }
@@ -279,18 +292,27 @@ impl<'a> HoldInput<'a> {
         Some(Self {
             require_ech: policy & 0x01 != 0,
             names,
+            previous: policy & 0x04 != 0,
             rest,
             after: Duration::ZERO,
         })
     }
 
-    /// The gate policy the input's policy byte asks for, under `key`.
-    pub fn policy(&self, key: Arc<EchKey>) -> Policy {
-        Policy::new(
-            Names::new(&self.names),
-            Some(Arc::new(EchKeySet::new(key))),
-            self.require_ech,
-        )
+    /// The ECH keys the input's policy byte asks for: `current` alone, or
+    /// `current` with `previous` beside it.
+    pub fn keys(&self, current: &Arc<EchKey>, previous: &Arc<EchKey>) -> Arc<EchKeySet> {
+        let set = EchKeySet::new(current.clone());
+        Arc::new(if self.previous {
+            set.with_previous(previous.clone())
+                .expect("the two hold input keys have different config_ids")
+        } else {
+            set
+        })
+    }
+
+    /// The gate policy the input's policy byte asks for, under `keys`.
+    pub fn policy(&self, keys: Arc<EchKeySet>) -> Policy {
+        Policy::new(Names::new(&self.names), Some(keys), self.require_ech)
     }
 }
 

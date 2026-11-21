@@ -3,13 +3,16 @@
 //!
 //! This is the state the gate keeps for datagrams nobody has authenticated:
 //! the reassembly of a CRYPTO stream across Initial packets, the expiry and
-//! eviction of flights, the HPKE check, and the replay record. The input is a
+//! eviction of flights, the choice of key by config_id, the HPKE check, and
+//! the replay record. The input is a
 //! policy byte and then a run of records, each a datagram with the address it
 //! came from and how much time passed before it, driven through
 //! [`gate::Screening`], which runs the receive path's own code under a clock
 //! this target moves.
 //!
-//! Byte 0: bit 0 is `require_ech`, bit 1 puts `localhost` on the name list.
+//! Byte 0: bit 0 is `require_ech`, bit 1 puts `localhost` on the name list,
+//! and bit 2 puts the previous key beside the current one, as a server holds
+//! it during a key rotation.
 //! Then records of one header byte, a big-endian `u16` length, and that many
 //! bytes of body. The header's low two bits pick one of four source
 //! addresses, bit 2 says how the body is read, and the top five bits are the
@@ -37,11 +40,17 @@
 //! released datagrams ([`gate::held_fragments`]), with a reassembly and a rule
 //! check of its own: no two values at one offset, a whole ClientHello within
 //! `HOLD_HELLO_BYTES`, and then an ECH extension the key opens, or none with
-//! `require_ech` off and the name on the list when there is one.
+//! `require_ech` off and the name on the list when there is one. The oracle
+//! asks each of the input's keys in turn, not the set's lookup by config_id,
+//! so ECH under the previous key is admitted only when the policy byte holds
+//! that key, and `EchKey::opens` refuses an extension that names another
+//! key's config_id before it decrypts.
 //!
-//! The ECH key is fixed ([`gate::hold_input_key`]), and the seeds written by
-//! a test in `tests/it_gate_shapes.rs` carry ECH that opens under it, in both
-//! record forms, which a fuzzer could not produce by luck. The input is read
+//! The ECH keys are fixed: the current one ([`gate::hold_input_key`],
+//! config_id 7) and the previous one ([`gate::hold_input_previous_key`],
+//! config_id 8). The seeds written by a test in `tests/it_gate_shapes.rs`
+//! carry ECH that opens under either, in both record forms, which a fuzzer
+//! could not produce by luck. The input is read
 //! by [`gate::HoldInput`], the same reader that test runs each seed through,
 //! so the two cannot read one input differently.
 
@@ -58,8 +67,12 @@ use volto::gate::{
 use volto::hello::{self, Ech};
 use volto::tls::EchKey;
 
-/// The key, built once.
+/// The current key, built once.
 static KEY: LazyLock<Arc<EchKey>> = LazyLock::new(|| Arc::new(gate::hold_input_key()));
+
+/// The previous key, built once.
+static PREVIOUS: LazyLock<Arc<EchKey>> =
+    LazyLock::new(|| Arc::new(gate::hold_input_previous_key()));
 
 /// Checks that the flight whose released datagrams are `flight` is one the
 /// rule table admits, reading its ClientHello again from their CRYPTO frames.
@@ -69,7 +82,12 @@ static KEY: LazyLock<Arc<EchKey>> = LazyLock::new(|| Arc::new(gate::hold_input_k
 /// gate's module documentation rather than called, so the hold's own
 /// judgement is not the oracle. The replay rule is not checked: a replay is a
 /// drop, and this looks only at what was admitted.
-fn admitted_by_the_rules(flight: &[(SocketAddr, Vec<u8>)], require_ech: bool, names: &[String]) {
+fn admitted_by_the_rules(
+    flight: &[(SocketAddr, Vec<u8>)],
+    keys: &[&EchKey],
+    require_ech: bool,
+    names: &[String],
+) {
     let mut stream: Vec<Option<u8>> = Vec::new();
     for (_, datagram) in flight {
         let fragments =
@@ -105,8 +123,8 @@ fn admitted_by_the_rules(flight: &[(SocketAddr, Vec<u8>)], require_ech: bool, na
     );
     match hello::ech(body) {
         Some(Ech::Outer(outer)) => assert!(
-            KEY.opens(body, &outer),
-            "a released ECH the key does not open"
+            keys.iter().any(|key| key.opens(body, &outer)),
+            "a released ECH that none of the input's keys opens"
         ),
         Some(Ech::Absent) => {
             assert!(
@@ -135,7 +153,12 @@ fuzz_target!(|data: &[u8]| {
     let names = input.names.clone();
     let list = Names::new(&names);
     let require_ech = input.require_ech;
-    let mut screening = Screening::new(input.policy(KEY.clone()));
+    let mut screening = Screening::new(input.policy(input.keys(&KEY, &PREVIOUS)));
+    let keys: Vec<&EchKey> = if input.previous {
+        vec![&**KEY, &**PREVIOUS]
+    } else {
+        vec![&**KEY]
+    };
 
     let mut held: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut admitted = 0usize;
@@ -163,7 +186,7 @@ fuzz_target!(|data: &[u8]| {
         );
         let released = screening.released();
         if screened == Screened::Released {
-            admitted_by_the_rules(&released, require_ech, &names);
+            admitted_by_the_rules(&released, &keys, require_ech, &names);
         } else {
             assert!(
                 released.is_empty(),

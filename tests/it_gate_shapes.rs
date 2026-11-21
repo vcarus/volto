@@ -59,7 +59,7 @@ use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
     HOLD_TOTAL_BYTES, HoldInput, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening,
-    Verdict, first_flight, hold_input_key, judgement, sealed_initial,
+    Verdict, first_flight, hold_input_key, hold_input_previous_key, judgement, sealed_initial,
 };
 use volto::tls::{EchKey, EchKeySet};
 
@@ -3232,12 +3232,12 @@ fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
 }
 
 /// Runs a hold fuzz input through `volto::gate::HoldInput`, the reader the
-/// target uses, and returns what became of its last record, checking the
-/// byte count against the hold's contents after every record as the target
-/// does.
-fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
+/// target uses, with the target's current key `key` and previous key
+/// `previous`, and returns what became of its last record, checking the byte
+/// count against the hold's contents after every record as the target does.
+fn run_hold_input(key: &Arc<EchKey>, previous: &Arc<EchKey>, input: &[u8]) -> Screened {
     let input = HoldInput::new(input).expect("a policy byte");
-    let mut screening = Screening::new(input.policy(key.clone()));
+    let mut screening = Screening::new(input.policy(input.keys(key, previous)));
     let mut last = Screened::Passed;
     for record in input {
         last = screening
@@ -3255,8 +3255,11 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
 /// The target cannot spell an ECH extension that opens, so without these it
 /// would never reach the HPKE check, the replay record or a release. Each seed
 /// is a whole input, read here by `volto::gate::HoldInput` under
-/// `volto::gate::hold_input_key`, the reader and the key the target uses; the
-/// assertion is the outcome of its last record. The `sealed-` seeds carry the
+/// `volto::gate::hold_input_key` and `volto::gate::hold_input_previous_key`,
+/// the reader and the keys the target uses; the assertion is the outcome of
+/// its last record. Bit 2 of the policy byte puts the previous key beside the
+/// current one, and the `previous-` seeds carry ECH under it, with and without
+/// that bit. The `sealed-` seeds carry the
 /// same flights as frames for the target to seal, which is how the fuzzer
 /// edits what the hold reads rather than ciphertext. `fuzz/corpus/` is
 /// machine-local and gitignored (D83), so this runs with every `cargo test`.
@@ -3264,8 +3267,11 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
 fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     let crypto = nameless_crypto();
     let key = Arc::new(hold_input_key());
+    let previous = Arc::new(hold_input_previous_key());
     let groups = surge_groups();
     let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
+    let older = rustls_hello(&Offer::Ech(previous.config_list()), &groups, "localhost");
+    let older_two = hold_flight(&*crypto, &CLIENT_CID, &[], &older, 2);
     let small = rustls_hello(&Offer::Ech(key.config_list()), &small_groups(), "localhost");
     let plain_hello = rustls_hello(&Offer::Plain, &groups, "localhost");
     let two = hold_flight(&*crypto, &CLIENT_CID, &[], &ours, 2);
@@ -3306,6 +3312,8 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     two_frames.extend_from_slice(&crypto_frame_at(small.len() / 2, &small[small.len() / 2..]));
     let mut replayed = sealed_two(0, &ours);
     replayed.extend(sealed_two(1, &ours));
+    let mut older_replayed = sealed_two(0, &older);
+    older_replayed.extend(sealed_two(1, &older));
 
     let seeds: Vec<(&str, Vec<u8>, Screened)> = vec![
         (
@@ -3402,6 +3410,32 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
             Screened::Released,
         ),
         (
+            "previous-ech-with-the-previous-key",
+            hold_input(
+                0x04,
+                &[record(0, 0, &older_two[0]), record(0, 0, &older_two[1])],
+            ),
+            Screened::Released,
+        ),
+        (
+            "previous-ech-without-the-previous-key",
+            hold_input(
+                0x00,
+                &[record(0, 0, &older_two[0]), record(0, 0, &older_two[1])],
+            ),
+            Screened::Dropped,
+        ),
+        (
+            "previous-sealed-ech-under-require-ech",
+            hold_input(0x05, &sealed_two(0, &older)),
+            Screened::Released,
+        ),
+        (
+            "previous-sealed-ech-replayed-from-another-address",
+            hold_input(0x04, &older_replayed),
+            Screened::Dropped,
+        ),
+        (
             "sealed-a-ping",
             hold_input(
                 0x00,
@@ -3421,7 +3455,11 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/hold");
     std::fs::create_dir_all(&directory).expect("a corpus directory to write seeds into");
     for (name, input, outcome) in seeds {
-        assert_eq!(run_hold_input(&key, &input), outcome, "the seed {name}");
+        assert_eq!(
+            run_hold_input(&key, &previous, &input),
+            outcome,
+            "the seed {name}"
+        );
         std::fs::write(directory.join(name), &input).expect("a seed file");
     }
 }
