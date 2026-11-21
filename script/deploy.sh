@@ -725,13 +725,13 @@ fi
 refuse_automatic_downgrade
 
 # The two hazards of a downgrade, which nothing else shows the operator before
-# the service fails: an older volto refuses a key it does not know
+# the service fails: an older volto refuses a key added after it
 # (docs/configuration.md#version-compatibility), and an enabled timer undoes
 # --tag. Printed before the decision below, and in a dry run as well, because a
 # dry run exists to show that decision.
 if is_older_version "$VERSION" "$INSTALLED"; then
     echo "==> $INSTALLED -> $VERSION is a downgrade"
-    note "nothing here rewrites the config, and an older volto refuses a key it does not know"
+    note "nothing here rewrites the config, and an older volto refuses a key added after it"
     note "-- the whole file, not the key -- so if the service does not come up, look for"
     note "'unknown field' in 'journalctl -u $SERVICE_NAME -e': it names the line to comment"
     note "out in $CONF (see docs/configuration.md, version compatibility)"

@@ -152,7 +152,8 @@ time, in the number of flights and in bytes, each by a named constant in
 `gate/hold.rs`, and a full hold evicts its oldest flight. The record of admitted
 `enc` values is bounded by count rather than time, kept by every reload and
 lost at a restart; only a flight a key opened can add to it. The TLS layer's
-ClientHello callback refuses the same ClientHellos a second time, so a defect in the gate costs a `handshake_failure` alert rather than the
+ClientHello callback refuses the same ClientHellos a second time, so a defect
+in the gate costs a `handshake_failure` alert rather than the
 ECHConfigList; [Encrypted Client Hello](configuration.md#encrypted-client-hello)
 says which.
 
@@ -790,7 +791,7 @@ coverage-guided fuzz target under `fuzz/`. A scheduled workflow,
 `.github/workflows/fuzz.yml`, runs each target for ten minutes a day on a
 nightly toolchain and keeps the corpus between runs. The CI run of a pull
 request only type-checks them: `fuzz/` is a workspace of its own and its
-targets reach items that are public only because they ask for them, so a
+targets use items that are public only for them, so a
 rename in `src/` would otherwise break the fuzzers until the next scheduled
 run. `fuzz/README.md` maps each target to the parser
 it covers and has the invocation. There are eleven. Beside the five codecs

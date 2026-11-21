@@ -327,8 +327,8 @@ impl HoldPolicy {
 /// One input of the `hold` fuzz target, read step by step.
 ///
 /// This is the one reader of that format: the fuzz target and the test that
-/// writes its seeds both call it, so a seed's outcome in the test is the
-/// outcome the target sees. The format is in the target's module
+/// writes its seeds both call it, so a seed's outcome in the test is its
+/// outcome in the target. The format is in the target's module
 /// documentation, `fuzz/fuzz_targets/hold.rs`. Byte 0 is the policy the run
 /// begins under; then each record is one header byte, a big-endian `u16`
 /// length, and that many bytes of body, cut at the end of the input.

@@ -91,14 +91,17 @@ enum Command {
         /// The key file this key replaces in a rotation, the one
         /// `server.ech_key` names now. The new key gets a config_id other
         /// than that key's, which the server needs to hold the two side by
-        /// side, and that key's public name unless `--public-name` gives one.
+        /// side, and that key's public name and maximum_name_length unless
+        /// `--public-name` and `--max-name-length` give others.
         /// The file is only read.
         #[arg(long, value_name = "FILE")]
         replaces: Option<PathBuf>,
         /// The ECHConfig's maximum_name_length, which only steers how much a
-        /// client pads its encrypted ClientHello.
-        #[arg(long, value_name = "N", default_value_t = 0)]
-        max_name_length: u8,
+        /// client pads its encrypted ClientHello. When left out it is 0, or
+        /// with `--replaces` that key's value, so that a rotation does not
+        /// change the length of what a client sends.
+        #[arg(long, value_name = "N")]
+        max_name_length: Option<u8>,
     },
     /// Print the ECHConfigList of an existing ECH key file.
     ///
@@ -228,7 +231,7 @@ fn run_command(command: &Command) -> Result<()> {
         } => {
             let replaced = replaces
                 .as_deref()
-                .map(volto::tls::EchKey::load)
+                .map(|path| volto::tls::EchKey::load_as("--replaces", path))
                 .transpose()?;
             let taken = replaced.as_ref().map(volto::tls::EchKey::config_id);
             let config_id = match *config_id {
@@ -255,7 +258,10 @@ fn run_command(command: &Command) -> Result<()> {
                 (None, Some(key)) => key.public_name(),
                 (None, None) => bail!("ech-keygen needs --public-name or --replaces"),
             };
-            let key = volto::tls::EchKey::generate(public_name, config_id, *max_name_length)?;
+            let max_name_length = max_name_length
+                .or(replaced.as_ref().map(volto::tls::EchKey::max_name_length))
+                .unwrap_or(0);
+            let key = volto::tls::EchKey::generate(public_name, config_id, max_name_length)?;
             volto::tls::write_new_key_file(out, &key)?;
             eprintln!(
                 "wrote {}: config_id {config_id}, public name {public_name}",

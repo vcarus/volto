@@ -149,8 +149,8 @@ pub struct ServerConfig {
     ctx: SslCtx,
     data: Arc<CtxData>,
     /// The ECH keys the context holds. The startup line reports them and the
-    /// socket gate opens ECH extensions with them before libssl sees them, so
-    /// all three use the one set loaded per build.
+    /// socket gate opens ECH extensions with them before libssl is given the
+    /// ClientHello, so all three use the one set loaded per build.
     ech: Option<Arc<EchKeySet>>,
 }
 

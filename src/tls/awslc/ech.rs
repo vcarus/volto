@@ -71,6 +71,7 @@ pub struct EchKey {
     config: Vec<u8>,
     config_id: u8,
     public_name: String,
+    max_name_length: u8,
     /// The ECHConfig's HPKE suites, as (KDF, AEAD) pairs.
     suites: Vec<(u16, u16)>,
 }
@@ -130,6 +131,7 @@ impl EchKey {
             config,
             config_id,
             public_name: public_name.to_owned(),
+            max_name_length,
             suites: fields.suites,
         };
         // The same check `from_pem` makes, so a key made here is one this
@@ -146,9 +148,9 @@ impl EchKey {
         Self::load_as("server.ech_key", path)
     }
 
-    /// [`EchKey::load`], with errors prefixed by `setting`, the configuration
-    /// key that names the file.
-    fn load_as(setting: &str, path: &Path) -> Result<Self> {
+    /// [`EchKey::load`], with errors prefixed by `setting`: the configuration
+    /// key or the command-line flag that names the file.
+    pub fn load_as(setting: &str, path: &Path) -> Result<Self> {
         let what = || format!("{setting} = {}", path.display());
         let text = Zeroizing::new(
             std::fs::read(path).with_context(|| format!("failed to read {}", what()))?,
@@ -199,6 +201,7 @@ impl EchKey {
             config,
             config_id: fields.config_id,
             public_name: fields.public_name,
+            max_name_length: fields.max_name_length,
             suites: fields.suites,
         };
         // AWS-LC's own check of the pair: the version, the KEM, every HPKE
@@ -255,6 +258,11 @@ impl EchKey {
     /// The ECHConfig's public name.
     pub fn public_name(&self) -> &str {
         &self.public_name
+    }
+
+    /// The ECHConfig's `maximum_name_length`.
+    pub fn max_name_length(&self) -> u8 {
+        self.max_name_length
     }
 
     /// Whether the outer ECH extension `ech` of the ClientHello body `body`
@@ -637,6 +645,7 @@ fn single_config(list: &[u8]) -> Result<&[u8]> {
 struct ConfigFields {
     config_id: u8,
     public_name: String,
+    max_name_length: u8,
     /// `HpkeSymmetricCipherSuite cipher_suites<4..2^16-4>`, as (KDF, AEAD).
     suites: Vec<(u16, u16)>,
 }
@@ -669,7 +678,7 @@ impl ConfigFields {
             let aead = list.u16().context(ENDS_EARLY)?;
             suites.push((kdf, aead));
         }
-        r.u8().context(ENDS_EARLY)?; // maximum_name_length
+        let max_name_length = r.u8().context(ENDS_EARLY)?;
         let name = r.vec8().context(ENDS_EARLY)?;
         r.vec16().context(ENDS_EARLY)?; // extensions
         ensure!(r.is_empty(), "bytes follow the ECHConfig's extensions");
@@ -678,6 +687,7 @@ impl ConfigFields {
         Ok(Self {
             config_id,
             public_name,
+            max_name_length,
             suites,
         })
     }

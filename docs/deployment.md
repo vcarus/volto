@@ -422,7 +422,7 @@ that go wrong on the way back before it does anything about them.
 **The config file goes back with nothing.** The script never rewrites
 `/etc/volto/config.toml` or the certificate — both belong to
 `install-selfsigned.sh`'s first run and to you afterwards — and an older volto
-refuses a key it does not know, refusing the *whole* file rather than the key,
+refuses a key added after it, refusing the *whole* file rather than the key,
 so the service does not start at all. Before pinning, comment out every key
 introduced after the target release; for anything older than v0.4.5 that
 includes `mtu_upper_bound`, which every install carries. On a rollback the
@@ -833,9 +833,12 @@ in between:
    server picks the key by the config_id a ClientHello names, so two keys with
    one config_id are refused, and `--replaces` gives the new key a config_id
    other than the current key's. It also gives it the current key's public
-   name. Add `--public-name` only when the name is meant to change: the public
-   name is sent in the clear, and with two names an observer sees both during
-   the rotation.
+   name and `maximum_name_length`. Add `--public-name` only when the name is
+   meant to change: the public name is sent in the clear, and with two names
+   an observer sees both during the rotation. `--replaces` names the file
+   `ech_key` points at now and `--out` a file that does not exist yet, so the
+   second rotation needs other file names than this example; a date in the
+   name keeps them apart.
 
    ```sh
    sudo volto ech-keygen --replaces /etc/volto/ech.pem --out /etc/volto/ech-new.pem
