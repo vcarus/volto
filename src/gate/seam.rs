@@ -31,7 +31,7 @@ pub use crate::hello::{FirstFlight, first_flight};
 // [`Screening`] and [`held_fragments`], [`first_flight`] above,
 // [`sealed_initial`] for building the packets the `hold` target judges, and
 // [`HoldInput`], [`hold_input_key`] and [`hold_input_previous_key`], that
-// target's input format.
+// target's input format, reloads included.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
@@ -247,28 +247,110 @@ const HOLD_INPUT_DCIDS: [[u8; 8]; 4] = [[0xaa; 8], [0xa1; 8], [0xa2; 8], [0xa3; 
 /// The record header bit that makes a record's body frames to seal.
 const HOLD_INPUT_SEALED: u8 = 0x04;
 
-/// One input of the `hold` fuzz target, read record by record.
+/// The policy one byte of a hold input selects, from the target's two fixed
+/// keys.
+///
+/// Bit 0 is `require_ech`. Bit 1 puts `localhost` on the name list. Bit 2 puts
+/// a previous key beside the current one. Bit 3 swaps the two keys' places, so
+/// the key that was the previous one is the current one, which is what a
+/// rotation does. Bit 4 leaves the server with no ECH key at all, which turns
+/// the hold off.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldPolicy {
+    /// Bit 0.
+    pub require_ech: bool,
+    /// `localhost` when bit 1 is set, else empty.
+    pub names: Vec<String>,
+    previous: bool,
+    swapped: bool,
+    keyless: bool,
+}
+
+impl HoldPolicy {
+    fn from_byte(byte: u8) -> Self {
+        let names = if byte & 0x02 != 0 {
+            vec!["localhost".to_owned()]
+        } else {
+            Vec::new()
+        };
+        Self {
+            require_ech: byte & 0x01 != 0,
+            names,
+            previous: byte & 0x04 != 0,
+            swapped: byte & 0x08 != 0,
+            keyless: byte & 0x10 != 0,
+        }
+    }
+
+    /// The keys this policy holds, the current one first: none, one or both
+    /// of `key` and `previous`, the target's two fixed keys.
+    pub fn keys<'k>(
+        &self,
+        key: &'k Arc<EchKey>,
+        previous: &'k Arc<EchKey>,
+    ) -> Vec<&'k Arc<EchKey>> {
+        if self.keyless {
+            return Vec::new();
+        }
+        let (current, other) = if self.swapped {
+            (previous, key)
+        } else {
+            (key, previous)
+        };
+        if self.previous {
+            vec![current, other]
+        } else {
+            vec![current]
+        }
+    }
+
+    /// The gate policy this is, with the keys [`HoldPolicy::keys`] gives.
+    pub fn policy(&self, key: &Arc<EchKey>, previous: &Arc<EchKey>) -> Policy {
+        let keys = match self.keys(key, previous)[..] {
+            [] => None,
+            [current] => Some(EchKeySet::new(current.clone())),
+            [current, other, ..] => Some(
+                EchKeySet::new(current.clone())
+                    .with_previous(other.clone())
+                    .expect("the two hold input keys have different config_ids"),
+            ),
+        };
+        Policy::new(
+            Names::new(&self.names),
+            keys.map(Arc::new),
+            self.require_ech,
+        )
+    }
+}
+
+/// One input of the `hold` fuzz target, read step by step.
 ///
 /// This is the one reader of that format: the fuzz target and the test that
 /// writes its seeds both call it, so a seed's outcome in the test is the
 /// outcome the target sees. The format is in the target's module
-/// documentation, `fuzz/fuzz_targets/hold.rs`. Byte 0 is the policy; then
-/// each record is one header byte, a big-endian `u16` length, and that many
-/// bytes of body, cut at the end of the input.
+/// documentation, `fuzz/fuzz_targets/hold.rs`. Byte 0 is the policy the run
+/// begins under; then each record is one header byte, a big-endian `u16`
+/// length, and that many bytes of body, cut at the end of the input.
 #[doc(hidden)]
 pub struct HoldInput<'a> {
-    /// Bit 0 of the policy byte.
-    pub require_ech: bool,
-    /// `localhost` when bit 1 of the policy byte is set, else empty.
-    pub names: Vec<String>,
-    /// Bit 2 of the policy byte: the server holds a previous key beside its
-    /// current one.
-    pub previous: bool,
+    /// The policy byte 0 selects.
+    pub policy: HoldPolicy,
     rest: &'a [u8],
     after: Duration,
 }
 
-/// One record of a [`HoldInput`], as the gate is to receive it.
+/// One step of a [`HoldInput`].
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HoldStep {
+    /// A datagram for the gate to receive.
+    Datagram(HoldRecord),
+    /// A reload that puts this policy in force.
+    Reload(HoldPolicy),
+}
+
+/// One datagram of a [`HoldInput`], as the gate is to receive it.
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HoldRecord {
@@ -284,42 +366,18 @@ impl<'a> HoldInput<'a> {
     /// Reads the policy byte of `data`, or `None` for an empty input.
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let (&policy, rest) = data.split_first()?;
-        let names = if policy & 0x02 != 0 {
-            vec!["localhost".to_owned()]
-        } else {
-            Vec::new()
-        };
         Some(Self {
-            require_ech: policy & 0x01 != 0,
-            names,
-            previous: policy & 0x04 != 0,
+            policy: HoldPolicy::from_byte(policy),
             rest,
             after: Duration::ZERO,
         })
     }
-
-    /// The ECH keys the input's policy byte selects: `current` alone, or
-    /// `current` with `previous` beside it.
-    pub fn keys(&self, current: &Arc<EchKey>, previous: &Arc<EchKey>) -> Arc<EchKeySet> {
-        let set = EchKeySet::new(current.clone());
-        Arc::new(if self.previous {
-            set.with_previous(previous.clone())
-                .expect("the two hold input keys have different config_ids")
-        } else {
-            set
-        })
-    }
-
-    /// The gate policy the input's policy byte selects, under `keys`.
-    pub fn policy(&self, keys: Arc<EchKeySet>) -> Policy {
-        Policy::new(Names::new(&self.names), Some(keys), self.require_ech)
-    }
 }
 
 impl Iterator for HoldInput<'_> {
-    type Item = HoldRecord;
+    type Item = HoldStep;
 
-    fn next(&mut self) -> Option<HoldRecord> {
+    fn next(&mut self) -> Option<HoldStep> {
         let [header, high, low, tail @ ..] = self.rest else {
             return None;
         };
@@ -330,6 +388,11 @@ impl Iterator for HoldInput<'_> {
         self.after += Duration::from_millis(100 * u64::from(header >> 3));
         let from = SocketAddr::from(([127, 0, 0, 1], 40_000 + u16::from(header & 0x03)));
         let datagram = if header & HOLD_INPUT_SEALED == 0 {
+            // No datagram of one byte reaches the hold, so that length is the
+            // reload record, and its byte is the new policy.
+            if let [policy] = body {
+                return Some(HoldStep::Reload(HoldPolicy::from_byte(*policy)));
+            }
             body.to_vec()
         } else {
             let (selector, frames) = match body.split_first() {
@@ -342,11 +405,11 @@ impl Iterator for HoldInput<'_> {
                 frames,
             )
         };
-        Some(HoldRecord {
+        Some(HoldStep::Datagram(HoldRecord {
             after: self.after,
             from,
             datagram,
-        })
+        }))
     }
 }
 

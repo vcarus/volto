@@ -10,16 +10,22 @@
 //! [`gate::Screening`], which runs the receive path's own code under a clock
 //! this target moves.
 //!
-//! Byte 0: bit 0 is `require_ech`, bit 1 puts `localhost` on the name list,
-//! and bit 2 puts the previous key beside the current one, as a server holds
-//! it during a key rotation.
+//! Byte 0 is a policy byte: bit 0 is `require_ech`, bit 1 puts `localhost` on
+//! the name list, bit 2 puts the previous key beside the current one, as a
+//! server holds it during a key rotation, bit 3 swaps the two keys' places,
+//! as the rotation itself does, and bit 4 leaves the server with no ECH key.
 //! Then records of one header byte, a big-endian `u16` length, and that many
 //! bytes of body. The header's low two bits pick one of four source
 //! addresses, bit 2 says how the body is read, and the top five bits are the
 //! time that passed before it, in steps of 100 ms, so a run can outlast
 //! `HOLD_LIFETIME`.
 //!
-//! With bit 2 clear the body is the datagram, as it arrived. With bit 2 set
+//! With bit 2 clear the body is the datagram, as it arrived, with one
+//! exception: a body of exactly one byte is a reload, and the byte is the
+//! policy byte that is in force from then on. That is how the target reaches
+//! what a reload does to the hold and the replay record: a flight held under
+//! one set of keys and judged under another, a key removed and put back, and
+//! the hold emptied when the last key goes. With bit 2 set
 //! the body is frames: its first byte picks one of four Destination
 //! Connection IDs (low two bits) and the packet number (the other six), and
 //! the rest is sealed into a first Initial under the keys that connection ID
@@ -32,7 +38,8 @@
 //! Oracles beyond "no panic": the table, the byte total and the replay record
 //! never exceed their bounds; the byte total, summed again from what the hold
 //! holds, equals the running count after every record; the replay record
-//! never holds more entries than flights were admitted; a datagram passed or
+//! never holds more entries than flights were admitted, across every reload;
+//! nothing is held after a reload that leaves no key; a datagram passed or
 //! refused gets the verdict the stateless gate gives it; every datagram
 //! released is one that was held, from the address it came from, byte for
 //! byte; and every flight released is one the rule table admits. That last
@@ -40,8 +47,9 @@
 //! released datagrams ([`gate::held_fragments`]), with a reassembly and a rule
 //! check of its own: no two values at one offset, a whole ClientHello within
 //! `HOLD_HELLO_BYTES`, and then an ECH extension the key opens, or none with
-//! `require_ech` off and the name on the list when there is one. The oracle
-//! tries each of the input's keys in turn, not the set's lookup by config_id,
+//! `require_ech` off and the name on the list when there is one, all under the
+//! policy in force when the flight was released. The oracle
+//! tries each of that policy's keys in turn, not the set's lookup by config_id,
 //! so ECH under the previous key is admitted only when the policy byte holds
 //! that key, and `EchKey::opens` refuses an extension that names another
 //! key's config_id before it decrypts.
@@ -61,8 +69,8 @@ use std::sync::{Arc, LazyLock};
 
 use libfuzzer_sys::fuzz_target;
 use volto::gate::{
-    self, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_TOTAL_BYTES, HoldInput, Names, REPLAY_ENTRIES,
-    Screened, Screening, Verdict,
+    self, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_TOTAL_BYTES, HoldInput, HoldStep, Names,
+    REPLAY_ENTRIES, Screened, Screening, Verdict,
 };
 use volto::hello::{self, Ech};
 use volto::tls::EchKey;
@@ -150,19 +158,34 @@ fuzz_target!(|data: &[u8]| {
     let Some(input) = HoldInput::new(data) else {
         return;
     };
-    let names = input.names.clone();
-    let list = Names::new(&names);
-    let require_ech = input.require_ech;
-    let mut screening = Screening::new(input.policy(input.keys(&KEY, &PREVIOUS)));
-    let keys: Vec<&EchKey> = if input.previous {
-        vec![&**KEY, &**PREVIOUS]
-    } else {
-        vec![&**KEY]
-    };
+    let mut policy = input.policy.clone();
+    let mut list = Names::new(&policy.names);
+    let mut screening = Screening::new(policy.policy(&KEY, &PREVIOUS));
 
     let mut held: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut admitted = 0usize;
-    for record in input {
+    for step in input {
+        let record = match step {
+            HoldStep::Datagram(record) => record,
+            HoldStep::Reload(new) => {
+                screening.set(new.policy(&KEY, &PREVIOUS));
+                policy = new;
+                list = Names::new(&policy.names);
+                if policy.keys(&KEY, &PREVIOUS).is_empty() {
+                    assert_eq!(screening.flights(), 0, "no key, nothing held");
+                }
+                assert_eq!(
+                    screening.recounted_bytes(),
+                    screening.held_bytes(),
+                    "the byte count after a reload"
+                );
+                assert!(
+                    screening.replay_entries() <= admitted,
+                    "a reload adds nothing to the replay record"
+                );
+                continue;
+            }
+        };
         let (after, from, datagram) = (record.after, record.from, record.datagram);
 
         let (screened, _drops) = screening.receive(after, from, &datagram);
@@ -186,7 +209,12 @@ fuzz_target!(|data: &[u8]| {
         );
         let released = screening.released();
         if screened == Screened::Released {
-            admitted_by_the_rules(&released, &keys, require_ech, &names);
+            let keys: Vec<&EchKey> = policy
+                .keys(&KEY, &PREVIOUS)
+                .into_iter()
+                .map(|key| &**key)
+                .collect();
+            admitted_by_the_rules(&released, &keys, policy.require_ech, &policy.names);
         } else {
             assert!(
                 released.is_empty(),

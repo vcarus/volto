@@ -58,8 +58,9 @@ use rustls::crypto::aws_lc_rs::kx_group;
 use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
-    HOLD_TOTAL_BYTES, HoldInput, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening,
-    Verdict, first_flight, hold_input_key, hold_input_previous_key, judgement, sealed_initial,
+    HOLD_TOTAL_BYTES, HoldInput, HoldStep, Names, Policy, REPLAY_ENTRIES, Refusal, Screened,
+    Screening, Verdict, first_flight, hold_input_key, hold_input_previous_key, judgement,
+    sealed_initial,
 };
 use volto::tls::{EchKey, EchKeySet};
 
@@ -3211,6 +3212,8 @@ const HOLD_FUZZ_SEALED: u8 = 0x04;
 enum Body {
     /// A datagram, as it arrived.
     Raw(Vec<u8>),
+    /// A reload to the policy this byte selects: a raw body of one byte.
+    Reload(u8),
     /// Frames for `volto::gate::sealed_initial`, addressed to the connection
     /// ID `selector & 3` picks (0 is [`CLIENT_CID`]) with packet number
     /// `selector >> 2`.
@@ -3231,7 +3234,11 @@ fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
     for record in records {
         assert!(record.steps < 32, "five bits of time");
         let (sealed, body) = match &record.body {
-            Body::Raw(datagram) => (0, datagram.clone()),
+            Body::Raw(datagram) => {
+                assert_ne!(datagram.len(), 1, "a one-byte body is a reload");
+                (0, datagram.clone())
+            }
+            Body::Reload(policy) => (0, vec![*policy]),
             Body::Sealed { selector, frames } => {
                 let mut body = vec![*selector];
                 body.extend_from_slice(frames);
@@ -3248,16 +3255,21 @@ fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
 
 /// Runs a hold fuzz input through `volto::gate::HoldInput`, the reader the
 /// target uses, with the target's current key `key` and previous key
-/// `previous`, and returns what became of its last record, checking the byte
-/// count against the hold's contents after every record as the target does.
+/// `previous`, and returns what became of its last datagram, checking the
+/// byte count against the hold's contents after every step as the target does.
 fn run_hold_input(key: &Arc<EchKey>, previous: &Arc<EchKey>, input: &[u8]) -> Screened {
     let input = HoldInput::new(input).expect("a policy byte");
-    let mut screening = Screening::new(input.policy(input.keys(key, previous)));
+    let mut screening = Screening::new(input.policy.policy(key, previous));
     let mut last = Screened::Passed;
-    for record in input {
-        last = screening
-            .receive(record.after, record.from, &record.datagram)
-            .0;
+    for step in input {
+        match step {
+            HoldStep::Datagram(record) => {
+                last = screening
+                    .receive(record.after, record.from, &record.datagram)
+                    .0;
+            }
+            HoldStep::Reload(policy) => screening.set(policy.policy(key, previous)),
+        }
         assert_eq!(screening.recounted_bytes(), screening.held_bytes());
         screening.released();
     }
@@ -3303,6 +3315,11 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
         source,
         steps,
         body: Body::Raw(datagram.clone()),
+    };
+    let reload = |policy: u8| Record {
+        source: 0,
+        steps: 0,
+        body: Body::Reload(policy),
     };
     // `hello` in two packets of one CRYPTO frame each, as frames to seal, to
     // the first connection ID with packet numbers 0 and 1.
@@ -3449,6 +3466,62 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
             "previous-sealed-ech-replayed-from-another-address",
             hold_input(0x04, &older_replayed),
             Screened::Dropped,
+        ),
+        // Reloads. 0x0c is the rotation: the previous key becomes the
+        // current one and the old current one stays beside it. 0x08 then
+        // removes the old current key, and 0x10 removes every key.
+        (
+            "reload-rotation-between-two-packets",
+            hold_input(
+                0x00,
+                &[record(0, 0, &two[0]), reload(0x0c), record(0, 0, &two[1])],
+            ),
+            Screened::Released,
+        ),
+        (
+            "reload-removes-the-key-between-two-packets",
+            hold_input(
+                0x04,
+                &[record(0, 0, &two[0]), reload(0x08), record(0, 0, &two[1])],
+            ),
+            Screened::Dropped,
+        ),
+        (
+            "reload-replay-after-the-rotation",
+            hold_input(
+                0x00,
+                &[
+                    record(0, 0, &two[0]),
+                    record(0, 0, &two[1]),
+                    reload(0x0c),
+                    record(1, 0, &two[0]),
+                    record(1, 0, &two[1]),
+                ],
+            ),
+            Screened::Dropped,
+        ),
+        (
+            "reload-replay-after-the-key-comes-back",
+            hold_input(
+                0x00,
+                &[
+                    record(0, 0, &two[0]),
+                    record(0, 0, &two[1]),
+                    reload(0x08),
+                    reload(0x0c),
+                    record(1, 0, &two[0]),
+                    record(1, 0, &two[1]),
+                ],
+            ),
+            Screened::Dropped,
+        ),
+        (
+            "reload-to-no-key-passes-the-second-packet",
+            hold_input(
+                0x00,
+                &[record(0, 0, &two[0]), reload(0x10), record(0, 0, &two[1])],
+            ),
+            Screened::Passed,
         ),
         (
             "sealed-a-ping",
