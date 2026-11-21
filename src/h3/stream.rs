@@ -817,6 +817,27 @@ impl Reader {
     }
 }
 
+/// The halves [`Stream::split`] hands a tunnel, over the request stream `send`
+/// and `recv` of the live QUIC connection `quic`, for the tunnels' unit tests.
+///
+/// The stream's request is taken as read and answered, so the reader is in
+/// the mode a split puts it in: only DATA may follow.
+#[cfg(test)]
+pub(crate) fn tunnel_halves(
+    quic: quinn::Connection,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) -> (Writer, Reader) {
+    let handle = Handle::for_tests(quic);
+    let frames = FrameReader::on_request_stream(recv, handle.budget());
+    Stream {
+        handle,
+        writer: Writer { send },
+        frames,
+    }
+    .split()
+}
+
 /// What one decoded item of a tunnel's body is to a [`Reader`]: a piece to hand
 /// out, nothing, or a violation.
 ///

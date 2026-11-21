@@ -58,6 +58,11 @@ pub fn peer_reset_code(error: &StreamError) -> Option<u64> {
 #[cfg(test)]
 pub(crate) use crate::h3::error::Violation;
 
+/// For the TCP tunnel's tests, which drive its two pumps over a live request
+/// stream.
+#[cfg(test)]
+pub(crate) use crate::h3::stream::tunnel_halves;
+
 #[cfg(test)]
 mod tests {
     use super::*;

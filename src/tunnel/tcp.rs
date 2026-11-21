@@ -659,6 +659,8 @@ fn gather(first: Bytes, reader: &mut Reader, batch: &mut Vec<Bytes>) {
 /// all of it is still there. `client_to_target` says why the places that
 /// abandon it may, and each of them drops `batch`.
 async fn write_batch(tcp: &mut OwnedWriteHalf, batch: &mut Vec<Bytes>) -> io::Result<()> {
+    #[cfg(test)]
+    tests::faults::write()?;
     for pieces in batch.chunks(WRITE_BATCH_PIECES) {
         let mut storage = [IoSlice::new(&[]); WRITE_BATCH_PIECES];
         for (slice, piece) in storage.iter_mut().zip(pieces) {
@@ -758,6 +760,9 @@ async fn target_to_client(
                 return;
             }
         };
+
+        #[cfg(test)]
+        let read = tests::faults::read(read);
 
         match read {
             // Target EOF: finish our sending side only. The client may still
@@ -1575,6 +1580,165 @@ mod tests {
             received == sent,
             "the target read something other than what was sent"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Faults in the target's I/O while its socket is still open
+    // -----------------------------------------------------------------------
+
+    /// A failure the pumps' target I/O meets once, on this thread, when a
+    /// test asks for it.
+    ///
+    /// On loopback a write to the target or a read from it fails only after
+    /// the target's socket has failed, so the target cannot then tell a reset
+    /// from a plain close. These let a test fail one of them while the target
+    /// still listens. They exist only in the unit test build, and the pumps
+    /// call them only there.
+    pub(super) mod faults {
+        use std::cell::Cell;
+        use std::io;
+
+        thread_local! {
+            static WRITE: Cell<bool> = const { Cell::new(false) };
+            static READ: Cell<bool> = const { Cell::new(false) };
+        }
+
+        /// The next write to the target on this thread fails.
+        pub(in crate::tunnel::tcp) fn fail_the_next_write() {
+            WRITE.set(true);
+        }
+
+        /// The next read from the target on this thread fails once it has
+        /// completed.
+        pub(in crate::tunnel::tcp) fn fail_the_next_read() {
+            READ.set(true);
+        }
+
+        /// Called by `write_batch` before it writes.
+        pub(in crate::tunnel::tcp) fn write() -> io::Result<()> {
+            if WRITE.take() {
+                return Err(io::Error::other("an injected write fault"));
+            }
+            Ok(())
+        }
+
+        /// Called by `target_to_client` with what its read returned.
+        pub(in crate::tunnel::tcp) fn read(read: io::Result<usize>) -> io::Result<usize> {
+            if READ.take() {
+                return Err(io::Error::other("an injected read fault"));
+            }
+            read
+        }
+    }
+
+    /// The server's halves of a request stream whose client has sent `wire`
+    /// and not finished, the proxy's end of a loopback TCP connection, and the
+    /// target's end. The client's connection and stream are returned so that
+    /// they stay open.
+    async fn tunnel_and_target(
+        wire: &[u8],
+    ) -> (
+        (crate::h3api::Writer, crate::h3api::Reader),
+        TcpStream,
+        TcpStream,
+        (quinn::Connection, quinn::SendStream, quinn::RecvStream),
+    ) {
+        let (client, server) =
+            crate::quic::tests::loopback_pair(quinn::TransportConfig::default()).await;
+        let (mut send, recv) = client.open_bi().await.expect("open a request stream");
+        send.write_all(wire)
+            .await
+            .expect("write the client's bytes");
+        let (server_send, server_recv) = server.accept_bi().await.expect("accept the stream");
+        let halves = crate::h3api::tunnel_halves(server, server_send, server_recv);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (proxied, target) = tokio::join!(TcpStream::connect(address), listener.accept());
+        (
+            halves,
+            proxied.expect("connect"),
+            target.expect("accept").0,
+            (client, send, recv),
+        )
+    }
+
+    /// Runs the two pumps as `run` does, to their end, and returns the state
+    /// they left.
+    async fn pump(
+        (writer, reader): (crate::h3api::Writer, crate::h3api::Reader),
+        proxied: TcpStream,
+    ) -> State {
+        let (tcp_read, tcp_write) = proxied.into_split();
+        let state = watch::Sender::new(State::Running);
+        let budget = Duration::from_secs(60);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                super::client_to_target(reader, tcp_write, &state, budget),
+                super::target_to_client(writer, tcp_read, &state, budget),
+            )
+        })
+        .await
+        .expect("both pumps end");
+        *state.borrow()
+    }
+
+    /// Asserts that the next read on the target's end meets a TCP reset.
+    async fn the_target_reads_a_reset(target: &mut TcpStream) {
+        let mut buf = [0u8; 64];
+        let read = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read(target, &mut buf),
+        )
+        .await
+        .expect("the close reaches the target");
+        assert!(
+            matches!(&read, Err(error) if error.kind() == io::ErrorKind::ConnectionReset),
+            "the target must meet a reset, not {read:?}"
+        );
+    }
+
+    /// A write to the target that fails while the client still uploads ends
+    /// the tunnel with a reset of the target, not a FIN after a cut upload.
+    ///
+    /// The target's socket is open and has sent nothing, and no FIN has gone
+    /// to it, so the proxy's socket is in ESTABLISHED when it closes, and an
+    /// armed reset is sent on Linux and macOS alike.
+    #[tokio::test]
+    async fn a_failed_write_to_the_target_resets_it() {
+        // One DATA frame of five bytes, and no FIN.
+        let (halves, proxied, mut target, _client) =
+            tunnel_and_target(&[0x00, 0x05, b'h', b'e', b'l', b'l', b'o']).await;
+
+        faults::fail_the_next_write();
+        let state = pump(halves, proxied).await;
+
+        assert_eq!(state, State::TornDown(Teardown::TargetError));
+        the_target_reads_a_reset(&mut target).await;
+    }
+
+    /// A read from the target that fails while the client still uploads ends
+    /// the tunnel with a reset of the target.
+    ///
+    /// The upload pump is parked on the client's next chunk when the other
+    /// pump raises the teardown, and its return is what closes the target's
+    /// socket. The proxy has read the one byte the target sent and sent no
+    /// FIN, so the reset is the armed one, on Linux and macOS alike.
+    #[tokio::test]
+    async fn a_failed_read_from_the_target_while_the_client_uploads_resets_it() {
+        // An empty DATA frame, which opens the stream and carries nothing.
+        let (halves, proxied, mut target, _client) = tunnel_and_target(&[0x00, 0x00]).await;
+
+        faults::fail_the_next_read();
+        tokio::io::AsyncWriteExt::write_all(&mut target, b"x")
+            .await
+            .expect("the target writes");
+        let state = pump(halves, proxied).await;
+
+        assert_eq!(state, State::TornDown(Teardown::TargetError));
+        the_target_reads_a_reset(&mut target).await;
     }
 
     #[test]
