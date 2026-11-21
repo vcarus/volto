@@ -897,8 +897,8 @@ with the table below and the line number in the journal.
 | `[limits].ip_family_preference` | v0.2.9 |
 | `[limits].mtu_upper_bound` | v0.4.5 |
 | `[security].expected_sni` | v0.9.0 |
-| `[server].ech_key` | the release after v1.5.0 |
-| `[security].require_ech` | the release after v1.5.0 |
+| `[server].ech_key` | v1.6.0 |
+| `[security].require_ech` | v1.6.0 |
 
 Everything else has been there since v0.1.0. `mtu_upper_bound` is the one that
 matters in practice, because the shipped example sets it and every install made by

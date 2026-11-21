@@ -96,7 +96,7 @@ are named `volto-<version>-<target>.tar.gz` for the two published targets,
 `uname -m` already answers on a Linux host:
 
 ```sh
-version=1.5.0                  # whatever the releases page shows
+version=1.6.0                  # whatever the releases page shows
 name="volto-${version}-$(uname -m)-unknown-linux-musl"
 base="https://github.com/vcarus/volto/releases/download/v${version}"
 

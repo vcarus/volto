@@ -1491,7 +1491,7 @@ pub(crate) mod tests {
     /// so a rename cannot pass unnoticed, and it deliberately does *not*
     /// mention the keys added since: `mtu_upper_bound` (v0.4.5),
     /// `security.expected_sni` (v0.9.0), `server.ech_key` and
-    /// `security.require_ech` (both after v1.5.0). An upgrade never rewrites
+    /// `security.require_ech` (both v1.6.0). An upgrade never rewrites
     /// `/etc/volto/config.toml`, so this is the file the new binary actually
     /// gets handed.
     #[test]
