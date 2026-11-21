@@ -39,56 +39,27 @@
 //! `HOLD_HELLO_BYTES`, and then an ECH extension the key opens, or none with
 //! `require_ech` off and the name on the list when there is one.
 //!
-//! The ECH key is fixed (`FUZZ_KEY`), and the seeds written by a test in
-//! `tests/it_gate_shapes.rs` carry ECH that opens under it, in both record
-//! forms, which a fuzzer could not produce by luck.
+//! The ECH key is fixed ([`gate::hold_input_key`]), and the seeds written by
+//! a test in `tests/it_gate_shapes.rs` carry ECH that opens under it, in both
+//! record forms, which a fuzzer could not produce by luck. The input is read
+//! by [`gate::HoldInput`], the same reader that test runs each seed through,
+//! so the two cannot read one input differently.
 
 #![no_main]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock};
-use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
 use volto::gate::{
-    self, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_TOTAL_BYTES, Names, Policy, REPLAY_ENTRIES,
+    self, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_TOTAL_BYTES, HoldInput, Names, REPLAY_ENTRIES,
     Screened, Screening, Verdict,
 };
 use volto::hello::{self, Ech};
 use volto::tls::EchKey;
 
-/// The X25519 private key of the target's ECH key. The seed test in
-/// `tests/it_gate_shapes.rs` builds the same key from the same bytes.
-const FUZZ_KEY: [u8; 32] = [0x42; 32];
-
 /// The key, built once.
-static KEY: LazyLock<Arc<EchKey>> = LazyLock::new(|| {
-    Arc::new(EchKey::from_private_bytes(&FUZZ_KEY, "public.example", 7, 0).expect("the fuzz key"))
-});
-
-/// The Destination Connection IDs a sealed record may be addressed to. The
-/// first is the one the seed test's flights use.
-const DCIDS: [[u8; 8]; 4] = [[0xaa; 8], [0xa1; 8], [0xa2; 8], [0xa3; 8]];
-
-/// The record header bit that makes the body frames to seal.
-const SEALED: u8 = 0x04;
-
-/// The four source addresses a record may come from.
-fn source(index: u8) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 40_000 + u16::from(index & 0x03)))
-}
-
-/// The datagram a record's body stands for.
-fn datagram(header: u8, body: &[u8]) -> Vec<u8> {
-    if header & SEALED == 0 {
-        return body.to_vec();
-    }
-    let (selector, frames) = match body.split_first() {
-        Some((selector, frames)) => (*selector, frames),
-        None => (0, &[][..]),
-    };
-    gate::sealed_initial(&DCIDS[usize::from(selector & 0x03)], selector >> 2, frames)
-}
+static KEY: LazyLock<Arc<EchKey>> = LazyLock::new(|| Arc::new(gate::hold_input_key()));
 
 /// Checks that the flight whose released datagrams are `flight` is one the
 /// rule table admits, reading its ClientHello again from their CRYPTO frames.
@@ -158,32 +129,18 @@ fn admitted_by_the_rules(flight: &[(SocketAddr, Vec<u8>)], require_ech: bool, na
 }
 
 fuzz_target!(|data: &[u8]| {
-    let Some((&policy, mut rest)) = data.split_first() else {
+    let Some(input) = HoldInput::new(data) else {
         return;
     };
-    let names: Vec<String> = if policy & 0x02 != 0 {
-        vec!["localhost".to_owned()]
-    } else {
-        Vec::new()
-    };
+    let names = input.names.clone();
     let list = Names::new(&names);
-    let require_ech = policy & 0x01 != 0;
-    let mut screening = Screening::new(Policy::new(
-        Names::new(&names),
-        Some(KEY.clone()),
-        require_ech,
-    ));
+    let require_ech = input.require_ech;
+    let mut screening = Screening::new(input.policy(KEY.clone()));
 
-    let mut after = Duration::ZERO;
     let mut held: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
     let mut admitted = 0usize;
-    while let [header, high, low, tail @ ..] = rest {
-        let length = usize::from(u16::from_be_bytes([*high, *low])).min(tail.len());
-        let (body, next) = tail.split_at(length);
-        rest = next;
-        after += Duration::from_millis(100 * u64::from(header >> 3));
-        let from = source(*header);
-        let datagram = datagram(*header, body);
+    for record in input {
+        let (after, from, datagram) = (record.after, record.from, record.datagram);
 
         let (screened, _drops) = screening.receive(after, from, &datagram);
         match &screened {

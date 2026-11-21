@@ -58,8 +58,8 @@ use rustls::crypto::aws_lc_rs::kx_group;
 use volto::datagram::{peek_varint, put_varint};
 use volto::gate::{
     Dropped, FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
-    HOLD_TOTAL_BYTES, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening, Verdict,
-    first_flight, judgement, nameless_crypto,
+    HOLD_TOTAL_BYTES, HoldInput, Names, Policy, REPLAY_ENTRIES, Refusal, Screened, Screening,
+    Verdict, first_flight, hold_input_key, judgement, nameless_crypto,
 };
 use volto::tls::EchKey;
 
@@ -2852,83 +2852,19 @@ async fn require_ech_is_reloadable_and_refused_without_a_key() {
 // (f) The seed corpus of `fuzz/fuzz_targets/hold.rs`
 // ---------------------------------------------------------------------------
 
-/// The X25519 private key of the hold fuzz target's ECH key, `FUZZ_KEY` in
-/// `fuzz/fuzz_targets/hold.rs`.
-const HOLD_FUZZ_KEY: [u8; 32] = [0x42; 32];
-
-/// The Destination Connection IDs a sealed record may be addressed to,
-/// `DCIDS` in `fuzz/fuzz_targets/hold.rs`. The first is [`CLIENT_CID`], which
-/// the flights below use.
-const HOLD_FUZZ_DCIDS: [[u8; 8]; 4] = [CLIENT_CID, [0xa1; 8], [0xa2; 8], [0xa3; 8]];
-
-/// The record header bit that makes a record's body frames to seal.
+/// The record header bit that makes a record's body frames to seal, in the
+/// format `volto::gate::HoldInput` reads. Written out here rather than taken
+/// from the reader, so that the seeds below are written by a second
+/// implementation of the format and read by the one the target uses.
 const HOLD_FUZZ_SEALED: u8 = 0x04;
-
-/// One step of a record's time field, in milliseconds.
-const HOLD_FUZZ_STEP_MS: u64 = 100;
-
-/// The source port of address index 0; the other three follow it.
-const HOLD_FUZZ_PORT_BASE: u16 = 40_000;
-
-/// The input format above is a copy of the one `fuzz/fuzz_targets/hold.rs`
-/// reads, and a seed is only worth what that copy agrees with. So the
-/// target's source must still carry every line the copy depends on: its key,
-/// its connection IDs, its header bits, its time step, its source ports, its
-/// policy bits and its length field. Whitespace is ignored, so a reflow by
-/// rustfmt changes nothing; any other change to one of these lines in the
-/// target has to be made here too.
-///
-/// Our own pin, because the fuzz crate and this binary share no code for the
-/// format. A decoder in `src/gate.rs` that both called would make it
-/// unnecessary.
-#[test]
-fn the_hold_seed_format_is_the_one_the_fuzz_target_reads() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/fuzz_targets/hold.rs");
-    let squeezed = |text: &str| -> String { text.split_whitespace().collect() };
-    let target = squeezed(&std::fs::read_to_string(&path).expect("the hold fuzz target"));
-
-    assert!(HOLD_FUZZ_KEY.iter().all(|byte| *byte == HOLD_FUZZ_KEY[0]));
-    assert_eq!(HOLD_FUZZ_PORT_BASE, 40_000, "the port the line below names");
-    let dcids: Vec<String> = HOLD_FUZZ_DCIDS
-        .iter()
-        .map(|dcid| {
-            assert!(dcid.iter().all(|byte| *byte == dcid[0]));
-            format!("[{:#04x}; 8]", dcid[0])
-        })
-        .collect();
-    let lines = [
-        format!(
-            "const FUZZ_KEY: [u8; 32] = [{:#04x}; 32];",
-            HOLD_FUZZ_KEY[0]
-        ),
-        format!("EchKey::from_private_bytes(&FUZZ_KEY, \"{PUBLIC_NAME}\", 7, 0)"),
-        format!("const DCIDS: [[u8; 8]; 4] = [{}];", dcids.join(", ")),
-        format!("const SEALED: u8 = {HOLD_FUZZ_SEALED:#04x};"),
-        "40_000 + u16::from(index & 0x03)".to_owned(),
-        "if header & SEALED == 0 {".to_owned(),
-        "gate::sealed_initial(&DCIDS[usize::from(selector & 0x03)], selector >> 2, frames)"
-            .to_owned(),
-        "let length = usize::from(u16::from_be_bytes([*high, *low]))".to_owned(),
-        format!("Duration::from_millis({HOLD_FUZZ_STEP_MS} * u64::from(header >> 3))"),
-        "let names: Vec<String> = if policy & 0x02 != 0 {".to_owned(),
-        "vec![\"localhost\".to_owned()]".to_owned(),
-        "let require_ech = policy & 0x01 != 0;".to_owned(),
-    ];
-    for line in lines {
-        assert!(
-            target.contains(&squeezed(&line)),
-            "{} no longer carries `{line}`, which the seed format here copies",
-            path.display()
-        );
-    }
-}
 
 /// What one record of a hold fuzz input carries.
 enum Body {
     /// A datagram, as it arrived.
     Raw(Vec<u8>),
-    /// Frames for `volto::gate::sealed_initial`, addressed to
-    /// `HOLD_FUZZ_DCIDS[selector & 3]` with packet number `selector >> 2`.
+    /// Frames for `volto::gate::sealed_initial`, addressed to the connection
+    /// ID `selector & 3` picks (0 is [`CLIENT_CID`]) with packet number
+    /// `selector >> 2`.
     Sealed { selector: u8, frames: Vec<u8> },
 }
 
@@ -2961,40 +2897,17 @@ fn hold_input(policy: u8, records: &[Record]) -> Vec<u8> {
     input
 }
 
-/// Runs a hold fuzz input the way the target does and returns what became of
-/// its last record, checking the byte count against the hold's contents
-/// after every record as the target does.
+/// Runs a hold fuzz input through `volto::gate::HoldInput`, the reader the
+/// target uses, and returns what became of its last record, checking the
+/// byte count against the hold's contents after every record as the target
+/// does.
 fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
-    let (&policy, mut rest) = input.split_first().expect("a policy byte");
-    let names: &[&str] = if policy & 0x02 != 0 {
-        &["localhost"]
-    } else {
-        &[]
-    };
-    let mut screening = Screening::new(hold_policy(key, names, policy & 0x01 != 0));
-    let mut after = Duration::ZERO;
+    let input = HoldInput::new(input).expect("a policy byte");
+    let mut screening = Screening::new(input.policy(key.clone()));
     let mut last = Screened::Passed;
-    while let [header, high, low, tail @ ..] = rest {
-        let length = usize::from(u16::from_be_bytes([*high, *low]));
-        let (body, next) = tail.split_at(length);
-        rest = next;
-        after += Duration::from_millis(HOLD_FUZZ_STEP_MS * u64::from(header >> 3));
-        let datagram = if header & HOLD_FUZZ_SEALED == 0 {
-            body.to_vec()
-        } else {
-            let (selector, frames) = body.split_first().expect("a selector byte");
-            volto::gate::sealed_initial(
-                &HOLD_FUZZ_DCIDS[usize::from(selector & 0x03)],
-                selector >> 2,
-                frames,
-            )
-        };
+    for record in input {
         last = screening
-            .receive(
-                after,
-                from(HOLD_FUZZ_PORT_BASE + u16::from(header & 0x03)),
-                &datagram,
-            )
+            .receive(record.after, record.from, &record.datagram)
             .0;
         assert_eq!(screening.recounted_bytes(), screening.held_bytes());
         screening.released();
@@ -3007,7 +2920,8 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
 ///
 /// The target cannot spell an ECH extension that opens, so without these it
 /// would never reach the HPKE check, the replay record or a release. Each seed
-/// is a whole input, run here through the same format the target reads; the
+/// is a whole input, read here by `volto::gate::HoldInput` under
+/// `volto::gate::hold_input_key`, the reader and the key the target uses; the
 /// assertion is the outcome of its last record. The `sealed-` seeds carry the
 /// same flights as frames for the target to seal, which is how the fuzzer
 /// edits what the hold reads rather than ciphertext. `fuzz/corpus/` is
@@ -3015,9 +2929,7 @@ fn run_hold_input(key: &Arc<EchKey>, input: &[u8]) -> Screened {
 #[test]
 fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
     let crypto = nameless_crypto();
-    let key = Arc::new(
-        EchKey::from_private_bytes(&HOLD_FUZZ_KEY, PUBLIC_NAME, 7, 0).expect("the fuzz key"),
-    );
+    let key = Arc::new(hold_input_key());
     let groups = surge_groups();
     let ours = rustls_hello(&Offer::Ech(key.config_list()), &groups, "localhost");
     let small = rustls_hello(&Offer::Ech(key.config_list()), &small_groups(), "localhost");

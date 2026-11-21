@@ -12,8 +12,8 @@ use quinn::udp::RecvMeta;
 
 use super::initial::{INITIAL_PACKET_TYPE, LONG_HEADER_FORM, QUIC_V1};
 use super::{
-    Classified, Dropped, MIN_INITIAL_DATAGRAM, Memory, Names, Policy, Screened, Verdict, classify,
-    flight_fragments, follow, judge, screen_one,
+    Classified, Dropped, EchKey, MIN_INITIAL_DATAGRAM, Memory, Names, Policy, Screened, Verdict,
+    classify, flight_fragments, follow, judge, screen_one,
 };
 
 /// What a first flight's CRYPTO bytes said, and the reader that says it.
@@ -28,9 +28,10 @@ pub use crate::hello::{FirstFlight, first_flight};
 
 // The seams `fuzz/fuzz_targets/gate.rs`, `fuzz/fuzz_targets/hold.rs` and
 // `tests/it_gate_shapes.rs` reach this module through (D83): [`judgement`],
-// [`Screening`] and [`held_fragments`], [`first_flight`] above, and
+// [`Screening`] and [`held_fragments`], [`first_flight`] above,
 // [`nameless_crypto`] and [`sealed_initial`] for building the packets they
-// judge.
+// judge, and [`HoldInput`] and [`hold_input_key`], the `hold` target's input
+// format.
 //
 // Everything above judges bytes an internet scanner chose, before any peer has
 // authenticated and before quinn has seen them, which is exactly the shape a
@@ -263,6 +264,107 @@ pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
         .encrypt(u64::from(number), &mut packet, number_offset + 1);
     keys.header.remote.encrypt(number_offset, &mut packet);
     packet
+}
+
+/// The ECH key of the `hold` fuzz target, built from fixed bytes so that the
+/// seeds `tests/it_gate_shapes.rs` writes carry ECH that opens under it.
+#[doc(hidden)]
+pub fn hold_input_key() -> EchKey {
+    EchKey::from_private_bytes(&[0x42; 32], "public.example", 7, 0).expect("the hold input key")
+}
+
+/// The Destination Connection IDs a sealed record of a hold input may be
+/// addressed to.
+const HOLD_INPUT_DCIDS: [[u8; 8]; 4] = [[0xaa; 8], [0xa1; 8], [0xa2; 8], [0xa3; 8]];
+
+/// The record header bit that makes a record's body frames to seal.
+const HOLD_INPUT_SEALED: u8 = 0x04;
+
+/// One input of the `hold` fuzz target, read record by record.
+///
+/// This is the one reader of that format: the fuzz target and the test that
+/// writes its seeds both call it, so a seed's outcome in the test is the
+/// outcome the target sees. The format is in the target's module
+/// documentation, `fuzz/fuzz_targets/hold.rs`. Byte 0 is the policy; then
+/// each record is one header byte, a big-endian `u16` length, and that many
+/// bytes of body, cut at the end of the input.
+#[doc(hidden)]
+pub struct HoldInput<'a> {
+    /// Bit 0 of the policy byte.
+    pub require_ech: bool,
+    /// `localhost` when bit 1 of the policy byte is set, else empty.
+    pub names: Vec<String>,
+    rest: &'a [u8],
+    after: Duration,
+}
+
+/// One record of a [`HoldInput`], as the gate is to receive it.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldRecord {
+    /// The time since the input began, summed over every record so far.
+    pub after: Duration,
+    /// The source address the header's low two bits pick.
+    pub from: SocketAddr,
+    /// The datagram the body stands for.
+    pub datagram: Vec<u8>,
+}
+
+impl<'a> HoldInput<'a> {
+    /// Reads the policy byte of `data`, or `None` for an empty input.
+    pub fn new(data: &'a [u8]) -> Option<Self> {
+        let (&policy, rest) = data.split_first()?;
+        let names = if policy & 0x02 != 0 {
+            vec!["localhost".to_owned()]
+        } else {
+            Vec::new()
+        };
+        Some(Self {
+            require_ech: policy & 0x01 != 0,
+            names,
+            rest,
+            after: Duration::ZERO,
+        })
+    }
+
+    /// The gate policy the input's policy byte asks for, under `key`.
+    pub fn policy(&self, key: Arc<EchKey>) -> Policy {
+        Policy::new(Names::new(&self.names), Some(key), self.require_ech)
+    }
+}
+
+impl Iterator for HoldInput<'_> {
+    type Item = HoldRecord;
+
+    fn next(&mut self) -> Option<HoldRecord> {
+        let [header, high, low, tail @ ..] = self.rest else {
+            return None;
+        };
+        let header = *header;
+        let length = usize::from(u16::from_be_bytes([*high, *low])).min(tail.len());
+        let (body, next) = tail.split_at(length);
+        self.rest = next;
+        self.after += Duration::from_millis(100 * u64::from(header >> 3));
+        let from = SocketAddr::from(([127, 0, 0, 1], 40_000 + u16::from(header & 0x03)));
+        let datagram = if header & HOLD_INPUT_SEALED == 0 {
+            body.to_vec()
+        } else {
+            let (selector, frames) = match body.split_first() {
+                Some((selector, frames)) => (*selector, frames),
+                None => (0, &[][..]),
+            };
+            sealed_initial(
+                &HOLD_INPUT_DCIDS[usize::from(selector & 0x03)],
+                selector >> 2,
+                frames,
+            )
+        };
+        Some(HoldRecord {
+            after: self.after,
+            from,
+            datagram,
+        })
+    }
 }
 
 #[cfg(test)]

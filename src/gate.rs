@@ -219,8 +219,8 @@ use initial::{
 #[doc(hidden)]
 pub use seam::{
     FirstFlight, HOLD_FLIGHT_BYTES, HOLD_FLIGHTS, HOLD_HELLO_BYTES, HOLD_LIFETIME,
-    HOLD_TOTAL_BYTES, REPLAY_ENTRIES, SEALED_FRAMES_MAX, Screening, first_flight, held_fragments,
-    judgement, nameless_crypto, sealed_initial,
+    HOLD_TOTAL_BYTES, HoldInput, HoldRecord, REPLAY_ENTRIES, SEALED_FRAMES_MAX, Screening,
+    first_flight, held_fragments, hold_input_key, judgement, nameless_crypto, sealed_initial,
 };
 
 /// The longest connection ID QUIC version 1 allows, in bytes.
