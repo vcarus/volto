@@ -134,6 +134,12 @@ jobs:
           args: "--locked --release"
           strip: true
           force-use-cross: true
+          # The `cross` program itself. Without this the action installs
+          # whatever release is the latest on the day of the build, so the
+          # tool that drives the pinned image could change under a release.
+          # It matches the image tag in `.github/cross/`; Dependabot does
+          # not read this line, so move the two together by hand.
+          cross-version: v0.2.5
       # <<< mirrored build step (release.yml <-> cross.yml) <<<
 
       # >>> mirrored smoke step (release.yml <-> cross.yml) >>>
