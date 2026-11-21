@@ -36,6 +36,8 @@
 //!   and `docs/deployment.md` state the `rust-version` of `Cargo.toml`.
 //! * **The release binary checks integer overflow in this crate.** Debug
 //!   builds always do, so no other test notices when the release profile stops.
+//! * **The fuzz workflow runs every target.** ci.yml only compiles them, so a
+//!   target missing from fuzz.yml's matrix would compile and never run.
 //! * **The release build compiles no rustls.** Every test build does, for the
 //!   test clients, so no other test notices when the manifest puts it back.
 
@@ -1215,6 +1217,79 @@ fn the_fuzz_lockfile_records_the_current_crate_version() {
         manifest, locked,
         "Cargo.toml says volto is {manifest} but fuzz/Cargo.lock records {locked}; run \
          `cargo update -p volto --manifest-path fuzz/Cargo.toml` alongside the version bump"
+    );
+}
+
+/// The value of `NIGHTLY:` under `env:` in `.github/workflows/<name>`.
+fn workflow_nightly(name: &str) -> String {
+    let path = repo_root().join(".github/workflows").join(name);
+    read_text(&path)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("NIGHTLY: "))
+        .unwrap_or_else(|| panic!("{} sets no `NIGHTLY:`", path.display()))
+        .to_owned()
+}
+
+/// fuzz.yml runs the targets its matrix lists, so a target missing from the
+/// list is compiled by ci.yml and never run. The list is held equal to the
+/// files in `fuzz/fuzz_targets/` and to the `[[bin]]` names in
+/// `fuzz/Cargo.toml`, which is where `cargo fuzz run <name>` looks.
+#[test]
+fn the_fuzz_workflow_runs_every_target() {
+    let root = repo_root();
+
+    let listed: BTreeSet<String> = matrix_targets("fuzz.yml").into_iter().collect();
+
+    let files: BTreeSet<String> = fs::read_dir(root.join("fuzz/fuzz_targets"))
+        .expect("fuzz/fuzz_targets is a directory")
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a UTF-8 file name")
+                .to_owned()
+        })
+        .collect();
+
+    let manifest: toml::Table = read_text(&root.join("fuzz/Cargo.toml"))
+        .parse()
+        .expect("fuzz/Cargo.toml is TOML");
+    let bins: BTreeSet<String> = manifest["bin"]
+        .as_array()
+        .expect("fuzz/Cargo.toml has `[[bin]]` tables")
+        .iter()
+        .map(|bin| bin["name"].as_str().expect("a bin has a name").to_owned())
+        .collect();
+
+    assert!(
+        files.len() >= 11,
+        "fuzz/fuzz_targets holds {files:?}; the reader is broken, or targets were removed"
+    );
+    assert_eq!(
+        listed, files,
+        "the matrix of .github/workflows/fuzz.yml and the files in fuzz/fuzz_targets differ"
+    );
+    assert_eq!(
+        bins, files,
+        "the `[[bin]]` names in fuzz/Cargo.toml and the files in fuzz/fuzz_targets differ"
+    );
+}
+
+/// Both workflows that need nightly name a dated one, and each says the two
+/// move together.
+#[test]
+fn the_nightly_workflows_name_the_same_toolchain() {
+    let asan = workflow_nightly("asan.yml");
+    let fuzz = workflow_nightly("fuzz.yml");
+
+    assert!(
+        asan.starts_with("nightly-20"),
+        "asan.yml's NIGHTLY is {asan:?}; the reader is broken, or the date was dropped"
+    );
+    assert_eq!(
+        asan, fuzz,
+        "asan.yml builds with {asan} and fuzz.yml with {fuzz}"
     );
 }
 
