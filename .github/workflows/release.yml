@@ -216,12 +216,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    # The name is older than the last step: this job leaves a draft. A release
-    # becomes installable when its SHA256SUMS is signed with the release key,
-    # and that key is not on GitHub, so the maintainer verifies the provenance
-    # below, signs, uploads SHA256SUMS.sig and publishes. `script/deploy.sh`
-    # refuses a release without that signature, and a draft is invisible to its
-    # latest-release request, so no host sees the release before it is signed.
+    # The name is older than the last step: this job leaves a draft. The
+    # maintainer verifies the provenance below, signs SHA256SUMS with the release
+    # key, which is not on GitHub, uploads SHA256SUMS.sig and publishes. A draft
+    # is invisible to `script/deploy.sh`'s latest-release request, so no host
+    # sees the release before it is signed. docs/deployment.md#the-release-signature
     name: publish release
     needs: build
     runs-on: ubuntu-latest

@@ -7,9 +7,9 @@
 # one certificate by its SHA-256 fingerprint. Surge calls this
 # `server-cert-fingerprint-sha256`.
 #
-# The trade-off against the ACME path is in docs/deployment.md. The short
-# version: no domain and no renewals, but the fingerprint has to reach every
-# client through a channel you trust, and there is no revocation if it leaks.
+# The fingerprint is then the clients' only trust anchor, and there is no
+# revocation. The trade-off against the ACME path:
+# docs/deployment.md#self-signed-with-fingerprint-pinning
 #
 # Safe to re-run: on a host that already has a config, the config, the
 # certificate, the user, the binary and the unit are kept and the service is
@@ -254,23 +254,21 @@ verify_config() {
 # Asks the volto binary whether it can load the config generated in $1, and ends
 # the run when it cannot.
 #
-# verify_config above only checks that the four substitutions landed. Everything
-# else in the file comes from the shipped example, where every table is
-# `deny_unknown_fields` -- so one key the binary being installed does not know
-# refuses the whole file, and the service never starts. On a first install there
-# is no running service to fall back to and no previous config to compare
-# against, which makes this the one moment the question can still be answered
-# cheaply. deploy.sh asks the same question on the update path
+# verify_config above only checks that the four substitutions landed. The rest
+# of the file is the shipped example, and a binary that does not know one of its
+# keys refuses the whole file (docs/configuration.md#version-compatibility). On a
+# first install there is no running service to fall back to, so this is the
+# moment to ask. deploy.sh asks the same question on the update path
 # (`check_config_with`); this is the first-install half of it.
 #
 # The temporary file is asked about rather than the installed one, so a refusal
 # leaves no configuration behind and the service is never started on it.
 # Installing first and checking after would write a config that the "already
-# exists, keeping it" branch then preserves on every later run -- the failure
-# would outlive the run that caused it. It cannot move any earlier than this:
-# one of the rules being checked is that the certificate and key the file names
-# exist and are files, and the certificate is generated a few lines above. A
-# binary too old to be asked leaves the run as it was before the check existed.
+# exists, keeping it" branch then keeps on every later run. The check cannot
+# move any earlier: one of the rules being checked is that the certificate and
+# key the file names exist and are files, and the certificate is generated a few
+# lines above. A binary too old to be asked leaves the run as it was before the
+# check existed.
 check_generated_config() {
     ask_binary "$1"
     case "$ASK_VERDICT" in

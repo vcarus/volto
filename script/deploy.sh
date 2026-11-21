@@ -9,17 +9,12 @@
 # acquire_lock, the ownership of /etc/volto at converge_ownership.
 #
 # A release is trusted for one reason: its SHA256SUMS carries a signature made
-# with the release key, whose public half is RELEASE_SIGNER below. The private
-# half is not on GitHub, so nobody who controls the repository or the release
-# page can produce a file this script accepts. The checksum only ties the
-# tarball to that signed list. The signature is checked with ssh-keygen, which
-# every host already has, and a release without a valid one is refused with the
-# running service left alone.
+# with the release key, whose public half is RELEASE_SIGNER below. The checksum
+# only ties the tarball to that signed list. What the signature does and does
+# not vouch for: docs/deployment.md#the-release-signature
 #
-# Releases older than the signature exist and stay reachable: --allow-unsigned
-# installs one whose SHA256SUMS.sig is absent, and needs --tag, so it is a
-# decision somebody makes for one named release and never what the timer does.
-# It applies to releases before FIRST_SIGNED_VERSION and to no later one. A
+# --allow-unsigned installs a release from before FIRST_SIGNED_VERSION, whose
+# SHA256SUMS.sig is absent, and needs --tag, so the timer never does it. A
 # signature that is present and wrong is refused either way. The installed copy
 # of this script is never replaced from an unsigned release, because the copy
 # such a release carries verifies nothing.
@@ -363,7 +358,7 @@ verify_release() {
 # "Latest" is a mark on the release page, and whoever controls that page can
 # move it to an older release. Every older release from 1.4.0 on carries a valid
 # signature, so the signature does not stop this: without the refusal a host
-# could be walked back to a release with a known defect. Going back is a
+# could be moved back to a release with a known defect. Going back is a
 # decision made at the host, with --tag. The run fails rather than passing
 # quietly, so the timer's unit shows that the release page and the host
 # disagree.
@@ -508,13 +503,10 @@ check_config_as_the_unit() {
 
 # Refuses the install when the binary in $1 cannot load this host's config.
 #
-# The hazard this closes is the rollback one: every table in the config file is
-# `deny_unknown_fields`, so a binary older than a key in the file refuses the
-# whole file and does not start. Nothing rewrites the config on the way back
-# either, so the answer is already fixed by the time the tarball is unpacked --
-# and the only moment it is worth anything is before the swap, since afterwards
-# the service is down and the guard below has restored the very release the
-# operator was trying to leave.
+# A binary older than a key in the file refuses the whole file and does not
+# start, and nothing rewrites the config (docs/configuration.md#version-compatibility).
+# So the question is asked before the swap: afterwards the service is down and
+# the guard below has restored the release the operator was trying to leave.
 #
 # The candidate is run rather than inspected, which costs no trust that was not
 # already spent: the release's signature and the archive's checksum have been
@@ -732,11 +724,11 @@ fi
 
 refuse_automatic_downgrade
 
-# A downgrade is the incident-response path, and it is the one path nobody
-# rehearses. Two of its hazards are invisible from the outside until they bite,
-# and both are cheaper to say here than to rediscover from a service that will
-# not start at three in the morning. Printed before the decision below, and in a
-# dry run as much as in a real one, because deciding is what a dry run is for.
+# The two hazards of a downgrade, which nothing else shows the operator before
+# the service fails: an older volto refuses a key it does not know
+# (docs/configuration.md#version-compatibility), and an enabled timer undoes
+# --tag. Printed before the decision below, and in a dry run as well, because a
+# dry run exists to show that decision.
 if is_older_version "$VERSION" "$INSTALLED"; then
     echo "==> $INSTALLED -> $VERSION is a downgrade"
     note "nothing here rewrites the config, and an older volto refuses a key it does not know"
