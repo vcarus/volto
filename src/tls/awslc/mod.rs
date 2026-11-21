@@ -59,7 +59,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use anyhow::{Context, Result, ensure};
 use aws_lc_sys as sys;
-use quinn::crypto::rustls::HandshakeData;
 use quinn_proto::crypto::{
     self, ExportKeyingMaterialError, HeaderKey, KeyPair, Keys, PacketKey, UnsupportedVersion,
 };
@@ -76,6 +75,20 @@ use crate::names::Names;
 pub use ech::EchKey;
 use ffi::{Ssl, SslCtx};
 use keys::{Secret, Suite, Version};
+
+/// What a finished handshake reports to `quic::peer_info`, which downcasts
+/// `Session::handshake_data` to this type.
+///
+/// The two fields quinn's rustls provider reports in its own `HandshakeData`,
+/// under the same names. That type exists only when quinn is built with a
+/// rustls feature, and the server's quinn is not.
+#[derive(Debug)]
+pub(crate) struct HandshakeData {
+    /// The negotiated ALPN identifier.
+    pub(crate) protocol: Option<Vec<u8>>,
+    /// The SNI the client sent, if it is a DNS name (see `server_name`).
+    pub(crate) server_name: Option<String>,
+}
 
 /// The groups this server accepts.
 ///
@@ -217,7 +230,7 @@ impl<'a> Builder<'a> {
     fn build(self) -> Result<ServerConfig> {
         ensure!(!self.certs.is_empty(), "no certificate to present");
         // Before libssl reads it, because libssl reads leaves webpki does not.
-        super::check_leaf(&rustls::pki_types::CertificateDer::from(
+        super::check_leaf(&rustls_pki_types::CertificateDer::from(
             self.certs[0].as_slice(),
         ))?;
         ffi::clear_errors();
@@ -768,7 +781,8 @@ unsafe fn server_name(ssl: *const sys::SSL) -> Option<String> {
     dns_name(&raw)
 }
 
-/// `raw` if it is a DNS name, as rustls's server judged a `server_name`.
+/// `raw` if it is a DNS name by the rustls-pki-types `DnsName` rule
+/// (`names::host_name`), the rule rustls's server applied to a `server_name`.
 fn dns_name(raw: &str) -> Option<String> {
     crate::names::host_name(raw).map(|name| name.as_ref().to_owned())
 }
@@ -1073,8 +1087,6 @@ impl crypto::Session for Session {
             };
             (protocol, server_name(self.ssl.as_ptr()))
         };
-        // quinn's own type, so `quic::peer_info` reads this provider's answer
-        // exactly as it read the rustls provider's.
         Some(Box::new(HandshakeData {
             protocol,
             server_name,

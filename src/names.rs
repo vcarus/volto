@@ -6,7 +6,7 @@
 //! certificate coverage warning (`tls::names_not_covered`) all judge the same
 //! configured names, so the rules they share are written here once.
 
-use rustls::pki_types::DnsName;
+use rustls_pki_types::DnsName;
 
 /// The hosts a handshake may name, compared the way a name is compared.
 ///

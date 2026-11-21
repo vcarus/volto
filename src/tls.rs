@@ -4,16 +4,17 @@
 //! provider in `tls/awslc/` (D115), which also carries the ECH key. This module
 //! holds what the provider and the configuration checks share: reading the
 //! certificate chain and the private key, and judging which names the
-//! certificate covers. Those use rustls's PEM parser and its certificate name
-//! check, which are not the server's TLS but are the same code a rustls client
-//! applies.
+//! certificate covers. Those call rustls-pki-types for the PEM parser and
+//! rustls-webpki for the certificate parse and the name check. rustls calls the
+//! same two crates for the same judgements, so a rustls client verifying the
+//! certificate applies this code.
 
 use std::fs::File;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use rustls::pki_types::pem::{self, PemObject};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pki_types::pem::{self, PemObject};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use zeroize::{Zeroize as _, Zeroizing};
 
 // The one module of the crate allowed `unsafe` code: the binding to libssl.
@@ -21,10 +22,10 @@ use zeroize::{Zeroize as _, Zeroizing};
 #[allow(unsafe_code)]
 mod awslc;
 
-pub(crate) use awslc::server_initial_keys;
 pub use awslc::{
     EchKey, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config, server_config,
 };
+pub(crate) use awslc::{HandshakeData, server_initial_keys};
 
 /// What an operator is told when the two configured files do not pair up.
 ///
@@ -33,7 +34,8 @@ pub use awslc::{
 pub(crate) const UNUSABLE_PAIR: &str =
     "server.cert and server.key do not form a usable certificate/key pair";
 
-/// Refuses a leaf certificate webpki cannot parse, as the rustls server did.
+/// Refuses a leaf certificate webpki cannot parse, as the rustls server did:
+/// rustls's `ParsedCertificate::try_from` is this same webpki parse.
 ///
 /// AWS-LC's `d2i_X509` reads certificates webpki refuses, an X.509
 /// version 1 certificate for one, so without this such a certificate would
@@ -42,21 +44,23 @@ pub(crate) const UNUSABLE_PAIR: &str =
 /// built and where the configuration is checked, so startup, a reload and
 /// `--check-config` refuse the same leaf with the same words.
 pub(crate) fn check_leaf(leaf: &CertificateDer<'_>) -> Result<()> {
-    rustls::server::ParsedCertificate::try_from(leaf)
+    webpki::EndEntityCert::try_from(leaf)
         .map(drop)
+        .context("invalid leaf certificate")
         .context(UNUSABLE_PAIR)
 }
 
 /// The names in `names` that the leaf certificate `cert` is not valid for.
 ///
-/// Judged the way a client judges it, with rustls's own name check over the
-/// certificate's Subject Alternative Names, so what is reported here is what a
-/// client verifying the certificate by that name would refuse. A certificate
-/// webpki cannot parse reports nothing: [`check_leaf`] refuses that one at
-/// startup and on reload, with the reason, and a second complaint would only
-/// bury it.
+/// Judged the way a client judges it, with webpki's name check over the
+/// certificate's Subject Alternative Names, which is the check a rustls client
+/// runs (`rustls::client::verify_server_name` calls it). So what is reported
+/// here is what a client verifying the certificate by that name would refuse.
+/// A certificate webpki cannot parse reports nothing: [`check_leaf`] refuses
+/// that one at startup and on reload, with the reason, and a second complaint
+/// would only bury it.
 pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> Vec<String> {
-    let Ok(parsed) = rustls::server::ParsedCertificate::try_from(cert) else {
+    let Ok(parsed) = webpki::EndEntityCert::try_from(cert) else {
         return Vec::new();
     };
     names
@@ -66,8 +70,10 @@ pub(crate) fn names_not_covered(cert: &CertificateDer<'_>, names: &[String]) -> 
             // check does not take one. The same helper, so the two cannot judge
             // the same string differently; see `names::root_relative`.
             let bare = crate::names::root_relative(name);
-            !rustls::pki_types::ServerName::try_from(bare).is_ok_and(|server_name| {
-                rustls::client::verify_server_name(&parsed, &server_name).is_ok()
+            !ServerName::try_from(bare).is_ok_and(|server_name| {
+                parsed
+                    .verify_is_valid_for_subject_name(&server_name)
+                    .is_ok()
             })
         })
         .cloned()

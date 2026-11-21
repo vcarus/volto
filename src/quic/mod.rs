@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use quinn::VarInt;
-use quinn::crypto::rustls::HandshakeData;
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::gate::{Expected, Gate};
 use crate::shutdown::{self, Shutdown, Trigger};
+use crate::tls::HandshakeData;
 use crate::{conn, h3api, tunnel};
 
 pub use reload::ReloadHandle;

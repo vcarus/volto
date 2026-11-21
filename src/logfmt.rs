@@ -13,8 +13,8 @@
 //!
 //! The third rule is about *provenance*: [`or_dash`] prints with `Display`, which
 //! escapes nothing, so it is only for values the server produced or validated
-//! itself: the ALPN it negotiated from its own list, the SNI rustls accepted as
-//! a DNS name, a `SocketAddr` it resolved. Bytes the peer chose (the user-id of
+//! itself: the ALPN it negotiated from its own list, the SNI the server's TLS
+//! accepted as a DNS name (`names::host_name`), a `SocketAddr` it resolved. Bytes the peer chose (the user-id of
 //! a rejected credential) are recorded as a plain `str` field instead, which
 //! tracing prints quoted and `Debug`-escaped: `username="user1"`, and a newline
 //! or a terminal escape sequence inside it stays on the one line, spelled out.

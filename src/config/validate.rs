@@ -540,12 +540,13 @@ fn validate_expected_sni(index: usize, name: &str) -> Result<()> {
 
     // One trailing dot spells the root and is stripped above; a second one, or a
     // dot at the start, or two in a row, is an empty label. Refused here rather
-    // than left to rustls, for the reason the whole function exists: `Names`
-    // would hold `host.tw.` for `host.tw..`, no ClientHello can carry that form
-    // (RFC 6066 §3 has the name represented "without a trailing dot"), and the
-    // gate would refuse every client in silence. `ServerName::try_from` would refuse
-    // it too, but only in the certificate-coverage warning, which is a warning
-    // and not a refusal to start.
+    // than left to rustls-pki-types, for the reason the whole function exists:
+    // `Names` would hold `host.tw.` for `host.tw..`, no ClientHello can carry
+    // that form (RFC 6066 §3 has the name represented "without a trailing
+    // dot"), and the gate would refuse every client in silence.
+    // `ServerName::try_from` would refuse it too, but only in the
+    // certificate-coverage warning, which is a warning and not a refusal to
+    // start.
     if bare.split('.').any(str::is_empty) {
         bail!(
             "security.expected_sni[{index}] = {name:?} has an empty label; a host name \
@@ -1141,7 +1142,7 @@ mod tests {
             "host.0xg",
         ] {
             assert!(
-                rustls::pki_types::DnsName::try_from(name).is_ok(),
+                rustls_pki_types::DnsName::try_from(name).is_ok(),
                 "{name} is a premise of this test"
             );
             let cfg = parse(&format!("[security]\nexpected_sni = [\"{name}\"]"));

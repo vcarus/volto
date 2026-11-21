@@ -20,7 +20,6 @@ use std::time::Duration;
 use aws_lc_rs::encoding::AsDer as _;
 use aws_lc_sys as sys;
 use bytes::BytesMut;
-use quinn::crypto::rustls::HandshakeData;
 use quinn_proto::crypto::Session as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
@@ -34,8 +33,8 @@ use zeroize::Zeroizing;
 use super::ech::pem_block;
 use super::ffi::{self, OpensslBytes};
 use super::{
-    Builder, EchKey, GROUPS, Names, OP_NO_TICKET, ProbeSession, ServerConfig, Session, Version,
-    keys,
+    Builder, EchKey, GROUPS, HandshakeData, Names, OP_NO_TICKET, ProbeSession, ServerConfig,
+    Session, Version, keys,
 };
 use crate::hello::{self, EXT_ECH};
 
@@ -390,7 +389,9 @@ fn handshake(
             if out.handshake_data.is_none()
                 && let Some(data) = session.0.handshake_data()
             {
-                let data = data.downcast::<HandshakeData>().expect("quinn's type");
+                let data = data
+                    .downcast::<HandshakeData>()
+                    .expect("the provider's type");
                 out.handshake_data = Some((data.protocol, data.server_name));
             }
             if let Err(error) = result {
@@ -1301,7 +1302,9 @@ l4C//p2WUXZZI6DSPHdrnjW3fT0qvLxAMccbKOs8PmtgAwjPb0pVq9Fo
 /// A leaf webpki cannot parse is refused at build, in the wording the rustls
 /// server used: that server parsed the leaf with webpki in `with_single_cert`,
 /// and without the refusal the certificate binds while the `expected_sni`
-/// coverage warning, which parses it the same way, says nothing.
+/// coverage warning, which parses it the same way, says nothing. The cause
+/// after that wording names the leaf and webpki's reason. rustls is the
+/// oracle here, so the refusal is judged by the parse a rustls client runs.
 #[test]
 fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
     use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -1321,10 +1324,10 @@ fn a_leaf_webpki_cannot_parse_is_refused_at_build() {
     )
     .build()
     .expect_err("a leaf webpki cannot parse");
-    assert!(
-        format!("{error:#}")
-            .contains("server.cert and server.key do not form a usable certificate/key pair"),
-        "{error:#}"
+    assert_eq!(
+        format!("{error:#}"),
+        "server.cert and server.key do not form a usable certificate/key pair: \
+         invalid leaf certificate: UnsupportedCertVersion"
     );
 }
 

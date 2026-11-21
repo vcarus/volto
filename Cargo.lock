@@ -1464,6 +1464,8 @@ dependencies = [
  "rcgen",
  "rustix",
  "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "socket2",
  "subtle",

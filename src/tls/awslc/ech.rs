@@ -20,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 use aws_lc_sys as sys;
-use rustls::pki_types::pem::{PemObject, SectionKind};
+use rustls_pki_types::pem::{PemObject, SectionKind};
 use zeroize::Zeroizing;
 
 use super::ffi::{self, EchKeys, HpkeCtx, HpkeKey, OpensslBytes};
