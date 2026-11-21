@@ -4,17 +4,18 @@ name: Cross
 # cross-builds, so a dependency bump that breaks one -- aws-lc-sys carries a
 # large C build that only these targets compile through a cross toolchain --
 # would otherwise surface at tag time, after the fix window has closed. This
-# runs the exact build step release.yml runs, gated to the paths that can
-# change the dependency surface, so a Dependabot PR pays for it and an
-# ordinary code PR does not.
+# runs the exact build step release.yml runs, on a change to the dependency
+# surface, to the build itself, to `script/` or to `src/`. A pull request that
+# changes only documentation, tests or another workflow does not run it.
 #
 # A workflow of its own rather than a job in ci.yml because the gate is the
 # `paths` filter, and `on.paths` is workflow-scoped.
 
 # The second job installs each built binary with the release's own installer
 # on a runner of the binary's architecture and drives it through the unit's
-# sandbox. `script/` is in the filter for that job: the installer and the unit
-# are what it runs.
+# sandbox. `script/` and `src/` are in the filter for that job. The installer
+# and the unit are what it runs, and a source change is what can add a system
+# call the unit's filter refuses or a read of a `/proc` path the unit hides.
 #
 # `release.yml` is in the filter because the build step below is a copy of its
 # own: a change to that step is exactly the change this workflow exists to run,
@@ -32,6 +33,7 @@ on:
       - Cross.toml
       - .github/cross/**
       - script/**
+      - src/**
   pull_request:
     paths:
       - Cargo.toml
@@ -41,6 +43,7 @@ on:
       - Cross.toml
       - .github/cross/**
       - script/**
+      - src/**
 
 # As in ci.yml: a new push to a pull request supersedes its running check, and
 # on main every commit keeps its own run. A push keys on its commit, because
@@ -157,7 +160,7 @@ jobs:
     # release binary with `script/install-selfsigned.sh`, which installs
     # `script/masque.service`, and then checks three things no cargo test can:
     # systemd accepts every directive of the unit, the process runs with the
-    # sandbox the unit asks for, and tunnels work from inside that sandbox,
+    # sandbox the unit sets, and tunnels work from inside that sandbox,
     # where `/proc` holds processes only and the system call filter is on.
     # The aarch64 half runs on an arm runner, so the claim that AWS-LC finds
     # the CPU's features there without `/proc/cpuinfo` is tested and not read

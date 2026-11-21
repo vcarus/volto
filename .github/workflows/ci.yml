@@ -170,7 +170,7 @@ jobs:
     #
     # `cargo check` rather than a build or a run: this job answers "do the
     # targets still compile against today's `src`", not "is there a crash".
-    # fuzz.yml answers the second question.
+    # fuzz.yml runs them.
     #
     # Stable, not the nightly `cargo fuzz` itself needs: libfuzzer-sys type-checks
     # on stable, and this job only asks whether the targets still compile
