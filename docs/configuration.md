@@ -106,10 +106,8 @@ ECHConfigList back as `retry_configs`, which would hand the list to anyone who
 sends an ECH extension at all. The same ECH sent again from the address it
 first came from is admitted, which is a client retransmitting its first
 packets. The record of admitted ECH handshakes lives in memory. A reload keeps
-it while the new keys include one of the old ones, which is the case in every
-step of a rotation, so a first flight recorded under the old key stays a replay
-from another address. A reload after which none of the old keys is accepted
-empties it, and a restart loses it.
+it, whatever it does to the keys, so a first flight recorded under the old key
+stays a replay from another address through a rotation. A restart loses it.
 
 The TLS layer refuses the same ClientHellos a second time, in case the gate
 ever lets one through: a ClientHello whose ECH extension libssl did not accept,

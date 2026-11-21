@@ -316,13 +316,6 @@ impl Replay {
         true
     }
 
-    /// Forgets every entry, for a reload after which none of the keys that
-    /// opened them is accepted.
-    pub(super) fn clear(&mut self) {
-        self.seen = HashMap::new();
-        self.order = VecDeque::new();
-    }
-
     pub(super) fn len(&self) -> usize {
         self.order.len()
     }
@@ -810,7 +803,7 @@ mod tests {
     }
 
     /// The same `enc` is admitted again from its own address and refused from
-    /// any other, and a cleared record forgets it.
+    /// any other.
     #[test]
     fn a_replay_is_an_enc_seen_from_another_address() {
         let mut replay = Replay::new();
@@ -819,9 +812,6 @@ mod tests {
         assert!(!replay.admit(b"enc-one", addr(2)));
         assert!(replay.admit(b"enc-two", addr(2)));
         assert_eq!(replay.len(), 2);
-        replay.clear();
-        assert_eq!(replay.len(), 0);
-        assert!(replay.admit(b"enc-one", addr(2)));
     }
 
     /// At the limit the oldest entry goes and the newest stays.

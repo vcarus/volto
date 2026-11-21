@@ -390,16 +390,6 @@ impl EchKey {
         };
         ffi::check(rc, "SSL_ECH_KEYS_add")
     }
-
-    /// Whether `self` and `other` are the same key.
-    ///
-    /// Compared by the ECHConfigList each one prints, which holds the public
-    /// key, so two files with the same list hold the same key. A reload reads
-    /// the files again, so the two are never the same allocation even when the
-    /// key did not change.
-    fn same_as(&self, other: &EchKey) -> bool {
-        self.config == other.config
-    }
 }
 
 /// A new, empty keys object.
@@ -483,12 +473,6 @@ impl EchKeySet {
     /// The key whose ECHConfig has `config_id`, if the set holds one.
     pub fn by_config_id(&self, config_id: u8) -> Option<&EchKey> {
         self.all().find(|key| key.config_id == config_id)
-    }
-
-    /// Whether `self` and `other` hold at least one key in common.
-    pub fn shares_a_key_with(&self, other: &EchKeySet) -> bool {
-        self.all()
-            .any(|ours| other.all().any(|theirs| ours.same_as(theirs)))
     }
 
     /// The keys object an `SSL_CTX` takes: the current key as a retry config,
@@ -1003,9 +987,8 @@ mod tests {
         refused(&text, "not an X25519 key");
     }
 
-    /// A set picks its key by config_id, refuses a previous key that shares
-    /// the current key's, and shares a key with another set exactly when one
-    /// of its keys is the same key as one of the other's.
+    /// A set picks its key by config_id and refuses a previous key that shares
+    /// the current key's.
     #[test]
     fn a_key_set_picks_by_config_id_and_refuses_one_config_id_twice() {
         let current = Arc::new(EchKey::generate("public.example", 2, 0).expect("a key"));
@@ -1017,11 +1000,11 @@ mod tests {
         assert!(alone.by_config_id(1).is_none());
         assert!(
             both.by_config_id(1)
-                .is_some_and(|key| key.same_as(&previous))
+                .is_some_and(|key| key.config_list() == previous.config_list())
         );
         assert!(
             both.by_config_id(2)
-                .is_some_and(|key| key.same_as(&current))
+                .is_some_and(|key| key.config_list() == current.config_list())
         );
         assert!(both.by_config_id(3).is_none());
 
@@ -1034,17 +1017,6 @@ mod tests {
             message.contains("config_id 2") && message.contains("another config_id"),
             "{message}"
         );
-
-        // The same key read again from its file is the same key.
-        let reread = Arc::new(EchKey::from_pem(current.to_pem().as_bytes()).expect("read back"));
-        let rotated = EchKeySet::new(Arc::new(
-            EchKey::generate("public.example", 3, 0).expect("a key"),
-        ))
-        .with_previous(reread)
-        .expect("two config_ids");
-        assert!(rotated.shares_a_key_with(&alone));
-        assert!(alone.shares_a_key_with(&both));
-        assert!(!EchKeySet::new(twin).shares_a_key_with(&both));
     }
 
     /// A previous key file that does not load is reported under its own
