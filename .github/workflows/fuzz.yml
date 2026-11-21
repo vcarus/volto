@@ -18,9 +18,10 @@ name: Fuzz
 # code that runs before authentication, where a failing input can be a
 # datagram that stops a deployed server, and their corpus is in the Actions
 # cache, which is not public, so a finding can rest on days of runs that a
-# reader cannot repeat at once. The stack trace stays in the log. Reproducing
-# such a finding means running the target locally (fuzz/README.md) from the
-# trace.
+# reader cannot repeat at once. fuzz/withhold-input.awk filters their output:
+# the panic location and the stack trace stay in the log, the panic message
+# and everything from libFuzzer's `MS:` line on do not. Reproducing such a
+# finding means running the target locally (fuzz/README.md) from the trace.
 on:
   schedule:
     # 19:17 UTC, a quiet minute. GitHub delays scheduled runs that start on
@@ -145,21 +146,17 @@ jobs:
           mkdir -p "fuzz/corpus/${{ matrix.target }}"
           [ "$SECONDS_PER_TARGET" -le 1800 ] ||
             { echo "::error::$SECONDS_PER_TARGET seconds is past the 1800 this job's time limit allows" >&2; exit 1; }
+          # The withheld targets keep only the trace, so there must be one.
+          export RUST_BACKTRACE=1
           run() {
             cargo fuzz run "${{ matrix.target }}" -- \
               -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=60
           }
           case " $WITHHELD " in
             *" ${{ matrix.target }} "*)
-              # libFuzzer prints a failing input after its `MS:` line, as
-              # bytes, as text and as base64, up to the line that names the
-              # file it wrote. Those lines are dropped; `pipefail` keeps the
-              # run's own exit status.
-              run 2>&1 | awk '
-                /^artifact_prefix=/ { skip = 0 }
-                /^MS: / { skip = 1; print "(the failing input is withheld)"; next }
-                /^Base64: / { next }
-                !skip' ;;
+              # What the filter prints and why: the header of the file.
+              # `pipefail` keeps the run's own exit status.
+              run 2>&1 | awk -f fuzz/withhold-input.awk ;;
             *) run ;;
           esac
 

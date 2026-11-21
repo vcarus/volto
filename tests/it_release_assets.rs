@@ -46,7 +46,9 @@ mod scripts;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use scripts::{read_text, repo_root, rust_files, source_root};
 
@@ -150,7 +152,7 @@ fn packaged_paths() -> BTreeSet<String> {
 /// Empty when git cannot answer, which leaves the directory listing below as
 /// strict as it is without this.
 fn ignored_in_script_dir() -> BTreeSet<String> {
-    let output = std::process::Command::new("git")
+    let output = Command::new("git")
         .args([
             "ls-files",
             "-z",
@@ -1273,6 +1275,117 @@ fn the_fuzz_workflow_runs_every_target() {
     assert_eq!(
         bins, files,
         "the `[[bin]]` names in fuzz/Cargo.toml and the files in fuzz/fuzz_targets differ"
+    );
+}
+
+/// `fuzz/withhold-input.awk` is what keeps a failing input of the
+/// pre-authentication targets out of a public log. It is run here over the
+/// output of a failed run, with the input in every form the tools print it:
+/// the oracle's panic message, libFuzzer's hex, text and base64 lines, and
+/// cargo-fuzz's `Debug` line after the `artifact_prefix=` line. The text form
+/// begins with bytes the input chose, here ones that look like a line the
+/// filter prints. The panic location and both stack traces must come through.
+#[test]
+fn the_fuzz_filter_withholds_the_failing_input_in_every_form() {
+    let root = repo_root();
+    let workflow = read_text(&root.join(".github/workflows/fuzz.yml"));
+    assert!(
+        workflow.contains("run 2>&1 | awk -f fuzz/withhold-input.awk ;;"),
+        "fuzz.yml pipes the withheld targets through the filter this test runs"
+    );
+    assert!(
+        workflow.contains("export RUST_BACKTRACE=1"),
+        "the trace is all the filter keeps of a panic, so the run asks for one"
+    );
+
+    // Every line that carries input holds one of these.
+    let secrets = ["SECRET", "0x53,0x45", "U0VDUkVU", "[83, 69, 67"];
+    let transcript = "\x20  Compiling volto-fuzz v0.0.0 (/work/fuzz)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 02s
+     Running `fuzz/target/x86_64-unknown-linux-gnu/release/hold -artifact_prefix=/work/fuzz/artifacts/hold/`
+INFO: Seed: 1234
+#2\tINITED cov: 10 ft: 11 corp: 1/1b exec/s: 0 rss: 40Mb
+#512\tNEW    cov: 12 ft: 13 corp: 2/9b lim: 4 exec/s: 0 rss: 41Mb L: 8/8 MS: 1 InsertByte-
+
+thread '<unnamed>' (4242) panicked at fuzz_targets/hold.rs:149:5:
+the released flight names SECRET
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/abc/library/std/src/panicking.rs:697:5
+   1: hold::_::__libfuzzer_sys_run
+             at ./fuzz_targets/hold.rs:149:5
+==4242== ERROR: libFuzzer: deadly signal
+    #0 0x55d0c0a1b2c3 in __sanitizer_print_stack_trace (/work/hold+0x1b2c3)
+    #1 0x55d0c0a2b2c3 in fuzzer::PrintStackTrace() (/work/hold+0x2b2c3)
+NOTE: libFuzzer has rudimentary signal handlers.
+SUMMARY: libFuzzer: deadly signal
+MS: 2 ChangeByte-InsertByte-; base unit: adc83b19e793491b1c6ea0fd8b46cd9f32e592fc
+0x53,0x45,0x43,0x52,0x45,0x54,
+INFO: SECRET
+artifact_prefix='/work/fuzz/artifacts/hold/'; Test unit written to /work/fuzz/artifacts/hold/crash-1
+Base64: U0VDUkVU
+
+────────────────────────────────────────
+
+Failing input:
+
+\tfuzz/artifacts/hold/crash-1
+
+Output of `std::fmt::Debug`:
+
+\t[83, 69, 67, 82, 69, 84]
+
+Reproduce with:
+
+\tcargo fuzz run hold fuzz/artifacts/hold/crash-1
+";
+
+    let mut awk = Command::new("awk")
+        .arg("-f")
+        .arg(root.join("fuzz/withhold-input.awk"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("awk is installed");
+    awk.stdin
+        .take()
+        .expect("a piped stdin")
+        .write_all(transcript.as_bytes())
+        .expect("write the transcript");
+    let output = awk.wait_with_output().expect("awk ran");
+    assert!(output.status.success(), "awk failed");
+    let printed = String::from_utf8(output.stdout).expect("UTF-8 output");
+
+    for secret in secrets {
+        assert!(
+            transcript.contains(secret),
+            "the transcript holds {secret:?}"
+        );
+        assert!(
+            !printed.contains(secret),
+            "the filter printed the input as {secret:?}:\n{printed}"
+        );
+    }
+    for kept in [
+        "thread '<unnamed>' (4242) panicked at fuzz_targets/hold.rs:149:5:",
+        "             at ./fuzz_targets/hold.rs:149:5",
+        "   1: hold::_::__libfuzzer_sys_run",
+        "==4242== ERROR: libFuzzer: deadly signal",
+        "    #1 0x55d0c0a2b2c3 in fuzzer::PrintStackTrace() (/work/hold+0x2b2c3)",
+        "SUMMARY: libFuzzer: deadly signal",
+        "#512\tNEW    cov: 12",
+    ] {
+        assert!(
+            printed.contains(kept),
+            "the filter dropped {kept:?}:\n{printed}"
+        );
+    }
+    assert!(
+        printed.ends_with(
+            "(the failing input is withheld, with every line after this one)\n\
+             (2 other lines withheld)\n"
+        ),
+        "{printed}"
     );
 }
 

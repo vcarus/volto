@@ -255,10 +255,10 @@ verify_config() {
 # the run when it cannot.
 #
 # verify_config above only checks that the four substitutions landed. The rest
-# of the file is the shipped example, and a binary that does not know one of its
+# of the file is the shipped example, and a binary older than one of its
 # keys refuses the whole file (docs/configuration.md#version-compatibility). On a
 # first install there is no running service to fall back to, so this is the
-# moment to ask. deploy.sh asks the same question on the update path
+# moment to check. deploy.sh makes the same check on the update path
 # (`check_config_with`); this is the first-install half of it.
 #
 # The temporary file is asked about rather than the installed one, so a refusal

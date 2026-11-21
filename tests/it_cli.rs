@@ -1058,8 +1058,17 @@ fn config_id_of(key: &Path) -> u8 {
     base64_decode(stdout_of(&printed).trim())[6]
 }
 
+/// The `maximum_name_length` of the one ECHConfig in `list`, by the layout
+/// [`assert_echconfig_list`] reads.
+fn max_name_length_of(list: &[u8]) -> u8 {
+    let u16_at = |at: usize| usize::from(u16::from_be_bytes([list[at], list[at + 1]]));
+    let suites = 9 + 2 + u16_at(9);
+    list[suites + 2 + u16_at(suites)]
+}
+
 /// `ech-keygen --replaces` gives the new key a config_id other than the
-/// replaced key's and, without `--public-name`, that key's public name. An
+/// replaced key's and, without `--public-name` and `--max-name-length`, that
+/// key's public name and `maximum_name_length`. An
 /// explicit `--config-id` equal to the replaced key's is refused and writes
 /// nothing.
 ///
@@ -1076,6 +1085,8 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
         "front.example",
         "--config-id",
         "200",
+        "--max-name-length",
+        "64",
         "--out",
         current.to_str().unwrap(),
     ]);
@@ -1095,6 +1106,7 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
         let list = base64_decode(stdout_of(&made).trim());
         assert_ne!(list[6], 200, "round {round}: the replaced key's config_id");
         assert_echconfig_list(&list, list[6], "front.example");
+        assert_eq!(max_name_length_of(&list), 64, "the replaced key's value");
     }
 
     let named = dir.join("named.pem");
@@ -1106,15 +1118,15 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
         "other.example",
         "--config-id",
         "201",
+        "--max-name-length",
+        "7",
         "--out",
         named.to_str().unwrap(),
     ]);
     assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
-    assert_echconfig_list(
-        &base64_decode(stdout_of(&made).trim()),
-        201,
-        "other.example",
-    );
+    let list = base64_decode(stdout_of(&made).trim());
+    assert_echconfig_list(&list, 201, "other.example");
+    assert_eq!(max_name_length_of(&list), 7, "the value the flag gave");
 
     let same = dir.join("same.pem");
     let refused = run(&[
@@ -1142,6 +1154,11 @@ fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
         same.to_str().unwrap(),
     ]);
     assert_eq!(missing.status.code(), Some(1));
+    let stderr = stderr_of(&missing);
+    assert!(
+        stderr.contains("failed to read --replaces = ") && !stderr.contains("server.ech_key"),
+        "the file is named by the flag that named it: {stderr}"
+    );
     assert!(
         !same.exists(),
         "nothing is written when the replaced key does not read"
