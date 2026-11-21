@@ -7,7 +7,9 @@
 //! it is the handshake itself: rustls in `EchMode::Enable` never completes a
 //! handshake that the server answered on the outer ClientHello, and a list the
 //! server no longer holds gets no answer at all, which the reload scenario
-//! shows.
+//! shows. The reload scenario is a key rotation: the old key is kept as the
+//! previous key beside the new one, both lists connect, and the old list gets
+//! silence once a second reload removes it.
 //!
 //! One test function, because the log subscriber is process-wide (see
 //! `SharedBuffer`).
@@ -176,10 +178,44 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     );
     drop(client);
 
-    // A reload with a new key file puts the new key in force: the old list no
-    // longer opens, so the socket gate drops its handshake without any reply
-    // (D115, batch 2), and the new list is accepted.
+    // A rotation: a reload makes a new key the current one and keeps the old
+    // key as the previous one. The reload line carries both config_ids, and
+    // a client with the old list and a client with the new list both run
+    // tunnels, each with ECH accepted under the key its list names.
     let (new_path, new_key) = key_file(&keys, "ech-new.pem", 9);
+    server.rewrite_config(&format!(
+        "ech_key = \"{}\"\nech_previous_key = \"{}\"\n{ALLOW_PRIVATE}",
+        new_path.display(),
+        key_path.display()
+    ));
+    let mark = buffer.mark();
+    server.reload().expect("the rotation reload applies");
+    let reloaded = one_line(&buffer, mark, "configuration reloaded");
+    assert!(
+        reloaded.contains(&format!(
+            "ech=true ech_config_id=9 ech_previous_config_id=7 ech_public_name={PUBLIC_NAME}"
+        )),
+        "{reloaded}"
+    );
+    for (what, list, config_id) in [
+        ("the old list", &list, 7),
+        ("the new list", &new_key.config_list(), 9),
+    ] {
+        let mark = buffer.mark();
+        let mut client = H3Client::connect_on(ech_endpoint(&server.ca, list), &server).await;
+        tcp_and_udp(&mut client, &server).await;
+        let line = one_line(&buffer, mark, "TLS handshake complete");
+        assert!(line.contains("ech_accepted=true"), "{what}: {line}");
+        assert!(
+            line.contains(&format!("ech_config_id={config_id} ")),
+            "{what}: {line}"
+        );
+        drop(client);
+    }
+
+    // A reload that removes the previous key: the old list no longer opens,
+    // so the socket gate drops its handshake without any reply (D115, batch
+    // 2), and the new list is accepted.
     server.rewrite_config(&format!(
         "ech_key = \"{}\"\n{ALLOW_PRIVATE}",
         new_path.display()

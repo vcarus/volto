@@ -1638,12 +1638,21 @@ fn ech_key(config_id: u8) -> Arc<EchKey> {
 /// The gate's policy with `key` alone, the name list `names` and
 /// `require_ech`.
 fn hold_policy(key: &Arc<EchKey>, names: &[&str], require_ech: bool) -> Policy {
+    keys_policy(EchKeySet::new(key.clone()), names, require_ech)
+}
+
+/// The gate's policy with the key set `keys`, the name list `names` and
+/// `require_ech`.
+fn keys_policy(keys: EchKeySet, names: &[&str], require_ech: bool) -> Policy {
     let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-    Policy::new(
-        Names::new(&names),
-        Some(Arc::new(EchKeySet::new(key.clone()))),
-        require_ech,
-    )
+    Policy::new(Names::new(&names), Some(Arc::new(keys)), require_ech)
+}
+
+/// The key set of a rotation: `current`, with `previous` still accepted.
+fn rotation(current: &Arc<EchKey>, previous: &Arc<EchKey>) -> EchKeySet {
+    EchKeySet::new(current.clone())
+        .with_previous(previous.clone())
+        .expect("the two keys have different config_ids")
 }
 
 /// X25519MLKEM768 first, as Surge orders its groups. An ECH ClientHello with
@@ -2429,8 +2438,10 @@ fn the_hold_stays_inside_its_bounds_under_a_flood() {
     );
 }
 
-/// A reload that keeps the key keeps the replay record, a reload that changes
-/// it empties the record, and a policy without a key empties the hold.
+/// A reload that keeps the key keeps the replay record, a reload to a key that
+/// was not accepted before empties the record, and a policy without a key
+/// empties the hold. `a_rotation_keeps_the_replay_record` covers a reload that
+/// keeps the old key as the previous one.
 #[test]
 fn a_new_key_empties_the_replay_record_and_no_key_empties_the_hold() {
     let crypto = nameless_crypto();
@@ -2471,6 +2482,212 @@ fn a_new_key_empties_the_replay_record_and_no_key_empties_the_hold() {
     screening.set(Names::new(&[]));
     assert_eq!(screening.flights(), 0, "no key, nothing held");
     assert_eq!(screening.held_bytes(), 0);
+}
+
+/// During a rotation the gate opens an ECH extension with the key whose
+/// config_id it names. A flight under the previous key is admitted, as is one
+/// under the current key. A flight that names the previous key's config_id and
+/// was sealed to another key is dropped, and so is one that names neither
+/// config_id. With `require_ech` off and on.
+#[test]
+fn during_a_rotation_ech_is_opened_with_the_key_its_config_id_names() {
+    let crypto = nameless_crypto();
+    let previous = ech_key(7);
+    let current = ech_key(9);
+    let groups = surge_groups();
+    let flight = |list: Vec<u8>| {
+        let hello = rustls_hello(&Offer::Ech(list), &groups, "localhost");
+        hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2)
+    };
+    let under_previous = flight(previous.config_list());
+    let under_current = flight(current.config_list());
+    let previous_id_other_key = flight(ech_key(7).config_list());
+    let neither_id = flight(ech_key(8).config_list());
+
+    for require_ech in [false, true] {
+        let policy = || keys_policy(rotation(&current, &previous), &["localhost"], require_ech);
+        let what = |what: &str| format!("{what}, require_ech = {require_ech}");
+
+        let mut screening = Screening::new(policy());
+        released_whole(
+            &mut screening,
+            from(1),
+            &under_previous,
+            &what("ECH under the previous key"),
+        );
+        assert_eq!(screening.replay_entries(), 1, "its enc is recorded");
+
+        let mut screening = Screening::new(policy());
+        released_whole(
+            &mut screening,
+            from(1),
+            &under_current,
+            &what("ECH under the current key"),
+        );
+
+        for (shape, datagrams) in [
+            (
+                "ECH that names the previous config_id, sealed to another key",
+                &previous_id_other_key,
+            ),
+            ("ECH that names neither config_id", &neither_id),
+        ] {
+            let mut screening = Screening::new(policy());
+            dropped_whole(
+                &mut screening,
+                from(1),
+                datagrams,
+                &Dropped::EchNotOpened,
+                &what(shape),
+            );
+            assert_eq!(screening.replay_entries(), 0, "{}", what(shape));
+        }
+    }
+}
+
+/// A flight under the previous key, sent again from another address, is a
+/// replay and is dropped, as it is under the current key; from its own
+/// address it is admitted again.
+#[test]
+fn the_same_ech_under_the_previous_key_from_another_address_is_a_replay() {
+    let crypto = nameless_crypto();
+    let previous = ech_key(7);
+    let current = ech_key(9);
+    let hello = rustls_hello(
+        &Offer::Ech(previous.config_list()),
+        &surge_groups(),
+        "localhost",
+    );
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let rewrapped = hold_flight(&*crypto, &[0x5c; 8], &[], &hello, 2);
+
+    let mut screening = Screening::new(keys_policy(rotation(&current, &previous), &[], false));
+    released_whole(&mut screening, from(1), &flight, "the original");
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &flight,
+        &Dropped::Replayed,
+        "the copy from another port",
+    );
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &rewrapped,
+        &Dropped::Replayed,
+        "its ClientHello under a new connection ID from another port",
+    );
+    released_whole(&mut screening, from(1), &flight, "the original again");
+    assert_eq!(screening.replay_entries(), 1, "one ClientHello, one entry");
+}
+
+/// The usual rotation, where the old current key becomes the previous key,
+/// keeps the replay record: an `enc` recorded under the old key before the
+/// reload is still a replay from another address after it, and its own
+/// address is still admitted. The reload reads the old key from its file
+/// again, as a real reload does, so the keys are compared by what they are
+/// and not by allocation. A reload that then removes the previous key keeps
+/// the record too, because the current key stays.
+#[test]
+fn a_rotation_keeps_the_replay_record() {
+    let crypto = nameless_crypto();
+    let old = ech_key(7);
+    let new = ech_key(9);
+    let hello = rustls_hello(&Offer::Ech(old.config_list()), &surge_groups(), "localhost");
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let rewrapped = hold_flight(&*crypto, &[0x5c; 8], &[], &hello, 2);
+    let new_hello = rustls_hello(&Offer::Ech(new.config_list()), &surge_groups(), "localhost");
+    let new_flight = hold_flight(&*crypto, &[0x5d; 8], &[], &new_hello, 2);
+
+    let mut screening = Screening::new(hold_policy(&old, &[], false));
+    released_whole(
+        &mut screening,
+        from(1),
+        &flight,
+        "admitted under the old key",
+    );
+    assert_eq!(screening.replay_entries(), 1);
+
+    let reread = Arc::new(EchKey::from_pem(old.to_pem().as_bytes()).expect("the old key"));
+    screening.set(keys_policy(rotation(&new, &reread), &[], false));
+    assert_eq!(
+        screening.replay_entries(),
+        1,
+        "the rotation keeps the record"
+    );
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &rewrapped,
+        &Dropped::Replayed,
+        "the recorded enc from another address after the rotation",
+    );
+    released_whole(
+        &mut screening,
+        from(1),
+        &flight,
+        "the recorded flight from its own address after the rotation",
+    );
+    released_whole(
+        &mut screening,
+        from(3),
+        &new_flight,
+        "a flight under the new key",
+    );
+    assert_eq!(screening.replay_entries(), 2);
+
+    screening.set(hold_policy(&new, &[], false));
+    assert_eq!(
+        screening.replay_entries(),
+        2,
+        "removing the previous key keeps the record of the current one"
+    );
+    dropped_whole(
+        &mut screening,
+        from(4),
+        &new_flight,
+        &Dropped::Replayed,
+        "the new key's recorded enc from another address",
+    );
+}
+
+/// After a reload that removes the previous key, its list gets silence: a
+/// flight under it is dropped, including one whose first packet was held
+/// before the reload and whose second arrived after it, because the hold
+/// judges a flight under the policy in force when it completes.
+#[test]
+fn after_a_reload_that_removes_the_previous_key_its_list_gets_silence() {
+    let crypto = nameless_crypto();
+    let previous = ech_key(7);
+    let current = ech_key(9);
+    let hello = rustls_hello(
+        &Offer::Ech(previous.config_list()),
+        &surge_groups(),
+        "localhost",
+    );
+    let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
+    let straddling = hold_flight(&*crypto, &[0x5e; 8], &[], &hello, 2);
+
+    let mut screening = Screening::new(keys_policy(rotation(&current, &previous), &[], false));
+    let (screened, drops) = feed(&mut screening, Duration::ZERO, from(2), &straddling[..1]);
+    assert_eq!(screened, vec![Screened::Held]);
+    assert!(drops.is_empty());
+
+    screening.set(hold_policy(&current, &[], false));
+    dropped_whole(
+        &mut screening,
+        from(2),
+        &straddling[1..],
+        &Dropped::EchNotOpened,
+        "a flight that was held under the previous key and completed after the reload",
+    );
+    dropped_whole(
+        &mut screening,
+        from(1),
+        &flight,
+        &Dropped::EchNotOpened,
+        "a flight under the removed key",
+    );
 }
 
 /// Without an ECH key the gate keeps no state: a first packet is judged on its
@@ -2891,6 +3108,78 @@ async fn require_ech_is_reloadable_and_refused_without_a_key() {
         .await
         .expect_err("the refused reload left require_ech on");
     assert_matches!(error, quinn::ConnectionError::TimedOut, "{error:?}");
+}
+
+/// A server holding a previous key beside its current one, on the wire: a
+/// flight under either key is answered, a flight that names the previous
+/// key's config_id and was sealed to another key draws nothing, and after a
+/// reload that removes the previous key a flight under it draws nothing
+/// either. Each flight has a connection ID of its own, so quinn would answer
+/// any of them the gate let through.
+#[tokio::test]
+async fn a_previous_key_is_answered_until_a_reload_removes_it() {
+    let crypto = nameless_crypto();
+    let previous = ech_key(7);
+    let current = ech_key(9);
+    let groups = surge_groups();
+    let next = std::cell::Cell::new(0x60u8);
+    let flight = |list: Vec<u8>| {
+        next.set(next.get() + 1);
+        let hello = rustls_hello(&Offer::Ech(list), &groups, "localhost");
+        hold_flight(&*crypto, &[next.get(); 8], &[], &hello, 2)
+    };
+
+    let keys = TempDir::new("ech-rotation");
+    let current_path = keys.path().join("ech.pem");
+    let previous_path = keys.path().join("ech-old.pem");
+    volto::tls::write_new_key_file(&current_path, &current).expect("write the current key");
+    volto::tls::write_new_key_file(&previous_path, &previous).expect("write the previous key");
+    let rotating = format!(
+        "ech_key = \"{}\"\nech_previous_key = \"{}\"\n[security]\nallow_private_networks = true\n",
+        current_path.display(),
+        previous_path.display()
+    );
+    let server = TestServer::start_with(&rotating).await;
+
+    for (what, list) in [
+        ("a flight under the previous key", previous.config_list()),
+        ("a flight under the current key", current.config_list()),
+    ] {
+        assert!(
+            !udp_answers(server.addr, &flight(list), PATIENCE)
+                .await
+                .is_empty(),
+            "{what} is answered"
+        );
+    }
+    all_silent(
+        server.addr,
+        vec![(
+            "ECH that names the previous config_id, sealed to another key",
+            flight(ech_key(7).config_list()),
+        )],
+    )
+    .await;
+
+    server.rewrite_config(&format!(
+        "ech_key = \"{}\"\n[security]\nallow_private_networks = true\n",
+        current_path.display()
+    ));
+    server.reload().expect("the reload applies");
+    all_silent(
+        server.addr,
+        vec![(
+            "a flight under the removed previous key",
+            flight(previous.config_list()),
+        )],
+    )
+    .await;
+    assert!(
+        !udp_answers(server.addr, &flight(current.config_list()), PATIENCE)
+            .await
+            .is_empty(),
+        "a flight under the current key is still answered"
+    );
 }
 
 // ---------------------------------------------------------------------------
