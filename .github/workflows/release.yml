@@ -27,6 +27,10 @@ jobs:
     # reports the pull request's head commit as its SHA, so the same commit can
     # carry one, but that run tested the merge with the base rather than this
     # commit, and it ran without the scrub secret (ci.yml, the `test` job).
+    # GitHub starts one push run per push, for the push's head commit, so the
+    # tagged commit must be the head of a push to `main`: a commit that
+    # arrived as a middle commit of a longer push has no run of its own, and
+    # a tag on it is refused for good. Tag the head of the push instead.
     #
     # It asks a question, it does not wait for an answer: a tag pushed in the
     # same breath as the commit will find CI still running and fail here, with
@@ -78,7 +82,7 @@ jobs:
             exit 1
           fi
           if [ "$green" -eq 0 ]; then
-            echo "::error::no successful ci.yml run of a push to main for ${{ github.sha }} (a pull-request run does not count); refusing to publish ${GITHUB_REF_NAME}"
+            echo "::error::no successful ci.yml run of a push to main for ${{ github.sha }} (a pull-request run does not count, and only the head commit of a push gets a run: tag the head of a push to main); refusing to publish ${GITHUB_REF_NAME}"
             exit 1
           fi
 
