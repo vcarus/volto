@@ -25,8 +25,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 bytes = "1"
 # The `tls` target drives the server's TLS with a real rustls client, the same
-# client the root's tests use. rustls is in this workspace's lock already
-# through volto, with these features, so this adds an edge and no crate.
+# client the root's tests use, with the features of the root's rustls
+# dev-dependency. volto depends on rustls only for its own tests, which this
+# workspace does not build, so this is the one edge to rustls here.
 rustls = { version = "0.23", default-features = false, features = [
     "aws_lc_rs",
     "std",

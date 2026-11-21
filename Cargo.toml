@@ -33,9 +33,16 @@ publish = false
 # build, which adds to every `tracing` call site, quinn's and ours, a branch
 # that writes a `log` record while no subscriber is installed. `main` installs
 # one before the endpoint exists, so that branch never runs here.
+#
+# `aws-lc-rs` is quinn's crypto library without a TLS implementation (D102):
+# the reset-token HMAC key of the default `EndpointConfig` and the token key of
+# `ServerConfig::with_crypto` are aws-lc-rs's, and the TLS is volto's own
+# provider (D115). No rustls feature is named here, so a release build
+# compiles no rustls; `tests/it_release_assets.rs` holds that. The tests turn
+# on `rustls-aws-lc-rs` through quinn's entry in `[dev-dependencies]`.
 quinn = { version = "0.11", default-features = false, features = [
     "runtime-tokio",
-    "rustls-aws-lc-rs",
+    "aws-lc-rs",
     "bloom",
 ] }
 # Named for what quinn does not re-export: `quinn_proto::RttEstimator`, which
@@ -46,34 +53,11 @@ quinn = { version = "0.11", default-features = false, features = [
 # crate. Same requirement style as quinn, and no features of its own: quinn
 # selects them.
 quinn-proto = { version = "0.11", default-features = false }
-# The crypto backend is aws-lc-rs rather than ring (D102). It is what rustls
-# enables by default upstream and the only rustls provider that carries ML-KEM,
-# which the test clients need to offer X25519MLKEM768 the way Surge does.
+# rustls is not the server's TLS (D115), and no release build compiles it. The
+# PEM parser, the certificate checks and the `DnsName` rule come from the two
+# crates below, which rustls calls for the same judgements. rustls is a
+# dev-dependency, for the test clients.
 #
-# `prefer-post-quantum` is deliberately *not* enabled. It only reorders the
-# provider's `DEFAULT_KX_GROUPS`, and since D115 no handshake of the server reads
-# that list: the server's groups are `GROUPS` in `src/tls/awslc/mod.rs`, and
-# libssl takes the first of them in the client's own order. What the feature
-# would change is the test suite: every rustls client on the default provider
-# would offer X25519MLKEM768 first and send its key share, where it now offers
-# X25519 first. A test that wants the post-quantum order asks for it (`pq_first`
-# in `src/tls/awslc/tests.rs`), and `nameless_crypto` in `tests/common`, which
-# builds the gate tests' Initial packets, never reaches a key exchange.
-# X25519MLKEM768 is in `DEFAULT_KX_GROUPS` either way.
-#
-# `default-features = false` also keeps `tls12` off, which QUIC requires anyway;
-# with it off both providers reduce to the same three TLS 1.3 suites.
-rustls = { version = "0.23", default-features = false, features = [
-    "aws_lc_rs",
-    "std",
-] }
-# rustls is no longer the server's TLS (D115), and the server's own code no
-# longer calls it: the PEM parser, the certificate checks and the `DnsName`
-# rule come from the two crates below, which rustls calls for the same
-# judgements. Nothing but the tests names it. Every client in the test suite is
-# rustls, which keeps the two ends of each test on different TLS
-# implementations.
-
 # The certificate and key types and the PEM parser (`tls::load_certs`,
 # `tls::load_key`, `EchKey::from_pem`), and the `DnsName` rule for a host name
 # (`names::host_name`). This is the crate rustls re-exports as
@@ -99,9 +83,9 @@ rustls-webpki = { version = "0.103", default-features = false, features = [
 
 # The server's TLS (D115): volto's own quinn crypto provider in `src/tls/awslc/`
 # runs the handshake on AWS-LC's libssl, which has server-side ECH and
-# BoringSSL's QUIC interface. It is the same `aws-lc-sys` build that already
-# backs rustls through aws-lc-rs (D102), so naming it here adds edges and
-# features, not a second copy of AWS-LC. `ssl` is what builds and binds libssl.
+# BoringSSL's QUIC interface. It is the same `aws-lc-sys` build that backs
+# aws-lc-rs (D102), so naming it here adds edges and features, not a second
+# copy of AWS-LC. `ssl` is what builds and binds libssl.
 # It implies `bindgen` and `all-bindings`, so the bindings are generated at
 # build time with libclang instead of taken from the pregenerated crypto-only
 # files, and the build goes through cmake: every builder now needs cmake and
@@ -116,13 +100,13 @@ aws-lc-sys = { version = "0.47", default-features = false, features = ["ssl"] }
 # Packet protection, header protection and the Initial and Retry keys of the
 # provider (`src/tls/awslc/keys.rs`) are safe code over aws-lc-rs's AEAD, HKDF
 # and QUIC header protection, the same primitives rustls's QUIC keys use. Already
-# in the tree through rustls; this is a direct edge to it.
+# in the tree through quinn's `aws-lc-rs` feature; this is a direct edge to it.
 aws-lc-rs = { version = "1.19", default-features = false, features = [
     "aws-lc-sys",
 ] }
 # Clears the TLS traffic secrets and the ECH private key from memory when the
 # provider drops them, as rustls does with its own secrets. Already in the tree
-# through aws-lc-rs and rustls.
+# through aws-lc-rs.
 zeroize = "1"
 
 # 1.50 is the first release with `TcpStream::set_zero_linger`, which
@@ -140,8 +124,7 @@ tokio = { version = "1.50", features = [
 bytes = "1"
 percent-encoding = "2"
 # Constant-time credential comparison (RFC 7617 secrets must not be compared with
-# a short-circuiting `==`). Already in the tree via rustls; `ConstantTimeEq` is
-# the only item used.
+# a short-circuiting `==`). `ConstantTimeEq` is the only item used.
 subtle = "2"
 serde = { version = "1", features = ["derive"] }
 # Read only: the configuration is parsed and never written, so the default
@@ -155,7 +138,7 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 # The default set less `tracing-log`, whose `LogTracer` would forward `log`
 # records into `tracing`. Nothing the server runs emits one: quinn's `log`
-# feature and rustls's `logging` feature are off, and `log` is left in the
+# feature is off, the server compiles no rustls, and `log` is left in the
 # graph only by bindgen at build time.
 tracing-subscriber = { version = "0.3", default-features = false, features = [
     "env-filter",
@@ -271,6 +254,40 @@ path = "tests/it_resolver_pool.rs"
 required-features = ["operator-runs"]
 
 [dev-dependencies]
+# The TLS of every test client, and of the test servers that are quinn's and
+# not volto's. rustls is a different TLS implementation from the server's
+# AWS-LC libssl (D115), so the two ends of each test run different code.
+#
+# Its crypto backend is aws-lc-rs rather than ring (D102). It is what rustls
+# enables by default upstream and the only rustls provider that carries ML-KEM,
+# which the test clients need to offer X25519MLKEM768 the way Surge does.
+#
+# `prefer-post-quantum` is deliberately *not* enabled. It only reorders the
+# provider's `DEFAULT_KX_GROUPS`, and since D115 no handshake of the server reads
+# that list: the server's groups are `GROUPS` in `src/tls/awslc/mod.rs`, and
+# libssl takes the first of them in the client's own order. What the feature
+# would change is the test suite: every rustls client on the default provider
+# would offer X25519MLKEM768 first and send its key share, where it now offers
+# X25519 first. A test that wants the post-quantum order asks for it (`pq_first`
+# in `src/tls/awslc/tests.rs`), and `nameless_crypto` in `tests/common`, which
+# builds the gate tests' Initial packets, never reaches a key exchange.
+# X25519MLKEM768 is in `DEFAULT_KX_GROUPS` either way.
+#
+# `default-features = false` also keeps `tls12` off, which QUIC requires anyway;
+# with it off both providers reduce to the same three TLS 1.3 suites.
+rustls = { version = "0.23", default-features = false, features = [
+    "aws_lc_rs",
+    "std",
+] }
+# quinn's rustls provider (`quinn::crypto::rustls`), which the test clients and
+# the rustls test servers run on. A dev-dependency feature, so Cargo turns it
+# on only for the targets that need dev-dependencies (tests, examples,
+# benches). `cargo build` does not build those, and its quinn has the three
+# features above and no TLS. The library compiles from the same source either
+# way: nothing in `src/` outside `#[cfg(test)]` names `quinn::crypto::rustls`.
+quinn = { version = "0.11", default-features = false, features = [
+    "rustls-aws-lc-rs",
+] }
 # Pinned to the same crypto backend as the server (D102). rcgen's default
 # feature set is `crypto` + `pem` + `ring`, so the backend has to be selected by
 # hand or ring is compiled into the test build for the test certificates alone.
@@ -369,7 +386,7 @@ strip = true
 # EndpointDriver`). `Expected::memory` in `src/gate.rs` gives the whole chain.
 #
 # Scoped to this package. The dependencies keep the profile default (off):
-# their hot paths (quinn-proto, rustls) are not ours to slow, and aws-lc is C,
+# their hot paths (quinn-proto, aws-lc-rs) are not ours to slow, and aws-lc is C,
 # which this setting does not reach. `as` casts are not checked by it either;
 # those are covered by `clippy::as_conversions`, which every cast in `src/`
 # allows explicitly with its own argument. Cost measured with `it_bench` on the

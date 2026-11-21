@@ -36,6 +36,8 @@
 //!   and `docs/deployment.md` state the `rust-version` of `Cargo.toml`.
 //! * **The release binary checks integer overflow in this crate.** Debug
 //!   builds always do, so no other test notices when the release profile stops.
+//! * **The release build compiles no rustls.** Every test build does, for the
+//!   test clients, so no other test notices when the manifest puts it back.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -1214,6 +1216,116 @@ fn the_fuzz_lockfile_records_the_current_crate_version() {
         "Cargo.toml says volto is {manifest} but fuzz/Cargo.lock records {locked}; run \
          `cargo update -p volto --manifest-path fuzz/Cargo.toml` alongside the version bump"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The release build compiles one TLS implementation
+// ---------------------------------------------------------------------------
+
+/// The dependency tables of `manifest` that a release build compiles:
+/// `[dependencies]`, `[build-dependencies]` and their `[target.<cfg>.…]`
+/// forms, each with the name it is reported under.
+fn compiled_dependency_tables(manifest: &toml::Table) -> Vec<(String, &toml::Table)> {
+    const KINDS: [&str; 2] = ["dependencies", "build-dependencies"];
+    let mut tables: Vec<(String, &toml::Table)> = KINDS
+        .into_iter()
+        .filter_map(|kind| {
+            let table = manifest.get(kind)?.as_table()?;
+            Some((kind.to_owned(), table))
+        })
+        .collect();
+    let targets = manifest.get("target").and_then(toml::Value::as_table);
+    for (cfg, target) in targets.into_iter().flatten() {
+        for kind in KINDS {
+            if let Some(table) = target.get(kind).and_then(toml::Value::as_table) {
+                tables.push((format!("target.{cfg}.{kind}"), table));
+            }
+        }
+    }
+    tables
+}
+
+/// The release binary is built from one TLS implementation, AWS-LC's libssl
+/// through volto's own provider in `src/tls/awslc/` (D115). rustls is a
+/// dev-dependency, for the test clients alone.
+///
+/// Every test build compiles rustls, so no other test notices when a release
+/// build starts to compile it again. Three manifest changes would do that: an
+/// entry for rustls in a table a release build compiles, under its own name or
+/// renamed; a quinn or quinn-proto entry that turns on a rustls feature, which
+/// is any `rustls-*` feature, `platform-verifier`, or quinn's default features;
+/// and a package feature that names rustls. This reads the root manifest for
+/// each of the three. A rustls reached through some other new dependency is not
+/// seen here; `cargo tree -e normal -i rustls --target all` prints nothing
+/// while none is.
+#[test]
+fn the_release_build_compiles_no_rustls() {
+    let path = repo_root().join("Cargo.toml");
+    let manifest: toml::Table = read_text(&path)
+        .parse()
+        .unwrap_or_else(|error| panic!("{} does not parse: {error}", path.display()));
+    let names_rustls =
+        |feature: &str| feature.contains("rustls") || feature.contains("platform-verifier");
+
+    let tables = compiled_dependency_tables(&manifest);
+    assert!(
+        tables.iter().any(|(name, table)| name == "dependencies"
+            && table.contains_key("quinn")
+            && table.contains_key("quinn-proto")),
+        "the reader found no [dependencies] table with quinn and quinn-proto in {}",
+        path.display()
+    );
+    for (table_name, table) in tables {
+        for (name, entry) in table {
+            let package = entry
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(name);
+            assert_ne!(
+                package, "rustls",
+                "[{table_name}] names rustls (as `{name}`), so a release build compiles a \
+                 second TLS implementation; the tests take rustls from [dev-dependencies]"
+            );
+            if !matches!(package, "quinn" | "quinn-proto") {
+                continue;
+            }
+            assert_eq!(
+                entry.get("default-features").and_then(toml::Value::as_bool),
+                Some(false),
+                "[{table_name}] {name} keeps its default features, which turn on rustls"
+            );
+            let rustls_features: Vec<&str> = entry
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+                .filter(|feature| names_rustls(feature))
+                .collect();
+            assert!(
+                rustls_features.is_empty(),
+                "[{table_name}] {name} turns on {rustls_features:?}, so a release build \
+                 compiles rustls; the tests turn on quinn's rustls provider from \
+                 [dev-dependencies]"
+            );
+        }
+    }
+
+    let features = manifest.get("features").and_then(toml::Value::as_table);
+    for (feature, enables) in features.into_iter().flatten() {
+        let rustls: Vec<&str> = enables
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+            .filter(|enabled| names_rustls(enabled))
+            .collect();
+        assert!(
+            rustls.is_empty(),
+            "the package feature `{feature}` turns on {rustls:?}, so a build with it \
+             compiles rustls"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
