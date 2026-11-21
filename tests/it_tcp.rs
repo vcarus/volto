@@ -17,11 +17,10 @@ use common::rawstream::{
 use common::{
     ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
     client_endpoint_with_transport, closed_address, connect_request, echoes, finish_connect,
-    open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to, send_and_respond,
-    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    h3_server_endpoint, open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to,
+    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
     spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_transport,
 };
-use rustls::pki_types::CertificateDer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -363,37 +362,6 @@ async fn an_upload_of_small_frames_reaches_the_target_whole_and_in_order() {
         echoed == sent,
         "the target read the upload's bytes in a different order"
     );
-}
-
-/// A bare QUIC server endpoint with a self-signed certificate.
-///
-/// [`TestServer`] is the whole proxy and hands nothing of its HTTP/3 connection
-/// back; the test below needs the *server* side of one in its own hands, so it
-/// builds the endpoint itself. Everything else about it -- TLS 1.3, the `h3`
-/// ALPN, a loopback port -- is what `volto::tls` and `volto::quic` would have
-/// produced.
-fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("generate a self-signed certificate");
-    let certificate = issued.cert.der().clone();
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
-
-    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .with_no_client_auth()
-        .with_single_cert(vec![certificate.clone()], key)
-        .expect("a usable certificate and key");
-    crypto.alpn_protocols = vec![b"h3".to_vec()];
-
-    let config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic tls"),
-    ));
-    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("bind address"))
-        .expect("bind the server endpoint");
-
-    (endpoint, certificate)
 }
 
 /// The watcher's drained arm: a stream the peer finished and this end has read

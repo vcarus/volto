@@ -144,6 +144,9 @@ pub struct TestServer {
     trigger: Trigger,
     /// Replaces the running configuration, exactly as the SIGHUP handler does.
     reload: ReloadHandle,
+    /// How many connections the endpoint holds; see
+    /// [`TestServer::open_connections`].
+    open_connections: Box<dyn Fn() -> usize + Send + Sync>,
     /// The bound server, until its accept loop is started.
     ///
     /// `Some` only between [`TestServer::bind_with`] and [`TestServer::serve`].
@@ -280,6 +283,7 @@ impl TestServer {
         // Taken before the server moves into its task.
         let trigger = server.shutdown_trigger();
         let reload = server.reload_handle();
+        let open_connections = Box::new(server.open_connections());
 
         Self {
             addr,
@@ -290,6 +294,7 @@ impl TestServer {
             key,
             trigger,
             reload,
+            open_connections,
             unserved: Some(server),
             task: None,
         }
@@ -314,6 +319,13 @@ impl TestServer {
     /// Applies the configuration file, exactly as the `SIGHUP` handler does.
     pub fn reload(&self) -> anyhow::Result<()> {
         self.reload.reload(&self.config_path).map(|_| ())
+    }
+
+    /// How many connections the server's endpoint holds now, those in their
+    /// draining period included. Zero once quinn has forgotten every
+    /// connection it had.
+    pub fn open_connections(&self) -> usize {
+        (self.open_connections)()
     }
 
     /// The directory holding this server's certificate, key and config.
@@ -418,6 +430,39 @@ pub fn bulk_alpn() -> Vec<String> {
     let mut alpn = vec!["h3".to_owned()];
     alpn.extend((0..8).map(|i| format!("{i}{}", "padding-".repeat(31))));
     alpn
+}
+
+/// A bare quinn server endpoint on a loopback port, with a self-signed
+/// certificate for `localhost` and the `h3` ALPN, and quinn's default
+/// endpoint configuration.
+///
+/// [`TestServer`] is the whole proxy and hands nothing of its connections
+/// back. A test that needs the server side of a connection in its own hands,
+/// or a server that is quinn's and not volto's, builds it here. TLS 1.3, the
+/// `h3` ALPN and a loopback port are what `volto::tls` and `volto::quic`
+/// would have produced.
+pub fn h3_server_endpoint() -> (quinn::Endpoint, CertificateDer<'static>) {
+    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+        .expect("generate a self-signed certificate");
+    let certificate = issued.cert.der().clone();
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(issued.signing_key.serialize_der().into());
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], key)
+        .expect("a usable certificate and key");
+    crypto.alpn_protocols = vec![b"h3".to_vec()];
+
+    let config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic tls"),
+    ));
+    let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("bind address"))
+        .expect("bind the server endpoint");
+
+    (endpoint, certificate)
 }
 
 /// Sends `bytes` once from a fresh socket and returns the first datagram back,

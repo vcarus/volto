@@ -322,6 +322,21 @@ impl Server {
             .context("failed to read the local address of the QUIC endpoint")
     }
 
+    /// A reader of how many connections the endpoint still holds, for the
+    /// tests.
+    ///
+    /// This is quinn's `Endpoint::open_connections`: a connection counts from
+    /// its first packet until quinn has drained it and removed its connection
+    /// IDs from the endpoint's index. So a count of zero says that a packet of
+    /// a finished connection no longer reaches it. The reader holds a clone of
+    /// the endpoint, so it can be taken before the server moves into its task.
+    /// Nothing in the crate calls it.
+    #[doc(hidden)]
+    pub fn open_connections(&self) -> impl Fn() -> usize + Send + Sync + 'static {
+        let endpoint = self.endpoint.clone();
+        move || endpoint.open_connections()
+    }
+
     /// Accepts connections until the endpoint closes or shutdown is triggered.
     ///
     /// Each connection is handled in its own task, so a failure only ever affects

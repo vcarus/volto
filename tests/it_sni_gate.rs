@@ -47,8 +47,8 @@ const GATE_OTHER: &str =
 /// The gate off, which is the shipped default.
 const GATE_OFF: &str = ALLOW_PRIVATE;
 
-/// The log the tests here read: the server's own lines about its connections
-/// and its drain, through [`SharedBuffer::shared`].
+/// The log the tests here read: the server's own line about its drain,
+/// through [`SharedBuffer::shared`].
 const LOG_FILTER: &str = "volto::quic=info";
 
 /// How long a refused handshake is given to prove it is not coming back.
@@ -243,43 +243,34 @@ async fn recording_relay(server: SocketAddr) -> (Relay, Arc<Mutex<Vec<Vec<u8>>>>
     (relay, recorded)
 }
 
-/// A short-header packet of a connection the server has forgotten draws
-/// nothing, sent again from the address the connection used or from any
-/// other. quinn would answer it with a Stateless Reset (RFC 9000 §10.3),
-/// because its connection ID is one the endpoint issued and passes the
-/// default generator's `validate`; `quic::cid` makes that check fail for every
-/// connection ID, which turns the reset into a silent drop.
+/// The answers to a short-header packet of a connection that the server at
+/// `server` has forgotten, sent again from the address the connection used
+/// and from another.
 ///
-/// The client's packets are recorded by a relay, the client closes the
-/// connection, and the server drops it after its draining period, which on
-/// loopback is a few tens of milliseconds. The gate is off, because a short
-/// header passes the gate whether it is on or not.
-///
-/// The server's "connection closed" line for the relay's address says the
-/// server has seen the close, which is when its draining period starts. The
-/// end of that period, when quinn forgets the connection, is not visible from
-/// outside the server, so the replay waits a fixed second after the line: many
-/// times three probe timeouts on loopback.
-#[tokio::test]
-async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
-    let log = SharedBuffer::shared(LOG_FILTER);
-    let server = TestServer::start_with(GATE_OFF).await;
-    let (mut relay, recorded) = recording_relay(server.addr).await;
-    let seen_as = relay.addr;
-    let mark = log.mark();
+/// A client connects to `server` through a relay that records its
+/// short-header packets, waits for the server's first uni stream (whose 1-RTT
+/// packets the client acknowledges in short-header packets of its own), and
+/// closes the connection. `open_connections` reads how many connections the
+/// server's endpoint holds; it must count this one before the close, and the
+/// replay goes out once it reads zero, which is when quinn has drained the
+/// connection and removed its connection IDs from the endpoint's index.
+async fn replay_of_a_forgotten_connection(
+    server: SocketAddr,
+    ca: &CertificateDer<'static>,
+    open_connections: impl Fn() -> usize,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (mut relay, recorded) = recording_relay(server).await;
 
-    let endpoint = client_endpoint(&server.ca, &["h3"]);
+    let endpoint = client_endpoint(ca, &["h3"]);
     let connection = endpoint
         .connect(relay.addr, "localhost")
         .expect("start connecting")
         .await
         .expect("a handshake through the relay");
-    // The server's HTTP/3 control stream arrives in 1-RTT packets, which the
-    // client acknowledges in short-header packets of its own.
     connection
         .accept_uni()
         .await
-        .expect("the server's control stream");
+        .expect("the server's first uni stream");
     let deadline = tokio::time::Instant::now() + common::TIMEOUT;
     let packet = loop {
         let first = recorded.lock().expect("the record").first().cloned();
@@ -295,22 +286,47 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
     // quinn-proto answers nothing shorter than 22 bytes with a reset, so a
     // shorter packet would prove nothing.
     assert!(packet.len() >= 22, "{} bytes", packet.len());
+    assert_eq!(open_connections(), 1, "the server holds the connection");
     connection.close(0u32.into(), b"done");
     endpoint.wait_idle().await;
 
-    // The server's draining period is three probe timeouts, a few tens of
-    // milliseconds on loopback, from the close the line reports; a second
-    // after it is ample.
-    log.wait_for_line(mark, &["connection closed", &format!("remote={seen_as} ")])
-        .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    let deadline = tokio::time::Instant::now() + common::TIMEOUT;
+    while open_connections() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the server still holds the connection"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     // Stopped, so that what comes back to the relay's socket is read here.
     relay.task.abort();
     let _ = (&mut relay.task).await;
 
     let replay = std::slice::from_ref(&packet);
-    let same = udp_answers_on(&relay.socket, server.addr, replay, CLIENT_IDLE).await;
-    let other = udp_answers(server.addr, replay, CLIENT_IDLE).await;
+    let same = udp_answers_on(&relay.socket, server, replay, CLIENT_IDLE).await;
+    let other = udp_answers(server, replay, CLIENT_IDLE).await;
+    (same, other)
+}
+
+/// A short-header packet of a connection the server has forgotten draws
+/// nothing, sent again from the address the connection used or from any
+/// other. quinn would answer it with a Stateless Reset (RFC 9000 §10.3),
+/// because its connection ID is one the endpoint issued and passes the
+/// default generator's `validate`; `quic::cid` makes that check fail for every
+/// connection ID, which turns the reset into a silent drop. The gate is off,
+/// because a short header passes the gate whether it is on or not.
+///
+/// The control below runs the same replay against quinn's own server, whose
+/// endpoint configuration is the default, and asserts the reset at both
+/// addresses. So the replayed packet is one that draws a reset when nothing
+/// removes it, and it leaves the probing sockets.
+#[tokio::test]
+async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
+    let server = TestServer::start_with(GATE_OFF).await;
+
+    let (same, other) =
+        replay_of_a_forgotten_connection(server.addr, &server.ca, || server.open_connections())
+            .await;
 
     assert!(
         same.is_empty() && other.is_empty(),
@@ -318,6 +334,44 @@ async fn a_packet_of_a_forgotten_connection_draws_no_stateless_reset() {
         same.len(),
         other.len()
     );
+}
+
+/// The control of the test above: quinn's server with its default connection
+/// ID generator answers the same replay with a Stateless Reset, a
+/// short-header datagram, at the connection's own address and at another.
+#[tokio::test]
+async fn a_packet_of_a_forgotten_connection_draws_a_stateless_reset_from_quinns_default() {
+    let (endpoint, ca) = common::h3_server_endpoint();
+    let addr = endpoint.local_addr().expect("the server's address");
+    let accepting = endpoint.clone();
+    let serving = tokio::spawn(async move {
+        let connection = accepting
+            .accept()
+            .await
+            .expect("an incoming connection")
+            .await
+            .expect("the server side of the handshake");
+        let mut stream = connection.open_uni().await.expect("a uni stream");
+        stream
+            .write_all(b"x")
+            .await
+            .expect("write to the uni stream");
+        stream.finish().expect("finish the uni stream");
+        connection.closed().await;
+    });
+
+    let (same, other) =
+        replay_of_a_forgotten_connection(addr, &ca, || endpoint.open_connections()).await;
+    serving.await.expect("the serving task");
+
+    for (answers, at) in [(&same, "its own address"), (&other, "another address")] {
+        assert!(
+            answers
+                .first()
+                .is_some_and(|reset| reset.first().is_some_and(|first| first & 0x80 == 0)),
+            "replayed at {at}, it drew {answers:?} and not a Stateless Reset"
+        );
+    }
 }
 
 /// An Initial that arrives during the shutdown grace draws nothing, with the
