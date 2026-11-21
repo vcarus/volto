@@ -127,8 +127,8 @@ pub fn random_bytes(out: &mut [u8]) -> Result<()> {
 }
 
 /// Writes `key` to a new file at `path`, readable by its owner only, or by its
-/// owner and the directory's group when root writes it into a directory closed
-/// to other users ([`shared_group`]).
+/// owner and the directory's group at mode 0640 when root writes it into a
+/// directory closed to other users and traversable by its group.
 ///
 /// Refuses a path that exists: the file is a credential a client was given, and
 /// overwriting it would lock every such client out without a word.
