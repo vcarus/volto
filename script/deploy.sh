@@ -239,6 +239,15 @@ cleanup() {
 # directory whose run no longer exists is taken over. An empty pid file counts
 # as held, since it is what a run that has made the directory and not yet
 # written its pid leaves, and so does a pid file that is not a number.
+#
+# The takeover is made under a second mkdir lock, $LOCK.takeover: the pid is
+# read again under it, and the stale directory is replaced and the new pid
+# written before it is released. Without it two runs that both found the same
+# dead pid could both remove and re-create $LOCK.d, the second removing the
+# first one's fresh lock, and both would go on. What remains possible: a run
+# killed while it holds $LOCK.takeover leaves it behind, and every later
+# takeover is refused until it is removed by hand (the message names it); and
+# a dead run's pid reused by a live process keeps the lock held, as before.
 acquire_lock() {
     local holder
 
@@ -248,18 +257,32 @@ acquire_lock() {
         flock -n 9 || die "another run of this script holds $LOCK -- wait for it to finish"
         return 0
     fi
+    if mkdir "$LOCK.d" 2>/dev/null; then
+        LOCK_DIR="$LOCK.d"
+        echo "$$" >"$LOCK_DIR/pid"
+        return 0
+    fi
+    holder="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
+    case "$holder" in ''|*[!0-9]*) holder="" ;; esac
+    if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
+        die "another run of this script holds $LOCK.d -- wait for it to finish, or remove the directory if no run is active"
+    fi
+    mkdir "$LOCK.takeover" 2>/dev/null ||
+        die "another run of this script is taking over $LOCK.d -- wait for it to finish, or remove $LOCK.takeover if no run is active"
+    holder="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
+    case "$holder" in ''|*[!0-9]*) holder="" ;; esac
+    if [ -d "$LOCK.d" ] && { [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; }; then
+        rm -rf "$LOCK.takeover"
+        die "another run of this script took $LOCK.d first -- wait for it to finish"
+    fi
+    rm -rf "$LOCK.d"
     if ! mkdir "$LOCK.d" 2>/dev/null; then
-        holder="$(cat "$LOCK.d/pid" 2>/dev/null || true)"
-        case "$holder" in ''|*[!0-9]*) holder="" ;; esac
-        if [ -z "$holder" ] || kill -0 "$holder" 2>/dev/null; then
-            die "another run of this script holds $LOCK.d -- wait for it to finish, or remove the directory if no run is active"
-        fi
-        rm -rf "$LOCK.d"
-        mkdir "$LOCK.d" 2>/dev/null ||
-            die "another run of this script took $LOCK.d first -- wait for it to finish"
+        rm -rf "$LOCK.takeover"
+        die "another run of this script took $LOCK.d first -- wait for it to finish"
     fi
     LOCK_DIR="$LOCK.d"
     echo "$$" >"$LOCK_DIR/pid"
+    rm -rf "$LOCK.takeover"
 }
 
 # True when the file $3 is a signature over the file $2 made by the key $1.

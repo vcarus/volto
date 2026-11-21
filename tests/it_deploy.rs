@@ -2819,6 +2819,30 @@ fn without_flock_a_directory_with_a_live_pid_is_the_lock() {
         Some(format!("{gone_pid}\n")),
         "the new run's pid must replace the old one"
     );
+    let takeover = dir.join("run/volto-deploy.lock.takeover");
+    assert!(!takeover.exists(), "a takeover releases its own lock");
+
+    // A stale lock that another run is taking over: refused, and left to
+    // that run (F3-L3). Two runs that found the same dead pid could both
+    // remove and re-create the directory, and both go on.
+    fs::write(held.join("pid"), format!("{gone_pid}\n")).expect("plant a dead pid");
+    fs::create_dir(&takeover).expect("plant a takeover in progress");
+    let (_, output) = acquire("takeover-held");
+    assert!(
+        !output.status.success(),
+        "a takeover in progress must stop a second one: {}",
+        stdout_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("is taking over"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(held.join("pid")).ok(),
+        Some(format!("{gone_pid}\n")),
+        "the refused run must leave the lock to the run taking it over"
+    );
 }
 
 /// The first-install password reaches the bundled installer in its
