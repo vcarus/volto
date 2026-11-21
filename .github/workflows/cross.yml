@@ -11,6 +11,11 @@ name: Cross
 # A workflow of its own rather than a job in ci.yml because the gate is the
 # `paths` filter, and `on.paths` is workflow-scoped.
 
+# The second job installs each built binary with the release's own installer
+# on a runner of the binary's architecture and drives it through the unit's
+# sandbox. `script/` is in the filter for that job: the installer and the unit
+# are what it runs.
+#
 # `release.yml` is in the filter because the build step below is a copy of its
 # own: a change to that step is exactly the change this workflow exists to run,
 # and without the entry it would be the one change that runs nothing.
@@ -26,6 +31,7 @@ on:
       - .github/workflows/release.yml
       - Cross.toml
       - .github/cross/**
+      - script/**
   pull_request:
     paths:
       - Cargo.toml
@@ -34,6 +40,7 @@ on:
       - .github/workflows/release.yml
       - Cross.toml
       - .github/cross/**
+      - script/**
 
 # As in ci.yml: a new push to a pull request supersedes its running check, and
 # on main every commit keeps its own run. A push keys on its commit, because
@@ -135,3 +142,124 @@ jobs:
             sort -u | tr '\n' ' ')"
           [ -z "$carried" ] ||
             { echo "::error::${binary} still carries ${carried}-- a release built from this branch would not be stripped" >&2; exit 1; }
+
+      # For the `installed` job below, which runs on the target's architecture.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: volto-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/volto
+          if-no-files-found: error
+          retention-days: 3
+
+  installed:
+    # The suite never starts the server under systemd, and the x86_64 smoke
+    # step above runs the binary outside any sandbox. This job installs the
+    # release binary with `script/install-selfsigned.sh`, which installs
+    # `script/masque.service`, and then checks three things no cargo test can:
+    # systemd accepts every directive of the unit, the process runs with the
+    # sandbox the unit asks for, and tunnels work from inside that sandbox,
+    # where `/proc` holds processes only and the system call filter is on.
+    # The aarch64 half runs on an arm runner, so the claim that AWS-LC finds
+    # the CPU's features there without `/proc/cpuinfo` is tested and not read
+    # from its source.
+    name: installed (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    env:
+      VOLTO_ADDR: 127.0.0.1:14443
+      VOLTO_SNI: localhost
+      VOLTO_USER: interop
+      VOLTO_PASSWORD: interop-password-not-a-secret
+      VOLTO_CERT: /etc/volto/cert.pem
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: volto-${{ matrix.target }}
+
+      - name: Install with the release's installer
+        run: |
+          set -euo pipefail
+          chmod +x volto
+          ./volto --version
+          sudo env PASSWORD="$VOLTO_PASSWORD" script/install-selfsigned.sh \
+            --binary ./volto --sni "$VOLTO_SNI" --port "${VOLTO_ADDR##*:}" --username "$VOLTO_USER"
+          systemctl is-active volto
+
+      - name: systemd accepts every directive of the unit
+        run: |
+          set -euo pipefail
+          # `verify` prints a line for a directive this systemd does not know
+          # and still exits 0, so any output fails.
+          report="$(systemd-analyze verify /etc/systemd/system/volto.service 2>&1)"
+          printf '%s\n' "$report"
+          [ -z "$report" ]
+
+      - name: The process runs inside the unit's sandbox
+        run: |
+          set -euo pipefail
+          pid="$(systemctl show -p MainPID --value volto)"
+          [ "$pid" -gt 1 ]
+          status="$(sudo cat "/proc/$pid/status")"
+          mounts="$(sudo cat "/proc/$pid/mountinfo")"
+          printf '%s\n' "$status" | grep -E '^(Uid|Umask|CapEff|CapBnd|NoNewPrivs|Seccomp):'
+          printf '%s\n' "$mounts" | grep ' /proc '
+          expect() { printf '%s\n' "$1" | grep -Eq "$2" || { echo "::error::$3" >&2; exit 1; }; }
+          expect "$status" '^NoNewPrivs:[[:space:]]+1$' 'NoNewPrivileges= is not in force'
+          expect "$status" '^Seccomp:[[:space:]]+2$' 'no system call filter is installed'
+          expect "$status" '^Umask:[[:space:]]+0077$' 'UMask= is not in force'
+          # CAP_NET_BIND_SERVICE is bit 10 and nothing else is set.
+          expect "$status" '^CapEff:[[:space:]]+0000000000000400$' 'the effective capability set is not CAP_NET_BIND_SERVICE alone'
+          expect "$status" '^CapBnd:[[:space:]]+0000000000000400$' 'the bounding capability set is not CAP_NET_BIND_SERVICE alone'
+          expect "$mounts" ' /proc .*subset=pid' 'ProcSubset=pid is not in force'
+          expect "$mounts" ' /proc .*hidepid=invisible' 'ProtectProc=invisible is not in force'
+          [ "$(id -u volto)" = "$(printf '%s\n' "$status" | awk '$1 == "Uid:" { print $2 }')" ]
+
+      # The suite's targets are echo servers on loopback, which the installed
+      # configuration refuses, as it must on a real host. The reload is also
+      # the check that SIGHUP works under the sandbox and keeps the process.
+      - name: Allow loopback targets by a reload
+        run: |
+          set -euo pipefail
+          before="$(systemctl show -p MainPID --value volto)"
+          sudo sed -i 's/^\[security\]$/[security]\nallow_private_networks = true/' /etc/volto/config.toml
+          sudo grep -q '^allow_private_networks = true$' /etc/volto/config.toml
+          sudo systemctl reload volto
+          for _ in $(seq 1 50); do
+            sudo journalctl -u volto --no-pager | grep -q 'configuration reloaded' && break
+            sleep 0.2
+          done
+          sudo journalctl -u volto --no-pager | grep 'configuration reloaded'
+          [ "$before" = "$(systemctl show -p MainPID --value volto)" ]
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: tests/interop/aioquic/requirements.txt
+
+      - name: Drive the installed service with aioquic
+        run: |
+          set -euo pipefail
+          pip install -r tests/interop/aioquic/requirements.txt
+          python tests/interop/aioquic/interop_test.py
+
+      - name: The service stops cleanly and its journal has no error
+        if: always()
+        run: |
+          set -euo pipefail
+          sudo systemctl stop volto || true
+          journal="$(sudo journalctl -u volto --no-pager)"
+          printf '%s\n' "$journal"
+          [ "$(systemctl show -p Result --value volto)" = success ]
+          [ "$(systemctl show -p NRestarts --value volto)" = 0 ]
+          if printf '%s\n' "$journal" | grep -E ' ERROR |panicked'; then exit 1; fi
