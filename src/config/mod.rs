@@ -603,10 +603,11 @@ pub struct Security {
     /// so a port scan of this address gets no answer at all. See
     /// [`crate::gate`] for what that covers and what it does not.
     pub expected_sni: Vec<String>,
-    /// Drop every handshake that does not open under `server.ech_key`.
+    /// Drop every handshake that carries no ECH extension a configured key
+    /// opens.
     ///
     /// Off by default. With an ECH key configured, the gate already drops a
-    /// ClientHello whose ECH extension the key does not open; this also drops
+    /// ClientHello whose ECH extension no configured key opens; this also drops
     /// one that carries no ECH extension at all, silently, so only a client
     /// holding the ECHConfigList reaches the TLS layer. Refused without
     /// `server.ech_key`, because it would drop every client. Reloadable, like

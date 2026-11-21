@@ -238,6 +238,14 @@ impl ReloadHandle {
         // `Server::shutdown_grace` each read one key of the live `Config` and
         // compare it with nothing else, so the order does not change what they
         // see.
+        //
+        // One flight can still be answered across this swap. A flight the
+        // gate admitted under a key this reload removes, and whose datagrams
+        // quinn reads only after `set_server_config`, reaches a libssl that no
+        // longer holds that key. libssl does not accept its ECH and the
+        // ClientHello callback refuses it with an alert. The peer held a key
+        // the server accepted a moment earlier, and the alert carries no
+        // ECHConfigList.
         self.expected.set(policy);
         *self.live.write().unwrap_or_else(PoisonError::into_inner) = live.clone();
         self.endpoint.set_server_config(Some((*live.quic).clone()));

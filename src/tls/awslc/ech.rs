@@ -406,7 +406,11 @@ fn new_keys() -> Result<EchKeys> {
 /// The two keys have different config_ids, which [`EchKeySet::with_previous`]
 /// checks. So the config_id a ClientHello names picks at most one key, the
 /// socket gate opens an ECH extension with that key alone, and a first flight
-/// costs at most one HPKE open with one key or with two (D115).
+/// costs at most one HPKE open with one key or with two (D115). RFC 9849 §4.1
+/// recommends the same for the same reason: "the client-facing server SHOULD
+/// allocate distinct config_id values for each ECHConfig in its known set."
+/// Refusing a shared config_id, where the RFC would try both keys, is our own
+/// rule.
 #[derive(Debug)]
 pub struct EchKeySet {
     current: Arc<EchKey>,
@@ -487,7 +491,7 @@ impl EchKeySet {
     /// a client is to move to is the current one. `SSL_CTX_set1_ech_keys`
     /// refuses a set without a retry config: "If |keys| does not contain any
     /// retry configs, this function will fail." The current key is always one,
-    /// and RFC 9849 §7.1 asks for it: "If the server is configured with any
+    /// and RFC 9849 §7.1 requires it: "If the server is configured with any
     /// ECHConfigs, it MUST include the "encrypted_client_hello" extension in
     /// its EncryptedExtensions with the "retry_configs" field set to one or
     /// more ECHConfig structures with up-to-date keys." So libssl on its own

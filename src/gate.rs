@@ -142,8 +142,8 @@
 //! holds a whole ClientHello, the flight is judged, and either every datagram
 //! it held is released to quinn in the order they arrived, or all of them are
 //! dropped and nothing is sent. The judgement is `hold::judge`, whose rule
-//! table admits an ECH extension the key opens unless it is a replay, drops
-//! one the key does not open whatever `[security] require_ech` says (our own
+//! table admits an ECH extension a configured key opens unless it is a replay,
+//! drops one no configured key opens whatever `[security] require_ech` says (our own
 //! rule, a deviation from RFC 9849 §7.1), and judges a ClientHello without ECH
 //! by `require_ech` and by its name, against the whole ClientHello rather than
 //! one packet.
@@ -634,7 +634,7 @@ fn log_drop(remote: SocketAddr, dropped: Dropped) {
         Dropped::Conflict => "two of its packets carry different bytes at one offset",
         Dropped::Frames => "a packet of it carries frames an Initial packet may not",
         Dropped::EchNotOpened => {
-            "its ECH extension does not open under the server key its config_id names"
+            "its ECH extension names no configured key, or does not open under the one it names"
         }
         Dropped::Replayed => "its ECH was already admitted from another address",
         Dropped::EchRequired => "it carries no ECH extension and security.require_ech is on",

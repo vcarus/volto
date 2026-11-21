@@ -2601,9 +2601,8 @@ fn the_same_ech_under_the_previous_key_from_another_address_is_a_replay() {
 /// keeps the replay record: an `enc` recorded under the old key before the
 /// reload is still a replay from another address after it, and its own
 /// address is still admitted. The reload reads the old key from its file
-/// again, as a real reload does, so the keys are compared by what they are
-/// and not by allocation. A reload that then removes the previous key keeps
-/// the record too, because the current key stays.
+/// again, as a real reload does. A reload that then removes the previous key
+/// keeps the record too.
 #[test]
 fn a_rotation_keeps_the_replay_record() {
     let crypto = nameless_crypto();

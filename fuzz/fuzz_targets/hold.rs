@@ -41,7 +41,7 @@
 //! check of its own: no two values at one offset, a whole ClientHello within
 //! `HOLD_HELLO_BYTES`, and then an ECH extension the key opens, or none with
 //! `require_ech` off and the name on the list when there is one. The oracle
-//! asks each of the input's keys in turn, not the set's lookup by config_id,
+//! tries each of the input's keys in turn, not the set's lookup by config_id,
 //! so ECH under the previous key is admitted only when the policy byte holds
 //! that key, and `EchKey::opens` refuses an extension that names another
 //! key's config_id before it decrypts.
