@@ -167,7 +167,9 @@ else printable is accepted, `*`, `.`, `|` and `&` included, and a generated
 password never runs into this.
 
 A password given with `--password` is on the installer's command line, which
-every local user can read in `/proc/<pid>/cmdline` while the run lasts. Leave
+every local user can read in `/proc/<pid>/cmdline` while the run lasts, and
+`sudo` records that command line in its log (`/var/log/auth.log` and the
+journal), where it stays for as long as the log is kept. Leave
 it out to have one generated, or set it in the environment of a root shell
 (`sudo -i`, then `read -rs PASSWORD && export PASSWORD`), which no other user
 can read. The installer writes the config with shell builtins and never hands
@@ -353,7 +355,7 @@ Omitting `--password` is also fine, and usually better: the installer generates
 Surge policy line when its output is a terminal, and no command line ever
 carries it. Without a terminal (a log file, the journal) the policy line names
 `/etc/volto/config.toml` in place of the password. A `--password` on this
-command line is readable by every local user while the run lasts. `--username` is independent, so naming the user still leaves
+command line is readable by every local user while the run lasts and stays in `sudo`'s log. `--username` is independent, so naming the user still leaves
 the password generated.
 
 The no-op path is what makes it safe to run on a schedule:

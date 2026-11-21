@@ -114,7 +114,8 @@ pair as `username=..., password=...`. Every other printable character is fine,
 | and & included, and a generated password is never affected.
 
 A password given with -w is on this script's command line, which every local
-user can read while the run lasts (/proc/<pid>/cmdline). Leaving it out has one
+user can read while the run lasts (/proc/<pid>/cmdline), and sudo records that
+command line in its log, where it stays. Leaving it out has one
 generated, and PASSWORD exported in a root shell reaches the script without
 being on any command line. The script itself never passes the password to
 another program as an argument.

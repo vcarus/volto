@@ -150,8 +150,9 @@ Options:
   -u, --username NAME  first install only: passed to install-selfsigned.sh
   -w, --password PASS  first install only: passed to install-selfsigned.sh in
                        its environment. On this command line every local user
-                       can read it while the run lasts; leave it out to have
-                       one generated, or export PASSWORD in a root shell
+                       can read it while the run lasts, and sudo records the
+                       command line in its log; leave it out to have one
+                       generated, or export PASSWORD in a root shell
   -h, --help           show this help
 
 REPO and TAG can also be given as environment variables, as can the
@@ -806,7 +807,7 @@ else
         mount_options="$(findmnt -no OPTIONS --target "$TMP" 2>/dev/null || true)"
         case ",$mount_options," in
             *,noexec,*)
-                die "$TMP is on a filesystem mounted noexec, where the release's binary cannot be run -- set TMPDIR to a directory that allows execution (for the timer, Environment=TMPDIR= in a drop-in for $TIMER_NAME.service)"
+                die "$TMP is on a filesystem mounted noexec, where the release's binary cannot be run -- set TMPDIR to a directory that allows execution (under sudo as 'sudo TMPDIR=<dir> ...', because sudo does not pass the caller's TMPDIR on; for the timer, Environment=TMPDIR= in a drop-in for $TIMER_NAME.service)"
                 ;;
         esac
     fi
@@ -840,7 +841,7 @@ else
     SRC="$TMP/$NAME"
     [ -f "$SRC/volto" ] || die "the archive did not contain a volto binary"
     [ -x "$SRC/volto" ] ||
-        die "$SRC/volto cannot be executed where it was unpacked: the archive's file has no execute bit, or $TMP is on a filesystem mounted noexec (then set TMPDIR to a directory that allows execution)"
+        die "$SRC/volto cannot be executed where it was unpacked: the archive's file has no execute bit, or $TMP is on a filesystem mounted noexec (then set TMPDIR to a directory that allows execution, under sudo as 'sudo TMPDIR=<dir> ...')"
     # The installed copy of this script is replaced only from a release whose
     # signature was verified. A release from before signing carries a script
     # that verifies nothing, and installing that one would end the check for
