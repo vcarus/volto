@@ -21,7 +21,9 @@ cargo build --release --locked      # target/release/volto
 On Debian or Ubuntu that needs `build-essential`, `pkg-config`, `cmake` and
 `libclang-dev`. Compiling on the server itself is the simplest route. The
 dependency stack is pure Rust apart from AWS-LC, the C and C++ library behind
-the server's TLS (and, on musl, mimalloc). The static musl binaries are built
+the server's TLS (and, on musl, mimalloc). AWS-LC is the only TLS implementation
+in the binary; `cargo test` also compiles rustls, the TLS of the test clients.
+The static musl binaries are built
 with [`cross`](https://github.com/cross-rs/cross), whose images carry a musl C
 and C++ toolchain, cmake and libclang:
 

@@ -38,14 +38,17 @@ change.
 
 ### TLS
 
-The handshake runs on AWS-LC's libssl, the TLS library of the same AWS-LC build
-that rustls uses for its cryptography. `tls/awslc/` is volto's own quinn crypto
+The handshake runs on AWS-LC's libssl. `tls/awslc/` is volto's own quinn crypto
 provider over it: libssl runs the TLS 1.3 state machine and hands over the
 traffic secrets of each encryption level, and the provider turns them into
-quinn's packet and header protection keys with aws-lc-rs. rustls has no
-server-side Encrypted Client Hello, which is why the server does not use it;
-every client in the test suite is still rustls, so the two ends of each test run
-on different TLS implementations.
+quinn's packet and header protection keys with aws-lc-rs, which is built from
+the same AWS-LC. The release binary contains no other TLS implementation. rustls
+has no server-side Encrypted Client Hello, which is why the server does not use
+it, and it is not a dependency of the server. The certificate and key files are
+read, and the leaf certificate and the names it covers are judged, with
+rustls-pki-types and rustls-webpki, the two crates rustls itself calls for
+those judgements. Every client in the test suite is rustls, so the two ends of
+each test run on different TLS implementations.
 
 The server offers TLS 1.3 only, with the three TLS 1.3 cipher suites, the key
 exchange groups X25519MLKEM768, X25519, P-256 and P-384 in the client's order of

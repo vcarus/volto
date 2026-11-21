@@ -2,10 +2,10 @@
 //! (D115).
 //!
 //! rustls has client-side ECH only, so the server runs its handshakes on
-//! libssl from the same `aws-lc-sys` build that already backs rustls through
-//! aws-lc-rs. libssl runs the TLS 1.3 state machine and hands over traffic
-//! secrets per encryption level through BoringSSL's QUIC method table; [`keys`]
-//! turns those into quinn's packet and header keys. This module implements
+//! libssl from the same `aws-lc-sys` build that backs aws-lc-rs, which
+//! quinn-proto and [`keys`] use. libssl runs the TLS 1.3 state machine and
+//! hands over traffic secrets per encryption level through BoringSSL's QUIC
+//! method table; [`keys`] turns those into quinn's packet and header keys. This module implements
 //! quinn-proto's `crypto::ServerConfig` and `crypto::Session` over it.
 //!
 //! The D106 second SNI gate is a ClientHello callback here. AWS-LC calls it
