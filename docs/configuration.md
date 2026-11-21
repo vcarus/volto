@@ -62,7 +62,10 @@ writes the key file and prints the ECHConfigList on stdout, in standard base64.
 That value is what a client takes, for example Surge's `ech-config`.
 `--config-id` picks the ECHConfig's config_id (random when left out), and
 `--max-name-length` its `maximum_name_length`, which only steers how much a
-client pads (default 0). An existing file is never overwritten. `/etc/volto` is
+client pads (default 0). `--replaces <file>` is for a rotation: it reads the
+key file being replaced, gives the new key a config_id other than that key's,
+and that key's public name when `--public-name` is left out. An existing file
+is never overwritten. `/etc/volto` is
 `root:volto` 0750, so only root can create the file, and the service reads it
 through the `volto` group. Run as root in a directory closed to other users,
 `ech-keygen` creates the file 0640 with the directory's group itself; anywhere
@@ -126,8 +129,8 @@ ClientHello against `expected_sni`, so the real name stays on the list.
 `ech_previous_key` names the key a rotation replaces, so the server can change
 first and the clients after it. The server then accepts ECH under either key.
 It picks the key by the config_id the ClientHello names, so the two keys must
-have different config_ids, and a first flight is still opened with one key at
-most. libssl holds the previous key as a key it decrypts with and never sends:
+have different config_ids (`ech-keygen --replaces` picks one that differs),
+and a first flight is still opened with one key at most. libssl holds the previous key as a key it decrypts with and never sends:
 its `retry_configs` would carry the current key's ECHConfigList alone, and the
 gate and the TLS layer keep every ClientHello that would draw them from getting
 that far, as the paragraphs above say. The steps are under

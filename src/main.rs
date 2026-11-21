@@ -13,7 +13,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 use tracing::{Event, Level, Subscriber, error, info, warn};
 use tracing_subscriber::fmt::format::Writer;
@@ -77,8 +77,9 @@ enum Command {
     EchKeygen {
         /// The ECHConfig's public name: the name an ECH client sends in the
         /// clear, and checks the certificate against when ECH is rejected.
-        #[arg(long, value_name = "NAME")]
-        public_name: String,
+        /// With `--replaces` it may be left out, and is then that key's.
+        #[arg(long, value_name = "NAME", required_unless_present = "replaces")]
+        public_name: Option<String>,
         /// Where to write the key file. Created with mode 0600, or 0640 with
         /// the directory's group when root writes it into a directory closed
         /// to other users, such as /etc/volto.
@@ -87,6 +88,13 @@ enum Command {
         /// The ECHConfig's config_id. Random when left out.
         #[arg(long, value_name = "ID")]
         config_id: Option<u8>,
+        /// The key file this key replaces in a rotation, the one
+        /// `server.ech_key` names now. The new key gets a config_id other
+        /// than that key's, which the server needs to hold the two side by
+        /// side, and that key's public name unless `--public-name` gives one.
+        /// The file is only read.
+        #[arg(long, value_name = "FILE")]
+        replaces: Option<PathBuf>,
         /// The ECHConfig's maximum_name_length, which only steers how much a
         /// client pads its encrypted ClientHello.
         #[arg(long, value_name = "N", default_value_t = 0)]
@@ -215,15 +223,37 @@ fn run_command(command: &Command) -> Result<()> {
             public_name,
             out,
             config_id,
+            replaces,
             max_name_length,
         } => {
-            let config_id = match config_id {
-                Some(id) => *id,
-                None => {
+            let replaced = replaces
+                .as_deref()
+                .map(volto::tls::EchKey::load)
+                .transpose()?;
+            let taken = replaced.as_ref().map(volto::tls::EchKey::config_id);
+            let config_id = match *config_id {
+                Some(id) => {
+                    ensure!(
+                        Some(id) != taken,
+                        "--config-id {id} is the config_id of the key --replaces names, and the \
+                         server picks between the two keys by their config_id: give another \
+                         one, or leave --config-id out"
+                    );
+                    id
+                }
+                None => loop {
                     let mut byte = [0u8; 1];
                     volto::tls::random_bytes(&mut byte)?;
-                    byte[0]
-                }
+                    if Some(byte[0]) != taken {
+                        break byte[0];
+                    }
+                },
+            };
+            // clap requires one of the two, so a missing name is a key to take it from.
+            let public_name = match (public_name, &replaced) {
+                (Some(name), _) => name.as_str(),
+                (None, Some(key)) => key.public_name(),
+                (None, None) => bail!("ech-keygen needs --public-name or --replaces"),
             };
             let key = volto::tls::EchKey::generate(public_name, config_id, *max_name_length)?;
             volto::tls::write_new_key_file(out, &key)?;
@@ -821,7 +851,7 @@ fn chosen_filter(
             None,
         )),
         FilterSource::InvalidRustLog(error) => Ok((configured()?, Some(error))),
-        FilterSource::Refused(reason) => anyhow::bail!("{reason}"),
+        FilterSource::Refused(reason) => bail!("{reason}"),
     }
 }
 
