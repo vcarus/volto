@@ -829,16 +829,16 @@ The server accepts a previous key beside the current one,
 changes the server first and the clients after it, and no client is cut off
 in between:
 
-1. Generate the new key with a config_id other than the current key's. The
-   current key's is the `ech_config_id` of the startup or reload line. The
+1. Generate the new key with `--replaces` naming the current key file. The
    server picks the key by the config_id a ClientHello names, so two keys with
-   one config_id are refused. Give it the current key's `--public-name`, which
-   `volto ech-config` prints for the current file, unless the name is meant to
-   change: the public name is sent in the clear, and with two names an
-   observer sees both during the rotation.
+   one config_id are refused, and `--replaces` gives the new key a config_id
+   other than the current key's. It also gives it the current key's public
+   name. Add `--public-name` only when the name is meant to change: the public
+   name is sent in the clear, and with two names an observer sees both during
+   the rotation.
 
    ```sh
-   sudo volto ech-keygen --public-name public.example --config-id 8 --out /etc/volto/ech-new.pem
+   sudo volto ech-keygen --replaces /etc/volto/ech.pem --out /etc/volto/ech-new.pem
    sudo chgrp volto /etc/volto/ech-new.pem
    sudo chmod 0640 /etc/volto/ech-new.pem
    ```

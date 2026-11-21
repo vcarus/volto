@@ -436,7 +436,7 @@ impl EchKeySet {
             previous.config_id != id,
             "server.ech_key and server.ech_previous_key both have config_id {id}, and the \
              server picks the key by its config_id: generate the new key with another \
-             config_id (volto ech-keygen --config-id)"
+             config_id (volto ech-keygen --replaces)"
         );
         Ok(Self {
             previous: Some(previous),

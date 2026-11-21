@@ -1034,6 +1034,214 @@ fn the_ech_subcommands_write_a_key_and_print_its_list_again() {
     );
 }
 
+/// Adds `server.ech_previous_key = key` to a configuration file that
+/// [`add_ech_key`] already gave an `ech_key`.
+fn add_ech_previous_key(config: &Path, key: &Path) {
+    let text = fs::read_to_string(config).expect("the config");
+    let with = text.replacen(
+        "\nech_key = ",
+        &format!("\nech_previous_key = \"{}\"\nech_key = ", key.display()),
+        1,
+    );
+    assert_ne!(
+        text, with,
+        "the config has an ech_key to put the key beside"
+    );
+    fs::write(config, with).expect("rewrite the config");
+}
+
+/// The config_id of the key file at `key`, read from the list `ech-config`
+/// prints for it.
+fn config_id_of(key: &Path) -> u8 {
+    let printed = run(&["ech-config", key.to_str().unwrap()]);
+    assert_eq!(printed.status.code(), Some(0), "{}", stderr_of(&printed));
+    base64_decode(stdout_of(&printed).trim())[6]
+}
+
+/// `ech-keygen --replaces` gives the new key a config_id other than the
+/// replaced key's and, without `--public-name`, that key's public name. An
+/// explicit `--config-id` equal to the replaced key's is refused and writes
+/// nothing.
+///
+/// A random config_id equals the replaced key's once in 256 runs without the
+/// rule, so the loop below cannot be relied on to fail when the rule is
+/// removed. The explicit `--config-id` case fails every time.
+#[test]
+fn a_replacing_ech_key_takes_another_config_id_and_the_same_public_name() {
+    let dir = config_dir("ech-replaces");
+    let current = dir.join("ech.pem");
+    let written = run(&[
+        "ech-keygen",
+        "--public-name",
+        "front.example",
+        "--config-id",
+        "200",
+        "--out",
+        current.to_str().unwrap(),
+    ]);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
+    let before = fs::read_to_string(&current).expect("the current key");
+
+    for round in 0..16 {
+        let new = dir.join(format!("ech-{round}.pem"));
+        let made = run(&[
+            "ech-keygen",
+            "--replaces",
+            current.to_str().unwrap(),
+            "--out",
+            new.to_str().unwrap(),
+        ]);
+        assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
+        let list = base64_decode(stdout_of(&made).trim());
+        assert_ne!(list[6], 200, "round {round}: the replaced key's config_id");
+        assert_echconfig_list(&list, list[6], "front.example");
+    }
+
+    let named = dir.join("named.pem");
+    let made = run(&[
+        "ech-keygen",
+        "--replaces",
+        current.to_str().unwrap(),
+        "--public-name",
+        "other.example",
+        "--config-id",
+        "201",
+        "--out",
+        named.to_str().unwrap(),
+    ]);
+    assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
+    assert_echconfig_list(
+        &base64_decode(stdout_of(&made).trim()),
+        201,
+        "other.example",
+    );
+
+    let same = dir.join("same.pem");
+    let refused = run(&[
+        "ech-keygen",
+        "--replaces",
+        current.to_str().unwrap(),
+        "--config-id",
+        "200",
+        "--out",
+        same.to_str().unwrap(),
+    ]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        stderr_of(&refused).contains("--config-id 200 is the config_id of the key --replaces"),
+        "{}",
+        stderr_of(&refused)
+    );
+    assert!(!same.exists(), "nothing is written for a refused config_id");
+
+    let missing = run(&[
+        "ech-keygen",
+        "--replaces",
+        dir.join("absent.pem").to_str().unwrap(),
+        "--out",
+        same.to_str().unwrap(),
+    ]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(
+        !same.exists(),
+        "nothing is written when the replaced key does not read"
+    );
+
+    let neither = run(&["ech-keygen", "--out", same.to_str().unwrap()]);
+    assert_eq!(neither.status.code(), Some(2), "{}", stderr_of(&neither));
+    assert!(
+        stderr_of(&neither).contains("--public-name"),
+        "{}",
+        stderr_of(&neither)
+    );
+    assert_eq!(
+        fs::read_to_string(&current).expect("the current key"),
+        before,
+        "the replaced key is only read"
+    );
+}
+
+/// `--check-config` reads `server.ech_previous_key` and holds it to the rules
+/// startup holds it to: a second key with another config_id passes, one with
+/// the current key's config_id is refused by both keys' names, a file that is
+/// not there is refused by its path, and so is the key without `ech_key`.
+#[test]
+fn the_check_holds_the_previous_ech_key_to_the_rules_of_startup() {
+    let dir = config_dir("ech-previous-check");
+    let current = dir.join("ech.pem");
+    let written = keygen(&current);
+    assert_eq!(written.status.code(), Some(0), "{}", stderr_of(&written));
+    let id = config_id_of(&current);
+    let check = |path: &Path| run(&["--check-config", "--config", path.to_str().unwrap()]);
+
+    let previous = dir.join("ech-old.pem");
+    let made = run(&[
+        "ech-keygen",
+        "--replaces",
+        current.to_str().unwrap(),
+        "--out",
+        previous.to_str().unwrap(),
+    ]);
+    assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    add_ech_key(&path, &current);
+    add_ech_previous_key(&path, &previous);
+    let checked = check(&path);
+    assert_eq!(checked.status.code(), Some(0), "{}", stderr_of(&checked));
+
+    let twin = dir.join("ech-twin.pem");
+    let made = run(&[
+        "ech-keygen",
+        "--public-name",
+        "public.example",
+        "--config-id",
+        &id.to_string(),
+        "--out",
+        twin.to_str().unwrap(),
+    ]);
+    assert_eq!(made.status.code(), Some(0), "{}", stderr_of(&made));
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    add_ech_key(&path, &current);
+    add_ech_previous_key(&path, &twin);
+    let refused = check(&path);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains(&format!(
+            "server.ech_key and server.ech_previous_key both have config_id {id}"
+        )),
+        "{stderr}"
+    );
+
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    add_ech_key(&path, &current);
+    add_ech_previous_key(&path, &dir.join("absent.pem"));
+    let refused = check(&path);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("ech_previous_key") && stderr.contains("absent.pem"),
+        "{stderr}"
+    );
+
+    let path = write_config(&dir, "127.0.0.1:4433", "");
+    let text = fs::read_to_string(&path).expect("the config");
+    let with = text.replacen(
+        "\n\n[auth]",
+        &format!("\nech_previous_key = \"{}\"\n\n[auth]", previous.display()),
+        1,
+    );
+    assert_ne!(text, with);
+    fs::write(&path, with).expect("rewrite the config");
+    let refused = check(&path);
+    assert_eq!(refused.status.code(), Some(1));
+    let stderr = stderr_of(&refused);
+    assert!(
+        stderr.contains("ech_previous_key") && stderr.contains("ech_key"),
+        "{stderr}"
+    );
+}
+
 /// `--check-config` reads the ECH key file whole, and refuses one the server
 /// would refuse at startup, by the key's name.
 #[test]
