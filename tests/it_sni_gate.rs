@@ -25,6 +25,7 @@ mod common;
 use std::assert_matches;
 use std::net::SocketAddr;
 use std::panic::Location;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -419,12 +420,29 @@ async fn an_initial_during_the_shutdown_grace_draws_no_stateless_reset() {
     initial.extend_from_slice(&0x4400u16.to_be_bytes()); // Length, two bytes
     initial.resize(1200, 0x5a);
 
+    // Sent through a relay that counts what it carries to the server and
+    // carries every answer back, so that the silence is the server's and not
+    // that of a probe that never left its socket.
+    let carried = Arc::new(AtomicUsize::new(0));
+    let count = carried.clone();
+    let tap = udp_relay(server.addr, move |leg, _| {
+        if leg == Leg::FromClient {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        Relayed::Forward
+    })
+    .await;
     let heard = common::udp_answers(
-        server.addr,
+        tap.addr,
         std::slice::from_ref(&initial),
         Duration::from_secs(1),
     )
     .await;
+    assert_eq!(
+        carried.load(Ordering::Relaxed),
+        1,
+        "the probe must have been carried to the server"
+    );
     assert!(
         heard.is_empty(),
         "an Initial during the grace drew {} datagrams, the first of {} bytes",
