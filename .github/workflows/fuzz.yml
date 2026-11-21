@@ -1,0 +1,147 @@
+name: Fuzz
+
+# ci.yml's `fuzz` job only type-checks the targets in `fuzz/`. This workflow
+# runs them: every target each day, for ten minutes, on the corpus the earlier
+# runs left. The targets cover every parser that reads bytes a peer chose
+# (fuzz/README.md lists them), and two of them, `tls` and `hold`, cover code
+# that runs before authentication and calls into C.
+#
+# Not a required check and not in release.yml's gate. A finding fails the
+# scheduled run, which GitHub reports to the repository owner; it does not
+# hold a pull request, because the same tree can pass on one day and fail on
+# the next.
+#
+# A crash input is uploaded as an artifact of the failed run, and libFuzzer
+# prints it in the log. Both are public, as this repository is. The targets
+# and their seeds are public too, so the run finds nothing that another reader
+# of this repository cannot find by running the same command.
+on:
+  schedule:
+    # 19:17 UTC, a quiet minute. GitHub delays scheduled runs that start on
+    # the hour.
+    - cron: "17 19 * * *"
+  # A change to a target or to this file runs every target for one minute, so
+  # a target that no longer starts, or a step here that no longer works, is
+  # seen on the pull request that broke it.
+  pull_request:
+    paths:
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds of fuzzing for each target
+        required: false
+        default: "600"
+
+concurrency:
+  group: fuzz-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # `cargo fuzz` needs nightly. The date is asan.yml's, for the same reason:
+  # a red run is then about this repository and not about that day's compiler.
+  # Move the two together by hand.
+  NIGHTLY: nightly-2026-11-15
+  # Dependabot does not read this line.
+  CARGO_FUZZ_VERSION: 0.13.2
+  SECONDS_PER_TARGET: ${{ github.event_name == 'pull_request' && '60' || inputs.seconds || '600' }}
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every file in fuzz/fuzz_targets/. `tests/it_release_assets.rs` holds
+        # this list equal to that directory, so a new target cannot be left
+        # out of the daily run.
+        target:
+          - auth
+          - authority
+          - capsule
+          - datagram
+          - frame
+          - gate
+          - hold
+          - huffman
+          - qpack
+          - request
+          - tls
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
+      - name: Install cmake and libclang
+        uses: ./.github/actions/cmake-libclang
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Both workspaces: the seed step builds the root, the run builds fuzz/.
+          workspaces: |
+            .
+            fuzz
+          key: fuzz-${{ matrix.target }}
+          # rust-cache keeps `~/.cargo/bin`, so the install below is a no-op
+          # on a warm cache.
+          cache-bin: true
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION"
+
+      # The corpus is not in the repository (fuzz/README.md), so the cache is
+      # where one day's run leaves it for the next. A cache key cannot be
+      # written twice, so each run saves under its own run id and restores the
+      # newest one by prefix.
+      - name: Restore the corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      # `gate` and `hold` need seeds no fuzzer produces by chance: Initial
+      # packets that open under their own keys, and ECH that opens under the
+      # target's key. Two tests write them and assert what each one reaches.
+      - name: Write the seed corpus
+        if: matrix.target == 'gate' || matrix.target == 'hold'
+        run: cargo test --locked --test it_gate_shapes fuzz_seed_corpus_is_written
+
+      - name: Fuzz
+        run: |
+          set -euo pipefail
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cargo fuzz run "${{ matrix.target }}" -- \
+            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=4096 -timeout=60
+
+      # Drops every input that adds no coverage, so the saved corpus does not
+      # grow by one day's run each day.
+      - name: Minimize the corpus
+        if: github.event_name != 'pull_request'
+        run: cargo fuzz cmin "${{ matrix.target }}"
+
+      # Only from the default branch: a cache saved by a pull request is
+      # visible to that pull request alone, and its one-minute corpus is not
+      # worth keeping.
+      - name: Save the corpus
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload the failing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

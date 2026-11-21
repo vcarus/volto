@@ -164,13 +164,13 @@ jobs:
     # `h3::stream::build_request`, `tunnel::tcp::split_authority`,
     # `tunnel::udp::parse_target` -- and a rename or a signature change to any
     # of them compiles green everywhere here while leaving the fuzzers broken.
-    # Nothing would notice until somebody started the on-demand container run in
-    # fuzz/README.md, which is weeks apart by design; the whole point of that
-    # crate is to be runnable on the day a parser changes.
+    # fuzz.yml runs the targets once a day and on a pull request that changes
+    # `fuzz/`, so without this job a pull request that changes only `src`
+    # would break them and stay green.
     #
     # `cargo check` rather than a build or a run: this job answers "do the
-    # targets still compile against today's `src`", not "is there a crash". The
-    # runs stay on demand, where a fuzzer's minutes belong.
+    # targets still compile against today's `src`", not "is there a crash".
+    # fuzz.yml answers the second question.
     #
     # Stable, not the nightly `cargo fuzz` itself needs: libfuzzer-sys type-checks
     # on stable, and this job only asks whether the targets still compile

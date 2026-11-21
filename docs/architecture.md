@@ -772,8 +772,8 @@ particular, and its verdicts are checked in rather than re-run: the differential
 oracle in `tests/interop/difforacle/` puts generated and mutated field sections
 through this server's QPACK and Huffman decoders and through ls-qpack (via
 `pylsqpack`), comparing both the accept/reject verdict and the decoded fields.
-It needs a pinned Python environment and so runs on demand like the fuzz
-targets, but what it settled lives in `tests/it_diff_oracle.rs` and is
+It needs a pinned Python environment and so runs on demand, but what it
+settled lives in `tests/it_diff_oracle.rs` and is
 re-checked on every `cargo test`: the five inputs the two implementations
 answer differently, none of them a fault here, and ls-qpack's own copy of the
 RFC 9204 static table, entry by entry. That table is the one thing the in-tree
@@ -782,11 +782,13 @@ Appendix A by hand and its unit test can only compare that transcription with
 itself.
 
 Every hand-written parser that reads bytes a peer chose also has a
-coverage-guided fuzz target under `fuzz/`, run on demand on a nightly toolchain
-in a Linux container rather than in CI -- which only type-checks them, since
-`fuzz/` is a workspace of its own and its targets reach items that are public
-only because they ask for them, so a rename in `src/` would otherwise break the
-fuzzers silently between runs. `fuzz/README.md` maps each target to the parser
+coverage-guided fuzz target under `fuzz/`. A scheduled workflow,
+`.github/workflows/fuzz.yml`, runs each target for ten minutes a day on a
+nightly toolchain and keeps the corpus between runs. The CI run of a pull
+request only type-checks them: `fuzz/` is a workspace of its own and its
+targets reach items that are public only because they ask for them, so a
+rename in `src/` would otherwise break the fuzzers until the next scheduled
+run. `fuzz/README.md` maps each target to the parser
 it covers and has the invocation. There are eleven. Beside the five codecs
 (the frame state machine, QPACK, Huffman, the capsule parser and the datagram
 codec), they cover the request validator that reaches RFC 9114 §4.1.2's
