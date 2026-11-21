@@ -300,7 +300,7 @@ async fn arrival_reporting_relay(server: SocketAddr) -> ArrivalRelay {
 /// buffer it keeps for a pending `Incoming` when that connection's first Initial
 /// arrives, so a `SIGHUP` between the arrival and this server's accept used to
 /// leave the connection on the old transport parameters beside the new
-/// `Config`. `Server::accept_under_the_swap` states the configuration instead,
+/// `Config`. `Server::accept_on_one_generation` states the configuration instead,
 /// through `Incoming::accept_with`, and this is that from the client's side.
 ///
 /// `max_streams_bidi` is the observable: below `INITIAL_BIDI_STREAMS` it is what

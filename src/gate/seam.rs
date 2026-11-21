@@ -49,7 +49,7 @@ pub use super::hold::{
 
 /// The gate's verdict on one datagram, for the fuzz target and the tests.
 ///
-/// This is the `judge` that `Gate::screen` calls, Initial key code included.
+/// This is the `judge` that `screen_one` calls, Initial key code included.
 /// The socket, the batch walk and the blinding are left out, and none of them
 /// is a parser.
 ///

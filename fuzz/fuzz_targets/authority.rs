@@ -9,7 +9,7 @@
 //!
 //! Even inputs: the template, with the well-known prefix optionally prepended
 //! so the fuzzer reaches the segment rules without having to spell it, and the
-//! query split off at the first "?" exactly as `stream::split_target` does
+//! query split off at the first "?" exactly as `request::split_target` does
 //! before handing the two halves over.
 //!
 //! Odd inputs: the authority form.

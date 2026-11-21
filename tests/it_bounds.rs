@@ -568,7 +568,7 @@ const CHURNED_SESSIONS: usize = 64;
 /// inbound channel it sends to, about 2 KiB a session on the dev host, and
 /// passes; the unit test
 /// `dropping_the_receiver_gives_up_the_quarter_stream_id` in
-/// `src/h3/connection.rs` is what catches that one.
+/// `src/h3/router.rs` is what catches that one.
 const KEPT_PER_CLOSED_SESSION: i64 = 8 * 1024;
 
 /// Closes a CONNECT-UDP session and waits for the server to close its half.

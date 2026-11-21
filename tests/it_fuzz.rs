@@ -110,9 +110,10 @@ fn split_at(bytes: &[u8], cuts: &[u16]) -> Vec<Vec<u8>> {
 // QUIC varints
 // ---------------------------------------------------------------------------
 //
-// The varint codec lives in `volto::datagram`, not in a `volto::h3::varint`
-// module: `src/h3/frame.rs` imports `peek_varint`/`put_varint` from there and
-// there is no second implementation.
+// The varint codec lives in `src/varint.rs`, not in an `h3` module, and these
+// tests reach it through the re-export in `volto::datagram`: `src/h3/frame.rs`
+// imports `peek_varint`/`put_varint` from `crate::varint`, and there is no
+// second implementation.
 //
 // `it_props` already states the two properties that matter most about it:
 // `a_varint_round_trips_and_leaves_the_remainder_alone` (encode then decode is
@@ -2209,7 +2210,7 @@ proptest! {
 // reached. It takes a `Vec<qpack::Field>` and returns, so a property can put an
 // arbitrary *combination* of pseudo-headers through it -- which is what the
 // rules are about, and what a live request stream cannot supply at proptest's
-// rates. `src/h3/stream.rs`'s own tests are the table of named cases; these are
+// rates. `src/h3/request.rs`'s own tests are the table of named cases; these are
 // the combinations between them.
 //
 // The properties state what the function does, which is not always what the RFC

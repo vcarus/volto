@@ -92,8 +92,12 @@ impl EchKey {
     pub fn generate(public_name: &str, config_id: u8, max_name_length: u8) -> Result<Self> {
         // Any 32 bytes are an X25519 private key, because AWS-LC clamps the
         // scalar where it is used (`x25519_public_from_private_nohw` and the
-        // s2n-bignum path alike). Its own `X25519_keypair` draws the 32 bytes
-        // from the same `RAND_bytes` and only sets bits that clamping discards.
+        // s2n-bignum path alike): it clears the three low bits of byte 0 and
+        // the top bit of byte 31, and sets bit 6 of byte 31. Its own
+        // `X25519_keypair` draws the 32 bytes from the same `RAND_bytes` and
+        // then does the opposite to those five bits (sets the three low bits
+        // and the top bit, clears bit 6), so every bit it changes is one that
+        // clamping overwrites (aws-lc-sys 0.47.0, `curve25519.c`).
         let mut private = Zeroizing::new([0u8; X25519_KEY_LEN]);
         crate::tls::random_bytes(&mut private[..])?;
         Self::from_private_bytes(&private, public_name, config_id, max_name_length)

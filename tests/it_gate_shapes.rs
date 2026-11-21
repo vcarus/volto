@@ -511,8 +511,9 @@ fn an_unsealed_initial_with_a_short_connection_id_is_refused() {
 ///
 /// `Refusal::OtherName` holds the bytes the extension spelled, so a build that
 /// is not logging at DEBUG formats nothing for a flood of refused handshakes.
-/// The escaping did not leave the path, it moved later into it: `Gate::screen`
-/// applies `logfmt::escaped_bytes` inside the `debug!` that prints the name.
+/// The escaping did not leave the path, it moved later into it: `log_refusal`
+/// in `src/gate.rs` applies `logfmt::escaped_bytes` inside the `debug!` that
+/// prints the name.
 /// This drives both steps in that order on a name carrying the two characters
 /// escaping exists for, a quote and a newline, either of which would otherwise
 /// let an unauthenticated peer forge a journal entry.
@@ -550,8 +551,9 @@ fn a_refused_name_is_carried_raw_and_escaped_where_it_is_logged() {
 ///
 /// RFC 9001 §5.4.2 samples header protection from four bytes past the packet
 /// number offset, so a packet declaring fewer bytes than that after the offset
-/// cannot be opened under any cipher. `Judge::decrypt` asks that half of the
-/// length test above `initial_keys`, which is nearly the whole cost of judging
+/// cannot be opened under any cipher. `gate::initial::decrypt` asks that half
+/// of the length test above `tls::server_initial_keys`, which is nearly the
+/// whole cost of judging
 /// an Initial, and the verdict is the same on both sides of the move: a packet
 /// that does not open is one quinn tells apart with state this gate does not
 /// have, so it reaches quinn.

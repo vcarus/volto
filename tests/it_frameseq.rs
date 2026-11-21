@@ -5,7 +5,7 @@
 //! thought of, pinned once. `it_fuzz` generates frame sequences too, but feeds
 //! them to the pure `FrameDecoder` -- deliberately, so it can pick the chunk
 //! boundaries -- which means everything *above* the decoder is out of its
-//! reach: the control stream's stateful rules (`connection::Control`), the
+//! reach: the control stream's stateful rules (`control::Control`), the
 //! request reader's ordering rules (`stream::read_request`), the uni-stream
 //! accounting, and how any of it composes across streams on one connection.
 //! This file generates sequences at that level and asserts what the peer
@@ -161,7 +161,7 @@ async fn open_uni_tolerant(
 // Property 1: the control stream's frame-sequence rules
 // ---------------------------------------------------------------------------
 //
-// `connection::Control` is a state machine -- whether SETTINGS has been seen,
+// `control::Control` is a state machine -- whether SETTINGS has been seen,
 // the GOAWAY floor, the MAX_PUSH_ID ceiling -- and its unit tests plus the
 // `it_hostile`/`it_settings`/`it_critical_streams` rows pin single transitions.
 // What none of them state is the *sequence* property: for any interleaving of

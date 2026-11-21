@@ -277,7 +277,7 @@ async fn a_datagram_sent_right_after_its_request_reaches_the_target() {
 /// A flood of datagrams at one live session costs datagrams, not the session.
 ///
 /// The session's inbound queue is bounded (`INBOUND_QUEUE_DEPTH` in
-/// `src/h3/connection.rs`) and overflow is dropped rather than buffered or
+/// `src/h3/router.rs`) and overflow is dropped rather than buffered or
 /// blocked on, so a peer sending faster than the target drains can lose
 /// packets -- UDP's own promise -- but must not be able to grow the server's
 /// memory, stall the routing task, or take the session down. Which packets
