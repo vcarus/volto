@@ -158,16 +158,22 @@ async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
     // The access path saw the inner name.
     let established = one_line(&buffer, mark, "connection established");
     assert!(
-        established.contains("server_name=localhost"),
+        established.contains("server_name=localhost ech=true "),
         "{established}"
     );
     drop(client);
 
-    // A plain client still gets in: ECH is accepted, not required.
+    // A plain client still gets in: ECH is accepted, not required. The
+    // connection line, which production logs at `info`, says which kind it was.
     let mark = buffer.mark();
     let mut client = H3Client::connect(&server).await;
     tcp_and_udp(&mut client, &server).await;
     assert!(one_line(&buffer, mark, "TLS handshake complete").contains("ech_accepted=false"));
+    let established = one_line(&buffer, mark, "connection established");
+    assert!(
+        established.contains("server_name=localhost ech=false "),
+        "{established}"
+    );
     drop(client);
 
     // A reload with a new key file puts the new key in force: the old list no
