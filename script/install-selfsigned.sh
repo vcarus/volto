@@ -775,15 +775,26 @@ fi
 # `systemctl $1`, then ends the run. The ERR trap of the swap below calls it
 # with `start` and the health check with `restart`, as deploy.sh's put_back
 # does, for the reasons given there.
+#
+# As in deploy.sh, a run that replaced the binary puts the unit back only
+# together with the binary: a unit's .prev without a binary's, from a host
+# whose binary was not executable, would put the new binary under the old unit.
+# A run that placed only the unit (the binary was kept) puts the unit back
+# alone, which is the pair the host had.
 put_back() {
     trap - ERR
     local restored=""
 
-    if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
-        restored="binary"
-    fi
-    if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
-        restored="${restored:+$restored and }unit"
+    rm -f "$BIN.new"
+    if [ "$PLACE_BINARY" -eq 1 ]; then
+        if [ -f "$BIN.prev" ] && install -m 0755 "$BIN.prev" "$BIN.new" && mv -f "$BIN.new" "$BIN"; then
+            restored="binary"
+            if [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+                restored="binary and unit"
+            fi
+        fi
+    elif [ -f "$UNIT.prev" ] && install -m 0644 "$UNIT.prev" "$UNIT"; then
+        restored="unit"
     fi
     systemctl daemon-reload || true
     systemctl "$1" "$SERVICE_NAME" || true
@@ -850,10 +861,17 @@ else
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
 
+    # Under Type=exec a start fails at once when the binary cannot be executed
+    # (a noexec mount, the wrong architecture). That failure must not end the
+    # run here: the report below prints the fingerprint and the policy line,
+    # which are the point of a first install, and then fails the run on the
+    # service's status.
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        systemctl restart "$SERVICE_NAME"
+        systemctl restart "$SERVICE_NAME" ||
+            note "systemctl restart $SERVICE_NAME failed; the report follows, then the run fails"
     else
-        systemctl start "$SERVICE_NAME"
+        systemctl start "$SERVICE_NAME" ||
+            note "systemctl start $SERVICE_NAME failed; the report follows, then the run fails"
     fi
 fi
 

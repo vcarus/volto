@@ -1110,6 +1110,52 @@ fn an_install_whose_service_failed_is_not_reported_as_success() {
     );
 }
 
+/// A first install whose `systemctl start` fails still prints the report
+/// before it fails (F3-L1).
+///
+/// Under `Type=exec` the start fails at once when the binary cannot be
+/// executed. Without a guard on that call `set -e` ended the run there, and
+/// the operator got neither the fingerprint nor the policy line.
+#[test]
+fn a_first_install_whose_start_fails_still_prints_the_report() {
+    let root = scratch_tree(
+        "install",
+        "start-fails",
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    );
+    let stubs = plant_root_stubs(&root, 0, "failed");
+    write_executable(
+        &stubs.join("systemctl"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in\n\
+             \x20 'start volto') exit 1 ;;\n\
+             \x20 'is-active --quiet volto') exit 3 ;;\n\
+             \x20 'is-active volto') echo failed; exit 3 ;;\n\
+             esac\n\
+             exit 0\n",
+            stubs.join("systemctl.log").display()
+        ),
+    );
+
+    let output = run_full_install_with_stubs(&root, &stubs, &[]);
+
+    let stdout = stdout_of(&output);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("systemctl start volto failed")
+            && stdout.contains("certificate: ")
+            && stdout.contains("server-cert-fingerprint-sha256="),
+        "the fingerprint and the policy line must print before the failure: {stdout}"
+    );
+    assert!(
+        stderr_of(&output).contains("volto is failed after the install"),
+        "{}",
+        stderr_of(&output)
+    );
+}
+
 /// And a service that is active still succeeds, with the report printed.
 #[test]
 fn an_install_whose_service_is_active_reports_success() {
@@ -1402,6 +1448,60 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
         systemctl_calls(&stubs).ends_with("restart volto\ndaemon-reload\nstart volto\n"),
         "the rollback reloads systemd and starts the service: {}",
         systemctl_calls(&stubs)
+    );
+}
+
+/// A rollback after `--replace-binary` puts the unit back only together with
+/// the binary, as `deploy.sh` does (F3-L2).
+///
+/// The installed binary here is not executable, so no `volto.prev` is made,
+/// while `volto.service.prev` is. Restoring that unit alone would put the new
+/// binary under the old unit and report a rollback.
+#[test]
+fn a_rollback_without_a_previous_binary_leaves_the_new_pair() {
+    let root = configured_root("replace-no-prev-binary", "");
+    fs::set_permissions(
+        root.join("usr/local/bin/volto"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("the installed binary's mode must be settable");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    write_executable(
+        &stubs.join("systemctl"),
+        &format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> '{}'\n\
+             case \"$*\" in\n\
+             \x20 'restart volto') exit 1 ;;\n\
+             \x20 'is-active volto') echo active ;;\n\
+             esac\n\
+             exit 0\n",
+            stubs.join("systemctl.log").display()
+        ),
+    );
+
+    let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
+
+    let stderr = stderr_of(&output);
+    assert!(!output.status.success(), "{}", stdout_of(&output));
+    assert!(
+        root.join("etc/systemd/system/volto.service.prev").exists()
+            && !root.join("usr/local/bin/volto.prev").exists(),
+        "the case under test: a unit .prev and no binary .prev"
+    );
+    assert!(
+        stderr.contains("there was nothing to restore"),
+        "a unit alone is not a rollback: {stderr}"
+    );
+    assert_eq!(
+        fs::read(root.join("usr/local/bin/volto")).ok(),
+        fs::read(real_binary()).ok(),
+        "the new binary stays: {stderr}"
+    );
+    assert_eq!(
+        fs::read(root.join("etc/systemd/system/volto.service")).ok(),
+        fs::read(repo_root().join("script/masque.service")).ok(),
+        "the new unit stays with it: {stderr}"
     );
 }
 
