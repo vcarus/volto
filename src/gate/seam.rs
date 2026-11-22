@@ -186,10 +186,9 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// it could change a held packet's bytes only by breaking its AEAD, and the
 /// hold would never see frames the fuzzer chose. With it, the fuzzer chooses
 /// the frames and this function seals them. The keys are the client's Initial
-/// keys, from the server's own key code (`tls::server_initial_keys`, whose
-/// `remote` half is what a client seals with). That code is checked against
-/// RFC 9001 Appendix A in both directions, and `tests/it_gate_shapes.rs`
-/// opens a packet sealed here with rustls's keys.
+/// keys, from the server's own key code (`tls::client_initial_keys`). That
+/// code is checked against RFC 9001 Appendix A in both directions, and
+/// `tests/it_gate_shapes.rs` opens a packet sealed here with rustls's keys.
 ///
 /// The header is the plainest a client sends: QUIC v1, no Source Connection
 /// ID, no token, a two-byte Length field and a one-byte packet number
@@ -197,8 +196,8 @@ pub const SEALED_FRAMES_MAX: usize = 0x3fff - 1 - 16;
 /// and cut at [`SEALED_FRAMES_MAX`] bytes.
 #[doc(hidden)]
 pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
-    let keys = crate::tls::server_initial_keys(dcid);
-    let tag = keys.packet.remote.tag_len();
+    let keys = crate::tls::client_initial_keys(dcid);
+    let tag = keys.packet.tag_len();
     let frames = &frames[..frames.len().min(SEALED_FRAMES_MAX)];
 
     let mut packet = vec![LONG_HEADER_FORM | 0x40 | INITIAL_PACKET_TYPE];
@@ -218,9 +217,8 @@ pub fn sealed_initial(dcid: &[u8; 8], number: u8, frames: &[u8]) -> Vec<u8> {
     packet.resize(number_offset + 1 + payload, 0); // PADDING
     packet.resize(number_offset + 1 + payload + tag, 0); // room for the tag
     keys.packet
-        .remote
         .encrypt(u64::from(number), &mut packet, number_offset + 1);
-    keys.header.remote.encrypt(number_offset, &mut packet);
+    keys.header.encrypt(number_offset, &mut packet);
     packet
 }
 

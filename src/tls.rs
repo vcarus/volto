@@ -22,11 +22,11 @@ use zeroize::{Zeroize as _, Zeroizing};
 #[allow(unsafe_code)]
 mod awslc;
 
+pub(crate) use awslc::{ClientInitialKeys, HandshakeData, client_initial_keys};
 pub use awslc::{
     EchKey, EchKeySet, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config,
     server_config,
 };
-pub(crate) use awslc::{HandshakeData, server_initial_keys};
 
 /// What an operator is told when the two configured files do not pair up.
 ///
