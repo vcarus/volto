@@ -20,7 +20,7 @@
 //!   tests share.
 //! * [`quic`]: the QUIC endpoint, transport parameters and the accept loop.
 //! * [`congestion`]: the default `bbr` controller, volto's own, whose window is
-//!   1.25 times the bandwidth-delay product it measures.
+//!   at most 1.25 times the bandwidth-delay product it measures.
 //! * [`shutdown`]: the graceful-shutdown signal shared by endpoint and connections.
 //! * [`h3`]: HTTP/3 (RFC 9114) for a proxy: framing, QPACK, the control
 //!   stream, request streams, and the routing of inbound HTTP Datagrams to the

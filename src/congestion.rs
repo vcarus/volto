@@ -1,9 +1,8 @@
-//! The `bbr` congestion controller: a window of 1.25 times the bandwidth-delay
-//! product it measures.
+//! The `bbr` congestion controller: a window of at most 1.25 times the
+//! bandwidth-delay product it measures.
 //!
-//! It is the default (D108). quinn's BBR as it ships is the value
-//! `bbr-uncapped`. The type is named [`BbrCapped`], for the name it had when it
-//! was a wrapper around quinn's BBR.
+//! It is the default (D108). The type is named [`BbrCapped`], for the name it
+//! had when it was a wrapper around quinn's BBR.
 //!
 //! quinn-proto 0.11's BBR estimates the bottleneck bandwidth several times too
 //! high, so its window never limits in-flight data, and a bulk download loses
@@ -11,31 +10,88 @@
 //! quinn's BBR. It measures its own delivery rate and minimum RTT, and its
 //! window is computed from them alone (D108).
 //!
-//! The window is 1.25 times the delivery rate measured once per round trip
-//! (see `DeliveryRate`) times the minimum RTT. It is never below the initial
-//! window, 240 kB: 200 packets of 1200 bytes, the default initial window of
-//! quinn's BBR (`BbrConfig`). So on a path whose bandwidth-delay product is
-//! under 192 kB, the window can be 240 kB. Until there is a delivery-rate sample
-//! and a minimum RTT, the window is the initial window.
+//! The window is a gain times the delivery rate measured once per round trip
+//! (see `DeliveryRate`) times the minimum RTT. The gain is 1.25 unless the
+//! path's loss has lowered it, as described below. Outside a recovery and a
+//! probe the window is never below the initial window, 240 kB: 200 packets of
+//! 1200 bytes, the default initial window of the BBR in quinn-proto 0.11
+//! (`BbrConfig`). So on a path whose bandwidth-delay product is under 192 kB,
+//! the window can be 240 kB. Until there is a delivery-rate sample and a
+//! minimum RTT, the window is the initial window.
 //!
 //! quinn paces from the window (quinn-proto `src/connection/pacing.rs`,
 //! `Pacer::delay`, which adds 1.25 windows of tokens per smoothed RTT), so the
-//! window also sets the pacing rate. In-flight data sits at the window, and a
-//! quarter of a bandwidth-delay product stands in the bottleneck queue. 1.25 is
+//! window also sets the pacing rate. In-flight data sits at the window, and at
+//! 1.25 a quarter of a bandwidth-delay product stands in the bottleneck queue
+//! when the queue can hold it. 1.25 is
 //! the highest pacing gain of BBR's ProbeBW cycle. BBR's window gain of two is a
 //! ceiling above a sender that paces at the estimated rate. In quinn the window
 //! is what the sender sends, so a gain of two keeps a whole bandwidth-delay
 //! product queued and loses packets wherever the queue is shorter than that.
 //!
+//! The gain follows the path between 1.05 and 1.25. With the window at a gain
+//! g, in-flight data is g times what the path carries in transit, and what the
+//! bottleneck queue cannot hold of the rest is lost. In the lab a queue of
+//! 0.04 bandwidth-delay products lost 19 percent of the packets at 1.25 and
+//! 0.9 percent at 1.05. A path that loses packets at random needs the higher gain:
+//! with 2 percent of them lost, a fixed 1.05 carried a third of what 1.25
+//! carried, because each loss holds in-flight data for a round trip and at
+//! 1.05 the window has no room to bring the delivery rate back. The two kinds
+//! of loss differ in one thing the sender can see. A lower gain removes the
+//! loss of a queue and leaves random loss as it is. The rule below is ours.
+//!
+//! The controller counts the bytes acknowledged and the bytes lost over loss
+//! windows of at least four sample intervals and 2000 packets. A window that
+//! lost one percent or more starts a trial of a lower gain: the gain times the
+//! share delivered, which is the in-flight data the path carried, and never
+//! under the floor. A window that lost so much that the path carried under 0.9
+//! bandwidth-delay products starts no trial, because a queue loses at most
+//! what the window holds above one. If the loss was the queue's, the loss at the lower gain is
+//! the part of the same in-flight data that the lower window still exceeds,
+//! often none. The lower gain is kept when a window within the next eight
+//! loses no more than the middle between the loss before and that prediction.
+//! Otherwise the old gain returns, and the wait before the next trial doubles,
+//! from 4 windows up to 256. Under random loss a trial lowers the gain by the
+//! loss share, 1.25 to 1.225 at 2 percent, so it costs nothing while it runs.
+//!
+//! A lowered gain is tried one step of 0.05 higher after 16 windows. The same
+//! test judges it in one window: when the loss is at or past the middle
+//! between the loss before and the loss predicted for the higher gain, the
+//! queue is still that short, the lowered gain returns and the wait doubles.
+//! A gain that has come down after a loss burst or on a path that has changed
+//! goes back up this way.
+//!
+//! A lowered gain is given up for 1.25 when the bandwidth estimate falls
+//! under three quarters of the highest one since the gain was last 1.25. The
+//! wait before the next trial of a lower gain doubles as after a refusal, and
+//! that trial does not go as low as the gain given up: the floor is 0.05 above
+//! it, and comes down by 0.05 every 256 windows. This guards a path with a
+//! short queue and random loss, where a low gain passes the loss test and then
+//! does not hold the rate.
+//!
+//! A window in which more than half of the intervals were app-limited did not
+//! fill the queue. It counts for lowering the gain, because behind a short
+//! queue the retransmissions stall the sender on flow control in nearly half
+//! of all intervals. It does not count towards the 16 windows, and it can
+//! refuse a higher gain on trial and cannot keep one. Otherwise a stream that
+//! sends less than the path carries would take a lowered gain back to 1.25
+//! step by step, and the next download would lose to the queue again.
+//!
+//! A connection that sends too little for a loss window within 32 intervals
+//! has its trial dropped and its gain set back to 1.25, and the gain starts
+//! again when the startup gain returns. Probe intervals and the two intervals
+//! after a probe or a change of gain are left out of the loss windows, and so
+//! are the interval that ends a startup and the seven after it. A startup ends
+//! with more in flight than the path holds, and that loss is not the steady
+//! gain's.
+//!
 //! A new connection also starts as slow start does. Until its first startup has
 //! ended, the window is at most the initial window plus the bytes acknowledged
 //! so far, so it doubles per round trip at most. The startup gain alone would
 //! let the first samples open the window to 2.89 times a bandwidth-delay
-//! product at once, and the bottleneck queue would lose what it cannot hold: in
-//! the lab a connection without this limit lost 5388 packets at its start
-//! through a 50 kB queue where one with it lost 3178, and reached 90 percent of
-//! the bottleneck 0.1 s sooner. The limit does not come back when the startup
-//! gain does.
+//! product at once. The controller had this limit through the window of
+//! quinn's BBR while it was built around it, and keeps it as a rule of its
+//! own. The limit does not come back when the startup gain does.
 //!
 //! A new connection uses a higher gain until its estimate stops growing. With
 //! the window at 1.25 times the estimate, each sample can only show the rate
@@ -124,7 +180,7 @@
 //! The window is computed when one of its inputs changes and stored, because
 //! quinn reads it before every packet it sends. The inputs are the estimate,
 //! the minimum RTT, the probe, the startup with its slow-start limit, the
-//! recovery window and the MTU.
+//! steady gain, the recovery window and the MTU.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -144,14 +200,83 @@ use quinn_proto::RttEstimator;
 const SAMPLES: usize = 10;
 
 /// The window a connection starts with, and the floor of the window outside a
-/// probe: 200 packets of 1200 bytes, the default initial window of quinn's BBR.
-/// Held here so that the controller does not depend on quinn's BBR; a test
-/// checks that the two still agree.
+/// probe: 200 packets of 1200 bytes, the default initial window of the BBR in
+/// quinn-proto 0.11 (`BbrConfig::default()`), which this controller replaced.
 const INITIAL_WINDOW: u64 = 200 * 1200;
 
 /// The window as a multiple of the estimated bandwidth-delay product, in per
-/// mille, once the startup has ended.
-const CWND_GAIN_PERMILLE: u128 = 1_250;
+/// mille, once the startup has ended: the steady gain a connection starts with
+/// and the highest one it uses.
+const CWND_GAIN_PERMILLE: u64 = 1_250;
+
+/// The lowest steady gain, in per mille. It is the lowest one measured: in the
+/// lab a fixed 1.05 lost 0.9 percent through a queue of 0.04 bandwidth-delay
+/// products where 1.25 lost 19 percent.
+const GAIN_FLOOR_PERMILLE: u64 = 1_050;
+
+/// How much a trial raises a lowered gain, in per mille.
+const GAIN_STEP_UP_PERMILLE: u64 = 50;
+
+/// The smallest step a trial lowers the gain by, in per mille.
+const GAIN_MIN_STEP_PERMILLE: u64 = 10;
+
+/// The share of bytes lost in a loss window, in parts per million, from which
+/// a lower gain is tried: one percent.
+const LOSS_TRIGGER_PPM: u64 = 10_000;
+
+/// The least a path must have carried, as a gain in per mille, for a lower gain
+/// to be tried. A queue loses at most what the window holds above one
+/// bandwidth-delay product, 20 percent at 1.25. A loss window after which the
+/// gain times the share delivered is under 0.9 lost more than a queue explains. In the lab a 3 s burst of 90
+/// percent loss would otherwise lower the gain to the floor for the climb back.
+const LEAST_CARRIED_PERMILLE: u64 = 900;
+
+/// The fewest sample intervals in a loss window.
+const WINDOW_INTERVALS: u8 = 4;
+
+/// The fewest packets of the current MTU in a loss window, so that a loss of
+/// one percent is twenty packets.
+const WINDOW_PACKETS: u64 = 2_000;
+
+/// After this many sample intervals a loss window that has not covered
+/// [`WINDOW_PACKETS`] is dropped with any trial, and a lowered gain goes back
+/// to 1.25: without loss windows the guard does not run and no trial is judged.
+const WINDOW_MAX_INTERVALS: u8 = 32;
+
+/// How many sample intervals after a change of gain or a probe are left out of
+/// the loss windows. The packets acknowledged and lost in them were sent
+/// before it.
+const SETTLE_INTERVALS: u8 = 2;
+
+/// How many sample intervals are left out of the loss windows at the end of a
+/// startup: the interval that ends it and the seven after it. The startup ends
+/// with more in flight than the path and its queue hold, and what is lost of
+/// that says nothing about the steady gain. In the lab a loss window that began
+/// two intervals after the end of a startup still lost 16 percent to it.
+const STARTUP_SETTLE_INTERVALS: u8 = 8;
+
+/// How many loss windows a lower gain on trial has to show the loss the queue
+/// rule predicts. The receiver first has to take the retransmissions of what
+/// was lost before, and until then the sender stalls on flow control and
+/// refills in bursts, which lose more.
+const TRIAL_WINDOWS: u8 = 8;
+
+/// How many loss windows pass after a lower gain was refused before one is
+/// tried again. Doubles with each refusal up to [`MAX_WAIT`], and starts again
+/// here when one is kept.
+const FIRST_BACKOFF: u16 = 4;
+
+/// How many loss windows a lowered gain is held before a higher one is tried.
+/// Doubles each time the higher one is refused, up to [`MAX_WAIT`], and starts
+/// again here when the gain is back at 1.25.
+const FIRST_HOLD: u16 = 16;
+
+/// The longest wait between two trials, in loss windows.
+const MAX_WAIT: u16 = 256;
+
+/// A lowered gain is given up when the bandwidth estimate is below this many
+/// percent of the highest one since the gain was last 1.25.
+const GUARD_PERCENT: u128 = 75;
 
 /// The probe window as a multiple of the estimated bandwidth-delay product, in
 /// per mille: half, the target of BBRv2's ProbeRTT.
@@ -210,14 +335,15 @@ impl ControllerFactory for BbrCappedConfig {
             lost: 0,
             recovery: None,
             slow_start: Some(INITIAL_WINDOW),
+            gain: Gain::default(),
             cap: None,
             window: INITIAL_WINDOW,
         })
     }
 }
 
-/// A controller whose window is 1.25 times the measured bandwidth-delay
-/// product. See the [module documentation](self).
+/// A controller whose window is at most 1.25 times the measured
+/// bandwidth-delay product. See the [module documentation](self).
 #[derive(Debug, Clone)]
 pub struct BbrCapped {
     rate: DeliveryRate,
@@ -240,6 +366,8 @@ pub struct BbrCapped {
     /// The slow-start limit of a new connection: the initial window plus the
     /// bytes acknowledged so far. `None` once the first startup has ended.
     slow_start: Option<u64>,
+    /// The steady gain and the loss windows that move it.
+    gain: Gain,
     /// What [`BbrCapped::compute_cap`] returned when an input last changed.
     cap: Option<u64>,
     /// What [`Controller::window`] returns: the cap, or the initial window
@@ -357,6 +485,7 @@ impl BbrCapped {
     ) {
         self.srtt = srtt;
         self.acked = self.acked.saturating_add(bytes);
+        self.gain.acked = self.gain.acked.saturating_add(bytes);
         if let Some(limit) = &mut self.slow_start {
             *limit = limit.saturating_add(bytes);
         }
@@ -471,6 +600,7 @@ impl BbrCapped {
             srtt_us = self.srtt.as_micros(),
             ack_interval_us = sample.ack_elapsed.as_micros(),
             send_interval_us = sample.send_elapsed.as_micros(),
+            gain_permille = self.gain.permille,
             startup = !self.startup.ended,
             app_limited = sample.app_limited,
             stored = sample.stored,
@@ -480,8 +610,8 @@ impl BbrCapped {
     }
 
     /// The window limit, once there is a delivery-rate sample to compute it
-    /// from: 1.25 times the bandwidth-delay product, the startup gain times it
-    /// until the startup has ended, or half of it during a probe.
+    /// from: the steady gain times the bandwidth-delay product, the startup
+    /// gain times it until the startup has ended, or half of it during a probe.
     ///
     /// Outside a probe the limit is never below [`INITIAL_WINDOW`], so a
     /// connection that has measured a low rate is never slower to send than a
@@ -490,13 +620,275 @@ impl BbrCapped {
         let bandwidth = self.rate.max()?;
         let (min_rtt, _) = self.min_rtt?;
         let (gain_permille, floor) = match self.probe {
-            None if self.startup.ended => (CWND_GAIN_PERMILLE, INITIAL_WINDOW),
+            None if self.startup.ended => (u128::from(self.gain.permille), INITIAL_WINDOW),
             None => (STARTUP_GAIN_PERMILLE, INITIAL_WINDOW),
             Some(_) => (PROBE_GAIN_PERMILLE, MIN_WINDOW_PACKETS * self.mtu),
         };
         // Bytes per second times microseconds times per mille.
         let bytes = u128::from(bandwidth) * min_rtt.as_micros() * gain_permille / 1_000_000_000;
         Some(u64::try_from(bytes).unwrap_or(u64::MAX).max(floor))
+    }
+}
+
+/// The steady gain and the rule that moves it; see the module documentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Gain {
+    /// The steady gain in per mille, from [`GAIN_FLOOR_PERMILLE`] to
+    /// [`CWND_GAIN_PERMILLE`].
+    permille: u64,
+    /// The lowest gain a trial may set. Raised when the guard gives up a gain,
+    /// and lowered again a step at a time.
+    floor: u64,
+    /// Bytes acknowledged in the current loss window.
+    acked: u64,
+    /// Bytes lost in the current loss window.
+    lost: u64,
+    /// Sample intervals in the current loss window.
+    intervals: u8,
+    /// How many of them were app-limited.
+    limited: u8,
+    /// Sample intervals still to leave out.
+    settle: u8,
+    /// The trial in progress, if any.
+    trial: Option<Trial>,
+    /// The highest bandwidth estimate at the end of a loss window since the
+    /// gain was last [`CWND_GAIN_PERMILLE`], in bytes per second.
+    reference: u64,
+    /// Loss windows to pass before a lower gain is tried.
+    down_wait: u16,
+    /// The wait the next refused lower gain sets.
+    backoff: u16,
+    /// Loss windows to pass before a higher gain is tried.
+    up_wait: u16,
+    /// The wait a refused higher gain sets.
+    hold: u16,
+    /// Loss windows to pass before a floor the guard raised comes down a step.
+    floor_wait: u16,
+}
+
+/// A gain on trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Trial {
+    /// The gain before the trial.
+    from: u64,
+    /// The loss share at that gain, in parts per million.
+    loss_ppm: u64,
+    /// Loss windows judged so far.
+    windows: u8,
+}
+
+impl Default for Gain {
+    fn default() -> Self {
+        Self {
+            permille: CWND_GAIN_PERMILLE,
+            floor: GAIN_FLOOR_PERMILLE,
+            acked: 0,
+            lost: 0,
+            intervals: 0,
+            limited: 0,
+            settle: STARTUP_SETTLE_INTERVALS,
+            trial: None,
+            reference: 0,
+            down_wait: 0,
+            backoff: FIRST_BACKOFF,
+            up_wait: FIRST_HOLD,
+            hold: FIRST_HOLD,
+            floor_wait: 0,
+        }
+    }
+}
+
+impl Gain {
+    /// The gain at which in-flight data is what the path carried at gain
+    /// `permille` with `loss_ppm` lost: the gain times the share delivered.
+    fn carried(permille: u64, loss_ppm: u64) -> u64 {
+        permille * (1_000_000 - loss_ppm.min(1_000_000)) / 1_000_000
+    }
+
+    /// The loss share at gain `to`, in parts per million, if what the path
+    /// lost at gain `from` was what its queue could not hold. The in-flight
+    /// data the path carries is then the same at both gains.
+    fn predicted_loss_ppm(from: u64, loss_ppm: u64, to: u64) -> u64 {
+        let carried = from * (1_000_000 - loss_ppm.min(1_000_000));
+        1_000_000u64.saturating_sub(carried / to.max(1))
+    }
+
+    fn restart(&mut self) {
+        self.acked = 0;
+        self.lost = 0;
+        self.intervals = 0;
+        self.limited = 0;
+    }
+
+    /// Counts the sample interval that has just closed, and judges the loss
+    /// window when the interval completes one. `probing` is whether a probe is
+    /// in progress, `app_limited` whether the interval was app-limited,
+    /// `estimate` is the bandwidth estimate, and `packets` is
+    /// [`WINDOW_PACKETS`] in bytes.
+    fn on_interval(&mut self, probing: bool, app_limited: bool, estimate: u64, packets: u64) {
+        if probing {
+            self.settle = self.settle.max(SETTLE_INTERVALS);
+            self.restart();
+            return;
+        }
+        if self.settle > 0 {
+            self.settle -= 1;
+            self.restart();
+            return;
+        }
+        self.intervals += 1;
+        self.limited += u8::from(app_limited);
+        let bytes = self.acked.saturating_add(self.lost);
+        if self.intervals >= WINDOW_INTERVALS && bytes >= packets {
+            let loss_ppm = u128::from(self.lost) * 1_000_000 / u128::from(bytes.max(1));
+            let limited = self.limited * 2 > self.intervals;
+            self.restart();
+            let loss_ppm = u64::try_from(loss_ppm).unwrap_or(u64::MAX);
+            self.on_window(loss_ppm, estimate, limited);
+        } else if self.intervals >= WINDOW_MAX_INTERVALS {
+            // A trial cannot be judged, and a later window would not measure
+            // what it started from.
+            self.restart();
+            self.trial = None;
+            self.hold = FIRST_HOLD;
+            if self.permille < CWND_GAIN_PERMILLE {
+                self.set(
+                    CWND_GAIN_PERMILLE,
+                    "too slow for a loss window",
+                    0,
+                    estimate,
+                );
+            }
+        }
+    }
+
+    /// Sets the gain and writes one debug line. Off under the shipped
+    /// `volto=info` filter.
+    fn set(&mut self, permille: u64, why: &'static str, loss_ppm: u64, estimate: u64) {
+        tracing::debug!(
+            from_permille = self.permille,
+            to_permille = permille,
+            floor_permille = self.floor,
+            loss_ppm,
+            estimate_bytes_per_sec = estimate,
+            reference_bytes_per_sec = self.reference,
+            why,
+            "bbr-capped gain"
+        );
+        if permille != self.permille {
+            self.permille = permille;
+            self.settle = SETTLE_INTERVALS;
+        }
+    }
+
+    /// Judges the loss window that has just closed, with its loss share, the
+    /// bandwidth estimate at its end, and whether more than half of its
+    /// intervals were app-limited.
+    fn on_window(&mut self, loss_ppm: u64, estimate: u64, limited: bool) {
+        self.down_wait = self.down_wait.saturating_sub(1);
+        if self.floor > GAIN_FLOOR_PERMILLE {
+            self.floor_wait = self.floor_wait.saturating_sub(1);
+            if self.floor_wait == 0 {
+                self.floor = (self.floor - GAIN_STEP_UP_PERMILLE).max(GAIN_FLOOR_PERMILLE);
+                self.floor_wait = MAX_WAIT;
+            }
+        }
+        if self.permille < CWND_GAIN_PERMILLE {
+            // The guard.
+            if u128::from(estimate) * 100 < u128::from(self.reference) * GUARD_PERCENT {
+                self.floor = (self.permille + GAIN_STEP_UP_PERMILLE).min(CWND_GAIN_PERMILLE);
+                self.floor_wait = MAX_WAIT;
+                self.trial = None;
+                self.hold = FIRST_HOLD;
+                self.refuse_lower();
+                self.set(CWND_GAIN_PERMILLE, "the estimate fell", loss_ppm, estimate);
+                return;
+            }
+            self.reference = self.reference.max(estimate);
+        }
+        if let Some(trial) = self.trial.take() {
+            self.judge(trial, loss_ppm, estimate, limited);
+        } else if !self.try_lower(loss_ppm, estimate)
+            && self.permille < CWND_GAIN_PERMILLE
+            && !limited
+        {
+            self.up_wait = self.up_wait.saturating_sub(1);
+            if self.up_wait == 0 {
+                self.trial = Some(Trial {
+                    from: self.permille,
+                    loss_ppm,
+                    windows: 0,
+                });
+                let higher = (self.permille + GAIN_STEP_UP_PERMILLE).min(CWND_GAIN_PERMILLE);
+                self.set(higher, "higher tried", loss_ppm, estimate);
+            }
+        }
+    }
+
+    /// Starts the wait after a refused lower gain and doubles the next one.
+    fn refuse_lower(&mut self) {
+        self.down_wait = self.backoff;
+        self.backoff = (self.backoff * 2).min(MAX_WAIT);
+    }
+
+    /// Starts a trial of the gain the path carried, when the window lost
+    /// [`LOSS_TRIGGER_PPM`] or more, no wait is running, the path carried
+    /// [`LEAST_CARRIED_PERMILLE`] or more and that gain is at least
+    /// [`GAIN_MIN_STEP_PERMILLE`] lower. Returns whether it did.
+    fn try_lower(&mut self, loss_ppm: u64, estimate: u64) -> bool {
+        if loss_ppm < LOSS_TRIGGER_PPM || self.down_wait > 0 {
+            return false;
+        }
+        let carried = Self::carried(self.permille, loss_ppm);
+        let target = carried.max(self.floor);
+        if carried < LEAST_CARRIED_PERMILLE || target + GAIN_MIN_STEP_PERMILLE > self.permille {
+            return false;
+        }
+        if self.permille == CWND_GAIN_PERMILLE {
+            self.reference = estimate;
+        }
+        self.trial = Some(Trial {
+            from: self.permille,
+            loss_ppm,
+            windows: 0,
+        });
+        self.set(target, "lower tried", loss_ppm, estimate);
+        true
+    }
+
+    /// Judges a trial by the loss of one more window at the gain on trial. The
+    /// loss is on the queue's side when it is at or past the middle between
+    /// the loss before the trial and the loss the queue rule predicts. A
+    /// window that was mostly app-limited did not fill the queue, so it can
+    /// refuse a higher gain and cannot keep one.
+    fn judge(&mut self, trial: Trial, loss_ppm: u64, estimate: u64, limited: bool) {
+        let predicted = Self::predicted_loss_ppm(trial.from, trial.loss_ppm, self.permille);
+        let middle = (trial.loss_ppm + predicted) / 2;
+        let windows = trial.windows + 1;
+        if self.permille < trial.from {
+            if loss_ppm <= middle {
+                self.backoff = FIRST_BACKOFF;
+                self.up_wait = self.hold;
+                self.set(self.permille, "lower kept", loss_ppm, estimate);
+            } else if windows < TRIAL_WINDOWS {
+                self.trial = Some(Trial { windows, ..trial });
+            } else {
+                self.refuse_lower();
+                self.set(trial.from, "lower refused", loss_ppm, estimate);
+            }
+        } else if loss_ppm >= middle {
+            self.hold = (self.hold * 2).min(MAX_WAIT);
+            self.up_wait = self.hold;
+            self.set(trial.from, "higher refused", loss_ppm, estimate);
+        } else if limited {
+            self.trial = Some(trial);
+        } else {
+            self.up_wait = self.hold;
+            self.set(self.permille, "higher kept", loss_ppm, estimate);
+        }
+        if self.permille == CWND_GAIN_PERMILLE && self.trial.is_none() {
+            self.hold = FIRST_HOLD;
+        }
     }
 }
 
@@ -525,6 +917,13 @@ impl Controller for BbrCapped {
                 .on_interval(self.rate.max().unwrap_or(0), sample.app_limited);
             if self.startup.ended {
                 self.slow_start = None;
+                let estimate = self.rate.max().unwrap_or(0);
+                let packets = WINDOW_PACKETS * self.mtu;
+                let probing = self.probe.is_some();
+                self.gain
+                    .on_interval(probing, sample.app_limited, estimate, packets);
+            } else {
+                self.gain = Gain::default();
             }
             self.refresh();
         }
@@ -549,6 +948,7 @@ impl Controller for BbrCapped {
     ) {
         self.startup.congested = true;
         self.lost = self.lost.saturating_add(lost_bytes);
+        self.gain.lost = self.gain.lost.saturating_add(lost_bytes);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
@@ -802,14 +1202,559 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// The initial window is held here and not read from quinn's BBR, so this
-    /// test is the one place that sees a change of quinn's default. It is the
-    /// only use of `quinn::congestion::Bbr` in this module.
+    /// The estimate the gain tests use: 18 MB/s.
+    const ESTIMATE: u64 = 18_000_000;
+
+    /// [`WINDOW_PACKETS`] at an MTU of 1200, in bytes.
+    const PACKETS: u64 = 2_400_000;
+
+    /// A gain as a connection has it once its first intervals have settled.
+    fn settled() -> Gain {
+        Gain {
+            settle: 0,
+            ..Gain::default()
+        }
+    }
+
+    /// A settled gain that has been lowered to `permille` and kept.
+    fn lowered(permille: u64) -> Gain {
+        Gain {
+            permille,
+            reference: ESTIMATE,
+            ..settled()
+        }
+    }
+
+    /// One sample interval that acknowledged and lost these bytes.
+    fn gain_interval(g: &mut Gain, acked: u64, lost: u64) {
+        g.acked += acked;
+        g.lost += lost;
+        g.on_interval(false, false, ESTIMATE, PACKETS);
+    }
+
     #[test]
-    fn the_initial_window_is_the_default_of_quinns_bbr() {
-        let bbr =
-            quinn::congestion::Bbr::new(Arc::new(quinn::congestion::BbrConfig::default()), 1200);
-        assert_eq!(INITIAL_WINDOW, bbr.initial_window());
+    fn a_window_that_lost_under_one_percent_leaves_the_gain() {
+        let mut g = settled();
+        g.on_window(9_999, ESTIMATE, false);
+        assert_eq!(g, settled());
+    }
+
+    #[test]
+    fn a_window_that_lost_one_percent_starts_a_trial_of_the_gain_the_path_carried() {
+        let mut g = settled();
+        g.on_window(10_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1237, "1250 x 0.99");
+        let mut g = settled();
+        g.on_window(80_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1150, "1250 x 0.92");
+        assert_eq!(
+            g.trial,
+            Some(Trial {
+                from: 1250,
+                loss_ppm: 80_000,
+                windows: 0
+            })
+        );
+        assert_eq!(g.reference, ESTIMATE, "the guard's reference");
+        assert_eq!(g.settle, SETTLE_INTERVALS, "a change of gain settles");
+    }
+
+    #[test]
+    fn a_trial_never_goes_under_the_floor_and_never_moves_the_gain_by_under_a_hundredth() {
+        let mut g = settled();
+        g.on_window(200_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1050, "1250 x 0.8 is 1000, under the floor");
+
+        let mut g = lowered(1060);
+        g.on_window(50_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1050, "a step of 10 is tried");
+
+        let mut g = lowered(1059);
+        g.on_window(50_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1059, "a step of 9 is not");
+        assert_eq!(g.trial, None);
+        assert_eq!(
+            g.up_wait,
+            FIRST_HOLD - 1,
+            "the window counts towards the hold"
+        );
+
+        let mut g = Gain {
+            floor: 1200,
+            floor_wait: MAX_WAIT,
+            ..settled()
+        };
+        g.on_window(80_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1200, "a raised floor holds the trial up");
+    }
+
+    #[test]
+    fn a_window_that_lost_more_than_a_queue_can_starts_no_trial() {
+        let mut g = settled();
+        g.on_window(280_001, ESTIMATE, false);
+        assert_eq!(g, settled(), "1250 x 0.719999 is 899");
+        g.on_window(280_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1050, "1250 x 0.72 is 900: tried, at the floor");
+
+        let mut g = lowered(1100);
+        g.on_window(190_000, ESTIMATE, false);
+        assert_eq!((g.permille, g.trial), (1100, None), "1100 x 0.81 is 891");
+    }
+
+    #[test]
+    fn a_lower_gain_is_kept_when_a_window_loses_no_more_than_the_middle() {
+        // 1250 at 8 percent carried 1150, so at 1150 the queue rule predicts no
+        // loss and the middle is 4 percent.
+        let mut g = settled();
+        g.backoff = 64;
+        g.on_window(80_000, ESTIMATE, false);
+        g.on_window(40_001, ESTIMATE, false);
+        assert_eq!(g.trial.map(|t| t.windows), Some(1), "still on trial");
+        assert_eq!(g.permille, 1150);
+        g.on_window(40_000, ESTIMATE, false);
+        assert_eq!(g.trial, None);
+        assert_eq!(g.permille, 1150, "kept");
+        assert_eq!(
+            g.backoff, FIRST_BACKOFF,
+            "a kept gain starts the backoff again"
+        );
+        assert_eq!(g.up_wait, FIRST_HOLD);
+        assert_eq!(
+            g.settle, SETTLE_INTERVALS,
+            "set by the change, not by keeping it"
+        );
+
+        // 1250 at 20 percent carried 1000. At the floor, 1050, the rule predicts
+        // 1 - 1000/1050, 4.762 percent, and the middle is 12.381 percent.
+        let mut g = settled();
+        g.on_window(200_000, ESTIMATE, false);
+        g.on_window(123_811, ESTIMATE, false);
+        assert!(g.trial.is_some(), "one part per million above the middle");
+        g.on_window(123_810, ESTIMATE, false);
+        assert_eq!((g.trial, g.permille), (None, 1050));
+    }
+
+    #[test]
+    fn a_lower_gain_is_refused_after_eight_windows_and_the_wait_doubles() {
+        let mut g = settled();
+        g.on_window(20_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1225, "1250 x 0.98");
+        for _ in 0..7 {
+            g.on_window(20_000, ESTIMATE, false);
+            assert_eq!(g.permille, 1225, "on trial for eight windows");
+        }
+        g.on_window(20_000, ESTIMATE, false);
+        assert_eq!((g.permille, g.trial), (1250, None), "random loss: refused");
+        assert_eq!((g.down_wait, g.backoff), (4, 8));
+        assert_eq!(g.settle, SETTLE_INTERVALS);
+
+        for _ in 0..3 {
+            g.on_window(20_000, ESTIMATE, false);
+            assert_eq!(g.permille, 1250, "no trial during the wait");
+        }
+        g.on_window(20_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1225, "the fourth window after the refusal");
+        for _ in 0..8 {
+            g.on_window(20_000, ESTIMATE, false);
+        }
+        assert_eq!((g.permille, g.down_wait, g.backoff), (1250, 8, 16));
+
+        g.backoff = MAX_WAIT;
+        g.down_wait = 0;
+        g.on_window(20_000, ESTIMATE, false);
+        for _ in 0..8 {
+            g.on_window(20_000, ESTIMATE, false);
+        }
+        assert_eq!((g.down_wait, g.backoff), (MAX_WAIT, MAX_WAIT));
+    }
+
+    #[test]
+    fn a_lowered_gain_is_tried_one_step_higher_after_the_hold() {
+        let mut g = lowered(1100);
+        for _ in 0..15 {
+            g.on_window(0, ESTIMATE, false);
+            assert_eq!((g.permille, g.trial), (1100, None));
+        }
+        g.on_window(5_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1150);
+        assert_eq!(
+            g.trial,
+            Some(Trial {
+                from: 1100,
+                loss_ppm: 5_000,
+                windows: 0
+            })
+        );
+
+        let mut g = lowered(1225);
+        g.up_wait = 1;
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!(g.permille, 1250, "never above 1.25");
+
+        let mut g = settled();
+        for _ in 0..40 {
+            g.on_window(0, ESTIMATE, false);
+        }
+        assert_eq!(g, settled(), "nothing to raise at 1.25");
+    }
+
+    #[test]
+    fn a_higher_gain_is_refused_when_the_loss_reaches_the_middle_and_the_hold_doubles() {
+        // 1100 without loss carried 1100. At 1150 the rule predicts
+        // 1 - 1100/1150, 4.3479 percent, and the middle is 2.1739 percent.
+        let tried = || {
+            let mut g = lowered(1100);
+            g.up_wait = 1;
+            g.on_window(0, ESTIMATE, false);
+            g
+        };
+        let mut g = tried();
+        g.on_window(21_739, ESTIMATE, false);
+        assert_eq!(
+            (g.permille, g.trial),
+            (1100, None),
+            "the queue is still short"
+        );
+        assert_eq!((g.hold, g.up_wait), (32, 32));
+
+        let mut g = tried();
+        g.on_window(21_738, ESTIMATE, false);
+        assert_eq!((g.permille, g.trial), (1150, None), "kept");
+        assert_eq!((g.hold, g.up_wait), (16, 16));
+
+        let mut g = tried();
+        g.hold = MAX_WAIT;
+        g.on_window(21_739, ESTIMATE, false);
+        assert_eq!((g.hold, g.up_wait), (MAX_WAIT, MAX_WAIT));
+    }
+
+    #[test]
+    fn a_gain_back_at_the_top_starts_the_hold_again() {
+        let mut g = lowered(1225);
+        g.hold = 64;
+        g.up_wait = 1;
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!(g.permille, 1250);
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!((g.trial, g.hold), (None, FIRST_HOLD));
+    }
+
+    #[test]
+    fn a_lowered_gain_is_given_up_when_the_estimate_falls_under_three_quarters() {
+        let mut g = lowered(1100);
+        g.on_window(0, ESTIMATE + 4, false);
+        assert_eq!(g.reference, ESTIMATE + 4, "the reference is the highest");
+        g.on_window(0, 13_500_003, false);
+        assert_eq!(g.permille, 1100, "exactly three quarters holds");
+        g.on_window(0, 13_500_002, false);
+        assert_eq!(g.permille, 1250, "given up");
+        assert_eq!(g.floor, 1150, "no later trial goes that low");
+        assert_eq!((g.down_wait, g.backoff), (4, 8));
+        assert_eq!(g.hold, FIRST_HOLD);
+
+        // The guard also ends a trial, and its floor never passes 1.25.
+        let mut g = settled();
+        g.on_window(20_000, ESTIMATE, false);
+        g.on_window(0, ESTIMATE / 2, false);
+        assert_eq!((g.permille, g.trial, g.floor), (1250, None, 1250));
+        g.down_wait = 0;
+        g.on_window(200_000, ESTIMATE, false);
+        assert_eq!(g.permille, 1250, "with the floor at 1.25 nothing is tried");
+
+        // At 1.25 there is no guard: the reference is taken when a trial starts.
+        let mut g = Gain {
+            reference: ESTIMATE,
+            ..settled()
+        };
+        g.on_window(0, 1, false);
+        assert_eq!((g.permille, g.floor), (1250, 1050));
+        g.on_window(80_000, 1_000, false);
+        assert_eq!(g.reference, 1_000);
+    }
+
+    #[test]
+    fn a_loss_window_is_four_settled_intervals_and_2000_packets() {
+        let mut g = Gain::default();
+        for _ in 0..8 {
+            gain_interval(&mut g, 0, 9_000_000);
+            assert_eq!(g.permille, 1250, "eight intervals after a startup");
+        }
+        assert_eq!((g.acked, g.lost, g.intervals, g.settle), (0, 0, 0, 0));
+        for _ in 0..3 {
+            gain_interval(&mut g, 588_000, 12_000);
+        }
+        assert_eq!((g.permille, g.intervals), (1250, 3), "three intervals");
+        gain_interval(&mut g, 588_000, 12_000);
+        assert_eq!(g.permille, 1225, "2 percent of 2.4 MB lost");
+        assert_eq!((g.acked, g.lost, g.intervals), (0, 0, 0), "a new window");
+
+        let mut g = settled();
+        for _ in 0..4 {
+            gain_interval(&mut g, 480_000, 100_000);
+        }
+        assert_eq!(
+            (g.permille, g.intervals),
+            (1250, 4),
+            "2.32 MB is under 2000 packets"
+        );
+        gain_interval(&mut g, 79_999, 0);
+        assert_eq!(g.permille, 1250, "one byte short");
+        gain_interval(&mut g, 1, 0);
+        assert_eq!(g.permille, 1050, "17 percent lost: lowered to the floor");
+    }
+
+    #[test]
+    fn a_probe_leaves_its_intervals_and_the_two_after_it_out_of_the_loss_window() {
+        let mut g = settled();
+        for _ in 0..3 {
+            gain_interval(&mut g, 600_000, 200_000);
+        }
+        g.acked += 600_000;
+        g.lost += 200_000;
+        g.on_interval(true, false, ESTIMATE, PACKETS);
+        assert_eq!((g.permille, g.intervals, g.acked, g.lost), (1250, 0, 0, 0));
+        assert_eq!(g.settle, SETTLE_INTERVALS);
+        for _ in 0..5 {
+            gain_interval(&mut g, 600_000, 200_000);
+        }
+        assert_eq!(g.permille, 1250, "two settle intervals and three counted");
+        gain_interval(&mut g, 600_000, 200_000);
+        assert_eq!(g.permille, 1050);
+    }
+
+    #[test]
+    fn a_connection_too_slow_for_a_loss_window_goes_back_to_the_top() {
+        let mut g = lowered(1100);
+        g.trial = Some(Trial {
+            from: 1150,
+            loss_ppm: 50_000,
+            windows: 3,
+        });
+        for _ in 0..31 {
+            gain_interval(&mut g, 1_000, 1_000);
+        }
+        assert_eq!((g.permille, g.intervals), (1100, 31));
+        gain_interval(&mut g, 1_000, 1_000);
+        assert_eq!((g.permille, g.trial, g.intervals), (1250, None, 0));
+        assert_eq!((g.acked, g.lost), (0, 0));
+
+        let mut g = settled();
+        for _ in 0..32 {
+            gain_interval(&mut g, 1_000, 1_000);
+        }
+        assert_eq!(g, settled(), "at 1.25 the window is only dropped");
+    }
+
+    /// A refused trial of 1.25 itself doubles the hold like any other.
+    #[test]
+    fn a_refused_trial_of_the_top_gain_doubles_the_hold() {
+        let mut g = lowered(1225);
+        g.hold = 64;
+        g.up_wait = 1;
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!(
+            (g.permille, g.hold),
+            (1250, 64),
+            "on trial: the hold stands"
+        );
+        g.on_window(30_000, ESTIMATE, false);
+        assert_eq!((g.permille, g.hold, g.up_wait), (1225, 128, 128));
+    }
+
+    #[test]
+    fn a_connection_too_slow_for_a_loss_window_drops_a_trial_of_the_top_gain() {
+        let mut g = lowered(1200);
+        g.hold = 64;
+        g.up_wait = 1;
+        g.on_window(0, ESTIMATE, false);
+        assert!(g.trial.is_some() && g.permille == 1250);
+        g.settle = 0;
+        for _ in 0..32 {
+            gain_interval(&mut g, 1_000, 0);
+        }
+        assert_eq!((g.permille, g.trial, g.hold), (1250, None, FIRST_HOLD));
+    }
+
+    #[test]
+    fn a_floor_the_guard_raised_comes_down_a_step_every_256_windows() {
+        let mut g = lowered(1100);
+        g.on_window(0, ESTIMATE / 2, false);
+        assert_eq!((g.floor, g.floor_wait), (1150, MAX_WAIT));
+        for _ in 0..255 {
+            g.on_window(0, ESTIMATE, false);
+        }
+        assert_eq!(g.floor, 1150);
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!((g.floor, g.floor_wait), (1100, MAX_WAIT));
+        for _ in 0..256 {
+            g.on_window(0, ESTIMATE, false);
+        }
+        assert_eq!(g.floor, 1050, "back at the lowest gain");
+        for _ in 0..600 {
+            g.on_window(0, ESTIMATE, false);
+        }
+        assert_eq!(g.floor, 1050, "and never under it");
+        assert_eq!(g.permille, 1250);
+    }
+
+    #[test]
+    fn a_mostly_app_limited_window_can_refuse_a_higher_gain_and_cannot_keep_one() {
+        let mut g = lowered(1100);
+        for _ in 0..40 {
+            g.on_window(0, ESTIMATE, true);
+        }
+        assert_eq!(
+            (g.permille, g.up_wait),
+            (1100, FIRST_HOLD),
+            "no count towards the hold"
+        );
+
+        g.up_wait = 1;
+        g.on_window(0, ESTIMATE, false);
+        assert_eq!(g.permille, 1150, "on trial");
+        g.on_window(0, ESTIMATE, true);
+        assert_eq!(g.permille, 1150);
+        assert!(
+            g.trial.is_some(),
+            "not kept on a window that did not fill the queue"
+        );
+        g.on_window(21_739, ESTIMATE, true);
+        assert_eq!((g.permille, g.trial), (1100, None), "refused all the same");
+
+        // Lowering does not wait for a window that is not app-limited: behind
+        // a short queue nearly half of all intervals are app-limited.
+        let mut g = settled();
+        g.on_window(80_000, ESTIMATE, true);
+        assert_eq!(g.permille, 1150);
+        g.on_window(0, ESTIMATE, true);
+        assert_eq!(g.trial, None, "kept");
+    }
+
+    #[test]
+    fn a_loss_window_is_mostly_app_limited_when_over_half_of_its_intervals_are() {
+        let run = |limited: u8| {
+            let mut g = lowered(1100);
+            g.up_wait = 1;
+            for i in 0..4 {
+                g.acked += 600_000;
+                g.on_interval(false, i < limited, ESTIMATE, PACKETS);
+            }
+            g.permille
+        };
+        assert_eq!(run(2), 1150, "half: the window counts towards the hold");
+        assert_eq!(run(3), 1100, "three of four: it does not");
+
+        // A window that needs eight intervals for its packets.
+        let long = |limited: u8| {
+            let mut g = lowered(1100);
+            g.up_wait = 1;
+            for i in 0..8 {
+                g.acked += 300_000;
+                g.on_interval(false, i < limited, ESTIMATE, PACKETS);
+            }
+            g.permille
+        };
+        assert_eq!(long(4), 1150, "half of eight");
+        assert_eq!(long(5), 1100, "five of eight");
+    }
+
+    #[test]
+    fn a_probe_does_not_shorten_the_intervals_left_out_after_a_startup() {
+        let mut g = Gain::default();
+        gain_interval(&mut g, 0, 0);
+        g.on_interval(true, false, ESTIMATE, PACKETS);
+        assert_eq!(g.settle, 7);
+        let mut g = settled();
+        g.on_interval(true, false, ESTIMATE, PACKETS);
+        assert_eq!(g.settle, SETTLE_INTERVALS);
+    }
+
+    /// The loss window's 2000 packets are packets of the current MTU.
+    #[test]
+    fn the_loss_window_counts_packets_of_the_current_mtu() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.mtu = 1400;
+        c.gain = settled();
+        end_acks(&mut c, t0, false);
+        let mut t = t0;
+        // 2000 packets of 1400 bytes are 2.8 MB. Each interval acknowledges
+        // 0.65 MB and loses 0.05 MB, so the window closes with the fourth.
+        for _ in 0..3 {
+            c.on_congestion_event(t, t - MIN_RTT, false, 50_000);
+            t = interval(&mut c, t, 6_500_000, false);
+        }
+        assert_eq!((c.gain.permille, c.gain.intervals), (1250, 3));
+        c.on_congestion_event(t, t - MIN_RTT, false, 50_000);
+        t = interval(&mut c, t, 6_500_000, false);
+        assert_eq!(c.gain.permille, 1160, "1250 x (1 - 0.2 / 2.8)");
+
+        let mut c = estimated(t0);
+        c.mtu = 1500;
+        c.gain = settled();
+        end_acks(&mut c, t, false);
+        for _ in 0..4 {
+            c.on_congestion_event(t, t - MIN_RTT, false, 50_000);
+            t = interval(&mut c, t, 6_500_000, false);
+        }
+        assert_eq!(
+            c.gain.permille, 1250,
+            "2.8 MB is under 2000 packets of 1500"
+        );
+    }
+
+    /// The controller feeds the loss windows from its ACKs and losses, and its
+    /// cap follows the gain.
+    #[test]
+    fn the_stored_window_follows_the_steady_gain() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.mtu = 1200;
+        c.gain = settled();
+        end_acks(&mut c, t0, false);
+        let mut t = t0;
+        // Three of the window's four intervals.
+        for _ in 0..3 {
+            c.on_congestion_event(t, t - MIN_RTT, false, 125_000);
+            t = interval(&mut c, t, BANDWIDTH, false);
+            assert_eq!(c.cap(), Some(1_125_000), "1.25 x 15 MB/s x 60 ms");
+        }
+        c.on_congestion_event(t, t - MIN_RTT, false, 125_000);
+        interval(&mut c, t, BANDWIDTH, false);
+        // 125 kB lost for 1.5 MB acknowledged is 7.6923 percent.
+        assert_eq!(c.gain.permille, 1153, "1250 x 0.923077");
+        assert_eq!(c.cap(), Some(1_037_700), "1.153 x 15 MB/s x 60 ms");
+    }
+
+    #[test]
+    fn the_gain_starts_again_when_the_startup_gain_returns() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        end_acks(&mut c, t0, false);
+        c.gain = lowered(1100);
+        c.gain.floor = 1150;
+        let t = interval(&mut c, t0, BANDWIDTH, false);
+        assert_eq!(c.gain.permille, 1100, "kept while the startup has ended");
+        c.startup.ended = false;
+        interval(&mut c, t, BANDWIDTH, false);
+        assert_eq!(c.gain, Gain::default());
+    }
+
+    /// A probe's intervals count as probing for the gain as well.
+    #[test]
+    fn a_probe_restarts_the_controllers_loss_window() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        end_acks(&mut c, t0, false);
+        c.gain.settle = 0;
+        let t = interval(&mut c, t0, BANDWIDTH, false);
+        assert_eq!(c.gain.intervals, 1);
+        c.probe = Some(Probe {
+            min: MIN_RTT,
+            ends: None,
+        });
+        interval(&mut c, t, BANDWIDTH, false);
+        assert_eq!((c.gain.intervals, c.gain.settle), (0, SETTLE_INTERVALS));
     }
 
     #[test]
@@ -1422,6 +2367,40 @@ mod tests {
     }
 
     #[test]
+    fn a_returned_startup_keeps_the_peak_and_the_last_estimate() {
+        // The peak stays at 15 MB/s: after the returned startup has ended at
+        // 5 MB/s, three rises below 7.5 MB/s bring it back again.
+        let (mut c, mut t) = fallen_to(2_000_000);
+        for rate in [3_000_000, 4_000_000, 5_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(!c.startup.ended);
+        for _ in 0..3 {
+            t = interval(&mut c, t, 5_000_000, false);
+        }
+        assert!(c.startup.ended, "three samples without growth");
+        for rate in [5_500_000, 6_000_000, 6_500_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(!c.startup.ended, "15 MB/s is still the peak");
+
+        // The last estimate is the one the startup returned at: when only an
+        // app-limited interval follows before it ends, a sample that leaves
+        // the estimate at 5 MB/s is not a rise.
+        let (mut c, mut t) = fallen_to(2_000_000);
+        for rate in [3_000_000, 4_000_000, 5_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        c.on_congestion_event(t, t - MIN_RTT, false, 1200);
+        t = interval(&mut c, t, 5_000_000, true);
+        assert!(c.startup.ended);
+        for rate in [5_000_000, 5_500_000, 6_000_000] {
+            t = interval(&mut c, t, rate, false);
+        }
+        assert!(c.startup.ended, "two rises, not three");
+    }
+
+    #[test]
     fn a_congestion_event_without_growth_ends_a_returned_startup() {
         let (mut c, mut t) = fallen_to(2_000_000);
         for rate in [3_000_000, 4_000_000, 5_000_000] {
@@ -1640,7 +2619,11 @@ mod tests {
             let mut fresh = self.capped.clone();
             fresh.refresh();
             let stored = (self.capped.cap, self.capped.window);
-            if (fresh.cap, fresh.window) != stored {
+            // During the first startup the slow-start limit moves with each
+            // ACK and the window is stored once per ACK batch, which is when
+            // quinn reads it next.
+            let between_batches = after == "on_ack" && self.capped.slow_start.is_some();
+            if (fresh.cap, fresh.window) != stored && !between_batches {
                 let computed = (fresh.cap, fresh.window);
                 shadow.mismatches.push(format!(
                     "after {after}: stored {stored:?}, computed {computed:?}"
