@@ -27,6 +27,16 @@
 //! is what the sender sends, so a gain of two keeps a whole bandwidth-delay
 //! product queued and loses packets wherever the queue is shorter than that.
 //!
+//! A new connection also starts as slow start does. Until its first startup has
+//! ended, the window is at most the initial window plus the bytes acknowledged
+//! so far, so it doubles per round trip at most. The startup gain alone would
+//! let the first samples open the window to 2.89 times a bandwidth-delay
+//! product at once, and the bottleneck queue would lose what it cannot hold: in
+//! the lab a connection without this limit lost 5388 packets at its start
+//! through a 50 kB queue where one with it lost 3178, and reached 90 percent of
+//! the bottleneck 0.1 s sooner. The limit does not come back when the startup
+//! gain does.
+//!
 //! A new connection uses a higher gain until its estimate stops growing. With
 //! the window at 1.25 times the estimate, each sample can only show the rate
 //! that window allows, so the estimate grows by at most 1.25 times per sample.
@@ -113,7 +123,8 @@
 //!
 //! The window is computed when one of its inputs changes and stored, because
 //! quinn reads it before every packet it sends. The inputs are the estimate,
-//! the minimum RTT, the probe, the startup, the recovery window and the MTU.
+//! the minimum RTT, the probe, the startup with its slow-start limit, the
+//! recovery window and the MTU.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -198,6 +209,7 @@ impl ControllerFactory for BbrCappedConfig {
             acked: 0,
             lost: 0,
             recovery: None,
+            slow_start: Some(INITIAL_WINDOW),
             cap: None,
             window: INITIAL_WINDOW,
         })
@@ -225,10 +237,14 @@ pub struct BbrCapped {
     lost: u64,
     /// The recovery in progress, if any.
     recovery: Option<Recovery>,
+    /// The slow-start limit of a new connection: the initial window plus the
+    /// bytes acknowledged so far. `None` once the first startup has ended.
+    slow_start: Option<u64>,
     /// What [`BbrCapped::compute_cap`] returned when an input last changed.
     cap: Option<u64>,
     /// What [`Controller::window`] returns: the cap, or the initial window
-    /// while there is none, lowered to the recovery window after the startup.
+    /// while there is none, lowered to the slow-start limit during the first
+    /// startup and to the recovery window after the startup.
     window: u64,
 }
 
@@ -341,6 +357,9 @@ impl BbrCapped {
     ) {
         self.srtt = srtt;
         self.acked = self.acked.saturating_add(bytes);
+        if let Some(limit) = &mut self.slow_start {
+            *limit = limit.saturating_add(bytes);
+        }
         // A probe holds the window below the path's rate on purpose, so its ACKs
         // count as app-limited and its low samples do not lower the estimate.
         let probing = self.probe.is_some();
@@ -430,6 +449,7 @@ impl BbrCapped {
     fn refresh(&mut self) {
         self.cap = self.compute_cap();
         let window = self.cap.unwrap_or(INITIAL_WINDOW);
+        let window = self.slow_start.map_or(window, |limit| window.min(limit));
         self.window = match self.recovery {
             Some(recovery) if self.startup.ended => window.min(recovery.window),
             _ => window,
@@ -503,12 +523,16 @@ impl Controller for BbrCapped {
         if let Some(sample) = &sample {
             self.startup
                 .on_interval(self.rate.max().unwrap_or(0), sample.app_limited);
+            if self.startup.ended {
+                self.slow_start = None;
+            }
             self.refresh();
         }
         if self.update_probe(now, in_flight) {
             self.refresh();
         }
-        if self.update_recovery(now, in_flight) {
+        // The slow-start limit moved with the bytes this batch acknowledged.
+        if self.update_recovery(now, in_flight) || self.slow_start.is_some() {
             self.refresh();
         }
         if let Some(sample) = &sample {
@@ -740,6 +764,7 @@ mod tests {
     fn capped() -> BbrCapped {
         let mut c = starting();
         c.startup.ended = true;
+        c.slow_start = None;
         c
     }
 
@@ -864,11 +889,43 @@ mod tests {
 
         ack(&mut c, t0 + SRTT, MIN_RTT, 200_000, false);
         end_acks(&mut c, t0 + SRTT, false);
+        assert_eq!(c.cap(), Some(3_462_000), "2.885 x 20 MB/s x 60 ms");
         assert_eq!(
             c.window(),
-            3_462_000,
-            "the first sample, 2 MB over 100 ms, sets 2.885 x 20 MB/s x 60 ms"
+            2_240_000,
+            "the slow-start limit: 240 kB plus the 2 MB acknowledged"
         );
+    }
+
+    /// During the first startup the window follows the bytes acknowledged
+    /// batch by batch, and the limit ends with that startup for good.
+    #[test]
+    fn the_slow_start_limit_moves_with_each_batch_and_ends_with_the_first_startup() {
+        let t0 = Instant::now();
+        let mut c = starting();
+        c.rate.samples = [BANDWIDTH; SAMPLES];
+        ack(&mut c, t0, MIN_RTT, 0, false);
+        end_acks(&mut c, t0, false);
+        assert_eq!(c.cap(), Some(2_596_500), "2.885 x 15 MB/s x 60 ms");
+        assert_eq!(c.window(), FLOOR, "nothing acknowledged yet");
+
+        // A batch that closes no sample interval still moves the limit.
+        ack(&mut c, t0 + ms(10), MIN_RTT, 50_000, false);
+        end_acks(&mut c, t0 + ms(10), false);
+        assert_eq!(c.window(), FLOOR + 50_000);
+
+        let mut t = t0 + ms(10);
+        while !c.startup.ended {
+            t = interval(&mut c, t, BANDWIDTH, false);
+        }
+        assert_eq!(c.slow_start, None);
+        assert_eq!(Some(c.window()), c.cap(), "the cap alone after the startup");
+
+        // The startup gain comes back; the limit does not.
+        c.startup = Startup::default();
+        c.refresh();
+        assert_eq!(c.cap(), Some(2_596_500));
+        assert_eq!(c.window(), 2_596_500);
     }
 
     #[test]
@@ -1535,7 +1592,11 @@ mod tests {
         ack(&mut c, t, MIN_RTT, 10_000, false);
         c.on_end_acks(t, 100_000, false, None);
         assert_eq!(c.recovery.map(|r| r.window), Some(110_000));
-        assert_eq!(c.window(), 2_596_500, "2.885 x 15 MB/s x 60 ms");
+        assert_eq!(
+            c.window(),
+            250_000,
+            "the slow-start limit, 240 kB plus 10 kB acknowledged, not the recovery window"
+        );
 
         // The first interval grows the estimate from nothing; the second has a
         // congestion event and no growth, so it ends the startup.
