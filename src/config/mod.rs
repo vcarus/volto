@@ -389,12 +389,12 @@ impl std::fmt::Debug for User {
 /// throughput where CUBIC and NewReno stall, matching what the Linux kernel does
 /// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
 ///
-/// The value `bbr` selects quinn's BBR with its window capped
-/// ([`crate::congestion`], D108), because quinn's BBR overestimates the
-/// bottleneck and loses the difference on a bulk download. The capped
-/// controller has the plain name so that a file that writes `bbr`, or leaves
-/// the key out, gets it without an edit. quinn's controller as it ships is
-/// selectable as `bbr-uncapped`.
+/// The value `bbr` selects volto's own controller ([`crate::congestion`],
+/// D108), whose window is 1.25 times the bandwidth-delay product it measures.
+/// quinn's BBR overestimates the bottleneck and loses the difference on a bulk
+/// download, so it is not the default. The own controller has the plain name
+/// so that a file that writes `bbr`, or leaves the key out, gets it without an
+/// edit. quinn's controller as it ships is selectable as `bbr-uncapped`.
 ///
 /// The other controllers are kept as a fallback: quinn's BBR is a port marked
 /// "experimental", so an operator who hits trouble after a dependency bump can
@@ -402,7 +402,7 @@ impl std::fmt::Debug for User {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CongestionControl {
-    /// quinn's BBR with its window capped at 1.25 times the measured
+    /// volto's own controller, with its window at 1.25 times the measured
     /// bandwidth-delay product; see [`crate::congestion`]. The default.
     Bbr,
     /// quinn's BBR as it ships (its experimental port of BBRv1), without the
@@ -532,8 +532,8 @@ pub struct Limits {
     /// follow `initial_mtu` up while a written one is checked exactly. Read the
     /// ceiling in effect through [`Limits::mtu_upper_bound`].
     pub mtu_upper_bound: Option<u16>,
-    /// QUIC congestion controller. Defaults to `bbr`, quinn's BBR with its
-    /// window capped; see [`CongestionControl`].
+    /// QUIC congestion controller. Defaults to `bbr`, volto's own controller;
+    /// see [`CongestionControl`].
     pub congestion_control: CongestionControl,
     /// Milliseconds of round-trip time assumed before the first measurement.
     ///
