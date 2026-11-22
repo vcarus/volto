@@ -74,6 +74,7 @@ use crate::names::Names;
 
 pub use ech::{EchKey, EchKeySet};
 use ffi::{Ssl, SslCtx};
+pub(crate) use keys::ClientInitialKeys;
 use keys::{Secret, Suite, Version};
 
 /// What a finished handshake reports to `quic::peer_info`, which downcasts
@@ -1294,12 +1295,13 @@ impl crypto::Session for Session {
     }
 }
 
-/// The Initial keys a QUIC v1 server derives from a client's Destination
-/// Connection ID (RFC 9001 §5.2), for the socket gate, which opens a first
-/// Initial with them before quinn sees it. The key code is the one every
-/// handshake of the server runs.
-pub(crate) fn server_initial_keys(dst_cid: &[u8]) -> Keys {
-    keys::initial_keys(Version::V1, dst_cid, Side::Server)
+/// The keys a QUIC v1 client protects its Initial packets with, derived from
+/// its Destination Connection ID (RFC 9001 §5.2), for the socket gate, which
+/// opens a first Initial with them before quinn sees it. The key code is the
+/// one every handshake of the server runs; the server's own half is left out,
+/// because the gate sends nothing.
+pub(crate) fn client_initial_keys(dst_cid: &[u8]) -> ClientInitialKeys {
+    keys::client_initial_keys(Version::V1, dst_cid)
 }
 
 /// A session whose SSL could not be created: it fails its first read.

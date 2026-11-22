@@ -593,7 +593,7 @@ fn a_refused_name_is_carried_raw_and_escaped_where_it_is_logged() {
 /// RFC 9001 §5.4.2 samples header protection from four bytes past the packet
 /// number offset, so a packet declaring fewer bytes than that after the offset
 /// cannot be opened under any cipher. `gate::initial::decrypt` asks that half
-/// of the length test above `tls::server_initial_keys`, which is nearly the
+/// of the length test above `tls::client_initial_keys`, which is nearly the
 /// whole cost of judging
 /// an Initial, and the verdict is the same on both sides of the move: a packet
 /// that does not open is one quinn tells apart with state this gate does not

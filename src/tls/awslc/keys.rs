@@ -268,22 +268,47 @@ pub(crate) fn packet_keys(local: &Secret, remote: &Secret) -> KeyPair<Box<dyn Pa
 
 /// The client and server Initial secrets of a connection ID (RFC 9001 §5.2).
 pub(crate) fn initial_secrets(version: Version, dst_cid: &[u8]) -> (Secret, Secret) {
-    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, version.initial_salt()).extract(dst_cid);
-    let mut client = Zeroizing::new(vec![0u8; 32]);
-    expand_label_prk(&prk, b"client in", &mut client);
-    let mut server = Zeroizing::new(vec![0u8; 32]);
-    expand_label_prk(&prk, b"server in", &mut server);
-    let suite = Suite::Aes128GcmSha256;
+    let prk = initial_prk(version, dst_cid);
     (
-        Secret {
-            suite,
-            bytes: client,
-        },
-        Secret {
-            suite,
-            bytes: server,
-        },
+        initial_secret(&prk, b"client in"),
+        initial_secret(&prk, b"server in"),
     )
+}
+
+/// The `initial_secret` of RFC 9001 §5.2, which both Initial secrets expand.
+fn initial_prk(version: Version, dst_cid: &[u8]) -> hkdf::Prk {
+    hkdf::Salt::new(hkdf::HKDF_SHA256, version.initial_salt()).extract(dst_cid)
+}
+
+/// One side's Initial secret, `label` being "client in" or "server in".
+fn initial_secret(prk: &hkdf::Prk, label: &[u8]) -> Secret {
+    let mut bytes = Zeroizing::new(vec![0u8; 32]);
+    expand_label_prk(prk, label, &mut bytes);
+    Secret {
+        suite: Suite::Aes128GcmSha256,
+        bytes,
+    }
+}
+
+/// The keys a client protects its Initial packets with: the half of the
+/// Initial keys a server reads with.
+pub(crate) struct ClientInitialKeys {
+    pub(crate) header: Box<dyn HeaderKey>,
+    pub(crate) packet: Box<dyn PacketKey>,
+}
+
+/// The client's Initial keys of `dst_cid`, without the server's.
+///
+/// For the socket gate, which opens a client's Initial and sends nothing. The
+/// server's secret and its three keys are four of the nine HKDF operations
+/// [`initial_keys`] runs, and the gate pays for a derivation on every first
+/// packet, before any peer is known.
+pub(crate) fn client_initial_keys(version: Version, dst_cid: &[u8]) -> ClientInitialKeys {
+    let client = initial_secret(&initial_prk(version, dst_cid), b"client in");
+    ClientInitialKeys {
+        header: Box::new(client.header_key()),
+        packet: Box::new(client.packet_key()),
+    }
 }
 
 /// The Initial keys of `dst_cid` for `side`.
@@ -518,13 +543,13 @@ mod tests {
         assert_eq!(packet[..header.len()], header[..]);
     }
 
-    /// A.2: the whole client Initial, sealed with the `remote` half of the
-    /// server's Initial keys, which is how `gate::sealed_initial` seals a
-    /// client's packet, and opened again with the same half, which is how the
-    /// socket gate opens one (`tls::server_initial_keys` is this call).
+    /// A.2: the whole client Initial, sealed with the client's Initial keys,
+    /// which is how `gate::sealed_initial` seals a client's packet, and opened
+    /// again with the same keys, which is how the socket gate opens one
+    /// (`tls::client_initial_keys` is this call).
     #[test]
     fn client_initial_packet_matches_appendix_a2() {
-        let keys = initial_keys(Version::V1, &hex(CID), Side::Server);
+        let keys = client_initial_keys(Version::V1, &hex(CID));
         let header = hex("c300000001088394c8f03e5157080000449e00000002");
         let mut payload = hex(
             "060040f1010000ed0303ebf8fa56f129 39b9584a3896472ec40bb863cfd3e868
@@ -541,9 +566,9 @@ mod tests {
         let mut packet = header.clone();
         packet.extend_from_slice(&payload);
         packet.extend_from_slice(&[0u8; 16]);
-        keys.packet.remote.encrypt(2, &mut packet, header.len());
+        keys.packet.encrypt(2, &mut packet, header.len());
         // The packet number is the last four header bytes.
-        keys.header.remote.encrypt(header.len() - 4, &mut packet);
+        keys.header.encrypt(header.len() - 4, &mut packet);
         assert_eq!(
             packet,
             hex(
@@ -588,11 +613,10 @@ mod tests {
             )
         );
 
-        keys.header.remote.decrypt(header.len() - 4, &mut packet);
+        keys.header.decrypt(header.len() - 4, &mut packet);
         assert_eq!(packet[..header.len()], header[..]);
         let mut body = BytesMut::from(&packet[header.len()..]);
         keys.packet
-            .remote
             .decrypt(2, &header, &mut body)
             .expect("the RFC's packet opens");
         assert_eq!(&body[..], &payload[..]);

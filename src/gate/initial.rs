@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use bytes::BytesMut;
 
 use super::MAX_CONNECTION_ID;
+use crate::tls::ClientInitialKeys;
 use crate::varint::peek_varint;
 
 /// The QUIC version this server speaks, as it appears in a long header.
@@ -47,7 +48,7 @@ const FRAME_CONNECTION_CLOSE: u64 = 0x1c;
 pub(super) fn decrypt(
     datagram: &[u8],
     header: &InitialHeader,
-) -> Option<(quinn::crypto::Keys, BytesMut)> {
+) -> Option<(ClientInitialKeys, BytesMut)> {
     // The header key (`tls::awslc::keys`) reads its sample from four bytes
     // past the start of the packet number and indexes the buffer it is given
     // without a check, so a packet too short for that would panic rather
@@ -72,7 +73,7 @@ pub(super) fn decrypt(
     //# derived from the Destination Connection ID field from the client's
     //# first Initial packet.
     // The server's own key code, the one its handshakes run (D115).
-    let keys = crate::tls::server_initial_keys(&datagram[header.dcid.clone()]);
+    let keys = crate::tls::client_initial_keys(&datagram[header.dcid.clone()]);
     let frames = open_with(&keys, datagram, header)?;
     Some((keys, frames))
 }
@@ -94,7 +95,7 @@ pub(super) fn decrypt(
 /// header can only be last. A datagram with nothing behind its first packet,
 /// which is every first flight quinn and Surge send, costs nothing here.
 pub(super) fn coalesced_frames(
-    keys: &quinn::crypto::Keys,
+    keys: &ClientInitialKeys,
     datagram: &[u8],
     first: &InitialHeader,
 ) -> Vec<BytesMut> {
@@ -128,14 +129,14 @@ pub(super) fn coalesced_frames(
 /// `None` for a packet too short for the keys to be applied or one that does
 /// not authenticate; [`decrypt`] says what each means.
 fn open_with(
-    keys: &quinn::crypto::Keys,
+    keys: &ClientInitialKeys,
     datagram: &[u8],
     header: &InitialHeader,
 ) -> Option<BytesMut> {
     let number_end_limit = header.packet_number_offset.checked_add(4)?;
 
     // The other half, which the cipher's sample size decides.
-    let sample_end = number_end_limit.checked_add(keys.header.remote.sample_size())?;
+    let sample_end = number_end_limit.checked_add(keys.header.sample_size())?;
     if sample_end > header.packet_end {
         return None;
     }
@@ -147,9 +148,7 @@ fn open_with(
     // where it already is, and the associated data the AEAD needs is inside
     // this copy.
     let mut head = datagram[..sample_end].to_vec();
-    keys.header
-        .remote
-        .decrypt(header.packet_number_offset, &mut head);
+    keys.header.decrypt(header.packet_number_offset, &mut head);
 
     // The two bits the header protection was hiding.
     let number_length = usize::from(head[0] & 0x03) + 1;
@@ -172,13 +171,12 @@ fn open_with(
     // The AEAD tag is the tail of the payload; a "packet" too short to hold
     // one is not one, and the check is here rather than left to the cipher
     // so that this function is total on its own terms.
-    if header.packet_end - number_end < keys.packet.remote.tag_len() {
+    if header.packet_end - number_end < keys.packet.tag_len() {
         return None;
     }
 
     let mut frames = BytesMut::from(&datagram[number_end..header.packet_end]);
     keys.packet
-        .remote
         .decrypt(number, &head[..number_end], &mut frames)
         .ok()?;
     Some(frames)
