@@ -212,14 +212,14 @@ initial_mtu = 1242
 # Default: 1436
 mtu_upper_bound = 1436
 
-# QUIC congestion controller: "bbr", "bbr-uncapped", "cubic" or "newreno".
+# QUIC congestion controller: "bbr", "cubic" or "newreno".
 #
 # Keep BBR on a long, lossy path: a loss-based controller (cubic, newreno) takes
 # every lost packet for congestion, and its downloads stall there. Use cubic only
-# on a clean path, or as a fallback. "bbr" is quinn's BBR with its window capped
-# at 1.25 times the bandwidth-delay product it measures, which removes most of
-# the loss quinn's BBR causes on a bulk download. "bbr-uncapped" is quinn's BBR
-# as it ships. The 1.1.x name "bbr-capped" is not accepted since 1.3.0.
+# on a clean path, or as a fallback. "bbr" is volto's own controller: its window
+# is at most 1.25 times the bandwidth-delay product it measures, and lower where
+# the path's queue is too short to hold the difference. The values "bbr-capped"
+# (1.1.x) and "bbr-uncapped" (1.2.0 to 1.7.0) are no longer accepted.
 # docs/configuration.md#notes-that-matter-in-practice
 # Default: "bbr"
 #congestion_control = "bbr"

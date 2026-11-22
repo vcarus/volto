@@ -390,25 +390,19 @@ impl std::fmt::Debug for User {
 /// for TCP with `net.ipv4.tcp_congestion_control = bbr`.
 ///
 /// The value `bbr` selects volto's own controller ([`crate::congestion`],
-/// D108), whose window is 1.25 times the bandwidth-delay product it measures.
-/// quinn's BBR overestimates the bottleneck and loses the difference on a bulk
-/// download, so it is not the default. The own controller has the plain name
-/// so that a file that writes `bbr`, or leaves the key out, gets it without an
-/// edit. quinn's controller as it ships is selectable as `bbr-uncapped`.
+/// D108), whose window is at most 1.25 times the bandwidth-delay product it
+/// measures. quinn's BBR overestimates the bottleneck and loses the difference
+/// on a bulk download, so it is not offered: the value `bbr-uncapped`, which
+/// selected it from 1.2.0 to 1.7.0, is no longer accepted.
 ///
-/// The other controllers are kept as a fallback: quinn's BBR is a port marked
-/// "experimental", so an operator who hits trouble after a dependency bump can
-/// switch without recompiling.
+/// The other controllers are kept as a fallback, so an operator who hits
+/// trouble with the default can switch without recompiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CongestionControl {
-    /// volto's own controller, with its window at 1.25 times the measured
+    /// volto's own controller, with its window at most 1.25 times the measured
     /// bandwidth-delay product; see [`crate::congestion`]. The default.
     Bbr,
-    /// quinn's BBR as it ships (its experimental port of BBRv1), without the
-    /// cap.
-    #[serde(rename = "bbr-uncapped")]
-    BbrUncapped,
     /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
     Cubic,
     /// NewReno. Loss-based and the most conservative; mainly of interest for
@@ -1017,7 +1011,6 @@ pub(crate) mod tests {
         );
         for (value, expected) in [
             ("bbr", CongestionControl::Bbr),
-            ("bbr-uncapped", CongestionControl::BbrUncapped),
             ("cubic", CongestionControl::Cubic),
             ("newreno", CongestionControl::NewReno),
         ] {
@@ -1036,7 +1029,22 @@ pub(crate) mod tests {
         let err = parse_err("[limits]\ncongestion_control = \"bbr-capped\"").to_string();
         assert!(err.contains("bbr-capped"), "{err}");
         assert!(err.contains("`bbr`"), "{err}");
+    }
+
+    /// `bbr-uncapped`, which selected quinn's BBR as it ships from 1.2.0 to
+    /// 1.7.0, is not accepted since the controller stopped using quinn's BBR
+    /// (D108, user ruling 2026-11-22). The parser's own error names the
+    /// accepted values; the startup error redacts them and keeps the line and
+    /// column.
+    #[test]
+    fn bbr_uncapped_is_no_longer_accepted() {
+        let err = parse_err("[limits]\ncongestion_control = \"bbr-uncapped\"").to_string();
         assert!(err.contains("bbr-uncapped"), "{err}");
+        assert!(err.contains("`bbr`"), "{err}");
+        assert!(
+            err.contains("`cubic`") && err.contains("`newreno`"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1668,7 +1676,6 @@ pub(crate) mod tests {
                 any::<bool>(),
                 prop::sample::select(vec![
                     CongestionControl::Bbr,
-                    CongestionControl::BbrUncapped,
                     CongestionControl::Cubic,
                     CongestionControl::NewReno,
                 ]),
