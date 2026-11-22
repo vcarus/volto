@@ -1,71 +1,48 @@
-//! The `bbr` congestion controller: quinn's BBR with its congestion window held
-//! to 1.25 times the measured bandwidth-delay product.
+//! The `bbr` congestion controller: a window of 1.25 times the bandwidth-delay
+//! product it measures.
 //!
 //! It is the default (D108). quinn's BBR as it ships is the value
-//! `bbr-uncapped`. The type is named [`BbrCapped`].
+//! `bbr-uncapped`. The type is named [`BbrCapped`], for the name it had when it
+//! was a wrapper around quinn's BBR.
 //!
-//! quinn-proto 0.11.x's BBR overestimates the bottleneck bandwidth, so its
-//! congestion window never limits what is in flight. Paths below are in that
-//! crate. quinn calls `Controller::on_ack` once per
-//! acknowledged packet (`src/connection/mod.rs`,
-//! `Connection::on_packet_acked`). For each call BBR takes that packet's bytes
-//! over the time since the previous call
-//! (`src/congestion/bbr/bw_estimation.rs`, `BandwidthEstimation::on_ack`, the
-//! `ack_rate` binding). For the first packet of an ACK frame that time is the
-//! gap since the previous ACK frame. For the other packets of the frame it is
-//! zero, and the rate is zero. The sample is the lower of that rate and a send
-//! rate taken from the last two `on_sent` calls (the `send_rate` binding, and
-//! `send_rate.min(ack_rate)` after it), and it reads several times too high.
-//! The max filter is only updated with a new maximum (the
-//! `self.max_filter.get() < bandwidth` condition in front of `update_max`), so
-//! its ten-round window (`src/congestion/bbr/min_max.rs`, `MinMax::default`,
-//! the field `window`) never expires an old one. The window BBR computes from
-//! that estimate (`src/congestion/bbr/mod.rs`, `Bbr::get_target_cwnd`) runs to
-//! tens of megabytes, and in-flight data is limited only by the recovery window
-//! and the peer's flow control. quinn paces from the window
-//! (`src/connection/pacing.rs`, `Pacer::delay`, which adds 1.25 windows of
-//! tokens per smoothed RTT), so nothing slows the sender to the bottleneck, and
-//! a bulk download loses what the bottleneck queue cannot hold (D108).
+//! quinn-proto 0.11's BBR estimates the bottleneck bandwidth several times too
+//! high, so its window never limits in-flight data, and a bulk download loses
+//! what the bottleneck queue cannot hold. This controller uses no part of
+//! quinn's BBR. It measures its own delivery rate and minimum RTT, and its
+//! window is computed from them alone (D108).
 //!
-//! [`BbrCapped`] forwards every callback to quinn's BBR and only lowers
-//! [`Controller::window`]. It caps the window at 1.25 times the delivery rate it
-//! measures once per round trip (see `DeliveryRate`) times its own minimum RTT.
-//! The cap is never below the window a new
-//! connection starts with, 240 kB with quinn's default (200 packets of 1200
-//! bytes), so on a path whose bandwidth-delay product is under 192 kB the
-//! window can be 240 kB. Because quinn paces from the window, the cap also sets
-//! the pacing rate, in-flight data sits at the cap, and a quarter of a
-//! bandwidth-delay product stands in the bottleneck queue. 1.25 is the highest
-//! pacing gain of BBR's ProbeBW cycle (`src/congestion/bbr/mod.rs`,
-//! `K_PACING_GAIN`). BBR's window gain of two (`K_DERIVED_HIGH_CWNDGAIN`) is a
+//! The window is 1.25 times the delivery rate measured once per round trip
+//! (see `DeliveryRate`) times the minimum RTT. It is never below the initial
+//! window, 240 kB: 200 packets of 1200 bytes, the default initial window of
+//! quinn's BBR (`BbrConfig`). So on a path whose bandwidth-delay product is
+//! under 192 kB, the window can be 240 kB. Until there is a delivery-rate sample
+//! and a minimum RTT, the window is the initial window.
+//!
+//! quinn paces from the window (quinn-proto `src/connection/pacing.rs`,
+//! `Pacer::delay`, which adds 1.25 windows of tokens per smoothed RTT), so the
+//! window also sets the pacing rate. In-flight data sits at the window, and a
+//! quarter of a bandwidth-delay product stands in the bottleneck queue. 1.25 is
+//! the highest pacing gain of BBR's ProbeBW cycle. BBR's window gain of two is a
 //! ceiling above a sender that paces at the estimated rate. In quinn the window
 //! is what the sender sends, so a gain of two keeps a whole bandwidth-delay
 //! product queued and loses packets wherever the queue is shorter than that.
-//! BBR's response to loss is unchanged: it has none beyond its recovery window,
-//! which is the property D33 chose BBR for. The wrapper's only response to loss
-//! is to end its startup gain, described next.
 //!
 //! A new connection uses a higher gain until its estimate stops growing. With
-//! the window at the cap, each sample can only show the rate the cap allows, so
-//! at 1.25 the estimate grows by at most 1.25 times per sample. The startup
-//! gain is BBR's Startup gain, 2/ln 2, about 2.89 (`src/congestion/bbr/mod.rs`,
-//! `K_DEFAULT_HIGH_GAIN`). The estimate has stopped growing when three samples
-//! in a row from intervals that were not app-limited have not raised it by 25
-//! percent since it last did. This is BBR's full-bandwidth test, with quinn's
-//! constants (`K_STARTUP_GROWTH_TARGET` and
-//! `K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP`). A congestion event
-//! also ends the startup when the sample interval it falls in does not raise
-//! the estimate by 25 percent, whether or not that interval was app-limited.
-//! quinn's own Startup ends the same way when it is in recovery at a round trip
-//! without growth (`Bbr::check_if_full_bw_reached`), but only in a round trip
-//! that is not app-limited. quinn reports a sender blocked by the peer's flow
-//! control as app-limited, so behind a flow-control window smaller than the
-//! startup cap the full-bandwidth test never runs, and without the congestion
-//! exit the startup gain would stay.
+//! the window at 1.25 times the estimate, each sample can only show the rate
+//! that window allows, so the estimate grows by at most 1.25 times per sample.
+//! The startup gain is BBR's Startup gain, 2/ln 2, about 2.89. The estimate has
+//! stopped growing when three samples in a row from intervals that were not
+//! app-limited have not raised it by 25 percent since it last did. This is
+//! BBR's full-bandwidth test. A congestion event also ends the startup when the
+//! sample interval it falls in does not raise the estimate by 25 percent,
+//! whether or not that interval was app-limited. quinn reports a sender blocked
+//! by the peer's flow control as app-limited. Behind a flow-control window
+//! smaller than the startup window the full-bandwidth test therefore never
+//! runs, and without the congestion exit the startup gain would stay.
 //!
 //! The startup gain returns when the estimate climbs back after a fall. The
 //! estimate keeps a sample for ten intervals, so a loss episode longer than that
-//! leaves only samples from the episode in it, and the cap starts again from
+//! leaves only samples from the episode in it, and the window starts again from
 //! its floor. At 1.25 the estimate then grows by about 12 percent per sample,
 //! not 25, because a raised window shows in the sample about two round trips
 //! later. So three samples in a row from intervals that were not app-limited,
@@ -76,20 +53,28 @@
 //! path whose rate has fallen for good, a later climb from below half of the
 //! old rate also uses the startup gain, until the same two rules end it.
 //!
-//! The minimum RTT is the wrapper's own, and it expires. quinn's
-//! `RttEstimator::min` never does within a path, so with it a lasting RTT rise
-//! would leave the cap below the new bandwidth-delay product, each
-//! delivery-rate sample would come out lower than the last, and the window
-//! would fall to its floor.
-//! Expiry alone would not fix that. A minimum measured again with the standing
-//! queue in it would raise the cap, and with it the queue, each time. So the
-//! wrapper empties the queue before it measures, the way BBR's ProbeRTT does.
-//! quinn's BBR does not do that for it. It enters ProbeRTT every 10 s
-//! (`src/congestion/bbr/mod.rs`, `Bbr::is_min_rtt_expired`), but its ProbeRTT
-//! window is 0.75 times its own inflated target window
-//! (`Bbr::get_probe_rtt_cwnd`, with the constant `PROBE_RTT_BASED_ON_BDP`
-//! true), so in-flight data does not fall. Its minimum RTT is
-//! `RttEstimator::min` as well (`on_ack` in `impl Controller for Bbr`).
+//! A loss holds in-flight data for one round trip, by BBR's packet
+//! conservation. The form here is ours, and it has the effect of the recovery
+//! window of quinn's BBR. quinn reports a loss after the ACK batch that found
+//! it, so the rule acts at the next batch. That batch sets a recovery window
+//! of in-flight data plus the bytes it acknowledged, and never less than four
+//! packets. Each later batch takes the bytes lost since the previous one off
+//! the recovery window. Once a packet sent after the recovery began has been
+//! acknowledged, each batch also adds the bytes it acknowledged. In-flight data
+//! plus the bytes the batch acknowledged stays the recovery window's lower
+//! bound. The recovery ends at the first batch without a loss that
+//! acknowledges a packet sent after the last batch with one. The recovery
+//! window limits the window only after the startup has ended, as quinn's BBR
+//! applies its own only outside its Startup. An ECN mark loses no bytes and
+//! starts no recovery.
+//!
+//! The minimum RTT expires. quinn's `RttEstimator::min` never does within a
+//! path, so with it a lasting RTT rise would leave the window below the new
+//! bandwidth-delay product, each delivery-rate sample would come out lower than
+//! the last, and the window would fall to its floor. Expiry alone would not fix
+//! that. A minimum measured again with the standing queue in it would raise the
+//! window, and with it the queue, each time. So the controller empties the
+//! queue before it measures, the way BBR's ProbeRTT does.
 //!
 //! The minimum is the lowest `now - sent` of any acknowledged packet. The
 //! peer's ACK delay is part of it, which can only make it larger. A sample at
@@ -123,7 +108,12 @@
 //! connection's state when the ACK arrives, not when the packet was sent, so
 //! the first sample stored after ten or more unstored intervals, which replaces
 //! the whole estimate, can measure packets sent while the sender was
-//! app-limited and put the cap about one round trip low until the next sample.
+//! app-limited and put the window about one round trip low until the next
+//! sample.
+//!
+//! The window is computed when one of its inputs changes and stored, because
+//! quinn reads it before every packet it sends. The inputs are the estimate,
+//! the minimum RTT, the probe, the startup, the recovery window and the MTU.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -131,7 +121,7 @@ use std::any::Any;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::congestion::{Bbr, BbrConfig, Controller, ControllerFactory, ControllerMetrics};
+use quinn::congestion::{Controller, ControllerFactory};
 use quinn_proto::RttEstimator;
 
 /// After how many sample intervals a stored delivery-rate sample can leave the
@@ -142,26 +132,30 @@ use quinn_proto::RttEstimator;
 /// While nothing is stored, the estimate does not change.
 const SAMPLES: usize = 10;
 
-/// The window cap as a multiple of the estimated bandwidth-delay product, in
-/// per mille, once the startup has ended.
+/// The window a connection starts with, and the floor of the window outside a
+/// probe: 200 packets of 1200 bytes, the default initial window of quinn's BBR.
+/// Held here so that the controller does not depend on quinn's BBR; a test
+/// checks that the two still agree.
+const INITIAL_WINDOW: u64 = 200 * 1200;
+
+/// The window as a multiple of the estimated bandwidth-delay product, in per
+/// mille, once the startup has ended.
 const CWND_GAIN_PERMILLE: u128 = 1_250;
 
 /// The probe window as a multiple of the estimated bandwidth-delay product, in
 /// per mille: half, the target of BBRv2's ProbeRTT.
 const PROBE_GAIN_PERMILLE: u128 = 500;
 
-/// The window cap until the estimate stops growing, in per mille: BBR's Startup
-/// gain, 2/ln 2 (quinn-proto 0.11.x, `src/congestion/bbr/mod.rs`,
-/// `K_DEFAULT_HIGH_GAIN` = 2.885).
+/// The window until the estimate stops growing, in per mille: BBR's Startup
+/// gain, 2/ln 2, to three decimals.
 const STARTUP_GAIN_PERMILLE: u128 = 2_885;
 
 /// How much the estimate has to rise, in percent of its value when it last
-/// rose, to count as growth: BBR's full-bandwidth test
-/// (`K_STARTUP_GROWTH_TARGET` = 1.25).
+/// rose, to count as growth: BBR's full-bandwidth test.
 const GROWTH_PERCENT: u128 = 125;
 
-/// How many samples in a row without growth end the startup
-/// (`K_ROUND_TRIPS_WITHOUT_GROWTH_BEFORE_EXITING_STARTUP` = 3).
+/// How many samples in a row without growth end the startup: BBR's
+/// full-bandwidth test.
 const SAMPLES_WITHOUT_GROWTH: u8 = 3;
 
 /// How far the estimate has to be below its highest value, in percent of it,
@@ -184,34 +178,36 @@ const MIN_RTT_LIFETIME: Duration = Duration::from_secs(10);
 /// to it: BBR's ProbeRTTDuration.
 const PROBE_TIME: Duration = Duration::from_millis(200);
 
-/// The smallest probe window, in packets: BBR's minimum congestion window.
-const PROBE_MIN_PACKETS: u64 = 4;
+/// The smallest probe window and the smallest recovery window, in packets:
+/// BBR's minimum congestion window.
+const MIN_WINDOW_PACKETS: u64 = 4;
 
-/// Builds [`BbrCapped`] controllers, each around a default quinn [`Bbr`].
+/// Builds [`BbrCapped`] controllers.
 #[derive(Debug, Clone, Default)]
-pub struct BbrCappedConfig {
-    inner: Arc<BbrConfig>,
-}
+pub struct BbrCappedConfig;
 
 impl ControllerFactory for BbrCappedConfig {
     fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(BbrCapped {
-            inner: Bbr::new(self.inner.clone(), current_mtu),
             rate: DeliveryRate::default(),
             startup: Startup::default(),
             min_rtt: None,
             probe: None,
             srtt: Duration::ZERO,
             mtu: current_mtu.into(),
+            acked: 0,
+            lost: 0,
+            recovery: None,
+            cap: None,
+            window: INITIAL_WINDOW,
         })
     }
 }
 
-/// quinn's [`Bbr`] with [`Controller::window`] capped at 1.25 times the
-/// measured bandwidth-delay product. See the [module documentation](self).
+/// A controller whose window is 1.25 times the measured bandwidth-delay
+/// product. See the [module documentation](self).
 #[derive(Debug, Clone)]
 pub struct BbrCapped {
-    inner: Bbr,
     rate: DeliveryRate,
     startup: Startup,
     /// The lowest RTT sample and when it was taken; `None` before the first ACK.
@@ -223,6 +219,17 @@ pub struct BbrCapped {
     /// lasts.
     srtt: Duration,
     mtu: u64,
+    /// Bytes acknowledged since the last ACK batch ended.
+    acked: u64,
+    /// Bytes lost since the last ACK batch ended.
+    lost: u64,
+    /// The recovery in progress, if any.
+    recovery: Option<Recovery>,
+    /// What [`BbrCapped::compute_cap`] returned when an input last changed.
+    cap: Option<u64>,
+    /// What [`Controller::window`] returns: the cap, or the initial window
+    /// while there is none, lowered to the recovery window after the startup.
+    window: u64,
 }
 
 /// The state of BBR's full-bandwidth test, which ends the startup gain, and
@@ -308,6 +315,19 @@ struct Probe {
     ends: Option<Instant>,
 }
 
+/// A recovery after a loss; see the module documentation.
+#[derive(Debug, Clone, Copy)]
+struct Recovery {
+    /// The most in-flight data the recovery allows.
+    window: u64,
+    /// The end of the ACK batch that began the recovery. Once a packet sent
+    /// after it has been acknowledged, the window grows by the bytes
+    /// acknowledged.
+    began: Instant,
+    /// The end of the last ACK batch that had a loss.
+    last_loss: Instant,
+}
+
 impl BbrCapped {
     /// The part of [`Controller::on_ack`] that is ours, split out because
     /// [`RttEstimator`] has no public constructor and the tests cannot make one.
@@ -320,6 +340,7 @@ impl BbrCapped {
         srtt: Duration,
     ) {
         self.srtt = srtt;
+        self.acked = self.acked.saturating_add(bytes);
         // A probe holds the window below the path's rate on purpose, so its ACKs
         // count as app-limited and its low samples do not lower the estimate.
         let probing = self.probe.is_some();
@@ -336,17 +357,26 @@ impl BbrCapped {
                         min: rtt,
                         ends: None,
                     });
+                    self.refresh();
                 }
             }
-            _ => self.min_rtt = Some((rtt, now)),
+            // An equal sample only restarts the lifetime.
+            Some((min, _)) if rtt == min => self.min_rtt = Some((rtt, now)),
+            _ => {
+                self.min_rtt = Some((rtt, now));
+                self.refresh();
+            }
         }
     }
 
     /// Starts the probe's clock once in-flight data has fallen to the probe
-    /// window, and ends the probe when that time is up.
-    fn update_probe(&mut self, now: Instant, in_flight: u64) {
-        let cap = self.cap();
-        let Some(probe) = &mut self.probe else { return };
+    /// window, and ends the probe when that time is up. Returns whether the
+    /// probe ended.
+    fn update_probe(&mut self, now: Instant, in_flight: u64) -> bool {
+        let cap = self.cap;
+        let Some(probe) = &mut self.probe else {
+            return false;
+        };
         match probe.ends {
             None if cap.is_none_or(|cap| in_flight <= cap) => {
                 probe.ends = Some(now + PROBE_TIME.max(self.srtt));
@@ -354,20 +384,68 @@ impl BbrCapped {
             Some(ends) if now >= ends => {
                 self.min_rtt = Some((probe.min, now));
                 self.probe = None;
+                return true;
             }
             _ => {}
         }
+        false
     }
 
-    /// One debug line per delivery-rate sample, with the terms that can limit
-    /// the window after it. Off under the shipped `volto=info` filter.
+    /// Applies the losses and acknowledgements of the ACK batch that has just
+    /// ended to the recovery window. Returns whether the recovery changed.
+    fn update_recovery(&mut self, now: Instant, in_flight: u64) -> bool {
+        let lost = std::mem::take(&mut self.lost);
+        let acked = std::mem::take(&mut self.acked);
+        let held = in_flight
+            .saturating_add(acked)
+            .max(MIN_WINDOW_PACKETS * self.mtu);
+        let acked_after = |at: Instant| self.rate.sent.is_some_and(|sent| sent > at);
+        match self.recovery {
+            None if lost == 0 => return false,
+            None => {
+                self.recovery = Some(Recovery {
+                    window: held,
+                    began: now,
+                    last_loss: now,
+                });
+            }
+            Some(r) if lost == 0 && acked_after(r.last_loss) => self.recovery = None,
+            Some(r) => {
+                let grown = if acked_after(r.began) { acked } else { 0 };
+                self.recovery = Some(Recovery {
+                    window: r
+                        .window
+                        .saturating_sub(lost)
+                        .saturating_add(grown)
+                        .max(held),
+                    last_loss: if lost > 0 { now } else { r.last_loss },
+                    ..r
+                });
+            }
+        }
+        true
+    }
+
+    /// Stores the cap and the window after a change to one of their inputs.
+    fn refresh(&mut self) {
+        self.cap = self.compute_cap();
+        let window = self.cap.unwrap_or(INITIAL_WINDOW);
+        self.window = match self.recovery {
+            Some(recovery) if self.startup.ended => window.min(recovery.window),
+            _ => window,
+        };
+    }
+
+    /// One debug line per delivery-rate sample, with the terms that limit the
+    /// window after the ACK batch that closed it. Off under the shipped
+    /// `volto=info` filter.
     fn trace(&self, sample: &Sample, in_flight: u64) {
         tracing::debug!(
             sample_bytes_per_sec = sample.rate,
             estimate_bytes_per_sec = self.rate.max().unwrap_or(0),
-            cap_bytes = self.cap().unwrap_or(0),
-            bbr_window_bytes = self.inner.window(),
-            window_bytes = self.window(),
+            cap_bytes = self.cap.unwrap_or(0),
+            recovery_bytes = self.recovery.map_or(0, |r| r.window),
+            window_bytes = self.window,
             in_flight_bytes = in_flight,
             min_rtt_us = self.min_rtt.map_or_default(|(min, _)| min.as_micros()),
             srtt_us = self.srtt.as_micros(),
@@ -385,16 +463,16 @@ impl BbrCapped {
     /// from: 1.25 times the bandwidth-delay product, the startup gain times it
     /// until the startup has ended, or half of it during a probe.
     ///
-    /// Outside a probe the limit is never below the window a new connection
-    /// starts with, BBR's initial window, so a connection that has measured a
-    /// low rate is never slower to send than a fresh one.
-    fn cap(&self) -> Option<u64> {
+    /// Outside a probe the limit is never below [`INITIAL_WINDOW`], so a
+    /// connection that has measured a low rate is never slower to send than a
+    /// fresh one.
+    fn compute_cap(&self) -> Option<u64> {
         let bandwidth = self.rate.max()?;
         let (min_rtt, _) = self.min_rtt?;
         let (gain_permille, floor) = match self.probe {
-            None if self.startup.ended => (CWND_GAIN_PERMILLE, self.inner.initial_window()),
-            None => (STARTUP_GAIN_PERMILLE, self.inner.initial_window()),
-            Some(_) => (PROBE_GAIN_PERMILLE, PROBE_MIN_PACKETS * self.mtu),
+            None if self.startup.ended => (CWND_GAIN_PERMILLE, INITIAL_WINDOW),
+            None => (STARTUP_GAIN_PERMILLE, INITIAL_WINDOW),
+            Some(_) => (PROBE_GAIN_PERMILLE, MIN_WINDOW_PACKETS * self.mtu),
         };
         // Bytes per second times microseconds times per mille.
         let bytes = u128::from(bandwidth) * min_rtt.as_micros() * gain_permille / 1_000_000_000;
@@ -403,10 +481,6 @@ impl BbrCapped {
 }
 
 impl Controller for BbrCapped {
-    fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-        self.inner.on_sent(now, bytes, last_packet_number);
-    }
-
     fn on_ack(
         &mut self,
         now: Instant,
@@ -415,7 +489,6 @@ impl Controller for BbrCapped {
         app_limited: bool,
         rtt: &RttEstimator,
     ) {
-        self.inner.on_ack(now, sent, bytes, app_limited, rtt);
         self.record_ack(now, sent, bytes, app_limited, rtt.get());
     }
 
@@ -424,44 +497,43 @@ impl Controller for BbrCapped {
         now: Instant,
         in_flight: u64,
         app_limited: bool,
-        largest_packet_num_acked: Option<u64>,
+        _largest_packet_num_acked: Option<u64>,
     ) {
-        self.inner
-            .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
-        if let Some(sample) = self.rate.on_end_acks(now, app_limited, self.srtt) {
+        let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
+        if let Some(sample) = &sample {
             self.startup
                 .on_interval(self.rate.max().unwrap_or(0), sample.app_limited);
-            self.trace(&sample, in_flight);
+            self.refresh();
         }
-        self.update_probe(now, in_flight);
+        if self.update_probe(now, in_flight) {
+            self.refresh();
+        }
+        if self.update_recovery(now, in_flight) {
+            self.refresh();
+        }
+        if let Some(sample) = &sample {
+            self.trace(sample, in_flight);
+        }
     }
 
     fn on_congestion_event(
         &mut self,
-        now: Instant,
-        sent: Instant,
-        is_persistent_congestion: bool,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.inner
-            .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
         self.startup.congested = true;
+        self.lost = self.lost.saturating_add(lost_bytes);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
-        self.inner.on_mtu_update(new_mtu);
         self.mtu = new_mtu.into();
+        self.refresh();
     }
 
     fn window(&self) -> u64 {
-        let inner = self.inner.window();
-        self.cap().map_or(inner, |cap| inner.min(cap))
-    }
-
-    fn metrics(&self) -> ControllerMetrics {
-        let mut metrics = self.inner.metrics();
-        metrics.congestion_window = self.window();
-        metrics
+        self.window
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
@@ -469,7 +541,7 @@ impl Controller for BbrCapped {
     }
 
     fn initial_window(&self) -> u64 {
-        self.inner.initial_window()
+        INITIAL_WINDOW
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -635,20 +707,23 @@ mod tests {
     const MIN_RTT: Duration = Duration::from_millis(60);
     /// The sample interval in these tests: one smoothed RTT.
     const SRTT: Duration = Duration::from_millis(100);
-    /// The default quinn BBR initial window, 200 packets of 1200 bytes, which
-    /// is the floor of the cap.
-    ///
-    /// The inner BBR is driven only through `on_end_acks` here (its `on_ack`
-    /// needs an `RttEstimator`, which has no public constructor), so its window
-    /// stays at this value, and a cap above it shows in `cap()` and not in
-    /// `window()`.
+    /// [`INITIAL_WINDOW`], 200 packets of 1200 bytes, which is the floor of the
+    /// cap outside a probe.
     const FLOOR: u64 = 240_000;
     /// The bandwidth estimate of [`estimated`], 120 Mbit/s.
     const BANDWIDTH: u64 = 15_000_000;
 
-    /// The controller `config` builds at `mtu`.
-    fn build(config: BbrCappedConfig, mtu: u16) -> BbrCapped {
-        *Arc::new(config)
+    impl BbrCapped {
+        /// The stored window limit; `None` before there is a delivery-rate
+        /// sample and a minimum RTT to compute it from.
+        fn cap(&self) -> Option<u64> {
+            self.cap
+        }
+    }
+
+    /// The controller the default factory builds at `mtu`.
+    fn build(mtu: u16) -> BbrCapped {
+        *Arc::new(BbrCappedConfig)
             .build(Instant::now(), mtu)
             .into_any()
             .downcast::<BbrCapped>()
@@ -657,7 +732,7 @@ mod tests {
 
     /// A controller as the default factory builds it, still in its startup.
     fn starting() -> BbrCapped {
-        build(BbrCappedConfig::default(), 1200)
+        build(1200)
     }
 
     /// [`starting`] with the startup ended, so that the cap is 1.25 times the
@@ -702,25 +777,35 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    /// The initial window is held here and not read from quinn's BBR, so this
+    /// test is the one place that sees a change of quinn's default. It is the
+    /// only use of `quinn::congestion::Bbr` in this module.
+    #[test]
+    fn the_initial_window_is_the_default_of_quinns_bbr() {
+        let bbr =
+            quinn::congestion::Bbr::new(Arc::new(quinn::congestion::BbrConfig::default()), 1200);
+        assert_eq!(INITIAL_WINDOW, bbr.initial_window());
+    }
+
     #[test]
     fn the_factory_starts_a_connection_in_its_startup_at_quinns_mtu() {
-        let c = build(BbrCappedConfig::default(), 1300);
+        let c = build(1300);
         assert_eq!(c.initial_window(), FLOOR);
+        assert_eq!(c.window(), FLOOR);
         assert_eq!(c.mtu, 1300);
         assert!(!c.startup.ended, "a new connection starts in its startup");
         assert!(c.min_rtt.is_none() && c.probe.is_none() && c.rate.max().is_none());
+        assert!(c.recovery.is_none());
     }
 
-    /// `window()` is `min(BBR's window, cap)`, and outside a probe the cap is
-    /// `max(gain x bandwidth-delay product, BBR's initial window)`.
+    /// The window is the cap, and outside a probe the cap is
+    /// `max(gain x bandwidth-delay product, initial window)`.
     #[test]
-    fn the_window_is_bbrs_lowered_to_the_cap_and_the_cap_never_goes_below_bbrs_initial_window() {
-        // BBR's initial window and the window it holds, the bytes acknowledged
-        // and how long after the interval started, then the cap and the window.
-        for (initial, inner, bytes, after, cap, window, case) in [
+    fn the_window_is_the_cap_and_the_cap_never_goes_below_the_initial_window() {
+        // The bytes acknowledged and how long after the interval started, then
+        // the cap and the window.
+        for (bytes, after, cap, window, case) in [
             (
-                FLOOR,
-                FLOOR,
                 1_500_000,
                 SRTT - ms(1),
                 None,
@@ -728,8 +813,6 @@ mod tests {
                 "no sample yet, so no cap",
             ),
             (
-                FLOOR,
-                FLOOR,
                 10_000,
                 SRTT,
                 Some(FLOOR),
@@ -737,49 +820,55 @@ mod tests {
                 "1.25 x 100 kB/s x 60 ms is below the floor",
             ),
             (
-                100_000,
-                100_000,
                 1_500_000,
                 SRTT,
                 Some(1_125_000),
-                100_000,
-                "the cap never raises BBR's window",
-            ),
-            (
-                1_000,
-                4_800,
-                4_000,
-                SRTT,
-                Some(3_000),
-                3_000,
-                "1.25 x 40 kB/s x 60 ms lowers BBR's window",
+                1_125_000,
+                "1.25 x 15 MB/s x 60 ms",
             ),
         ] {
-            let mut config = BbrConfig::default();
-            config.initial_window(initial);
-            let mut c = build(
-                BbrCappedConfig {
-                    inner: Arc::new(config),
-                },
-                1200,
-            );
-            c.startup.ended = true;
-            // An MTU update raises quinn's BBR window to at least four packets,
-            // but not the initial window it reports (quinn-proto 0.11.x
-            // `src/congestion/bbr/mod.rs`, `on_mtu_update` and `initial_window`
-            // in `impl Controller for Bbr`).
-            c.on_mtu_update(1200);
-
+            let mut c = capped();
             let t0 = Instant::now();
             end_acks(&mut c, t0, false);
             ack(&mut c, t0 + after, MIN_RTT, bytes, false);
             end_acks(&mut c, t0 + after, false);
 
-            assert_eq!(c.inner.window(), inner, "{case}");
             assert_eq!(c.cap(), cap, "{case}");
             assert_eq!(c.window(), window, "{case}");
-            assert_eq!(c.metrics().congestion_window, window, "{case}");
+            let metrics = c.metrics();
+            assert_eq!(metrics.congestion_window, window, "{case}");
+            assert_eq!(
+                metrics.pacing_rate, None,
+                "{case}: quinn paces from the window"
+            );
         }
+    }
+
+    /// Before the first sample there is no cap, and the window is the initial
+    /// window however many bytes are acknowledged: it does not grow by them,
+    /// and a loss during the startup does not lower it.
+    #[test]
+    fn before_the_first_sample_the_window_is_the_initial_window() {
+        let mut c = starting();
+        let t0 = Instant::now();
+        end_acks(&mut c, t0, false);
+        for n in 1..=9 {
+            let at = t0 + ms(10 * n);
+            ack(&mut c, at, MIN_RTT, 200_000, false);
+            c.on_congestion_event(at, at - MIN_RTT, false, 1200);
+            c.on_end_acks(at, 500_000, false, None);
+            assert_eq!(c.cap(), None, "no interval has closed at {n}0 ms");
+            assert_eq!(c.window(), FLOOR, "at {n}0 ms");
+        }
+        assert_eq!(c.min_rtt.map(|(min, _)| min), Some(MIN_RTT));
+
+        ack(&mut c, t0 + SRTT, MIN_RTT, 200_000, false);
+        end_acks(&mut c, t0 + SRTT, false);
+        assert_eq!(
+            c.window(),
+            3_462_000,
+            "the first sample, 2 MB over 100 ms, sets 2.885 x 20 MB/s x 60 ms"
+        );
     }
 
     #[test]
@@ -968,9 +1057,10 @@ mod tests {
         let mut c = capped();
         c.rate.samples[0] = u64::MAX;
         c.min_rtt = Some((Duration::from_secs(1), Instant::now()));
+        c.refresh();
 
         assert_eq!(c.cap(), Some(u64::MAX));
-        assert_eq!(c.window(), FLOOR);
+        assert_eq!(c.window(), u64::MAX);
     }
 
     #[test]
@@ -1021,6 +1111,7 @@ mod tests {
         assert_eq!(c.cap(), Some(450_000), "15 MB/s x 60 ms / 2");
 
         c.rate.samples = [10_000; SAMPLES];
+        c.refresh();
         assert_eq!(c.window(), 4 * 1200, "half of 600 bytes is less");
         c.on_mtu_update(1452);
         assert_eq!(c.window(), 4 * 1452);
@@ -1285,34 +1376,213 @@ mod tests {
         assert!(c.startup.ended);
     }
 
+    // The stored cap and window are refreshed at each change of an input. Each
+    // test below changes one input and reads the stored window at once.
+
+    #[test]
+    fn the_stored_window_follows_each_new_estimate() {
+        let mut c = capped();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        t = interval(&mut c, t, 10_000_000, false);
+        assert_eq!(c.window(), 750_000, "1.25 x 10 MB/s x 60 ms");
+        interval(&mut c, t, 20_000_000, false);
+        assert_eq!(c.window(), 1_500_000, "1.25 x 20 MB/s x 60 ms");
+    }
+
+    #[test]
+    fn the_stored_window_follows_the_end_of_the_startup() {
+        let mut c = starting();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        for _ in 0..3 {
+            t = interval(&mut c, t, BANDWIDTH, false);
+        }
+        assert_eq!(c.window(), 2_596_500, "2.885 x 15 MB/s x 60 ms");
+        interval(&mut c, t, BANDWIDTH, false);
+        assert!(c.startup.ended, "the third sample without growth");
+        assert_eq!(
+            c.window(),
+            1_125_000,
+            "the same estimate at 1.25: 1.25 x 15 MB/s x 60 ms"
+        );
+    }
+
+    #[test]
+    fn the_stored_window_follows_a_lower_minimum_rtt() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        assert_eq!(c.window(), 1_125_000);
+        ack(&mut c, t0 + ms(10), ms(30), 0, false);
+        assert_eq!(c.window(), 562_500, "1.25 x 15 MB/s x 30 ms");
+    }
+
+    #[test]
+    fn the_stored_window_follows_the_start_and_the_end_of_a_probe() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(10_001);
+        ack(&mut c, t1, ms(120), 0, false);
+        assert_eq!(c.window(), 450_000, "the probe starts: 15 MB/s x 60 ms / 2");
+
+        c.on_end_acks(t1, 0, false, None);
+        assert_eq!(c.window(), 450_000, "in-flight data has fallen to it");
+        c.on_end_acks(t1 + ms(200), 0, false, None);
+        assert!(c.probe.is_none());
+        assert_eq!(
+            c.window(),
+            2_250_000,
+            "the probe ends: 1.25 x 15 MB/s x 120 ms"
+        );
+    }
+
+    #[test]
+    fn the_stored_window_follows_the_mtu() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.rate.samples = [10_000; SAMPLES];
+        ack(&mut c, t0 + ms(10_001), ms(120), 0, false);
+        assert_eq!(c.window(), 4 * 1200, "a probe window of four packets");
+        c.on_mtu_update(1452);
+        assert_eq!(c.window(), 4 * 1452);
+    }
+
+    /// The recovery rule of the module documentation, batch by batch. The
+    /// recovery begins at t1 + 5 ms, and the last loss is reported to the batch
+    /// at t1 + 20 ms.
+    #[test]
+    fn a_loss_holds_in_flight_data_for_a_round_trip_and_then_lets_it_grow() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(1_000);
+        // An ACK of `bytes` at t1 + `at` ms, of packets sent at t1 + `sent` ms,
+        // then the end of the batch with `in_flight` bytes still in flight.
+        let batch = |c: &mut BbrCapped, at: u64, sent: i64, bytes: u64, in_flight: u64| {
+            let now = t1 + ms(at);
+            let sent = if sent < 0 {
+                t1 - ms(sent.unsigned_abs())
+            } else {
+                t1 + ms(sent.unsigned_abs())
+            };
+            c.record_ack(now, sent, bytes, false, SRTT);
+            c.on_end_acks(now, in_flight, false, None);
+        };
+
+        c.on_congestion_event(t1, t1 - MIN_RTT, false, 100_000);
+        assert_eq!(c.window(), 1_125_000, "a loss acts at the next batch");
+        batch(&mut c, 5, -55, 50_000, 600_000);
+        assert_eq!(c.window(), 650_000, "in-flight data plus the bytes acked");
+
+        batch(&mut c, 10, -50, 50_000, 550_000);
+        assert_eq!(
+            c.window(),
+            650_000,
+            "acknowledged packets were sent before the recovery: no growth"
+        );
+
+        c.on_congestion_event(t1 + ms(15), t1 - ms(45), false, 30_000);
+        batch(&mut c, 20, -40, 20_000, 500_000);
+        assert_eq!(c.window(), 620_000, "a later loss takes its bytes off");
+
+        batch(&mut c, 70, 10, 40_000, 500_000);
+        assert_eq!(
+            c.window(),
+            660_000,
+            "a packet sent after the recovery began: the bytes acked are added"
+        );
+
+        batch(&mut c, 80, 15, 10_000, 700_000);
+        assert_eq!(
+            c.window(),
+            710_000,
+            "the window never falls below in-flight data plus the bytes acked"
+        );
+
+        batch(&mut c, 85, 25, 10_000, 500_000);
+        assert!(c.recovery.is_none(), "a packet sent after the last loss");
+        assert_eq!(c.window(), 1_125_000, "back at the cap");
+    }
+
+    #[test]
+    fn a_recovery_never_holds_the_window_below_four_packets() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.on_congestion_event(t0, t0 - MIN_RTT, false, 100_000);
+        c.on_end_acks(t0 + ms(5), 0, false, None);
+        assert_eq!(c.window(), 4 * 1200);
+    }
+
+    #[test]
+    fn an_ecn_mark_starts_no_recovery() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.on_congestion_event(t0, t0 - MIN_RTT, false, 0);
+        c.on_end_acks(t0 + ms(5), 100_000, false, None);
+        assert!(c.recovery.is_none());
+        assert_eq!(c.window(), 1_125_000);
+    }
+
+    /// A recovery that begins during the startup does not lower the window
+    /// until the startup has ended, and then it does at once.
+    #[test]
+    fn a_recovery_limits_the_window_only_after_the_startup() {
+        let t0 = Instant::now();
+        let mut c = starting();
+        c.rate.samples = [BANDWIDTH; SAMPLES];
+        ack(&mut c, t0, MIN_RTT, 0, false);
+        c.on_congestion_event(t0, t0 - MIN_RTT, false, 1200);
+        let mut t = t0 + ms(5);
+        ack(&mut c, t, MIN_RTT, 10_000, false);
+        c.on_end_acks(t, 100_000, false, None);
+        assert_eq!(c.recovery.map(|r| r.window), Some(110_000));
+        assert_eq!(c.window(), 2_596_500, "2.885 x 15 MB/s x 60 ms");
+
+        // The first interval grows the estimate from nothing; the second has a
+        // congestion event and no growth, so it ends the startup.
+        for _ in 0..2 {
+            c.on_congestion_event(t, t - MIN_RTT, false, 1200);
+            t += SRTT;
+            ack(&mut c, t, MIN_RTT, 10_000, false);
+            c.on_end_acks(t, 100_000, false, None);
+        }
+        assert!(c.startup.ended);
+        assert_eq!(
+            c.window(),
+            127_600,
+            "110 kB, then twice 1200 bytes lost and 10 kB acked"
+        );
+    }
+
     /// What a [`Shadowed`] controller saw on a real connection.
     #[derive(Debug, Default)]
     struct Shadow {
         acks: u64,
-        /// Every point where the wrapper's inner BBR and the plain one
-        /// disagreed, or the wrapper did not hold quinn's smoothed RTT.
+        /// Every point where the stored cap or window differed from a fresh
+        /// computation, or the controller did not hold quinn's smoothed RTT.
         mismatches: Vec<String>,
         min_rtt: Option<Duration>,
         estimate: Option<u64>,
     }
 
-    /// A [`BbrCapped`] and a plain [`Bbr`] fed the same callbacks by quinn,
-    /// which is the one way to call [`Controller::on_ack`] with a real
-    /// [`RttEstimator`].
+    /// A [`BbrCapped`] that quinn drives, which is the one way to call
+    /// [`Controller::on_ack`] with a real [`RttEstimator`], checked after every
+    /// callback.
     #[derive(Debug, Clone)]
     struct Shadowed {
         capped: BbrCapped,
-        plain: Bbr,
         shadow: Arc<Mutex<Shadow>>,
     }
 
     impl Shadowed {
         fn compare(&self, after: &str, srtt: Option<Duration>) {
             let mut shadow = self.shadow.lock().expect("the shadow lock");
-            let (inner, plain) = (self.capped.inner.window(), self.plain.window());
-            if inner != plain {
+            let mut fresh = self.capped.clone();
+            fresh.refresh();
+            let stored = (self.capped.cap, self.capped.window);
+            if (fresh.cap, fresh.window) != stored {
+                let computed = (fresh.cap, fresh.window);
                 shadow.mismatches.push(format!(
-                    "after {after}: inner window {inner}, plain {plain}"
+                    "after {after}: stored {stored:?}, computed {computed:?}"
                 ));
             }
             if let Some(srtt) = srtt
@@ -1329,12 +1599,6 @@ mod tests {
     }
 
     impl Controller for Shadowed {
-        fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
-            self.capped.on_sent(now, bytes, last_packet_number);
-            self.plain.on_sent(now, bytes, last_packet_number);
-            self.compare("on_sent", None);
-        }
-
         fn on_ack(
             &mut self,
             now: Instant,
@@ -1344,7 +1608,6 @@ mod tests {
             rtt: &RttEstimator,
         ) {
             self.capped.on_ack(now, sent, bytes, app_limited, rtt);
-            self.plain.on_ack(now, sent, bytes, app_limited, rtt);
             self.shadow.lock().expect("the shadow lock").acks += 1;
             self.compare("on_ack", Some(rtt.get()));
         }
@@ -1358,8 +1621,6 @@ mod tests {
         ) {
             self.capped
                 .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
-            self.plain
-                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
             self.compare("on_end_acks", None);
         }
 
@@ -1372,14 +1633,11 @@ mod tests {
         ) {
             self.capped
                 .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
-            self.plain
-                .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
             self.compare("on_congestion_event", None);
         }
 
         fn on_mtu_update(&mut self, new_mtu: u16) {
             self.capped.on_mtu_update(new_mtu);
-            self.plain.on_mtu_update(new_mtu);
             self.compare("on_mtu_update", None);
         }
 
@@ -1406,19 +1664,17 @@ mod tests {
     impl ControllerFactory for ShadowedConfig {
         fn build(self: Arc<Self>, _now: Instant, current_mtu: u16) -> Box<dyn Controller> {
             Box::new(Shadowed {
-                capped: build(BbrCappedConfig::default(), current_mtu),
-                plain: Bbr::new(Arc::new(BbrConfig::default()), current_mtu),
+                capped: build(current_mtu),
                 shadow: self.0.clone(),
             })
         }
     }
 
-    /// `on_ack` forwards to quinn's BBR and hands `record_ack` quinn's smoothed
-    /// RTT: the server sends 8 MB over a real connection, and its inner BBR's
-    /// window matches a plain BBR fed the same callbacks after every one of
-    /// them.
+    /// `on_ack` hands `record_ack` quinn's smoothed RTT, and the stored cap and
+    /// window match a fresh computation after every callback: the server sends
+    /// 8 MB over a real connection.
     #[tokio::test]
-    async fn on_ack_forwards_to_bbr_and_records_quinns_smoothed_rtt() {
+    async fn on_ack_records_quinns_smoothed_rtt_and_the_stored_window_stays_current() {
         const BYTES: usize = 8_000_000;
         let shadow = Arc::new(Mutex::new(Shadow::default()));
         let mut transport = quinn::TransportConfig::default();

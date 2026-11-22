@@ -243,13 +243,13 @@ impl AuthGate {
 /// `config::CongestionControl` for why this is the default and stays
 /// configurable.
 ///
-/// `bbr` builds the capped controller of [`crate::congestion`] (D108), and
+/// `bbr` builds volto's own controller of [`crate::congestion`] (D108), and
 /// `bbr-uncapped` builds quinn's BBR as it ships.
 fn congestion_factory(
     cc: CongestionControl,
 ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match cc {
-        CongestionControl::Bbr => Arc::new(crate::congestion::BbrCappedConfig::default()),
+        CongestionControl::Bbr => Arc::new(crate::congestion::BbrCappedConfig),
         CongestionControl::BbrUncapped => Arc::new(quinn::congestion::BbrConfig::default()),
         CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
         CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
