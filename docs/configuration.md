@@ -417,8 +417,8 @@ a packet lost once a packet three numbers later has been acknowledged, or once
 it is 9/8 of a round-trip time old. A path that delivers some packets a few
 milliseconds late meets the first rule on every one of them at a bulk
 download's rate, so each is sent a second time although it arrived, and the
-congestion controller counts a loss that did not happen. volto switches the
-count off and sets the age to 5/4 of the round-trip time, the allowance RACK-TLP
+congestion controller counts a loss that did not happen. From 1.8.2 on volto switches
+the count off and sets the age to 5/4 of the round-trip time, the allowance RACK-TLP
 (RFC 8985) starts with for TCP. This holds for all three values of
 `congestion_control` and there is no key for it. On a production path where 2
 to 3.5 percent of the packets arrived out of order, the server called 94 to 98
