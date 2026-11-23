@@ -905,7 +905,7 @@ documented default when the file does not mention it, and nothing ever rewrites
 `/etc/volto/config.toml`: not `script/deploy.sh` on an update, not
 `install-selfsigned.sh` on a re-run. No key has been renamed or removed. Two
 accepted values of `congestion_control` have been removed: `"bbr-capped"` in
-v1.3.0 and `"bbr-uncapped"` in the release after v1.7.0 (documented under
+v1.3.0 and `"bbr-uncapped"` in v1.8.0 (documented under
 [What is stable from v1.0.0](#what-is-stable-from-v100)). A file that sets
 either is refused at startup, and apart from those two values a file written
 for any earlier release still loads.
@@ -977,7 +977,7 @@ first, the first of two exceptions to the rules above so far. The value existed
 for two patch releases only, so a file that still writes `bbr-capped` is refused
 at startup with an unknown-variant error that gives its line and column, and the
 fix is to write `bbr`. From 1.2.0 to 1.7.0 `bbr-uncapped` selected quinn's BBR as `bbr`
-had selected it before. The release after v1.7.0 removes that value, also
+had selected it before. v1.8.0 removes that value, also
 without a warning release, which is the second exception: `bbr` no longer uses
 quinn's BBR, the comparison the value existed for is made, and quinn's BBR
 loses packets on a bulk download that `bbr` does not. A file that still writes
