@@ -41,21 +41,35 @@
 //! loss of a queue and leaves random loss as it is. The rule below is ours.
 //!
 //! The controller counts the bytes acknowledged and the bytes lost over loss
-//! windows of at least four sample intervals and 2000 packets. A window that
-//! lost one percent or more starts a trial of a lower gain: the gain times the
-//! share delivered, which is the in-flight data the path carried, and never
-//! under the floor. A window that lost so much that the path carried under 0.9
-//! bandwidth-delay products starts no trial, because a queue loses at most
-//! what the window holds above one. If the loss was the queue's, the loss at the lower gain is
-//! the part of the same in-flight data that the lower window still exceeds,
-//! often none. The lower gain is kept when a window within the next eight
-//! loses no more than the middle between the loss before and that prediction.
-//! Otherwise the old gain returns, and the wait before the next trial doubles,
-//! from 4 windows up to 256. Under random loss a trial lowers the gain by the
-//! loss share, 1.25 to 1.225 at 2 percent, so it costs nothing while it runs.
+//! windows of at least four sample intervals and 2000 packets. When the last
+//! four windows at the present gain each lost something and the mean of their
+//! loss shares is one percent or more, a trial of a lower gain starts: the gain
+//! times the share delivered, which is the in-flight data the path carried, and never under
+//! the floor. Windows that lost so much that the path carried under 0.9
+//! bandwidth-delay products start no trial, because a queue loses at most what
+//! the window holds above one. If the loss was the queue's, the loss at the
+//! lower gain is the part of the same in-flight data that the lower window
+//! still exceeds, often none.
 //!
-//! A lowered gain is tried one step of 0.05 higher after 16 windows. The same
-//! test judges it in one window: when the loss is at or past the middle
+//! The first two windows of a trial are left out. The lower gain is kept when
+//! each of the next four lost less than the lowest of the four before the
+//! trial, and their mean is at or under the middle between the loss before and
+//! that prediction. The first of them that does not lose less ends the trial:
+//! the old gain returns, and the wait before the next trial doubles, from 16
+//! windows up to 256. This is a rank test. Eight windows whose loss does not
+//! depend on the gain come in any order with the same chance, and the four
+//! after the change are all below the four before it in 1 of 70 orders. The
+//! chance here is higher than that, because a trial starts only after four
+//! windows that all lost something, and windows without loss pass: loss series
+//! recorded in the lab at a fixed gain passed in 2 to 3 of 100 places. Through
+//! 1.8.0 one window of eight at or under the middle kept the gain, and after a
+//! burst of loss the next window is at or under it at any gain. On a path with
+//! loss in bursts every trial was kept, the gain stayed near the floor, and the
+//! path carried 4 to 5 percent less than at 1.25. Under random loss a trial
+//! lowers the gain by the loss share, 1.25 to 1.225 at 2 percent.
+//!
+//! A lowered gain is tried one step of 0.05 higher after 16 windows. The
+//! middle alone judges it, in one window: when the loss is at or past the middle
 //! between the loss before and the loss predicted for the higher gain, the
 //! queue is still that short, the lowered gain returns and the wait doubles.
 //! A gain that has come down after a loss burst or on a path that has changed
@@ -142,15 +156,36 @@
 //! window, and with it the queue, each time. So the controller empties the
 //! queue before it measures, the way BBR's ProbeRTT does.
 //!
-//! The minimum is the lowest `now - sent` of any acknowledged packet. The
-//! peer's ACK delay is part of it, which can only make it larger. A sample at
-//! or below the minimum replaces it and restarts its 10 s lifetime, BBR's
+//! A sample is the `now - sent` of an acknowledged packet. The peer's ACK
+//! delay is part of it, which can only make it larger. The `now` can make it
+//! smaller: quinn reads the clock once per endpoint poll and hands every ACK
+//! of that poll the same value, so a poll that is held up between the clock
+//! read and the socket read gives samples that are too short by the delay. One
+//! such sample taken as the minimum holds the window under the
+//! bandwidth-delay product for the 10 s it lasts, each delivery-rate sample
+//! then comes out lower than the last, and nothing raises the estimate again:
+//! in the lab a 60 ms path read as 37 ms once every 7 s carried 50 to 81
+//! Mbit/s of 144. So the samples of one `now` count once. A sample under the
+//! minimum lowers it when three values of `now` within a second have given
+//! one, and the new minimum is the highest of the three lowest. A fall in the
+//! path's RTT meets this with the third socket poll that reads an ACK. A
+//! connection whose ACKs arrive less often than three polls in a second keeps
+//! its minimum through such a fall; it sends too little for the window to
+//! limit it, and the first bulk transfer confirms the lower minimum at once.
+//! The rule is ours; BBR takes the
+//! plain minimum, under a window gain of two that a short sample does not
+//! bring under the bandwidth-delay product.
+//!
+//! A sample equal to the minimum restarts its 10 s lifetime, BBR's
 //! MinRTTFilterLen. The first ACK after the lifetime ends that does not find
 //! the sender app-limited starts a probe: the window is held at half the
 //! estimated bandwidth-delay product, the target of BBRv2's ProbeRTT, and at
 //! least four packets. Once in-flight data has fallen to that window, the probe
-//! lasts 200 ms or one smoothed RTT, whichever is longer. The lowest sample
-//! seen since the probe started then becomes the new minimum. While the sender
+//! lasts 200 ms or one smoothed RTT, whichever is longer. The new minimum is
+//! then taken from the samples since the probe started: the highest of the
+//! lowest samples of the three values of `now` that gave the lowest ones,
+//! without the limit of a second, or the lowest sample when the probe saw
+//! fewer than three values of `now`. While the sender
 //! is app-limited the probe does not start, because the window does not limit
 //! an app-limited sender. ACKs that arrive during a probe count as app-limited
 //! for the delivery rate, so the probe's own low samples do not lower the
@@ -162,7 +197,7 @@
 //! app-limited. By then the estimate has fallen to what the floor carries, so
 //! once the probe has taken the new minimum, the climb back to the new
 //! bandwidth-delay product brings the startup gain back. A fall in RTT takes
-//! effect with the first lower sample. Each probe holds the window low for
+//! effect with the third arrival that shows it. Each probe holds the window low for
 //! about a quarter of a second.
 //!
 //! A delivery-rate sample is bounded by the send interval of its packets as
@@ -226,8 +261,8 @@ const LOSS_TRIGGER_PPM: u64 = 10_000;
 
 /// The least a path must have carried, as a gain in per mille, for a lower gain
 /// to be tried. A queue loses at most what the window holds above one
-/// bandwidth-delay product, 20 percent at 1.25. A loss window after which the
-/// gain times the share delivered is under 0.9 lost more than a queue explains. In the lab a 3 s burst of 90
+/// bandwidth-delay product, 20 percent at 1.25. Loss windows after which the
+/// gain times the mean share delivered is under 0.9 lost more than a queue explains. In the lab a 3 s burst of 90
 /// percent loss would otherwise lower the gain to the floor for the climb back.
 const LEAST_CARRIED_PERMILLE: u64 = 900;
 
@@ -255,16 +290,30 @@ const SETTLE_INTERVALS: u8 = 2;
 /// two intervals after the end of a startup still lost 16 percent to it.
 const STARTUP_SETTLE_INTERVALS: u8 = 8;
 
-/// How many loss windows a lower gain on trial has to show the loss the queue
-/// rule predicts. The receiver first has to take the retransmissions of what
-/// was lost before, and until then the sender stalls on flow control and
-/// refills in bursts, which lose more.
-const TRIAL_WINDOWS: u8 = 8;
+/// How many loss windows at the present gain a lower gain is measured against,
+/// and how many windows at the lower gain are judged. Eight windows whose loss
+/// does not depend on the gain come in any order with the same chance, and all
+/// of the later four are below all of the earlier four in 1 of 70 orders. A
+/// trial starts only after four windows that all lost something, which raises
+/// that chance: in the lab, loss series recorded at a fixed gain passed in 2 to
+/// 3 of 100 places.
+const TRIAL_WINDOWS: usize = 4;
+
+/// [`TRIAL_WINDOWS`] as the divisor of a sum of loss shares.
+const TRIAL_WINDOWS_U64: u64 = 4;
+
+/// How many loss windows at a lower gain on trial are left out before the
+/// judged ones. The receiver first has to take the retransmissions of what was
+/// lost before, and until then the sender stalls on flow control and refills in
+/// bursts, which lose more.
+const TRIAL_SKIPPED_WINDOWS: u8 = 2;
 
 /// How many loss windows pass after a lower gain was refused before one is
 /// tried again. Doubles with each refusal up to [`MAX_WAIT`], and starts again
-/// here when one is kept.
-const FIRST_BACKOFF: u16 = 4;
+/// here when one is kept. A trial runs at a gain under the one the path needs,
+/// so under loss that is not the queue's the trials themselves cost rate: in
+/// the lab a wait of 4 put a third of a 60 s transfer on trial.
+const FIRST_BACKOFF: u16 = 16;
 
 /// How many loss windows a lowered gain is held before a higher one is tried.
 /// Doubles each time the higher one is refused, up to [`MAX_WAIT`], and starts
@@ -306,8 +355,16 @@ const FALLEN_PERCENT: u128 = 50;
 /// estimate grows by about 12 percent per sample.
 const RISES_TO_RESTART: u8 = 3;
 
-/// How long a minimum RTT holds without a sample at or below it before a probe
-/// measures it again: BBR's MinRTTFilterLen.
+/// How many ACK batches with different arrival times have to give an RTT sample
+/// under the minimum before the minimum comes down, to the highest of their
+/// lowest samples.
+const MIN_RTT_CONFIRMATIONS: usize = 3;
+
+/// How long a sample under the minimum waits for the others that confirm it.
+const LOW_SAMPLE_LIFETIME: Duration = Duration::from_secs(1);
+
+/// How long a minimum RTT holds without a sample equal to it or a confirmed
+/// lower one before a probe measures it again: BBR's MinRTTFilterLen.
 const MIN_RTT_LIFETIME: Duration = Duration::from_secs(10);
 
 /// The shortest time a probe holds its window once in-flight data has fallen
@@ -328,6 +385,7 @@ impl ControllerFactory for BbrCappedConfig {
             rate: DeliveryRate::default(),
             startup: Startup::default(),
             min_rtt: None,
+            low: LowSamples::default(),
             probe: None,
             srtt: Duration::ZERO,
             mtu: current_mtu.into(),
@@ -348,8 +406,12 @@ impl ControllerFactory for BbrCappedConfig {
 pub struct BbrCapped {
     rate: DeliveryRate,
     startup: Startup,
-    /// The lowest RTT sample and when it was taken; `None` before the first ACK.
+    /// The minimum RTT and when it was taken or last renewed; `None` before
+    /// the first ACK.
     min_rtt: Option<(Duration, Instant)>,
+    /// The samples under the minimum that are not confirmed yet, and during a
+    /// probe the lowest samples of the probe.
+    low: LowSamples,
     /// The probe in progress, if any.
     probe: Option<Probe>,
     /// quinn's smoothed RTT as it was before the latest ACK frame, since quinn
@@ -449,6 +511,51 @@ impl Startup {
     }
 }
 
+/// The lowest RTT samples of up to [`MIN_RTT_CONFIRMATIONS`] arrival times.
+///
+/// quinn reads the clock once per endpoint poll and hands every ACK of that
+/// poll the same `now` (quinn `EndpointDriver::poll`). A poll that is held up
+/// between the clock read and the socket read, by the scheduler or by the host
+/// of a virtual machine, gives samples that are too short by the delay, all
+/// under one `now`. So one `now` counts once, and a minimum needs
+/// [`MIN_RTT_CONFIRMATIONS`] of them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LowSamples([Option<(Instant, Duration)>; MIN_RTT_CONFIRMATIONS]);
+
+impl LowSamples {
+    /// Takes a sample that arrived at `now`. Entries older than `lifetime` are
+    /// dropped first. The lowest sample per `now` is kept, for the
+    /// [`MIN_RTT_CONFIRMATIONS`] values of `now` whose lowest sample is lowest.
+    fn add(&mut self, now: Instant, rtt: Duration, lifetime: Option<Duration>) {
+        if let Some(lifetime) = lifetime {
+            for entry in &mut self.0 {
+                if entry.is_some_and(|(at, _)| now.saturating_duration_since(at) > lifetime) {
+                    *entry = None;
+                }
+            }
+        }
+        if let Some((_, lowest)) = self.0.iter_mut().flatten().find(|(at, _)| *at == now) {
+            *lowest = (*lowest).min(rtt);
+        } else if let Some(free) = self.0.iter_mut().find(|entry| entry.is_none()) {
+            *free = Some((now, rtt));
+        } else if let Some(highest) = self.0.iter_mut().flatten().max_by_key(|(_, rtt)| *rtt)
+            && rtt < highest.1
+        {
+            *highest = (now, rtt);
+        }
+    }
+
+    /// The highest of the kept samples once every slot is filled: the
+    /// [`MIN_RTT_CONFIRMATIONS`]-th lowest of the arrival times seen.
+    fn confirmed(&self) -> Option<Duration> {
+        let mut highest = Duration::ZERO;
+        for entry in &self.0 {
+            highest = highest.max(entry.as_ref()?.1);
+        }
+        Some(highest)
+    }
+}
+
 /// A probe that holds the window low to measure the minimum RTT again.
 #[derive(Debug, Clone)]
 struct Probe {
@@ -496,6 +603,7 @@ impl BbrCapped {
         let rtt = now.saturating_duration_since(sent);
         if let Some(probe) = &mut self.probe {
             probe.min = probe.min.min(rtt);
+            self.low.add(now, rtt, None);
             return;
         }
         match self.min_rtt {
@@ -505,12 +613,23 @@ impl BbrCapped {
                         min: rtt,
                         ends: None,
                     });
+                    self.low = LowSamples::default();
+                    self.low.add(now, rtt, None);
                     self.refresh();
                 }
             }
             // An equal sample only restarts the lifetime.
             Some((min, _)) if rtt == min => self.min_rtt = Some((rtt, now)),
-            _ => {
+            // A lower sample waits for two more arrival times that confirm it.
+            Some(_) => {
+                self.low.add(now, rtt, Some(LOW_SAMPLE_LIFETIME));
+                if let Some(confirmed) = self.low.confirmed() {
+                    self.min_rtt = Some((confirmed, now));
+                    self.low = LowSamples::default();
+                    self.refresh();
+                }
+            }
+            None => {
                 self.min_rtt = Some((rtt, now));
                 self.refresh();
             }
@@ -530,7 +649,10 @@ impl BbrCapped {
                 probe.ends = Some(now + PROBE_TIME.max(self.srtt));
             }
             Some(ends) if now >= ends => {
-                self.min_rtt = Some((probe.min, now));
+                // A probe too short for the confirmations takes its lowest sample.
+                let min = self.low.confirmed().unwrap_or(probe.min);
+                self.min_rtt = Some((min, now));
+                self.low = LowSamples::default();
                 self.probe = None;
                 return true;
             }
@@ -664,6 +786,11 @@ struct Gain {
     hold: u16,
     /// Loss windows to pass before a floor the guard raised comes down a step.
     floor_wait: u16,
+    /// The loss shares of the latest windows at the present gain outside a
+    /// trial, in parts per million, newest last.
+    recent: [u64; TRIAL_WINDOWS],
+    /// How many of them there are.
+    recent_len: usize,
 }
 
 /// A gain on trial.
@@ -671,10 +798,16 @@ struct Gain {
 struct Trial {
     /// The gain before the trial.
     from: u64,
-    /// The loss share at that gain, in parts per million.
+    /// The loss share at that gain, in parts per million: for a lower gain the
+    /// mean of the [`TRIAL_WINDOWS`] windows before the trial, for a higher
+    /// gain the window before it.
     loss_ppm: u64,
-    /// Loss windows judged so far.
+    /// The lowest loss share of the windows before a trial of a lower gain.
+    lowest_ppm: u64,
+    /// Loss windows since the trial started.
     windows: u8,
+    /// The sum of the loss shares of the judged windows of a lower gain.
+    judged_ppm: u64,
 }
 
 impl Default for Gain {
@@ -694,6 +827,8 @@ impl Default for Gain {
             up_wait: FIRST_HOLD,
             hold: FIRST_HOLD,
             floor_wait: 0,
+            recent: [0; TRIAL_WINDOWS],
+            recent_len: 0,
         }
     }
 }
@@ -750,6 +885,7 @@ impl Gain {
             // what it started from.
             self.restart();
             self.trial = None;
+            self.recent_len = 0;
             self.hold = FIRST_HOLD;
             if self.permille < CWND_GAIN_PERMILLE {
                 self.set(
@@ -778,6 +914,7 @@ impl Gain {
         if permille != self.permille {
             self.permille = permille;
             self.settle = SETTLE_INTERVALS;
+            self.recent_len = 0;
         }
     }
 
@@ -808,16 +945,20 @@ impl Gain {
         }
         if let Some(trial) = self.trial.take() {
             self.judge(trial, loss_ppm, estimate, limited);
-        } else if !self.try_lower(loss_ppm, estimate)
-            && self.permille < CWND_GAIN_PERMILLE
-            && !limited
-        {
+            return;
+        }
+        self.recent.rotate_left(1);
+        self.recent[TRIAL_WINDOWS - 1] = loss_ppm;
+        self.recent_len = (self.recent_len + 1).min(TRIAL_WINDOWS);
+        if !self.try_lower(estimate) && self.permille < CWND_GAIN_PERMILLE && !limited {
             self.up_wait = self.up_wait.saturating_sub(1);
             if self.up_wait == 0 {
                 self.trial = Some(Trial {
                     from: self.permille,
                     loss_ppm,
+                    lowest_ppm: 0,
                     windows: 0,
+                    judged_ppm: 0,
                 });
                 let higher = (self.permille + GAIN_STEP_UP_PERMILLE).min(CWND_GAIN_PERMILLE);
                 self.set(higher, "higher tried", loss_ppm, estimate);
@@ -831,12 +972,20 @@ impl Gain {
         self.backoff = (self.backoff * 2).min(MAX_WAIT);
     }
 
-    /// Starts a trial of the gain the path carried, when the window lost
-    /// [`LOSS_TRIGGER_PPM`] or more, no wait is running, the path carried
-    /// [`LEAST_CARRIED_PERMILLE`] or more and that gain is at least
-    /// [`GAIN_MIN_STEP_PERMILLE`] lower. Returns whether it did.
-    fn try_lower(&mut self, loss_ppm: u64, estimate: u64) -> bool {
-        if loss_ppm < LOSS_TRIGGER_PPM || self.down_wait > 0 {
+    /// Starts a trial of the gain the path carried, when the last
+    /// [`TRIAL_WINDOWS`] windows at the present gain each lost something and
+    /// together lost [`LOSS_TRIGGER_PPM`] or more, no wait is running, the path
+    /// carried [`LEAST_CARRIED_PERMILLE`] or more and that gain is at least
+    /// [`GAIN_MIN_STEP_PERMILLE`] lower. A window without loss cannot be
+    /// beaten, so with one among them there is nothing to measure against.
+    /// Returns whether it did.
+    fn try_lower(&mut self, estimate: u64) -> bool {
+        if self.down_wait > 0 || self.recent_len < TRIAL_WINDOWS {
+            return false;
+        }
+        let lowest_ppm = self.recent.iter().copied().min().unwrap_or(0);
+        let loss_ppm = self.recent.iter().sum::<u64>() / TRIAL_WINDOWS_U64;
+        if lowest_ppm == 0 || loss_ppm < LOSS_TRIGGER_PPM {
             return false;
         }
         let carried = Self::carried(self.permille, loss_ppm);
@@ -850,31 +999,50 @@ impl Gain {
         self.trial = Some(Trial {
             from: self.permille,
             loss_ppm,
+            lowest_ppm,
             windows: 0,
+            judged_ppm: 0,
         });
         self.set(target, "lower tried", loss_ppm, estimate);
         true
     }
 
-    /// Judges a trial by the loss of one more window at the gain on trial. The
-    /// loss is on the queue's side when it is at or past the middle between
-    /// the loss before the trial and the loss the queue rule predicts. A
-    /// window that was mostly app-limited did not fill the queue, so it can
-    /// refuse a higher gain and cannot keep one.
+    /// Judges a trial by the loss of one more window at the gain on trial.
+    ///
+    /// A lower gain is kept when, after [`TRIAL_SKIPPED_WINDOWS`] windows,
+    /// each of the next [`TRIAL_WINDOWS`] lost less than the lowest of the
+    /// windows before the trial, and their mean is at or under the middle
+    /// between the loss before the trial and the loss the queue rule predicts.
+    /// The first judged window that does not lose less ends the trial.
+    ///
+    /// A higher gain is judged in one window: the loss is on the queue's side
+    /// when it is at or past that middle. A window that was mostly app-limited
+    /// did not fill the queue, so it can refuse a higher gain and cannot keep
+    /// one.
     fn judge(&mut self, trial: Trial, loss_ppm: u64, estimate: u64, limited: bool) {
         let predicted = Self::predicted_loss_ppm(trial.from, trial.loss_ppm, self.permille);
         let middle = (trial.loss_ppm + predicted) / 2;
         let windows = trial.windows + 1;
         if self.permille < trial.from {
-            if loss_ppm <= middle {
+            let judged = usize::from(windows.saturating_sub(TRIAL_SKIPPED_WINDOWS));
+            let judged_ppm = trial.judged_ppm + loss_ppm;
+            if judged == 0 {
+                self.trial = Some(Trial { windows, ..trial });
+            } else if loss_ppm >= trial.lowest_ppm
+                || (judged == TRIAL_WINDOWS && judged_ppm > middle * TRIAL_WINDOWS_U64)
+            {
+                self.refuse_lower();
+                self.set(trial.from, "lower refused", loss_ppm, estimate);
+            } else if judged < TRIAL_WINDOWS {
+                self.trial = Some(Trial {
+                    windows,
+                    judged_ppm,
+                    ..trial
+                });
+            } else {
                 self.backoff = FIRST_BACKOFF;
                 self.up_wait = self.hold;
                 self.set(self.permille, "lower kept", loss_ppm, estimate);
-            } else if windows < TRIAL_WINDOWS {
-                self.trial = Some(Trial { windows, ..trial });
-            } else {
-                self.refuse_lower();
-                self.set(trial.from, "lower refused", loss_ppm, estimate);
             }
         } else if loss_ppm >= middle {
             self.hold = (self.hold * 2).min(MAX_WAIT);
@@ -1233,26 +1401,47 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_lost_under_one_percent_leaves_the_gain() {
-        let mut g = settled();
-        g.on_window(9_999, ESTIMATE, false);
-        assert_eq!(g, settled());
+    fn the_divisor_of_the_trial_windows_is_their_count() {
+        assert_eq!(u64::try_from(TRIAL_WINDOWS), Ok(TRIAL_WINDOWS_U64));
+    }
+
+    /// `n` loss windows that each lost `loss_ppm`.
+    fn windows(g: &mut Gain, n: usize, loss_ppm: u64) {
+        for _ in 0..n {
+            g.on_window(loss_ppm, ESTIMATE, false);
+        }
     }
 
     #[test]
-    fn a_window_that_lost_one_percent_starts_a_trial_of_the_gain_the_path_carried() {
+    fn four_windows_that_lost_under_one_percent_leave_the_gain() {
         let mut g = settled();
-        g.on_window(10_000, ESTIMATE, false);
+        windows(&mut g, 4, 9_999);
+        assert_eq!((g.permille, g.trial), (1250, None));
+        windows(&mut g, 40, 9_999);
+        assert_eq!((g.permille, g.trial), (1250, None));
+    }
+
+    #[test]
+    fn four_windows_that_lost_one_percent_start_a_trial_of_the_gain_the_path_carried() {
+        let mut g = settled();
+        windows(&mut g, 3, 10_000);
+        assert_eq!((g.permille, g.trial), (1250, None), "three are too few");
+        windows(&mut g, 1, 10_000);
         assert_eq!(g.permille, 1237, "1250 x 0.99");
+
         let mut g = settled();
-        g.on_window(80_000, ESTIMATE, false);
-        assert_eq!(g.permille, 1150, "1250 x 0.92");
+        for loss_ppm in [60_000, 100_000, 80_000, 80_000] {
+            g.on_window(loss_ppm, ESTIMATE, false);
+        }
+        assert_eq!(g.permille, 1150, "1250 x 0.92, by the mean of the four");
         assert_eq!(
             g.trial,
             Some(Trial {
                 from: 1250,
                 loss_ppm: 80_000,
-                windows: 0
+                lowest_ppm: 60_000,
+                windows: 0,
+                judged_ppm: 0
             })
         );
         assert_eq!(g.reference, ESTIMATE, "the guard's reference");
@@ -1260,23 +1449,39 @@ mod tests {
     }
 
     #[test]
+    fn a_window_without_loss_among_the_four_starts_no_trial() {
+        let mut g = settled();
+        for loss_ppm in [80_000, 0, 80_000, 80_000] {
+            g.on_window(loss_ppm, ESTIMATE, false);
+        }
+        assert_eq!((g.permille, g.trial), (1250, None), "6 percent together");
+        windows(&mut g, 1, 80_000);
+        assert_eq!(
+            g.permille, 1250,
+            "the window without loss is still one of the four"
+        );
+        windows(&mut g, 1, 80_000);
+        assert_eq!(g.permille, 1150);
+    }
+
+    #[test]
     fn a_trial_never_goes_under_the_floor_and_never_moves_the_gain_by_under_a_hundredth() {
         let mut g = settled();
-        g.on_window(200_000, ESTIMATE, false);
+        windows(&mut g, 4, 200_000);
         assert_eq!(g.permille, 1050, "1250 x 0.8 is 1000, under the floor");
 
         let mut g = lowered(1060);
-        g.on_window(50_000, ESTIMATE, false);
+        windows(&mut g, 4, 50_000);
         assert_eq!(g.permille, 1050, "a step of 10 is tried");
 
         let mut g = lowered(1059);
-        g.on_window(50_000, ESTIMATE, false);
+        windows(&mut g, 4, 50_000);
         assert_eq!(g.permille, 1059, "a step of 9 is not");
         assert_eq!(g.trial, None);
         assert_eq!(
             g.up_wait,
-            FIRST_HOLD - 1,
-            "the window counts towards the hold"
+            FIRST_HOLD - 4,
+            "the windows count towards the hold"
         );
 
         let mut g = Gain {
@@ -1284,34 +1489,47 @@ mod tests {
             floor_wait: MAX_WAIT,
             ..settled()
         };
-        g.on_window(80_000, ESTIMATE, false);
+        windows(&mut g, 4, 80_000);
         assert_eq!(g.permille, 1200, "a raised floor holds the trial up");
     }
 
     #[test]
-    fn a_window_that_lost_more_than_a_queue_can_starts_no_trial() {
+    fn windows_that_lost_more_than_a_queue_can_start_no_trial() {
         let mut g = settled();
-        g.on_window(280_001, ESTIMATE, false);
-        assert_eq!(g, settled(), "1250 x 0.719999 is 899");
-        g.on_window(280_000, ESTIMATE, false);
-        assert_eq!(g.permille, 1050, "1250 x 0.72 is 900: tried, at the floor");
+        windows(&mut g, 4, 280_001);
+        assert_eq!(
+            (g.permille, g.trial),
+            (1250, None),
+            "1250 x 0.719999 is 899"
+        );
+        windows(&mut g, 1, 280_000);
+        assert_eq!(
+            g.permille, 1050,
+            "the mean, cut to a whole part per million, is 28 percent: 900, tried, at the floor"
+        );
 
         let mut g = lowered(1100);
-        g.on_window(190_000, ESTIMATE, false);
+        windows(&mut g, 4, 190_000);
         assert_eq!((g.permille, g.trial), (1100, None), "1100 x 0.81 is 891");
     }
 
     #[test]
-    fn a_lower_gain_is_kept_when_a_window_loses_no_more_than_the_middle() {
+    fn a_lower_gain_is_kept_when_four_windows_lose_less_than_any_before_and_no_more_than_the_middle()
+     {
         // 1250 at 8 percent carried 1150, so at 1150 the queue rule predicts no
         // loss and the middle is 4 percent.
         let mut g = settled();
         g.backoff = 64;
-        g.on_window(80_000, ESTIMATE, false);
-        g.on_window(40_001, ESTIMATE, false);
-        assert_eq!(g.trial.map(|t| t.windows), Some(1), "still on trial");
-        assert_eq!(g.permille, 1150);
-        g.on_window(40_000, ESTIMATE, false);
+        windows(&mut g, 4, 80_000);
+        windows(&mut g, 2, 300_000);
+        assert_eq!(
+            (g.permille, g.trial.map(|t| (t.windows, t.judged_ppm))),
+            (1150, Some((2, 0))),
+            "the first two windows are left out"
+        );
+        windows(&mut g, 3, 40_000);
+        assert_eq!(g.trial.map(|t| t.windows), Some(5), "still on trial");
+        windows(&mut g, 1, 40_000);
         assert_eq!(g.trial, None);
         assert_eq!(g.permille, 1150, "kept");
         assert_eq!(
@@ -1324,47 +1542,79 @@ mod tests {
             "set by the change, not by keeping it"
         );
 
+        // The sum of the four one part per million above four times the middle.
+        let mut g = settled();
+        windows(&mut g, 4, 80_000);
+        windows(&mut g, 5, 40_000);
+        windows(&mut g, 1, 40_001);
+        assert_eq!((g.permille, g.trial), (1250, None), "refused");
+
         // 1250 at 20 percent carried 1000. At the floor, 1050, the rule predicts
         // 1 - 1000/1050, 4.762 percent, and the middle is 12.381 percent.
         let mut g = settled();
-        g.on_window(200_000, ESTIMATE, false);
-        g.on_window(123_811, ESTIMATE, false);
-        assert!(g.trial.is_some(), "one part per million above the middle");
-        g.on_window(123_810, ESTIMATE, false);
+        windows(&mut g, 4, 200_000);
+        windows(&mut g, 6, 123_810);
         assert_eq!((g.trial, g.permille), (None, 1050));
     }
 
     #[test]
-    fn a_lower_gain_is_refused_after_eight_windows_and_the_wait_doubles() {
+    fn a_lower_gain_is_refused_by_the_first_judged_window_that_does_not_lose_less() {
+        let before = [50_000, 110_000, 80_000, 80_000];
+        let tried = || {
+            let mut g = settled();
+            for loss_ppm in before {
+                g.on_window(loss_ppm, ESTIMATE, false);
+            }
+            assert_eq!(g.permille, 1150);
+            windows(&mut g, 2, 0);
+            g
+        };
+        let mut g = tried();
+        windows(&mut g, 1, 49_999);
+        assert_eq!(g.permille, 1150, "under the lowest of the four: on trial");
+        let mut g = tried();
+        windows(&mut g, 1, 50_000);
+        assert_eq!(
+            (g.permille, g.trial),
+            (1250, None),
+            "the lowest of the four again: refused at once"
+        );
+        let mut g = tried();
+        windows(&mut g, 3, 0);
+        windows(&mut g, 1, 50_000);
+        assert_eq!(
+            (g.permille, g.trial),
+            (1250, None),
+            "the last one decides too"
+        );
+    }
+
+    #[test]
+    fn a_refused_lower_gain_waits_sixteen_windows_and_the_wait_doubles() {
         let mut g = settled();
-        g.on_window(20_000, ESTIMATE, false);
+        windows(&mut g, 4, 20_000);
         assert_eq!(g.permille, 1225, "1250 x 0.98");
-        for _ in 0..7 {
-            g.on_window(20_000, ESTIMATE, false);
-            assert_eq!(g.permille, 1225, "on trial for eight windows");
-        }
-        g.on_window(20_000, ESTIMATE, false);
+        windows(&mut g, 2, 20_000);
+        assert_eq!(g.permille, 1225, "left out");
+        windows(&mut g, 1, 20_000);
         assert_eq!((g.permille, g.trial), (1250, None), "random loss: refused");
-        assert_eq!((g.down_wait, g.backoff), (4, 8));
+        assert_eq!((g.down_wait, g.backoff), (16, 32));
         assert_eq!(g.settle, SETTLE_INTERVALS);
 
-        for _ in 0..3 {
-            g.on_window(20_000, ESTIMATE, false);
+        for _ in 0..15 {
+            windows(&mut g, 1, 20_000);
             assert_eq!(g.permille, 1250, "no trial during the wait");
         }
-        g.on_window(20_000, ESTIMATE, false);
-        assert_eq!(g.permille, 1225, "the fourth window after the refusal");
-        for _ in 0..8 {
-            g.on_window(20_000, ESTIMATE, false);
-        }
-        assert_eq!((g.permille, g.down_wait, g.backoff), (1250, 8, 16));
+        windows(&mut g, 1, 20_000);
+        assert_eq!(g.permille, 1225, "the sixteenth window after the refusal");
+        windows(&mut g, 3, 20_000);
+        assert_eq!((g.permille, g.down_wait, g.backoff), (1250, 32, 64));
 
         g.backoff = MAX_WAIT;
         g.down_wait = 0;
-        g.on_window(20_000, ESTIMATE, false);
-        for _ in 0..8 {
-            g.on_window(20_000, ESTIMATE, false);
-        }
+        windows(&mut g, 4, 20_000);
+        assert_eq!(g.permille, 1225, "the four windows since the refusal");
+        windows(&mut g, 3, 20_000);
         assert_eq!((g.down_wait, g.backoff), (MAX_WAIT, MAX_WAIT));
     }
 
@@ -1382,7 +1632,9 @@ mod tests {
             Some(Trial {
                 from: 1100,
                 loss_ppm: 5_000,
-                windows: 0
+                lowest_ppm: 0,
+                windows: 0,
+                judged_ppm: 0
             })
         );
 
@@ -1395,7 +1647,11 @@ mod tests {
         for _ in 0..40 {
             g.on_window(0, ESTIMATE, false);
         }
-        assert_eq!(g, settled(), "nothing to raise at 1.25");
+        assert_eq!(
+            (g.permille, g.trial, g.up_wait),
+            (1250, None, FIRST_HOLD),
+            "nothing to raise at 1.25"
+        );
     }
 
     #[test]
@@ -1449,16 +1705,16 @@ mod tests {
         g.on_window(0, 13_500_002, false);
         assert_eq!(g.permille, 1250, "given up");
         assert_eq!(g.floor, 1150, "no later trial goes that low");
-        assert_eq!((g.down_wait, g.backoff), (4, 8));
+        assert_eq!((g.down_wait, g.backoff), (16, 32));
         assert_eq!(g.hold, FIRST_HOLD);
 
         // The guard also ends a trial, and its floor never passes 1.25.
         let mut g = settled();
-        g.on_window(20_000, ESTIMATE, false);
+        windows(&mut g, 4, 20_000);
         g.on_window(0, ESTIMATE / 2, false);
         assert_eq!((g.permille, g.trial, g.floor), (1250, None, 1250));
         g.down_wait = 0;
-        g.on_window(200_000, ESTIMATE, false);
+        windows(&mut g, 4, 200_000);
         assert_eq!(g.permille, 1250, "with the floor at 1.25 nothing is tried");
 
         // At 1.25 there is no guard: the reference is taken when a trial starts.
@@ -1468,8 +1724,10 @@ mod tests {
         };
         g.on_window(0, 1, false);
         assert_eq!((g.permille, g.floor), (1250, 1050));
-        g.on_window(80_000, 1_000, false);
-        assert_eq!(g.reference, 1_000);
+        for _ in 0..4 {
+            g.on_window(80_000, 1_000, false);
+        }
+        assert_eq!((g.permille, g.reference), (1150, 1_000));
     }
 
     #[test]
@@ -1485,8 +1743,16 @@ mod tests {
         }
         assert_eq!((g.permille, g.intervals), (1250, 3), "three intervals");
         gain_interval(&mut g, 588_000, 12_000);
-        assert_eq!(g.permille, 1225, "2 percent of 2.4 MB lost");
         assert_eq!((g.acked, g.lost, g.intervals), (0, 0, 0), "a new window");
+        assert_eq!(
+            (g.recent_len, g.recent[TRIAL_WINDOWS - 1]),
+            (1, 20_000),
+            "2 percent of 2.4 MB lost"
+        );
+        for _ in 0..12 {
+            gain_interval(&mut g, 588_000, 12_000);
+        }
+        assert_eq!(g.permille, 1225, "four such windows");
 
         let mut g = settled();
         for _ in 0..4 {
@@ -1498,9 +1764,13 @@ mod tests {
             "2.32 MB is under 2000 packets"
         );
         gain_interval(&mut g, 79_999, 0);
-        assert_eq!(g.permille, 1250, "one byte short");
+        assert_eq!(g.recent_len, 0, "one byte short");
         gain_interval(&mut g, 1, 0);
-        assert_eq!(g.permille, 1050, "17 percent lost: lowered to the floor");
+        assert_eq!(
+            (g.recent_len, g.recent[TRIAL_WINDOWS - 1]),
+            (1, 166_666),
+            "0.4 MB of 2.4 MB lost"
+        );
     }
 
     #[test]
@@ -1517,9 +1787,9 @@ mod tests {
         for _ in 0..5 {
             gain_interval(&mut g, 600_000, 200_000);
         }
-        assert_eq!(g.permille, 1250, "two settle intervals and three counted");
+        assert_eq!(g.recent_len, 0, "two settle intervals and three counted");
         gain_interval(&mut g, 600_000, 200_000);
-        assert_eq!(g.permille, 1050);
+        assert_eq!((g.recent_len, g.recent[TRIAL_WINDOWS - 1]), (1, 250_000));
     }
 
     #[test]
@@ -1528,7 +1798,9 @@ mod tests {
         g.trial = Some(Trial {
             from: 1150,
             loss_ppm: 50_000,
+            lowest_ppm: 40_000,
             windows: 3,
+            judged_ppm: 0,
         });
         for _ in 0..31 {
             gain_interval(&mut g, 1_000, 1_000);
@@ -1543,6 +1815,18 @@ mod tests {
             gain_interval(&mut g, 1_000, 1_000);
         }
         assert_eq!(g, settled(), "at 1.25 the window is only dropped");
+
+        // The windows before it are dropped as well: a later one would be
+        // measured against a transfer that has ended.
+        let mut g = settled();
+        windows(&mut g, 3, 80_000);
+        assert_eq!(g.recent_len, 3);
+        for _ in 0..32 {
+            gain_interval(&mut g, 1_000, 1_000);
+        }
+        assert_eq!((g.permille, g.recent_len), (1250, 0));
+        windows(&mut g, 1, 80_000);
+        assert_eq!((g.permille, g.trial), (1250, None));
     }
 
     /// A refused trial of 1.25 itself doubles the hold like any other.
@@ -1624,10 +1908,14 @@ mod tests {
         // Lowering does not wait for a window that is not app-limited: behind
         // a short queue nearly half of all intervals are app-limited.
         let mut g = settled();
-        g.on_window(80_000, ESTIMATE, true);
+        for _ in 0..4 {
+            g.on_window(80_000, ESTIMATE, true);
+        }
         assert_eq!(g.permille, 1150);
-        g.on_window(0, ESTIMATE, true);
-        assert_eq!(g.trial, None, "kept");
+        for _ in 0..6 {
+            g.on_window(0, ESTIMATE, true);
+        }
+        assert_eq!((g.permille, g.trial), (1150, None), "kept");
     }
 
     #[test]
@@ -1687,6 +1975,11 @@ mod tests {
         assert_eq!((c.gain.permille, c.gain.intervals), (1250, 3));
         c.on_congestion_event(t, t - MIN_RTT, false, 50_000);
         t = interval(&mut c, t, 6_500_000, false);
+        assert_eq!(c.gain.recent_len, 1, "a window");
+        for _ in 0..12 {
+            c.on_congestion_event(t, t - MIN_RTT, false, 50_000);
+            t = interval(&mut c, t, 6_500_000, false);
+        }
         assert_eq!(c.gain.permille, 1160, "1250 x (1 - 0.2 / 2.8)");
 
         let mut c = estimated(t0);
@@ -1698,7 +1991,8 @@ mod tests {
             t = interval(&mut c, t, 6_500_000, false);
         }
         assert_eq!(
-            c.gain.permille, 1250,
+            (c.gain.recent_len, c.gain.intervals),
+            (0, 4),
             "2.8 MB is under 2000 packets of 1500"
         );
     }
@@ -1713,8 +2007,9 @@ mod tests {
         c.gain = settled();
         end_acks(&mut c, t0, false);
         let mut t = t0;
-        // Three of the window's four intervals.
-        for _ in 0..3 {
+        // Three loss windows of four intervals and three intervals of the
+        // fourth.
+        for _ in 0..15 {
             c.on_congestion_event(t, t - MIN_RTT, false, 125_000);
             t = interval(&mut c, t, BANDWIDTH, false);
             assert_eq!(c.cap(), Some(1_125_000), "1.25 x 15 MB/s x 60 ms");
@@ -2071,8 +2366,11 @@ mod tests {
         let mut c = estimated(t0);
         ack(&mut c, t0 + ms(1_000), ms(70), 0, false);
         assert_eq!(c.cap(), Some(1_125_000), "a higher sample leaves it");
+        ack(&mut c, t0 + ms(4_998), ms(55), 0, false);
+        ack(&mut c, t0 + ms(4_999), ms(55), 0, false);
+        assert_eq!(c.cap(), Some(1_125_000), "two lower arrivals leave it");
         ack(&mut c, t0 + ms(5_000), ms(55), 0, false);
-        assert_eq!(c.cap(), Some(1_031_250), "a lower one replaces it");
+        assert_eq!(c.cap(), Some(1_031_250), "the third replaces it");
         ack(&mut c, t0 + ms(9_000), ms(55), 0, false);
 
         // The equal sample at 9 s renewed it, so 10 s after that it still holds.
@@ -2150,7 +2448,7 @@ mod tests {
     }
 
     #[test]
-    fn the_new_minimum_is_the_lowest_sample_of_the_probe_even_above_the_old_one() {
+    fn the_new_minimum_is_the_third_lowest_arrival_of_the_probe_even_above_the_old_one() {
         let t0 = Instant::now();
         let mut c = estimated(t0);
         // The path RTT has risen from 60 to 150 ms.
@@ -2168,8 +2466,77 @@ mod tests {
         end_acks(&mut c, t1 + ms(220), false);
 
         assert!(c.probe.is_none());
-        assert_eq!(c.min_rtt, Some((ms(150), t1 + ms(220))));
-        assert_eq!(c.cap(), Some(2_812_500), "1.25 x 15 MB/s x 150 ms");
+        assert_eq!(
+            c.min_rtt,
+            Some((ms(155), t1 + ms(220))),
+            "of 160, 150, 155 and 152"
+        );
+        assert_eq!(c.cap(), Some(2_906_250), "1.25 x 15 MB/s x 155 ms");
+    }
+
+    #[test]
+    fn a_probe_with_under_three_arrivals_takes_its_lowest_sample() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(10_001);
+        ack(&mut c, t1, ms(160), 0, false);
+        ack(&mut c, t1 + ms(10), ms(150), 0, false);
+        end_acks(&mut c, t1 + ms(10), false);
+        end_acks(&mut c, t1 + ms(210), false);
+        assert!(c.probe.is_none());
+        assert_eq!(c.min_rtt, Some((ms(150), t1 + ms(210))));
+    }
+
+    /// quinn hands every ACK of one endpoint poll the same `now`. A poll that
+    /// was held up gives samples that are too short, all under that `now`.
+    #[test]
+    fn the_samples_of_one_arrival_time_do_not_lower_the_minimum() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let held = t0 + ms(1_000);
+        for rtt in [37, 38, 37, 39] {
+            ack(&mut c, held, ms(rtt), 0, false);
+        }
+        assert_eq!(c.min_rtt, Some((MIN_RTT, t0)));
+        assert_eq!(c.cap(), Some(1_125_000));
+        // A second held-up poll within the second does not confirm it either.
+        ack(&mut c, held + ms(500), ms(37), 0, false);
+        assert_eq!(c.min_rtt, Some((MIN_RTT, t0)));
+        // A sample at the minimum renews it and leaves the two waiting.
+        ack(&mut c, held + ms(600), MIN_RTT, 0, false);
+        assert_eq!(c.min_rtt, Some((MIN_RTT, held + ms(600))));
+        assert_eq!(c.low.0.iter().flatten().count(), 2);
+        // A third arrival exactly a second after the first confirms them.
+        ack(&mut c, held + ms(1_000), ms(39), 0, false);
+        assert_eq!(c.min_rtt, Some((ms(39), held + ms(1_000))));
+    }
+
+    #[test]
+    fn a_lower_minimum_is_the_highest_of_three_arrivals_within_a_second() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(1_000);
+        ack(&mut c, t1, ms(40), 0, false);
+        ack(&mut c, t1, ms(38), 0, false);
+        ack(&mut c, t1 + ms(5), ms(50), 0, false);
+        assert_eq!(c.min_rtt, Some((MIN_RTT, t0)));
+        ack(&mut c, t1 + ms(9), ms(45), 0, false);
+        assert_eq!(
+            c.min_rtt,
+            Some((ms(50), t1 + ms(9))),
+            "of 38, 50 and 45, each the lowest of its arrival"
+        );
+        assert_eq!(c.cap(), Some(937_500), "1.25 x 15 MB/s x 50 ms");
+        assert_eq!(c.low, LowSamples::default(), "the next one starts again");
+
+        // An arrival more than a second old no longer counts.
+        let mut c = estimated(t0);
+        ack(&mut c, t1, ms(40), 0, false);
+        ack(&mut c, t1 + ms(500), ms(40), 0, false);
+        ack(&mut c, t1 + ms(1_001), ms(40), 0, false);
+        assert_eq!(c.min_rtt, Some((MIN_RTT, t0)));
+        ack(&mut c, t1 + ms(1_400), ms(40), 0, false);
+        assert_eq!(c.min_rtt, Some((ms(40), t1 + ms(1_400))));
     }
 
     #[test]
@@ -2449,7 +2816,9 @@ mod tests {
         let t0 = Instant::now();
         let mut c = estimated(t0);
         assert_eq!(c.window(), 1_125_000);
-        ack(&mut c, t0 + ms(10), ms(30), 0, false);
+        for after in [10, 11, 12] {
+            ack(&mut c, t0 + ms(after), ms(30), 0, false);
+        }
         assert_eq!(c.window(), 562_500, "1.25 x 15 MB/s x 30 ms");
     }
 

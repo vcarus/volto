@@ -345,8 +345,14 @@ is under 192 kB the window can be 240 kB. The gain is
 product stands in the bottleneck queue, and a queue shorter than that loses the
 rest. So when one percent or more of the bytes are lost, the controller tries
 the gain at which in-flight data is what the path carried, and keeps it only if
-the loss then falls as a short queue predicts. Random loss does not fall, and
-there the gain stays at 1.25, which a lossy path needs. A lowered gain is tried
+the loss then falls as a short queue predicts: the loss is counted over windows
+of at least four round trips, and each of four windows at the lower gain has to
+lose less than every one of the four before it. Random loss does not fall, and
+there the gain stays at 1.25, which a lossy path needs. Through 1.8.0 one window
+of eight was enough, and loss that comes in bursts passed that test by chance:
+on a 28 Mbit/s path with a 75 ms RTT and bursts of loss in the lab, 1.8.0
+carried 25.7 Mbit/s and 1.8.1 carries 26.9, which is what a fixed 1.25 carries.
+A lowered gain is tried
 higher again from time to time, and is given up when the measured rate does not
 hold. In a lab with a 150 Mbit/s bottleneck and a 60 ms RTT, behind a 50 kB
 queue this took the loss from 18.9 to 1.0 percent of the packets sent and the
@@ -369,10 +375,18 @@ as in slow start. After a loss, in-flight data is held for one round trip and
 then grows by the bytes acknowledged. Apart from the gain rule above, it does
 not take a lost packet for a reason to send less for longer than that, which is
 what makes BBR the choice for a lossy path. It keeps its own
-minimum RTT, which lasts 10 s unless a lower or equal sample renews it. When it
+minimum RTT, which lasts 10 s unless an equal sample renews it. A lower sample
+replaces it once ACKs of three different arrival times within a second have
+shown one, and the new minimum is the highest of the three. quinn stamps every
+ACK of one socket poll with one clock reading, so a poll that the scheduler or
+the host of a virtual machine held up gives samples that are too short; through
+1.8.0 one such sample was taken as the minimum and held the window too small
+for 10 s. In the lab a 60 ms path read as 37 ms once every 7 s carried 50 to 81
+Mbit/s of 144 with that rule and 141 to 144 with this one. When the minimum
 runs out, and once the sender is not app-limited, the window is held at half the
 bandwidth-delay product for at least 200 ms so that the bottleneck queue
-empties, and the lowest RTT seen then becomes the new minimum. In a lab with a
+empties, and the new minimum is taken from the samples seen then by the same
+rule. In a lab with a
 150 Mbit/s bottleneck and a 60 ms RTT, behind a queue of one bandwidth-delay
 product, quinn's BBR as it ships lost 28 percent of the packets it sent and
 `bbr` none, at 8 percent higher throughput, and under 0.2 and 2 percent random
@@ -388,7 +402,12 @@ production relay path in which it lost fewer packets and carried more data than
 quinn's BBR in every run. Through 1.7.0 it was built around quinn's BBR and its
 gain was fixed at 1.25; the startup, loss-burst, RTT-rise and quinn's-BBR
 figures in this paragraph were measured on those releases, and the short-queue
-figures on the controller as it is now. The names it has had, and the value `bbr-uncapped` that
+figures on 1.8.0; with the stricter test of 1.8.1 the 50 kB and 150 kB figures
+are the same, and behind the 20 kB queue the loss is 5.0 to 5.5 percent at 121
+to 123 Mbit/s. The stricter test has a cost where even 1.05 overflows the
+queue and a lower gain only loses less: behind a 50 kB queue at a 150 ms RTT
+1.8.1 carried 74 to 79 Mbit/s at 9 to 12 percent loss, 1.8.0 76 to 91 at 4 to
+7 percent, and 1.7.0 71 at 16 percent. The names it has had, and the value `bbr-uncapped` that
 selected quinn's BBR from 1.2.0 to 1.7.0, are under
 [What is stable from v1.0.0](#what-is-stable-from-v100).
 
