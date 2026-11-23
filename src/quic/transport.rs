@@ -96,6 +96,12 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
     // received is CONNECT-UDP's own bound, `INBOUND_QUEUE_DEPTH`; what the
     // transport holds before that is [`DATAGRAM_RECEIVE_BUFFER`] above.
 
+    // A packet is declared lost by its age alone, so a packet that arrives a
+    // few milliseconds late is not sent again; see [`LOSS_PACKET_THRESHOLD`]
+    // and [`LOSS_TIME_THRESHOLD`].
+    transport.packet_threshold(LOSS_PACKET_THRESHOLD);
+    transport.time_threshold(LOSS_TIME_THRESHOLD);
+
     transport.congestion_controller_factory(congestion_factory(limits.congestion_control));
 
     Ok(transport)
@@ -439,6 +445,79 @@ const DATAGRAM_RECEIVE_BUFFER: usize = 1_250_000;
 /// post-quantum key share.
 const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 
+/// How many packet numbers behind the largest acknowledged one a packet must
+/// be for quinn to declare it lost by count: never, so only
+/// [`LOSS_TIME_THRESHOLD`] declares a loss.
+///
+/// quinn's default is 3, the value RFC 9002 section 6.1.1 recommends as the
+/// initial one. The same section goes on: "Some networks may exhibit higher
+/// degrees of packet reordering, causing a sender to detect spurious losses."
+/// A sender at 14 000 packets a second puts 70 packets on the wire in 5 ms, so
+/// with a threshold of 3 every packet that a path delivers 5 ms late is
+/// declared lost. It is sent again although it arrived, and the congestion
+/// controller is told of a loss that did not happen.
+///
+/// Measured on one production path in November 2026, with a capture at the
+/// client beside the server's counters: 2 to 3.5 percent of the packets of a
+/// bulk download arrived after a packet with a higher number, 4 to 6 ms late
+/// at the median, and 98 to 99 percent of them were 3 or more numbers behind. With
+/// quinn's defaults the server declared 94 to 98 percent of those packets
+/// lost, which was between a quarter and seven tenths of everything it counted
+/// as lost.
+/// The packets left the server in order; the path reordered them. With the
+/// two constants here the server declared 13 to 28 percent of them lost, the
+/// share of packets that really did not arrive was unchanged, and of two
+/// connections sharing that path at the same time the one with these values
+/// carried 16 percent more than the one with quinn's defaults, in five pairs
+/// of five.
+///
+/// The count is switched off rather than raised because a count is a time
+/// that depends on the sending rate: 1000 packets are 70 ms at 14 000 packets
+/// a second and 7 ms at ten times that. RACK-TLP makes the same choice for TCP
+/// once a connection has seen reordering (RFC 8985 section 6.2, step 4):
+/// "Otherwise, if some reordering has been observed, then RACK does not
+/// trigger fast recovery based on DupThresh." quinn 0.11 cannot observe
+/// reordering per connection, so the choice is made for every connection. On
+/// a path that does not reorder, the cost is the time [`LOSS_TIME_THRESHOLD`]
+/// waits before a packet that really was lost is sent again.
+///
+/// Not a `[limits]` key: there is one value that is right for a path that
+/// reorders, and what it costs a path that does not is a quarter of a round
+/// trip on a real loss, which no operator can read off a log to tune against.
+const LOSS_PACKET_THRESHOLD: u32 = u32::MAX;
+
+/// How old a packet must be, as a multiple of the round-trip time, before
+/// quinn declares it lost once a later packet has been acknowledged.
+///
+/// quinn's default is 9/8, the value RFC 9002 section 6.1.2 recommends. The
+/// same section notes: "TCP's RACK \[RFC8985\] specifies a slightly larger
+/// threshold, equivalent to 5/4, for a similar purpose." It allows other
+/// values and names what they cost: "Smaller thresholds reduce reordering
+/// resilience and increase spurious retransmissions, and larger thresholds
+/// increase loss detection delay." RFC 8985 section 6.2, step 4, gives RACK's
+/// value: "it starts with a conservative RACK.reo_wnd of RACK.min_RTT/4."
+///
+/// The round-trip time quinn multiplies is the larger of the smoothed one and
+/// the latest sample, so the allowance for a late packet is a quarter of it:
+/// 15 ms on a 60 ms path. On the path [`LOSS_PACKET_THRESHOLD`] describes, 57
+/// to 67 percent of the late packets were under an eighth of the round-trip
+/// time late and 82 to 85 percent under a quarter, which is why 9/8 left 43 to
+/// 46 percent of them declared lost and 5/4 leaves 13 to 28. The price is that
+/// a packet that really was lost is sent again an eighth of a round trip later
+/// than with 9/8.
+///
+/// That delay matters where flow control is tight. Data sent after a lost
+/// packet counts against the peer's connection window, and against
+/// [`SEND_WINDOW`], until the packet has been sent again and acknowledged,
+/// about 2.25 round trips after it was first sent where the defaults take
+/// about 2. In the lab at 150 Mbit/s over 60 ms with 2 or 5 percent of the
+/// packets dropped and nothing reordered, a client with a 4 MiB connection
+/// window received 6 to 8 percent less with these values than with quinn's
+/// defaults, and a client with a 16 MiB window, which is what Surge advertises,
+/// received the same. With reordering as on the production path, the lab
+/// carried 128 to 135 Mbit/s where the defaults carried 91 to 92.
+const LOSS_TIME_THRESHOLD: f32 = 1.25;
+
 /// Unidirectional streams a peer may have open on one connection at a time.
 ///
 /// HTTP/3 gives a client exactly three of them, the control stream and the
@@ -591,6 +670,22 @@ mod tests {
         );
     }
 
+    /// A packet is declared lost by its age and never by how many packets were
+    /// acknowledged after it; [`LOSS_PACKET_THRESHOLD`] has the measurement.
+    #[test]
+    fn a_loss_is_declared_by_age_alone() {
+        let rendered = transport_debug(&crate::config::Limits::default());
+
+        assert!(
+            rendered.contains(&format!("packet_threshold: {}", u32::MAX)),
+            "the packet threshold is not at its maximum: {rendered}"
+        );
+        assert!(
+            rendered.contains("time_threshold: 1.25"),
+            "the time threshold is not 5/4: {rendered}"
+        );
+    }
+
     /// quinn's own defaults still agree with what this module says about them.
     ///
     /// Both values reaching the wire are set explicitly, so this guards
@@ -603,6 +698,11 @@ mod tests {
     fn quinn_has_not_moved_the_defaults_we_quote() {
         let rendered = format!("{:?}", quinn::TransportConfig::default());
 
+        assert!(
+            rendered.contains("packet_threshold: 3,") && rendered.contains("time_threshold: 1.125"),
+            "a quinn bump changed a loss-detection default: our two constants hold, \
+             but their comments call 3 and 9/8 quinn's defaults: {rendered}"
+        );
         assert!(
             rendered.contains(&format!("send_window: {SEND_WINDOW}")),
             "a quinn bump changed the default send window: our pin is unaffected, but \

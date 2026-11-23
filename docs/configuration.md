@@ -411,6 +411,27 @@ queue and a lower gain only loses less: behind a 50 kB queue at a 150 ms RTT
 selected quinn's BBR from 1.2.0 to 1.7.0, are under
 [What is stable from v1.0.0](#what-is-stable-from-v100).
 
+**A packet is declared lost by its age, not by how many packets were
+acknowledged after it.** quinn's defaults, the initial values of RFC 9002, call
+a packet lost once a packet three numbers later has been acknowledged, or once
+it is 9/8 of a round-trip time old. A path that delivers some packets a few
+milliseconds late meets the first rule on every one of them at a bulk
+download's rate, so each is sent a second time although it arrived, and the
+congestion controller counts a loss that did not happen. volto switches the
+count off and sets the age to 5/4 of the round-trip time, the allowance RACK-TLP
+(RFC 8985) starts with for TCP. This holds for all three values of
+`congestion_control` and there is no key for it. On a production path where 2
+to 3.5 percent of the packets arrived out of order, the server called 94 to 98
+percent of those lost with quinn's defaults and 13 to 28 percent with these
+values, and of two downloads sharing the path the one with these values carried
+16 percent more. The price is paid on a path that does not reorder: a packet
+that really was lost is sent again about a quarter of a round trip later, and
+the data sent after it stays charged to the client's flow-control window for
+that much longer. In the lab at 150 Mbit/s and a 60 ms RTT with 2 or 5 percent
+random loss, a client with a 16 MiB connection window, which is what Surge
+advertises, received the same as before, and a client with a 4 MiB window
+received 6 to 8 percent less.
+
 **Path MTU discovery reports what it found in the connection close line.** The
 `INFO ... connection closed` and `WARN ... connection closed with error` lines
 carry `mtu=`, the largest UDP payload the sender settled on for that path, and
