@@ -254,7 +254,7 @@ fn congestion_factory(
     cc: CongestionControl,
 ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
     match cc {
-        CongestionControl::Bbr => Arc::new(crate::congestion::BbrCappedConfig),
+        CongestionControl::Bbr => Arc::new(crate::congestion::BbrConfig),
         CongestionControl::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
         CongestionControl::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
     }
@@ -993,7 +993,7 @@ mod tests {
         let (_client, server) = loopback_pair(transport).await;
         let any = server.congestion_state().into_any();
 
-        if any.is::<crate::congestion::BbrCapped>() {
+        if any.is::<crate::congestion::Bbr>() {
             "bbr"
         } else if any.is::<quinn::congestion::Cubic>() {
             "cubic"

@@ -46,7 +46,7 @@ quinn = { version = "0.11", default-features = false, features = [
     "bloom",
 ] }
 # Named for what quinn does not re-export: `quinn_proto::RttEstimator`, which
-# `Controller::on_ack` takes (src/congestion.rs), the crypto and transport
+# `Controller::on_ack` takes (src/congestion/), the crypto and transport
 # parameter types the TLS provider implements (src/tls/awslc/), and the
 # connection ID generator types `src/quic/cid.rs` wraps. quinn-proto is already
 # in the tree as quinn's own dependency, so `Cargo.lock` gains this edge and no
