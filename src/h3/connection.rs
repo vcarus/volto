@@ -13,11 +13,19 @@
 //!
 //! The background task makes the peer's SETTINGS usable when they arrive. The
 //! control stream has a reader of its own, and the flag it writes is the one
-//! the sessions hold ([`Connection::peer_datagrams`]). So there is no moment at
+//! the sessions hold ([`Connection::peer_settings`]). So there is no moment at
 //! which the peer's answer is known and not yet acted on. If the control stream
 //! were read only while an accept is polled, a CONNECT-UDP session started
 //! right after the handshake could read a stale "datagrams not allowed" and
 //! stay on the RFC 9297 capsule fallback for its whole life.
+//!
+//! A request can still be served before that reader has run, although the
+//! peer sent its SETTINGS first: the request has a task of its own, and
+//! nothing orders the two. A CONNECT-UDP session set up in that window would
+//! send its first answers as capsules to a peer that asked for datagrams. So a
+//! session waits for the frame to be read before it is set up, within a bound
+//! that starts at the handshake ([`PeerSettings::read`],
+//! [`PEER_SETTINGS_WAIT`], D119).
 //!
 //! # HTTP Datagrams
 //!
@@ -52,11 +60,12 @@
 //! recorded when the connection is closed and read back by
 //! [`Connection::accept`].
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bytes::BytesMut;
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::debug;
 
@@ -87,6 +96,99 @@ pub(super) const STREAM_QPACK_DECODER: u64 = 0x03;
 /// initiator and directionality, so each kind of stream is numbered in fours.
 const REQUEST_STREAM_STEP: u64 = 4;
 
+/// How long after the handshake a request that needs the peer's SETTINGS waits
+/// for them to be read ([`PeerSettings::read`], D119).
+///
+/// The wait is for a frame the peer has to send before anything else:
+///
+//= https://www.rfc-editor.org/rfc/rfc9114#section-6.2.1
+//# Each side MUST initiate a single control stream at the beginning of
+//# the connection and send its SETTINGS frame as the first frame on this
+//# stream.
+///
+/// So in the usual case the frame is already here, or in the same flight as
+/// the request, and the wait ends as soon as this endpoint's reader of the
+/// control stream has run. The bound is for the two other cases. A peer that
+/// sends no SETTINGS must not hold a request for good. And when the packet
+/// that carried the frame was lost, the request is served without it after
+/// the bound, as it was before this wait existed.
+///
+/// The figure is our own choice. It is the one RFC 9002 §6.2.2 gives for a
+/// round trip that has not been measured, quoted on
+/// [`EARLY_DATAGRAM_HOLD`], which bounds the mirror case of a datagram that
+/// arrives ahead of its session.
+///
+/// The bound runs from the handshake and not from the request, because the
+/// beginning of the connection is when the frame is due. A request that
+/// arrives later than this after the handshake does not wait at all, so a
+/// peer that never sends SETTINGS pays the wait once per connection and not
+/// once per session.
+pub const PEER_SETTINGS_WAIT: Duration = Duration::from_millis(333);
+
+/// What the peer's SETTINGS say about HTTP Datagrams, and whether the frame
+/// has been read.
+///
+/// A live view, not a copy: the reader of the peer's control stream writes
+/// both halves, and every holder sees them change. The sessions in
+/// `tunnel::udp` hold one through their connection's context.
+#[derive(Clone, Debug)]
+pub struct PeerSettings {
+    /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`. The
+    /// connection's own flag, [`Shared::peer_datagrams`].
+    datagrams: Arc<AtomicBool>,
+    /// True once the peer's SETTINGS frame has been read, whatever it said.
+    read: watch::Receiver<bool>,
+    /// When [`Self::read`] stops waiting: [`PEER_SETTINGS_WAIT`] after the
+    /// handshake.
+    wait_until: tokio::time::Instant,
+}
+
+impl PeerSettings {
+    /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
+    ///
+    /// RFC 9297 §2.1.1 forbids sending HTTP Datagrams before this is true:
+    ///
+    //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1.1
+    //# QUIC DATAGRAM frames MUST NOT be sent until the SETTINGS_H3_DATAGRAM
+    //# setting has been both sent and received with a value of 1.
+    ///
+    /// Until the peer's SETTINGS have been read it is `false`, which is the
+    /// safe direction to be wrong in. One atomic load, because a session asks
+    /// for every packet.
+    pub fn datagrams(&self) -> bool {
+        self.datagrams.load(Ordering::Relaxed)
+    }
+
+    /// Waits until the peer's SETTINGS frame has been read, or until
+    /// [`PEER_SETTINGS_WAIT`] after the handshake, whichever comes first.
+    ///
+    /// Returns at once when either has already happened. It reports nothing:
+    /// the caller reads [`Self::datagrams`] afterwards, which says `false`
+    /// for SETTINGS that did not come in time just as it does for SETTINGS
+    /// that do not allow datagrams, and the caller acts the same on both.
+    ///
+    /// The frame is marked as read after the datagram flag is written, so a
+    /// caller this wakes reads the flag as the frame set it.
+    pub async fn read(&self) {
+        let mut read = self.read.clone();
+        // The error is the sender dropped, which is the connection gone. The
+        // caller finds that out from the stream it is about to write to.
+        let _ = tokio::time::timeout_at(self.wait_until, read.wait_for(|read| *read)).await;
+    }
+
+    /// A view for tests that build a context without an HTTP/3 connection:
+    /// the SETTINGS count as read, with `datagrams` as what they said.
+    #[cfg(test)]
+    pub(crate) fn for_tests(datagrams: bool) -> Self {
+        let (_, read) = watch::channel(true);
+        Self {
+            datagrams: Arc::new(AtomicBool::new(datagrams)),
+            read,
+            wait_until: tokio::time::Instant::now(),
+        }
+    }
+}
+
 /// Connection state that outlives any one stream or task.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -97,6 +199,13 @@ pub(crate) struct Shared {
     /// read it per packet, so the moment the control stream reports it, every
     /// session on the connection is already looking at the new value.
     pub(super) peer_datagrams: Arc<AtomicBool>,
+    /// Whether the peer's SETTINGS frame has been read, whatever it said.
+    ///
+    /// A watch and not a second flag, because a request waits on it
+    /// ([`PeerSettings::read`]). The control stream's reader sets it after
+    /// `peer_datagrams`, so whoever it wakes reads that flag as the frame set
+    /// it.
+    pub(super) settings_read: watch::Sender<bool>,
     /// What this connection may hold in half-received frames at once (D77).
     ///
     /// Its own `Arc` because every request stream's [`FrameReader`](frame::FrameReader) holds it,
@@ -163,6 +272,16 @@ impl Shared {
     /// [`Connection::accept`] reports.
     fn record(&self, violation: Violation) -> Violation {
         self.local_error.get_or_init(|| violation).clone()
+    }
+
+    /// A view of the peer's SETTINGS whose [`PeerSettings::read`] waits until
+    /// `wait_until` at the latest.
+    fn peer_settings(&self, wait_until: tokio::time::Instant) -> PeerSettings {
+        PeerSettings {
+            datagrams: self.peer_datagrams.clone(),
+            read: self.settings_read.subscribe(),
+            wait_until,
+        }
     }
 }
 
@@ -364,6 +483,9 @@ pub struct Connection {
     _qpack: [quinn::SendStream; 2],
     /// The task reading the peer's unidirectional streams and datagrams.
     peer: JoinHandle<()>,
+    /// When a request stops waiting for the peer's SETTINGS:
+    /// [`PEER_SETTINGS_WAIT`] after [`Self::handshake`] began.
+    settings_wait_until: tokio::time::Instant,
     /// The highest request stream id handed to the caller.
     last_accepted: Option<u64>,
     /// The identifier sent in GOAWAY, once [`Self::shutdown`] has sent one.
@@ -401,6 +523,10 @@ impl Connection {
         within: Duration,
         dropped_datagrams: Arc<AtomicU64>,
     ) -> Result<Self, ConnectionError> {
+        // The peer's SETTINGS are due from here on: its handshake was over
+        // before this endpoint's was.
+        let settings_wait_until = tokio::time::Instant::now() + PEER_SETTINGS_WAIT;
+
         let handle = Handle {
             quic,
             idle: within,
@@ -442,22 +568,20 @@ impl Connection {
             control,
             _qpack: [encoder, decoder],
             peer,
+            settings_wait_until,
             last_accepted: None,
             going_away: None,
         })
     }
 
-    /// A live view of whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
+    /// A live view of the peer's SETTINGS: whether they allow HTTP Datagrams,
+    /// and whether they have been read yet.
     ///
-    /// RFC 9297 §2.1.1 forbids sending HTTP Datagrams before this is true, and
-    /// a CONNECT-UDP session falls back to capsules on the request stream while
-    /// it is not. The flag is handed out rather than sampled, for the reason
-    /// the module documentation gives.
-    ///
-    /// Until the peer's SETTINGS arrive it reads `false`, which is the safe
-    /// direction to be wrong in.
-    pub fn peer_datagrams(&self) -> Arc<AtomicBool> {
-        self.handle.shared.peer_datagrams.clone()
+    /// A CONNECT-UDP session falls back to capsules on the request stream
+    /// while [`PeerSettings::datagrams`] is false. The view is handed out
+    /// rather than sampled, for the reason the module documentation gives.
+    pub fn peer_settings(&self) -> PeerSettings {
+        self.handle.shared.peer_settings(self.settings_wait_until)
     }
 
     /// Waits for the next request stream.
@@ -785,6 +909,94 @@ mod tests {
         assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
     }
 
+    /// What the control stream's reader does when it has read the peer's
+    /// SETTINGS: the datagram flag first, then the mark a request waits on.
+    fn settings_arrive(shared: &Shared, datagrams: bool) {
+        shared.peer_datagrams.store(datagrams, Ordering::Relaxed);
+        shared.settings_read.send_replace(true);
+    }
+
+    /// The usual case, and the one that must cost nothing: the frame was read
+    /// before the request asked.
+    #[tokio::test(start_paused = true)]
+    async fn settings_that_were_read_are_not_waited_for() {
+        let shared = Shared::default();
+        let start = tokio::time::Instant::now();
+        let settings = shared.peer_settings(start + PEER_SETTINGS_WAIT);
+        settings_arrive(&shared, true);
+
+        settings.read().await;
+
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(settings.datagrams());
+    }
+
+    /// The case the wait exists for: the request is here first, and the frame
+    /// is read a moment later. The wait ends then and not at the bound, and
+    /// the flag already says what the frame said.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_when_the_settings_are_read() {
+        const LATER: Duration = Duration::from_millis(100);
+
+        for datagrams in [true, false] {
+            let shared = Arc::new(Shared::default());
+            let start = tokio::time::Instant::now();
+            let settings = shared.peer_settings(start + PEER_SETTINGS_WAIT);
+
+            let reader = shared.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(LATER).await;
+                settings_arrive(&reader, datagrams);
+            });
+            settings.read().await;
+
+            assert_eq!(start.elapsed(), LATER, "datagrams: {datagrams}");
+            assert_eq!(settings.datagrams(), datagrams);
+        }
+    }
+
+    /// A peer that sends no SETTINGS holds a request until the bound and no
+    /// longer, and the request is then served without datagrams.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_at_the_bound() {
+        let shared = Shared::default();
+        let start = tokio::time::Instant::now();
+        let settings = shared.peer_settings(start + PEER_SETTINGS_WAIT);
+
+        settings.read().await;
+
+        assert_eq!(start.elapsed(), PEER_SETTINGS_WAIT);
+        assert!(!settings.datagrams());
+    }
+
+    /// The bound runs from the handshake, so a request that arrives after it
+    /// does not wait: a peer that never sends SETTINGS pays once per
+    /// connection and not once per session.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_after_the_bound_does_not_wait() {
+        let shared = Shared::default();
+        let settings = shared.peer_settings(tokio::time::Instant::now() + PEER_SETTINGS_WAIT);
+        tokio::time::sleep(PEER_SETTINGS_WAIT * 2).await;
+
+        let asked = tokio::time::Instant::now();
+        settings.read().await;
+
+        assert_eq!(asked.elapsed(), Duration::ZERO);
+    }
+
+    /// The connection ending ends the wait: nothing will read the frame.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_ends_with_the_connection() {
+        let shared = Shared::default();
+        let start = tokio::time::Instant::now();
+        let settings = shared.peer_settings(start + PEER_SETTINGS_WAIT);
+        drop(shared);
+
+        settings.read().await;
+
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
     /// A quiet close after a violation reports the violation, as every other
     /// close for a reason of this endpoint's own does.
     ///
@@ -805,6 +1017,7 @@ mod tests {
             control: uni().await,
             _qpack: [uni().await, uni().await],
             peer: tokio::spawn(async {}),
+            settings_wait_until: tokio::time::Instant::now(),
             last_accepted: None,
             going_away: None,
         };

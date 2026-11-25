@@ -156,6 +156,23 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         }
     };
 
+    // The peer's SETTINGS decide whether this session's packets go to the
+    // client as QUIC datagrams or as capsules, and this request can be here
+    // before the SETTINGS have been read: the control stream has a reader of
+    // its own, and nothing orders the two tasks. A session set up in that
+    // window would send its first answers as capsules to a peer that asked for
+    // datagrams. So the session waits for the frame before it exists, within
+    // the bound [`h3api::PeerSettings::read`] describes (D119). The wait is
+    // over at once when the frame has been read, which is the usual case, or
+    // when the bound has passed.
+    //
+    // Only a peer that can take a QUIC datagram at all is waited for: without
+    // `max_datagram_frame_size` the capsule stream is the only way out,
+    // whatever the SETTINGS say (see `Session::datagrams`).
+    if !ctx.datagrams_allowed() && ctx.quic.max_datagram_size().is_some() {
+        ctx.peer_settings.read().await;
+    }
+
     // Bounded exactly as every refusal is, and for the reason
     // [`tunnel::respond`] gives: the session below does not exist until this
     // write returns, so nothing else would ever end the wait. On expiry the
@@ -181,9 +198,11 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         host,
         port,
         target = %crate::logfmt::or_dash(target),
-        // A snapshot, and named as one: a session raced ahead of the peer's
-        // SETTINGS reads false here, while the send path re-reads the flag on
-        // every packet and moves onto datagrams the moment they are allowed.
+        // A snapshot, and named as one: a session set up before the peer's
+        // SETTINGS were read, which the wait above allows only once its bound
+        // has passed, reads false here, while the send path re-reads the flag
+        // on every packet and moves onto datagrams the moment they are
+        // allowed.
         datagrams_at_setup = ctx.datagrams_allowed(),
         "udp session established"
     );

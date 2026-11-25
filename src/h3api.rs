@@ -27,7 +27,7 @@
 //! header holds stays inside [`crate::h3`].
 
 pub use crate::h3::MAX_FIELD_SECTION_SIZE;
-pub use crate::h3::connection::{Connection, DatagramReceiver};
+pub use crate::h3::connection::{Connection, DatagramReceiver, PeerSettings};
 pub use crate::h3::error::{Code, ConnectionError, StreamError};
 pub use crate::h3::frame::{DATA_HEADER_ROOM, READ_AHEAD_CHUNKS};
 pub use crate::h3::message::{FieldValue, Fields, Method, Request, Status};

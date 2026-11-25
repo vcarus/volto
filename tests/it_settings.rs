@@ -9,7 +9,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use common::rawstream::{
@@ -24,6 +24,7 @@ use common::{
 };
 use volto::capsule::CapsuleDecoder;
 use volto::datagram;
+use volto::h3::connection::PEER_SETTINGS_WAIT;
 
 /// The value the server must advertise, matching `h3api::MAX_FIELD_SECTION_SIZE`.
 const EXPECTED_MAX_FIELD_SECTION_SIZE: u64 = 64 * 1024;
@@ -348,6 +349,116 @@ async fn a_session_opened_before_the_peer_settings_moves_onto_datagrams() {
 /// A SETTINGS frame enabling HTTP Datagrams (RFC 9297 §2.1.1).
 fn datagram_settings() -> Vec<u8> {
     rawstream::settings_frame(&[(SETTINGS_H3_DATAGRAM, 1)])
+}
+
+/// A CONNECT-UDP session is not set up while the peer's SETTINGS can still be
+/// expected and have not been read (D119).
+///
+/// The peer here sends none, so only the bound ends the wait. The server's
+/// clock for the bound starts when its own handshake is over, which is after
+/// this client began to connect. A response that arrives less than the bound
+/// after `started` was therefore sent before the bound had passed.
+#[tokio::test]
+async fn a_session_waits_for_the_peer_settings_until_the_bound() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+
+    let started = Instant::now();
+    let (_endpoint, connection) = connect_quic(&server).await;
+    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+    send.write_all(&connect_udp_headers_frame(
+        &server.addr.to_string(),
+        &target.ip().to_string(),
+        target.port(),
+    ))
+    .await
+    .expect("send the CONNECT-UDP request");
+
+    let (frame_type, _) = read_frame(&mut recv).await;
+    let answered = started.elapsed();
+    assert_eq!(
+        frame_type, FRAME_HEADERS,
+        "the server must answer the request with a HEADERS frame"
+    );
+    assert!(
+        answered >= PEER_SETTINGS_WAIT,
+        "the session was set up {answered:?} after the client began to connect, with no \
+         SETTINGS read and the bound of {PEER_SETTINGS_WAIT:?} not yet passed"
+    );
+}
+
+/// How often [`a_session_set_up_once_the_settings_are_read_answers_on_datagrams`]
+/// tries for a response that arrived before the bound could have passed.
+const SETTINGS_ATTEMPTS: usize = 20;
+
+/// SETTINGS that are read within the bound end the wait, and the session is on
+/// QUIC datagrams from its first packet (D119).
+///
+/// The request and a datagram for it go out first and the SETTINGS a moment
+/// later. A server that sets the session up without waiting has the target's
+/// answer before it has read the SETTINGS, and sends it as a capsule on the
+/// request stream. That is the order a slow control stream reader produced in
+/// CI, where the client had sent its SETTINGS first.
+///
+/// An attempt counts only when the response arrived less than the bound after
+/// the client began to connect: only then is it certain that the SETTINGS ended
+/// the wait and the bound did not. A machine that stalls for longer makes an
+/// attempt prove nothing, and the next one runs on a new connection.
+#[tokio::test]
+async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
+    let server = TestServer::start().await;
+    let target = spawn_udp_echo_target().await;
+
+    for _ in 0..SETTINGS_ATTEMPTS {
+        let started = Instant::now();
+        let (_endpoint, connection) = connect_quic(&server).await;
+        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+        let quarter_stream_id = datagram::quarter_stream_id(u64::from(send.id()));
+        send.write_all(&connect_udp_headers_frame(
+            &server.addr.to_string(),
+            &target.ip().to_string(),
+            target.port(),
+        ))
+        .await
+        .expect("send the CONNECT-UDP request");
+        send_udp_payload(&connection, quarter_stream_id, b"ahead of the settings");
+
+        // Long enough for a server that does not wait to have relayed the
+        // datagram and its answer.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let _control = open_uni_stream(&connection, STREAM_CONTROL, &datagram_settings()).await;
+
+        let (frame_type, _) = read_frame(&mut recv).await;
+        assert_eq!(
+            frame_type, FRAME_HEADERS,
+            "the server must answer the request with a HEADERS frame"
+        );
+        if started.elapsed() >= PEER_SETTINGS_WAIT {
+            continue;
+        }
+
+        tokio::select! {
+            raw = tokio::time::timeout(TIMEOUT, connection.read_datagram()) => {
+                let raw = raw
+                    .expect("the answer arrives on one of the two channels")
+                    .expect("read a datagram");
+                let decoded = datagram::decode(raw).expect("server datagrams must be well formed");
+                assert_eq!(decoded.quarter_stream_id, quarter_stream_id);
+                assert_eq!(decoded.context_id, datagram::CONTEXT_ID_UDP_PAYLOAD);
+                assert_eq!(&decoded.payload[..], b"ahead of the settings");
+                return;
+            }
+            (frame_type, _) = read_frame(&mut recv) => panic!(
+                "the session was set up after the peer's SETTINGS were read, and its first \
+                 answer still came on the request stream, in a frame of type {frame_type:#x}"
+            ),
+        }
+    }
+
+    panic!(
+        "none of {SETTINGS_ATTEMPTS} responses arrived within {PEER_SETTINGS_WAIT:?} of the \
+         start of its connection, so none showed what ended the wait"
+    );
 }
 
 /// A peer that says `SETTINGS_H3_DATAGRAM = 1` but never told QUIC how large a

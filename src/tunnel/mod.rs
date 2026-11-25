@@ -12,7 +12,7 @@ mod status;
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -287,8 +287,8 @@ const _: () = assert!(
 /// costs one refcount bump rather than a copy of every field. Deliberately
 /// not [`Clone`]: a second whole `Context` would be a second view of the same
 /// connection and nothing else. That one `Arc` is also the only sharing the
-/// members need, so they are stored inline. The three that keep an `Arc` of
-/// their own, `peer_datagrams`, `tunnels` and `authenticated`, do so because
+/// members need, so they are stored inline. The three that share state of
+/// their own, `peer_settings`, `tunnels` and `authenticated`, do so because
 /// something outside this connection's request handling holds them as well.
 ///
 /// The UDP-specific members are here rather than in [`udp`] because a connection
@@ -308,13 +308,15 @@ pub struct Context {
     /// authentication failures goes through the request's stream instead, so
     /// the HTTP/3 layer records it as the connection's reason.
     pub quic: quinn::Connection,
-    /// Whether the peer advertised `SETTINGS_H3_DATAGRAM = 1`.
+    /// What the peer's SETTINGS say about HTTP Datagrams, and whether they
+    /// have been read.
     ///
-    /// RFC 9297 §2.1.1 forbids sending QUIC datagrams when this is false; such
-    /// sessions fall back to DATAGRAM capsules on the request stream. Shared
-    /// with the HTTP/3 connection rather than copied from it, for the reason
-    /// [`crate::h3api::Connection::peer_datagrams`] gives.
-    pub peer_datagrams: Arc<AtomicBool>,
+    /// RFC 9297 §2.1.1 forbids sending QUIC datagrams until the peer has
+    /// advertised `SETTINGS_H3_DATAGRAM = 1`; until then a session falls back
+    /// to DATAGRAM capsules on the request stream. A view of the HTTP/3
+    /// connection's own state rather than a copy of it, for the reason
+    /// [`crate::h3api::Connection::peer_settings`] gives.
+    pub peer_settings: crate::h3api::PeerSettings,
     /// The configuration generation this connection was accepted under, for
     /// the credentials every request is checked against and the destinations
     /// this proxy may reach.
@@ -479,16 +481,16 @@ impl Generation {
 impl Context {
     /// Builds the context for one accepted connection.
     ///
-    /// `peer_datagrams` comes from the HTTP/3 connection, which keeps writing
-    /// to it. `resolver` is this connection's own view of the server's
-    /// blocking-pool allowance. `tunnels` is the connection's tunnel counter
-    /// and `authenticated` its authentication flag, both created by
-    /// [`crate::quic`] so that they outlive this context: the first is read
+    /// `peer_settings` comes from the HTTP/3 connection, whose control stream
+    /// reader updates what it shows. `resolver` is this connection's own view
+    /// of the server's blocking-pool allowance. `tunnels` is the connection's
+    /// tunnel counter and `authenticated` its authentication flag, both created
+    /// by [`crate::quic`] so that they outlive this context: the first is read
     /// once the connection is over, the second while it runs.
     pub fn new(
         generation: Arc<Generation>,
         quic: quinn::Connection,
-        peer_datagrams: Arc<AtomicBool>,
+        peer_settings: crate::h3api::PeerSettings,
         resolver: crate::net::ConnectionResolver,
         tunnels: Arc<AtomicU64>,
         authenticated: AuthGate,
@@ -500,7 +502,7 @@ impl Context {
             max_auth_failures: config.security.max_auth_failures,
             authenticated,
             quic,
-            peer_datagrams,
+            peer_settings,
             quota: Quota::new(config.limits.max_targets_per_conn),
             max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
@@ -540,7 +542,7 @@ impl Context {
 
     /// Whether QUIC datagrams may be sent to the peer right now.
     pub(crate) fn datagrams_allowed(&self) -> bool {
-        self.peer_datagrams.load(Ordering::Relaxed)
+        self.peer_settings.datagrams()
     }
 
     /// Records that a request on this connection got past the credentials check,

@@ -286,7 +286,7 @@ mod tests {
         let ctx = Context::new(
             std::sync::Arc::new(crate::tunnel::Generation::new(std::sync::Arc::new(config))),
             ours,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            crate::h3api::PeerSettings::for_tests(true),
             crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS)
                 .per_connection(),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
