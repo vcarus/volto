@@ -166,11 +166,13 @@
 //! (1.28 either way) and cost 9 to 14 percent of a 5 s transfer on a lossy
 //! path, so it is not done. The first reading can therefore be an episode's or
 //! an outage's. So a reading that brings the base loss from zero to 5 percent
-//! or more acts at once and is confirmed once: a further probe is due ten
-//! sample intervals later, the estimate's window, and its reading enters the
-//! lowest of four like any other, or clears the base loss by the rule of the
-//! next paragraph. A reading taken in an outage or an episode then acts for
-//! about ten round trips, not until the next regular probe 10 s or more later.
+//! or more acts at once and is confirmed: a further probe is due ten sample
+//! intervals later, the estimate's window, and its reading enters the lowest of
+//! four like any other, or clears the base loss by the rule of the next
+//! paragraph. This happens each time a reading takes the base loss up from
+//! zero, so again after a clearing. A reading taken in an outage or an episode
+//! then acts until that probe has closed, about thirteen round trips, not
+//! until the next regular probe 10 s or more later.
 //! In `line_sim` the review's sweep of partial outages inside the early probe
 //! behind clean policers had 68 of 144 runs more than 0.3 above 1.8.2's sent
 //! over delivered over the first 12 s without the confirming probe and 1 with
@@ -210,12 +212,28 @@
 //! and the arrivals stayed, the sender was above the path's rate even at the
 //! probe's, and a base loss in force is what put it there or keeps it there:
 //! the kept readings and the carry are cleared, and the base loss is zero until
-//! a new reading. On lossy paths in `line_sim`, with and without a limit, with
-//! ACK jitter and with episodes, this cleared nothing in 63 runs. Both end the
-//! early probe's repeat, because arrivals that did not fall mean that the
-//! startup's loss was a limit's. A probe whose rate stays above a limit while
-//! the allowance that fed the arrivals before it runs out inside it could pass;
-//! `line_sim` did not reproduce that case. The rule is ours.
+//! a new reading. That inference is too strong in two cases, which a second
+//! review found in `line_sim`, and in both a base loss that was right is
+//! cleared and the transfer runs as it did through 1.8.2 until the next kept
+//! reading. First, a lossy path behind a policer whose burst allowance is half
+//! a second to two seconds of its rate: when the factor comes into force the
+//! estimate grows on the allowance to two or three times the token rate, the
+//! confirming probe falls there, and it is above the limit. In a sweep of 96
+//! such runs 16 cleared, and on one line (30 Mbit/s, 100 ms, a fifth dropped)
+//! the base loss was zero for 74 of 90 s: 18.8 Mbit/s delivered, against 23 to
+//! 24 without the clearing or without the confirming probe, and 14.7 for
+//! 1.8.2. Second, an episode or a partial outage in the round trip before a
+//! probe: the arrivals before the probe are low while lost bytes count as
+//! sent, so the arrival ratio is high and the sending ratio low. 14 of 48 runs
+//! with episodes behind a queue cleared once, and over 144 lossy lines the sum
+//! delivered was 1.6 percent under that without the clearing. On no lossy line
+//! did the controller deliver less than 1.8.2 does. The two rules are kept for
+//! what they prevent at a limit: of the outage sweep above, 68 runs without
+//! the confirming probe, 26 without the clearing, 1 with both. Both outcomes
+//! end the early probe's repeat, because arrivals that did not fall mean that
+//! the startup's loss was a limit's. A probe whose rate stays above a limit
+//! while the allowance that fed the arrivals before it runs out inside it could
+//! pass; `line_sim` did not reproduce that case. The rule is ours.
 //!
 //! The first probe would come when the minimum RTT expires, 10 s after it was
 //! last taken, and in production it came 14 to 45 s after the start. So when a
@@ -802,7 +820,8 @@ impl Controller for Bbr {
             && was_zero
             && self.base.ppm() >= self.base.early_probe_ppm()
         {
-            // A first reading acts at once and is confirmed once.
+            // A reading that takes the base loss up from zero acts at once
+            // and is confirmed by one more probe.
             self.confirm = Some(CONFIRM_INTERVALS);
         }
         if closed != Closed::No {
