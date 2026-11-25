@@ -280,6 +280,9 @@ impl Control {
                 if settings.datagrams {
                     shared.peer_datagrams.store(true, Ordering::Relaxed);
                 }
+                // After the flag: a request this wakes reads the flag next
+                // (`PeerSettings::read`).
+                shared.settings_read.send_replace(true);
                 Ok(())
             }
 
@@ -728,11 +731,19 @@ mod tests {
             let seen_by_a_session = shared.peer_datagrams.clone();
             assert!(!seen_by_a_session.load(Ordering::Relaxed), "nothing yet");
 
+            let read = shared.settings_read.subscribe();
+            assert!(!*read.borrow(), "nothing read yet");
+
             Control::default()
                 .accept(settings(datagrams), false, &shared)
                 .expect("accepted");
 
             assert_eq!(seen_by_a_session.load(Ordering::Relaxed), datagrams);
+            assert!(
+                *read.borrow(),
+                "the frame counts as read whatever it said, so a request that waits \
+                 for it is not held by a peer that turns datagrams down"
+            );
         }
     }
 

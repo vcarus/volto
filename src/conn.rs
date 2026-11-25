@@ -147,12 +147,13 @@ pub async fn handle(
     let idle = generation.config.limits.max_idle_timeout();
     let mut connection = h3api::Connection::handshake(quic, idle, dropped_datagrams).await?;
 
-    // The datagram flag handed to the context is the connection's own rather
-    // than a copy of it; `h3api::Connection::peer_datagrams` says why.
+    // The view of the peer's SETTINGS handed to the context is the connection's
+    // own state rather than a copy of it; `h3api::Connection::peer_settings`
+    // says why.
     let context = Arc::new(Context::new(
         generation,
         for_context,
-        connection.peer_datagrams(),
+        connection.peer_settings(),
         resolver,
         tunnels,
         authenticated,

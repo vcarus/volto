@@ -552,6 +552,16 @@ writes it and every session reads it once per packet, so a session opened before
 the SETTINGS arrived moves onto QUIC datagrams the moment they do. The module
 comment on `src/h3/connection.rs` records what the sampled version cost.
 
+A request has a task of its own, so it can be served before the control stream's
+reader has run, even when the peer sent its SETTINGS first. A session set up in
+that window would send its first answers as capsules to a client that asked for
+datagrams. So a CONNECT-UDP session whose peer can take QUIC datagrams waits,
+before its 2xx, until the peer's SETTINGS frame has been read. RFC 9114 §6.2.1
+makes that frame the first thing a peer sends, so the wait is usually over
+before it starts. It ends 333 ms after the handshake at the latest
+(`PEER_SETTINGS_WAIT`): a peer that sends no SETTINGS has its first sessions
+held until then, once per connection, and is served on capsules as before.
+
 ## The HTTP/3 layer
 
 HTTP/3 is implemented in `src/h3` rather than taken from a crate. What it covers
