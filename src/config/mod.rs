@@ -391,7 +391,7 @@ impl std::fmt::Debug for User {
 ///
 /// The value `bbr` selects volto's own controller ([`crate::congestion`],
 /// D108), whose window is at most 1.25 times the bandwidth-delay product it
-/// measures. quinn's BBR overestimates the bottleneck and loses the difference
+/// measures, plus what the path's own loss takes out of it. quinn's BBR overestimates the bottleneck and loses the difference
 /// on a bulk download, so it is not offered: the value `bbr-uncapped`, which
 /// selected it from 1.2.0 to 1.7.0, is no longer accepted.
 ///
@@ -401,7 +401,8 @@ impl std::fmt::Debug for User {
 #[serde(rename_all = "lowercase")]
 pub enum CongestionControl {
     /// volto's own controller, with its window at most 1.25 times the measured
-    /// bandwidth-delay product; see [`crate::congestion`]. The default.
+    /// bandwidth-delay product, plus what the path's own loss takes out of it;
+    /// see [`crate::congestion`]. The default.
     Bbr,
     /// CUBIC, quinn's own default. Loss-based; the standard choice on clean paths.
     Cubic,

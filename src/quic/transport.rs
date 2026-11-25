@@ -516,7 +516,11 @@ const LOSS_PACKET_THRESHOLD: u32 = u32::MAX;
 /// defaults, and a client with a 16 MiB window, which is what Surge advertises,
 /// received the same. With reordering as on the production path, the lab
 /// carried 128 to 135 Mbit/s where the defaults carried 91 to 92.
-const LOSS_TIME_THRESHOLD: f32 = 1.25;
+///
+/// The congestion controller reads this value: a lost packet stays in flight
+/// for this many round trips, and the window covers that on a path with base
+/// loss (`LOSS_DELAY_EXTRA_PERMILLE` in `src/congestion/mod.rs`).
+pub(crate) const LOSS_TIME_THRESHOLD: f32 = 1.25;
 
 /// Unidirectional streams a peer may have open on one connection at a time.
 ///

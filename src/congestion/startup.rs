@@ -1,5 +1,5 @@
-//! BBR's full-bandwidth test, which ends the startup gain, and the rule that
-//! brings it back.
+//! BBR's full-bandwidth test, which ends the startup gain, the congestion
+//! exit, and the rule that brings the startup back.
 
 /// How much the estimate has to rise, in percent of its value when it last
 /// rose, to count as growth: BBR's full-bandwidth test.
@@ -33,6 +33,16 @@ pub(super) struct Startup {
     flat: u8,
     /// Whether a congestion event came in the current sample interval.
     pub(super) congested: bool,
+    /// Whether a congestion event that lost no bytes, an ECN mark, came in
+    /// the current sample interval.
+    pub(super) marked: bool,
+    /// Bytes acknowledged in the current sample interval.
+    pub(super) acked: u64,
+    /// Bytes lost in the current sample interval.
+    pub(super) lost: u64,
+    /// Bytes acknowledged and lost since the startup began, also after it has
+    /// ended.
+    total: (u64, u64),
     /// The highest estimate so far.
     peak: u64,
     /// The estimate after the last sample interval that was not app-limited.
@@ -45,9 +55,29 @@ pub(super) struct Startup {
 
 impl Startup {
     /// Applies the test to the sample interval that has just closed, with the
-    /// estimate after it.
-    pub(super) fn on_interval(&mut self, estimate: u64, app_limited: bool) {
+    /// estimate after it. A congestion event in an interval without growth
+    /// ends the startup when the interval lost more than `exit_above_ppm` of
+    /// its bytes, or when it was an ECN mark, provided the startup has counted
+    /// `least` bytes, acknowledged and lost, this interval's included.
+    pub(super) fn on_interval(
+        &mut self,
+        estimate: u64,
+        app_limited: bool,
+        exit_above_ppm: u64,
+        least: u64,
+    ) {
         let congested = std::mem::take(&mut self.congested);
+        let marked = std::mem::take(&mut self.marked);
+        let acked = std::mem::take(&mut self.acked);
+        let lost = std::mem::take(&mut self.lost);
+        self.total = (
+            self.total.0.saturating_add(acked),
+            self.total.1.saturating_add(lost),
+        );
+        // Compared without rounding, so that with `exit_above_ppm` at zero any
+        // lost byte is above it.
+        let above = u128::from(lost) * 1_000_000
+            > u128::from(exit_above_ppm) * u128::from(acked.saturating_add(lost));
         self.peak = self.peak.max(estimate);
         if self.ended {
             if !app_limited {
@@ -64,14 +94,27 @@ impl Startup {
         if u128::from(estimate) * 100 >= u128::from(self.grown_to) * GROWTH_PERCENT {
             self.grown_to = estimate;
             self.flat = 0;
-        } else if congested {
+        } else if (marked || (congested && above))
+            && self.total.0.saturating_add(self.total.1) >= least
+        {
             // The Startup loss exit of BBRv2 and BBRv3, in a form of our own:
-            // one congestion event in an interval without growth is enough.
+            // one interval without growth that lost more than the base loss
+            // explains is enough, once the startup has counted enough packets
+            // to have measured something of the path.
             self.ended = true;
+        } else if app_limited {
+            // An app-limited interval is not part of the full-bandwidth test.
         } else {
             self.flat += 1;
             self.ended = self.flat >= SAMPLES_WITHOUT_GROWTH;
         }
+    }
+
+    /// The share of its bytes the startup has lost so far, in parts per
+    /// million: lost over acknowledged plus lost.
+    pub(super) fn lost_ppm(&self) -> u64 {
+        let bytes = u128::from(self.total.0.saturating_add(self.total.1));
+        u64::try_from(u128::from(self.total.1) * 1_000_000 / bytes.max(1)).unwrap_or(u64::MAX)
     }
 
     /// Brings the startup back once [`RISES_TO_RESTART`] samples in a row,

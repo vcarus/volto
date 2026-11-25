@@ -1,4 +1,7 @@
 //! The steady gain between 1.05 and 1.25, and the loss windows that move it.
+//!
+//! A loss window's share is its loss above the path's base loss (see
+//! `base_loss.rs`): the gain rule acts on the loss a lower gain can remove.
 
 /// The window as a multiple of the estimated bandwidth-delay product, in per
 /// mille, once the startup has ended: the steady gain a connection starts with
@@ -195,14 +198,16 @@ impl Gain {
     /// Counts the sample interval that has just closed, and judges the loss
     /// window when the interval completes one. `probing` is whether a probe is
     /// in progress, `app_limited` whether the interval was app-limited,
-    /// `estimate` is the bandwidth estimate, and `packets` is
-    /// [`WINDOW_PACKETS`] in bytes.
+    /// `estimate` is the bandwidth estimate, `packets` is [`WINDOW_PACKETS`]
+    /// in bytes, and `base_ppm` is the path's base loss in parts per million.
+    /// The window is judged by its loss above the base loss.
     pub(super) fn on_interval(
         &mut self,
         probing: bool,
         app_limited: bool,
         estimate: u64,
         packets: u64,
+        base_ppm: u64,
     ) {
         if probing {
             self.settle = self.settle.max(SETTLE_INTERVALS);
@@ -218,7 +223,9 @@ impl Gain {
         self.limited += u8::from(app_limited);
         let bytes = self.acked.saturating_add(self.lost);
         if self.intervals >= WINDOW_INTERVALS && bytes >= packets {
-            let loss_ppm = u128::from(self.lost) * 1_000_000 / u128::from(bytes.max(1));
+            let base = u128::from(bytes) * u128::from(base_ppm) / 1_000_000;
+            let excess = u128::from(self.lost).saturating_sub(base);
+            let loss_ppm = excess * 1_000_000 / u128::from(bytes.max(1));
             let limited = self.limited * 2 > self.intervals;
             self.restart();
             let loss_ppm = u64::try_from(loss_ppm).unwrap_or(u64::MAX);
@@ -437,7 +444,7 @@ mod tests {
     fn gain_interval(g: &mut Gain, acked: u64, lost: u64) {
         g.acked += acked;
         g.lost += lost;
-        g.on_interval(false, false, ESTIMATE, PACKETS);
+        g.on_interval(false, false, ESTIMATE, PACKETS, 0);
     }
 
     #[test]
@@ -450,6 +457,39 @@ mod tests {
         for _ in 0..n {
             g.on_window(loss_ppm, ESTIMATE, false);
         }
+    }
+
+    /// Four loss windows of four intervals that each acknowledged 2.4 MB and
+    /// lost 600 kB, a fifth of the bytes, with the base loss at `base_ppm`.
+    fn lossy_windows(g: &mut Gain, base_ppm: u64) {
+        for _ in 0..16 {
+            g.acked += 2_400_000;
+            g.lost += 600_000;
+            g.on_interval(false, false, ESTIMATE, PACKETS, base_ppm);
+        }
+    }
+
+    #[test]
+    fn a_loss_window_is_judged_by_its_loss_above_the_base_loss() {
+        let mut g = settled();
+        lossy_windows(&mut g, 0);
+        assert_eq!(g.permille, 1050, "1250 x 0.8 is under the floor");
+
+        let mut g = settled();
+        lossy_windows(&mut g, 200_000);
+        assert_eq!(
+            (g.permille, g.trial, g.recent),
+            (1250, None, [0; TRIAL_WINDOWS]),
+            "a fifth lost at a base loss of a fifth is no loss"
+        );
+
+        let mut g = settled();
+        lossy_windows(&mut g, 180_000);
+        assert_eq!(
+            g.recent, [20_000; TRIAL_WINDOWS],
+            "2 percent above the base"
+        );
+        assert_eq!(g.permille, 1225, "1250 x 0.98");
     }
 
     #[test]
@@ -821,7 +861,7 @@ mod tests {
         }
         g.acked += 600_000;
         g.lost += 200_000;
-        g.on_interval(true, false, ESTIMATE, PACKETS);
+        g.on_interval(true, false, ESTIMATE, PACKETS, 0);
         assert_eq!((g.permille, g.intervals, g.acked, g.lost), (1250, 0, 0, 0));
         assert_eq!(g.settle, SETTLE_INTERVALS);
         for _ in 0..5 {
@@ -965,7 +1005,7 @@ mod tests {
             g.up_wait = 1;
             for i in 0..4 {
                 g.acked += 600_000;
-                g.on_interval(false, i < limited, ESTIMATE, PACKETS);
+                g.on_interval(false, i < limited, ESTIMATE, PACKETS, 0);
             }
             g.permille
         };
@@ -978,7 +1018,7 @@ mod tests {
             g.up_wait = 1;
             for i in 0..8 {
                 g.acked += 300_000;
-                g.on_interval(false, i < limited, ESTIMATE, PACKETS);
+                g.on_interval(false, i < limited, ESTIMATE, PACKETS, 0);
             }
             g.permille
         };
@@ -990,10 +1030,10 @@ mod tests {
     fn a_probe_does_not_shorten_the_intervals_left_out_after_a_startup() {
         let mut g = Gain::default();
         gain_interval(&mut g, 0, 0);
-        g.on_interval(true, false, ESTIMATE, PACKETS);
+        g.on_interval(true, false, ESTIMATE, PACKETS, 0);
         assert_eq!(g.settle, 7);
         let mut g = settled();
-        g.on_interval(true, false, ESTIMATE, PACKETS);
+        g.on_interval(true, false, ESTIMATE, PACKETS, 0);
         assert_eq!(g.settle, SETTLE_INTERVALS);
     }
 }
