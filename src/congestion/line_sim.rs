@@ -2,7 +2,8 @@
 //! path, for tests only.
 //!
 //! The path drops a share of packets at random, which can change at given
-//! times, can drop packets in episodes or all of them for a span, can limit
+//! times, can drop packets in episodes or all of them for a span, or as a
+//! recorded sequence of packet fates says, can limit
 //! the rate with a token-bucket policer or a queue, and delays each packet by
 //! a fixed time each way. The sender is a bulk sender that behaves as
 //! quinn-proto 0.11.19 does under this crate's transport settings. It is never
@@ -308,6 +309,16 @@ struct Scenario {
     /// The packets with these numbers are dropped on the path whatever else
     /// happens to them.
     drop_packets: &'static [u64],
+    /// A recorded sequence of fates, one byte per packet, `b'0'` for a packet
+    /// the path dropped: the n-th packet that passes the policer and the queue
+    /// meets the n-th byte from `trace_start` on, and the sequence starts again
+    /// at its end.
+    trace: Option<&'static [u8]>,
+    trace_start: usize,
+    /// How many packets in a row meet each byte of `trace`: with 2 or more,
+    /// the recorded runs are that many times longer, as loss that follows
+    /// time and not packets would be at that many times the recorded rate.
+    trace_stretch: usize,
     seed: u64,
 }
 
@@ -338,6 +349,9 @@ impl Scenario {
             client_window: None,
             handshake: None,
             drop_packets: &[],
+            trace: None,
+            trace_start: 0,
+            trace_stretch: 1,
             seed,
         }
     }
@@ -359,6 +373,17 @@ impl Scenario {
             limit,
         });
         self
+    }
+
+    /// Whether the recorded sequence drops the `n`-th packet that reaches it,
+    /// counted from zero; `false` without a sequence. The sequence is read
+    /// from `trace_start`, each of its bytes holds for `trace_stretch` packets
+    /// in a row, and it starts again at its end.
+    fn traced_drop(&self, n: usize) -> bool {
+        self.trace.is_some_and(|trace| {
+            let at = self.trace_start + n / self.trace_stretch.max(1);
+            trace[at % trace.len()] == b'0'
+        })
     }
 
     /// The same scenario on the controller as it was before it read the base
@@ -546,6 +571,8 @@ struct Sim {
     state_until: u64,
     episodes: u64,
     episode_drops: u64,
+    /// How many packets have met the recorded sequence.
+    trace_at: usize,
     outage_from: Option<u64>,
     startup_end: Option<u64>,
     startup_end_estimate: u64,
@@ -751,6 +778,7 @@ impl Sim {
             state_until,
             episodes: 0,
             episode_drops: 0,
+            trace_at: 0,
             outage_from: None,
             startup_end: None,
             startup_end_estimate: 0,
@@ -875,7 +903,11 @@ impl Sim {
             (Some(o), Some(from)) => now >= from && now < from + nanos(o.length),
             _ => false,
         };
-        if dropped || in_episode || outage {
+        let traced = self.sc.traced_drop(self.trace_at);
+        if self.sc.trace.is_some() {
+            self.trace_at += 1;
+        }
+        if dropped || traced || in_episode || outage {
             self.episode_drops += u64::from(in_episode);
             if let Some(span) = self.span(now) {
                 span.1 += 1;
@@ -1872,6 +1904,143 @@ fn a_policer_with_loss_in_episodes_calibrated_to_production() {
             sc.episodes = Some(episodes);
             sc.seconds = 120;
             both(&format!("{name} episodes"), sc, true);
+        }
+    }
+}
+
+/// A recorded sequence is read from its starting point, each byte holds for
+/// the stretch, and the sequence starts again at its end.
+#[test]
+fn a_recorded_sequence_is_read_in_order_and_starts_again() {
+    let fates = |sc: Scenario, count: usize| -> Vec<bool> {
+        (0..count).map(|n| sc.traced_drop(n)).collect()
+    };
+    let mut sc = Scenario::new(60, 0.0, 1);
+    assert_eq!(fates(sc, 3), [false; 3], "no sequence drops nothing");
+    sc.trace = Some(b"1101");
+    assert_eq!(
+        fates(sc, 8),
+        [false, false, true, false, false, false, true, false],
+        "the third of every four"
+    );
+    sc.trace_start = 2;
+    assert_eq!(
+        fates(sc, 6),
+        [true, false, false, false, true, false],
+        "from the third byte on"
+    );
+    sc.trace_start = 0;
+    sc.trace_stretch = 2;
+    assert_eq!(
+        fates(sc, 10),
+        [
+            false, false, false, false, true, true, false, false, false, false
+        ],
+        "each byte for two packets in a row"
+    );
+}
+
+/// A sender that a client window holds under the path's rate loses exactly
+/// what the recorded sequence drops: a quarter of its packets when the
+/// sequence drops every fourth, whatever the stretch.
+#[test]
+fn a_held_sender_loses_what_the_recorded_sequence_drops() {
+    for stretch in [1, 3] {
+        let mut sc = Scenario::new(60, 0.0, 1);
+        sc.seconds = 12;
+        sc.warmup = 2;
+        sc.client_window = Some(600_000);
+        sc.trace = Some(b"1110");
+        sc.trace_stretch = stretch;
+        let report = run(&format!("sequence stretch {stretch}"), sc, false);
+        assert!(
+            (report.lost_share - 0.25).abs() < 0.01,
+            "stretch {stretch}: lost {:.3}",
+            report.lost_share
+        );
+    }
+}
+
+/// Recorded loss sequences in place of the random share, for a report. Every
+/// file of the directory `LINE_SIM_TRACE_DIR` whose name starts with
+/// `LINE_SIM_TRACE_PREFIX` is one sequence, a `0` per dropped packet and a `1`
+/// per delivered one. Each runs from three starting points behind a policer
+/// of each rate in `LINE_SIM_TRACE_MBPS` (megabits per second, separated by
+/// commas) with 1 MB, at `LINE_SIM_TRACE_RTT_MS`. With `LINE_SIM_TRACE_STRETCH`
+/// each recorded packet's fate is met by that many packets in a row. Prints
+/// only.
+#[test]
+#[ignore = "a scenario for a report"]
+fn recorded_loss_sequences() {
+    let Ok(dir) = std::env::var("LINE_SIM_TRACE_DIR") else {
+        return;
+    };
+    let prefix = std::env::var("LINE_SIM_TRACE_PREFIX").unwrap_or_default();
+    let limits: Vec<f64> = std::env::var("LINE_SIM_TRACE_MBPS")
+        .unwrap_or_else(|_| "90,150".to_owned())
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let rtt_ms: u64 = std::env::var("LINE_SIM_TRACE_RTT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90);
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .expect("the directory of sequences")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix))
+        })
+        .collect();
+    files.sort();
+    for path in files {
+        let bytes: Vec<u8> = std::fs::read(&path)
+            .expect("a sequence")
+            .into_iter()
+            .filter(|b| *b == b'0' || *b == b'1')
+            .collect();
+        let trace: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let dropped = trace.iter().filter(|&&b| b == b'0').count();
+        let share = to_f64(u64::try_from(dropped).unwrap_or(u64::MAX))
+            / to_f64(u64::try_from(trace.len()).unwrap_or(u64::MAX));
+        let label = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("sequence")
+            .to_owned();
+        for &mbps in &limits {
+            for third in 0..3 {
+                let mut sc = Scenario::new(rtt_ms, 0.0, 1).policer(mbps, 1e6);
+                sc.trace = Some(trace);
+                sc.trace_start = trace.len() / 3 * third;
+                sc.trace_stretch = std::env::var("LINE_SIM_TRACE_STRETCH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1);
+                let name = format!("T {label} {mbps:.0} start{third}");
+                let (before, after) = both(&name, sc, series());
+                let own: Vec<String> = after
+                    .readings
+                    .iter()
+                    .map(|(at, p)| format!("{p:.3}@{at:.0}"))
+                    .collect();
+                println!(
+                    "  TRACE {label} limit {mbps:.0} start {third}: recorded {share:.3} | \
+                     delivered after {:.1} before {:.1} ratio {:.2} | after floor {:.2} base {:.3} \
+                     sent/delivered {:.3} | before floor {:.2} | readings {}",
+                    after.delivered,
+                    before.delivered,
+                    after.delivered / before.delivered.max(1e-9),
+                    after.floor_share,
+                    after.base,
+                    after.send / after.delivered.max(1e-9),
+                    before.floor_share,
+                    own.join(" ")
+                );
+            }
         }
     }
 }
