@@ -414,6 +414,7 @@ mod gain;
 mod line_sim;
 mod min_rtt;
 mod rate;
+mod record;
 mod recovery;
 mod startup;
 #[cfg(test)]
@@ -423,6 +424,7 @@ use base_loss::{BaseLoss, Closed, READING_PACKETS};
 use gain::{Gain, WINDOW_PACKETS};
 use min_rtt::{LowSamples, Probe};
 use rate::{DeliveryRate, Sample};
+pub use record::Record;
 use recovery::Recovery;
 use startup::Startup;
 
@@ -506,6 +508,7 @@ impl ControllerFactory for BbrConfig {
             exit_packets: READING_PACKETS,
             cap: None,
             window: INITIAL_WINDOW,
+            record: Record::default(),
         })
     }
 }
@@ -573,9 +576,16 @@ pub struct Bbr {
     /// while there is none, lowered to the slow-start limit during the first
     /// startup and to the recovery window after the startup.
     window: u64,
+    /// What the connection's close line reports; see [`Record`].
+    record: Record,
 }
 
 impl Bbr {
+    /// What the controller has counted for the connection's close line.
+    pub fn record(&self) -> Record {
+        self.record
+    }
+
     /// The part of [`Controller::on_ack`] that is ours, split out because
     /// [`RttEstimator`] has no public constructor and the tests cannot make one.
     fn record_ack(
@@ -767,6 +777,18 @@ impl Controller for Bbr {
         let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
         if let Some(sample) = &sample {
             let was_ended = self.startup.ended;
+            // The close line's counts, read before this interval moves the
+            // startup, the estimate and the cap, and before the startup takes
+            // the interval's lost bytes. A probe's ACKs count as app-limited,
+            // so an interval with a probe in it is left out with the others.
+            if was_ended && !sample.app_limited {
+                self.record.count(
+                    sample.ack_elapsed,
+                    sample.rate,
+                    self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
+                    self.startup.lost == 0,
+                );
+            }
             // 1.5 times the base loss: any lost byte while it is zero.
             let exit_above = self.base.ppm() * 3 / 2;
             self.startup.on_interval(
@@ -2235,6 +2257,86 @@ mod tests {
         batch(&mut c, 85, 25, 10_000, 500_000);
         assert!(c.recovery.is_none(), "a packet sent after the last loss");
         assert_eq!(c.window(), 1_125_000, "back at the cap");
+    }
+
+    /// What the close line reports of the controller. 2 MB/s at 60 ms is a
+    /// bandwidth-delay product of 120 kB, so the cap is at its floor; 10 MB/s
+    /// gives 750 kB.
+    #[test]
+    fn the_record_counts_the_time_the_window_held_the_sender_and_the_part_at_the_floor() {
+        let mut c = capped();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+
+        // There is no cap before the first sample, so no floor yet.
+        t = interval(&mut c, t, 2_000_000, false);
+        assert_eq!(
+            c.record(),
+            Record {
+                window_limited: SRTT,
+                floor: Duration::ZERO,
+                floor_lossless: Duration::ZERO,
+                peak: 2_000_000,
+            }
+        );
+        assert_eq!(c.cap(), Some(FLOOR));
+
+        // At the floor, and nothing lost.
+        t = interval(&mut c, t, 2_000_000, false);
+        // At the floor, with a loss.
+        c.on_congestion_event(t, t - MIN_RTT, false, 1200);
+        t = interval(&mut c, t, 2_000_000, false);
+        assert_eq!(
+            c.record(),
+            Record {
+                window_limited: 3 * SRTT,
+                floor: 2 * SRTT,
+                floor_lossless: SRTT,
+                peak: 2_000_000,
+            }
+        );
+
+        // An app-limited interval is the application's, not the window's.
+        t = interval(&mut c, t, 2_000_000, true);
+        assert_eq!(c.record().window_limited, 3 * SRTT);
+
+        // The interval that raises the estimate closed with the cap still at
+        // the floor; the next one closes above it.
+        t = interval(&mut c, t, 10_000_000, false);
+        interval(&mut c, t, 10_000_000, false);
+        assert_eq!(
+            c.record(),
+            Record {
+                window_limited: 5 * SRTT,
+                floor: 3 * SRTT,
+                floor_lossless: 2 * SRTT,
+                peak: 10_000_000,
+            }
+        );
+    }
+
+    #[test]
+    fn the_record_leaves_out_a_startup_and_a_probe() {
+        // A startup: its window is not the steady one.
+        let mut c = starting();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        t = interval(&mut c, t, 2_000_000, false);
+        assert!(!c.startup.ended);
+        assert_eq!(c.record(), Record::default());
+
+        // A probe: it holds the window low on purpose, and its ACKs count
+        // as app-limited.
+        let mut c = capped();
+        end_acks(&mut c, t, false);
+        t = interval(&mut c, t, 2_000_000, false);
+        let before = c.record();
+        c.probe = Some(Probe {
+            min: MIN_RTT,
+            ends: None,
+        });
+        interval(&mut c, t, 2_000_000, false);
+        assert_eq!(c.record(), before);
     }
 
     #[test]

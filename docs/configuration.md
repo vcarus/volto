@@ -544,6 +544,21 @@ to be silent where it happens, leaving this total as their only
 production-visible trace. All of them come from one
 snapshot taken as the connection ends, so they cost nothing while it is running.
 
+**They end with four counts from the `bbr` controller.** `window_limited_ms=` is
+the time, after the connection's startup, in which the congestion window and
+nothing before it held the sender. `window_floor_ms=` is the part of that time
+with the window at its floor of 240 kB, and `window_floor_lossless_ms=` is the
+part of the floor time in which nothing was lost. `peak_bytes_per_sec=` is the
+highest delivery rate measured in that time. A sender at the floor sends 240 kB
+per round trip, whatever the path carries. On a slow path that is all there is
+to send. A connection that spent seconds at the floor without loss, after a peak
+several times what the floor carries, is one the controller may have held below
+what the path carried: it sizes the window by the lowest round trip it has seen,
+and a path whose round trip has risen, or whose acknowledgements arrive in
+clumps, keeps packets in the window for longer than that. The four are reports,
+not knobs, and they are read once as the connection ends. Under `cubic` or
+`newreno` each of them prints `-`.
+
 **`initial_rtt_ms` seeds the handshake retransmission timers.** Until the first
 ACK arrives there is no RTT sample, and a lost handshake packet waits roughly
 three times this value before it is resent. The default of 333 comes from

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory};
 
 use super::base_loss::{Closed, READINGS};
-use super::{Bbr, BbrConfig, INITIAL_WINDOW};
+use super::{Bbr, BbrConfig, INITIAL_WINDOW, Record};
 use crate::quic::LOSS_TIME_THRESHOLD;
 
 /// quinn's `TIMER_GRANULARITY` in quinn-proto `src/lib.rs`: the shortest loss
@@ -521,6 +521,8 @@ struct Report {
     /// Packets sent and packets the drop stages dropped, per 100 ms.
     spans: Vec<(u32, u32)>,
     seconds: Vec<Second>,
+    /// What the controller counted for the close line, over the whole run.
+    record: Record,
 }
 
 /// The sender, the path and the controller.
@@ -1326,6 +1328,7 @@ impl Sim {
             per_episode: to_f64(self.episode_drops) / to_f64(self.episodes.max(1)),
             spans: self.spans.clone(),
             seconds: seconds.to_vec(),
+            record: self.c.record(),
         }
     }
 }
@@ -2042,6 +2045,67 @@ fn recorded_loss_sequences() {
                 );
             }
         }
+    }
+}
+
+/// A clean path whose acknowledgements reach the sender in clumps, here 50 ms
+/// apart on a round trip of 65 ms, holds the sender at its floor, and the
+/// record for the close line shows it: most of the time the window held the
+/// sender was spent at the floor without loss, on a connection that had
+/// delivered several times what the floor carries. With acknowledgements
+/// every 2 ms the same path spends no time at the floor.
+///
+/// The first half asserts what the controller does today, which is a fault
+/// and not a rule: the window is sized by the minimum RTT, and a packet stays
+/// in it for as long as it is in flight. When that is repaired, the first half
+/// changes.
+#[test]
+fn acknowledgements_in_clumps_hold_the_sender_at_the_floor_and_the_record_shows_it() {
+    // What the floor sends on this path when a window turns over once per
+    // round trip, in bytes per second.
+    let floor_rate = INITIAL_WINDOW * 1000 / 65;
+    for seed in SEEDS {
+        let mut sc = Scenario::new(65, 0.0, seed).policer(150.0, 1e6);
+        sc.ack_batch = Duration::from_millis(50);
+        let r = run("clumps of 50 ms", sc, false);
+        let held = r.record.window_limited.as_secs_f64();
+        assert!(
+            held >= 40.0,
+            "seed {seed}: the window held the sender for {held} s of 60"
+        );
+        assert!(
+            r.record.floor_lossless.as_secs_f64() >= 0.6 * held,
+            "seed {seed}: {:?}",
+            r.record
+        );
+        assert!(
+            r.record.peak >= 4 * floor_rate,
+            "seed {seed}: {:?}",
+            r.record
+        );
+        assert!(
+            r.delivered <= 40.0,
+            "seed {seed}: delivered {}",
+            r.delivered
+        );
+
+        let r = run(
+            "no clumps",
+            Scenario::new(65, 0.0, seed).policer(150.0, 1e6),
+            false,
+        );
+        assert!(r.record.window_limited.as_secs_f64() >= 40.0, "seed {seed}");
+        assert_eq!(
+            r.record.floor,
+            Duration::ZERO,
+            "seed {seed}: {:?}",
+            r.record
+        );
+        assert!(
+            r.delivered >= 140.0,
+            "seed {seed}: delivered {}",
+            r.delivered
+        );
     }
 }
 

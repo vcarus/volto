@@ -185,6 +185,29 @@ async fn operator_facing_fields_print_values_not_options() {
         bloated.len()
     );
 
+    // The close line's four counts come from this crate's own controller.
+    // Under another one there is nothing to count, and each field prints the
+    // dash an absent value prints as, not a zero that would read as a
+    // measurement.
+    let other = TestServer::start_with("[limits]\ncongestion_control = \"cubic\"\n").await;
+    let mark = buffer.mark();
+    let leaving = H3Client::connect(&other).await;
+    leaving.quic.close(quinn::VarInt::from_u32(0), b"");
+    let closed = buffer
+        .wait_for_line(mark, &["connection closed", "reason=\"peer_close\""])
+        .await;
+    for field in [
+        "window_limited_ms=-",
+        "window_floor_ms=-",
+        "window_floor_lossless_ms=-",
+        "peak_bytes_per_sec=-",
+    ] {
+        assert!(
+            closed.contains(field),
+            "under `cubic` the close line must carry {field}; line was:\n{closed}"
+        );
+    }
+
     // The point of the whole exercise: no `Option` reaches an operator's eyes.
     assert!(
         !logged.contains("Some("),

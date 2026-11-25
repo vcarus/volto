@@ -1032,6 +1032,17 @@ impl CloseReason {
 /// much did this connection move through this host" and nothing finer.
 /// `sent_packets` and `lost_packets` are reported together because a loss rate
 /// needs both: either number alone says nothing about the path (D72).
+///
+/// The last four fields are the controller's own counts
+/// ([`crate::congestion::Record`]): `window_limited_ms` is the time the
+/// window held the sender after its startup, `window_floor_ms` the part of it
+/// with the window at its 240 kB floor, `window_floor_lossless_ms` the part
+/// of that in which nothing was lost, and `peak_bytes_per_sec` the highest
+/// delivery rate of that time. A connection that sat at the floor without
+/// loss, after it had delivered several times what the floor carries, is one
+/// the controller may have held there. Under a controller other than `bbr`
+/// each of the four prints `-`. They are read from quinn's copy of the
+/// controller, taken once here like the snapshot above.
 fn log_connection_closed(
     remote: SocketAddr,
     quic: &quinn::Connection,
@@ -1044,6 +1055,17 @@ fn log_connection_closed(
     // nothing while the connection runs.
     let stats = quic.stats();
     let path = stats.path;
+    let record = quic
+        .congestion_state()
+        .into_any()
+        .downcast::<crate::congestion::Bbr>()
+        .ok()
+        .map(|controller| controller.record());
+    let window_limited_ms = crate::logfmt::or_dash(record.map(|r| r.window_limited.as_millis()));
+    let window_floor_ms = crate::logfmt::or_dash(record.map(|r| r.floor.as_millis()));
+    let window_floor_lossless_ms =
+        crate::logfmt::or_dash(record.map(|r| r.floor_lossless.as_millis()));
+    let peak_bytes_per_sec = crate::logfmt::or_dash(record.map(|r| r.peak));
 
     match closed {
         Ok(reason) => {
@@ -1061,6 +1083,10 @@ fn log_connection_closed(
                 rx_bytes = stats.udp_rx.bytes,
                 sent_packets = path.sent_packets,
                 lost_packets = path.lost_packets,
+                %window_limited_ms,
+                %window_floor_ms,
+                %window_floor_lossless_ms,
+                %peak_bytes_per_sec,
                 "connection closed"
             );
         }
@@ -1079,6 +1105,10 @@ fn log_connection_closed(
                 rx_bytes = stats.udp_rx.bytes,
                 sent_packets = path.sent_packets,
                 lost_packets = path.lost_packets,
+                %window_limited_ms,
+                %window_floor_ms,
+                %window_floor_lossless_ms,
+                %peak_bytes_per_sec,
                 "connection closed with error"
             );
         }

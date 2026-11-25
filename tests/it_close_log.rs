@@ -99,6 +99,22 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             numeric_field(&line, "sent_packets") > 0,
             "a connection that answered must have sent packets; line was:\n{line}"
         );
+        // What the controller counted. A tunnel that echoes seven bytes never
+        // has more to send than its window lets out, so no time is counted,
+        // at the floor or above it. The values are numbers under `bbr`, the
+        // default; `it_log_fields` reads them under another controller.
+        for field in [
+            "window_limited_ms",
+            "window_floor_ms",
+            "window_floor_lossless_ms",
+            "peak_bytes_per_sec",
+        ] {
+            assert_eq!(
+                numeric_field(&line, field),
+                0,
+                "a connection the window never held counts nothing; line was:\n{line}"
+            );
+        }
     }
 
     // 3. Any other application error code is the peer reporting a problem, and
@@ -325,6 +341,10 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             "rx_bytes=",
             "sent_packets=",
             "lost_packets=",
+            "window_limited_ms=",
+            "window_floor_ms=",
+            "window_floor_lossless_ms=",
+            "peak_bytes_per_sec=",
         ] {
             assert!(
                 line.contains(field),
