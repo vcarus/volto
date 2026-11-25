@@ -599,6 +599,29 @@ impl Context {
     }
 }
 
+/// Runs `work` and returns what it gave with the time it took.
+///
+/// On tokio's clock, like every budget in this module, so a test on a paused
+/// clock reads the time exactly.
+pub(crate) async fn timed<F: std::future::Future>(work: F) -> (F::Output, Duration) {
+    let started = tokio::time::Instant::now();
+    let output = work.await;
+    (output, started.elapsed())
+}
+
+/// A target [`admit_target`] let through.
+#[derive(Debug)]
+pub(crate) struct Admitted {
+    /// The addresses the tunnel may dial, in the order to try them. Never
+    /// empty.
+    pub(crate) addresses: Vec<std::net::SocketAddr>,
+    /// How long the name took to resolve: the wait for a lookup slot plus the
+    /// lookup ([`crate::net::ConnectionResolver::lookup`]). An IP literal asks
+    /// no resolver and reads zero. Each tunnel prints it as `resolve_ms` on
+    /// its established line.
+    pub(crate) resolve: Duration,
+}
+
 /// Resolves `host`/`port`, giving the resolver at most `budget` and ordering the
 /// answer by `family`.
 ///
@@ -843,10 +866,11 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// Turns a request's target into the addresses it may be dialled on, answering
 /// the request itself when there are none it may use.
 ///
-/// `Some(addresses)` is a non-empty, policy-filtered, family-ordered list, ready
-/// for the caller to dial. `None` means the request has **already been
-/// answered** (with a 403, a 502, a 504, or the 200 that closes on the spot),
-/// and the caller has nothing left to do but return.
+/// `Some` carries a non-empty, policy-filtered, family-ordered list, ready for
+/// the caller to dial, and the time the resolution took ([`Admitted`]). `None`
+/// means the request has **already been answered** (with a 403, a 502, a 504,
+/// or the 200 that closes on the spot), and the caller has nothing left to do
+/// but return.
 ///
 /// Both tunnel types run exactly this preamble, which is why it is written once:
 /// two copies could drift, and the two protocols would then disagree about what
@@ -888,7 +912,7 @@ pub(crate) async fn admit_target(
     ctx: &Context,
     stream: &mut Stream,
     accepted_fields: impl FnOnce() -> Fields,
-) -> Option<Vec<std::net::SocketAddr>> {
+) -> Option<Admitted> {
     let stream_id = stream.id();
 
     if !ctx.generation.policy.allows_port(port) {
@@ -897,13 +921,13 @@ pub(crate) async fn admit_target(
         return None;
     }
 
-    let resolved = resolve_within(
+    let (resolved, resolve) = timed(resolve_within(
         host,
         port,
         &ctx.resolver,
         ctx.connect_timeout,
         ctx.ip_family_preference,
-    )
+    ))
     .await;
     let addresses = match resolved {
         Ok(addresses) => addresses,
@@ -967,7 +991,10 @@ pub(crate) async fn admit_target(
         return None;
     }
 
-    Some(allowed)
+    Some(Admitted {
+        addresses: allowed,
+        resolve,
+    })
 }
 
 #[cfg(test)]
@@ -1239,6 +1266,23 @@ mod tests {
             );
         }
     }
+    /// The time a tunnel line reports for a step is the time the step took, and
+    /// nothing before or after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_step_reads_the_time_the_step_took() {
+        tokio::time::advance(Duration::from_millis(7)).await;
+
+        let (output, took) = timed(async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            "done"
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(5)).await;
+
+        assert_eq!(output, "done");
+        assert_eq!(took, Duration::from_millis(30));
+    }
+
     /// A resolver that never answers costs the request its budget and no more,
     /// and is reported as the timeout it is rather than as an ordinary lookup
     /// failure — the two carry different statuses.
