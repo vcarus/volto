@@ -26,6 +26,20 @@ use crate::quic::AuthGate;
 use crate::shutdown::Shutdown;
 use crate::tunnel::{self, Context, ProxyError, Route, udp};
 
+/// What one connection counts for its closing line.
+///
+/// Created by [`crate::quic`] and not inside the connection, so that they are
+/// still there to read once the connection is over.
+#[derive(Debug, Clone, Default)]
+pub struct Counts {
+    /// Requests granted a tunnel slot ([`Context::tunnels`]).
+    pub tunnels: Arc<AtomicU64>,
+    /// Tunnel setups that failed at the lookup or at the target.
+    pub failed_setups: Arc<tunnel::FailedSetups>,
+    /// Inbound HTTP Datagrams the connection's router dropped.
+    pub dropped_datagrams: Arc<AtomicU64>,
+}
+
 /// Drives one QUIC connection until the peer stops sending requests.
 ///
 /// Returns `Err` only for connection-level failures; per-request problems are
@@ -107,20 +121,24 @@ use crate::tunnel::{self, Context, ProxyError, Route, udp};
 /// the threads its name lookups can hold (D90).
 ///
 /// `authenticated` is that state, and it belongs to [`crate::quic`] for the same
-/// reason `tunnels` does: the accept loop reads it after this has been handed
+/// reason `counts` does: the accept loop reads it after this has been handed
 /// the connection, to decide which connection loses its slot when the server is
-/// full. `dropped_datagrams` belongs there too, because it is read for the
-/// closing line at the same moment `tunnels` is. It is handed on to the HTTP/3
-/// connection, whose datagram router is the thing that drops.
+/// full. Of `counts`, the tunnel counter and the failed setups go to every
+/// request through the context, and `dropped_datagrams` is handed on to the
+/// HTTP/3 connection, whose datagram router is the thing that drops.
 pub async fn handle(
     quic: quinn::Connection,
     generation: Arc<tunnel::Generation>,
     mut shutdown: Shutdown,
     resolver: crate::net::ConnectionResolver,
-    tunnels: Arc<AtomicU64>,
-    dropped_datagrams: Arc<AtomicU64>,
+    counts: Counts,
     authenticated: AuthGate,
 ) -> Result<(), h3api::ConnectionError> {
+    let Counts {
+        tunnels,
+        failed_setups,
+        dropped_datagrams,
+    } = counts;
     // Cloned before the handshake, which takes ownership of the connection. The
     // context needs the connection itself, not only its datagram half: a UDP
     // session sends datagrams on it and asks it per packet how large one may be
@@ -156,6 +174,7 @@ pub async fn handle(
         connection.peer_settings(),
         resolver,
         tunnels,
+        failed_setups,
         authenticated,
     ));
 

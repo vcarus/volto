@@ -290,6 +290,7 @@ mod tests {
             crate::net::ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS)
                 .per_connection(),
             std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            std::sync::Arc::new(crate::tunnel::FailedSetups::default()),
             crate::quic::AuthGate::closed(),
         );
         (ctx, peer)

@@ -12,7 +12,7 @@ mod status;
 pub mod tcp;
 pub mod udp;
 
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -384,6 +384,9 @@ pub struct Context {
     /// the connection ends to report it on the closing line (D72); nothing here
     /// ever reads it back.
     pub tunnels: Arc<AtomicU64>,
+    /// The setups on this connection that failed at the lookup or at the
+    /// target; see [`FailedSetups`]. Owned by [`crate::quic`] as `tunnels` is.
+    pub failed_setups: Arc<FailedSetups>,
     /// The longest one tunnel may make no progress before it is given up on.
     ///
     /// Both tunnel kinds spend it, which is why it is not named for either: a
@@ -493,6 +496,7 @@ impl Context {
         peer_settings: crate::h3api::PeerSettings,
         resolver: crate::net::ConnectionResolver,
         tunnels: Arc<AtomicU64>,
+        failed_setups: Arc<FailedSetups>,
         authenticated: AuthGate,
     ) -> Self {
         let config = &generation.config;
@@ -506,6 +510,7 @@ impl Context {
             quota: Quota::new(config.limits.max_targets_per_conn),
             max_streams_bidi: config.limits.max_streams_bidi,
             tunnels,
+            failed_setups,
             stall_budget: config.limits.udp_session_timeout(),
             connect_timeout: config.limits.connect_timeout(),
             resolver,
@@ -596,6 +601,51 @@ impl Context {
     /// Whether any request on this connection has (D76).
     pub(crate) fn is_authenticated(&self) -> bool {
         self.authenticated.is_open()
+    }
+}
+
+/// The tunnel setups of one connection that ended in a 502, a 503 or a 504
+/// because the name did not resolve or the target could not be reached.
+///
+/// Such a setup prints at debug only, as every refusal does, because a peer
+/// can provoke as many as it likes (D97). These counts are what the production
+/// level keeps of them, and they cost one line: the connection's closing line
+/// prints them once. A setup the policy refused, or one refused at the tunnel
+/// limit, is not counted here.
+#[derive(Debug, Default)]
+pub struct FailedSetups {
+    resolves: AtomicU64,
+    connects: AtomicU64,
+    millis: AtomicU64,
+}
+
+impl FailedSetups {
+    /// Counts a lookup that failed or ran out of its budget after `waited`.
+    pub(crate) fn resolve(&self, waited: Duration) {
+        self.resolves.fetch_add(1, Ordering::Relaxed);
+        self.wait(waited);
+    }
+
+    /// Counts a target none of whose addresses could be reached. `waited` is
+    /// the lookup plus the walk over the addresses.
+    pub(crate) fn connect(&self, waited: Duration) {
+        self.connects.fetch_add(1, Ordering::Relaxed);
+        self.wait(waited);
+    }
+
+    fn wait(&self, waited: Duration) {
+        let millis = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        self.millis.fetch_add(millis, Ordering::Relaxed);
+    }
+
+    /// How many lookups failed, how many targets could not be reached, and
+    /// how long those setups took in sum, in milliseconds.
+    pub fn read(&self) -> (u64, u64, u64) {
+        (
+            self.resolves.load(Ordering::Relaxed),
+            self.connects.load(Ordering::Relaxed),
+            self.millis.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -933,6 +983,7 @@ pub(crate) async fn admit_target(
         Ok(addresses) => addresses,
         Err(failure) => {
             let error = failure.proxy_error();
+            ctx.failed_setups.resolve(resolve);
             debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
             refuse_because(stream, error).await;
             return None;

@@ -544,20 +544,40 @@ to be silent where it happens, leaving this total as their only
 production-visible trace. All of them come from one
 snapshot taken as the connection ends, so they cost nothing while it is running.
 
-**They end with four counts from the `bbr` controller.** `window_limited_ms=` is
-the time, after the connection's startup, in which the congestion window and
-nothing before it held the sender. `window_floor_ms=` is the part of that time
-with the window at its floor of 240 kB, and `window_floor_lossless_ms=` is the
-part of the floor time in which nothing was lost. `peak_bytes_per_sec=` is the
-highest delivery rate measured in that time. A sender at the floor sends 240 kB
-per round trip, whatever the path carries. On a slow path that is all there is
-to send. A connection that spent seconds at the floor without loss, after a peak
-several times what the floor carries, is one the controller may have held below
-what the path carried: it sizes the window by the lowest round trip it has seen,
-and a path whose round trip has risen, or whose acknowledgements arrive in
-clumps, keeps packets in the window for longer than that. The four are reports,
-not knobs, and they are read once as the connection ends. Under `cubic` or
-`newreno` each of them prints `-`.
+**They also carry nine readings from the `bbr` controller.**
+`window_limited_ms=` is the time, after the connection's startup, in which the
+congestion window and nothing before it held the sender. `window_floor_ms=` is
+the part of that time with the window at its floor of 240 kB, and
+`window_floor_lossless_ms=` is the part of the floor time in which nothing was
+lost. `peak_bytes_per_sec=` is the highest delivery rate measured in that time.
+A sender at the floor sends 240 kB per round trip, whatever the path carries. On
+a slow path that is all there is to send. A connection that spent seconds at the
+floor without loss, after a peak several times what the floor carries, is one
+the controller may have held below what the path carried: it sizes the window by
+the lowest round trip it has seen, and a path whose round trip has risen, or
+whose acknowledgements arrive in clumps, keeps packets in the window for longer
+than that. The other five are means over the window-limited time, and print `-`
+when there was none. `window_turnover_permille=` is how many minimum RTTs the
+window took to deliver its own size; the steady gain allows 1250 on a path
+without loss, and a connection well above that delivered less than the
+controller's own estimate. `flight_over_min_rtt_permille=` is how long the
+acknowledged bytes had been in flight, in minimum RTTs, which is the part of the
+turnover that is delay. `base_loss_mean_ppm=` and `base_loss_peak_ppm=` are the
+base loss the window was widened for, and `gain_mean_permille=` is the steady
+gain, 1250 unless the path's loss lowered it. All nine are reports, not knobs,
+and they are read once as the connection ends. Under `cubic` or `newreno` each
+of them prints `-`. They describe the controller as it is built today and are
+there to answer questions about it, so unlike the other fields of these lines
+they may change or go in a later release.
+
+**And they count the tunnel setups that failed.** `failed_resolves=` is how many
+targets could not be resolved, `failed_connects=` how many resolved and could
+not be reached, and `failed_setup_ms=` the time those setups took in sum, which
+is the time the client waited for a 502, a 503 or a 504. A failed setup prints
+no line of its own at the default log level, because a client can ask for as
+many unreachable targets as it likes; these three are what the default level
+keeps of them. A request the policy refused, or one refused at the tunnel limit,
+is not counted here.
 
 **`initial_rtt_ms` seeds the handshake retransmission timers.** Until the first
 ACK arrives there is no RTT sample, and a lost handshake packet waits roughly

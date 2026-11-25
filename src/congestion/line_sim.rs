@@ -2088,6 +2088,13 @@ fn acknowledgements_in_clumps_hold_the_sender_at_the_floor_and_the_record_shows_
             "seed {seed}: delivered {}",
             r.delivered
         );
+        // The cause, as the record reads it: the window took more minimum
+        // RTTs to deliver its own size than the steady gain of 1.25 allows,
+        // and part of that is the time the acknowledged bytes were in flight.
+        let (turnover, flight) = (r.record.turnover_permille(), r.record.flight_permille());
+        println!("clumps seed {seed}: turnover {turnover:?} in flight {flight:?}");
+        assert!(turnover >= Some(1300), "seed {seed}: turnover {turnover:?}");
+        assert!(flight >= Some(1150), "seed {seed}: in flight {flight:?}");
 
         let r = run(
             "no clumps",
@@ -2105,6 +2112,16 @@ fn acknowledgements_in_clumps_hold_the_sender_at_the_floor_and_the_record_shows_
             r.delivered >= 140.0,
             "seed {seed}: delivered {}",
             r.delivered
+        );
+        let (turnover, flight) = (r.record.turnover_permille(), r.record.flight_permille());
+        println!("no clumps seed {seed}: turnover {turnover:?} in flight {flight:?}");
+        assert!(
+            turnover >= Some(1000) && turnover <= Some(1200),
+            "seed {seed}: turnover {turnover:?}"
+        );
+        assert!(
+            flight >= Some(1000) && flight <= Some(1100),
+            "seed {seed}: in flight {flight:?}"
         );
     }
 }
