@@ -114,8 +114,11 @@ pub(super) enum Closed {
     /// No reading was due to close.
     No,
     /// A reading completed and was kept. `ratio_ppm` is the probe's arrival
-    /// rate over the arrival rate of the round trip before it.
-    Kept { ratio_ppm: u64 },
+    /// rate over the arrival rate of the round trip before it. `share_ppm` is
+    /// the loss share the reading itself read, with what was carried into it,
+    /// which is not the base loss in force: that is the lowest of the kept
+    /// readings.
+    Kept { ratio_ppm: u64, share_ppm: u64 },
     /// The probe's bytes, `own` of them, are carried, because with the carry
     /// they are still too few for a reading. `lost_ppm` is the loss share of
     /// the carried bytes including this probe's. `cleared` when this was the
@@ -369,7 +372,10 @@ impl BaseLoss {
                 Some(ppm) => {
                     self.carry = (0, 0);
                     if self.push(ppm) {
-                        return Closed::Kept { ratio_ppm };
+                        return Closed::Kept {
+                            ratio_ppm,
+                            share_ppm: ppm,
+                        };
                     }
                     None
                 }
@@ -450,7 +456,10 @@ mod tests {
         );
         assert_eq!(
             b.close(t0 + ms(400), SRTT, 120_000),
-            Closed::Kept { ratio_ppm: 250_000 },
+            Closed::Kept {
+                ratio_ppm: 250_000,
+                share_ppm: 200_000
+            },
             "1 MB/s arrived in the probe, 4 MB/s before it"
         );
         assert_eq!(b.ppm(), 200_000, "50 kB lost of 250 kB");
@@ -484,7 +493,10 @@ mod tests {
         let mut b = BaseLoss::default();
         assert_eq!(
             probe_after(&mut b, t0, 100_000, 150_000, 30_000),
-            Closed::Kept { ratio_ppm: 750_000 },
+            Closed::Kept {
+                ratio_ppm: 750_000,
+                share_ppm: 166_666
+            },
             "0.75 MB/s arrived in the probe, 1 MB/s before it"
         );
         assert_eq!(b.ppm(), 166_666);
@@ -619,10 +631,30 @@ mod tests {
         assert_eq!(b.ppm(), 0, "nothing kept yet");
         assert_eq!(
             probe(&mut b, t0 + ms(1_000), 50_000, 30_001),
-            Closed::Kept { ratio_ppm: 500_000 }
+            Closed::Kept {
+                ratio_ppm: 500_000,
+                share_ppm: 250_000
+            }
         );
         assert_eq!(b.ppm(), 250_000, "50 kB lost of 200 kB over both probes");
         assert_eq!(b.carry, (0, 0), "the carry starts again");
+    }
+
+    /// The debug line of a reading prints its outcome, so this is what tells a
+    /// reader what one probe read when an earlier, lower reading is in force.
+    #[test]
+    fn a_kept_reading_reports_its_own_share_and_not_the_base_loss_in_force() {
+        let t0 = Instant::now();
+        let mut b = BaseLoss::default();
+        probe(&mut b, t0, 900_000, 100_000);
+        assert_eq!(
+            probe(&mut b, t0 + ms(10_000), 750_000, 250_000),
+            Closed::Kept {
+                ratio_ppm: 500_000,
+                share_ppm: 250_000
+            }
+        );
+        assert_eq!(b.ppm(), 100_000, "the lower of the two readings");
     }
 
     #[test]
@@ -638,7 +670,10 @@ mod tests {
         assert_eq!(b.carry, (60_000, 0), "the carry is what it was");
         assert_eq!(
             probe(&mut b, t0 + ms(2_000), 60_000, 20_000),
-            Closed::Kept { ratio_ppm: 500_000 }
+            Closed::Kept {
+                ratio_ppm: 500_000,
+                share_ppm: 142_857
+            }
         );
         assert_eq!(b.ppm(), 142_857, "20 kB lost of 140 kB, without the outage");
     }
@@ -649,7 +684,10 @@ mod tests {
         let mut b = BaseLoss::default();
         assert_eq!(
             probe(&mut b, t0, 800_000, 200_000),
-            Closed::Kept { ratio_ppm: 500_000 }
+            Closed::Kept {
+                ratio_ppm: 500_000,
+                share_ppm: 200_000
+            }
         );
         assert_eq!(b.ppm(), 200_000);
         for i in 1..4 {
@@ -686,7 +724,11 @@ mod tests {
         }
         assert_eq!(
             probe(&mut b, t0 + ms(30_000), 800_000, 200_000),
-            Closed::Kept { ratio_ppm: 500_000 }
+            // 200 kB lost of 1060 kB: the three short probes carried 60 kB.
+            Closed::Kept {
+                ratio_ppm: 500_000,
+                share_ppm: 188_679
+            }
         );
         for i in 4..7 {
             probe(&mut b, t0 + ms(10_000 * i), 20_000, 0);
