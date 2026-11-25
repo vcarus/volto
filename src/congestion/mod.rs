@@ -1,5 +1,6 @@
 //! The `bbr` congestion controller: a window of at most 1.25 times the
-//! bandwidth-delay product it measures.
+//! bandwidth-delay product it measures, plus what the path's own loss takes
+//! out of it.
 //!
 //! It is the default (D108). The type is [`Bbr`].
 //!
@@ -40,15 +41,18 @@
 //! loss of a queue and leaves random loss as it is. The rule below is ours.
 //!
 //! The controller counts the bytes acknowledged and the bytes lost over loss
-//! windows of at least four sample intervals and 2000 packets. When the last
-//! four windows at the present gain each lost something and the mean of their
-//! loss shares is one percent or more, a trial of a lower gain starts: the gain
-//! times the share delivered, which is the in-flight data the path carried, and never under
-//! the floor. Windows that lost so much that the path carried under 0.9
-//! bandwidth-delay products start no trial, because a queue loses at most what
-//! the window holds above one. If the loss was the queue's, the loss at the
-//! lower gain is the part of the same in-flight data that the lower window
-//! still exceeds, often none.
+//! windows of at least four sample intervals and 2000 packets. The loss share
+//! of a window is its loss above the path's base loss, described below: the
+//! base loss times the window's bytes is taken off its lost bytes, not below
+//! zero. Loss at the base loss is not the queue's, and a lower gain does not
+//! remove it. When the last four windows at the present gain each lost
+//! something and the mean of their loss shares is one percent or more, a trial
+//! of a lower gain starts: the gain times the share delivered, which is the
+//! in-flight data the path carried, and never under the floor. Windows that
+//! lost so much that the path carried under 0.9 bandwidth-delay products start
+//! no trial, because a queue loses at most what the window holds above one. If
+//! the loss was the queue's, the loss at the lower gain is the part of the same
+//! in-flight data that the lower window still exceeds, often none.
 //!
 //! The first two windows of a trial are left out. The lower gain is kept when
 //! each of the next four lost less than the lowest of the four before the
@@ -98,6 +102,141 @@
 //! with more in flight than the path holds, and that loss is not the steady
 //! gain's.
 //!
+//! A path can drop a share of all packets whatever the sender sends: its base
+//! loss. quinn takes an acknowledged packet out of in-flight data one round
+//! trip after it was sent, and a lost one only when it declares it lost, 1.25
+//! round trips after it was sent (`LOSS_TIME_THRESHOLD` in
+//! `src/quic/transport.rs`, D116). With a base loss p, a window of 1.25 times
+//! the bandwidth-delay product therefore delivers 1.25 (1 - p) / (1 + 0.25 p)
+//! times the estimate. Above about one sixth lost that is under one, each
+//! sample is lower than the estimate, and the window falls to its floor
+//! however much the path carries. In the lab, on a path that carried 115
+//! Mbit/s with 23 percent lost, each of three releases sent 21 to 22 Mbit/s
+//! and delivered 16 to 17.
+//!
+//! So outside the startup and a probe the window is multiplied by
+//! (1 + t p) / (1 - p), where t is the time threshold minus one and p is the
+//! base loss, at most 40 percent. The rule is ours.
+//!
+//! Loss the sender causes by sending above a rate limit or a queue is not base
+//! loss, and the window does not cover it. A window that grew with that loss
+//! would grow without end at a limiter, because what it adds is lost and
+//! covered again. So the base loss is read only where the sender's rate cannot
+//! cause it: during a probe, whose window is half the estimated
+//! bandwidth-delay product. Behind a buffer of under ten packets the probe's
+//! own sending causes loss too, because quinn's pacer sends at least ten
+//! packets at once and those bursts overflow such a buffer at any rate; in
+//! `line_sim` behind a 20 Mbit/s queue of 10 kB the sent rate rose from 20.4 to
+//! 23.5 Mbit/s for 19.4 delivered. This is a known limit. The startup is no
+//! such place. It sends above the path by design, and in `line_sim` each of
+//! three ways of reading the base loss from it read the sender's own loss
+//! behind some limit. A reading counts the bytes acknowledged and the bytes
+//! lost of the packets sent from the moment in-flight data has fallen to the
+//! probe window until the probe ends. quinn reports a loss detection pass as
+//! one congestion event with the send time of the newest packet it found lost,
+//! so a pass counts whole when that packet was sent in the span. The reading
+//! closes two smoothed RTTs after the probe ended. A probe that lost 75 percent
+//! or more of its packets fell mostly into an outage and is dropped. A reading
+//! needs 100 packets, and a probe that counted fewer is not dropped: its bytes
+//! are carried into the next probe's, and the reading completes at the probe
+//! where the sum reaches 100 packets. A probe at half the window counts about
+//! the estimate times 200 ms or one smoothed RTT, whichever is longer, over 2
+//! (1 + p / 4), so a sender at the 240 kB floor on an RTT of 200 ms or more
+//! counts under 100 packets in one probe: in `line_sim` 45 to 62 at 200 and 250
+//! ms with 30 and 40 percent lost. A completed reading of 75 percent or more is
+//! dropped too. A reading between the bound of 40 percent and 75 percent is
+//! kept, and the base loss is held at the bound where it is used. A partial
+//! outage in the only reading can still raise the base loss until the next
+//! probe. The fourth probe in a row that completes no kept reading clears the
+//! kept readings and the carried bytes, and the base loss is zero until a new
+//! reading. On a path where four probes together count under 100 packets, a
+//! base loss once read would otherwise last for the whole connection. A probe
+//! during a change of path can read too much loss, because quinn does not call
+//! `Controller::on_ack` while it validates a new path (quinn-proto
+//! `src/connection/mod.rs`, `Connection::on_packet_acked`) and still reports
+//! the losses. This is a known limit. On the production limiter's evening
+//! captures a window of 200 ms read 10 percent or more in 6 to 24 percent of
+//! the cases and 25 percent or more in 1 to 3 percent, so a probe there can
+//! read an episode's loss; this tail is accepted, at a mean cost of about 1
+//! percent of the bytes sent on that line's shape. The base loss is the lowest
+//! of the last four readings. Loss that comes in episodes is missing from some
+//! probes, and loss that is steady shows in all of them. A single reading acts.
+//! On a limiter line with loss in episodes calibrated to production captures,
+//! waiting for a second reading did not lower sent over delivered in `line_sim`
+//! (1.28 either way) and cost 9 to 14 percent of a 5 s transfer on a lossy
+//! path, so it is not done. The first reading can therefore be an episode's or
+//! an outage's. So a reading that brings the base loss from zero to 5 percent
+//! or more acts at once and is confirmed once: a further probe is due ten
+//! sample intervals later, the estimate's window, and its reading enters the
+//! lowest of four like any other, or clears the base loss by the rule of the
+//! next paragraph. A reading taken in an outage or an episode then acts for
+//! about ten round trips, not until the next regular probe 10 s or more later.
+//! In `line_sim` the review's sweep of partial outages inside the early probe
+//! behind clean policers had 68 of 144 runs more than 0.3 above 1.8.2's sent
+//! over delivered over the first 12 s without the confirming probe and 1 with
+//! it. It costs one probe and the lower of two readings: 5 to 6 percent of a 5
+//! s transfer at 85 ms with 15 and 23 percent dropped, and 0.5 to 3 s more to
+//! the full window at 151 to 250 ms. The base loss is to loss what the minimum
+//! RTT is to delay. A rise in the path's loss therefore takes effect once every
+//! kept reading has risen, which is up to four probes. The lag is a known
+//! property. On the one production path it was measured on, the base loss moved
+//! over hours. The rules of this paragraph are ours.
+//!
+//! A probe is under the path's rate only if half the estimate is, and right
+//! after a startup behind a policer with a large burst allowance it is not:
+//! the allowance lets the startup measure several times the token rate. So a
+//! reading verifies its own premise. On a path that delivers 1 - p of what is
+//! sent up to a limit, sending less makes less arrive only under the limit.
+//! The reading compares the arrival rate of the packets sent while the probe
+//! held its window with the arrival rate of the packets sent in the round trip
+//! before the probe was entered, counted the same way by send time over the
+//! minimum RTT before entry. The minimum RTT is the highest of three low
+//! arrivals within a second, so a single round trip can be shorter than it by
+//! up to the spread of those arrivals, and a packet of that round trip that
+//! was acknowledged before entry is missed. That lowers the arrival rate before
+//! entry by the share missed and raises the ratio; in `line_sim` the share
+//! missed at entry was 0.000 in all 1403 entries. The reading is kept only when
+//! the probe's arrival rate is at most 0.75 of the one before it. In `line_sim`
+//! a probe under the path's rate gave 0.12 to 0.73 on every path with base
+//! loss, and up to 0.90 behind clean limits, where a reading reads zero and
+//! rejecting it costs nothing while no base loss is in force. The early probe
+//! behind clean policers with burst allowances of 1 to 8 MB gave 1.10 to 1.40;
+//! without the rule it read 0.23 to 0.64 of the sender's own loss. A reading
+//! that fails is judged by what was sent in the two spans, acknowledged and
+//! lost, counted the same way. When the probe did not lower the sending to 0.75
+//! of the round trip before it either, as when a client holds the sender, it
+//! says nothing about the path: it is unverified, dropped, not carried, and
+//! does not count as a probe without a reading. When it did lower the sending
+//! and the arrivals stayed, the sender was above the path's rate even at the
+//! probe's, and a base loss in force is what put it there or keeps it there:
+//! the kept readings and the carry are cleared, and the base loss is zero until
+//! a new reading. On lossy paths in `line_sim`, with and without a limit, with
+//! ACK jitter and with episodes, this cleared nothing in 63 runs. Both end the
+//! early probe's repeat, because arrivals that did not fall mean that the
+//! startup's loss was a limit's. A probe whose rate stays above a limit while
+//! the allowance that fed the arrivals before it runs out inside it could pass;
+//! `line_sim` did not reproduce that case. The rule is ours.
+//!
+//! The first probe would come when the minimum RTT expires, 10 s after it was
+//! last taken, and in production it came 14 to 45 s after the start. So when a
+//! startup ends having lost 5 percent or more of its bytes, and no reading is
+//! kept, the minimum RTT's lifetime is treated as over, and the probe starts at
+//! the next ACK that does not find the sender app-limited. Nothing else about
+//! the probe changes. After a startup that lost that much, the path either
+//! drops a share of everything or the startup overshot a limit, and only a
+//! reading below the path's rate tells the two apart. Under 5 percent the
+//! factor is under 1.07, and waiting costs little. While no reading is kept
+//! after such a startup, a probe whose reading closes short makes the next one
+//! due at once, provided it counted at least 25 packets, a quarter of a
+//! reading, and the bytes carried so far, its own included, lost 5 percent or
+//! more. Four such probes complete a reading, so the early probes are at most
+//! four. Under 25 packets four probes cannot complete a reading, and a short
+//! probe that lost under 5 percent has shown that the startup's loss was its
+//! own; either ends the repeat, and the bytes stay carried for the regular
+//! probes. On a path with a clean limit the rule therefore costs one probe
+//! about a second into the connection: half the window for 200 ms or one
+//! smoothed RTT. The rules of this paragraph are ours.
+//!
 //! A new connection also starts as slow start does. Until its first startup has
 //! ended, the window is at most the initial window plus the bytes acknowledged
 //! so far, so it doubles per round trip at most. The startup gain alone would
@@ -113,11 +252,35 @@
 //! stopped growing when three samples in a row from intervals that were not
 //! app-limited have not raised it by 25 percent since it last did. This is
 //! BBR's full-bandwidth test. A congestion event also ends the startup when the
-//! sample interval it falls in does not raise the estimate by 25 percent,
-//! whether or not that interval was app-limited. quinn reports a sender blocked
-//! by the peer's flow control as app-limited. Behind a flow-control window
-//! smaller than the startup window the full-bandwidth test therefore never
-//! runs, and without the congestion exit the startup gain would stay.
+//! sample interval it falls in does not raise the estimate by 25 percent and
+//! lost a share of its bytes above 1.5 times the base loss, whether or not
+//! that interval was app-limited. An ECN mark ends it in such an interval at
+//! any loss. With a base loss of zero that is any lost byte. Either applies
+//! only once the startup has counted 100 packets of the current MTU,
+//! acknowledged and lost, which departs from the exit as it was through 1.8.2.
+//! Before that count the startup has measured nothing of the path: a handshake
+//! is a few packets per round trip, app-limited, and one that lost a packet in
+//! each of two round trips ended the startup on a dozen packets, so the
+//! connection never ran one. On a path that drops a quarter of its packets
+//! such a start is common, and in `line_sim` it then sent at its floor until a
+//! regular probe 10 s or more later. The count cannot let a first startup
+//! overshoot: 100 packets are at most 147 kB, under the initial window, and
+//! until the first startup has ended the window is at most the initial window
+//! plus the bytes acknowledged, so within those packets the startup gain sets
+//! nothing. A startup that returns counts again from zero, but its window is
+//! never below the initial window and no recovery limits it, so it counts 100
+//! packets within its first sample interval unless the sender is held under
+//! 100 packets in flight; in `line_sim` no returned startup reached its exit
+//! under the count. Beyond the count, a first startup, which comes before the
+//! first probe, and every startup on a path without base loss end as they did
+//! before the base loss was read. On a path with base loss, a startup that
+//! returns would otherwise end at its first interval without growth, far below
+//! the path's rate. quinn reports a sender blocked by the peer's flow control
+//! as app-limited. Behind a flow-control window smaller than the startup window
+//! the full-bandwidth test therefore never runs, and without the congestion
+//! exit the startup gain would stay. On a path with base loss such a sender
+//! keeps the startup gain until an interval loses more than 1.5 times the base
+//! loss.
 //!
 //! The startup gain returns when the estimate climbs back after a fall. The
 //! estimate keeps a sample for ten intervals, so a loss episode longer than that
@@ -214,7 +377,7 @@
 //! The window is computed when one of its inputs changes and stored, because
 //! quinn reads it before every packet it sends. The inputs are the estimate,
 //! the minimum RTT, the probe, the startup with its slow-start limit, the
-//! steady gain, the recovery window and the MTU.
+//! steady gain, the base loss, the recovery window and the MTU.
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -225,7 +388,12 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory};
 use quinn_proto::RttEstimator;
 
+use crate::quic::LOSS_TIME_THRESHOLD;
+
+mod base_loss;
 mod gain;
+#[cfg(test)]
+mod line_sim;
 mod min_rtt;
 mod rate;
 mod recovery;
@@ -233,6 +401,7 @@ mod startup;
 #[cfg(test)]
 mod test_support;
 
+use base_loss::{BaseLoss, Closed, READING_PACKETS};
 use gain::{Gain, WINDOW_PACKETS};
 use min_rtt::{LowSamples, Probe};
 use rate::{DeliveryRate, Sample};
@@ -260,6 +429,11 @@ const LOW_SAMPLE_LIFETIME: Duration = Duration::from_secs(1);
 /// lower one before a probe measures it again: BBR's MinRTTFilterLen.
 const MIN_RTT_LIFETIME: Duration = Duration::from_secs(10);
 
+/// How many sample intervals after a first reading of 5 percent or more the
+/// probe that confirms it is due: the estimate's window, so that the reading
+/// acts for about as long as the estimate holds a sample. Our own value.
+const CONFIRM_INTERVALS: usize = rate::SAMPLES;
+
 /// The shortest time a probe holds its window once in-flight data has fallen
 /// to it: BBR's ProbeRTTDuration.
 const PROBE_TIME: Duration = Duration::from_millis(200);
@@ -267,6 +441,23 @@ const PROBE_TIME: Duration = Duration::from_millis(200);
 /// The smallest probe window and the smallest recovery window, in packets:
 /// BBR's minimum congestion window.
 const MIN_WINDOW_PACKETS: u64 = 4;
+
+/// How much longer than a round trip a lost packet stays in flight, in per
+/// mille of a round trip: quinn's time threshold minus one, taken from
+/// `LOSS_TIME_THRESHOLD` in `src/quic/transport.rs` so that the two cannot
+/// differ. quinn declares a packet lost once a later one has been
+/// acknowledged and its age is the threshold times the RTT.
+#[allow(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+const LOSS_DELAY_EXTRA_PERMILLE: u128 = ((LOSS_TIME_THRESHOLD - 1.0) * 1000.0) as u128;
+
+const _: () = assert!(
+    LOSS_DELAY_EXTRA_PERMILLE <= 1000,
+    "a threshold over two round trips is not what the window covers"
+);
 
 /// Builds [`Bbr`] controllers.
 #[derive(Debug, Clone, Default)]
@@ -287,6 +478,14 @@ impl ControllerFactory for BbrConfig {
             recovery: None,
             slow_start: Some(INITIAL_WINDOW),
             gain: Gain::default(),
+            base: BaseLoss::default(),
+            probe_due: false,
+            repeat: false,
+            confirm: None,
+            #[cfg(test)]
+            last_closed: None,
+            #[cfg(test)]
+            exit_packets: READING_PACKETS,
             cap: None,
             window: INITIAL_WINDOW,
         })
@@ -294,7 +493,8 @@ impl ControllerFactory for BbrConfig {
 }
 
 /// A controller whose window is at most 1.25 times the measured
-/// bandwidth-delay product. See the [module documentation](self).
+/// bandwidth-delay product, plus what the path's own loss takes out of it.
+/// See the [module documentation](self).
 #[derive(Debug, Clone)]
 pub struct Bbr {
     rate: DeliveryRate,
@@ -323,6 +523,32 @@ pub struct Bbr {
     slow_start: Option<u64>,
     /// The steady gain and the loss windows that move it.
     gain: Gain,
+    /// The path's base loss and the reading in progress.
+    base: BaseLoss,
+    /// Whether the minimum RTT's lifetime is treated as over, so that a probe
+    /// starts at the next ACK that does not find the sender app-limited: set
+    /// when a startup that lost [`base_loss::EARLY_PROBE_PPM`] of its bytes
+    /// or more ends with no reading kept, again for `repeat`, and when
+    /// `confirm` runs out.
+    probe_due: bool,
+    /// Whether the early probe repeats: set with `probe_due` at the end of a
+    /// startup. Cleared once a reading is kept, when a probe closes short
+    /// having counted under a quarter of [`READING_PACKETS`] or with its carry
+    /// under [`base_loss::EARLY_PROBE_PPM`] lost, and when a probe is
+    /// unverified or clears the base loss. A probe dropped as an outage leaves
+    /// it as it is. While it is set, a probe whose reading closes short makes
+    /// the next one due at once.
+    repeat: bool,
+    /// Sample intervals, not counting those of a probe, until the probe that
+    /// confirms a first reading is due.
+    confirm: Option<usize>,
+    /// When the latest reading closed and what became of it, for `line_sim`.
+    #[cfg(test)]
+    last_closed: Option<(Instant, Closed)>,
+    /// What [`Bbr::exit_packets`] returns; zero runs the startup's exit as it
+    /// was before.
+    #[cfg(test)]
+    exit_packets: u64,
     /// What [`Bbr::compute_cap`] returned when an input last changed.
     cap: Option<u64>,
     /// What [`Controller::window`] returns: the cap, or the initial window
@@ -345,6 +571,8 @@ impl Bbr {
         self.srtt = srtt;
         self.acked = self.acked.saturating_add(bytes);
         self.gain.acked = self.gain.acked.saturating_add(bytes);
+        self.startup.acked = self.startup.acked.saturating_add(bytes);
+        self.base.on_ack(sent, bytes);
         if let Some(limit) = &mut self.slow_start {
             *limit = limit.saturating_add(bytes);
         }
@@ -360,7 +588,12 @@ impl Bbr {
         }
         match self.min_rtt {
             Some((min, at)) if rtt > min => {
-                if !app_limited && now.saturating_duration_since(at) > MIN_RTT_LIFETIME {
+                let expired =
+                    self.probe_due || now.saturating_duration_since(at) > MIN_RTT_LIFETIME;
+                if !app_limited && expired {
+                    self.probe_due = false;
+                    // The round trip before the probe, by send time.
+                    self.base.enter(now, min);
                     self.probe = Some(Probe {
                         min: rtt,
                         ends: None,
@@ -399,8 +632,10 @@ impl Bbr {
         match probe.ends {
             None if cap.is_none_or(|cap| in_flight <= cap) => {
                 probe.ends = Some(now + PROBE_TIME.max(self.srtt));
+                self.base.begin(now);
             }
             Some(ends) if now >= ends => {
+                self.base.end(now);
                 // A probe too short for the confirmations takes its lowest sample.
                 let min = self.low.confirmed().unwrap_or(probe.min);
                 self.min_rtt = Some((min, now));
@@ -411,6 +646,20 @@ impl Bbr {
             _ => {}
         }
         false
+    }
+
+    /// The packets of the current MTU a startup counts before one interval
+    /// can end it: [`READING_PACKETS`].
+    #[cfg(not(test))]
+    fn exit_packets(&self) -> u64 {
+        READING_PACKETS
+    }
+
+    /// The packets of the current MTU a startup counts before one interval
+    /// can end it: [`READING_PACKETS`] unless a test has set another value.
+    #[cfg(test)]
+    fn exit_packets(&self) -> u64 {
+        self.exit_packets
     }
 
     /// Stores the cap and the window after a change to one of their inputs.
@@ -440,6 +689,7 @@ impl Bbr {
             ack_interval_us = sample.ack_elapsed.as_micros(),
             send_interval_us = sample.send_elapsed.as_micros(),
             gain_permille = self.gain.permille,
+            base_loss_ppm = self.base.ppm(),
             startup = !self.startup.ended,
             app_limited = sample.app_limited,
             stored = sample.stored,
@@ -451,6 +701,8 @@ impl Bbr {
     /// The window limit, once there is a delivery-rate sample to compute it
     /// from: the steady gain times the bandwidth-delay product, the startup
     /// gain times it until the startup has ended, or half of it during a probe.
+    /// The steady window also covers the base loss `p`: it is multiplied by
+    /// (1 + t p) / (1 - p), where t is [`LOSS_DELAY_EXTRA_PERMILLE`].
     ///
     /// Outside a probe the limit is never below [`INITIAL_WINDOW`], so a
     /// connection that has measured a low rate is never slower to send than a
@@ -464,7 +716,13 @@ impl Bbr {
             Some(_) => (PROBE_GAIN_PERMILLE, MIN_WINDOW_PACKETS * self.mtu),
         };
         // Bytes per second times microseconds times per mille.
-        let bytes = u128::from(bandwidth) * min_rtt.as_micros() * gain_permille / 1_000_000_000;
+        let mut bytes = u128::from(bandwidth) * min_rtt.as_micros() * gain_permille / 1_000_000_000;
+        if self.probe.is_none() && self.startup.ended {
+            // Parts per million times per mille.
+            let base = u128::from(self.base.ppm());
+            bytes = bytes * (1_000_000_000 + LOSS_DELAY_EXTRA_PERMILLE * base)
+                / (1_000_000u128.saturating_sub(base).max(1) * 1_000);
+        }
         Some(u64::try_from(bytes).unwrap_or(u64::MAX).max(floor))
     }
 }
@@ -490,21 +748,95 @@ impl Controller for Bbr {
     ) {
         let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
         if let Some(sample) = &sample {
-            self.startup
-                .on_interval(self.rate.max().unwrap_or(0), sample.app_limited);
+            let was_ended = self.startup.ended;
+            // 1.5 times the base loss: any lost byte while it is zero.
+            let exit_above = self.base.ppm() * 3 / 2;
+            self.startup.on_interval(
+                self.rate.max().unwrap_or(0),
+                sample.app_limited,
+                exit_above,
+                self.exit_packets() * self.mtu,
+            );
+            if self.startup.ended
+                && !was_ended
+                && !self.base.has_reading()
+                && self.startup.lost_ppm() >= self.base.early_probe_ppm()
+            {
+                self.probe_due = true;
+                self.repeat = true;
+            }
             if self.startup.ended {
                 self.slow_start = None;
                 let estimate = self.rate.max().unwrap_or(0);
                 let packets = WINDOW_PACKETS * self.mtu;
                 let probing = self.probe.is_some();
-                self.gain
-                    .on_interval(probing, sample.app_limited, estimate, packets);
+                self.gain.on_interval(
+                    probing,
+                    sample.app_limited,
+                    estimate,
+                    packets,
+                    self.base.ppm(),
+                );
             } else {
                 self.gain = Gain::default();
+            }
+            if self.probe.is_none()
+                && let Some(left) = self.confirm
+            {
+                if left <= 1 {
+                    self.confirm = None;
+                    self.probe_due = true;
+                } else {
+                    self.confirm = Some(left - 1);
+                }
             }
             self.refresh();
         }
         if self.update_probe(now, in_flight) {
+            self.refresh();
+        }
+        let least = READING_PACKETS * self.mtu;
+        let was_zero = self.base.ppm() == 0;
+        let closed = self.base.close(now, self.srtt, least);
+        if let Closed::Kept { .. } = closed
+            && was_zero
+            && self.base.ppm() >= self.base.early_probe_ppm()
+        {
+            // A first reading acts at once and is confirmed once.
+            self.confirm = Some(CONFIRM_INTERVALS);
+        }
+        if closed != Closed::No {
+            #[cfg(test)]
+            {
+                self.last_closed = Some((now, closed));
+            }
+            tracing::debug!(
+                outcome = ?closed,
+                base_loss_ppm = self.base.ppm(),
+                "bbr reading"
+            );
+        }
+        if let Closed::Unverified { .. } | Closed::Cleared { .. } = closed {
+            // What arrived did not fall with what was sent: the startup's
+            // loss was a limit's, and probing again soon tells nothing more.
+            self.repeat = false;
+        }
+        if let Closed::Short { own, lost_ppm, .. } = closed
+            && self.repeat
+        {
+            // At least a quarter of a reading, so that four such probes
+            // complete one, and a loss that a reading is needed for. Under
+            // either, the regular probes take the carry further.
+            if own.saturating_mul(4) >= least && lost_ppm >= self.base.early_probe_ppm() {
+                self.probe_due = true;
+            } else {
+                self.repeat = false;
+            }
+        }
+        if self.base.has_reading() {
+            self.repeat = false;
+        }
+        if closed != Closed::No {
             self.refresh();
         }
         // The slow-start limit moved with the bytes this batch acknowledged.
@@ -519,11 +851,14 @@ impl Controller for Bbr {
     fn on_congestion_event(
         &mut self,
         _now: Instant,
-        _sent: Instant,
+        sent: Instant,
         _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
         self.startup.congested = true;
+        self.startup.marked |= lost_bytes == 0;
+        self.startup.lost = self.startup.lost.saturating_add(lost_bytes);
+        self.base.on_loss(sent, lost_bytes);
         self.lost = self.lost.saturating_add(lost_bytes);
         self.gain.lost = self.gain.lost.saturating_add(lost_bytes);
     }
@@ -1278,6 +1613,342 @@ mod tests {
         assert_eq!(c.cap(), Some(1_500_000), "1.25 x 20 MB/s x 60 ms");
     }
 
+    /// Runs one sample interval like [`interval`] that also loses a quarter
+    /// of the bytes it acknowledges, a fifth of all its bytes.
+    fn lossy_interval(c: &mut Bbr, start: Instant, rate: u64) -> Instant {
+        c.on_congestion_event(start, start - MIN_RTT, false, rate / 40);
+        interval(c, start, rate, false)
+    }
+
+    /// Runs one sample interval like [`interval`] that loses `ppm` of all its
+    /// bytes.
+    fn share_interval(c: &mut Bbr, start: Instant, rate: u64, ppm: u64) -> Instant {
+        let acked = rate / 10;
+        let lost = acked * ppm / (1_000_000 - ppm);
+        c.on_congestion_event(start, start - MIN_RTT, false, lost);
+        interval(c, start, rate, false)
+    }
+
+    #[test]
+    fn a_first_startup_ends_as_it_did_before_the_base_loss() {
+        for before in [false, true] {
+            let mut c = starting();
+            if before {
+                // The controller as it was before it read the base loss.
+                c.base.bound = 0;
+                c.base.early = u64::MAX;
+                c.exit_packets = 0;
+            }
+            let mut t = Instant::now();
+            end_acks(&mut c, t, false);
+            for rate in [10_000_000, 20_000_000, 40_000_000] {
+                t = lossy_interval(&mut c, t, rate);
+                assert!(!c.startup.ended, "growth");
+            }
+            c.on_congestion_event(t, t - MIN_RTT, false, 1200);
+            interval(&mut c, t, 40_000_000, false);
+            assert!(
+                c.startup.ended,
+                "with no base loss read, any lost byte in an interval without growth ends it"
+            );
+        }
+    }
+
+    #[test]
+    fn with_a_base_loss_the_startup_ends_above_one_and_a_half_times_it() {
+        let mut c = starting();
+        c.base.push(200_000);
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        for rate in [10_000_000, 20_000_000, 40_000_000] {
+            t = lossy_interval(&mut c, t, rate);
+        }
+        t = share_interval(&mut c, t, 40_000_000, 290_000);
+        assert!(!c.startup.ended, "29 percent is not above 1.5 x 20 percent");
+        share_interval(&mut c, t, 40_000_000, 310_000);
+        assert!(c.startup.ended, "31 percent is");
+    }
+
+    #[test]
+    fn a_startup_that_lost_five_percent_starts_the_first_probe_at_the_next_ack() {
+        // A startup that loses `ppm` of its bytes and ends at its first
+        // interval without growth, with `reading` kept or not.
+        let ended = |ppm: u64, reading: bool| {
+            let mut c = starting();
+            if reading {
+                c.base.push(0);
+            }
+            let mut t = Instant::now();
+            end_acks(&mut c, t, false);
+            for rate in [10_000_000, 20_000_000, 40_000_000, 40_000_000] {
+                t = share_interval(&mut c, t, rate, ppm);
+            }
+            assert!(c.startup.ended);
+            (c, t)
+        };
+
+        let (mut c, t) = ended(51_000, false);
+        assert!(c.probe_due);
+        ack(&mut c, t + ms(1), ms(70), 0, true);
+        assert!(c.probe.is_none(), "an app-limited ACK does not start it");
+        ack(&mut c, t + ms(2), ms(70), 0, false);
+        assert!(c.probe.is_some(), "the next ACK does, 10 s early");
+        assert!(!c.probe_due);
+
+        let (c, _) = ended(49_000, false);
+        assert!(
+            !c.probe_due,
+            "4.9 percent waits for the minimum RTT to expire"
+        );
+        let (c, _) = ended(51_000, true);
+        assert!(!c.probe_due, "a reading is kept");
+    }
+
+    /// A startup whose first interval acknowledges `first` bytes and grows
+    /// the estimate from nothing, and whose second acknowledges `second`
+    /// bytes, does not grow it by a quarter, and has a congestion event that
+    /// loses `lost` bytes, an ECN mark when `lost` is zero.
+    fn two_intervals(first: u64, second: u64, lost: u64, app_limited: bool) -> Bbr {
+        let mut c = starting();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, app_limited);
+        if app_limited {
+            // An app-limited interval runs the test only with a congestion
+            // event.
+            c.on_congestion_event(t, t - MIN_RTT, false, 0);
+        }
+        t = interval(&mut c, t, first * 10, app_limited);
+        assert!(!c.startup.ended, "growth");
+        c.on_congestion_event(t, t - MIN_RTT, false, lost);
+        interval(&mut c, t, second * 10, app_limited);
+        c
+    }
+
+    #[test]
+    fn a_loss_ends_the_startup_only_once_it_has_counted_100_packets() {
+        // 100 packets of 1200 bytes are 120 kB.
+        let c = two_intervals(50_000, 50_000, 18_800, false);
+        assert!(!c.startup.ended, "118.8 kB counted, 99 packets");
+        let c = two_intervals(50_000, 50_000, 20_000, false);
+        assert!(c.startup.ended, "120 kB counted, 100 packets");
+    }
+
+    #[test]
+    fn an_ecn_mark_ends_the_startup_only_once_it_has_counted_100_packets() {
+        let c = two_intervals(59_400, 59_400, 0, false);
+        assert!(!c.startup.ended, "99 packets");
+        let c = two_intervals(59_400, 60_600, 0, false);
+        assert!(c.startup.ended, "100 packets");
+        // A handshake: app-limited intervals of a few packets, the second
+        // with a mark.
+        let c = two_intervals(2_400, 2_400, 0, true);
+        assert!(!c.startup.ended, "a marked handshake");
+    }
+
+    #[test]
+    fn three_intervals_without_growth_end_a_startup_under_100_packets() {
+        let mut c = starting();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        // 1 kB per interval.
+        for _ in 0..3 {
+            t = interval(&mut c, t, 10_000, false);
+            assert!(!c.startup.ended);
+        }
+        interval(&mut c, t, 10_000, false);
+        assert!(c.startup.ended, "three samples without growth, on 4 kB");
+    }
+
+    /// Closes one reading on `c`: a probe entered at `t` after a round trip
+    /// of 100 ms in which 150 kB arrived, holding its window for 200 ms from
+    /// 10 ms after it, with `acked` bytes arriving and `lost` lost, a ratio
+    /// under 0.75. Returns when it closed.
+    fn reading(c: &mut Bbr, t: Instant, acked: u64, lost: u64) -> Instant {
+        c.base.enter(t, ms(100));
+        c.base.on_ack(t - ms(50), 150_000);
+        c.base.begin(t + ms(10));
+        c.base.on_ack(t + ms(10), acked);
+        c.base.on_loss(t + ms(10), lost);
+        c.base.end(t + ms(210));
+        let closed = t + ms(210) + SRTT * 2;
+        end_acks(c, closed, false);
+        closed
+    }
+
+    #[test]
+    fn a_first_reading_is_confirmed_by_a_probe_ten_intervals_later() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.startup.ended = true;
+        let mut t = reading(&mut c, t0, 150_000, 30_000);
+        assert_eq!(c.base.ppm(), 166_666);
+        assert_eq!(
+            c.confirm,
+            Some(CONFIRM_INTERVALS),
+            "from zero to 16.7 percent"
+        );
+        for _ in 0..CONFIRM_INTERVALS - 1 {
+            t = interval(&mut c, t, BANDWIDTH, false);
+            assert!(!c.probe_due);
+        }
+        // The next ACK would start the probe, so the interval is closed by
+        // hand.
+        let end = t + SRTT;
+        c.record_ack(end, end - MIN_RTT, BANDWIDTH / 10, false, SRTT);
+        end_acks(&mut c, end, false);
+        assert!(c.probe_due, "the tenth interval");
+        assert_eq!(c.confirm, None, "once");
+
+        // A further reading while the base loss is in force is not confirmed.
+        let mut c = estimated(t0);
+        c.startup.ended = true;
+        c.base.push(200_000);
+        reading(&mut c, t0, 150_000, 30_000);
+        assert_eq!(c.confirm, None, "not from zero");
+        // Nor is a first reading under 5 percent.
+        let mut c = estimated(t0);
+        c.startup.ended = true;
+        reading(&mut c, t0, 150_000, 6_000);
+        assert_eq!(c.base.ppm(), 38_461);
+        assert_eq!(c.confirm, None, "3.8 percent");
+    }
+
+    #[test]
+    fn a_short_early_probe_makes_the_next_one_due_when_it_counted_a_quarter_reading_and_lost_five_percent()
+     {
+        // A startup that lost 5.1 percent, then its early probe, in which the
+        // packets sent while it held its window had `acked` bytes acknowledged
+        // and `lost` bytes lost, and those sent in the 60 ms before it was
+        // entered had `before` bytes acknowledged.
+        let early = |before: u64, acked: u64, lost: u64| {
+            let mut c = starting();
+            let mut t = Instant::now();
+            end_acks(&mut c, t, false);
+            for rate in [10_000_000, 20_000_000, 40_000_000, 40_000_000] {
+                t = share_interval(&mut c, t, rate, 51_000);
+            }
+            assert!(c.repeat && c.probe_due);
+            let t1 = t + ms(2);
+            ack(&mut c, t1, ms(70), 0, false);
+            c.on_end_acks(t1, 0, false, None);
+            assert!(
+                c.probe.as_ref().is_some_and(|p| p.ends.is_some()),
+                "drained"
+            );
+            assert!(!c.probe_due);
+            ack(&mut c, t1 + ms(50), ms(100), before, false);
+            ack(&mut c, t1 + ms(100), MIN_RTT, acked, false);
+            c.on_congestion_event(t1 + ms(100), t1 + ms(50), false, lost);
+            end_acks(&mut c, t1 + ms(200), false);
+            assert!(c.probe.is_none());
+            end_acks(&mut c, t1 + ms(400), false);
+            c
+        };
+
+        // As much arriving before as in the probe: a ratio of 0.3.
+        let c = early(28_500, 28_500, 1_500);
+        assert!(
+            c.probe_due && c.repeat,
+            "25 packets of 1200 bytes with 5 percent lost: the next is due"
+        );
+        let c = early(29_000, 29_000, 1_000);
+        assert!(
+            !c.probe_due && !c.repeat,
+            "under 5 percent lost: the repeat ends"
+        );
+        let c = early(28_000, 28_000, 1_999);
+        assert!(
+            !c.probe_due && !c.repeat,
+            "under 25 packets: one early probe"
+        );
+        let c = early(150_000, 150_000, 0);
+        assert!(c.base.has_reading());
+        assert!(!c.probe_due && !c.repeat, "a kept reading stops the repeat");
+        // A third as much arriving before: a ratio of 0.9.
+        let c = early(9_500, 28_500, 1_500);
+        assert!(matches!(
+            c.last_closed,
+            Some((_, Closed::Unverified { .. }))
+        ));
+        assert!(
+            !c.probe_due && !c.repeat,
+            "arrivals that did not fall end the repeat"
+        );
+    }
+
+    #[test]
+    fn the_steady_window_covers_the_base_loss_and_the_probe_and_the_startup_do_not() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        c.base.push(200_000);
+        c.refresh();
+        assert_eq!(
+            c.cap(),
+            Some(1_476_562),
+            "1.125 MB x (1 + 0.25 x 0.2) / (1 - 0.2)"
+        );
+        c.base.push(500_000);
+        c.refresh();
+        assert_eq!(c.cap(), Some(1_476_562), "the lowest of the readings");
+
+        let mut c = estimated(t0);
+        c.base.push(400_000);
+        c.refresh();
+        assert_eq!(
+            c.cap(),
+            Some(2_062_500),
+            "1.125 MB x (1 + 0.25 x 0.4) / (1 - 0.4), the bound"
+        );
+
+        ack(&mut c, t0 + ms(10_001), ms(120), 0, false);
+        assert_eq!(c.cap(), Some(450_000), "the probe window is half the BDP");
+
+        let mut c = estimated(t0);
+        c.startup.ended = false;
+        c.base.push(200_000);
+        c.refresh();
+        assert_eq!(c.cap(), Some(2_596_500), "2.885 x 15 MB/s x 60 ms");
+    }
+
+    #[test]
+    fn a_probe_reads_the_base_loss_of_the_packets_sent_while_it_held_its_window() {
+        let t0 = Instant::now();
+        let mut c = estimated(t0);
+        let t1 = t0 + ms(10_001);
+        ack(&mut c, t1, ms(120), 0, false);
+        c.on_end_acks(t1, 0, false, None);
+        assert!(
+            c.probe.as_ref().is_some_and(|p| p.ends.is_some()),
+            "drained"
+        );
+
+        // A packet sent before the probe held its window does not count.
+        ack(&mut c, t1 + ms(50), MIN_RTT, 1_000_000, false);
+        c.on_congestion_event(t1 + ms(50), t1 - ms(10), false, 1_000_000);
+        ack(&mut c, t1 + ms(100), MIN_RTT, 400_000, false);
+        c.on_congestion_event(t1 + ms(100), t1 + ms(10), false, 75_000);
+        end_acks(&mut c, t1 + ms(100), false);
+        end_acks(&mut c, t1 + ms(200), false);
+        assert!(c.probe.is_none());
+        // A packet sent before the probe ended, declared lost after it.
+        c.on_congestion_event(t1 + ms(300), t1 + ms(150), false, 25_000);
+        end_acks(&mut c, t1 + ms(399), false);
+        assert_eq!(c.base.ppm(), 0, "the reading is still open");
+        let cap = c.cap().expect("a cap");
+
+        end_acks(&mut c, t1 + ms(400), false);
+        assert_eq!(c.base.ppm(), 200_000, "100 kB lost of 500 kB");
+        assert_eq!(c.cap(), Some(cap * 21 / 16), "(1 + 0.25 x 0.2) / (1 - 0.2)");
+    }
+
+    #[test]
+    fn the_time_threshold_the_window_covers_is_quinns() {
+        assert_eq!(
+            LOSS_DELAY_EXTRA_PERMILLE, 250,
+            "LOSS_TIME_THRESHOLD is 1.25"
+        );
+    }
+
     /// A controller whose startup ended at 15 MB/s by three samples without
     /// growth, and whose estimate has since fallen to `rate` through ten
     /// intervals at that rate. Returns it and when its last interval ended.
@@ -1586,18 +2257,19 @@ mod tests {
         );
 
         // The first interval grows the estimate from nothing; the second has a
-        // congestion event and no growth, so it ends the startup.
+        // congestion event and no growth, and with it the startup has counted
+        // 133.6 kB, over 100 packets, so it ends the startup.
         for _ in 0..2 {
             c.on_congestion_event(t, t - MIN_RTT, false, 1200);
             t += SRTT;
-            ack(&mut c, t, MIN_RTT, 10_000, false);
+            ack(&mut c, t, MIN_RTT, 60_000, false);
             c.on_end_acks(t, 100_000, false, None);
         }
         assert!(c.startup.ended);
         assert_eq!(
             c.window(),
-            127_600,
-            "110 kB, then twice 1200 bytes lost and 10 kB acked"
+            227_600,
+            "110 kB, then twice 1200 bytes lost and 60 kB acked"
         );
     }
 
