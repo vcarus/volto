@@ -292,6 +292,8 @@ async fn stalled(rx: &mut watch::Receiver<State>, other: State, budget: Duration
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
 pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     let stream_id = stream.id();
+    // The start of what the established line reports as `setup_ms`.
+    let started = tokio::time::Instant::now();
 
     let (host, port) = match split_authority(authority) {
         Ok(target) => target,
@@ -306,12 +308,14 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     // every refusal already answered by the time this returns; see
     // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
     // fields of its own, so the 200-then-close path is handed an empty list.
-    let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, Fields::new).await
+    let Some(admitted) = tunnel::admit_target(&host, port, ctx, &mut stream, Fields::new).await
     else {
         return;
     };
+    let allowed = admitted.addresses;
 
-    let tcp = match connect_any(&allowed, ctx.connect_timeout).await {
+    let (connected, connect) = tunnel::timed(connect_any(&allowed, ctx.connect_timeout)).await;
+    let tcp = match connected {
         Ok(tcp) => tcp,
         Err(failure) => {
             // RFC 9114 §4.4: a proxy that cannot establish the connection
@@ -360,11 +364,20 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         return;
     }
 
+    // The three times are what the client waited for on this side, beyond its
+    // own round trip. `resolve_ms` is the wait for a lookup slot plus the
+    // lookup, zero for an IP literal. `connect_ms` is the walk over the
+    // target's addresses up to the one that accepted, failed attempts
+    // included. `setup_ms` runs from the start of this function to the 200
+    // having been written, so it holds both; the rest is the write of the 200.
     info!(
         log_id = "rr3u3t70",
         stream_id,
         authority,
         target = %crate::logfmt::or_dash(target),
+        resolve_ms = admitted.resolve.as_millis(),
+        connect_ms = connect.as_millis(),
+        setup_ms = started.elapsed().as_millis(),
         "tcp tunnel established"
     );
 

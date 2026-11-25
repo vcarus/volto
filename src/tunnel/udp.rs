@@ -67,6 +67,8 @@ pub(super) const CONNECT_UDP: &str = "connect-udp";
 /// Establishes a UDP tunnel for a `connect-udp` request and runs it.
 pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     let stream_id = stream.id();
+    // The start of what the established line reports as `setup_ms`.
+    let started = tokio::time::Instant::now();
 
     if let Err(reason) = validate(req) {
         debug!(stream_id, reason, "malformed connect-udp request");
@@ -134,10 +136,11 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     // whatever the client sent optimistically. The router then drops later
     // datagrams for that id silently, as it does for a session that has just
     // closed.
-    let Some(allowed) = tunnel::admit_target(&host, port, ctx, &mut stream, capsule_fields).await
+    let Some(admitted) = tunnel::admit_target(&host, port, ctx, &mut stream, capsule_fields).await
     else {
         return;
     };
+    let allowed = admitted.addresses;
 
     let socket = match bind_any(&allowed).await {
         Ok(socket) => socket,
@@ -204,6 +207,11 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         // on every packet and moves onto datagrams the moment they are
         // allowed.
         datagrams_at_setup = ctx.datagrams_allowed(),
+        // As on the TCP line, without a connect time: the socket's `connect`
+        // sends nothing. What `setup_ms` holds beyond `resolve_ms` is the
+        // wait for the peer's SETTINGS above and the write of the 200.
+        resolve_ms = admitted.resolve.as_millis(),
+        setup_ms = started.elapsed().as_millis(),
         "udp session established"
     );
 

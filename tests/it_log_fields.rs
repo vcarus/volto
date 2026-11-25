@@ -79,6 +79,28 @@ async fn operator_facing_fields_print_values_not_options() {
         "the connected address must print as its value; line was:\n{session}"
     );
 
+    // How long each tunnel took to set up, in whole milliseconds, on the line
+    // that says it is established. The parts are measured inside the whole, so
+    // they cannot add up to more than it. Both targets are on loopback, so the
+    // values are near zero and only their presence and that order are judged.
+    let (resolve, connect, setup) = (
+        millis(tunnel, "resolve_ms"),
+        millis(tunnel, "connect_ms"),
+        millis(tunnel, "setup_ms"),
+    );
+    assert!(
+        resolve + connect <= setup && setup < 10_000,
+        "resolving and connecting are parts of the setup; line was:\n{tunnel}"
+    );
+    assert!(
+        millis(session, "resolve_ms") <= millis(session, "setup_ms"),
+        "resolving is a part of the setup; line was:\n{session}"
+    );
+    assert!(
+        !session.contains("connect_ms="),
+        "a UDP session connects to nothing, so it has no connect time; line was:\n{session}"
+    );
+
     // The `username` of a rejected attempt, on the WARN line a fail2ban rule
     // reads. A second server because the first one has no users configured.
     let guarded = TestServer::start_with(&auth_section(&[("user1", "a-real-password")])).await;
@@ -168,4 +190,21 @@ async fn operator_facing_fields_print_values_not_options() {
         !logged.contains("Some("),
         "no operator-facing field may print Rust's Option spelling; log was:\n{logged}"
     );
+}
+
+/// The value of a field that prints as whole milliseconds, such as
+/// `setup_ms=12`.
+///
+/// The caller is read before the closures: a closure does not inherit
+/// `#[track_caller]`, so a panic inside one would name this function.
+#[track_caller]
+fn millis(line: &str, field: &str) -> u64 {
+    let caller = std::panic::Location::caller();
+    let value = line
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix(field)?.strip_prefix('='))
+        .unwrap_or_else(|| panic!("{caller}: no `{field}` field; line was:\n{line}"));
+    value.parse().unwrap_or_else(|_| {
+        panic!("{caller}: `{field}={value}` is not a whole number; line was:\n{line}")
+    })
 }
