@@ -662,7 +662,7 @@ fn describe(closed: Closed) -> String {
     let ratio = |ppm: u64| to_f64(ppm) / 1e6;
     match closed {
         Closed::No => "no close".to_owned(),
-        Closed::Kept { ratio_ppm } => format!("kept, ratio {:.3}", ratio(ratio_ppm)),
+        Closed::Kept { ratio_ppm, .. } => format!("kept, ratio {:.3}", ratio(ratio_ppm)),
         Closed::Short {
             ratio_ppm, cleared, ..
         } => format!(
