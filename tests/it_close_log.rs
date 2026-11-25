@@ -17,11 +17,13 @@ mod common;
 use common::rawstream::{STREAM_PUSH, open_uni_stream};
 use common::{
     ALLOW_PRIVATE, H3Client, IMPATIENT, STOP_TIMEOUT, SharedBuffer, TIMEOUT, TestServer,
-    connect_quic, echoes, field_text, numeric_field, open_tcp_tunnel, open_udp_session,
-    recv_datagram, send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
+    closed_address, connect_quic, connect_request, echoes, field_text, numeric_field,
+    open_tcp_tunnel, open_udp_session, recv_datagram, respond_to, send_udp_payload,
+    spawn_echo_target, spawn_udp_echo_target,
 };
 use std::assert_matches;
 use volto::datagram;
+use volto::h3api::Status;
 
 /// The eight ways a connection ends, each with the level and reason it earns.
 ///
@@ -115,6 +117,66 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
                 "a connection the window never held counts nothing; line was:\n{line}"
             );
         }
+        // The five readings that are means have nothing to be a mean of, and
+        // say so with a dash, not with a zero that would read as a measurement.
+        for field in [
+            "window_turnover_permille",
+            "flight_over_min_rtt_permille",
+            "base_loss_mean_ppm",
+            "base_loss_peak_ppm",
+            "gain_mean_permille",
+        ] {
+            assert_eq!(
+                field_text(&line, field),
+                "-",
+                "a mean over no time has no value; line was:\n{line}"
+            );
+        }
+        // Every setup on this connection succeeded.
+        for field in ["failed_resolves", "failed_connects", "failed_setup_ms"] {
+            assert_eq!(
+                numeric_field(&line, field),
+                0,
+                "no setup failed on this connection; line was:\n{line}"
+            );
+        }
+    }
+
+    // 2b. A connection whose tunnel setups failed says how many and for how
+    //     long. At the production level a failed setup prints no line of its
+    //     own, so this is the only trace of it: one name that cannot be
+    //     resolved and one address that refuses the connection.
+    {
+        let mark = buffer.mark();
+        let mut client = H3Client::connect(&server).await;
+        let unresolvable = format!("{}:443", common::unresolvable_host());
+        let refused = respond_to(&mut client, connect_request(&unresolvable)).await;
+        assert_eq!(refused.status, Status::BAD_GATEWAY);
+        let closed = closed_address().await;
+        let refused = respond_to(&mut client, connect_request(&closed.to_string())).await;
+        assert_eq!(refused.status, Status::BAD_GATEWAY);
+        client.quic.close(quinn::VarInt::from_u32(0), b"");
+
+        let line = buffer
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
+            .await;
+        assert_eq!(
+            (
+                numeric_field(&line, "failed_resolves"),
+                numeric_field(&line, "failed_connects")
+            ),
+            (1, 1),
+            "one failed lookup and one refused connect; line was:\n{line}"
+        );
+        // Both fail at once on loopback, so only the field's presence and a
+        // sane value are judged.
+        assert!(
+            numeric_field(&line, "failed_setup_ms") < 5_000,
+            "the time the failed setups took; line was:\n{line}"
+        );
     }
 
     // 3. Any other application error code is the peer reporting a problem, and
@@ -302,8 +364,9 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .collect();
     assert_eq!(
         closes.len(),
-        6,
-        "six of the eight closes are routine; log was:\n{logged}"
+        7,
+        "six of the eight ways to end are routine, and scenario 2b ends as \
+         scenario 2 does; log was:\n{logged}"
     );
     for line in &closes {
         assert!(
@@ -345,6 +408,14 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
             "window_floor_ms=",
             "window_floor_lossless_ms=",
             "peak_bytes_per_sec=",
+            "window_turnover_permille=",
+            "flight_over_min_rtt_permille=",
+            "base_loss_mean_ppm=",
+            "base_loss_peak_ppm=",
+            "gain_mean_permille=",
+            "failed_resolves=",
+            "failed_connects=",
+            "failed_setup_ms=",
         ] {
             assert!(
                 line.contains(field),

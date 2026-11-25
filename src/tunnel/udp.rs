@@ -148,6 +148,8 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
             // As on the TCP path, the status follows from the RFC 9209 type
             // rather than collapsing every failure into one 502, and the answer
             // names the address that failed.
+            // The socket's `connect` sends nothing, so the wait is the lookup.
+            ctx.failed_setups.connect(admitted.resolve);
             debug!(
                 stream_id,
                 allowed = %crate::logfmt::addresses(&allowed),

@@ -424,6 +424,7 @@ use base_loss::{BaseLoss, Closed, READING_PACKETS};
 use gain::{Gain, WINDOW_PACKETS};
 use min_rtt::{LowSamples, Probe};
 use rate::{DeliveryRate, Sample};
+use record::Counted;
 pub use record::Record;
 use recovery::Recovery;
 use startup::Startup;
@@ -509,6 +510,7 @@ impl ControllerFactory for BbrConfig {
             cap: None,
             window: INITIAL_WINDOW,
             record: Record::default(),
+            flight: (0, 0),
         })
     }
 }
@@ -578,6 +580,9 @@ pub struct Bbr {
     window: u64,
     /// What the connection's close line reports; see [`Record`].
     record: Record,
+    /// The bytes acknowledged since the last sample interval closed, and the
+    /// sum of their times in flight in byte-microseconds, for `record`.
+    flight: (u64, u128),
 }
 
 impl Bbr {
@@ -597,6 +602,12 @@ impl Bbr {
         srtt: Duration,
     ) {
         self.srtt = srtt;
+        let rtt = now.saturating_duration_since(sent);
+        self.flight.0 = self.flight.0.saturating_add(bytes);
+        self.flight.1 = self
+            .flight
+            .1
+            .saturating_add(u128::from(bytes) * rtt.as_micros());
         self.acked = self.acked.saturating_add(bytes);
         self.gain.acked = self.gain.acked.saturating_add(bytes);
         self.startup.acked = self.startup.acked.saturating_add(bytes);
@@ -608,7 +619,6 @@ impl Bbr {
         // count as app-limited and its low samples do not lower the estimate.
         let probing = self.probe.is_some();
         self.rate.on_ack(sent, bytes, app_limited || probing);
-        let rtt = now.saturating_duration_since(sent);
         if let Some(probe) = &mut self.probe {
             probe.min = probe.min.min(rtt);
             self.low.add(now, rtt, None);
@@ -781,13 +791,19 @@ impl Controller for Bbr {
             // startup, the estimate and the cap, and before the startup takes
             // the interval's lost bytes. A probe's ACKs count as app-limited,
             // so an interval with a probe in it is left out with the others.
+            let flight = std::mem::take(&mut self.flight);
             if was_ended && !sample.app_limited {
-                self.record.count(
-                    sample.ack_elapsed,
-                    sample.rate,
-                    self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
-                    self.startup.lost == 0,
-                );
+                self.record.count(Counted {
+                    length: sample.ack_elapsed,
+                    rate: sample.rate,
+                    at_floor: self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
+                    lossless: self.startup.lost == 0,
+                    window: self.window,
+                    flight,
+                    min_rtt: self.min_rtt.map_or(Duration::ZERO, |(min, _)| min),
+                    base_loss_ppm: self.base.ppm(),
+                    gain_permille: self.gain.permille,
+                });
             }
             // 1.5 times the base loss: any lost byte while it is zero.
             let exit_above = self.base.ppm() * 3 / 2;
@@ -2259,6 +2275,12 @@ mod tests {
         assert_eq!(c.window(), 1_125_000, "back at the cap");
     }
 
+    /// The four counts of [`Record`] that the floor is read from.
+    fn floor_counts(c: &Bbr) -> (Duration, Duration, Duration, u64) {
+        let r = c.record();
+        (r.window_limited, r.floor, r.floor_lossless, r.peak)
+    }
+
     /// What the close line reports of the controller. 2 MB/s at 60 ms is a
     /// bandwidth-delay product of 120 kB, so the cap is at its floor; 10 MB/s
     /// gives 750 kB.
@@ -2271,13 +2293,8 @@ mod tests {
         // There is no cap before the first sample, so no floor yet.
         t = interval(&mut c, t, 2_000_000, false);
         assert_eq!(
-            c.record(),
-            Record {
-                window_limited: SRTT,
-                floor: Duration::ZERO,
-                floor_lossless: Duration::ZERO,
-                peak: 2_000_000,
-            }
+            floor_counts(&c),
+            (SRTT, Duration::ZERO, Duration::ZERO, 2_000_000)
         );
         assert_eq!(c.cap(), Some(FLOOR));
 
@@ -2286,15 +2303,7 @@ mod tests {
         // At the floor, with a loss.
         c.on_congestion_event(t, t - MIN_RTT, false, 1200);
         t = interval(&mut c, t, 2_000_000, false);
-        assert_eq!(
-            c.record(),
-            Record {
-                window_limited: 3 * SRTT,
-                floor: 2 * SRTT,
-                floor_lossless: SRTT,
-                peak: 2_000_000,
-            }
-        );
+        assert_eq!(floor_counts(&c), (3 * SRTT, 2 * SRTT, SRTT, 2_000_000));
 
         // An app-limited interval is the application's, not the window's.
         t = interval(&mut c, t, 2_000_000, true);
@@ -2304,14 +2313,84 @@ mod tests {
         // the floor; the next one closes above it.
         t = interval(&mut c, t, 10_000_000, false);
         interval(&mut c, t, 10_000_000, false);
+        assert_eq!(floor_counts(&c), (5 * SRTT, 3 * SRTT, 2 * SRTT, 10_000_000));
+    }
+
+    /// The means of [`Record`], over the same intervals.
+    #[test]
+    fn the_record_reads_the_time_in_flight_the_base_loss_and_the_gain_as_means() {
+        let mut c = capped();
+        let mut t = Instant::now();
+        end_acks(&mut c, t, false);
+        let r = c.record();
         assert_eq!(
-            c.record(),
-            Record {
-                window_limited: 5 * SRTT,
-                floor: 3 * SRTT,
-                floor_lossless: 2 * SRTT,
-                peak: 10_000_000,
-            }
+            (
+                r.flight_permille(),
+                r.base_loss_mean(),
+                r.base_loss_highest(),
+                r.gain_mean()
+            ),
+            (None, None, None, None),
+            "nothing counted yet"
+        );
+
+        // One interval whose bytes were all in flight for one minimum RTT, at
+        // the top gain and without a base loss. The window of 240 kB was held
+        // for 100 ms, which is 400 kB of window per minimum RTT of 60 ms, and
+        // 200 kB were delivered: two minimum RTTs per window.
+        t = interval(&mut c, t, 2_000_000, false);
+        let r = c.record();
+        assert_eq!(
+            (
+                r.flight_permille(),
+                r.base_loss_mean(),
+                r.base_loss_highest(),
+                r.gain_mean()
+            ),
+            (Some(1000), Some(0), Some(0), Some(1250))
+        );
+        assert_eq!(r.turnover_permille(), Some(2000));
+
+        // A second one of the same length: a third of its bytes were in flight
+        // for one minimum RTT and two thirds for two, a base loss of 0.10 is in
+        // force and the gain is 1.05. Of the bytes of both intervals, half were
+        // in flight for two minimum RTTs.
+        assert!(c.base.push(100_000));
+        c.gain.permille = 1_050;
+        let end = t + SRTT;
+        ack(&mut c, end, MIN_RTT, 100_000, false);
+        ack(&mut c, end, 2 * MIN_RTT, 300_000, false);
+        end_acks(&mut c, end, false);
+        let r = c.record();
+        assert_eq!(r.window_limited, 2 * SRTT);
+        assert_eq!(
+            (
+                r.flight_permille(),
+                r.base_loss_mean(),
+                r.base_loss_highest(),
+                r.gain_mean()
+            ),
+            (Some(1500), Some(50_000), Some(100_000), Some(1150))
+        );
+        assert_eq!(
+            r.turnover_permille(),
+            Some(1333),
+            "the same window for twice the time, and 600 kB delivered"
+        );
+
+        // An app-limited interval adds nothing, and its bytes do not wait for
+        // the next one.
+        let end = end + SRTT;
+        ack(&mut c, end, 3 * MIN_RTT, 400_000, true);
+        end_acks(&mut c, end, true);
+        let end = end + SRTT;
+        ack(&mut c, end, MIN_RTT, 200_000, false);
+        end_acks(&mut c, end, false);
+        assert_eq!(c.record().window_limited, 3 * SRTT);
+        assert_eq!(
+            c.record().flight_permille(),
+            Some(1375),
+            "800 kB, 300 of them for two minimum RTTs"
         );
     }
 

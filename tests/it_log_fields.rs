@@ -185,7 +185,8 @@ async fn operator_facing_fields_print_values_not_options() {
         bloated.len()
     );
 
-    // The close line's four counts come from this crate's own controller.
+    // The close line's nine controller readings come from this crate's own
+    // controller.
     // Under another one there is nothing to count, and each field prints the
     // dash an absent value prints as, not a zero that would read as a
     // measurement.
@@ -201,6 +202,11 @@ async fn operator_facing_fields_print_values_not_options() {
         "window_floor_ms=-",
         "window_floor_lossless_ms=-",
         "peak_bytes_per_sec=-",
+        "window_turnover_permille=-",
+        "flight_over_min_rtt_permille=-",
+        "base_loss_mean_ppm=-",
+        "base_loss_peak_ppm=-",
+        "gain_mean_permille=-",
     ] {
         assert!(
             closed.contains(field),

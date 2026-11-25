@@ -323,6 +323,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
             // Which non-2xx follows from the RFC 9209 type, so a timeout is a
             // 504 and an unreachable target a 503 rather than all of them 502,
             // and the answer names the address that failed.
+            ctx.failed_setups.connect(admitted.resolve + connect);
             debug!(
                 stream_id,
                 authority,

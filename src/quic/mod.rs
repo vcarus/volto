@@ -8,7 +8,7 @@ mod transport;
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::Duration;
@@ -712,11 +712,10 @@ impl Server {
             let _registration = registration;
 
             // Created here rather than inside the connection so they survive
-            // it: `conn::handle` hands the first to every request and the
-            // second to the HTTP/3 datagram router, and both are read below,
-            // once, after the connection is over.
-            let tunnels = Arc::new(AtomicU64::new(0));
-            let dropped_datagrams = Arc::new(AtomicU64::new(0));
+            // it: `conn::handle` hands them to the requests and to the HTTP/3
+            // datagram router, and they are read below, once, after the
+            // connection is over.
+            let counts = conn::Counts::default();
 
             // Written once the handshake completes, so the closing line can tell
             // an eviction during the handshake from one after it. `conn::handle`
@@ -794,8 +793,7 @@ impl Server {
                         generation,
                         shutdown,
                         resolver,
-                        tunnels.clone(),
-                        dropped_datagrams.clone(),
+                        counts.clone(),
                         authenticated,
                     )
                     .await;
@@ -824,8 +822,9 @@ impl Server {
                     remote,
                     &rtt_probe,
                     closed,
-                    tunnels.load(Ordering::Relaxed),
-                    dropped_datagrams.load(Ordering::Relaxed),
+                    counts.tunnels.load(Ordering::Relaxed),
+                    counts.failed_setups.read(),
+                    counts.dropped_datagrams.load(Ordering::Relaxed),
                 ),
             }
         }
@@ -1033,21 +1032,33 @@ impl CloseReason {
 /// `sent_packets` and `lost_packets` are reported together because a loss rate
 /// needs both: either number alone says nothing about the path (D72).
 ///
-/// The last four fields are the controller's own counts
-/// ([`crate::congestion::Record`]): `window_limited_ms` is the time the
+/// Nine fields are the controller's own readings
+/// ([`crate::congestion::Record`]). `window_limited_ms` is the time the
 /// window held the sender after its startup, `window_floor_ms` the part of it
 /// with the window at its 240 kB floor, `window_floor_lossless_ms` the part
 /// of that in which nothing was lost, and `peak_bytes_per_sec` the highest
 /// delivery rate of that time. A connection that sat at the floor without
 /// loss, after it had delivered several times what the floor carries, is one
-/// the controller may have held there. Under a controller other than `bbr`
-/// each of the four prints `-`. They are read from quinn's copy of the
-/// controller, taken once here like the snapshot above.
+/// the controller may have held there. The other five are means over the
+/// same time and print `-` when there was none: `window_turnover_permille`,
+/// how many minimum RTTs the window took to deliver its own size, where the
+/// steady gain allows 1250; `flight_over_min_rtt_permille`, how long the
+/// acknowledged bytes had been in flight, in minimum RTTs;
+/// `base_loss_mean_ppm` and `base_loss_peak_ppm`, the base loss in force; and
+/// `gain_mean_permille`, the steady gain. Under a controller other than `bbr`
+/// all nine print `-`. They are read from quinn's copy of the controller,
+/// taken once here like the snapshot above.
+///
+/// `failed_resolves`, `failed_connects` and `failed_setup_ms` are the tunnel
+/// setups that failed at the lookup or at the target, and the time they took
+/// in sum ([`tunnel::FailedSetups`]). A failed setup prints no line of its
+/// own at the production level, so these are its only trace there.
 fn log_connection_closed(
     remote: SocketAddr,
     quic: &quinn::Connection,
     closed: Result<CloseReason, h3api::ConnectionError>,
     tunnels: u64,
+    (failed_resolves, failed_connects, failed_setup_ms): (u64, u64, u64),
     dropped_datagrams: u64,
 ) {
     // One snapshot for every transport field below, so they all describe the
@@ -1066,6 +1077,13 @@ fn log_connection_closed(
     let window_floor_lossless_ms =
         crate::logfmt::or_dash(record.map(|r| r.floor_lossless.as_millis()));
     let peak_bytes_per_sec = crate::logfmt::or_dash(record.map(|r| r.peak));
+    let window_turnover_permille =
+        crate::logfmt::or_dash(record.and_then(|r| r.turnover_permille()));
+    let flight_over_min_rtt_permille =
+        crate::logfmt::or_dash(record.and_then(|r| r.flight_permille()));
+    let base_loss_mean_ppm = crate::logfmt::or_dash(record.and_then(|r| r.base_loss_mean()));
+    let base_loss_peak_ppm = crate::logfmt::or_dash(record.and_then(|r| r.base_loss_highest()));
+    let gain_mean_permille = crate::logfmt::or_dash(record.and_then(|r| r.gain_mean()));
 
     match closed {
         Ok(reason) => {
@@ -1087,6 +1105,14 @@ fn log_connection_closed(
                 %window_floor_ms,
                 %window_floor_lossless_ms,
                 %peak_bytes_per_sec,
+                %window_turnover_permille,
+                %flight_over_min_rtt_permille,
+                %base_loss_mean_ppm,
+                %base_loss_peak_ppm,
+                %gain_mean_permille,
+                failed_resolves,
+                failed_connects,
+                failed_setup_ms,
                 "connection closed"
             );
         }
@@ -1109,6 +1135,14 @@ fn log_connection_closed(
                 %window_floor_ms,
                 %window_floor_lossless_ms,
                 %peak_bytes_per_sec,
+                %window_turnover_permille,
+                %flight_over_min_rtt_permille,
+                %base_loss_mean_ppm,
+                %base_loss_peak_ppm,
+                %gain_mean_permille,
+                failed_resolves,
+                failed_connects,
+                failed_setup_ms,
                 "connection closed with error"
             );
         }
@@ -1118,6 +1152,7 @@ fn log_connection_closed(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
