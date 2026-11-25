@@ -406,8 +406,15 @@ four readings, at most 40 percent, and the steady window is multiplied by
 stays at most 1.25 bandwidth-delay products. When a re-measurement lowered
 what was sent and what arrived did not fall, the sender was above the path's
 rate, and the base loss in force is cleared. A reading that brings the base
-loss up from zero is checked by one more re-measurement about ten round trips
-later, so a reading taken in an outage acts for about that long. Loss that
+loss up from zero is checked by one more re-measurement ten sample intervals
+later, so a reading taken in an outage acts for about thirteen round trips.
+These two rules keep a wrong reading short behind a rate limit, and they can
+also clear a base loss that was right: on a lossy path behind a rate limit
+with a burst allowance of half a second to two seconds of its rate, and when
+a loss episode falls into the round trip before a re-measurement. The
+transfer then runs as it did through 1.8.2 until the next reading; in the
+simulator that cost 1.6 percent of the bytes delivered over 144 lossy paths,
+and up to a fifth on single ones. Loss that
 comes in episodes is covered when an episode falls into a reading and not
 otherwise; on a simulated limiter line with loss in episodes calibrated to
 production captures, sent over delivered stayed within 0.012 of 1.8.2 in the
