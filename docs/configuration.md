@@ -167,7 +167,7 @@ answered with 407 and `Proxy-Authenticate: Basic`.
 | `initial_mtu` | bytes | `1200` | Size of the first QUIC packets — a *UDP payload* size, not an IP packet size. Range 1200..1452. **Below 1200 is an error** (RFC 9000 §14) rather than a silent round-up; above 1452 is an error too, because an Ethernet frame leaves 1452 bytes of payload over IPv6 (1472 over IPv4) and quinn applies `initial_mtu` with no ceiling of its own — so a handshake sent in packets no path carries leaves the server unreachable with nothing to fall back to. That failure mode is what separates this key from `mtu_upper_bound`: this value is sent blind, before any feedback channel exists to correct it |
 | `mtu_discovery` | bool | `true` | Probe for a larger path MTU (RFC 8899 DPLPMTUD). `false` stops the upward search, so packets stay at `initial_mtu` — except that quinn's black-hole detector still runs and can drop them to the 1200-byte floor for the rest of the connection, with nothing to bring them back up. Slower, but predictable |
 | `mtu_upper_bound` | bytes | `1436` | Ceiling for the MTU discovery search, a *UDP payload* size like `initial_mtu`. Range `initial_mtu`..1472. When the key is absent and `initial_mtu` is above 1436, the ceiling is `initial_mtu`, so a file from a release whose default was 1452 still loads. No effect (and a startup warning) when `mtu_discovery` is off. Why the default is 1436 rather than quinn's 1452, and when to raise it, is in the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) |
-| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `cubic` or `newreno`. `bbr` is volto's own controller, which holds its window to at most 1.25 times the bandwidth-delay product it measures; see [Notes that matter in practice](#notes-that-matter-in-practice) |
+| `congestion_control` | string | `"bbr"` | QUIC congestion controller: `bbr`, `cubic` or `newreno`. `bbr` is volto's own controller, which holds its window to at most 1.25 times the bandwidth-delay product it measures, plus what the path's own loss takes out of it; see [Notes that matter in practice](#notes-that-matter-in-practice) |
 | `initial_rtt_ms` | milliseconds | `333` | Round-trip time assumed before the first measurement. Range 10..10000 |
 | `socket_recv_buffer` | bytes | `2097152` | UDP socket receive buffer to request when the socket is created; `0` leaves the operating system's own value alone. Range `0`..`2147483647`, the largest value the socket API's signed 32-bit argument can carry; a larger one is refused at load time rather than truncated. Capped by `net.core.rmem_max`, and volto warns at startup when it was capped |
 | `socket_send_buffer` | bytes | `2097152` | The same on the way out, capped by `net.core.wmem_max`; the same `0`..`2147483647` range and the same truncation reason |
@@ -333,17 +333,20 @@ proxy, which the kernel runs on BBR, is unaffected. BBR models bandwidth and RTT
 instead. Switch to cubic only on a clean path, or as a fallback.
 
 **`bbr` is volto's own controller, with its window held to at most 1.25 times
-the bandwidth-delay product it measures.** quinn's BBR estimates the bottleneck
+the bandwidth-delay product it measures, plus what the path's own loss takes
+out of it.** quinn's BBR estimates the bottleneck
 bandwidth several times too high, so during a bulk download it sends faster than
 the path carries and the path drops the difference. `bbr` uses no part of it. It
 measures the delivery rate once per round trip and sets the window, and with it
-the pacing rate, to a gain times that rate times the minimum RTT. Outside a
+the pacing rate, to a gain times that rate times the minimum RTT, widened for
+the path's base loss as described below. Outside a
 recovery and the re-measurement of the minimum RTT the window is never below the
 240 kB a new connection starts with, so on a path whose bandwidth-delay product
 is under 192 kB the window can be 240 kB. The gain is
 1.25 and follows the path down to 1.05. At 1.25 a quarter of a bandwidth-delay
 product stands in the bottleneck queue, and a queue shorter than that loses the
-rest. So when one percent or more of the bytes are lost, the controller tries
+rest. So when one percent or more of the bytes are lost beyond the path's base
+loss, the controller tries
 the gain at which in-flight data is what the path carried, and keeps it only if
 the loss then falls as a short queue predicts: the loss is counted over windows
 of at least four round trips, and each of four windows at the lower gain has to
@@ -361,8 +364,14 @@ and from 127 to 144 Mbit/s; under 0.2 and 2 percent random loss and behind a
 queue of one bandwidth-delay product nothing changed. Behind a 20 kB queue the
 loss went from 20.4 to 4.4 percent and the throughput from 117 to 114 Mbit/s. A new connection uses
 2.89 times instead, BBR's startup
-gain, until its measured rate stops growing, or until a loss arrives in a round
-trip in which it did not grow; behind a 150 Mbit/s bottleneck in the lab it
+gain, until its measured rate stops growing, or until a round trip in which it
+did not grow loses more than 1.5 times the path's base loss, which before the
+first reading is any loss at all, or carries an ECN mark, once the connection
+has counted 100 packets. Through 1.8.2 that exit applied from the first
+packet, so a handshake that lost a packet in each of two round trips ended the
+startup on a dozen packets and the connection never ran one; within 100
+packets the window is the initial window's whatever the gain. Behind a
+150 Mbit/s bottleneck in the lab it
 reached 90 percent of that rate 1.4 s after the handshake at a 60 ms RTT and 2.9
 s at 150 ms, against 2.0 and 4.5 s with 1.25 from the start. The higher gain
 returns when the measured rate, after falling below half of its highest value,
@@ -371,7 +380,61 @@ lab, the climb back to 90 percent of the bottleneck rate, once sending resumed,
 took 0.2 s at a 60 ms RTT and 2.0 to 2.2 s at 150 ms, against 0.8 to 0.9 s and
 3.2 to 3.5 s before this rule. A new connection's window is also at most the
 initial window plus the bytes acknowledged until that first startup has ended,
-as in slow start. After a loss, in-flight data is held for one round trip and
+as in slow start.
+
+Some paths drop a share of all packets whatever the sending rate. A lost packet
+stays counted in the window until it is declared lost, a quarter of a round trip
+longer than a delivered one, so on such a path a window of 1.25 bandwidth-delay
+products delivers less than the measured rate once more than about one sixth of
+the packets are lost. Each measurement then comes out lower than the last, and
+the window falls to its 240 kB floor although the path could carry far more.
+Through 1.8.2 that is what happened. The controller now reads the path's base
+loss where its own sending cannot be the cause: among the packets sent while
+the window is held at half for the re-measurement of the minimum RTT, and
+only when what arrived fell with what was sent: the arrival rate during the
+re-measurement has to be at most three quarters of the arrival rate in the
+round trip before it. Behind a rate limit with a large burst allowance, where
+the startup has measured several times the limit, sending less leaves the
+arrivals as they were, and the loss is the sender's own. When a startup has lost
+5 percent of its bytes or more and no reading is kept yet, that re-measurement
+starts as soon as the startup ends rather than 10 s or more later; on a path
+with a clean rate limit this costs one re-measurement about a second into the
+connection. When one re-measurement counts too few packets and shows the loss,
+the next follows at once, up to four. The base loss is the lowest of the last
+four readings, at most 40 percent, and the steady window is multiplied by
+(1 + p/4) / (1 - p) for a base loss p. So what is in flight and will arrive
+stays at most 1.25 bandwidth-delay products. When a re-measurement lowered
+what was sent and what arrived did not fall, the sender was above the path's
+rate, and the base loss in force is cleared. A reading that brings the base
+loss up from zero is checked by one more re-measurement about ten round trips
+later, so a reading taken in an outage acts for about that long. Loss that
+comes in episodes is covered when an episode falls into a reading and not
+otherwise; on a simulated limiter line with loss in episodes calibrated to
+production captures, sent over delivered stayed within 0.012 of 1.8.2 in the
+mean and 0.055 in the worst run over 120 s. Loss the sender causes itself by
+exceeding a rate limit or a queue does not enter a reading, with one known
+exception: behind a buffer of under ten packets quinn's bursts of ten packets
+overflow it at any rate, and in the simulator behind a 20 Mbit/s queue of
+10 kB the sent rate rose from 20.4 to 23.5 Mbit/s for 19.4 delivered. A rise of
+the base loss takes effect once every kept reading has risen, which can take a
+minute or two. In a lab with Surge as the client, on a path of 85 ms that
+carries 150 Mbit/s before its loss, 1.8.2 delivered 16 Mbit/s with 23 percent
+of the packets dropped and this controller 109 to 112, where the path carries
+115. Earlier builds of the change delivered 131 to 132 where 1.8.2 gave 106 to
+111 with 15 percent dropped, and 123 to 124 where it gave 21 to 24 with 18
+percent. On a path of 151 ms with 24 percent dropped 1.8.2 ended at the floor,
+9 Mbit/s, at once in one run and after 40 s in the other; this controller ran
+at 63 to 67 from 1.5 s on, where the client's own windows were the limit.
+Behind rate limits without a queue the sent rate over the delivered rate was
+1.09 against 1.14 to 1.15 for 1.8.2 at 30 Mbit/s with a burst allowance of
+1 MB, 1.10 against 1.12 to 1.16 at 60 Mbit/s with 4 MB, and 1.00 for both at
+190 Mbit/s with 1 MB, and no base loss was read. An earlier build of the
+change, which differs from this one only where a base loss is read or a packet
+of the handshake is lost, stayed within what 1.8.2 gives from run to run behind
+a 50 kB queue, a deep queue, 2 percent random loss, a poor Wi-Fi hop, and a
+competing CUBIC flow through a short, a middle and a deep queue.
+
+After a loss, in-flight data is held for one round trip and
 then grows by the bytes acknowledged. Apart from the gain rule above, it does
 not take a lost packet for a reason to send less for longer than that, which is
 what makes BBR the choice for a lossy path. It keeps its own
