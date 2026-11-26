@@ -61,7 +61,7 @@
 //! [`Connection::accept`].
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::BytesMut;
@@ -77,7 +77,7 @@ use super::frame::{self, BufferBudget};
 pub use super::router::{
     DatagramReceiver, EARLY_DATAGRAM_HOLD, EARLY_DATAGRAMS, INBOUND_QUEUE_DEPTH,
 };
-use super::router::{Routes, route_datagram};
+use super::router::{Router, route_datagram};
 use super::stream::Resolver;
 use super::varint;
 
@@ -213,14 +213,12 @@ pub(crate) struct Shared {
     /// stream separately. The peer's control stream is the one reader that
     /// does not: see [`BufferBudget::unshared`].
     buffered: Arc<BufferBudget>,
-    /// Where an inbound HTTP Datagram goes, and the datagrams held for a
-    /// session that has not claimed its Quarter Stream ID yet.
+    /// The routing of the peer's HTTP Datagrams, with the hold and the drop
+    /// counts ([`Router`]).
     ///
-    /// Both under one lock, so that "is this id claimed" and "hold this
-    /// datagram" are one decision: a claim cannot happen between the router's
-    /// lookup and its hold, which would leave the held datagram behind the
-    /// claim that should have taken it.
-    pub(super) routes: Mutex<Routes>,
+    /// Its own `Arc` because every [`DatagramReceiver`] holds it too, to take
+    /// its entry out of the routing table when it is dropped.
+    router: Arc<Router>,
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
     /// Whether a control stream has already been accepted (RFC 9114 §6.2.1).
@@ -229,36 +227,6 @@ pub(crate) struct Shared {
     pub(super) encoder_seen: AtomicBool,
     /// Whether a QPACK decoder stream has already been accepted.
     pub(super) decoder_seen: AtomicBool,
-    /// Inbound HTTP Datagrams dropped instead of delivered, all three ways at
-    /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
-    /// a session whose inbound queue was full. A datagram held for a session
-    /// that never claimed it counts with the second, when it is let go.
-    ///
-    /// RFC 9298 §5 and RFC 9297 §2.1 ask for silent drops, so this counter is
-    /// the only trace they leave in production. It is read once, by the
-    /// closing line in [`crate::quic`], which is written after this struct is
-    /// gone. So the `Arc` is passed in by [`Connection::handshake`]'s caller,
-    /// as that line's `tunnels` counter is.
-    pub(super) dropped_datagrams: Arc<AtomicU64>,
-    /// How often each way of dropping has been reported, on a doubling
-    /// schedule.
-    ///
-    /// Drops arrive at whatever rate the peer sends, so a line per drop would
-    /// amplify the log under a debug subscriber and cost formatting on the
-    /// routing task either way. [`crate::logfmt::Sampler`] is this crate's one
-    /// mechanism for that. The first drop of each shape is reported at once,
-    /// and later reports give the running count. There are four samplers
-    /// because the shapes have different diagnoses, and each doubles at its
-    /// own rate: an extension this server does not speak, a session racing its
-    /// own close (or a misdirected flood), a target not draining, and a
-    /// datagram cut short of its Context ID.
-    ///
-    /// The closing line's `dropped_datagrams` is still the total across all
-    /// four. These bound the debug lines, not the count.
-    pub(super) unknown_context_drops: crate::logfmt::Sampler,
-    pub(super) unroutable_drops: crate::logfmt::Sampler,
-    pub(super) queue_full_drops: crate::logfmt::Sampler,
-    pub(super) malformed_drops: crate::logfmt::Sampler,
 }
 
 impl Shared {
@@ -329,7 +297,7 @@ impl Handle {
     }
 
     /// Claims a Quarter Stream ID for a session on this connection
-    /// ([`Shared::claim`]).
+    /// ([`Router::claim`]).
     ///
     /// When the claim takes datagrams that arrived before it, a debug line
     /// says how many, with the peer's address, which is the `remote` of the
@@ -338,6 +306,7 @@ impl Handle {
     pub(crate) fn register_datagrams(&self, quarter_stream_id: u64) -> Option<DatagramReceiver> {
         let (inbound, released) = self
             .shared
+            .router
             .claim(quarter_stream_id, tokio::time::Instant::now)?;
         if released > 0 {
             debug!(
@@ -531,7 +500,7 @@ impl Connection {
             quic,
             idle: within,
             shared: Arc::new(Shared {
-                dropped_datagrams,
+                router: Arc::new(Router::new(dropped_datagrams)),
                 ..Shared::default()
             }),
         };
@@ -718,7 +687,7 @@ impl Drop for Connection {
             b"connection closed by the server",
         );
         self.peer.abort();
-        self.handle.shared.close_routes();
+        self.handle.shared.router.close_routes();
     }
 }
 
@@ -777,7 +746,7 @@ async fn serve_peer(handle: Handle) {
                     }
                 };
 
-                if let Err(violation) = route_datagram(&handle.shared, datagram) {
+                if let Err(violation) = route_datagram(&handle.shared.router, datagram) {
                     handle.fail(violation);
                     return;
                 }
@@ -802,6 +771,7 @@ fn datagrams_stopped(error: quinn::ConnectionError) {
 mod tests {
     use super::*;
     use bytes::{Bytes, BytesMut};
+    use std::sync::Mutex;
 
     /// The peer writes the reason phrase of its CONNECTION_CLOSE, and the line
     /// that reports the end of the datagram loop prints the error. A newline in
