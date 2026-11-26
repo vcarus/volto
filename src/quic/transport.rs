@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use quinn::{IdleTimeout, VarInt};
 
 use crate::config::CongestionControl;
+use crate::congestion::LOSS_TIME_THRESHOLD;
 
 #[cfg(doc)]
 use super::reload::server_config;
@@ -98,7 +99,7 @@ pub(super) fn transport_config(limits: &crate::config::Limits) -> Result<quinn::
 
     // A packet is declared lost by its age alone, so a packet that arrives a
     // few milliseconds late is not sent again; see [`LOSS_PACKET_THRESHOLD`]
-    // and [`LOSS_TIME_THRESHOLD`].
+    // here and `LOSS_TIME_THRESHOLD` in `src/congestion/mod.rs`.
     transport.packet_threshold(LOSS_PACKET_THRESHOLD);
     transport.time_threshold(LOSS_TIME_THRESHOLD);
 
@@ -447,7 +448,7 @@ const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 
 /// How many packet numbers behind the largest acknowledged one a packet must
 /// be for quinn to declare it lost by count: never, so only
-/// [`LOSS_TIME_THRESHOLD`] declares a loss.
+/// [`LOSS_TIME_THRESHOLD`], in `src/congestion/mod.rs`, declares a loss.
 ///
 /// quinn's default is 3, the value RFC 9002 section 6.1.1 recommends as the
 /// initial one. The same section goes on: "Some networks may exhibit higher
@@ -485,42 +486,6 @@ const CRYPTO_BUFFER_SIZE: usize = 16 * 1024;
 /// reorders, and what it costs a path that does not is a quarter of a round
 /// trip on a real loss, which no operator can read off a log to tune against.
 const LOSS_PACKET_THRESHOLD: u32 = u32::MAX;
-
-/// How old a packet must be, as a multiple of the round-trip time, before
-/// quinn declares it lost once a later packet has been acknowledged.
-///
-/// quinn's default is 9/8, the value RFC 9002 section 6.1.2 recommends. The
-/// same section notes: "TCP's RACK \[RFC8985\] specifies a slightly larger
-/// threshold, equivalent to 5/4, for a similar purpose." It allows other
-/// values and names what they cost: "Smaller thresholds reduce reordering
-/// resilience and increase spurious retransmissions, and larger thresholds
-/// increase loss detection delay." RFC 8985 section 6.2, step 4, gives RACK's
-/// value: "it starts with a conservative RACK.reo_wnd of RACK.min_RTT/4."
-///
-/// The round-trip time quinn multiplies is the larger of the smoothed one and
-/// the latest sample, so the allowance for a late packet is a quarter of it:
-/// 15 ms on a 60 ms path. On the path [`LOSS_PACKET_THRESHOLD`] describes, 57
-/// to 67 percent of the late packets were under an eighth of the round-trip
-/// time late and 82 to 85 percent under a quarter, which is why 9/8 left 43 to
-/// 46 percent of them declared lost and 5/4 leaves 13 to 28. The price is that
-/// a packet that really was lost is sent again an eighth of a round trip later
-/// than with 9/8.
-///
-/// That delay matters where flow control is tight. Data sent after a lost
-/// packet counts against the peer's connection window, and against
-/// [`SEND_WINDOW`], until the packet has been sent again and acknowledged,
-/// about 2.25 round trips after it was first sent where the defaults take
-/// about 2. In the lab at 150 Mbit/s over 60 ms with 2 or 5 percent of the
-/// packets dropped and nothing reordered, a client with a 4 MiB connection
-/// window received 6 to 8 percent less with these values than with quinn's
-/// defaults, and a client with a 16 MiB window, which is what Surge advertises,
-/// received the same. With reordering as on the production path, the lab
-/// carried 128 to 135 Mbit/s where the defaults carried 91 to 92.
-///
-/// The congestion controller reads this value: a lost packet stays in flight
-/// for this many round trips, and the window covers that on a path with base
-/// loss (`LOSS_DELAY_EXTRA_PERMILLE` in `src/congestion/mod.rs`).
-pub(crate) const LOSS_TIME_THRESHOLD: f32 = 1.25;
 
 /// Unidirectional streams a peer may have open on one connection at a time.
 ///

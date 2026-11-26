@@ -105,8 +105,8 @@
 //! A path can drop a share of all packets whatever the sender sends: its base
 //! loss. quinn takes an acknowledged packet out of in-flight data one round
 //! trip after it was sent, and a lost one only when it declares it lost, 1.25
-//! round trips after it was sent (`LOSS_TIME_THRESHOLD` in
-//! `src/quic/transport.rs`, D116). With a base loss p, a window of 1.25 times
+//! round trips after it was sent (`LOSS_TIME_THRESHOLD` below,
+//! D116). With a base loss p, a window of 1.25 times
 //! the bandwidth-delay product therefore delivers 1.25 (1 - p) / (1 + 0.25 p)
 //! times the estimate. Above about one sixth lost that is under one, each
 //! sample is lower than the estimate, and the window falls to its floor
@@ -406,8 +406,6 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory};
 use quinn_proto::RttEstimator;
 
-use crate::quic::LOSS_TIME_THRESHOLD;
-
 mod base_loss;
 mod gain;
 #[cfg(test)]
@@ -463,11 +461,51 @@ const PROBE_TIME: Duration = Duration::from_millis(200);
 /// BBR's minimum congestion window.
 const MIN_WINDOW_PACKETS: u64 = 4;
 
+/// How old a packet must be, as a multiple of the round-trip time, before
+/// quinn declares it lost once a later packet has been acknowledged.
+///
+/// quinn's default is 9/8, the value RFC 9002 section 6.1.2 recommends. The
+/// same section notes: "TCP's RACK \[RFC8985\] specifies a slightly larger
+/// threshold, equivalent to 5/4, for a similar purpose." It allows other
+/// values and names what they cost: "Smaller thresholds reduce reordering
+/// resilience and increase spurious retransmissions, and larger thresholds
+/// increase loss detection delay." RFC 8985 section 6.2, step 4, gives RACK's
+/// value: "it starts with a conservative RACK.reo_wnd of RACK.min_RTT/4."
+///
+/// The round-trip time quinn multiplies is the larger of the smoothed one and
+/// the latest sample, so the allowance for a late packet is a quarter of it:
+/// 15 ms on a 60 ms path. On the path that `LOSS_PACKET_THRESHOLD` in
+/// `src/quic/transport.rs` describes, 57 to 67 percent of the late packets
+/// were under an eighth of the round-trip time late and 82 to 85 percent under
+/// a quarter, which is why 9/8 left 43 to 46 percent of them declared lost and
+/// 5/4 leaves 13 to 28. The price is that a packet that really was lost is
+/// sent again an eighth of a round trip later than with 9/8.
+///
+/// That delay matters where flow control is tight. Data sent after a lost
+/// packet counts against the peer's connection window, and against
+/// `SEND_WINDOW` in `src/quic/transport.rs`, until the packet has been sent
+/// again and acknowledged, about 2.25 round trips after it was first sent
+/// where the defaults take about 2. In the lab at 150 Mbit/s over 60 ms with 2
+/// or 5 percent of the packets dropped and nothing reordered, a client with a
+/// 4 MiB connection window received 6 to 8 percent less with these values than
+/// with quinn's defaults, and a client with a 16 MiB window, which is what
+/// Surge advertises, received the same. With reordering as on the production
+/// path, the lab carried 128 to 135 Mbit/s where the defaults carried 91 to
+/// 92.
+///
+/// `src/quic/transport.rs` gives this value to quinn. The congestion
+/// controller reads it too: a lost packet stays in flight for this many round
+/// trips, and the window covers that on a path with base loss
+/// ([`LOSS_DELAY_EXTRA_PERMILLE`]). It is defined here, beside the window that
+/// reads it, so that the transport imports from this module and this module
+/// imports nothing from the transport.
+pub(crate) const LOSS_TIME_THRESHOLD: f32 = 1.25;
+
 /// How much longer than a round trip a lost packet stays in flight, in per
 /// mille of a round trip: quinn's time threshold minus one, taken from
-/// `LOSS_TIME_THRESHOLD` in `src/quic/transport.rs` so that the two cannot
-/// differ. quinn declares a packet lost once a later one has been
-/// acknowledged and its age is the threshold times the RTT.
+/// [`LOSS_TIME_THRESHOLD`] above so that the two cannot differ. quinn
+/// declares a packet lost once a later one has been acknowledged and its age
+/// is the threshold times the RTT.
 #[allow(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
