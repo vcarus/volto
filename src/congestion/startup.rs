@@ -32,14 +32,14 @@ pub(super) struct Startup {
     /// Samples since then that did not grow it.
     flat: u8,
     /// Whether a congestion event came in the current sample interval.
-    pub(super) congested: bool,
+    congested: bool,
     /// Whether a congestion event that lost no bytes, an ECN mark, came in
     /// the current sample interval.
-    pub(super) marked: bool,
+    marked: bool,
     /// Bytes acknowledged in the current sample interval.
-    pub(super) acked: u64,
+    acked: u64,
     /// Bytes lost in the current sample interval.
-    pub(super) lost: u64,
+    lost: u64,
     /// Bytes acknowledged and lost since the startup began, also after it has
     /// ended.
     total: (u64, u64),
@@ -54,6 +54,25 @@ pub(super) struct Startup {
 }
 
 impl Startup {
+    /// Counts acknowledged bytes in the current sample interval.
+    pub(super) fn on_ack(&mut self, bytes: u64) {
+        self.acked = self.acked.saturating_add(bytes);
+    }
+
+    /// Counts a congestion event and its lost bytes in the current sample
+    /// interval. An event that lost no bytes is an ECN mark.
+    pub(super) fn on_loss(&mut self, bytes: u64) {
+        self.congested = true;
+        self.marked |= bytes == 0;
+        self.lost = self.lost.saturating_add(bytes);
+    }
+
+    /// Whether the current sample interval has lost no bytes so far. An ECN
+    /// mark loses none.
+    pub(super) fn lossless(&self) -> bool {
+        self.lost == 0
+    }
+
     /// Applies the test to the sample interval that has just closed, with the
     /// estimate after it. A congestion event in an interval without growth
     /// ends the startup when the interval lost more than `exit_above_ppm` of

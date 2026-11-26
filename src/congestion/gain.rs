@@ -102,9 +102,9 @@ pub(super) struct Gain {
     /// and lowered again a step at a time.
     pub(super) floor: u64,
     /// Bytes acknowledged in the current loss window.
-    pub(super) acked: u64,
+    acked: u64,
     /// Bytes lost in the current loss window.
-    pub(super) lost: u64,
+    lost: u64,
     /// Sample intervals in the current loss window.
     pub(super) intervals: u8,
     /// How many of them were app-limited.
@@ -186,6 +186,16 @@ impl Gain {
     fn predicted_loss_ppm(from: u64, loss_ppm: u64, to: u64) -> u64 {
         let carried = from * (1_000_000 - loss_ppm.min(1_000_000));
         1_000_000u64.saturating_sub(carried / to.max(1))
+    }
+
+    /// Counts acknowledged bytes in the current loss window.
+    pub(super) fn on_ack(&mut self, bytes: u64) {
+        self.acked = self.acked.saturating_add(bytes);
+    }
+
+    /// Counts the bytes of a congestion event in the current loss window.
+    pub(super) fn on_loss(&mut self, bytes: u64) {
+        self.lost = self.lost.saturating_add(bytes);
     }
 
     fn restart(&mut self) {
