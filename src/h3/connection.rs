@@ -187,6 +187,13 @@ impl PeerSettings {
             wait_until: tokio::time::Instant::now(),
         }
     }
+
+    /// Whether the peer's SETTINGS frame has been read, without waiting, for
+    /// the tests of the control stream's reader.
+    #[cfg(test)]
+    pub(super) fn has_been_read(&self) -> bool {
+        *self.read.borrow()
+    }
 }
 
 /// Connection state that outlives any one stream or task.
@@ -198,14 +205,14 @@ pub(crate) struct Shared {
     /// leaves this layer: the sessions in `tunnel::udp` hold the same flag and
     /// read it per packet, so the moment the control stream reports it, every
     /// session on the connection is already looking at the new value.
-    pub(super) peer_datagrams: Arc<AtomicBool>,
+    peer_datagrams: Arc<AtomicBool>,
     /// Whether the peer's SETTINGS frame has been read, whatever it said.
     ///
     /// A watch and not a second flag, because a request waits on it
-    /// ([`PeerSettings::read`]). The control stream's reader sets it after
+    /// ([`PeerSettings::read`]). [`Shared::settings_arrived`] sets it after
     /// `peer_datagrams`, so whoever it wakes reads that flag as the frame set
     /// it.
-    pub(super) settings_read: watch::Sender<bool>,
+    settings_read: watch::Sender<bool>,
     /// What this connection may hold in half-received frames at once (D77).
     ///
     /// Its own `Arc` because every request stream's [`FrameReader`](frame::FrameReader) holds it,
@@ -222,11 +229,11 @@ pub(crate) struct Shared {
     /// Why this endpoint closed the connection, if it did.
     local_error: OnceLock<Violation>,
     /// Whether a control stream has already been accepted (RFC 9114 §6.2.1).
-    pub(super) control_seen: AtomicBool,
+    control_seen: AtomicBool,
     /// Whether a QPACK encoder stream has already been accepted.
-    pub(super) encoder_seen: AtomicBool,
+    encoder_seen: AtomicBool,
     /// Whether a QPACK decoder stream has already been accepted.
-    pub(super) decoder_seen: AtomicBool,
+    decoder_seen: AtomicBool,
 }
 
 impl Shared {
@@ -244,13 +251,54 @@ impl Shared {
 
     /// A view of the peer's SETTINGS whose [`PeerSettings::read`] waits until
     /// `wait_until` at the latest.
-    fn peer_settings(&self, wait_until: tokio::time::Instant) -> PeerSettings {
+    pub(super) fn peer_settings(&self, wait_until: tokio::time::Instant) -> PeerSettings {
         PeerSettings {
             datagrams: self.peer_datagrams.clone(),
             read: self.settings_read.subscribe(),
             wait_until,
         }
     }
+
+    /// Records that the peer's SETTINGS frame has been read, and whether it
+    /// enabled HTTP Datagrams.
+    ///
+    /// The datagram flag starts false, so it is written only when `datagrams`
+    /// is true. It is written before the mark that the frame was read, for the
+    /// reason the comment below gives.
+    pub(super) fn settings_arrived(&self, datagrams: bool) {
+        if datagrams {
+            self.peer_datagrams.store(true, Ordering::Relaxed);
+        }
+        // After the flag: a request this wakes reads the flag next
+        // (`PeerSettings::read`).
+        self.settings_read.send_replace(true);
+    }
+
+    /// Records that the peer opened a stream of `kind`, and says whether it
+    /// had opened one before.
+    ///
+    /// One swap, so of two streams of one kind that arrive at once, exactly
+    /// one is taken for the first.
+    pub(super) fn opened_before(&self, kind: OnceStream) -> bool {
+        let seen = match kind {
+            OnceStream::Control => &self.control_seen,
+            OnceStream::QpackEncoder => &self.encoder_seen,
+            OnceStream::QpackDecoder => &self.decoder_seen,
+        };
+        seen.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// A kind of unidirectional stream the peer may open only once, for
+/// [`Shared::opened_before`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnceStream {
+    /// The peer's control stream.
+    Control,
+    /// The peer's QPACK encoder stream.
+    QpackEncoder,
+    /// The peer's QPACK decoder stream.
+    QpackDecoder,
 }
 
 /// A cheap handle to the connection, held by every stream and task on it.
@@ -879,13 +927,6 @@ mod tests {
         assert_eq!(reported.code(), Code::H3_FRAME_UNEXPECTED);
     }
 
-    /// What the control stream's reader does when it has read the peer's
-    /// SETTINGS: the datagram flag first, then the mark a request waits on.
-    fn settings_arrive(shared: &Shared, datagrams: bool) {
-        shared.peer_datagrams.store(datagrams, Ordering::Relaxed);
-        shared.settings_read.send_replace(true);
-    }
-
     /// The usual case, and the one that must cost nothing: the frame was read
     /// before the request asked.
     #[tokio::test(start_paused = true)]
@@ -893,7 +934,7 @@ mod tests {
         let shared = Shared::default();
         let start = tokio::time::Instant::now();
         let settings = shared.peer_settings(start + PEER_SETTINGS_WAIT);
-        settings_arrive(&shared, true);
+        shared.settings_arrived(true);
 
         settings.read().await;
 
@@ -916,7 +957,7 @@ mod tests {
             let reader = shared.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(LATER).await;
-                settings_arrive(&reader, datagrams);
+                reader.settings_arrived(datagrams);
             });
             settings.read().await;
 
