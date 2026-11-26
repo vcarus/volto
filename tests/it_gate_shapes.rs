@@ -3551,3 +3551,34 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
         std::fs::write(directory.join(name), &input).expect("a seed file");
     }
 }
+
+/// The port a probe sent from stays taken after the probe has returned.
+///
+/// A server that answered a probe sends its flight again to that port for
+/// seconds after the probe stopped listening. If the next probe's socket were
+/// given the same port, it would hear those datagrams and a test of silence
+/// would count them as an answer ([`common::udp_answers`] says how it keeps
+/// the port).
+#[tokio::test]
+async fn the_port_of_a_finished_probe_is_not_free_for_the_next_one() {
+    let target = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind a target");
+    let addr = target.local_addr().expect("the target's address");
+    let brief = Duration::from_millis(50);
+    let mut probe = vec![0u8; 16];
+
+    assert!(udp_answers(addr, &[vec![1u8; 8]], brief).await.is_empty());
+    let (_, many) = target.recv_from(&mut probe).await.expect("the probe");
+    assert!(udp_answer(addr, &[2u8; 8], brief).await.is_none());
+    let (_, one) = target.recv_from(&mut probe).await.expect("the probe");
+
+    for (helper, from) in [("udp_answers", many), ("udp_answer", one)] {
+        let again = tokio::net::UdpSocket::bind(from).await;
+        assert_eq!(
+            again.as_ref().err().map(std::io::Error::kind),
+            Some(std::io::ErrorKind::AddrInUse),
+            "{helper} sent from {from}, and that port must still be taken"
+        );
+    }
+}
