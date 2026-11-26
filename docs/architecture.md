@@ -318,6 +318,16 @@ all — connecting a UDP socket only asks the kernel for a route, so the first
 address with one wins outright. The reorder is a stable partition, leaving
 RFC 6724's ordering within each family intact; `system` opts out of it entirely.
 
+With `ipv4` or `ipv6` the preference also decides what is asked of the resolver.
+The preferred family is looked up alone, and a tunnel goes on as soon as that
+answer has an address; it does not wait for the other family. The other family's
+lookup starts at the same moment when the connection has a lookup slot to spare,
+and otherwise only when it is needed: when the preferred family gave no usable
+address, or when every preferred address failed to connect. The order in which
+addresses are tried is the same as with one lookup of both families, and so is
+the share of `connect_timeout` each attempt gets once the other family's answer
+is known. With `system` a name is one lookup of both families.
+
 ### The name lookup budget
 
 Name resolution is the one place in this server where a request reaches a
