@@ -285,29 +285,19 @@ jobs:
         run: cargo deny --manifest-path fuzz/Cargo.toml --locked check licenses sources
 
   test:
-    # macOS is the development host and Linux the deployment target; both have to
-    # stay green, so the suite runs on both rather than on one of them.
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    # Linux is the deployment target and the only platform a release is built
+    # for. macOS is the development host: the suite runs there before every
+    # push, so a second run on a hosted macOS runner repeated that one and
+    # waited on the runner quota. The job keeps the name the branch
+    # protection requires.
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
     timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Why and from where: the header of .github/actions/cmake-libclang/action.yml.
       - name: Install cmake and libclang
-        if: runner.os == 'Linux'
         uses: ./.github/actions/cmake-libclang
-      # On macOS the image's Xcode carries libclang; cmake comes from Homebrew,
-      # which the image also carries, and is installed only if it is missing.
-      - name: Check cmake and libclang
-        if: runner.os == 'macOS'
-        run: |
-          command -v cmake >/dev/null || brew install cmake
-          cmake --version
-          xcrun --find clang
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: stable
