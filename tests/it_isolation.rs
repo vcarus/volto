@@ -132,7 +132,7 @@ fn capsule_reply_is<'a>(
 /// The neighbour is an ordinary echo session on the same connection, asked for
 /// an ordinary round trip.
 ///
-/// Red check: making `Shared::deliver` await `Sender::send` instead of
+/// Red check: making `Router::deliver` await `Sender::send` instead of
 /// `try_send` fails this and the test below, and nothing else in the suite.
 #[tokio::test]
 async fn a_session_that_never_drains_its_queue_does_not_stall_the_router() {
