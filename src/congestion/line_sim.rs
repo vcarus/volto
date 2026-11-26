@@ -22,8 +22,7 @@ use std::time::{Duration, Instant};
 use quinn::congestion::{Controller, ControllerFactory};
 
 use super::base_loss::{Closed, READINGS};
-use super::{Bbr, BbrConfig, INITIAL_WINDOW, Record};
-use crate::quic::LOSS_TIME_THRESHOLD;
+use super::{Bbr, BbrConfig, INITIAL_WINDOW, LOSS_TIME_THRESHOLD, Record};
 
 /// quinn's `TIMER_GRANULARITY` in quinn-proto `src/lib.rs`: the shortest loss
 /// delay.
@@ -171,8 +170,9 @@ impl Rtt {
 enum LossRule {
     /// This crate's settings (D116): no packet threshold, and a packet is lost
     /// once its age is `LOSS_TIME_THRESHOLD` times the larger of the smoothed
-    /// and the latest RTT. See `LOSS_PACKET_THRESHOLD` and
-    /// `LOSS_TIME_THRESHOLD` in `src/quic/transport.rs`.
+    /// and the latest RTT. See `LOSS_PACKET_THRESHOLD` in
+    /// `src/quic/transport.rs` and `LOSS_TIME_THRESHOLD` in
+    /// `src/congestion/mod.rs`.
     Ours,
     /// quinn's defaults, which release 1.8.1 ran: a packet is lost once a
     /// packet numbered 3 or more above it has been acknowledged, or once its
