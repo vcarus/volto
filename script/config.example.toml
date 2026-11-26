@@ -133,6 +133,9 @@ users = [
 # can then be shaped through /etc/gai.conf). The reordering is a stable
 # partition, so RFC 6724 still decides the order within a family, and a target
 # that resolves to a single family (an IP literal above all) is unaffected.
+# With "ipv4" or "ipv6" the preferred family is looked up first and a tunnel
+# does not wait for the other family's answer; the other family is asked at
+# the same time when a lookup slot is spare, and otherwise only when needed.
 # Like connect_timeout above, this is snapshotted per connection: a reload
 # applies it to connections accepted after it.
 # Default: "ipv4"
