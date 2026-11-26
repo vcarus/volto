@@ -14,8 +14,72 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 
 use crate::config::IpFamilyPreference;
+
+/// One address family, as a lookup can be limited to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    /// A records, IPv4 addresses.
+    Ipv4,
+    /// AAAA records, IPv6 addresses.
+    Ipv6,
+}
+
+impl Family {
+    /// The family `preference` asks for first, or `None` for
+    /// [`System`](IpFamilyPreference::System), which asks for both in one call.
+    pub fn preferred(preference: IpFamilyPreference) -> Option<Self> {
+        match preference {
+            IpFamilyPreference::Ipv4 => Some(Self::Ipv4),
+            IpFamilyPreference::Ipv6 => Some(Self::Ipv6),
+            IpFamilyPreference::System => None,
+        }
+    }
+
+    /// The family that is not this one.
+    pub fn other(self) -> Self {
+        match self {
+            Self::Ipv4 => Self::Ipv6,
+            Self::Ipv6 => Self::Ipv4,
+        }
+    }
+
+    /// Whether `address` is of this family.
+    fn holds(self, address: &SocketAddr) -> bool {
+        address.is_ipv6() == (self == Self::Ipv6)
+    }
+}
+
+/// Whether a lookup error says the name has no address of the family asked
+/// for, rather than that the lookup itself failed.
+///
+/// That is `EAI_NODATA` from a lookup of one family, and an answer that held
+/// no address at all. Both carry a private marker type, which is what this
+/// checks for. The [`io::ErrorKind`] alone cannot say it: an `EAI_SYSTEM`
+/// failure carries the `errno` of the call, and that can be `ENOENT`.
+pub fn is_no_data(error: &io::Error) -> bool {
+    error.get_ref().is_some_and(|inner| inner.is::<NoAddress>())
+}
+
+/// The error of a lookup that found the name but no address of the family it
+/// asked for. Its text is the resolver's own.
+#[derive(Debug)]
+struct NoAddress(String);
+
+impl std::fmt::Display for NoAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoAddress {}
+
+/// A [`NoAddress`] error with `message` as its text.
+fn no_address(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, NoAddress(message))
+}
 
 /// Reorders `addresses` so the preferred address family comes first.
 ///
@@ -88,32 +152,172 @@ async fn on_the_blocking_pool(
     port: u16,
     slot: Option<LookupSlot>,
 ) -> io::Result<Vec<SocketAddr>> {
-    let owned = host.to_owned();
-    let resolved = tokio::task::spawn_blocking(move || {
-        let addresses = std::net::ToSocketAddrs::to_socket_addrs(&(owned.as_str(), port));
-        // Explicit, and last: the slot is what the thread is holding, so it is
-        // given back where the thread finishes rather than where the caller
-        // does.
-        drop(slot);
-        addresses
-    })
-    .await;
+    answered(host, &mut System::Getaddrinfo.spawn(host, port, None, slot)).await
+}
 
-    let addresses: Vec<SocketAddr> = match resolved {
-        Ok(addresses) => addresses?.collect(),
+/// The answer of a lookup [`System::spawn`] started.
+///
+/// Takes the handle by reference so that a caller that stops waiting keeps it
+/// and can wait again later ([`OtherFamily::addresses`]). A handle must not be
+/// polled again once this has returned.
+async fn answered(
+    host: &str,
+    lookup: &mut JoinHandle<io::Result<Vec<SocketAddr>>>,
+) -> io::Result<Vec<SocketAddr>> {
+    let addresses = match lookup.await {
+        Ok(addresses) => addresses?,
         // The runtime is shutting down, or the resolver call panicked. Neither
         // is an answer about the name.
         Err(error) => return Err(io::Error::other(error)),
     };
 
     if addresses.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{host} resolved to no addresses"),
-        ));
+        return Err(no_address(format!("{host} resolved to no addresses")));
     }
 
     Ok(addresses)
+}
+
+/// The resolver a lookup is asked of.
+///
+/// In a build that is not a test there is one: the system's `getaddrinfo`.
+/// The tests put a stand-in in its place (`ResolverBudget::per_connection_with`),
+/// so that they say what each family answers and when, on tokio's clock.
+#[derive(Clone)]
+enum System {
+    /// `getaddrinfo`, on a thread of the blocking pool.
+    Getaddrinfo,
+    /// A test's stand-in, run as a task of the runtime.
+    #[cfg(test)]
+    StandIn(StandIn),
+}
+
+/// A test's stand-in for `getaddrinfo`: the addresses `host` has in the
+/// family asked for, or in both for `None`, with the port still to be set.
+#[cfg(test)]
+pub(crate) type StandIn = Arc<
+    dyn Fn(
+            &str,
+            Option<Family>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = io::Result<Vec<std::net::IpAddr>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for System {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Getaddrinfo => f.write_str("Getaddrinfo"),
+            #[cfg(test)]
+            Self::StandIn(_) => f.write_str("StandIn"),
+        }
+    }
+}
+
+impl System {
+    /// Starts a lookup of `host` in `family`, or in both families for `None`,
+    /// holding `slot` until it returns.
+    ///
+    /// `None` is the call `std::net::ToSocketAddrs` makes, unchanged. A family
+    /// is asked through [`one_family`].
+    fn spawn(
+        &self,
+        host: &str,
+        port: u16,
+        family: Option<Family>,
+        slot: Option<LookupSlot>,
+    ) -> JoinHandle<io::Result<Vec<SocketAddr>>> {
+        let owned = host.to_owned();
+        match self {
+            Self::Getaddrinfo => tokio::task::spawn_blocking(move || {
+                let addresses = match family {
+                    None => std::net::ToSocketAddrs::to_socket_addrs(&(owned.as_str(), port))
+                        .map(Iterator::collect),
+                    Some(family) => one_family(&owned, port, family),
+                };
+                // Explicit, and last: the slot is what the thread is holding,
+                // so it is given back where the thread finishes rather than
+                // where the caller does.
+                drop(slot);
+                addresses
+            }),
+            #[cfg(test)]
+            Self::StandIn(stand_in) => {
+                let answer = stand_in(&owned, family);
+                tokio::spawn(async move {
+                    let answer = answer.await;
+                    drop(slot);
+                    answer.map(|ips| {
+                        ips.into_iter()
+                            .map(|ip| SocketAddr::new(ip, port))
+                            .collect()
+                    })
+                })
+            }
+        }
+    }
+}
+
+/// Asks the system resolver for the addresses of `host` in `family` alone.
+///
+/// The hint is what makes the C library send one query: with `AF_INET` musl
+/// and glibc send an A query and no AAAA query, and with `AF_INET6` the
+/// reverse. `std` passes no family, so it always waits for both answers.
+///
+/// The socket type is `SOCK_STREAM`, as `std` asks, because without one every
+/// address comes back once per socket type. `EAI_NODATA`, a name with no
+/// address of this family, becomes a [`NoAddress`] error with the resolver's
+/// text; every other error keeps the text `std` would give it.
+fn one_family(host: &str, port: u16, family: Family) -> io::Result<Vec<SocketAddr>> {
+    let hints = dns_lookup::AddrInfoHints {
+        socktype: dns_lookup::SockType::Stream.into(),
+        address: match family {
+            Family::Ipv4 => dns_lookup::AddrFamily::Inet,
+            Family::Ipv6 => dns_lookup::AddrFamily::Inet6,
+        }
+        .into(),
+        ..dns_lookup::AddrInfoHints::default()
+    };
+
+    let answers = dns_lookup::getaddrinfo(Some(host), None, Some(hints)).map_err(lookup_error)?;
+    Ok(one_family_list(
+        answers.map(|answer| answer.map(|answer| answer.sockaddr)),
+        port,
+        family,
+    ))
+}
+
+/// A `dns-lookup` error as the [`io::Error`] the rest of the crate reads.
+fn lookup_error(error: dns_lookup::LookupError) -> io::Error {
+    match error.kind() {
+        dns_lookup::LookupErrorKind::NoData => no_address(error.to_string()),
+        _ => error.into(),
+    }
+}
+
+/// The addresses of one family's answer, in the resolver's order, each once
+/// and with `port` set.
+///
+/// The C library hands back every address with port 0, because no service
+/// was named. An entry it cannot read is skipped, as `std` skips one. An
+/// address of the other family is dropped, so the list is of `family` whatever
+/// the C library does with the hint. An address it lists twice is kept once:
+/// glibc lists `127.0.0.1` twice for `localhost` under an IPv4 hint, because
+/// it reads the `::1 localhost` line of `/etc/hosts` as `127.0.0.1` too.
+fn one_family_list(
+    answers: impl Iterator<Item = io::Result<SocketAddr>>,
+    port: u16,
+    family: Family,
+) -> Vec<SocketAddr> {
+    let mut addresses: Vec<SocketAddr> = Vec::new();
+    for mut address in answers.filter_map(Result::ok) {
+        address.set_port(port);
+        if family.holds(&address) && !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    addresses
 }
 
 /// Name lookups the whole process may have in flight beyond the one every
@@ -228,14 +432,36 @@ impl ResolverBudget {
 
     /// One connection's view of it.
     pub fn per_connection(&self) -> ConnectionResolver {
+        self.view(System::Getaddrinfo)
+    }
+
+    /// One connection's view of it, asking `stand_in` instead of the system
+    /// resolver. The budget is the real one.
+    #[cfg(test)]
+    pub(crate) fn per_connection_with(&self, stand_in: StandIn) -> ConnectionResolver {
+        self.view(System::StandIn(stand_in))
+    }
+
+    fn view(&self, system: System) -> ConnectionResolver {
         ConnectionResolver {
             reserved: Arc::new(Semaphore::new(1)),
             reserved_allowance: self.reserved.clone(),
             burst: Arc::new(Semaphore::new(BURST_LOOKUPS)),
             shared: self.shared.clone(),
+            system,
         }
     }
 }
+
+/// Burst permits a connection may have in use and still start the other
+/// family's lookup at once: fewer than this many.
+///
+/// Half of [`BURST_LOOKUPS`]. Our own rule, not a protocol number. A
+/// connection that opens a page's worth of tunnels at once therefore starts
+/// each preferred lookup as it would without this rule, and starts few of the
+/// second lookups beside them. A second lookup that is not started at once is
+/// asked for later, if it is needed at all ([`OtherFamily`]).
+pub const SPARE_BURST_IN_USE: usize = BURST_LOOKUPS / 2;
 
 /// What one connection may ask the resolver to do at once.
 ///
@@ -273,6 +499,8 @@ pub struct ConnectionResolver {
     burst: Arc<Semaphore>,
     /// The server-wide allowance, from [`ResolverBudget`].
     shared: Arc<Semaphore>,
+    /// The resolver the lookups are asked of.
+    system: System,
 }
 
 impl ConnectionResolver {
@@ -287,7 +515,55 @@ impl ConnectionResolver {
         }
 
         let slot = self.acquire().await;
-        on_the_blocking_pool(host, port, Some(slot)).await
+        answered(host, &mut self.system.spawn(host, port, None, Some(slot))).await
+    }
+
+    /// [`lookup`](Self::lookup) of `family` alone, with the lookup of the
+    /// other family started beside it when this connection has a slot to spare.
+    ///
+    /// This lookup takes its slot exactly as [`lookup`](Self::lookup) does.
+    /// Once it holds one, `other` is started at once if a slot of the shared
+    /// allowance is spare ([`SPARE_BURST_IN_USE`]), and is left unstarted
+    /// otherwise. Either way the answer
+    /// returned is this family's alone, and it does not wait for `other`.
+    ///
+    /// `other` is borrowed rather than returned so that it keeps its lookup
+    /// when the caller stops waiting for this one, which is what a
+    /// `connect_timeout` that expires does.
+    pub async fn lookup_family(
+        &self,
+        host: &str,
+        port: u16,
+        family: Family,
+        other: &mut OtherFamily,
+    ) -> io::Result<Vec<SocketAddr>> {
+        if let Some(address) = literal(host, port) {
+            return Ok(vec![address]);
+        }
+
+        let slot = self.acquire().await;
+        let mut lookup = self.system.spawn(host, port, Some(family), Some(slot));
+        other.start_if_spare(self);
+        answered(host, &mut lookup).await
+    }
+
+    /// A slot for a lookup nobody waits for yet, if one is free right now.
+    ///
+    /// Taken from the shared allowance only, and only while fewer than
+    /// [`SPARE_BURST_IN_USE`] of this connection's burst permits are in use.
+    /// Never the reserved slot, and never by waiting: a lookup that may not be
+    /// needed must not take the slot that the next name's lookup waits for.
+    fn spare(&self) -> Option<LookupSlot> {
+        if BURST_LOOKUPS - self.burst.available_permits() >= SPARE_BURST_IN_USE {
+            return None;
+        }
+        let burst = self.burst.clone().try_acquire_owned().ok()?;
+        let shared = self.shared.clone().try_acquire_owned().ok()?;
+
+        Some(LookupSlot::Shared {
+            _burst: burst,
+            _shared: shared,
+        })
     }
 
     /// Takes this connection's reserved slot or a share of the allowance,
@@ -380,6 +656,102 @@ enum LookupSlot {
         _burst: OwnedSemaphorePermit,
         _shared: OwnedSemaphorePermit,
     },
+}
+
+/// The lookup of the family a preference puts second.
+///
+/// Started beside the preferred family's lookup when the connection has a
+/// slot to spare ([`ConnectionResolver::lookup_family`]), and otherwise only
+/// when [`addresses`](Self::addresses) is first awaited, which a tunnel does
+/// only once it needs this family. A lookup that has started holds its slot
+/// until the resolver returns, as every lookup does, even when this value is
+/// dropped first.
+#[derive(Debug)]
+pub struct OtherFamily {
+    host: String,
+    port: u16,
+    family: Family,
+    state: OtherState,
+}
+
+#[derive(Debug)]
+enum OtherState {
+    /// No slot was spare when the preferred lookup started.
+    NotStarted,
+    /// The lookup is running, or has returned and not been read yet.
+    Running(JoinHandle<io::Result<Vec<SocketAddr>>>),
+    /// [`OtherFamily::addresses`] has returned the answer.
+    Read,
+}
+
+impl OtherFamily {
+    /// The lookup of `host` in `family`, not yet started.
+    pub fn new(host: &str, port: u16, family: Family) -> Self {
+        Self {
+            host: host.to_owned(),
+            port,
+            family,
+            state: OtherState::NotStarted,
+        }
+    }
+
+    /// The family this lookup asks for.
+    pub fn family(&self) -> Family {
+        self.family
+    }
+
+    /// Whether the lookup has been started.
+    pub fn is_started(&self) -> bool {
+        !matches!(self.state, OtherState::NotStarted)
+    }
+
+    /// Starts the lookup on a spare slot of `resolver`, if it has one.
+    fn start_if_spare(&mut self, resolver: &ConnectionResolver) {
+        if self.is_started() {
+            return;
+        }
+        if let Some(slot) = resolver.spare() {
+            self.start(resolver, slot);
+        }
+    }
+
+    fn start(&mut self, resolver: &ConnectionResolver, slot: LookupSlot) {
+        self.state = OtherState::Running(resolver.system.spawn(
+            &self.host,
+            self.port,
+            Some(self.family),
+            Some(slot),
+        ));
+    }
+
+    /// The answer of this lookup, starting it now if it has not started.
+    ///
+    /// A lookup started here takes its slot the normal way, as
+    /// [`ConnectionResolver::lookup`] does, because it is now the lookup a
+    /// tunnel waits for. Safe to stop awaiting and await again: a slot not yet taken
+    /// is given back, and a lookup already started stays started. Gives the
+    /// answer once; after that it is an error.
+    pub async fn addresses(
+        &mut self,
+        resolver: &ConnectionResolver,
+    ) -> io::Result<Vec<SocketAddr>> {
+        loop {
+            match &mut self.state {
+                OtherState::NotStarted => {
+                    let slot = resolver.acquire().await;
+                    self.start(resolver, slot);
+                }
+                OtherState::Running(lookup) => {
+                    let answer = answered(&self.host, lookup).await;
+                    self.state = OtherState::Read;
+                    return answer;
+                }
+                OtherState::Read => {
+                    return Err(io::Error::other("this lookup's answer was already read"));
+                }
+            }
+        }
+    }
 }
 
 /// Whether this host holds `address`, meaning a socket of this process may be
@@ -893,6 +1265,307 @@ mod tests {
                 RESERVED_LOOKUP_CEILING,
                 "an uncapped server reserves like one at the ceiling"
             );
+        }
+
+        /// The shared allowance, all of it held, the way the hostile
+        /// connections of the tests above leave it. Taken in one call rather
+        /// than through [`hold`], because inside a runtime tokio's cooperative
+        /// budget makes the hundred and twenty-ninth acquire wait.
+        fn drain_shared(budget: &ResolverBudget) -> OwnedSemaphorePermit {
+            let held = budget
+                .shared
+                .clone()
+                .try_acquire_many_owned(u32::try_from(SHARED_LOOKUPS).unwrap())
+                .expect("the shared allowance starts whole");
+            assert_eq!(budget.shared.available_permits(), 0);
+            held
+        }
+
+        /// An idle connection has a slot to spare for the other family, and
+        /// it comes from the shared allowance, never from the reserved slot.
+        #[test]
+        fn an_idle_connection_has_a_shared_slot_to_spare() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let resolver = budget.per_connection();
+
+            let spare = resolver
+                .spare()
+                .expect("an idle connection has a slot to spare");
+
+            assert!(matches!(spare, LookupSlot::Shared { .. }), "{spare:?}");
+            assert_eq!(
+                resolver.reserved.available_permits(),
+                1,
+                "a spare slot took the reserved slot"
+            );
+            assert_eq!(budget.shared.available_permits(), SHARED_LOOKUPS - 1);
+        }
+
+        /// The second lookup starts at once only while fewer than half of the
+        /// connection's burst permits are in use.
+        #[test]
+        fn no_slot_is_spare_once_half_the_burst_is_in_use() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let resolver = budget.per_connection();
+
+            // The reserved slot, then one burst permit short of the line.
+            let mut held = hold(&resolver, 1 + SPARE_BURST_IN_USE - 1);
+            let spare = resolver.spare();
+            assert!(
+                spare.is_some(),
+                "{} burst permits in use left nothing to spare",
+                SPARE_BURST_IN_USE - 1
+            );
+            drop(spare);
+
+            held.extend(hold(&resolver, 1));
+            assert!(
+                resolver.spare().is_none(),
+                "{SPARE_BURST_IN_USE} burst permits in use still gave a spare slot"
+            );
+
+            // A lookup that is needed takes its slot exactly as before.
+            assert!(ready(resolver.acquire()).is_some());
+            drop(held);
+        }
+
+        /// With the shared allowance gone nothing is spare, and asking gives
+        /// back the burst permit it tried and leaves the reserved slot free.
+        #[test]
+        fn no_slot_is_spare_when_the_shared_allowance_is_gone() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let _held = drain_shared(&budget);
+
+            let victim = budget.per_connection();
+            assert!(victim.spare().is_none(), "a spare slot came from nowhere");
+            assert_eq!(
+                victim.burst.available_permits(),
+                BURST_LOOKUPS,
+                "asking for a spare slot kept a burst permit"
+            );
+            assert!(
+                ready(victim.acquire()).is_some(),
+                "asking for a spare slot took the reserved slot"
+            );
+        }
+
+        /// The lookups a stand-in resolver was asked for, in order.
+        type Asked = Arc<std::sync::Mutex<Vec<Option<Family>>>>;
+
+        /// A stand-in that records every lookup and answers each family with
+        /// `answer`, which never returns for an address of `None`.
+        fn stand_in(
+            asked: &Asked,
+            answer: fn(Option<Family>) -> Option<io::Result<Vec<std::net::IpAddr>>>,
+        ) -> StandIn {
+            let asked = asked.clone();
+            Arc::new(move |_host, family| {
+                asked.lock().unwrap().push(family);
+                let answer = answer(family);
+                Box::pin(async move {
+                    match answer {
+                        Some(answer) => answer,
+                        None => std::future::pending().await,
+                    }
+                })
+            })
+        }
+
+        fn v4_answers_v6_never(
+            family: Option<Family>,
+        ) -> Option<io::Result<Vec<std::net::IpAddr>>> {
+            match family {
+                Some(Family::Ipv4) => Some(Ok(vec!["192.0.2.1".parse().unwrap()])),
+                _ => None,
+            }
+        }
+
+        fn both_answer(family: Option<Family>) -> Option<io::Result<Vec<std::net::IpAddr>>> {
+            Some(Ok(match family {
+                Some(Family::Ipv4) => vec!["192.0.2.1".parse().unwrap()],
+                Some(Family::Ipv6) => vec!["2001:db8::1".parse().unwrap()],
+                None => vec!["2001:db8::1".parse().unwrap(), "192.0.2.1".parse().unwrap()],
+            }))
+        }
+
+        /// The preferred family is asked alone and answered without waiting
+        /// for the other, whose lookup was started beside it.
+        #[tokio::test]
+        async fn a_family_lookup_asks_one_family_and_starts_the_other_beside_it() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let asked = Asked::default();
+            let resolver = budget.per_connection_with(stand_in(&asked, v4_answers_v6_never));
+            let mut other = OtherFamily::new("example.test", 443, Family::Ipv6);
+
+            let addresses = resolver
+                .lookup_family("example.test", 443, Family::Ipv4, &mut other)
+                .await
+                .expect("the preferred family answers");
+
+            assert_eq!(addresses, vec!["192.0.2.1:443".parse().unwrap()]);
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![Some(Family::Ipv4), Some(Family::Ipv6)]
+            );
+            assert!(other.is_started());
+        }
+
+        /// Without a spare slot the other family is not asked until a tunnel
+        /// awaits it, and then it takes a slot the normal way, here the
+        /// connection's reserved slot.
+        #[tokio::test]
+        async fn without_a_spare_slot_the_other_family_waits_until_it_is_asked_for() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let _held = drain_shared(&budget);
+            let asked = Asked::default();
+            let victim = budget.per_connection_with(stand_in(&asked, both_answer));
+            let mut other = OtherFamily::new("example.test", 443, Family::Ipv6);
+
+            victim
+                .lookup_family("example.test", 443, Family::Ipv4, &mut other)
+                .await
+                .expect("the preferred family answers on the reserved slot");
+            assert_eq!(*asked.lock().unwrap(), vec![Some(Family::Ipv4)]);
+            assert!(
+                !other.is_started(),
+                "a lookup started with no slot to spare"
+            );
+
+            let later = other
+                .addresses(&victim)
+                .await
+                .expect("the other family answers once it is asked for");
+            assert_eq!(later, vec!["[2001:db8::1]:443".parse().unwrap()]);
+            assert_eq!(
+                *asked.lock().unwrap(),
+                vec![Some(Family::Ipv4), Some(Family::Ipv6)]
+            );
+        }
+
+        /// A second lookup nobody waits for still holds its slot until the
+        /// resolver returns, as D90 requires of every lookup.
+        #[tokio::test]
+        async fn a_second_lookup_holds_its_slot_until_the_resolver_returns() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let (release, released) = tokio::sync::oneshot::channel::<()>();
+            let released = std::sync::Mutex::new(Some(released));
+            let stand_in: StandIn = Arc::new(move |_host, family| {
+                let gate = match family {
+                    Some(Family::Ipv6) => released.lock().unwrap().take(),
+                    _ => None,
+                };
+                Box::pin(async move {
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    Ok(vec!["192.0.2.1".parse().unwrap()])
+                })
+            });
+            let resolver = budget.per_connection_with(stand_in);
+            let mut other = OtherFamily::new("example.test", 443, Family::Ipv6);
+
+            resolver
+                .lookup_family("example.test", 443, Family::Ipv4, &mut other)
+                .await
+                .expect("the preferred family answers");
+            drop(other);
+
+            assert_eq!(
+                budget.shared.available_permits(),
+                SHARED_LOOKUPS - 1,
+                "a running lookup gave its slot back when nobody was waiting for it"
+            );
+
+            release.send(()).expect("the lookup is still running");
+            for _ in 0..100 {
+                if budget.shared.available_permits() == SHARED_LOOKUPS {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the slot did not come back when the lookup returned");
+        }
+
+        /// An IP literal of either family is answered with no lookup at all.
+        #[tokio::test]
+        async fn a_family_lookup_answers_a_literal_without_a_lookup() {
+            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+            let asked = Asked::default();
+            let resolver = budget.per_connection_with(stand_in(&asked, both_answer));
+            let mut other = OtherFamily::new("2001:db8::1", 443, Family::Ipv6);
+
+            let addresses = resolver
+                .lookup_family("2001:db8::1", 443, Family::Ipv4, &mut other)
+                .await
+                .expect("a literal resolves");
+
+            assert_eq!(addresses, vec!["[2001:db8::1]:443".parse().unwrap()]);
+            assert!(asked.lock().unwrap().is_empty());
+            assert!(!other.is_started());
+        }
+    }
+
+    /// One family's answer keeps the resolver's order, each address once, of
+    /// that family alone, with the port set, and skips what it cannot read.
+    #[test]
+    fn a_family_list_has_each_address_once_with_its_port() {
+        let answers = vec![
+            Ok("127.0.0.1:0".parse().unwrap()),
+            Ok("[::1]:0".parse().unwrap()),
+            Err(io::Error::other("an address of an unknown family")),
+            Ok("192.0.2.7:0".parse().unwrap()),
+            // glibc's second copy of `localhost` under an IPv4 hint.
+            Ok("127.0.0.1:0".parse().unwrap()),
+        ];
+
+        assert_eq!(
+            one_family_list(answers.into_iter(), 443, Family::Ipv4),
+            vec![
+                "127.0.0.1:443".parse::<SocketAddr>().unwrap(),
+                "192.0.2.7:443".parse().unwrap(),
+            ]
+        );
+    }
+
+    /// `EAI_NODATA` is "no address in this family" and keeps the resolver's
+    /// text. Nothing else is, an `ENOENT` from `EAI_SYSTEM` included.
+    #[test]
+    fn only_no_data_is_read_as_no_address_in_the_family() {
+        let no_data = dns_lookup::LookupError::new(libc::EAI_NODATA);
+        let text = no_data.to_string();
+        let error = lookup_error(no_data);
+        assert!(is_no_data(&error), "{error}");
+        assert_eq!(error.to_string(), text);
+
+        for code in [libc::EAI_NONAME, libc::EAI_AGAIN, libc::EAI_FAIL] {
+            let error = lookup_error(dns_lookup::LookupError::new(code));
+            assert!(!is_no_data(&error), "{code}: {error}");
+        }
+        assert!(!is_no_data(&io::Error::from_raw_os_error(libc::ENOENT)));
+    }
+
+    /// The real `getaddrinfo`, asked one family of `localhost`: every address
+    /// is of that family, once, and carries the port. No query leaves the
+    /// host, because `localhost` comes from `/etc/hosts`. A host whose
+    /// `/etc/hosts` has no IPv6 line may answer IPv6 with no data.
+    #[test]
+    fn localhost_is_asked_one_family_at_a_time() {
+        for family in [Family::Ipv4, Family::Ipv6] {
+            let addresses = match one_family("localhost", 8080, family) {
+                Ok(addresses) => addresses,
+                Err(error) if family == Family::Ipv6 && is_no_data(&error) => continue,
+                Err(error) => panic!("{family:?}: {error}"),
+            };
+
+            assert!(!addresses.is_empty(), "{family:?}");
+            for address in &addresses {
+                assert!(family.holds(address), "{family:?}: {addresses:?}");
+                assert!(address.ip().is_loopback(), "{family:?}: {addresses:?}");
+                assert_eq!(address.port(), 8080, "{family:?}: {addresses:?}");
+            }
+            let mut unique = addresses.clone();
+            unique.dedup();
+            assert_eq!(unique, addresses, "{family:?}");
         }
     }
 

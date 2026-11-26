@@ -181,6 +181,15 @@ rustix = { version = "1", default-features = false, features = [
 # one-line `socket2::SockRef` wrapper quinn repeats when it wraps the socket.
 socket2 = "0.6"
 
+# `getaddrinfo` with an address family hint, which `std` cannot pass. With
+# `ip_family_preference` at `ipv4` or `ipv6`, `src/net.rs` asks for the
+# preferred family alone, so a tunnel does not wait for the other family's
+# answer. With a hint, musl and glibc send one query of that family, and
+# without one they send both. The crate is a thin safe wrapper around the
+# libc call, so the `unsafe` stays out of `src/`. Its dependencies on Unix are
+# `libc`, `socket2` and `cfg-if`, all three already in the tree.
+dns-lookup = "4.0.2"
+
 # The global allocator of the musl builds, installed in `src/main.rs` through
 # `src/alloc.rs`. The release binaries are static musl, which `tests/it_bench.rs`
 # measured costlier in CPU than `x86_64-unknown-linux-gnu` with identical
