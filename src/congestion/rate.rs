@@ -44,7 +44,7 @@ pub(super) struct DeliveryRate {
     /// Whether any ACK in the current interval found the sender app-limited.
     app_limited: bool,
     /// The latest send time of any packet acknowledged so far.
-    pub(super) sent: Option<Instant>,
+    sent: Option<Instant>,
     /// The earliest send time among the packets acknowledged since the current
     /// interval started, or the latest send time acknowledged before it,
     /// whichever is earlier.
@@ -144,6 +144,11 @@ impl DeliveryRate {
     /// above zero.
     pub(super) fn max(&self) -> Option<u64> {
         self.samples.iter().copied().max().filter(|&max| max > 0)
+    }
+
+    /// Whether a packet sent after `at` has been acknowledged.
+    pub(super) fn acked_sent_after(&self, at: Instant) -> bool {
+        self.sent.is_some_and(|sent| sent > at)
     }
 }
 

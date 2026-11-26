@@ -26,7 +26,7 @@ impl Bbr {
         let held = in_flight
             .saturating_add(acked)
             .max(MIN_WINDOW_PACKETS * self.mtu);
-        let acked_after = |at: Instant| self.rate.sent.is_some_and(|sent| sent > at);
+        let acked_after = |at: Instant| self.rate.acked_sent_after(at);
         match self.recovery {
             None if lost == 0 => return false,
             None => {
