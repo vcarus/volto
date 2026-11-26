@@ -647,8 +647,8 @@ impl Bbr {
             .1
             .saturating_add(u128::from(bytes) * rtt.as_micros());
         self.acked = self.acked.saturating_add(bytes);
-        self.gain.acked = self.gain.acked.saturating_add(bytes);
-        self.startup.acked = self.startup.acked.saturating_add(bytes);
+        self.gain.on_ack(bytes);
+        self.startup.on_ack(bytes);
         self.base.on_ack(sent, bytes);
         if let Some(limit) = &mut self.slow_start {
             *limit = limit.saturating_add(bytes);
@@ -835,7 +835,7 @@ impl Controller for Bbr {
                     length: sample.ack_elapsed,
                     rate: sample.rate,
                     at_floor: self.cap.is_some_and(|cap| cap <= INITIAL_WINDOW),
-                    lossless: self.startup.lost == 0,
+                    lossless: self.startup.lossless(),
                     window: self.window,
                     flight,
                     min_rtt: self.min_rtt.map_or(Duration::ZERO, |(min, _)| min),
@@ -950,12 +950,10 @@ impl Controller for Bbr {
         _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        self.startup.congested = true;
-        self.startup.marked |= lost_bytes == 0;
-        self.startup.lost = self.startup.lost.saturating_add(lost_bytes);
+        self.startup.on_loss(lost_bytes);
         self.base.on_loss(sent, lost_bytes);
         self.lost = self.lost.saturating_add(lost_bytes);
-        self.gain.lost = self.gain.lost.saturating_add(lost_bytes);
+        self.gain.on_loss(lost_bytes);
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
