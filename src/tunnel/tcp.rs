@@ -104,7 +104,7 @@ use tracing::{debug, info};
 
 use crate::h3api::{self, Fields, Reader, Status, Stream, StreamError, Writer};
 use crate::tunnel;
-use crate::tunnel::{Context, Unreachable};
+use crate::tunnel::Context;
 
 /// Smallest window a read is ever offered on the target → client relay,
 /// counting the frame header room in front of it.
@@ -312,10 +312,25 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     else {
         return;
     };
-    let allowed = admitted.addresses;
+    let tunnel::Admitted {
+        addresses: first,
+        mut later,
+        resolve,
+        ..
+    } = admitted;
+    let later = later.as_mut().map(|other| {
+        tunnel::later_addresses(other, &ctx.resolver, |addresses| {
+            tunnel::usable_addresses(ctx, stream_id, &host, port, addresses)
+        })
+    });
 
-    let (connected, connect) = tunnel::timed(connect_any(&allowed, ctx.connect_timeout)).await;
-    let tcp = match connected {
+    let (walk, walked) = tunnel::timed(connect_any(&first, later, ctx.connect_timeout)).await;
+    // A wait for the other family's lookup with no attempt in flight is lookup
+    // time, so it moves from `connect_ms` to `resolve_ms`.
+    let resolve = resolve + walk.waited;
+    let connect = walked.saturating_sub(walk.waited);
+    let allowed = walk.addresses;
+    let tcp = match walk.result {
         Ok(tcp) => tcp,
         Err(failure) => {
             // RFC 9114 §4.4: a proxy that cannot establish the connection
@@ -323,7 +338,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
             // Which non-2xx follows from the RFC 9209 type, so a timeout is a
             // 504 and an unreachable target a 503 rather than all of them 502,
             // and the answer names the address that failed.
-            ctx.failed_setups.connect(admitted.resolve + connect);
+            ctx.failed_setups.connect(resolve + connect);
             debug!(
                 stream_id,
                 authority,
@@ -367,16 +382,17 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 
     // The three times are what the client waited for on this side, beyond its
     // own round trip. `resolve_ms` is the wait for a lookup slot plus the
-    // lookup, zero for an IP literal. `connect_ms` is the walk over the
-    // target's addresses up to the one that accepted, failed attempts
-    // included. `setup_ms` runs from the start of this function to the 200
-    // having been written, so it holds both; the rest is the write of the 200.
+    // lookup, zero for an IP literal, and any later wait for the other
+    // family's lookup. `connect_ms` is the walk over the target's addresses
+    // up to the one that accepted, failed attempts included, less that later
+    // wait. `setup_ms` runs from the start of this function to the 200 having
+    // been written, so it holds both; the rest is the write of the 200.
     info!(
         log_id = "rr3u3t70",
         stream_id,
         authority,
         target = %crate::logfmt::or_dash(target),
-        resolve_ms = admitted.resolve.as_millis(),
+        resolve_ms = resolve.as_millis(),
         connect_ms = connect.as_millis(),
         setup_ms = started.elapsed().as_millis(),
         "tcp tunnel established"
@@ -400,8 +416,9 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// Connects to the first address that accepts, reporting the last failure.
 ///
 /// Trying every address matters for dual-stack targets, where the AAAA record
-/// may be unreachable while the A record works. [`tunnel::first_reachable`]
-/// walks the list and shares `budget` out among the attempts.
+/// may be unreachable while the A record works. [`tunnel::first_reachable_then`]
+/// walks `first`, then the other family's addresses that `later` gives, and
+/// shares `budget` out among the attempts by the rule it states.
 ///
 /// Why the walk is bounded at all: the tunnel slot and the file descriptor
 /// behind it are held for the length of this call, and a target that silently
@@ -414,11 +431,15 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
 /// One thing this deliberately does not do is notice the client giving up: a
 /// request stream reset mid-connect leaves the attempt running until it finishes
 /// or the budget expires. Bounding it is what makes that acceptable.
-async fn connect_any(
-    addresses: &[SocketAddr],
+async fn connect_any<L>(
+    first: &[SocketAddr],
+    later: Option<tunnel::Later<L>>,
     budget: Option<Duration>,
-) -> Result<TcpStream, Unreachable> {
-    tunnel::first_reachable(addresses, budget, TcpStream::connect, CONNECT_FAILED).await
+) -> tunnel::Walk<TcpStream>
+where
+    L: std::future::Future<Output = Vec<SocketAddr>>,
+{
+    tunnel::first_reachable_then(first, later, budget, TcpStream::connect, CONNECT_FAILED).await
 }
 
 /// The debug line for one address that did not accept.

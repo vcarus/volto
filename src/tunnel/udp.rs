@@ -33,6 +33,8 @@
 //! * Closing the socket also closes the request stream, and vice versa
 //!   (RFC 9298 §3.1). A half-open UDP session has no meaning.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use percent_encoding::percent_decode_str;
 use rustix::io::Errno;
@@ -45,7 +47,7 @@ use crate::datagram::{self, MAX_UDP_PAYLOAD};
 use crate::h3api::{
     self, DatagramReceiver, FieldValue, Fields, Reader, Request, Status, Stream, Writer,
 };
-use crate::tunnel::{Context, Unreachable};
+use crate::tunnel::Context;
 use crate::{net, tunnel};
 
 mod block;
@@ -140,16 +142,41 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
     else {
         return;
     };
-    let allowed = admitted.addresses;
+    let tunnel::Admitted {
+        addresses: first,
+        mut later,
+        deadline,
+        resolve,
+    } = admitted;
+    // The other family is read only once every address of the first one has
+    // failed to connect, and inside what is left of the resolution budget.
+    let later = later.as_mut().map(|other| {
+        let addresses = tunnel::later_addresses(other, &ctx.resolver, |addresses| {
+            tunnel::usable_addresses(ctx, stream_id, &host, port, addresses)
+        })
+        .addresses;
+        async move {
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, addresses)
+                    .await
+                    .unwrap_or_default(),
+                None => addresses.await,
+            }
+        }
+    });
 
-    let socket = match bind_any(&allowed).await {
+    let walk = bind_any(&first, later).await;
+    // The wait for the other family is lookup time, as on the TCP path.
+    let resolve = resolve + walk.waited;
+    let allowed = walk.addresses;
+    let socket = match walk.result {
         Ok(socket) => socket,
         Err(failure) => {
             // As on the TCP path, the status follows from the RFC 9209 type
             // rather than collapsing every failure into one 502, and the answer
             // names the address that failed.
             // The socket's `connect` sends nothing, so the wait is the lookup.
-            ctx.failed_setups.connect(admitted.resolve);
+            ctx.failed_setups.connect(resolve);
             debug!(
                 stream_id,
                 allowed = %crate::logfmt::addresses(&allowed),
@@ -212,7 +239,7 @@ pub async fn run(req: &Request, mut stream: Stream, ctx: &Context) {
         // As on the TCP line, without a connect time: the socket's `connect`
         // sends nothing. What `setup_ms` holds beyond `resolve_ms` is the
         // wait for the peer's SETTINGS above and the write of the 200.
-        resolve_ms = admitted.resolve.as_millis(),
+        resolve_ms = resolve.as_millis(),
         setup_ms = started.elapsed().as_millis(),
         "udp session established"
     );
@@ -957,14 +984,63 @@ fn capsule_fields() -> Fields {
 /// asks the kernel for a route, so the first address with one wins and nothing
 /// later can correct the choice. The family ordering applied at resolution
 /// (decision D58) is therefore the whole of the decision here.
-async fn bind_any(addresses: &[std::net::SocketAddr]) -> Result<UdpSocket, Unreachable> {
-    tunnel::first_reachable(
+///
+/// `first` is tried before the other family is read at all. `later` is
+/// awaited only when every address of `first` failed, as it would have been
+/// reached in one list, and its addresses are tried after them.
+async fn bind_any<L>(first: &[std::net::SocketAddr], later: Option<L>) -> tunnel::Walk<UdpSocket>
+where
+    L: std::future::Future<Output = Vec<std::net::SocketAddr>>,
+{
+    bind_any_with(first, later, net::connected_udp_socket).await
+}
+
+/// [`bind_any`] with the socket step supplied by the caller, so a test can
+/// stand in for a family that has no route.
+async fn bind_any_with<T, D, F, L>(
+    first: &[std::net::SocketAddr],
+    later: Option<L>,
+    dial: D,
+) -> tunnel::Walk<T>
+where
+    D: Fn(std::net::SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<T>>,
+    L: std::future::Future<Output = Vec<std::net::SocketAddr>>,
+{
+    const FAILED: &str = "could not open a socket to the target";
+
+    let failure = match tunnel::first_reachable(first, None, &dial, FAILED).await {
+        Ok(socket) => {
+            return tunnel::Walk {
+                result: Ok(socket),
+                waited: Duration::ZERO,
+                addresses: first.to_vec(),
+            };
+        }
+        Err(failure) => failure,
+    };
+
+    let mut addresses = first.to_vec();
+    let Some(later) = later else {
+        return tunnel::Walk {
+            result: Err(failure),
+            waited: Duration::ZERO,
+            addresses,
+        };
+    };
+    let (more, waited) = tunnel::timed(later).await;
+    let result = if more.is_empty() {
+        Err(failure)
+    } else {
+        tunnel::first_reachable(&more, None, &dial, FAILED).await
+    };
+    addresses.extend(more);
+
+    tunnel::Walk {
+        result,
+        waited,
         addresses,
-        None,
-        net::connected_udp_socket,
-        "could not open a socket to the target",
-    )
-    .await
+    }
 }
 
 /// Checks a CONNECT-UDP request against the rules that are about the message
@@ -1089,6 +1165,74 @@ mod tests {
 
     fn parse(path: &str) -> Result<(String, u16), &'static str> {
         parse_target(path, None)
+    }
+
+    /// Row 5 of D123: CONNECT-UDP opens its socket on the first address with
+    /// a route, as before. The other family is read only once every
+    /// preferred address has failed, and its address is then used.
+    ///
+    /// No slot is spare, so the stand-in shows whether the other family was
+    /// asked for at all, and the wait for it is lookup time.
+    #[tokio::test(start_paused = true)]
+    async fn udp_goes_on_to_the_other_family_only_when_every_preferred_address_fails() {
+        use crate::config::IpFamilyPreference;
+        use crate::net::Family;
+        use crate::tunnel::tests::family::{Answer, Lab, at, ms};
+
+        for has_ipv4_route in [true, false] {
+            let lab = Lab::new(
+                Answer::Addresses(ms(0), vec!["192.0.2.1"]),
+                Answer::Addresses(ms(30), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+            let _held = lab.budget.hold_shared();
+
+            let resolved = tunnel::resolve_within(
+                "example.test",
+                443,
+                &lab.resolver,
+                Some(ms(5_000)),
+                IpFamilyPreference::Ipv4,
+            )
+            .await
+            .expect("the name resolves");
+            let mut other = resolved
+                .other
+                .expect("the other family is still to be read");
+            let later = tunnel::later_addresses(
+                &mut other,
+                &lab.resolver,
+                <[std::net::SocketAddr]>::to_vec,
+            )
+            .addresses;
+
+            let walk = bind_any_with(&resolved.addresses, Some(later), |address| async move {
+                if address.is_ipv4() && !has_ipv4_route {
+                    Err(std::io::Error::from(std::io::ErrorKind::NetworkUnreachable))
+                } else {
+                    Ok(address)
+                }
+            })
+            .await;
+
+            let reached = match walk.result {
+                Ok(address) => address,
+                Err(failure) => panic!("no socket was opened: {}", failure.error),
+            };
+            if has_ipv4_route {
+                assert_eq!(reached, at("192.0.2.1"));
+                assert_eq!(lab.asked(), vec![(Some(Family::Ipv4), ms(0))]);
+                assert_eq!(walk.waited, Duration::ZERO);
+            } else {
+                assert_eq!(reached, at("2001:db8::1"));
+                assert_eq!(
+                    lab.asked(),
+                    vec![(Some(Family::Ipv4), ms(0)), (Some(Family::Ipv6), ms(0))]
+                );
+                assert_eq!(walk.waited, ms(30));
+                assert_eq!(walk.addresses, vec![at("192.0.2.1"), at("2001:db8::1")]);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

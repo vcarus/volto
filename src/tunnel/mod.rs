@@ -662,18 +662,41 @@ pub(crate) async fn timed<F: std::future::Future>(work: F) -> (F::Output, Durati
 /// A target [`admit_target`] let through.
 #[derive(Debug)]
 pub(crate) struct Admitted {
-    /// The addresses the tunnel may dial, in the order to try them. Never
-    /// empty.
+    /// The addresses the tunnel may dial first, in the order to try them:
+    /// those of the preferred family that passed the destination policy, or,
+    /// when none did, those of the other family that passed it. Never empty.
     pub(crate) addresses: Vec<std::net::SocketAddr>,
-    /// How long the name took to resolve: the wait for a lookup slot plus the
-    /// lookup ([`crate::net::ConnectionResolver::lookup`]). An IP literal asks
-    /// no resolver and reads zero. Each tunnel prints it as `resolve_ms` on
-    /// its established line.
+    /// The other family's lookup, when its answer has not been read yet. A
+    /// tunnel reads it only once every address above has failed, and its
+    /// addresses still have to pass the destination policy
+    /// ([`later_addresses`]). `None` for `system`, for an IP literal, and
+    /// when `addresses` already are the other family's.
+    pub(crate) later: Option<crate::net::OtherFamily>,
+    /// When the resolution budget runs out, or `None` when there is none.
+    pub(crate) deadline: Option<tokio::time::Instant>,
+    /// How long the tunnel waited on lookups so far: the wait for a lookup
+    /// slot plus the lookup ([`crate::net::ConnectionResolver::lookup`]), and
+    /// the other family's lookup when the policy left none of the first
+    /// family. An IP literal asks no resolver and reads zero. Each tunnel adds
+    /// any later wait for the other family and prints the sum as
+    /// `resolve_ms` on its established line.
     pub(crate) resolve: Duration,
 }
 
-/// Resolves `host`/`port`, giving the resolver at most `budget` and ordering the
-/// answer by `family`.
+/// What [`resolve_within`] found.
+#[derive(Debug)]
+pub(crate) struct Resolved {
+    /// The preferred family's addresses, or the other family's when the
+    /// preferred one gave none. Never empty.
+    pub(crate) addresses: Vec<std::net::SocketAddr>,
+    /// The other family's lookup, when `addresses` are the preferred family's.
+    pub(crate) other: Option<crate::net::OtherFamily>,
+    /// When the budget runs out, or `None` when there is none.
+    pub(crate) deadline: Option<tokio::time::Instant>,
+}
+
+/// Resolves `host`/`port`, giving the resolver at most `budget` and asking for
+/// the families in the order `family` gives.
 ///
 /// Bounded because the tunnel slot and the file descriptor it stands for are
 /// already held by the time this runs: a stub resolver whose nameserver has gone
@@ -681,21 +704,128 @@ pub(crate) struct Admitted {
 /// client cannot use for anything else. `None` leaves the wait to the resolver,
 /// which is what `connect_timeout = 0` asks for.
 ///
-/// The address-family ordering happens here, once, rather than in each tunnel
-/// (decision D58): this is the single point where a name becomes a list of
-/// addresses, and it sits before the destination policy filters that list and
-/// before either tunnel starts dialling it, so both kinds agree on which family
-/// is tried first without either having to remember to ask.
+/// The address-family preference is applied here, once, rather than in each
+/// tunnel (decision D58): this is the single point where a name becomes a list
+/// of addresses, and it sits before the destination policy filters that list
+/// and before either tunnel starts dialling it, so both kinds agree on which
+/// family is tried first without either having to remember to ask.
+///
+/// With `ipv4` or `ipv6` the preferred family is asked alone, and the answer
+/// is returned as soon as it has an address. The other family's lookup is
+/// started beside it when the connection has a lookup slot to spare, and
+/// otherwise only when a tunnel needs it (D123). RFC 8305 §3: "Implementations
+/// SHOULD NOT wait for both families of answers to return before attempting
+/// connection establishment." The slot rule and the lookup made only on demand
+/// are this server's own. When the preferred family gives no address, for any
+/// reason, the other family is asked before the name is refused, inside the
+/// same budget. When both fail, the failure reported is the first of the two
+/// that is not "no address in this family", the preferred family's first.
+///
+/// With `system` this is one lookup of both families, in the resolver's
+/// order, as before.
 pub(crate) async fn resolve_within(
     host: &str,
     port: u16,
     resolver: &crate::net::ConnectionResolver,
     budget: Option<Duration>,
     family: IpFamilyPreference,
+) -> Result<Resolved, ResolveFailure> {
+    let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
+
+    let Some(preferred) = crate::net::Family::preferred(family) else {
+        let mut addresses = within_budget(resolver.lookup(host, port), budget).await?;
+        crate::net::prefer_family(&mut addresses, family);
+        return Ok(Resolved {
+            addresses,
+            other: None,
+            deadline,
+        });
+    };
+
+    if let Some(address) = crate::net::literal(host, port) {
+        return Ok(Resolved {
+            addresses: vec![address],
+            other: None,
+            deadline,
+        });
+    }
+
+    let mut other = crate::net::OtherFamily::new(host, port, preferred.other());
+    let first = until_deadline(
+        resolver.lookup_family(host, port, preferred, &mut other),
+        deadline,
+        budget,
+    )
+    .await;
+    let first_failure = match first {
+        Ok(addresses) => {
+            return Ok(Resolved {
+                addresses,
+                other: Some(other),
+                deadline,
+            });
+        }
+        Err(failure) => failure,
+    };
+
+    match ask_other(&mut other, resolver, deadline, budget).await {
+        Ok(addresses) => Ok(Resolved {
+            addresses,
+            other: None,
+            deadline,
+        }),
+        Err(second_failure) => Err(reported(first_failure, second_failure)),
+    }
+}
+
+/// The failure reported when both families failed: the first of the two that
+/// is not "no address in this family", the preferred family's first.
+fn reported(first: ResolveFailure, second: ResolveFailure) -> ResolveFailure {
+    if first.is_no_data() && !second.is_no_data() {
+        second
+    } else {
+        first
+    }
+}
+
+/// The other family's answer, waited for until `deadline`.
+///
+/// A lookup that was never started is not started once the deadline has
+/// passed, because nothing would wait for its answer.
+async fn ask_other(
+    other: &mut crate::net::OtherFamily,
+    resolver: &crate::net::ConnectionResolver,
+    deadline: Option<tokio::time::Instant>,
+    budget: Option<Duration>,
 ) -> Result<Vec<std::net::SocketAddr>, ResolveFailure> {
-    let mut addresses = within_budget(resolver.lookup(host, port), budget).await?;
-    crate::net::prefer_family(&mut addresses, family);
-    Ok(addresses)
+    if let (Some(deadline), Some(budget)) = (deadline, budget)
+        && !other.is_started()
+        && tokio::time::Instant::now() >= deadline
+    {
+        return Err(ResolveFailure::TimedOut(budget));
+    }
+    until_deadline(other.addresses(resolver), deadline, budget).await
+}
+
+/// [`within_budget`] against a deadline taken earlier, so that two lookups
+/// share one budget. `budget` is what a timeout reports.
+async fn until_deadline<F>(
+    lookup: F,
+    deadline: Option<tokio::time::Instant>,
+    budget: Option<Duration>,
+) -> Result<Vec<std::net::SocketAddr>, ResolveFailure>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<std::net::SocketAddr>>>,
+{
+    let resolved = match deadline {
+        Some(deadline) => match tokio::time::timeout_at(deadline, lookup).await {
+            Ok(resolved) => resolved,
+            Err(_) => return Err(ResolveFailure::TimedOut(budget.unwrap_or_default())),
+        },
+        None => lookup.await,
+    };
+
+    resolved.map_err(ResolveFailure::Failed)
 }
 
 /// Applies a resolution budget to `lookup`.
@@ -760,37 +890,153 @@ where
     D: Fn(std::net::SocketAddr) -> F,
     F: std::future::Future<Output = std::io::Result<T>>,
 {
+    first_reachable_then(
+        addresses,
+        None::<Later<std::future::Ready<Vec<std::net::SocketAddr>>>>,
+        budget,
+        dial,
+        failed,
+    )
+    .await
+    .result
+}
+
+/// The other family's addresses, for a walk to go on to once the first
+/// addresses have failed.
+pub(crate) struct Later<L> {
+    /// Whether the lookup behind `addresses` is already running, so that
+    /// waiting for it beside an attempt starts nothing.
+    pub(crate) started: bool,
+    /// The addresses that passed the destination policy. Empty when the
+    /// lookup failed.
+    pub(crate) addresses: L,
+}
+
+/// What [`first_reachable_then`] did.
+pub(crate) struct Walk<T> {
+    /// The first address that answered, or the last failure.
+    pub(crate) result: Result<T, Unreachable>,
+    /// How long the walk waited for the other family's addresses with no
+    /// attempt in flight. This is lookup time, which a tunnel reports as
+    /// `resolve_ms` rather than as `connect_ms`.
+    pub(crate) waited: Duration,
+    /// Every address the walk knew of by the end, in the order it tries them.
+    pub(crate) addresses: Vec<std::net::SocketAddr>,
+}
+
+/// [`first_reachable`] over `first`, then over the other family's addresses
+/// that `later` gives.
+///
+/// The share of `budget` each attempt gets is the one [`first_reachable`]
+/// gives over both lists together, the other family counted as soon as its
+/// addresses are known. While they are not, an attempt is given the share
+/// that counts only the known ones, and the lookup is waited for beside it:
+/// when it gives addresses, the attempt's share becomes what the rule gives
+/// with them, counted from the moment the attempt started, and an attempt
+/// already past that share ends at once. Beside an earlier attempt the lookup
+/// is waited for only if it is already running. A lookup that never started,
+/// because the connection had no slot to spare, is started beside the last
+/// known address. Once every known address has failed, the walk waits for the
+/// lookup alone, inside the same budget. A lookup that fails or runs out of
+/// time adds no address, and the walk reports its last connect failure.
+pub(crate) async fn first_reachable_then<T, D, F, L>(
+    first: &[std::net::SocketAddr],
+    later: Option<Later<L>>,
+    budget: Option<Duration>,
+    dial: D,
+    failed: &'static str,
+) -> Walk<T>
+where
+    D: Fn(std::net::SocketAddr) -> F,
+    F: std::future::Future<Output = std::io::Result<T>>,
+    L: std::future::Future<Output = Vec<std::net::SocketAddr>>,
+{
     // Taken once, before the first attempt: every address draws on the same
     // budget.
     let deadline = budget.map(|budget| tokio::time::Instant::now() + budget);
+    let mut addresses = first.to_vec();
+    let (mut started, mut lookup) = match later {
+        Some(later) => (later.started, Some(Box::pin(later.addresses))),
+        None => (false, None),
+    };
+    let mut waited = Duration::ZERO;
     let mut last = None;
+    let mut tried = 0;
 
-    for (tried, address) in addresses.iter().enumerate() {
-        let attempt = dial(*address);
-
-        let result = match deadline {
-            Some(deadline) => {
-                let untried = u32::try_from(addresses.len() - tried).unwrap_or(u32::MAX);
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                let share = (remaining / untried).max(MIN_CONNECT_SHARE).min(remaining);
-                tokio::time::timeout(share, attempt)
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "the connect budget expired before the target answered",
-                        ))
-                    })
+    loop {
+        if tried == addresses.len() {
+            // Every known address has failed. What is left is the other
+            // family, and nothing else is in flight while the walk waits.
+            let Some(mut pending) = lookup.take() else {
+                break;
+            };
+            let (found, took) = timed(async {
+                match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, pending.as_mut())
+                        .await
+                        .unwrap_or_default(),
+                    None => pending.as_mut().await,
+                }
+            })
+            .await;
+            waited += took;
+            addresses.extend(found);
+            if tried == addresses.len()
+                || deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                break;
             }
-            None => attempt.await,
+            continue;
+        }
+
+        let address = addresses[tried];
+        let beside = lookup.is_some() && (started || tried + 1 == addresses.len());
+        let mut attempt = std::pin::pin!(dial(address));
+        let began = tokio::time::Instant::now();
+        let share_end = |untried: usize| {
+            deadline.map(|deadline| {
+                let untried = u32::try_from(untried).unwrap_or(u32::MAX);
+                let remaining = deadline.saturating_duration_since(began);
+                began + (remaining / untried).max(MIN_CONNECT_SHARE).min(remaining)
+            })
         };
+        let mut ends = share_end(addresses.len() - tried);
+
+        let result = loop {
+            tokio::select! {
+                biased;
+                result = &mut attempt => break result,
+                () = expiry(ends) => break Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the connect budget expired before the target answered",
+                )),
+                found = async {
+                    match lookup.as_mut() {
+                        Some(pending) => pending.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                }, if beside && lookup.is_some() => {
+                    lookup = None;
+                    started = true;
+                    addresses.extend(found);
+                    ends = share_end(addresses.len() - tried);
+                }
+            }
+        };
+        tried += 1;
 
         match result {
-            Ok(reached) => return Ok(reached),
+            Ok(reached) => {
+                return Walk {
+                    result: Ok(reached),
+                    waited,
+                    addresses,
+                };
+            }
             Err(error) => {
                 debug!(%address, %error, "{failed}");
                 last = Some(Unreachable {
-                    next_hop: Some(*address),
+                    next_hop: Some(address),
                     error,
                 });
             }
@@ -803,7 +1049,40 @@ where
         }
     }
 
-    Err(last.unwrap_or_else(Unreachable::no_addresses))
+    Walk {
+        result: Err(last.unwrap_or_else(Unreachable::no_addresses)),
+        waited,
+        addresses,
+    }
+}
+
+/// Waits until `at`, or for ever when it is `None`.
+async fn expiry(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The other family's addresses that pass the destination policy, for a
+/// tunnel whose first addresses have all failed.
+///
+/// The lookup was started at resolution, or is started now if the connection
+/// had no slot to spare then. A lookup that fails gives no address.
+pub(crate) fn later_addresses<'a>(
+    other: &'a mut crate::net::OtherFamily,
+    resolver: &'a crate::net::ConnectionResolver,
+    usable: impl Fn(&[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> + 'a,
+) -> Later<impl std::future::Future<Output = Vec<std::net::SocketAddr>> + 'a> {
+    Later {
+        started: other.is_started(),
+        addresses: async move {
+            match other.addresses(resolver).await {
+                Ok(addresses) => usable(&addresses),
+                Err(_) => Vec::new(),
+            }
+        },
+    }
 }
 
 /// Whether a resolved address is one of this proxy's own.
@@ -917,7 +1196,8 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 /// the request itself when there are none it may use.
 ///
 /// `Some` carries a non-empty, policy-filtered, family-ordered list, ready for
-/// the caller to dial, and the time the resolution took ([`Admitted`]). `None`
+/// the caller to dial, the other family's lookup when it is still to be read,
+/// and the time the resolution took ([`Admitted`]). `None`
 /// means the request has **already been answered** (with a 403, a 502, a 504,
 /// or the 200 that closes on the spot), and the caller has nothing left to do
 /// but return.
@@ -932,12 +1212,15 @@ fn own_address_probes(address: std::net::SocketAddr) -> Vec<std::net::SocketAddr
 ///   asked anything: a denied port cannot be used to make the proxy run lookups.
 /// * Resolution is explicit, rather than left to the connect call, so the
 ///   addresses are visible to the policy below. [`resolve_within`] bounds it and
-///   orders the answer by family. A resolver failure is not the client's fault
+///   asks for the families in the preferred order. A resolver failure is not the client's fault
 ///   (decision D9), so it is a 502 with the RFC 9209 reason rather than a 400,
 ///   and a resolver that never answered is a 504 `dns_timeout` instead.
 /// * A name resolving to a mix of public and private addresses keeps only the
 ///   public ones, so DNS rebinding onto loopback gains nothing. What survives
-///   that filter is then asked [`is_the_proxys_own`].
+///   that filter is then asked [`is_the_proxys_own`]. When no address of the
+///   preferred family survives, the other family is read and filtered before
+///   anything is decided, so what follows is judged on both families together
+///   ([`judge`]).
 ///
 /// Nothing left after that filter splits two ways (decision D49). A name whose
 /// every address is the unspecified one was blocked by a filtering resolver
@@ -971,26 +1254,76 @@ pub(crate) async fn admit_target(
         return None;
     }
 
-    let (resolved, resolve) = timed(resolve_within(
+    let (judged, resolve) = judge(
         host,
         port,
         &ctx.resolver,
         ctx.connect_timeout,
         ctx.ip_family_preference,
-    ))
+        |addresses| usable_addresses(ctx, stream_id, host, port, addresses),
+    )
     .await;
-    let addresses = match resolved {
-        Ok(addresses) => addresses,
-        Err(failure) => {
+
+    match judged {
+        Judged::Admitted(admitted) => Some(admitted),
+        Judged::Unresolved(failure) => {
             let error = failure.proxy_error();
             ctx.failed_setups.resolve(resolve);
             debug!(stream_id, host, port, reason = %failure, "failed to resolve target");
             refuse_because(stream, error).await;
-            return None;
+            None
         }
-    };
+        Judged::Blackhole(addresses) => {
+            info!(
+                log_id = "t9hu0cd2",
+                stream_id,
+                host,
+                port,
+                addresses = %crate::logfmt::addresses(&addresses),
+                "every address of the target is a DNS blackhole"
+            );
+            accept_then_close(stream, accepted_fields()).await;
+            None
+        }
+        Judged::Prohibited(addresses) => {
+            // INFO on a doubling schedule rather than every time, for the
+            // reason [`Context::policy_refusals`] gives.
+            match ctx.policy_refusals.record() {
+                Some(refusals) => info!(
+                    log_id = "ucmaf4w6",
+                    stream_id,
+                    host,
+                    port,
+                    addresses = %crate::logfmt::addresses(&addresses),
+                    refusals,
+                    "every address of the target is prohibited by policy; further refusals on \
+                     this connection are logged at debug level until the count doubles"
+                ),
+                None => debug!(
+                    stream_id,
+                    host,
+                    port,
+                    addresses = %crate::logfmt::addresses(&addresses),
+                    "every address of the target is prohibited by policy"
+                ),
+            }
+            refuse_because(stream, ProxyError::DestinationIpProhibited).await;
+            None
+        }
+    }
+}
 
-    let mut allowed = ctx.generation.policy.allowed_addresses(&addresses);
+/// The addresses of `addresses` the destination policy lets a tunnel dial,
+/// in the same order: the ones [`Policy`] allows that are not
+/// [`is_the_proxys_own`].
+pub(crate) fn usable_addresses(
+    ctx: &Context,
+    stream_id: u64,
+    host: &str,
+    port: u16,
+    addresses: &[std::net::SocketAddr],
+) -> Vec<std::net::SocketAddr> {
+    let mut allowed = ctx.generation.policy.allowed_addresses(addresses);
     let judged = allowed.len();
     allowed.retain(|address| !is_the_proxys_own(*address));
     if allowed.len() < judged {
@@ -1002,50 +1335,82 @@ pub(crate) async fn admit_target(
             "refused an address this host holds as one of the proxy's own"
         );
     }
+    allowed
+}
 
-    if allowed.is_empty() {
-        if policy::is_dns_blackhole(&addresses) {
-            info!(
-                log_id = "t9hu0cd2",
-                stream_id,
-                host,
-                port,
-                addresses = %crate::logfmt::addresses(&addresses),
-                "every address of the target is a DNS blackhole"
-            );
-            accept_then_close(stream, accepted_fields()).await;
-            return None;
-        }
+/// What [`judge`] decided about a target.
+#[derive(Debug)]
+enum Judged {
+    /// The tunnel may dial it.
+    Admitted(Admitted),
+    /// The name did not resolve.
+    Unresolved(ResolveFailure),
+    /// Every address, of both families, is the unspecified one.
+    Blackhole(Vec<std::net::SocketAddr>),
+    /// No address passed the policy. These are all of them, of both families.
+    Prohibited(Vec<std::net::SocketAddr>),
+}
 
-        // INFO on a doubling schedule rather than every time, for the reason
-        // [`Context::policy_refusals`] gives.
-        match ctx.policy_refusals.record() {
-            Some(refusals) => info!(
-                log_id = "ucmaf4w6",
-                stream_id,
-                host,
-                port,
-                addresses = %crate::logfmt::addresses(&addresses),
-                refusals,
-                "every address of the target is prohibited by policy; further refusals on \
-                 this connection are logged at debug level until the count doubles"
-            ),
-            None => debug!(
-                stream_id,
-                host,
-                port,
-                addresses = %crate::logfmt::addresses(&addresses),
-                "every address of the target is prohibited by policy"
-            ),
-        }
-        refuse_because(stream, ProxyError::DestinationIpProhibited).await;
-        return None;
+/// Resolves a target and applies `usable`, the destination policy, to what
+/// it resolved to, with the time spent waiting on lookups.
+///
+/// The preferred family is judged first. When none of its addresses passes,
+/// the other family is read before anything is decided, so the request is
+/// answered as it would be with both families in one list: the other family's
+/// usable addresses if it has any, and otherwise the blackhole or refusal
+/// judged on both families together. The other family's lookup failing here
+/// counts as no address, inside the resolution budget.
+async fn judge(
+    host: &str,
+    port: u16,
+    resolver: &crate::net::ConnectionResolver,
+    budget: Option<Duration>,
+    family: IpFamilyPreference,
+    usable: impl Fn(&[std::net::SocketAddr]) -> Vec<std::net::SocketAddr>,
+) -> (Judged, Duration) {
+    let (resolved, mut resolve) = timed(resolve_within(host, port, resolver, budget, family)).await;
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(failure) => return (Judged::Unresolved(failure), resolve),
+    };
+
+    let allowed = usable(&resolved.addresses);
+    if !allowed.is_empty() {
+        return (
+            Judged::Admitted(Admitted {
+                addresses: allowed,
+                later: resolved.other,
+                deadline: resolved.deadline,
+                resolve,
+            }),
+            resolve,
+        );
     }
 
-    Some(Admitted {
-        addresses: allowed,
-        resolve,
-    })
+    let mut addresses = resolved.addresses;
+    let mut allowed = Vec::new();
+    if let Some(mut other) = resolved.other {
+        let (found, took) = timed(ask_other(&mut other, resolver, resolved.deadline, budget)).await;
+        resolve += took;
+        if let Ok(found) = found {
+            allowed = usable(&found);
+            addresses.extend(found);
+        }
+    }
+
+    let judged = if !allowed.is_empty() {
+        Judged::Admitted(Admitted {
+            addresses: allowed,
+            later: None,
+            deadline: resolved.deadline,
+            resolve,
+        })
+    } else if policy::is_dns_blackhole(&addresses) {
+        Judged::Blackhole(addresses)
+    } else {
+        Judged::Prohibited(addresses)
+    };
+    (judged, resolve)
 }
 
 #[cfg(test)]
@@ -1576,5 +1941,613 @@ mod tests {
         .await
         .expect_err("a lookup that fails must fail");
         assert_eq!(failure.proxy_error(), ProxyError::DnsError);
+    }
+
+    /// The address family preference end to end below the stream: which
+    /// lookups ran, when, and which addresses were dialled when (D123).
+    ///
+    /// A stand-in takes the place of `getaddrinfo` behind the real lookup
+    /// budget, and answers each family after a delay on tokio's paused
+    /// clock. The tunnels' own composition is used: [`judge`], then
+    /// [`first_reachable_then`] with [`later_addresses`], as
+    /// [`super::tcp`] calls them.
+    pub(crate) mod family {
+        use super::*;
+        use crate::net::{ConnectionResolver, Family, ResolverBudget, StandIn};
+        use std::cell::RefCell;
+        use std::net::{IpAddr, SocketAddr};
+        use std::rc::Rc;
+        use tokio::time::Instant;
+
+        /// What the stand-in answers for one family, and after how long.
+        #[derive(Clone, Debug)]
+        pub(crate) enum Answer {
+            Addresses(Duration, Vec<&'static str>),
+            /// The name exists and has no address of this family.
+            NoData(Duration),
+            /// A failure that is not "no data", such as NXDOMAIN.
+            Fails(Duration, &'static str),
+            Never,
+        }
+
+        /// What a dialled address does.
+        #[derive(Clone, Copy, Debug)]
+        pub(crate) enum Dial {
+            Connects(Duration),
+            Refuses(Duration),
+            Silent,
+        }
+
+        pub(crate) fn ms(millis: u64) -> Duration {
+            Duration::from_millis(millis)
+        }
+
+        pub(crate) fn at(address: &str) -> SocketAddr {
+            SocketAddr::new(address.parse().expect("address"), 443)
+        }
+
+        type Asked = Arc<Mutex<Vec<(Option<Family>, Duration)>>>;
+
+        /// One connection's resolver with a stand-in behind it.
+        pub(crate) struct Lab {
+            pub(crate) budget: ResolverBudget,
+            pub(crate) resolver: ConnectionResolver,
+            asked: Asked,
+            start: Instant,
+            dialled: Rc<RefCell<Vec<(SocketAddr, Duration)>>>,
+        }
+
+        impl Lab {
+            /// A stand-in answering A with `v4`, AAAA with `v6` and an
+            /// unhinted lookup with `both`.
+            pub(crate) fn new(v4: Answer, v6: Answer, both: Answer) -> Self {
+                let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
+                let asked = Asked::default();
+                let start = Instant::now();
+                let record = asked.clone();
+                let stand_in: StandIn = Arc::new(move |_host, family| {
+                    record.lock().unwrap().push((family, start.elapsed()));
+                    let answer = match family {
+                        Some(Family::Ipv4) => v4.clone(),
+                        Some(Family::Ipv6) => v6.clone(),
+                        None => both.clone(),
+                    };
+                    Box::pin(async move {
+                        match answer {
+                            Answer::Addresses(after, addresses) => {
+                                tokio::time::sleep(after).await;
+                                Ok(addresses
+                                    .iter()
+                                    .map(|address| address.parse::<IpAddr>().unwrap())
+                                    .collect())
+                            }
+                            // An answer with no address is what the lookup
+                            // turns into "no data".
+                            Answer::NoData(after) => {
+                                tokio::time::sleep(after).await;
+                                Ok(Vec::new())
+                            }
+                            Answer::Fails(after, text) => {
+                                tokio::time::sleep(after).await;
+                                Err(std::io::Error::other(text))
+                            }
+                            Answer::Never => std::future::pending().await,
+                        }
+                    })
+                });
+                Self {
+                    resolver: budget.per_connection_with(stand_in),
+                    budget,
+                    asked,
+                    start,
+                    dialled: Rc::default(),
+                }
+            }
+
+            /// The lookups the stand-in was asked for, with when.
+            pub(crate) fn asked(&self) -> Vec<(Option<Family>, Duration)> {
+                self.asked.lock().unwrap().clone()
+            }
+
+            /// The addresses dialled, with when.
+            pub(crate) fn dialled(&self) -> Vec<(SocketAddr, Duration)> {
+                self.dialled.borrow().clone()
+            }
+
+            pub(crate) fn now(&self) -> Duration {
+                self.start.elapsed()
+            }
+
+            /// A dial step that records each address and then does what
+            /// `plan` says for it. It yields the address it reached.
+            pub(crate) fn dialler(
+                &self,
+                plan: impl Fn(SocketAddr) -> Dial,
+            ) -> impl Fn(
+                SocketAddr,
+            ) -> std::pin::Pin<
+                Box<dyn Future<Output = std::io::Result<SocketAddr>>>,
+            > {
+                let dialled = self.dialled.clone();
+                let start = self.start;
+                move |address| {
+                    dialled.borrow_mut().push((address, start.elapsed()));
+                    let dial = plan(address);
+                    Box::pin(async move {
+                        match dial {
+                            Dial::Connects(after) => {
+                                tokio::time::sleep(after).await;
+                                Ok(address)
+                            }
+                            Dial::Refuses(after) => {
+                                tokio::time::sleep(after).await;
+                                Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                            }
+                            Dial::Silent => std::future::pending().await,
+                        }
+                    })
+                }
+            }
+
+            /// [`judge`] for `example.test:443`, with a policy that allows
+            /// every address `allowed` says it does.
+            pub(crate) async fn judge(
+                &self,
+                preference: IpFamilyPreference,
+                budget: Option<Duration>,
+                allowed: fn(&SocketAddr) -> bool,
+            ) -> (Judged, Duration) {
+                judge(
+                    "example.test",
+                    443,
+                    &self.resolver,
+                    budget,
+                    preference,
+                    |addresses| addresses.iter().copied().filter(allowed).collect(),
+                )
+                .await
+            }
+
+            /// A TCP tunnel's setup: [`judge`] with every address allowed,
+            /// then the walk with the other family behind it.
+            pub(crate) async fn tcp(
+                &self,
+                preference: IpFamilyPreference,
+                budget: Option<Duration>,
+                plan: impl Fn(SocketAddr) -> Dial,
+            ) -> (Walk<SocketAddr>, Duration) {
+                let (judged, resolve) = self.judge(preference, budget, |_| true).await;
+                let Judged::Admitted(Admitted {
+                    addresses,
+                    mut later,
+                    ..
+                }) = judged
+                else {
+                    panic!("the target was not admitted: {judged:?}");
+                };
+                let later = later
+                    .as_mut()
+                    .map(|other| later_addresses(other, &self.resolver, <[SocketAddr]>::to_vec));
+                let walk =
+                    first_reachable_then(&addresses, later, budget, self.dialler(&plan), "test")
+                        .await;
+                (walk, resolve)
+            }
+        }
+
+        /// The address a walk reached, or a panic naming its failure.
+        fn reached(walk: Walk<SocketAddr>) -> SocketAddr {
+            match walk.result {
+                Ok(address) => address,
+                Err(failure) => panic!("nothing was reached: {}", failure.error),
+            }
+        }
+
+        fn v4() -> Option<Family> {
+            Some(Family::Ipv4)
+        }
+
+        fn v6() -> Option<Family> {
+            Some(Family::Ipv6)
+        }
+
+        /// Row 1: a name with both families whose preferred address connects
+        /// waits for the preferred answer and not for the other one.
+        #[tokio::test(start_paused = true)]
+        async fn both_families_the_preferred_one_connects_without_the_other_answer() {
+            let lab = Lab::new(
+                Answer::Addresses(ms(10), vec!["192.0.2.1"]),
+                Answer::Addresses(ms(500), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+
+            let (walk, resolve) = lab
+                .tcp(IpFamilyPreference::Ipv4, Some(ms(10_000)), |_| {
+                    Dial::Connects(ms(5))
+                })
+                .await;
+
+            assert_eq!(reached(walk), at("192.0.2.1"));
+            assert_eq!(lab.asked(), vec![(v4(), ms(0)), (v6(), ms(0))]);
+            assert_eq!(lab.dialled(), vec![(at("192.0.2.1"), ms(10))]);
+            assert_eq!(resolve, ms(10));
+            assert_eq!(lab.now(), ms(15), "the tunnel waited for the AAAA answer");
+        }
+
+        /// Row 2: a name with the preferred family only waits for that
+        /// family's answer, however long the other takes to say it has none.
+        #[tokio::test(start_paused = true)]
+        async fn the_preferred_family_only_waits_for_the_preferred_answer() {
+            let lab = Lab::new(
+                Answer::NoData(ms(300)),
+                Answer::Addresses(ms(10), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+
+            let (walk, resolve) = lab
+                .tcp(IpFamilyPreference::Ipv6, Some(ms(10_000)), |_| {
+                    Dial::Connects(ms(0))
+                })
+                .await;
+
+            assert_eq!(reached(walk), at("2001:db8::1"));
+            assert_eq!(lab.asked(), vec![(v6(), ms(0)), (v4(), ms(0))]);
+            assert_eq!(lab.dialled(), vec![(at("2001:db8::1"), ms(10))]);
+            assert_eq!(resolve, ms(10));
+        }
+
+        /// Row 3: a name with the other family only is dialled on that
+        /// family once it answers. Both lookups ran at once, so the wait is
+        /// the longer of the two and not their sum.
+        #[tokio::test(start_paused = true)]
+        async fn the_other_family_only_is_dialled_once_it_answers() {
+            let lab = Lab::new(
+                Answer::NoData(ms(20)),
+                Answer::Addresses(ms(50), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+
+            let (walk, resolve) = lab
+                .tcp(IpFamilyPreference::Ipv4, Some(ms(10_000)), |_| {
+                    Dial::Connects(ms(0))
+                })
+                .await;
+
+            assert_eq!(reached(walk), at("2001:db8::1"));
+            assert_eq!(lab.asked(), vec![(v4(), ms(0)), (v6(), ms(0))]);
+            assert_eq!(lab.dialled(), vec![(at("2001:db8::1"), ms(50))]);
+            assert_eq!(resolve, ms(50));
+        }
+
+        /// Added row: with the shared allowance used up the other family's
+        /// lookup is not started beside the preferred one, and a name with
+        /// only the other family still resolves, one lookup later.
+        #[tokio::test(start_paused = true)]
+        async fn without_a_spare_slot_a_name_with_only_the_other_family_still_resolves() {
+            let lab = Lab::new(
+                Answer::NoData(ms(20)),
+                Answer::Addresses(ms(30), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+            let _held = lab.budget.hold_shared();
+
+            let (walk, resolve) = lab
+                .tcp(IpFamilyPreference::Ipv4, Some(ms(10_000)), |_| {
+                    Dial::Connects(ms(0))
+                })
+                .await;
+
+            assert_eq!(reached(walk), at("2001:db8::1"));
+            assert_eq!(lab.asked(), vec![(v4(), ms(0)), (v6(), ms(20))]);
+            assert_eq!(lab.dialled(), vec![(at("2001:db8::1"), ms(50))]);
+            assert_eq!(resolve, ms(50));
+        }
+
+        /// Row 4: when every preferred address fails, the walk goes on to the
+        /// other family inside the same budget, and every attempt gives up
+        /// when it would have with both families in one list.
+        ///
+        /// The reference is [`first_reachable`] over the four addresses known
+        /// from the start, on the same paused clock.
+        #[tokio::test(start_paused = true)]
+        async fn every_preferred_address_failing_keeps_the_shares_of_one_list() {
+            let budget = Some(ms(12_000));
+            let reference = Lab::new(Answer::Never, Answer::Never, Answer::Never);
+            let failure = first_reachable(
+                &[
+                    at("192.0.2.1"),
+                    at("192.0.2.2"),
+                    at("2001:db8::1"),
+                    at("2001:db8::2"),
+                ],
+                budget,
+                reference.dialler(|_| Dial::Silent),
+                "test",
+            )
+            .await
+            .expect_err("nothing answers");
+            assert_eq!(failure.next_hop, Some(at("2001:db8::2")));
+
+            let lab = Lab::new(
+                Answer::Addresses(ms(0), vec!["192.0.2.1", "192.0.2.2"]),
+                Answer::Addresses(ms(1_000), vec!["2001:db8::1", "2001:db8::2"]),
+                Answer::Never,
+            );
+            let (walk, resolve) = lab
+                .tcp(IpFamilyPreference::Ipv4, budget, |_| Dial::Silent)
+                .await;
+
+            assert_eq!(lab.dialled(), reference.dialled());
+            assert_eq!(
+                lab.dialled()
+                    .iter()
+                    .map(|(_, when)| *when)
+                    .collect::<Vec<_>>(),
+                vec![ms(0), ms(3_000), ms(6_000), ms(9_000)]
+            );
+            let failure = walk.result.expect_err("nothing answers");
+            assert_eq!(failure.error.kind(), std::io::ErrorKind::TimedOut);
+            assert_eq!(failure.next_hop, Some(at("2001:db8::2")));
+            assert_eq!(lab.now(), ms(12_000));
+            assert_eq!((resolve, walk.waited), (ms(0), ms(0)));
+        }
+
+        /// Row 4 without a spare slot: the other family's lookup is started
+        /// beside the last preferred address, on a slot taken the normal
+        /// way, and that attempt's share becomes what the rule gives with the
+        /// addresses it brings.
+        ///
+        /// The first address had a share of half the budget, because the
+        /// other family was not known yet. From the second address on, each
+        /// share is the one-list rule's: six seconds left over three
+        /// addresses is two, raised to the three-second floor.
+        #[tokio::test(start_paused = true)]
+        async fn a_lookup_never_started_is_asked_beside_the_last_preferred_address() {
+            let lab = Lab::new(
+                Answer::Addresses(ms(0), vec!["192.0.2.1", "192.0.2.2"]),
+                Answer::Addresses(ms(1_000), vec!["2001:db8::1", "2001:db8::2"]),
+                Answer::Never,
+            );
+            let _held = lab.budget.hold_shared();
+
+            let (walk, _) = lab
+                .tcp(IpFamilyPreference::Ipv4, Some(ms(12_000)), |_| Dial::Silent)
+                .await;
+
+            assert_eq!(lab.asked(), vec![(v4(), ms(0)), (v6(), ms(6_000))]);
+            assert_eq!(
+                lab.dialled(),
+                vec![
+                    (at("192.0.2.1"), ms(0)),
+                    (at("192.0.2.2"), ms(6_000)),
+                    (at("2001:db8::1"), ms(9_000)),
+                ]
+            );
+            let failure = walk.result.expect_err("nothing answers");
+            assert_eq!(failure.next_hop, Some(at("2001:db8::1")));
+            assert_eq!(lab.now(), ms(12_000));
+        }
+
+        /// Row 4 when the other family gives nothing: a lookup that fails,
+        /// or one that runs out of the budget, adds no address, and the
+        /// tunnel reports its last connect failure. The time spent waiting
+        /// for that lookup alone is lookup time.
+        #[tokio::test(start_paused = true)]
+        async fn a_second_lookup_that_gives_nothing_leaves_the_last_connect_failure() {
+            for (v6_answer, waited) in [
+                (Answer::Fails(ms(2_000), "Name does not resolve"), ms(1_900)),
+                (Answer::Never, ms(9_900)),
+            ] {
+                let lab = Lab::new(
+                    Answer::Addresses(ms(0), vec!["192.0.2.1"]),
+                    v6_answer.clone(),
+                    Answer::Never,
+                );
+
+                let (walk, _) = lab
+                    .tcp(IpFamilyPreference::Ipv4, Some(ms(10_000)), |_| {
+                        Dial::Refuses(ms(100))
+                    })
+                    .await;
+
+                let failure = walk.result.expect_err("the only address refuses");
+                assert_eq!(
+                    failure.error.kind(),
+                    std::io::ErrorKind::ConnectionRefused,
+                    "{v6_answer:?}"
+                );
+                assert_eq!(failure.next_hop, Some(at("192.0.2.1")), "{v6_answer:?}");
+                assert_eq!(walk.waited, waited, "{v6_answer:?}");
+                assert_eq!(lab.dialled(), vec![(at("192.0.2.1"), ms(0))]);
+            }
+        }
+
+        /// Row 6: an IP literal of either family asks no resolver under any
+        /// preference, and has no other family behind it.
+        #[tokio::test(start_paused = true)]
+        async fn an_ip_literal_asks_no_resolver_whatever_its_family() {
+            let lab = Lab::new(Answer::Never, Answer::Never, Answer::Never);
+            for preference in [
+                IpFamilyPreference::Ipv4,
+                IpFamilyPreference::Ipv6,
+                IpFamilyPreference::System,
+            ] {
+                for literal in ["192.0.2.1", "2001:db8::1"] {
+                    let resolved =
+                        resolve_within(literal, 443, &lab.resolver, Some(ms(10)), preference)
+                            .await
+                            .expect("a literal resolves");
+                    assert_eq!(resolved.addresses, vec![at(literal)], "{preference:?}");
+                    assert!(resolved.other.is_none(), "{preference:?} {literal}");
+                }
+            }
+            assert!(lab.asked().is_empty(), "{:?}", lab.asked());
+        }
+
+        /// `system` is one lookup of both families, in the resolver's order.
+        #[tokio::test(start_paused = true)]
+        async fn the_system_preference_is_one_lookup_of_both_families() {
+            let lab = Lab::new(
+                Answer::Never,
+                Answer::Never,
+                Answer::Addresses(ms(10), vec!["2001:db8::1", "192.0.2.1"]),
+            );
+
+            let resolved = resolve_within(
+                "example.test",
+                443,
+                &lab.resolver,
+                Some(ms(10_000)),
+                IpFamilyPreference::System,
+            )
+            .await
+            .expect("the name resolves");
+
+            assert_eq!(resolved.addresses, vec![at("2001:db8::1"), at("192.0.2.1")]);
+            assert!(resolved.other.is_none());
+            assert_eq!(lab.asked(), vec![(None, ms(0))]);
+        }
+
+        /// When both families fail, the failure reported is the first of the
+        /// two that is not "no data", the preferred family's first, so the
+        /// status is the one a single lookup of both families gives.
+        #[tokio::test(start_paused = true)]
+        async fn when_both_families_fail_the_first_failure_that_is_not_no_data_is_reported() {
+            let budget = ms(5_000);
+            for (v4_answer, v6_answer, expected) in [
+                (
+                    Answer::NoData(ms(10)),
+                    Answer::Fails(ms(20), "the AAAA failure"),
+                    Some("the AAAA failure"),
+                ),
+                (
+                    Answer::Fails(ms(10), "the A failure"),
+                    Answer::NoData(ms(20)),
+                    Some("the A failure"),
+                ),
+                (
+                    Answer::Fails(ms(10), "the A failure"),
+                    Answer::Fails(ms(20), "the AAAA failure"),
+                    Some("the A failure"),
+                ),
+                (Answer::NoData(ms(10)), Answer::NoData(ms(20)), Some("")),
+                (Answer::Never, Answer::NoData(ms(20)), None),
+                (Answer::NoData(ms(10)), Answer::Never, None),
+            ] {
+                let lab = Lab::new(v4_answer.clone(), v6_answer.clone(), Answer::Never);
+                let failure = resolve_within(
+                    "example.test",
+                    443,
+                    &lab.resolver,
+                    Some(budget),
+                    IpFamilyPreference::Ipv4,
+                )
+                .await
+                .expect_err("neither family has an address");
+
+                let case = format!("{v4_answer:?} then {v6_answer:?}: {failure}");
+                match expected {
+                    None => assert_matches!(failure, ResolveFailure::TimedOut(_), "{case}"),
+                    // Both "no data": the preferred family's, which names
+                    // the name and says it resolved to nothing.
+                    Some("") => {
+                        assert!(failure.is_no_data(), "{case}");
+                        assert_eq!(failure.proxy_error(), ProxyError::DnsError, "{case}");
+                    }
+                    Some(text) => assert_eq!(failure.to_string(), text, "{case}"),
+                }
+            }
+        }
+
+        /// A preferred lookup that never answers within the budget does not
+        /// refuse a name whose other family did answer.
+        #[tokio::test(start_paused = true)]
+        async fn a_preferred_lookup_that_times_out_is_served_by_the_other_family() {
+            let lab = Lab::new(
+                Answer::Never,
+                Answer::Addresses(ms(10), vec!["2001:db8::1"]),
+                Answer::Never,
+            );
+
+            let resolved = resolve_within(
+                "example.test",
+                443,
+                &lab.resolver,
+                Some(ms(5_000)),
+                IpFamilyPreference::Ipv4,
+            )
+            .await
+            .expect("the other family answered");
+
+            assert_eq!(resolved.addresses, vec![at("2001:db8::1")]);
+            assert_eq!(lab.now(), ms(5_000));
+        }
+
+        /// The destination policy sees both families before it refuses: an
+        /// address of the other family that passes is admitted, and the
+        /// blackhole check and the refusal are judged on both families
+        /// together, as on one list.
+        #[tokio::test(start_paused = true)]
+        async fn the_blackhole_and_the_refusal_are_judged_on_both_families() {
+            // Unspecified, loopback and RFC 1918 refused, the rest allowed.
+            fn allowed(address: &SocketAddr) -> bool {
+                let ip = address.ip();
+                !ip.is_unspecified()
+                    && !ip.is_loopback()
+                    && !matches!(ip, IpAddr::V4(v4) if v4.is_private())
+            }
+
+            let cases: [(Answer, Answer, &str, Vec<SocketAddr>); 5] = [
+                (
+                    Answer::Addresses(ms(10), vec!["0.0.0.0"]),
+                    Answer::Addresses(ms(20), vec!["::"]),
+                    "blackhole",
+                    vec![at("0.0.0.0"), at("::")],
+                ),
+                (
+                    Answer::Addresses(ms(10), vec!["0.0.0.0"]),
+                    Answer::NoData(ms(20)),
+                    "blackhole",
+                    vec![at("0.0.0.0")],
+                ),
+                (
+                    Answer::Addresses(ms(10), vec!["0.0.0.0"]),
+                    Answer::Addresses(ms(20), vec!["::1"]),
+                    "prohibited",
+                    vec![at("0.0.0.0"), at("::1")],
+                ),
+                (
+                    Answer::Addresses(ms(10), vec!["10.0.0.1"]),
+                    Answer::Addresses(ms(20), vec!["2001:db8::1"]),
+                    "admitted",
+                    vec![at("2001:db8::1")],
+                ),
+                (
+                    Answer::Addresses(ms(10), vec!["0.0.0.0", "192.0.2.1"]),
+                    Answer::Addresses(ms(20), vec!["::"]),
+                    "admitted",
+                    vec![at("192.0.2.1")],
+                ),
+            ];
+
+            for (v4_answer, v6_answer, expected, addresses) in cases {
+                let lab = Lab::new(v4_answer.clone(), v6_answer.clone(), Answer::Never);
+                let (judged, _) = lab
+                    .judge(IpFamilyPreference::Ipv4, Some(ms(5_000)), allowed)
+                    .await;
+
+                let case = format!("{v4_answer:?} then {v6_answer:?}: {judged:?}");
+                match (expected, judged) {
+                    ("blackhole", Judged::Blackhole(seen))
+                    | ("prohibited", Judged::Prohibited(seen)) => {
+                        assert_eq!(seen, addresses, "{case}");
+                    }
+                    ("admitted", Judged::Admitted(admitted)) => {
+                        assert_eq!(admitted.addresses, addresses, "{case}");
+                    }
+                    _ => panic!("expected {expected}, {case}"),
+                }
+            }
+        }
     }
 }

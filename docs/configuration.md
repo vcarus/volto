@@ -652,6 +652,12 @@ be shaped through `gai.conf`. The ordering is a stable partition, so whatever
 RFC 6724 decided *within* a family still stands; a target that resolves to one
 family, an IP literal above all, is unaffected by any of the three.
 
+With `ipv4` or `ipv6`, volto looks a name up in the preferred family first. It
+looks the other family up at the same time when the server has a lookup slot to
+spare, and otherwise only when that family is needed. A tunnel does not wait for
+the other family's answer while it still has a preferred address to try. With
+`system`, both families come from one lookup.
+
 ## `[security]`
 
 | Key | Type | Default | Meaning |
