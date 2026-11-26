@@ -3,13 +3,13 @@
 //! has claimed its Quarter Stream ID (D79, D114).
 //!
 //! This is the datagram surface a peer reaches before any request has
-//! authenticated. The routing state lives in the connection's `Shared`; the
-//! methods that read and write it are here.
+//! authenticated. The routing state and the methods that read and write it
+//! are both here, in `Router`. The connection's shared state holds one.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -19,13 +19,12 @@ use tracing::debug;
 
 use crate::datagram;
 
-use super::connection::Shared;
 use super::error::{Code, Violation};
 
-/// Which way an inbound HTTP Datagram was dropped, and so which of [`Shared`]'s
+/// Which way an inbound HTTP Datagram was dropped, and so which of [`Router`]'s
 /// four samplers keeps its schedule.
 ///
-/// Naming the shape rather than passing [`Shared::count_drop`] one of its own
+/// Naming the shape rather than passing [`Router::count_drop`] one of its own
 /// fields keeps the choice of sampler in one place. A fifth shape then fails to
 /// compile until it has a sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +40,66 @@ enum DropKind {
     Malformed,
 }
 
-impl Shared {
+/// One connection's routing of inbound HTTP Datagrams: the routing table, the
+/// hold, and the count of what was dropped.
+///
+/// The connection's shared state holds it in an `Arc`, and so does every
+/// [`DatagramReceiver`], which takes its own entry out of the table when it is
+/// dropped.
+#[derive(Default)]
+pub(super) struct Router {
+    /// Where an inbound HTTP Datagram goes, and the datagrams held for a
+    /// session that has not claimed its Quarter Stream ID yet.
+    ///
+    /// Both under one lock, so that "is this id claimed" and "hold this
+    /// datagram" are one decision: a claim cannot happen between the router's
+    /// lookup and its hold, which would leave the held datagram behind the
+    /// claim that should have taken it.
+    routes: Mutex<Routes>,
+    /// Inbound HTTP Datagrams dropped instead of delivered, all three ways at
+    /// once: an unknown Context ID, a Quarter Stream ID no session claims, and
+    /// a session whose inbound queue was full. A datagram held for a session
+    /// that never claimed it counts with the second, when it is let go.
+    ///
+    /// RFC 9298 §5 and RFC 9297 §2.1 ask for silent drops, so this counter is
+    /// the only trace they leave in production. It is read once, by the
+    /// closing line in [`crate::quic`], which is written after this struct is
+    /// gone. So the `Arc` is passed in by [`Connection::handshake`]'s caller,
+    /// as that line's `tunnels` counter is.
+    ///
+    /// [`Connection::handshake`]: super::connection::Connection::handshake
+    dropped_datagrams: Arc<AtomicU64>,
+    /// How often each way of dropping has been reported, on a doubling
+    /// schedule.
+    ///
+    /// Drops arrive at whatever rate the peer sends, so a line per drop would
+    /// amplify the log under a debug subscriber and cost formatting on the
+    /// routing task either way. [`crate::logfmt::Sampler`] is this crate's one
+    /// mechanism for that. The first drop of each shape is reported at once,
+    /// and later reports give the running count. There are four samplers
+    /// because the shapes have different diagnoses, and each doubles at its
+    /// own rate: an extension this server does not speak, a session racing its
+    /// own close (or a misdirected flood), a target not draining, and a
+    /// datagram cut short of its Context ID.
+    ///
+    /// The closing line's `dropped_datagrams` is still the total across all
+    /// four. These bound the debug lines, not the count.
+    unknown_context_drops: crate::logfmt::Sampler,
+    unroutable_drops: crate::logfmt::Sampler,
+    queue_full_drops: crate::logfmt::Sampler,
+    malformed_drops: crate::logfmt::Sampler,
+}
+
+impl Router {
+    /// A router with nothing claimed and nothing held, which counts the
+    /// datagrams it drops in `dropped_datagrams`.
+    pub(super) fn new(dropped_datagrams: Arc<AtomicU64>) -> Self {
+        Self {
+            dropped_datagrams,
+            ..Self::default()
+        }
+    }
+
     /// Claims `quarter_stream_id` for a session, or reports that it is taken,
     /// and says how many held datagrams the claim took.
     ///
@@ -83,7 +141,7 @@ impl Shared {
         self.count_expired(expired);
         Some((
             DatagramReceiver {
-                shared: Arc::clone(self),
+                router: Arc::clone(self),
                 quarter_stream_id,
                 inbound,
             },
@@ -266,7 +324,7 @@ impl Shared {
     }
 }
 
-/// What [`Shared::deliver`] did with one datagram of Context ID 0.
+/// What [`Router::deliver`] did with one datagram of Context ID 0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Routed {
     /// It is on its session's queue.
@@ -342,14 +400,14 @@ pub const EARLY_DATAGRAM_HOLD: Duration = Duration::from_millis(333);
 const _: () = assert!(EARLY_DATAGRAMS <= INBOUND_QUEUE_DEPTH);
 
 /// The connection's datagram routing table and its hold, which
-/// [`Shared::lock`] guards together.
+/// [`Router::lock`] guards together.
 #[derive(Default)]
-pub(super) struct Routes {
+struct Routes {
     /// Where an inbound HTTP Datagram goes, keyed by Quarter Stream ID.
     ///
     /// The whole of the connection's datagram routing: an entry is a live
     /// session's claim on one Quarter Stream ID, put there by
-    /// [`Shared::claim`] and taken out again when the
+    /// [`Router::claim`] and taken out again when the
     /// [`DatagramReceiver`] it belongs to is dropped. A request stream that
     /// never asks, such as every TCP tunnel, never appears here.
     sessions: HashMap<u64, mpsc::Sender<Bytes>>,
@@ -537,7 +595,7 @@ pub const INBOUND_QUEUE_DEPTH: usize = 64;
 /// which is exactly what RFC 9297 §2.1 permits for a stream that no longer
 /// exists.
 pub struct DatagramReceiver {
-    shared: Arc<Shared>,
+    router: Arc<Router>,
     quarter_stream_id: u64,
     inbound: mpsc::Receiver<Bytes>,
 }
@@ -570,7 +628,7 @@ impl DatagramReceiver {
 
 impl Drop for DatagramReceiver {
     fn drop(&mut self) {
-        self.shared.lock().sessions.remove(&self.quarter_stream_id);
+        self.router.lock().sessions.remove(&self.quarter_stream_id);
     }
 }
 
@@ -602,7 +660,7 @@ impl Drop for DatagramReceiver {
 /// so a Quarter Stream ID past it cannot be told apart from a session that has
 /// already closed. For the same reason the hold cannot refuse such an id: it
 /// is bounded by its count and its hold time instead ([`EARLY_DATAGRAMS`]).
-pub(super) fn route_datagram(shared: &Shared, datagram: Bytes) -> Result<(), Violation> {
+pub(super) fn route_datagram(router: &Router, datagram: Bytes) -> Result<(), Violation> {
     //= https://www.rfc-editor.org/rfc/rfc9297#section-2.1
     //# The largest legal QUIC stream ID value is 2^62-1, so the largest legal
     //# value of the Quarter Stream ID field is 2^60-1. Receipt of an HTTP/3
@@ -619,7 +677,7 @@ pub(super) fn route_datagram(shared: &Shared, datagram: Bytes) -> Result<(), Vio
     // acted on, so this is the one copy of them (D79).
     match datagram::decode(datagram) {
         Ok(decoded) => {
-            shared.deliver(decoded);
+            router.deliver(decoded);
             Ok(())
         }
 
@@ -637,8 +695,8 @@ pub(super) fn route_datagram(shared: &Shared, datagram: Bytes) -> Result<(), Vio
         Err(error) => {
             // The one malformation §2.1 does not make a connection error: a
             // datagram cut short of its Context ID. Dropped like the routing
-            // misses in [`Shared::deliver`], and counted with them.
-            shared.count_drop(DropKind::Malformed, |drops| {
+            // misses in [`Router::deliver`], and counted with them.
+            router.count_drop(DropKind::Malformed, |drops| {
                 debug!(
                     %error,
                     drops,
@@ -653,7 +711,7 @@ pub(super) fn route_datagram(shared: &Shared, datagram: Bytes) -> Result<(), Vio
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::AtomicBool;
 
     use bytes::{BufMut, BytesMut};
 
@@ -688,12 +746,12 @@ mod tests {
     /// other's.
     #[tokio::test]
     async fn a_datagram_reaches_the_session_that_claimed_its_quarter_stream_id() {
-        let shared = Arc::new(Shared::default());
-        let mut first = shared.register_datagrams(1).expect("a free id");
-        let mut second = shared.register_datagrams(2).expect("a free id");
+        let router = Arc::new(Router::default());
+        let mut first = router.register_datagrams(1).expect("a free id");
+        let mut second = router.register_datagrams(2).expect("a free id");
 
-        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for one"));
-        shared.deliver(datagram(2, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for two"));
+        router.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for one"));
+        router.deliver(datagram(2, datagram::CONTEXT_ID_UDP_PAYLOAD, b"for two"));
 
         assert_eq!(
             recv_within(&mut first).await.as_deref(),
@@ -711,13 +769,13 @@ mod tests {
     /// more, without waiting.
     #[tokio::test]
     async fn try_recv_takes_what_is_queued_in_order() {
-        let shared = Arc::new(Shared::default());
-        let mut inbound = shared.register_datagrams(1).expect("a free id");
+        let router = Arc::new(Router::default());
+        let mut inbound = router.register_datagrams(1).expect("a free id");
 
         assert_eq!(inbound.try_recv(), None, "nothing is queued yet");
 
         for payload in [&b"first"[..], b"second", b"third"] {
-            shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
+            router.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
         }
 
         assert_eq!(inbound.try_recv().as_deref(), Some(b"first".as_slice()));
@@ -732,22 +790,22 @@ mod tests {
     /// reads.
     #[tokio::test]
     async fn dropping_the_receiver_gives_up_the_quarter_stream_id() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
 
-        let inbound = shared.register_datagrams(1).expect("a free id");
+        let inbound = router.register_datagrams(1).expect("a free id");
         assert!(
-            shared.register_datagrams(1).is_none(),
+            router.register_datagrams(1).is_none(),
             "a claimed id must not be handed out twice"
         );
         drop(inbound);
 
-        assert!(shared.lock().sessions.is_empty(), "the entry must be gone");
+        assert!(router.lock().sessions.is_empty(), "the entry must be gone");
 
         // Which is observable from the outside: the id is free again, and a
         // datagram that arrives in between is dropped instead of piling up in
         // the queue the finished session left behind.
-        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"too late"));
-        let mut reopened = shared.register_datagrams(1).expect("free again");
+        router.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"too late"));
+        let mut reopened = router.register_datagrams(1).expect("free again");
         assert!(
             reopened.inbound.try_recv().is_err(),
             "a new session must not inherit a finished one's datagrams"
@@ -776,13 +834,13 @@ mod tests {
             (batch, decoded)
         }
 
-        let shared = Arc::new(Shared::default());
-        let mut inbound = shared.register_datagrams(1).expect("a free id");
+        let router = Arc::new(Router::default());
+        let mut inbound = router.register_datagrams(1).expect("a free id");
 
         let (first_batch, first) = batch(b"first");
         let (second_batch, second) = batch(b"second");
-        shared.deliver(first);
-        shared.deliver(second);
+        router.deliver(first);
+        router.deliver(second);
 
         assert!(
             !first_batch.is_unique(),
@@ -810,19 +868,19 @@ mod tests {
     async fn the_routing_table_is_flat_across_a_churn_of_sessions() {
         const CHURN: u64 = 512;
 
-        let shared = Arc::new(Shared::default());
-        let held = shared.register_datagrams(0).expect("a free id");
+        let router = Arc::new(Router::default());
+        let held = router.register_datagrams(0).expect("a free id");
 
         for id in 1..=CHURN {
-            let inbound = shared.register_datagrams(id).expect("a free id");
+            let inbound = router.register_datagrams(id).expect("a free id");
             assert_eq!(
-                shared.lock().sessions.len(),
+                router.lock().sessions.len(),
                 2,
                 "one held session and one live one, whatever id {id} we are on"
             );
             drop(inbound);
             assert_eq!(
-                shared.lock().sessions.len(),
+                router.lock().sessions.len(),
                 1,
                 "session {id} took its entry with it"
             );
@@ -830,7 +888,7 @@ mod tests {
 
         drop(held);
         assert!(
-            shared.lock().sessions.is_empty(),
+            router.lock().sessions.is_empty(),
             "nothing is left once the last session has gone"
         );
     }
@@ -875,13 +933,13 @@ mod tests {
         /// well inside the router's own 30s deadline.
         const FIRST_DELIVERY: Duration = Duration::from_secs(10);
 
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
         let stop = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicU64::new(0));
 
         // The router: every id, over and over, whether or not anyone is there.
-        let router = tokio::spawn({
-            let shared = shared.clone();
+        let router_task = tokio::spawn({
+            let router = router.clone();
             let stop = stop.clone();
             let sent = sent.clone();
             async move {
@@ -890,7 +948,7 @@ mod tests {
                     for id in 0..SESSIONS {
                         // The payload names the session it is for, which is how
                         // a misroute is told from an ordinary drop.
-                        shared.deliver(datagram(
+                        router.deliver(datagram(
                             id,
                             datagram::CONTEXT_ID_UDP_PAYLOAD,
                             &id.to_be_bytes(),
@@ -905,11 +963,11 @@ mod tests {
         // The sessions: each one opens, drains what it was given, and closes.
         let sessions: Vec<_> = (0..SESSIONS)
             .map(|id| {
-                let shared = shared.clone();
+                let router = router.clone();
                 tokio::spawn(async move {
                     let mut received = 0u64;
                     for round in 0..ROUNDS {
-                        let mut inbound = shared.register_datagrams(id).unwrap_or_else(|| {
+                        let mut inbound = router.register_datagrams(id).unwrap_or_else(|| {
                             panic!("session {id} could not re-claim its own id on round {round}")
                         });
 
@@ -961,10 +1019,10 @@ mod tests {
             received += session.await.expect("session task");
         }
         stop.store(true, Ordering::Relaxed);
-        router.await.expect("router task");
+        router_task.await.expect("router task");
 
         assert!(
-            shared.lock().sessions.is_empty(),
+            router.lock().sessions.is_empty(),
             "an entry outlived the receiver that owned it"
         );
         assert!(
@@ -981,34 +1039,34 @@ mod tests {
     /// session surviving each of them.
     #[tokio::test]
     async fn unknown_ids_are_dropped_and_the_session_survives() {
-        let shared = Arc::new(Shared::default());
-        drop(shared.register_datagrams(0).expect("a free id"));
-        let mut inbound = shared.register_datagrams(1).expect("a free id");
+        let router = Arc::new(Router::default());
+        drop(router.register_datagrams(0).expect("a free id"));
+        let mut inbound = router.register_datagrams(1).expect("a free id");
 
         // A Quarter Stream ID no session owns: legitimate whenever a session
         // closes with packets still in flight. Session 0 has closed, so its
         // id is below the highest claimed one and is not held (D114).
-        shared.deliver(datagram(0, datagram::CONTEXT_ID_UDP_PAYLOAD, b"nowhere"));
+        router.deliver(datagram(0, datagram::CONTEXT_ID_UDP_PAYLOAD, b"nowhere"));
         // A context this server never registered (RFC 9298 §5).
-        shared.deliver(datagram(1, 9, b"unknown context"));
+        router.deliver(datagram(1, 9, b"unknown context"));
 
         assert!(
             inbound.inbound.try_recv().is_err(),
             "neither may reach a session"
         );
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             2,
             "both drops are counted for the closing line"
         );
 
-        shared.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"still here"));
+        router.deliver(datagram(1, datagram::CONTEXT_ID_UDP_PAYLOAD, b"still here"));
         assert_eq!(
             recv_within(&mut inbound).await.as_deref(),
             Some(b"still here".as_slice())
         );
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             2,
             "a delivery is not a drop"
         );
@@ -1026,11 +1084,11 @@ mod tests {
     /// actually lives, on the routing table and its queue.
     #[tokio::test]
     async fn datagrams_delivered_before_the_session_starts_are_kept() {
-        let shared = Arc::new(Shared::default());
-        let mut inbound = shared.register_datagrams(9).expect("a free id");
+        let router = Arc::new(Router::default());
+        let mut inbound = router.register_datagrams(9).expect("a free id");
 
         for payload in [b"first".as_slice(), b"second".as_slice()] {
-            shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
+            router.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, payload));
         }
 
         // The session loop starts only now.
@@ -1053,14 +1111,14 @@ mod tests {
     /// when a session is not draining it.
     #[tokio::test]
     async fn the_early_buffer_is_bounded_and_the_overflow_is_dropped() {
-        let shared = Arc::new(Shared::default());
-        let mut inbound = shared.register_datagrams(9).expect("a free id");
+        let router = Arc::new(Router::default());
+        let mut inbound = router.register_datagrams(9).expect("a free id");
 
         let depth = u8::try_from(INBOUND_QUEUE_DEPTH).expect("the depth fits a byte");
         for index in 0..depth {
-            shared.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
+            router.deliver(datagram(9, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
         }
-        shared.deliver(datagram(
+        router.deliver(datagram(
             9,
             datagram::CONTEXT_ID_UDP_PAYLOAD,
             b"past the depth",
@@ -1078,7 +1136,7 @@ mod tests {
             "the queue must stop accepting at its depth rather than grow"
         );
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             1,
             "the overflow is the one drop this connection saw, and it is counted"
         );
@@ -1089,12 +1147,12 @@ mod tests {
     /// arrives after the claim (D114).
     #[tokio::test]
     async fn a_datagram_that_arrives_before_its_session_is_delivered_in_order() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
 
-        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"early"));
-        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"second"));
-        let mut inbound = shared.register_datagrams(3).expect("a free id");
-        shared.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"later"));
+        router.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"early"));
+        router.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"second"));
+        let mut inbound = router.register_datagrams(3).expect("a free id");
+        router.deliver(datagram(3, datagram::CONTEXT_ID_UDP_PAYLOAD, b"later"));
 
         assert_eq!(
             inbound.try_recv().as_deref(),
@@ -1105,12 +1163,12 @@ mod tests {
         assert_eq!(inbound.try_recv().as_deref(), Some(b"later".as_slice()));
         assert_eq!(inbound.try_recv(), None, "each one once");
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             0,
             "a delivered datagram is not a drop"
         );
         assert!(
-            shared.lock().early.is_empty(),
+            router.lock().early.is_empty(),
             "the claim takes what was held for it"
         );
     }
@@ -1119,26 +1177,26 @@ mod tests {
     /// counted as unroutable, rather than evicting one it already has.
     #[test]
     fn the_hold_is_bounded_in_count_and_drops_the_newcomer() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
         let count = u8::try_from(EARLY_DATAGRAMS).expect("the count fits a byte");
 
         for index in 0..count {
-            shared.deliver(datagram(5, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
+            router.deliver(datagram(5, datagram::CONTEXT_ID_UDP_PAYLOAD, &[index]));
         }
-        shared.deliver(datagram(
+        router.deliver(datagram(
             5,
             datagram::CONTEXT_ID_UDP_PAYLOAD,
             b"one too many",
         ));
 
-        assert_eq!(shared.lock().early.len(), EARLY_DATAGRAMS);
+        assert_eq!(router.lock().early.len(), EARLY_DATAGRAMS);
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             1,
             "the newcomer is dropped and counted"
         );
 
-        let mut inbound = shared.register_datagrams(5).expect("a free id");
+        let mut inbound = router.register_datagrams(5).expect("a free id");
         for index in 0..count {
             assert_eq!(
                 inbound.try_recv().as_deref(),
@@ -1153,14 +1211,14 @@ mod tests {
     /// order, leaves the others held, and reports the number it moved.
     #[test]
     fn a_release_moves_only_its_own_session_and_says_how_many() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
         let start = Instant::now();
-        shared.deliver_at(datagram(5, 0, b"one"), || start);
-        shared.deliver_at(datagram(6, 0, b"other"), || start);
-        shared.deliver_at(datagram(5, 0, b"two"), || start);
+        router.deliver_at(datagram(5, 0, b"one"), || start);
+        router.deliver_at(datagram(6, 0, b"other"), || start);
+        router.deliver_at(datagram(5, 0, b"two"), || start);
 
         let (sink, mut inbound) = mpsc::channel(INBOUND_QUEUE_DEPTH);
-        let mut routes = shared.lock();
+        let mut routes = router.lock();
         routes.sessions.insert(5, sink);
         assert_eq!(routes.release(5), 2, "both datagrams held for session 5");
         assert_eq!(routes.early.len(), 1, "the one for session 6 stays held");
@@ -1175,19 +1233,19 @@ mod tests {
     /// [`EARLY_DATAGRAM_HOLD`], when the hold is next touched, and counted.
     #[test]
     fn the_hold_is_bounded_in_time() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
         let start = Instant::now();
         let just_inside = EARLY_DATAGRAM_HOLD - Duration::from_millis(1);
 
-        shared.deliver_at(datagram(5, 0, b"stale"), || start);
-        shared.deliver_at(datagram(5, 0, b"fresh"), || start + just_inside);
+        router.deliver_at(datagram(5, 0, b"stale"), || start);
+        router.deliver_at(datagram(5, 0, b"fresh"), || start + just_inside);
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             0,
             "neither has been held for the whole hold time yet"
         );
 
-        let (mut inbound, _) = shared
+        let (mut inbound, _) = router
             .claim(5, || start + EARLY_DATAGRAM_HOLD)
             .expect("a free id");
         assert_eq!(
@@ -1197,26 +1255,26 @@ mod tests {
         );
         assert_eq!(inbound.try_recv(), None);
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             1,
             "the expired one is counted as a drop"
         );
-        assert!(shared.lock().early.is_empty(), "nothing is left behind");
+        assert!(router.lock().early.is_empty(), "nothing is left behind");
     }
 
     /// A full hold first lets go of what has expired, so expired entries never
     /// cost a current datagram its place.
     #[test]
     fn a_full_hold_makes_room_only_by_expiry() {
-        let shared = Arc::new(Shared::default());
+        let router = Arc::new(Router::default());
         let start = Instant::now();
 
         for _ in 0..EARLY_DATAGRAMS {
-            shared.deliver_at(datagram(5, 0, b"old"), || start);
+            router.deliver_at(datagram(5, 0, b"old"), || start);
         }
-        shared.deliver_at(datagram(6, 0, b"new"), || start + EARLY_DATAGRAM_HOLD);
+        router.deliver_at(datagram(6, 0, b"new"), || start + EARLY_DATAGRAM_HOLD);
 
-        let early = &shared.lock().early;
+        let early = &router.lock().early;
         assert_eq!(
             early.len(),
             1,
@@ -1224,7 +1282,7 @@ mod tests {
         );
         assert_eq!(early[0].quarter_stream_id, 6);
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             u64::try_from(EARLY_DATAGRAMS).expect("small"),
             "each expired datagram is counted"
         );
@@ -1236,60 +1294,60 @@ mod tests {
     /// request), and its datagrams are dropped at once.
     #[test]
     fn a_datagram_for_a_stream_already_past_its_claim_is_not_held() {
-        let shared = Arc::new(Shared::default());
-        drop(shared.register_datagrams(4).expect("a free id"));
+        let router = Arc::new(Router::default());
+        drop(router.register_datagrams(4).expect("a free id"));
 
         // The session that claimed 4 has closed.
-        shared.deliver(datagram(4, 0, b"after the close"));
+        router.deliver(datagram(4, 0, b"after the close"));
         // 2 was accepted before 4 and never claimed.
-        shared.deliver(datagram(2, 0, b"never claimed"));
+        router.deliver(datagram(2, 0, b"never claimed"));
 
-        assert!(shared.lock().early.is_empty(), "neither may be held");
-        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 2);
+        assert!(router.lock().early.is_empty(), "neither may be held");
+        assert_eq!(router.dropped_datagrams.load(Ordering::Relaxed), 2);
 
         // Above the mark, the hold applies again.
-        shared.deliver(datagram(5, 0, b"next request"));
-        assert_eq!(shared.lock().early.len(), 1);
+        router.deliver(datagram(5, 0, b"next request"));
+        assert_eq!(router.lock().early.len(), 1);
     }
 
     /// Only Context ID 0 is held. A datagram under any other Context ID is
     /// dropped at once even for a stream that may still claim its id, because
     /// no extension that could register that Context ID exists here (RFC 9298
-    /// §5, the comment in [`Shared::deliver_at`]).
+    /// §5, the comment in [`Router::deliver_at`]).
     #[test]
     fn an_unknown_context_id_is_never_held() {
-        let shared = Arc::new(Shared::default());
-        shared.deliver(datagram(5, 9, b"unknown context"));
+        let router = Arc::new(Router::default());
+        router.deliver(datagram(5, 9, b"unknown context"));
 
-        assert!(shared.lock().early.is_empty());
-        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 1);
+        assert!(router.lock().early.is_empty());
+        assert_eq!(router.dropped_datagrams.load(Ordering::Relaxed), 1);
 
-        let mut inbound = shared.register_datagrams(5).expect("a free id");
+        let mut inbound = router.register_datagrams(5).expect("a free id");
         assert_eq!(inbound.try_recv(), None, "nothing was held for the claim");
     }
 
     /// What is held for one session is handed to that session and no other.
     #[test]
     fn a_held_datagram_reaches_only_its_own_session() {
-        let shared = Arc::new(Shared::default());
-        shared.deliver(datagram(6, 0, b"for six"));
-        shared.deliver(datagram(7, 0, b"for seven"));
-        shared.deliver(datagram(6, 0, b"for six again"));
+        let router = Arc::new(Router::default());
+        router.deliver(datagram(6, 0, b"for six"));
+        router.deliver(datagram(7, 0, b"for seven"));
+        router.deliver(datagram(6, 0, b"for six again"));
 
-        let mut seven = shared.register_datagrams(7).expect("a free id");
+        let mut seven = router.register_datagrams(7).expect("a free id");
         assert_eq!(seven.try_recv().as_deref(), Some(b"for seven".as_slice()));
         assert_eq!(seven.try_recv(), None, "six's datagrams stay held");
-        assert_eq!(shared.lock().early.len(), 2);
+        assert_eq!(router.lock().early.len(), 2);
 
         // 6 is below the mark now, but what was held for it before 7 claimed
         // is still its own.
-        let mut six = shared.register_datagrams(6).expect("a free id");
+        let mut six = router.register_datagrams(6).expect("a free id");
         assert_eq!(six.try_recv().as_deref(), Some(b"for six".as_slice()));
         assert_eq!(six.try_recv().as_deref(), Some(b"for six again".as_slice()));
         assert_eq!(six.try_recv(), None);
         assert_eq!(seven.try_recv(), None);
-        assert!(shared.lock().early.is_empty());
-        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 0);
+        assert!(router.lock().early.is_empty());
+        assert_eq!(router.dropped_datagrams.load(Ordering::Relaxed), 0);
     }
 
     /// A held datagram is a copy, so the hold never keeps quinn's receive
@@ -1302,10 +1360,10 @@ mod tests {
         let batch = batch.freeze();
         let decoded = datagram::decode(batch.slice(..packet.len())).expect("well formed");
 
-        let shared = Arc::new(Shared::default());
-        shared.deliver(decoded);
+        let router = Arc::new(Router::default());
+        router.deliver(decoded);
 
-        assert_eq!(shared.lock().early.len(), 1);
+        assert_eq!(router.lock().early.len(), 1);
         assert!(
             batch.is_unique(),
             "a held datagram must not keep its receive batch alive"
@@ -1316,28 +1374,28 @@ mod tests {
     /// counts what was held, and nothing is held after.
     #[test]
     fn closing_the_connection_empties_the_hold() {
-        let shared = Arc::new(Shared::default());
-        shared.deliver(datagram(5, 0, b"one"));
-        shared.deliver(datagram(6, 0, b"two"));
+        let router = Arc::new(Router::default());
+        router.deliver(datagram(5, 0, b"one"));
+        router.deliver(datagram(6, 0, b"two"));
 
-        shared.close_routes();
-        assert!(shared.lock().early.is_empty());
+        router.close_routes();
+        assert!(router.lock().early.is_empty());
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             2,
             "what was held is counted before the closing line reads the count"
         );
 
-        shared.deliver(datagram(7, 0, b"after the close"));
-        assert!(shared.lock().early.is_empty(), "nothing is held after");
-        assert_eq!(shared.dropped_datagrams.load(Ordering::Relaxed), 3);
+        router.deliver(datagram(7, 0, b"after the close"));
+        assert!(router.lock().early.is_empty(), "nothing is held after");
+        assert_eq!(router.dropped_datagrams.load(Ordering::Relaxed), 3);
     }
 
     /// Arbitrary interleavings of datagrams, claims, releases and clock steps,
     /// against the three bounds and the routing rule (D114).
     ///
     /// The standing check for code that runs before authentication. A
-    /// cargo-fuzz target cannot reach [`Shared`], which is private to the
+    /// cargo-fuzz target cannot reach [`Router`], which is private to the
     /// crate, so the interleavings are generated here instead.
     ///
     /// Every payload names its Quarter Stream ID and its place in the sequence
@@ -1368,7 +1426,7 @@ mod tests {
         ];
 
         proptest!(|(steps in proptest::collection::vec(step, 0..120))| {
-            let shared = Arc::new(Shared::default());
+            let router = Arc::new(Router::default());
             let start = Instant::now();
             let mut now = start;
             let mut receivers: HashMap<u64, DatagramReceiver> = HashMap::new();
@@ -1384,14 +1442,14 @@ mod tests {
                         payload[..8].copy_from_slice(&sent.to_be_bytes());
                         payload[8] = u8::try_from(id).expect("small");
                         touched = {
-                            let routes = shared.lock();
+                            let routes = router.lock();
                             !routes.sessions.contains_key(&id) && routes.may_hold(id)
                         };
-                        shared.deliver_at(datagram(id, 0, &payload), || now);
+                        router.deliver_at(datagram(id, 0, &payload), || now);
                         sent += 1;
                     }
                     Step::Claim { id } => {
-                        if let Some((inbound, _)) = shared.claim(id, || now) {
+                        if let Some((inbound, _)) = router.claim(id, || now) {
                             receivers.insert(id, inbound);
                             touched = true;
                         }
@@ -1414,7 +1472,7 @@ mod tests {
                     }
                 }
 
-                let routes = shared.lock();
+                let routes = router.lock();
                 prop_assert!(routes.early.len() <= EARLY_DATAGRAMS, "count bound");
                 let bytes: usize = routes.early.iter().map(|early| early.payload.len()).sum();
                 prop_assert!(bytes <= EARLY_DATAGRAMS * MAX_PAYLOAD, "byte bound");
@@ -1438,10 +1496,10 @@ mod tests {
             }
 
             drop(receivers);
-            shared.close_routes();
-            prop_assert!(shared.lock().early.is_empty());
+            router.close_routes();
+            prop_assert!(router.lock().early.is_empty());
             prop_assert_eq!(
-                received + shared.dropped_datagrams.load(Ordering::Relaxed),
+                received + router.dropped_datagrams.load(Ordering::Relaxed),
                 sent,
                 "every datagram is delivered or counted, once"
             );
@@ -1457,10 +1515,10 @@ mod tests {
     /// names as wrong.
     #[test]
     fn a_drop_shape_is_reported_on_a_doubling_schedule_and_counted_every_time() {
-        let shared = Shared::default();
+        let router = Router::default();
         let mut reports: Vec<u64> = Vec::new();
         for _ in 0..8 {
-            shared.count_drop(DropKind::Unroutable, |drops| reports.push(drops));
+            router.count_drop(DropKind::Unroutable, |drops| reports.push(drops));
         }
         assert_eq!(
             reports,
@@ -1469,12 +1527,12 @@ mod tests {
              say how far the count has got"
         );
         assert_eq!(
-            shared.dropped_datagrams.load(Ordering::Relaxed),
+            router.dropped_datagrams.load(Ordering::Relaxed),
             8,
             "every drop is counted, reported or not"
         );
         // A different shape keeps its own schedule, from its own first drop.
-        shared.count_drop(DropKind::QueueFull, |drops| reports.push(drops));
+        router.count_drop(DropKind::QueueFull, |drops| reports.push(drops));
         assert_eq!(reports, vec![1, 2, 4, 8, 1], "each shape speaks for itself");
     }
 }
