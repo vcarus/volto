@@ -3,14 +3,14 @@
 //! streams (RFC 9204 §4.2).
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::debug;
 
 use crate::varint::{VARINT_MAX_LEN, peek_varint, varint_len_of_first};
 
 use super::connection::{
-    Handle, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER, Shared,
+    Handle, OnceStream, STREAM_CONTROL, STREAM_PUSH, STREAM_QPACK_DECODER, STREAM_QPACK_ENCODER,
+    Shared,
 };
 use super::error::{Code, StreamError, Violation};
 use super::frame::{self, BufferBudget, Frame, FrameReader, Item};
@@ -68,7 +68,7 @@ pub(super) async fn serve_stream(handle: Handle, mut recv: quinn::RecvStream) {
         //# stream claiming to be a control stream MUST be treated as a
         //# connection error of type H3_STREAM_CREATION_ERROR.
         STREAM_CONTROL => {
-            if handle.shared.control_seen.swap(true, Ordering::Relaxed) {
+            if handle.shared.opened_before(OnceStream::Control) {
                 handle.fail(duplicate("a second control stream"));
                 return;
             }
@@ -277,12 +277,7 @@ impl Control {
 
         match (frame, seen) {
             (Frame::Settings(settings), false) => {
-                if settings.datagrams {
-                    shared.peer_datagrams.store(true, Ordering::Relaxed);
-                }
-                // After the flag: a request this wakes reads the flag next
-                // (`PeerSettings::read`).
-                shared.settings_read.send_replace(true);
+                shared.settings_arrived(settings.datagrams);
                 Ok(())
             }
 
@@ -348,11 +343,11 @@ enum QpackStream {
 }
 
 impl QpackStream {
-    /// The flag recording whether a stream of this kind has been accepted.
-    fn seen(self, shared: &Shared) -> &AtomicBool {
+    /// This stream's kind among the ones the peer may open only once.
+    fn once(self) -> OnceStream {
         match self {
-            Self::Encoder => &shared.encoder_seen,
-            Self::Decoder => &shared.decoder_seen,
+            Self::Encoder => OnceStream::QpackEncoder,
+            Self::Decoder => OnceStream::QpackDecoder,
         }
     }
 
@@ -448,7 +443,7 @@ impl QpackProgress {
 /// connection error; [`critical_stream_closed`] reports it, under the same
 /// rules as for the control stream.
 async fn serve_qpack(handle: &Handle, mut recv: quinn::RecvStream, kind: QpackStream) {
-    if kind.seen(&handle.shared).swap(true, Ordering::Relaxed) {
+    if handle.shared.opened_before(kind.once()) {
         handle.fail(duplicate("a second QPACK stream of the same kind"));
         return;
     }
@@ -728,19 +723,17 @@ mod tests {
     fn the_peers_settings_reach_the_shared_flag() {
         for datagrams in [true, false] {
             let shared = Shared::default();
-            let seen_by_a_session = shared.peer_datagrams.clone();
-            assert!(!seen_by_a_session.load(Ordering::Relaxed), "nothing yet");
-
-            let read = shared.settings_read.subscribe();
-            assert!(!*read.borrow(), "nothing read yet");
+            let seen_by_a_session = shared.peer_settings(tokio::time::Instant::now());
+            assert!(!seen_by_a_session.datagrams(), "nothing yet");
+            assert!(!seen_by_a_session.has_been_read(), "nothing read yet");
 
             Control::default()
                 .accept(settings(datagrams), false, &shared)
                 .expect("accepted");
 
-            assert_eq!(seen_by_a_session.load(Ordering::Relaxed), datagrams);
+            assert_eq!(seen_by_a_session.datagrams(), datagrams);
             assert!(
-                *read.borrow(),
+                seen_by_a_session.has_been_read(),
                 "the frame counts as read whatever it said, so a request that waits \
                  for it is not held by a peer that turns datagrams down"
             );
