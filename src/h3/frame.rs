@@ -575,6 +575,17 @@ impl FrameDecoder {
         self.chunk = chunk;
     }
 
+    /// Drops the unconsumed rest of the chunk last pushed, undecoded.
+    ///
+    /// Only the chunk changes. The frame state and any header bytes carried
+    /// over stay as they were, so the decoder is no longer in step with the
+    /// stream's bytes and is meant for a stream whose reading has stopped.
+    /// The chunk is empty afterwards, which is the condition the assertion in
+    /// [`Self::push`] checks, so a later push does not trip it.
+    pub(super) fn discard_chunk(&mut self) {
+        self.chunk = Bytes::new();
+    }
+
     /// Narrows the frame rules to the ones RFC 9114 §4.4 gives a tunnel.
     ///
     /// Called once the 2xx answering a CONNECT has gone out, which is what
