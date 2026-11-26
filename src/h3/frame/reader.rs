@@ -192,7 +192,7 @@ impl FrameReader {
         if let Some(ahead) = &mut self.ahead {
             ahead.clear();
         }
-        self.decoder.chunk = Bytes::new();
+        self.decoder.discard_chunk();
     }
 
     /// Whether quinn has more of this stream to give, without taking it.
