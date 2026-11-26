@@ -508,11 +508,37 @@ pub fn nameless_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
     )
 }
 
+/// How long a probing socket stays bound after its probe has returned.
+///
+/// A server that answered a probe has a connection whose handshake never
+/// completes, and it sends its flight again to the probe's port until it gives
+/// the connection up. Measured on loopback against a server with the default
+/// limits: two datagrams at 1 s, two at 2 s and one at 5 s after the probe.
+/// The operating system hands out ephemeral ports at random, so a later probe
+/// socket can be given the port of an earlier one, and it then hears those
+/// datagrams. A test of silence counted them as an answer once, on 2026-11-26:
+/// "must draw nothing, and drew 2 datagrams".
+///
+/// Twelve times the last of those, so a probe's port is not used again while
+/// the server it probed still has anything to send to it. The socket is held
+/// by a task of the test's runtime, so it goes when the test ends, as the
+/// test's server does.
+const PROBE_PORT_HELD: Duration = Duration::from_secs(60);
+
+/// Keeps `socket` bound for [`PROBE_PORT_HELD`] and reads nothing from it.
+fn hold_port(socket: UdpSocket) {
+    tokio::spawn(async move {
+        tokio::time::sleep(PROBE_PORT_HELD).await;
+        drop(socket);
+    });
+}
+
 /// Sends `bytes` once from a fresh socket and returns the first datagram back,
 /// or `None` if nothing arrives within `patience`.
 ///
 /// Returns as soon as one datagram lands, so a server that answers is a fast
-/// answer; only a server that does not costs the whole wait.
+/// answer; only a server that does not costs the whole wait. The socket's
+/// port stays taken afterwards ([`PROBE_PORT_HELD`]).
 pub async fn udp_answer(addr: SocketAddr, bytes: &[u8], patience: Duration) -> Option<Vec<u8>> {
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
@@ -520,14 +546,16 @@ pub async fn udp_answer(addr: SocketAddr, bytes: &[u8], patience: Duration) -> O
     socket.send_to(bytes, addr).await.expect("send the probe");
 
     let mut answer = vec![0u8; 2048];
-    match tokio::time::timeout(patience, socket.recv(&mut answer)).await {
+    let answered = match tokio::time::timeout(patience, socket.recv(&mut answer)).await {
         Ok(Ok(read)) => {
             answer.truncate(read);
             Some(answer)
         }
         Ok(Err(error)) => panic!("the probing socket failed: {error}"),
         Err(_elapsed) => None,
-    }
+    };
+    hold_port(socket);
+    answered
 }
 
 /// A 1200-byte long-header packet naming a QUIC version nobody speaks.
@@ -565,7 +593,9 @@ pub fn is_version_negotiation(datagram: &[u8]) -> bool {
 ///
 /// Every datagram rather than the first, because "the server answered" and
 /// "the server answered twice" are different facts about how loud a shape is —
-/// and because proving silence takes the whole wait.
+/// and because proving silence takes the whole wait. The socket's port stays
+/// taken afterwards ([`PROBE_PORT_HELD`]), so that a later probe is not given
+/// it and does not hear what a server still sends to this one.
 pub async fn udp_answers(
     addr: SocketAddr,
     datagrams: &[Vec<u8>],
@@ -574,7 +604,9 @@ pub async fn udp_answers(
     let socket = UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("bind a probing socket");
-    udp_answers_on(&socket, addr, datagrams, patience).await
+    let heard = udp_answers_on(&socket, addr, datagrams, patience).await;
+    hold_port(socket);
+    heard
 }
 
 /// [`udp_answers`] from `socket`, so that a test can send more than once from
