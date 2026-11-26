@@ -430,6 +430,14 @@ pub enum CongestionControl {
 /// [`System`](Self::System) keeps RFC 6724 ordering, which on glibc an operator
 /// can shape further through `gai.conf`. shadowsocks-rust carries the same
 /// choice as `ipv6_first`, likewise off by default.
+///
+/// The preference also decides what is asked of the resolver. With `Ipv4` or
+/// `Ipv6` the preferred family is looked up alone, and a tunnel does not wait
+/// for the other family's answer while it has a preferred address to try. The
+/// other family is looked up at the same time when the connection has a lookup
+/// slot to spare, and otherwise only when it is needed (`tunnel::resolve_within`
+/// and [`crate::net::OtherFamily`]). The order in which addresses are tried
+/// is the same either way. `System` is one lookup of both families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IpFamilyPreference {

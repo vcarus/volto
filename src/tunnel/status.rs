@@ -95,6 +95,12 @@ pub(crate) enum ResolveFailure {
 }
 
 impl ResolveFailure {
+    /// Whether the resolver found the name but no address in the family it
+    /// was asked for ([`crate::net::is_no_data`]).
+    pub(crate) fn is_no_data(&self) -> bool {
+        matches!(self, Self::Failed(error) if crate::net::is_no_data(error))
+    }
+
     /// The RFC 9209 type this failure is reported as.
     pub(crate) fn proxy_error(&self) -> ProxyError {
         match self {

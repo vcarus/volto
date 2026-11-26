@@ -7,6 +7,18 @@
 //! * RFC 9298 §3.1 requires a CONNECT-UDP request to be resolved *before* the
 //!   2xx response is sent.
 //! * The destination ACL ([`crate::policy`]) can only filter what it can see.
+//!
+//! A lookup can ask for one address family. With `ip_family_preference` at
+//! `ipv4` or `ipv6`, a tunnel's name is looked up in the preferred family
+//! first ([`ConnectionResolver::lookup_family`]), so the C library sends one
+//! query of that family and the tunnel waits for that answer alone. The other
+//! family's lookup ([`OtherFamily`]) starts at the same moment when the
+//! connection has a lookup slot to spare, and otherwise only when a tunnel
+//! needs it: when the preferred family gave no usable address, or when every
+//! preferred address failed to connect. With `system`, a name is one lookup of
+//! both families through `std`, as `TcpStream::connect` would make it. Every
+//! lookup takes a slot of the D90 budget and holds it until the resolver
+//! returns.
 
 use std::io;
 use std::net::SocketAddr;
@@ -128,7 +140,7 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
 }
 
 /// `host` read as an IP address, which resolves to itself.
-fn literal(host: &str, port: u16) -> Option<SocketAddr> {
+pub(crate) fn literal(host: &str, port: u16) -> Option<SocketAddr> {
     host.parse::<std::net::IpAddr>()
         .ok()
         .map(|ip| SocketAddr::new(ip, port))
@@ -440,6 +452,16 @@ impl ResolverBudget {
     #[cfg(test)]
     pub(crate) fn per_connection_with(&self, stand_in: StandIn) -> ConnectionResolver {
         self.view(System::StandIn(stand_in))
+    }
+
+    /// The whole shared allowance, held until the permit is dropped, which is
+    /// how hostile connections that never let go leave it.
+    #[cfg(test)]
+    pub(crate) fn hold_shared(&self) -> OwnedSemaphorePermit {
+        self.shared
+            .clone()
+            .try_acquire_many_owned(u32::try_from(SHARED_LOOKUPS).expect("128 fits a u32"))
+            .expect("the shared allowance starts whole")
     }
 
     fn view(&self, system: System) -> ConnectionResolver {
