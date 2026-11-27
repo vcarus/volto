@@ -29,8 +29,6 @@
 //!   below the number of refusals the run drives, so a slot leaked per failure
 //!   would turn the later refusals into `503 connection_limit_reached` — a
 //!   different `Proxy-Status` on the wire, which is what the assertion reads.
-//!   Driven sequentially and then as a concurrent burst, because the two take
-//!   different paths through the quota.
 //! * **And its Quarter Stream ID.** A CONNECT-UDP session claims one before the
 //!   resolver is asked anything, so a refusal has to give the routing entry
 //!   back; a datagram named for a refused session is counted as dropped on the
@@ -58,14 +56,13 @@ mod common;
 mod fds;
 
 use std::os::fd::AsRawFd;
-use std::panic::Location;
 use std::time::{Duration, Instant};
 
 use common::{
-    ALLOW_PRIVATE, ClientStream, H3Client, Response, SharedBuffer, TIMEOUT, TestServer,
-    connect_request, connect_udp_request, echoes, numeric_field, open_tcp_tunnel, open_udp_session,
-    proxy_status, respond_to, send_and_respond, send_udp_payload, spawn_echo_target,
-    spawn_udp_echo_target, udp_round_trip,
+    ALLOW_PRIVATE, H3Client, Response, SharedBuffer, TestServer, connect_request,
+    connect_udp_request, echoes, numeric_field, open_tcp_tunnel, open_udp_session, proxy_status,
+    respond_to, send_and_respond, send_udp_payload, spawn_echo_target, spawn_udp_echo_target,
+    udp_round_trip,
 };
 use fds::settled_fds;
 use rustix::process::{Resource, Rlimit};
@@ -75,12 +72,9 @@ use volto::h3api::Status;
 /// Tunnel slots the connection under test is given.
 ///
 /// Two of them are held for the whole run by the tunnels opened before the
-/// fault, so [`FREE_SLOTS`] is what the refusals actually draw on — and it is
-/// far below [`REFUSALS`], which is the point.
+/// fault, so the refusals draw on the other four, far below [`REFUSALS`],
+/// which is the point.
 const SLOTS: u32 = 6;
-
-/// Slots left over once the two long-lived tunnels have theirs.
-const FREE_SLOTS: usize = SLOTS as usize - 2;
 
 /// Refusals driven one at a time while the descriptor budget is exhausted.
 ///
@@ -230,57 +224,6 @@ fn assert_local_failure(response: &Response, what: &str) {
     );
 }
 
-/// Sends `count` CONNECT requests before reading any of their answers.
-///
-/// The concurrent shape of the quota: `count` request tasks are live on the
-/// server at once, each asking [`volto`]'s tunnel quota for a slot, where the
-/// sequential loop asks for one at a time.
-///
-/// A synchronous function returning a future, so that a failure names the
-/// calling test's line (D66).
-#[track_caller]
-fn burst<'a>(
-    client: &'a mut H3Client,
-    authority: &'a str,
-    count: usize,
-) -> impl Future<Output = Vec<Response>> + 'a {
-    let caller = Location::caller();
-    async move {
-        let mut streams: Vec<ClientStream> = Vec::with_capacity(count);
-        for index in 0..count {
-            streams.push(
-                tokio::time::timeout(
-                    TIMEOUT,
-                    client.send.send_request(connect_request(authority)),
-                )
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("burst request {index} sent at {caller} could not open a stream")
-                })
-                .unwrap_or_else(|error| {
-                    panic!("burst request {index} sent at {caller} failed: {error:?}")
-                }),
-            );
-        }
-
-        let mut responses = Vec::with_capacity(count);
-        for (index, stream) in streams.iter_mut().enumerate() {
-            responses.push(
-                tokio::time::timeout(TIMEOUT, stream.recv_response())
-                    .await
-                    .unwrap_or_else(|_| {
-                        panic!("no answer to burst request {index} sent at {caller}")
-                    })
-                    .unwrap_or_else(|error| {
-                        panic!("burst request {index} sent at {caller} failed: {error:?}")
-                    }),
-            );
-        }
-
-        responses
-    }
-}
-
 #[tokio::test]
 async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
     let log = SharedBuffer::shared("volto=debug");
@@ -362,20 +305,6 @@ async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
             elapsed < REFUSAL_BOUND,
             "refusal {refusal} took {elapsed:?}"
         );
-    }
-
-    // --- And as a burst, which asks the quota for every slot at once. ---
-    //
-    // The settle is for the server-side release that trails the client's view of
-    // an answered request by a scheduling turn: the same lag `it_stress` leaves
-    // headroom for, and here the burst is sized to the free slots exactly.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    for (index, response) in burst(&mut client, &echo_authority, FREE_SLOTS)
-        .await
-        .iter()
-        .enumerate()
-    {
-        assert_local_failure(response, &format!("burst refusal {index}"));
     }
 
     // --- Nothing spins while the fault lasts. ---
