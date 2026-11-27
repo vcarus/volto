@@ -465,6 +465,42 @@ fn a_candidate_that_cannot_load_this_hosts_config_is_refused_before_anything_mov
     );
 }
 
+/// The config check does not pass the script's `JOURNAL_STREAM` on (S9-L9).
+///
+/// Under the timer the script's own output goes to the journal, so systemd sets
+/// `JOURNAL_STREAM` for it, and volto takes the variable alone as the cue to
+/// put a `<N>` priority before each line. The check's output is captured and
+/// printed by the script, so the refusal carried a literal `<3>`. The run here
+/// sets the variable as the timer's service does, and the real binary refuses
+/// the config.
+#[test]
+fn the_config_check_does_not_write_for_the_journal() {
+    let root = install_root("candidate-journal");
+    plant_binary(&root, "0.5.1");
+    plant_loadable_config(&root, "\n[limits]\na_key_a_later_release_added = 2\n");
+    plant_unit(&root);
+
+    let output = Command::new("bash")
+        .arg(deploy_script())
+        .args(["--dry-run", "--tag", "v0.4.4"])
+        .current_dir(repo_root())
+        .env("VOLTO_DEPLOY_ROOT", &root)
+        .env("VOLTO_DEPLOY_CANDIDATE", real_binary())
+        .env("JOURNAL_STREAM", "8:12345")
+        .output()
+        .expect("the deploy script must be runnable");
+
+    let stderr = stderr_of(&output);
+    assert!(
+        !output.status.success() && stderr.contains("Error: failed to parse config file"),
+        "the real binary must refuse the planted config: {stderr}"
+    );
+    assert!(
+        !stderr.contains("<3>"),
+        "the captured refusal must carry no journal priority prefix: {stderr}"
+    );
+}
+
 /// The other verdict: a configuration the candidate loads is not in the way, and
 /// the run carries on to the decision it was going to make anyway.
 #[test]

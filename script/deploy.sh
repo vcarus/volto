@@ -508,15 +508,21 @@ read_unit_rust_log() {
 # read_unit_rust_log left it, exported for this one command, and without
 # RUST_LOG when the unit sets none or one that could not be read: the service
 # does not inherit this script's environment, so neither does its check.
+#
+# Without JOURNAL_STREAM as well. systemd sets it when this script's output goes
+# to the journal, as under the timer, and volto takes the variable alone as the
+# cue to put a "<N>" priority before each line. The check's output is captured
+# and printed by the caller, so it would carry the prefix as text.
 check_config_as_the_unit() {
-    if [ "$UNIT_RUST_LOG_STATE" = found ]; then
-        RUST_LOG="$UNIT_RUST_LOG" "$1" --check-config --config "$2"
-    else
-        (
+    (
+        unset JOURNAL_STREAM
+        if [ "$UNIT_RUST_LOG_STATE" = found ]; then
+            RUST_LOG="$UNIT_RUST_LOG" "$1" --check-config --config "$2"
+        else
             unset RUST_LOG
             "$1" --check-config --config "$2"
-        )
-    fi
+        fi
+    )
 }
 # <<< mirrored RUST_LOG reader (deploy.sh <-> install-selfsigned.sh) <<<
 
