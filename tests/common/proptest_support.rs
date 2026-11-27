@@ -1,16 +1,12 @@
 //! Generators and knobs shared by the property-test binaries.
 //!
 //! `it_props`, `it_fuzz` and `it_frameseq` each drive `proptest` at a different
-//! subject, and each wrote out the same case-count policy and the same
-//! length-plus-seed payload generator to do it. Those are here.
+//! subject. What they share is here.
 //!
 //! Reached with `#[path = "common/proptest_support.rs"] mod props;` rather than
 //! declared inside `common`: `tests/common/mod.rs` does not name this file, so
 //! `mod common;` does not compile it and no other test binary links `proptest`
-//! on its account. That was the objection recorded at `it_fuzz`'s copy of
-//! [`config`] — "`tests/common` is compiled into every integration binary" —
-//! and it is an objection to `mod common;`, not to sharing, which is the same
-//! distinction D66's QR5 turned on.
+//! on its account (D66).
 //!
 //! What is deliberately *not* here: `it_props`'s and `it_fuzz`'s `any_varint`,
 //! which differ by two entries in their boundary lists, and `it_frameseq`'s

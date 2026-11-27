@@ -1,11 +1,10 @@
 //! Huffman *encoding* for the test client (RFC 7541 Appendix B).
 //!
 //! The server only ever decodes: `src/h3/qpack.rs` writes every string literal
-//! with `H = 0`, so nothing in the crate can produce a Huffman-coded field line
-//! and `src/h3/huffman.rs` was never reached from the wire by `cargo test` --
-//! while Surge Huffman-codes every request it sends. This module is the missing
-//! half, and it lives here rather than in the server because the server has no
-//! use for it.
+//! with `H = 0`, so without this encoder nothing in `cargo test` reaches
+//! `src/h3/huffman.rs` from the wire, while Surge Huffman-codes every request.
+//! This module is the missing half, and it lives here rather than in the
+//! server because the server has no use for it.
 //!
 //! # Why the table is copied rather than imported
 //!
@@ -117,10 +116,7 @@ pub const EOS: usize = 256;
 /// the code corresponding to the EOS (end-of-string) symbol are used." Those
 /// bits are all ones, which is why the padding below is simply that.
 pub fn encode(input: &[u8]) -> Vec<u8> {
-    // Never more than one byte per symbol plus the padding byte: the longest
-    // code is 30 bits, but the codes that are longer than 8 bits belong to
-    // symbols a field line practically never carries, and over-reserving by a
-    // factor of four is not worth the arithmetic in a test helper.
+    // A capacity hint: most field-line symbols code in eight bits or fewer.
     let mut out = Vec::with_capacity(input.len() + 1);
 
     // The bits written so far that do not yet fill a byte. Thirty bits of code

@@ -2,8 +2,7 @@
 //!
 //! Two binaries prove that nothing leaks one -- `it_os_faults`, over a burst of
 //! requests that each fail on a different exhausted resource, and `it_soak`, over
-//! a long run of tunnels that all succeed. Both ask the same two questions, and
-//! asked them with the same two functions until this module.
+//! a long run of tunnels that all succeed.
 //!
 //! A leaf module reached with `#[path = "common/fds.rs"] mod fds;` rather than an
 //! item in [`super`], the way `common/alloc.rs` already is for the three binaries
@@ -11,7 +10,7 @@
 //! it is a directory listing about this process, it uses the standard library and
 //! one `tokio::time::sleep`, and keeping it out of `common/mod.rs` is what lets a
 //! future binary ask the question without linking rcgen, quinn and rustls to get
-//! an answer (D66's QR5, reopened 2026-08-31).
+//! an answer (D66).
 
 #![allow(dead_code)] // Each of these binaries uses a subset of this.
 

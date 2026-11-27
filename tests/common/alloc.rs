@@ -5,8 +5,8 @@
 //! the way past. What they count is genuinely different — signed live bytes,
 //! allocations at or above the relay's read window, every allocation and its
 //! size — and stays in each of those files, next to the measurement it serves.
-//! What was written out three times is the forwarding itself: four `unsafe`
-//! methods that call the inner allocator and report what happened.
+//! Shared here is the forwarding itself: four `unsafe` methods that call the
+//! inner allocator and report what happened.
 //!
 //! The inner allocator is [`System`] unless the binary names another one.
 //! `it_bench` names `volto::alloc::Global`, the allocator the `volto` binary
@@ -16,12 +16,11 @@
 //!
 //! Reached with `#[path = "common/alloc.rs"] mod alloc;` rather than declared
 //! inside `common`, so the binaries that do not measure allocations do not
-//! compile it (the same leaf-module route D66's QR5 did not consider).
+//! compile it (D66).
 //!
-//! One deliberate difference from the copies this replaces: an allocation is
-//! reported only once the inner allocator has returned a non-null pointer, the
-//! way `it_bounds` already did it and the other two did not. A null return is
-//! the allocator failing, and nothing was handed out to count.
+//! An allocation is reported only once the inner allocator has returned a
+//! non-null pointer. A null return is the allocator failing, and nothing was
+//! handed out to count.
 
 // One of the package's argued exceptions to `unsafe_code = "deny"`: a global
 // allocator is an `unsafe` contract by definition, and these methods only
