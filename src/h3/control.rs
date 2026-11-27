@@ -1030,9 +1030,6 @@ mod tests {
 
     /// RFC 9114 §6.2.1 and RFC 9204 §4.2 stand while the connection does; once
     /// it is over, the same ending is the peer saying goodbye a packet early.
-    ///
-    /// All four endings are listed rather than one of them, so that an
-    /// ending whose caller lost the exemption is caught.
     #[test]
     fn a_critical_stream_ending_is_a_fault_only_while_the_connection_lives() {
         let endings = [
