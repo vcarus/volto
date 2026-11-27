@@ -654,9 +654,10 @@ struct ConfigFields {
 }
 
 impl ConfigFields {
-    /// Reads the ECHConfig layout of RFC 9849 §4 far enough to find the
-    /// config_id and the public name. AWS-LC checks the rest when the key is
-    /// added (`EchKey::keys`).
+    /// Reads the ECHConfig of RFC 9849 §4 for the fields this server reports,
+    /// and refuses with a reason a version or a KEM it does not serve and
+    /// bytes after the contents or after the extensions. AWS-LC checks the
+    /// rest when the key is added (`EchKey::keys`).
     fn parse(config: &[u8]) -> Result<Self> {
         let mut r = Reader::new(config);
         let version = r.u16().context(ENDS_EARLY)?;
