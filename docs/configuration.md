@@ -941,32 +941,9 @@ instead.
 
 ### What is stable from v1.0.0
 
-Configuration keys and the command-line arguments are stable within 1.x, under
-four rules. A key keeps its name and its meaning. A file written for any earlier
-1.x release still loads. A documented default can move in a minor release when
-the release note says so, and the old value stays settable. A key is removed
-only after at least one minor release has warned about it at startup. The
-cases so far are these. v1.2.0 lowers the documented default of `mtu_upper_bound` from
-1452 to 1436 on measured evidence (the MTU paragraphs under [Notes that matter
-in practice](#notes-that-matter-in-practice) give it); a host that relied on
-1452 can set it explicitly. v1.2.0 also changes what `bbr`, the default value of
-`congestion_control`, selects: from 1.2.0 to 1.7.0 it was quinn's BBR with its
-window capped, the controller v1.1.0 and v1.1.1 called `bbr-capped`. A file that writes
-`bbr` or leaves the key out gets it without an edit. In v1.1.0 and v1.1.1 that
-controller was opt-in under the name `bbr-capped`, and 1.2.0 also accepted
-`bbr-capped` as an alias. v1.3.0 removes the alias without a warning release
-first, the first of two exceptions to the rules above so far. The value existed
-for two patch releases only, so a file that still writes `bbr-capped` is refused
-at startup with an unknown-variant error that gives its line and column, and the
-fix is to write `bbr`. From 1.2.0 to 1.7.0 `bbr-uncapped` selected quinn's BBR as `bbr`
-had selected it before. v1.8.0 removes that value, also
-without a warning release, which is the second exception: `bbr` no longer uses
-quinn's BBR, the comparison the value existed for is made, and quinn's BBR
-loses packets on a bulk download that `bbr` does not. A file that still writes
-`bbr-uncapped` is refused at startup with an unknown-variant error that gives
-its line and column, and the fix is to write `bbr` or to remove the line. A new key keeps
-taking its documented default when the file does not mention it, which is what
-makes the upgrade half of this section a no-op.
+Configuration keys and the command-line arguments are stable within 1.x, under four rules. A key keeps its name and its meaning. A file written for any earlier 1.x release still loads. A documented default can move in a minor release when the release note says so, and the old value stays settable. A key is removed only after at least one minor release has warned about it at startup.
+
+Under the third rule, v1.2.0 lowered the documented default of `mtu_upper_bound` from 1452 to 1436 (the MTU paragraphs under [Notes that matter in practice](#notes-that-matter-in-practice) say why); a host that relied on 1452 can set it explicitly. Two changes are exceptions to the rules: v1.3.0 removed the value `bbr-capped` of `congestion_control` and v1.8.0 the value `bbr-uncapped`, each without a warning release. A file that writes either is refused at startup with an unknown-variant error that gives its line and column, and the fix is to write `bbr` or to remove the line. A new key keeps taking its documented default when the file does not mention it, which is what makes the upgrade half of this section a no-op.
 
 Two things are deliberately outside that promise. Log line shapes are not an
 interface: fields are added, reworded and moved between levels as the
