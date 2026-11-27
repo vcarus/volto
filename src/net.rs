@@ -1684,14 +1684,23 @@ mod tests {
 
     /// The startup fd check is only useful if the probe works on both hosts.
     ///
-    /// `None` is not a failure to read the limit — it is `RLIM_INFINITY`, and a
-    /// host that grants it is answering the question rather than refusing to.
-    /// So what is pinned is the only answer that would be wrong: a finite
-    /// ceiling no running process could be under.
+    /// `None` is `RLIM_INFINITY`, not a failure to read the limit. Linux never
+    /// gives it for the soft limit, because the kernel refuses any
+    /// `RLIMIT_NOFILE` above `fs.nr_open`, so there a probe that answered
+    /// `None` would be wrong and would make the startup check skip. Elsewhere
+    /// the only answer that is wrong is a finite ceiling no running process
+    /// could be under.
     #[test]
     fn the_fd_soft_limit_is_readable() {
+        let soft = fd_limits().0;
+        #[cfg(target_os = "linux")]
         assert!(
-            fd_limits().0.is_none_or(|limit| limit > 0),
+            matches!(soft, Some(limit) if limit > 0),
+            "a Linux soft limit is a positive number: {soft:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            soft.is_none_or(|limit| limit > 0),
             "a process with no descriptors could not run this"
         );
     }
