@@ -1351,7 +1351,8 @@ fn a_first_install_whose_start_fails_still_prints_the_report() {
     );
 }
 
-/// And a service that is active still succeeds, with the report printed.
+/// And a service that is active still succeeds, with the report printed, the
+/// binary and the unit installed and the service enabled before it starts.
 #[test]
 fn an_install_whose_service_is_active_reports_success() {
     let root = scratch_tree(
@@ -1359,14 +1360,30 @@ fn an_install_whose_service_is_active_reports_success() {
         "service-active",
         &["etc/volto", "usr/local/bin", "etc/systemd/system"],
     );
+    let stubs = plant_root_stubs(&root, 0, "active");
 
-    let output = run_full_install(&root, "active");
+    let output = run_full_install_with_stubs(&root, &stubs, &[]);
 
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
         stdout_of(&output).contains("==> done"),
         "the report must print: {}",
         stdout_of(&output)
+    );
+    assert_eq!(
+        fs::read(root.join("usr/local/bin/volto")).ok(),
+        fs::read(real_binary()).ok(),
+        "the binary must be installed"
+    );
+    assert_eq!(
+        fs::read(root.join("etc/systemd/system/volto.service")).ok(),
+        fs::read(repo_root().join("script/masque.service")).ok(),
+        "the shipped unit must be installed"
+    );
+    let calls = systemctl_calls(&stubs);
+    assert!(
+        calls.starts_with("daemon-reload\nenable volto\n"),
+        "systemd must read the unit and enable the service, so it comes back after a reboot: {calls}"
     );
 }
 
@@ -1592,8 +1609,8 @@ fn replacing_the_binary_keeps_the_previous_one_and_restarts() {
     );
     let calls = systemctl_calls(&stubs);
     assert!(
-        calls.contains("daemon-reload\n") && calls.contains("restart volto\n"),
-        "the service must be restarted on the new files: {calls}"
+        calls.starts_with("daemon-reload\nenable volto\nis-active --quiet volto\nrestart volto\n"),
+        "systemd must read the new unit before the service restarts on it: {calls}"
     );
 }
 
