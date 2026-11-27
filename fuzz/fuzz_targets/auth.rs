@@ -41,14 +41,15 @@ const MAX_SECRET: usize = 32;
 ///
 /// More than [`MAX_CREDENTIAL_VALUES`], which is all a request reaching this
 /// server may carry: `conn` refuses the rest with 400 before any value is tried
-/// (D76 addendum of 2026-09-04). The extra values are kept because they cost
+/// (D76). The extra values are kept because they cost
 /// nothing and they drive the scheme split and the base64 decoder, which is what
 /// this target is for.
 const MAX_VALUES: usize = 8;
 
-/// Longest a bounded token may print as: at most [`MAX_SECRET`] bytes of head,
-/// each of which may decode to a three-byte replacement character, plus the
-/// suffix naming the original length.
+/// Longest a bounded token may print as: at most 32 bytes of head
+/// (`logfmt::MAX_TOKEN`, which is private to the crate), each of which may
+/// decode to a three-byte replacement character, plus the suffix naming the
+/// original length.
 const MAX_BOUNDED: usize = 256;
 
 fuzz_target!(|data: &[u8]| {
