@@ -148,8 +148,7 @@ users = [
 # request streams and draw a refusal on each.
 # Raise it with care: a stream slot is reserved for every unit of the credit when
 # the allowance is granted, not when a stream is opened. That work is done at
-# once by the connection's first authenticated request: about 11 ms at 1024 and
-# 7 seconds at a million.
+# once by the connection's first authenticated request, and grows with the value.
 # Range: 1..65536
 # Default: 1024
 #max_streams_bidi = 1024
