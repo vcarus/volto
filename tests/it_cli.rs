@@ -562,10 +562,10 @@ fn the_check_judges_rust_log_by_the_rule_startup_applies() {
 /// such as `kill` or a renewal hook that does not go through systemd, can still
 /// arrive earlier. Until a handler is installed
 /// the signal's default action ends the process, and systemd does not restart a
-/// service that died by `SIGHUP` unless the unit says so. The first stdout line
-/// is the startup warning about authentication, written before `Server::bind`.
-/// The handler has to exist by then, so the signal sent at that line must come
-/// back as a reload, and the process must still stop cleanly on `SIGTERM`.
+/// service that died by `SIGHUP` unless the unit says so. The startup warnings
+/// are written before `Server::bind`. The handler has to exist by then, so the
+/// signal sent at a warning line must come back as a reload, and the process
+/// must still stop cleanly on `SIGTERM`.
 ///
 /// Without help the window between the warning line and `Server::bind` lasts
 /// microseconds, and the signal sent here reaches the process only after the
@@ -578,92 +578,36 @@ fn the_check_judges_rust_log_by_the_rule_startup_applies() {
 /// created after `Server::bind`.
 #[test]
 fn a_sighup_during_startup_is_taken_as_a_reload() {
-    use std::io::{BufRead, BufReader, Write};
-    use std::sync::mpsc;
+    use std::io::Write;
 
     use rustix::process::{Pid, Signal, kill_process};
 
     let dir = scratch_tree("cli", "early-sighup", &[]);
-    let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-        .expect("a self-signed certificate must be generated");
-    let cert = dir.join("cert.pem");
-    let key = dir.join("key.pem");
-    fs::write(&cert, issued.cert.pem()).expect("the cert must be writable");
-    fs::write(&key, issued.signing_key.serialize_pem()).expect("the key must be writable");
-    // No `[auth]`, so the startup warning about it is the first line written.
-    let path = dir.join("config.toml");
-    write_private(&path, &server_section(&cert, &key, "127.0.0.1:0"));
+    // A keep-alive of 0 draws a startup warning, so there is a line to send
+    // the signal at.
+    let mut serving = Serving::start(
+        &dir,
+        "\n[limits]\nkeep_alive_interval = 0\n",
+        &[(
+            "VOLTO_DEBUG_PAUSE_AFTER_THE_WARNINGS",
+            std::ffi::OsStr::new("1"),
+        )],
+    );
+    let pid = Pid::from_child(&serving.child.0);
+    let mut stdin = serving.child.0.stdin.take().expect("stdin is piped");
 
-    let mut child = Command::new(real_binary())
-        .args(["--config", path.to_str().unwrap()])
-        .env_remove("JOURNAL_STREAM")
-        .env_remove("RUST_LOG")
-        .env("VOLTO_DEBUG_PAUSE_AFTER_THE_WARNINGS", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the volto binary must be runnable");
-    let pid = Pid::from_child(&child);
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-
-    let (lines, received) = mpsc::channel();
-    let stdout = child.stdout.take().expect("stdout is piped");
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let mut seen = Vec::new();
-    let mut wait_for = |needle: &str, child: &mut std::process::Child| loop {
-        if let Some(status) = child.try_wait().expect("the child must be waitable") {
-            panic!(
-                "volto exited with {status} while waiting for {needle:?}; stdout so far:\n{}",
-                seen.join("\n")
-            );
-        }
-        match received.recv_timeout(Duration::from_millis(20)) {
-            Ok(line) => {
-                let found = line.contains(needle);
-                seen.push(line);
-                if found {
-                    return;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "no {needle:?} within 20 s; stdout so far:\n{}",
-            seen.join("\n")
-        );
-    };
-
-    wait_for("authentication is DISABLED", &mut child);
+    serving.wait_for("limits.keep_alive_interval = 0");
     // The process is now waiting for this line, before `Server::bind`. A
     // signal whose action is still the default ends it at once, before the
     // line can be read.
     kill_process(pid, Signal::HUP).expect("SIGHUP must be deliverable");
     writeln!(stdin, "go").expect("the paused process must read its stdin");
-    wait_for("received SIGHUP", &mut child);
+    serving.wait_for("received SIGHUP");
 
-    kill_process(pid, Signal::TERM).expect("SIGTERM must be deliverable");
-    let output = child
-        .wait_with_output()
-        .expect("the child's output must be readable");
+    let (status, _, stderr) = serving.stop();
     assert!(
-        output.status.success(),
-        "volto must stop cleanly on SIGTERM after the reload: {} {}",
-        output.status,
-        stderr_of(&output)
+        status.success(),
+        "volto must stop cleanly on SIGTERM after the reload: {status} {stderr}"
     );
 }
 
@@ -1391,9 +1335,9 @@ struct Serving {
 
 impl Serving {
     /// Starts the binary on a configuration written into `dir`, with `body`
-    /// appended to it and both of its output streams piped and nothing reading
-    /// them yet. Returns the child, the address it listens on and its
-    /// certificate.
+    /// appended to it and stdin and both output streams piped and nothing
+    /// reading or writing them yet. Returns the child, the address it listens
+    /// on and its certificate.
     fn spawn(
         dir: &Path,
         body: &str,
@@ -1431,7 +1375,7 @@ impl Serving {
             // Plain text, so a line can be matched on its fields.
             .env("NO_COLOR", "1")
             .envs(env.iter().copied())
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
