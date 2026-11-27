@@ -9,10 +9,6 @@
 //! was": several cases send something the server must accept first, and only
 //! the phrase shows it was read past rather than tripped over.
 
-// The package-wide default is `deny` (`Cargo.toml`); this file argues for its
-// allow: the stream numbers are ones this file writes out itself.
-#![allow(clippy::as_conversions)]
-
 mod common;
 
 use common::rawstream::{
@@ -90,7 +86,7 @@ async fn a_stopped_critical_stream_ends_the_connection() {
         // Any code would do: what is under test is the server's answer to being
         // stopped at all.
         stream
-            .stop(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
+            .stop(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a varint"))
             .expect("stop the server's stream");
 
         let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
@@ -112,11 +108,9 @@ async fn a_stopped_critical_stream_ends_the_connection() {
 //# The sender MUST NOT close the control stream, and the receiver
 //# MUST NOT request that the sender close the control stream.
 ///
-/// The verdict is the same as for a clean finish, and since review L1 it is
-/// reached through the same helper (`critical_stream_closed`) rather than
-/// through an arm of its own. This case is the half of that helper's rule the
-/// wire can show: the reset happens on a connection the peer keeps open, so the
-/// exemption does not apply and the CONNECTION_CLOSE is observable.
+/// The verdict is the same as for a clean finish and comes from the same helper
+/// (`critical_stream_closed`). Here the peer keeps the connection open, so the
+/// helper's exemption does not apply and the CONNECTION_CLOSE is observable.
 ///
 /// The other half, a reset that arrives in the same flight as the peer's own
 /// CONNECTION_CLOSE, cannot be arranged from here: `quinn::Connection::close`
@@ -142,7 +136,7 @@ async fn a_reset_control_stream_ends_the_connection() {
 
     // Any code: what the server owes is its own verdict on being reset at all.
     control
-        .reset(quinn::VarInt::from_u32(H3_REQUEST_CANCELLED as u32))
+        .reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a varint"))
         .expect("reset the control stream");
 
     let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
@@ -163,14 +157,9 @@ async fn a_reset_control_stream_ends_the_connection() {
 /// Closure of either unidirectional stream type MUST be treated as a connection
 /// error of type H3_CLOSED_CRITICAL_STREAM."
 ///
-/// This was deliberately not enforced, and the reason it was not is a race
-/// rather than the rule: a peer tearing a connection down finishes its send
-/// streams and sends CONNECTION_CLOSE in the same breath, and answering an
-/// ordinary goodbye with a protocol error puts a fault in the operator's log.
-/// The server answers that with an exemption rather than with silence --
-/// `critical_stream_closed` reports nothing once `close_reason` is `Some` --
-/// and all three critical streams reach it through that one helper (audit N3,
-/// review L1).
+/// The server exempts a stream that ends once the connection is already
+/// closing (`critical_stream_closed`), because a peer tearing down finishes its
+/// streams and sends CONNECTION_CLOSE together.
 ///
 /// So what is asserted is the case the exemption does not cover: a peer that
 /// closes one of these streams and leaves the connection up. A reset is the
@@ -272,7 +261,7 @@ async fn decoder_instructions_for_a_table_never_used_are_refused() {
         // byte, then Increment 0. The reason names the Increment only if all
         // nine were read past.
         (
-            "an Insert Count Increment after a stream id of the full 62 bits",
+            "an Insert Count Increment after a stream id nine continuation bytes long",
             vec![
                 0x7f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01, 0x00,
             ],
