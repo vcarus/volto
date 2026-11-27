@@ -30,13 +30,6 @@ use volto::varint;
 
 /// A server with `users` configured, private targets allowed and a failure
 /// budget of `failures`.
-///
-/// The configuration eleven of the tests below share, written out eleven times
-/// before this. The only thing any of them varied was the user list and the
-/// number, and both are parameters, so a test now says what it is about on one
-/// line. `a_peer_that_never_reads_its_407_still_spends_its_budget` is the
-/// twelfth and keeps its own `format!`: it prepends [`UNHURRIED`] and does not
-/// allow private networks, which are the two things this does not take.
 async fn server_with_budget(users: &[(&str, &str)], failures: u32) -> TestServer {
     TestServer::start_with(&format!(
         "{}[security]\nallow_private_networks = true\nmax_auth_failures = {failures}\n",
@@ -298,10 +291,7 @@ fn guesses(authority: &str, passwords: &[&str]) -> Request {
 /// A request carrying two guesses pays for both of them.
 ///
 /// The budget counts guesses, and one request may carry a guess under each of
-/// the two field names D3 accepts. Charged per request instead, a request was a
-/// batch of guesses at the price of one failure: with the field section limit at
-/// 64 KiB about a thousand of them fit, so one handshake bought about five
-/// thousand guesses at the shipped default rather than five (audit M1).
+/// the two field names D3 accepts.
 ///
 /// Two failures at `max_auth_failures = 2` is the whole budget in one request,
 /// so the connection goes after a single one. Charged per request, this same
@@ -362,26 +352,14 @@ async fn a_third_credential_value_is_refused_before_any_is_tried() {
 
 /// A five-second idle timeout, for the one test that measures against it.
 ///
-/// `DELIBERATE`'s two seconds is what the rest of this binary wants: long enough
-/// that a deadline lapsing is deliberate, short enough to wait out. The test
-/// below wants the opposite, because there the idle timeout is the *wrong*
-/// answer's price tag: it asserts that a close does not wait behind a bounded
-/// write, and that write is bounded by exactly this value. So the gap between
-/// what the test allows and this number is the whole assertion, and at two
-/// seconds the test could allow at most one — the narrowest timing bound in the
-/// suite, against `it_udp`, `it_policy` and `it_shutdown` all allowing two. Five
-/// buys the same two seconds they allow while keeping the 2.5x ratio between the
-/// wrong answer's cost and the bound that `it_shutdown` has.
+/// Five seconds, so the 2 s bound in the test below is far from the idle
+/// timeout a close waiting behind the 407 would cost.
 const UNHURRIED: &str = "[limits]\nmax_idle_timeout = 5\nkeep_alive_interval = 0\n";
 
 /// A peer that will not read its 407 must still spend the budget.
 ///
-/// The failure is counted before the answer goes out, and the answer itself is
-/// bounded: a peer that grants a window smaller than a 407 used to leave the
-/// count on the unreachable side of a write that never completed, which turned
-/// "N guesses cost a handshake" into "guess once per stream, forever" — and left
-/// a parked task holding the whole decoded request behind each of them
-/// (review H1/H2).
+/// The failure is counted, and the close decided, before the 407 is written, so
+/// a peer that never reads it still reaches the cap (review H1/H2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
     let server = TestServer::start_with(&format!(
@@ -420,9 +398,7 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 
     // The close is decided before the 407 is written, so it does not wait on
     // the bounded write: the last guess ends the connection at once, not one
-    // idle timeout ([`UNHURRIED`]'s five seconds here) later. Measured at about
-    // twenty microseconds on the dev host, so the two seconds is headroom for a
-    // loaded runner rather than a figure anything approaches.
+    // idle timeout ([`UNHURRIED`]'s five seconds here) later.
     assert!(
         started.elapsed() < Duration::from_secs(2),
         "the close must not wait behind the unanswerable 407; took {:?}",
@@ -439,10 +415,8 @@ async fn a_peer_that_never_reads_its_407_still_spends_its_budget() {
 /// granting no window at all: a FIN would wait behind bytes that cannot be sent
 /// (review H1).
 ///
-/// Driven on raw quinn streams like its neighbour below, and for the same
-/// reason: `quinn::RecvStream::received_reset` observes the reset without
-/// granting the flow-control credit an ordinary read would, which is the
-/// condition this test used to sleep past. The shared HTTP/3 client cannot
+/// Raw quinn streams, because `received_reset` observes the reset without
+/// granting the credit an ordinary read would. The shared HTTP/3 client cannot
 /// offer it, because its receiving half lives inside `FrameReader`
 /// (`tests/common/h3client.rs`) and D78 is what keeps `src/h3` from growing a
 /// public accessor for a test.
@@ -537,7 +511,7 @@ async fn a_431_the_peer_will_not_take_is_reset() {
 
     // And the reset is still to come when the stop arrives: the answer is parked
     // on a window that is not coming and has a whole idle timeout left to lapse
-    // in. Answering first put both on the wire together, one timeout later.
+    // in.
     assert!(
         tokio::time::timeout(Duration::ZERO, recv.received_reset())
             .await
@@ -545,9 +519,6 @@ async fn a_431_the_peer_will_not_take_is_reset() {
         "the stop must reach the peer before the abandoned answer's reset, not with it"
     );
 
-    // Waited for rather than slept past: `received_reset` observes the reset
-    // without granting the flow-control credit an ordinary read would, which is
-    // the whole reason a window this small is the setup.
     let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
         .await
         .expect("the server must not wait for a window that is not coming")
@@ -693,8 +664,7 @@ async fn a_success_does_not_clear_another_users_failures() {
 /// failure as *itself*. With one run charged to the first failure that named
 /// somebody, that claimed the run for a name the peer can clear at will, so the
 /// success at the end of the cycle wiped the guesses at the second user out with
-/// it -- measured against that version at `max_auth_failures = 5`: eight rounds,
-/// twenty-four guesses, connection never closed.
+/// it.
 ///
 /// With a bucket per user-id the success clears the peer's own and nothing else,
 /// so the guesses stand and the *total* reaches the cap in the second round.
@@ -873,10 +843,10 @@ async fn a_zero_budget_disables_the_cap() {
 ///
 /// Reading the stream type is the one wait in the HTTP/3 layer with no protocol
 /// answer behind it: until the varint arrives there is nothing to say about the
-/// stream at all. A peer that opens streams and writes half a varint on each
-/// used to park a task apiece for the life of the connection, and the transport
-/// could not end it either, since the keep-alive here is answered by the
-/// client's own stack (review L3).
+/// stream at all. Without a bound, a peer that writes half a varint on each
+/// stream would park a task apiece for the life of the connection, and the
+/// transport could not end it either, since the keep-alive here is answered by
+/// the client's own stack (review L3).
 ///
 /// The bound is per stream and so is the answer. The 2s deadline is
 /// `DELIBERATE`'s idle timeout, and the connection is still serving requests
@@ -929,26 +899,19 @@ async fn a_unidirectional_stream_that_never_names_its_type_is_abandoned() {
 /// is also the most it will buffer for a single frame, so the budget divides into
 /// exactly [`FULL_SIZED_FRAMES_THAT_FIT`] of them and the next one is the one
 /// that cannot fit. The spare few are what makes the count of refusals exact
-/// without the test having to know which stream the server's tasks reach first:
-/// not one of these frames is ever completed, so every one past the budget is
-/// refused whatever order they arrive in.
-fn streams_past_the_budget() -> usize {
-    FULL_SIZED_FRAMES_THAT_FIT + 4
-}
+/// without the test of the bound having to know which stream the server's tasks
+/// reach first: not one of its frames is ever completed, so every one past the
+/// budget is refused whatever order they arrive in.
+const STREAMS_PAST_THE_BUDGET: usize = FULL_SIZED_FRAMES_THAT_FIT + 4;
 
 /// Every frame here is within what the server will buffer for one frame, and no
 /// stream breaks a rule of its own — so the bound that has to catch this is the
 /// one on their sum, and what it catches is the request rather than the
 /// connection carrying it (D77).
 ///
-/// Authenticated first, because the budget is now only *reachable* there. An
-/// unauthenticated connection is held to `quic::INITIAL_BIDI_STREAMS` request
-/// streams at once, and sixteen full-sized field sections are exactly the
-/// budget — so a peer that has proved nothing can meet it and never overshoot
-/// it, and this test's twenty streams cannot all be open. That is the clamp
-/// doing D77's job before D77 is asked, not D77 becoming untestable: what still
-/// has to hold is the budget on a connection with the configured 1024 streams
-/// to spend, which is what this now measures.
+/// Authenticated first: an unauthenticated connection is held to
+/// `quic::INITIAL_BIDI_STREAMS` = 16 streams, which is exactly the budget, so
+/// twenty announcements need the configured allowance.
 #[tokio::test(flavor = "multi_thread")]
 async fn headers_buffered_across_a_connection_are_bounded() {
     let server = TestServer::start().await;
@@ -965,12 +928,12 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     // tasks reach them in, so all of them are read at once and only the count is
     // asserted.
     let mut streams = Vec::new();
-    for _ in 0..streams_past_the_budget() {
+    for _ in 0..STREAMS_PAST_THE_BUDGET {
         streams.push(announce_full_sized_headers(&connection).await);
     }
-    let mut batch = collect_refusals(streams, streams_past_the_budget());
+    let mut batch = collect_refusals(streams, STREAMS_PAST_THE_BUDGET);
 
-    for _ in FULL_SIZED_FRAMES_THAT_FIT..streams_past_the_budget() {
+    for _ in FULL_SIZED_FRAMES_THAT_FIT..STREAMS_PAST_THE_BUDGET {
         let (_, response) = tokio::time::timeout(TIMEOUT, batch.answers.recv())
             .await
             .expect("a stream past the buffering budget must be refused")
@@ -1016,8 +979,8 @@ async fn a_connection_of_complete_requests_never_reaches_the_budget() {
         &full_sized_connect_section(&target.to_string()),
     );
 
-    let mut tunnels = Vec::with_capacity(streams_past_the_budget());
-    for index in 0..streams_past_the_budget() {
+    let mut tunnels = Vec::with_capacity(STREAMS_PAST_THE_BUDGET);
+    for index in 0..STREAMS_PAST_THE_BUDGET {
         let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
         send.write_all(&frame)
             .await
