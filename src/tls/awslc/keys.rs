@@ -8,14 +8,11 @@
 //! build as libssl, and it uses the same AEAD and header protection primitives
 //! rustls's QUIC keys use.
 //!
-//! The keys of every level are made here, the Initial keys included. rustls
-//! exports the Initial keys (`quic::Keys::initial`), but no way to make a
-//! packet key from a secret libssl hands over: `KeyBuilder`, `Secrets::new`
-//! and `AeadKey::with_length` are `pub(crate)`, and `AeadKey`'s public
-//! constructor makes 32-byte keys only, so an AES-128 key cannot be built from
-//! outside. One implementation for every level is simpler than two. Neither
-//! quinn nor rustls exports the Retry key. The unit tests below check every
-//! value against RFC 9001 Appendix A.
+//! rustls cannot build a packet key from a secret it did not derive
+//! (`KeyBuilder`, `Secrets::new` and `AeadKey::with_length` are `pub(crate)`),
+//! and neither quinn nor rustls exports the Retry key, so every level's keys
+//! are made here, the Initial and Retry keys included. The unit tests below
+//! check every value against RFC 9001 Appendix A.
 
 #![forbid(unsafe_code)]
 
@@ -206,8 +203,8 @@ fn expand_label_prk(prk: &hkdf::Prk, label: &[u8], out: &mut [u8]) {
 /// One direction's traffic secret, with the suite that derived it.
 ///
 /// The bytes are cleared when the value is dropped, so a secret that libssl
-/// handed over and quinn no longer needs does not stay in freed memory.
-#[derive(Clone)]
+/// handed over and quinn no longer needs does not stay in freed memory. It is
+/// not `Clone`, so a secret is not copied by accident.
 pub(crate) struct Secret {
     pub(crate) suite: Suite,
     pub(crate) bytes: Zeroizing<Vec<u8>>,
