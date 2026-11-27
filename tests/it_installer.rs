@@ -208,16 +208,17 @@ fn the_placeholder_password_never_survives() {
         "the example placeholder password reached the generated config:\n{text}"
     );
 
-    // The installer's second layer is its own `grep` for the placeholder, a
-    // literal in the script; it is only a layer while it names the same string
-    // the crate does.
-    let script = fs::read_to_string(repo_root().join("script/install-selfsigned.sh"))
-        .expect("the installer script must be readable");
+    // The installer's own refusal is the second layer. An example that still
+    // names the placeholder anywhere, a comment included, must be refused.
+    let root = scratch_tree("install", "placeholder", &[]);
+    let script = plant_script_dir(&root, &format!("\n# {EXAMPLE_PLACEHOLDER_PASSWORD}\n"));
+    let output = run_within_deadline(installer(&script).args(["--print-config", "-w", "hunter2"]));
     assert!(
-        script.contains(&format!("'{EXAMPLE_PLACEHOLDER_PASSWORD}'")),
-        "script/install-selfsigned.sh no longer greps for the crate's placeholder \
-         password {EXAMPLE_PLACEHOLDER_PASSWORD:?}, so its refusal to install a file \
-         that still carries it has drifted from the string the example ships"
+        !output.status.success()
+            && stderr_of(&output).contains("the example placeholder password survived"),
+        "an example that names the crate's placeholder password {EXAMPLE_PLACEHOLDER_PASSWORD:?} \
+         must be refused: {}",
+        stderr_of(&output)
     );
 
     // With no password given, one is generated -- and it is not empty or trivial.
@@ -361,8 +362,25 @@ fn plant_argv_recorders(dir: &Path, stubs: &Path, tools: &[&str]) -> PathBuf {
 /// [`the_password_is_on_no_command_line_the_installer_runs`] call, with
 /// nothing else on `PATH`, and that test holds it to exactly that.
 const INSTALLER_TOOLS: &[&str] = &[
-    "awk", "cat", "chmod", "chown", "cut", "date", "dirname", "grep", "hostname", "id", "install",
-    "mktemp", "mv", "openssl", "rm", "sleep", "systemctl", "ufw", "wc",
+    "awk",
+    "cat",
+    "chmod",
+    "chown",
+    "cut",
+    "date",
+    "dirname",
+    "grep",
+    "hostname",
+    "id",
+    "install",
+    "mktemp",
+    "mv",
+    "openssl",
+    "rm",
+    "sleep",
+    "systemctl",
+    "ufw",
+    "wc",
 ];
 
 /// Looked up by the installer with `command -v` and never run.
@@ -406,7 +424,11 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
         &stubs.join("ufw"),
         "#!/bin/sh\n[ \"$1\" = status ] && echo 'Status: active'\nexit 0\n",
     );
-    let planted: Vec<&str> = INSTALLER_TOOLS.iter().chain(LOOKED_UP_ONLY).copied().collect();
+    let planted: Vec<&str> = INSTALLER_TOOLS
+        .iter()
+        .chain(LOOKED_UP_ONLY)
+        .copied()
+        .collect();
     let recorders = plant_argv_recorders(&root.join("recorders"), &stubs, &planted);
     let missing = root.join("missing");
 
@@ -1230,11 +1252,7 @@ fn run_full_install(root: &Path, service_status: &str) -> Output {
 
 /// Runs the full install path with `stubs` in front of `PATH`, which a test uses
 /// to replace one of the stand-ins the builder wrote.
-fn run_full_install_with_stubs(
-    root: &Path,
-    stubs: &Path,
-    extra_args: &[&str],
-) -> Output {
+fn run_full_install_with_stubs(root: &Path, stubs: &Path, extra_args: &[&str]) -> Output {
     run_within_deadline(
         installer(&installer_script())
             .args([
