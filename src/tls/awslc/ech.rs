@@ -160,25 +160,28 @@ impl EchKey {
 
     /// Parses the two PEM blocks and checks that they belong together.
     ///
-    /// The decoded private key is cleared on drop. The PEM parser's own base64
-    /// buffer, which held it as text, is dropped uncleared by rustls-pki-types
-    /// and cannot be reached from here.
+    /// Every decoded block is cleared on drop, on the refusal paths too. The
+    /// PEM parser's own base64 buffer, which held each block as text, is
+    /// dropped uncleared by rustls-pki-types and cannot be reached from here.
     pub fn from_pem(pem: &[u8]) -> Result<Self> {
         let mut key_der: Option<Zeroizing<Vec<u8>>> = None;
         let mut list: Option<Vec<u8>> = None;
         for item in <(SectionKind, Vec<u8>)>::pem_slice_iter(pem) {
             let (kind, der) = item.context("not a well-formed PEM file")?;
+            // Cleared on every path, the refusals below included: a block of
+            // any kind may hold a private key.
+            let der = Zeroizing::new(der);
             match kind {
                 SectionKind::PrivateKey => {
                     ensure!(
                         key_der.is_none(),
                         "it holds more than one PRIVATE KEY block"
                     );
-                    key_der = Some(Zeroizing::new(der));
+                    key_der = Some(der);
                 }
                 SectionKind::EchConfigList => {
                     ensure!(list.is_none(), "it holds more than one ECHCONFIG block");
-                    list = Some(der);
+                    list = Some(der.to_vec());
                 }
                 other => bail!(
                     "it holds a {other:?} block, and an ECH key file holds only a PRIVATE KEY and an ECHCONFIG"
