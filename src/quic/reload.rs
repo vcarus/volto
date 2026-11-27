@@ -182,19 +182,11 @@ impl ReloadHandle {
             quic: Arc::new(quic_config),
         });
 
-        // Everything from the latch read to the last write is one step, and the
-        // drain takes the same lock around its own `set_server_config`. Held
-        // here rather than only around the writes because the latch is a
-        // check-then-act: reading it and then re-opening the listener is
-        // precisely the race D22 forbids. Every parse above is deliberately
-        // outside it, so a `SIGHUP` with a large certificate cannot delay a
-        // drain that is waiting for this.
-        //
-        // The guard covers the latch read through the last write and nothing
-        // after it. It is dropped straight after `set_server_config`, before the
-        // log lines and the fd check: those report what was swapped rather than
-        // decide it, and holding the guard across them would let a blocked log
-        // sink stall the drain, which takes it before closing the endpoint.
+        // Held from the latch read through the last write, because reading the
+        // latch and then re-opening the listener is the race D22 forbids. Every
+        // parse is before it and every report after it, so neither a large
+        // certificate nor a blocked log sink can delay a drain that waits for
+        // it.
         let swapping = self.swap.hold();
 
         // A reload during shutdown must not re-open the listener that `drain` just
@@ -232,12 +224,7 @@ impl ReloadHandle {
         // endpoint never holds a configuration the slot does not hold yet; an
         // accept between the two states the new configuration over an
         // `Incoming` the endpoint's old copy opened, as for any handshake
-        // queued before a reload. `Gate::poll_recv` and quinn-proto's
-        // first-Initial read see the gate's list before the endpoint's
-        // configuration, the order the first paragraph gives. `admit` and
-        // `Server::shutdown_grace` each read one key of the live `Config` and
-        // compare it with nothing else, so the order does not change what they
-        // see.
+        // queued before a reload.
         //
         // One flight can still be answered across this swap. A flight the
         // gate admitted under a key this reload removes, and whose datagrams
