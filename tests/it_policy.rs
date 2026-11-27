@@ -742,7 +742,7 @@ async fn tcp_and_udp_tunnels_share_the_quota() {
 }
 
 /// The slot has to come back when a tunnel ends, or a long-lived connection
-/// slowly dies. This is the leak test in miniature; `it_stress` runs it 500 times.
+/// slowly dies.
 #[tokio::test]
 async fn a_finished_tunnel_returns_its_slot() {
     let server = TestServer::start_with(&format!(
