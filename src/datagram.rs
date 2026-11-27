@@ -29,9 +29,8 @@ pub const MAX_UDP_PAYLOAD: usize = 65527;
 
 /// Largest legal Quarter Stream ID (RFC 9297 §2.1).
 ///
-/// "The largest legal QUIC stream ID value is 2^62-1, so the largest legal value
-/// of the Quarter Stream ID field is 2^60-1." A varint can carry more than that,
-/// so the excess has to be rejected here rather than assumed away.
+/// RFC 9297 §2.1, quoted at `h3::router::route_datagram`: a varint can carry
+/// more, so the excess is rejected here.
 pub const MAX_QUARTER_STREAM_ID: u64 = (1 << 60) - 1;
 
 /// Why a datagram could not be decoded.
