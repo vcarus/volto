@@ -727,5 +727,60 @@ pub fn expect_reset<'a>(
             ),
             other => panic!("at {caller}: {what}: expected a reset with {code:#x}, got {other:?}"),
         }
+
+/// Writes `request`, a request stream's opening bytes that the server will
+/// accept, on a connection that grants no stream window, and asserts that the
+/// server resets the stream rather than wait for the window, and keeps the
+/// connection.
+///
+/// The 200 that opens a tunnel or a session is bounded like every refusal. It
+/// is written after the target socket exists, and the task that would notice
+/// the client giving up starts only after this write, so a peer that grants no
+/// flow-control credit would otherwise park the request task with the socket
+/// in its hand for as long as the connection lasts. RFC 9114 §8.1's
+/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
+/// response) is cancelled", and a reset is the only end that reaches a peer
+/// granting no window at all.
+#[track_caller]
+pub fn withheld_200_is_reset(
+    server: &super::TestServer,
+    request: Vec<u8>,
+) -> impl Future<Output = ()> + '_ {
+    let caller = Location::caller();
+    async move {
+        let (_endpoint, connection) = super::windowless_connection_at(server, caller).await;
+
+        let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
+        send.write_all(&request)
+            .await
+            .unwrap_or_else(|error| panic!("at {caller}: the request was not sent: {error}"));
+
+        // Waited for rather than slept past: `received_reset` observes the reset
+        // without granting the flow-control credit an ordinary read would, which
+        // is the reason a window this small is the setup.
+        let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("at {caller}: the server must not wait for a window that is not coming")
+            })
+            .unwrap_or_else(|error| {
+                panic!("at {caller}: a 200 the peer would not take must end in a reset: {error}")
+            });
+        assert_eq!(
+            reset.map(quinn::VarInt::into_inner),
+            Some(H3_REQUEST_CANCELLED),
+            "at {caller}: an abandoned 200 is a cancelled request"
+        );
+
+        // One request that could not be answered is not a reason to drop
+        // everything else on the connection. Waited for rather than read once:
+        // a close sent a moment after the reset would still be in flight when
+        // the reset arrived.
+        let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
+        assert!(
+            closed.is_err(),
+            "at {caller}: the connection must survive a request whose 200 could not be \
+             delivered: {closed:?}"
+        );
     }
 }

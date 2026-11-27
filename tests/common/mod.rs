@@ -1974,4 +1974,25 @@ pub fn impatient_transport() -> quinn::TransportConfig {
     transport.max_idle_timeout(Some(CLIENT_IDLE.try_into().expect("a legal idle timeout")));
     transport.keep_alive_interval(None);
     transport
+
+/// A raw QUIC connection to `server` on [`windowless_transport`], for a test
+/// whose subject is a response the server cannot deliver.
+#[track_caller]
+pub fn windowless_connection(
+    server: &TestServer,
+) -> impl Future<Output = (quinn::Endpoint, quinn::Connection)> + '_ {
+    windowless_connection_at(server, Location::caller())
+}
+
+/// [`windowless_connection`] with `caller` already captured.
+pub async fn windowless_connection_at(
+    server: &TestServer,
+    caller: &'static Location<'static>,
+) -> (quinn::Endpoint, quinn::Connection) {
+    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
+    let connection = finish_connect(&endpoint, server.addr)
+        .await
+        .unwrap_or_else(|error| panic!("the handshake at {caller} failed: {error}"));
+
+    (endpoint, connection)
 }

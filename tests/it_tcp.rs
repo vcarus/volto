@@ -12,14 +12,14 @@ use common::h3client::{ends_with_no_body, ends_with_reset};
 use common::rawstream::{
     FRAME_DATA, FRAME_HEADERS, H3_CONNECT_ERROR, H3_FRAME_UNEXPECTED, H3_MESSAGE_ERROR,
     H3_REQUEST_CANCELLED, close_reason, connect_headers_frame, frame, headers_frame, read_frame,
-    status_of,
+    status_of, withheld_200_is_reset,
 };
 use common::{
     ALLOW_PRIVATE, ConnectionEnd, DELIBERATE, H3Client, TIMEOUT, TestServer, assert_peer_reset,
-    client_endpoint_with_transport, closed_address, connect_request, echoes, finish_connect,
-    h3_server_endpoint, open_tcp_tunnel, proxy_status, read_at_least, read_to_end, respond_to,
-    send_and_respond, spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
-    spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_transport,
+    closed_address, connect_request, echoes, finish_connect, h3_server_endpoint, open_tcp_tunnel,
+    proxy_status, read_at_least, read_to_end, respond_to, send_and_respond,
+    spawn_drain_then_reply_target, spawn_echo_target, spawn_end_reporting_target,
+    spawn_flood_then_reset_target, spawn_reset_after_read_target, windowless_connection,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -1466,53 +1466,15 @@ async fn a_target_that_stops_reading_after_its_own_eof_is_cut() {
     );
 }
 
-/// The 200 that opens a tunnel is bounded like every refusal.
-///
-/// It is the one response written after a target connection exists, which used
-/// to be the argument for exempting it — but the pumps that would notice the
-/// client giving up are started by the line *after* this write, so a peer that
-/// grants no flow-control credit parks the request task with the target socket
-/// in its hand for as long as the connection lasts. RFC 9114 §8.1's
-/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
-/// response) is cancelled", and a reset is the only end that reaches a peer
-/// granting no window at all.
+/// The 200 that opens a tunnel, withheld by a peer that grants no stream
+/// window, is reset rather than waited for, and the connection lives
+/// (`rawstream::withheld_200_is_reset` says why).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tunnel_200_the_peer_will_not_take_is_reset() {
     let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
     let target = spawn_echo_target().await;
 
-    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
-    let connection = finish_connect(&endpoint, server.addr)
-        .await
-        .expect("handshake");
-
-    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
-    send.write_all(&connect_headers_frame(&target.to_string()))
-        .await
-        .expect("send a CONNECT that will be accepted");
-
-    // Waited for rather than slept past: `received_reset` observes the reset
-    // without granting the flow-control credit an ordinary read would, which is
-    // the whole reason a window this small is the setup.
-    let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
-        .await
-        .expect("the server must not wait for a window that is not coming")
-        .expect("a 200 the peer would not take must end in a reset");
-    assert_eq!(
-        reset.map(quinn::VarInt::into_inner),
-        Some(H3_REQUEST_CANCELLED),
-        "an abandoned 200 is a cancelled request"
-    );
-
-    // One tunnel that could not be opened is not a reason to drop everything
-    // else on the connection.
-    // Waited for rather than read once: a close sent a moment after the reset
-    // would still be in flight when the reset arrived.
-    let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
-    assert!(
-        closed.is_err(),
-        "the connection must survive a tunnel whose 200 could not be delivered: {closed:?}"
-    );
+    withheld_200_is_reset(&server, connect_headers_frame(&target.to_string())).await;
 }
 
 /// The target of a 200 that could not be delivered is closed with a reset, not
@@ -1531,10 +1493,7 @@ async fn the_target_of_a_200_the_peer_will_not_take_is_reset_too() {
     let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
     let (target, mut ended) = spawn_end_reporting_target().await;
 
-    let endpoint = client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
-    let connection = finish_connect(&endpoint, server.addr)
-        .await
-        .expect("handshake");
+    let (_endpoint, connection) = windowless_connection(&server).await;
 
     let (mut send, _recv) = connection.open_bi().await.expect("open a request stream");
     send.write_all(&connect_headers_frame(&target.to_string()))

@@ -8,13 +8,16 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::h3client::{ends_cleanly, ends_with_reset, stops_with_no_error_at_once};
-use common::rawstream::{H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_REQUEST_CANCELLED};
+use common::rawstream::{
+    H3_DATAGRAM_ERROR, H3_MESSAGE_ERROR, H3_REQUEST_CANCELLED, connect_udp_headers_frame,
+    withheld_200_is_reset,
+};
 use common::{
     ALLOW_PRIVATE, DELIBERATE, H3Client, TIMEOUT, TestServer, closed_udp_address,
     connect_udp_request, open_udp_session, open_udp_session_to, respond_to, send_udp_payload,
     spawn_bursting_udp_target, spawn_flooding_udp_target, spawn_pushing_udp_target,
     spawn_silent_udp_target, spawn_tagged_udp_target, spawn_udp_echo_target, spawn_udp_target,
-    udp_round_trip, windowless_transport,
+    udp_round_trip,
 };
 use volto::datagram;
 use volto::h3api::{FieldValue, Method, Request, Status};
@@ -1315,58 +1318,20 @@ async fn a_client_that_stops_reading_capsules_gets_the_stream_reset() {
     let (_, _second) = open_udp_session(&mut client, &server, echo).await;
 }
 
-/// The 200 that opens a session is bounded like every refusal.
-///
-/// The socket is already bound by the time this write happens, which used to be
-/// the argument for exempting it — but the session loop that would notice the
-/// client giving up is started by the line *after* this write, so a peer that
-/// grants no flow-control credit parks the request task with the target socket
-/// and the Quarter Stream ID claim in its hand. RFC 9114 §8.1's
-/// H3_REQUEST_CANCELLED covers "The request or its response (including pushed
-/// response) is cancelled", and a reset is the only end that reaches a peer
-/// granting no window at all.
+/// The 200 that opens a session, withheld by a peer that grants no stream
+/// window, is reset rather than waited for, and the connection lives
+/// (`rawstream::withheld_200_is_reset` says why). Here the request task holds
+/// the Quarter Stream ID claim as well as the target socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_200_the_peer_will_not_take_is_reset() {
     let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
     let target = spawn_udp_echo_target().await;
 
-    let endpoint =
-        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
-    let connection = common::finish_connect(&endpoint, server.addr)
-        .await
-        .expect("handshake");
-
-    let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
-    send.write_all(&common::rawstream::connect_udp_headers_frame(
-        &server.addr.to_string(),
-        "127.0.0.1",
-        target.port(),
-    ))
-    .await
-    .expect("send a connect-udp request that will be accepted");
-
-    // Waited for rather than slept past: `received_reset` observes the reset
-    // without granting the flow-control credit an ordinary read would, which is
-    // the whole reason a window this small is the setup.
-    let reset = tokio::time::timeout(TIMEOUT, recv.received_reset())
-        .await
-        .expect("the server must not wait for a window that is not coming")
-        .expect("a 200 the peer would not take must end in a reset");
-    assert_eq!(
-        reset.map(quinn::VarInt::into_inner),
-        Some(H3_REQUEST_CANCELLED),
-        "an abandoned 200 is a cancelled request"
-    );
-
-    // One session that could not be opened is not a reason to drop everything
-    // else on the connection.
-    // Waited for rather than read once: a close sent a moment after the reset
-    // would still be in flight when the reset arrived.
-    let closed = tokio::time::timeout(Duration::from_millis(300), connection.closed()).await;
-    assert!(
-        closed.is_err(),
-        "the connection must survive a session whose 200 could not be delivered: {closed:?}"
-    );
+    withheld_200_is_reset(
+        &server,
+        connect_udp_headers_frame(&server.addr.to_string(), "127.0.0.1", target.port()),
+    )
+    .await;
 }
 
 /// And no packet is forwarded for a session that 200 was going to open.
@@ -1392,15 +1357,11 @@ async fn a_session_whose_200_never_landed_forwards_nothing() {
     let server = TestServer::start_with(&format!("{DELIBERATE}{ALLOW_PRIVATE}")).await;
     let (target, received) = spawn_silent_udp_target().await;
 
-    let endpoint =
-        common::client_endpoint_with_transport(&server.ca, &["h3"], windowless_transport());
-    let connection = common::finish_connect(&endpoint, server.addr)
-        .await
-        .expect("handshake");
+    let (_endpoint, connection) = common::windowless_connection(&server).await;
 
     let (mut send, mut recv) = connection.open_bi().await.expect("open a request stream");
     let quarter_stream_id = datagram::quarter_stream_id(u64::from(send.id()));
-    send.write_all(&common::rawstream::connect_udp_headers_frame(
+    send.write_all(&connect_udp_headers_frame(
         &server.addr.to_string(),
         "127.0.0.1",
         target.port(),
