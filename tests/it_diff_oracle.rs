@@ -18,8 +18,6 @@
 //!   transcription with itself; the table below is a second implementation's
 //!   copy, so a mistyped entry -- a decoder that quietly reports the wrong
 //!   field name -- fails here.
-//!
-//! Every RFC sentence quoted below was read from the RFC, not remembered.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the oracle packs bytes the way the decoder under test reads them.
