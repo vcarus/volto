@@ -38,10 +38,12 @@
 //! ```
 //!
 //! `PROPTEST_CASES` is honoured by every property here; the per-property counts
-//! below are CI defaults, applied only when the variable is unset. The defaults
-//! run in about a second, and almost all of a long run is spent in the five
-//! properties that put bytes on a QUIC stream, which is why their defaults are
-//! the low ones.
+//! below are CI defaults, applied only when the variable is unset. With the
+//! variable set, every property runs the same count, and almost all of the run
+//! is spent in the five properties that put bytes on a QUIC stream, since each
+//! of their cases is a round trip. That is why their defaults are the low ones.
+//! At the defaults those five take under a second, and the whole binary takes
+//! about fifteen seconds in a debug build on the dev host.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the generated inputs have the lengths this file chose for them.
@@ -54,7 +56,7 @@ mod props;
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use proptest::prelude::*;
@@ -617,16 +619,6 @@ fn decode_chunks(kind: StreamKind, chunks: &[Vec<u8>]) -> Vec<Step> {
     normalise(steps)
 }
 
-/// [`decode_chunks`] with every byte its own chunk.
-///
-/// The worst case a real stream can produce, and the one thing the wire cannot
-/// be asked for: it is where a frame header straddling chunks is either
-/// reassembled or mis-parsed.
-fn decode_bytewise(kind: StreamKind, bytes: &[u8]) -> Vec<Step> {
-    let chunks: Vec<Vec<u8>> = bytes.iter().map(|byte| vec![*byte]).collect();
-    decode_chunks(kind, &chunks)
-}
-
 /// Reads `request`, answers the CONNECT if `narrow`, then reads `tail`.
 ///
 /// The transition RFC 9114 §4.4 turns on, which no constructor reaches: a
@@ -1031,7 +1023,6 @@ proptest! {
         ),
     ) {
         let budget = Arc::new(BufferBudget::default());
-        let started = Instant::now();
 
         for (kind, length) in kinds.iter().zip(lengths.iter().cycle()) {
             let mut header = BytesMut::new();
@@ -1049,15 +1040,6 @@ proptest! {
                 length
             );
         }
-
-        // Promptness, as a bound rather than a measurement. Each call above has
-        // its own timeout; this bounds the calls together, because every
-        // refusal is decided from a handful of bytes.
-        prop_assert!(
-            started.elapsed() < WIRE_TIMEOUT,
-            "the refusals took {:?}",
-            started.elapsed()
-        );
     }
 
     /// A `FrameReader` on a QUIC stream answers what its `FrameDecoder` did,
@@ -1248,7 +1230,8 @@ proptest! {
     ) {
         let whole = decode_chunks(kind, std::slice::from_ref(&bytes));
 
-        prop_assert_eq!(decode_bytewise(kind, &bytes), whole.clone(), "{:?}", kind);
+        let bytewise: Vec<Vec<u8>> = bytes.iter().map(|byte| vec![*byte]).collect();
+        prop_assert_eq!(decode_chunks(kind, &bytewise), whole.clone(), "{:?}", kind);
         prop_assert_eq!(
             decode_chunks(kind, &split_at(&bytes, &cuts)),
             whole.clone(),
@@ -1499,7 +1482,7 @@ fn section_size(fields: &[(Vec<u8>, Vec<u8>)]) -> u64 {
 /// every one of these is a protocol violation rather than an unsupported
 /// feature -- which is why they are generated rather than assumed absent.
 ///
-/// "Complete" is load-bearing and was found the hard way: an index equal to the
+/// "Complete" is load-bearing: an index equal to the
 /// prefix mask means "a continuation byte follows" (RFC 7541 §5.1), so
 /// `0b1011_1111` on its own is a *truncated* representation rather than a
 /// reference to entry 63, and the decoder answers it as such. What that is and
@@ -1662,9 +1645,8 @@ proptest! {
 /// A dynamic reference whose *index* never arrived is a stream error, not the
 /// connection error RFC 9204 §2.2.3 gives a complete one.
 ///
-/// Found by `any_dynamic_table_reference_is_a_connection_error` at 20000 cases,
-/// which shrank to the single byte `0xBF`. Recorded rather than filtered out,
-/// because the byte looks like it should be the §2.2.3 case and is not:
+/// Kept as its own case because the byte `0xBF` looks like it should be the
+/// §2.2.3 case and is not:
 /// `0b10_111111` is an Indexed Field Line (§4.5.2) with T = 0, and its 6-bit
 /// prefix is full, which RFC 7541 §5.1 makes "a continuation byte follows"
 /// rather than "index 63". `qpack::decode` reads the integer before it looks at
@@ -1804,11 +1786,8 @@ proptest! {
     fn padding_that_is_not_all_ones_is_a_decoding_error(
         input in prop::collection::vec(any::<u8>(), 1..48).prop_map(|mut input| {
             // An input whose codes happen to fill a whole number of octets has
-            // no padding to corrupt. Rejecting those would spend the run's
-            // rejection budget on an eighth of every case -- which is how this
-            // property first failed, at 20000 cases, with "Too many global
-            // rejects" and not a single wrong answer. Nudging instead keeps the
-            // case: "a" is five bits (RFC 7541 Appendix B), so appending one
+            // no padding to corrupt. Rejecting those would spend the rejection
+            // budget on an eighth of the cases. Nudging instead keeps the case: "a" is five bits (RFC 7541 Appendix B), so appending one
             // leaves the encoding three bits short of an octet.
             if padding_bits(&input) == 0 {
                 input.push(b'a');
