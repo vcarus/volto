@@ -110,10 +110,8 @@ use volto::varint;
 
 /// A pass-through allocator that counts what goes through it.
 ///
-/// The point is ADR D29: the UDP outbound path allocates one `BytesMut` per
-/// packet, and the question that shelved it was how much that costs. A global
-/// counter answers "how many allocations per packet does the whole pipeline
-/// make", which bounds the answer from above no matter where they come from.
+/// A global counter bounds the allocations per packet of the whole pipeline
+/// from above, wherever they come from.
 ///
 /// Reallocation counts as one allocation of the growth, which is what makes a
 /// `Vec` that doubles look like the several allocations it really is.
@@ -1196,8 +1194,6 @@ async fn bench_udp_small_datagrams() {
     let budget = seconds();
 
     udp_direction("udp_64_client_to_target", 64, count, budget, udp_uplink).await;
-    // The D29 direction: one `BytesMut` per outbound datagram, at the packet
-    // size where per-packet cost matters most.
     udp_direction("udp_64_target_to_client", 64, count, budget, udp_downlink).await;
 }
 
@@ -1252,65 +1248,6 @@ async fn bench_concurrent_tunnels() {
         max_rss_bytes().saturating_sub(baseline) as f64 / (1024.0 * 1024.0),
         max_rss_bytes().saturating_sub(baseline) as f64 / 1024.0 / at_once as f64,
     );
-}
-
-/// The allocation ADR D29 is about, timed on its own.
-///
-/// `forward_to_client` calls `datagram::encode_udp_payload` once per packet,
-/// which allocates a `BytesMut` and copies the payload into it behind the two
-/// varints. This measures that call against the same copy into a buffer that is
-/// already there — the difference is the whole of what an amortised buffer could
-/// save, before any of the plumbing such a change would need.
-///
-/// Single-threaded and allocator-warm, so it is an optimistic bound on the
-/// saving rather than a pessimistic one.
-#[test]
-#[ignore = "benchmark: run it deliberately, with --release --nocapture"]
-fn bench_datagram_encode() {
-    header();
-    const ITERATIONS: u64 = 2_000_000;
-
-    for size in [64usize, 1200] {
-        let payload = vec![0x5au8; size];
-
-        // Warm-up, and a check that the optimiser cannot delete the call.
-        let mut checksum = 0u64;
-        for _ in 0..ITERATIONS / 10 {
-            let encoded = datagram::encode_udp_payload(4242, std::hint::black_box(&payload));
-            checksum += encoded.len() as u64;
-        }
-
-        let window = Window::open();
-        for _ in 0..ITERATIONS {
-            let encoded = datagram::encode_udp_payload(4242, std::hint::black_box(&payload));
-            checksum += encoded.len() as u64;
-        }
-        let encode = window.close();
-
-        // The same work with the allocation taken out: the copy stays, the
-        // malloc/free pair goes.
-        let mut scratch = vec![0u8; size + 16];
-        let window = Window::open();
-        for _ in 0..ITERATIONS {
-            let payload = std::hint::black_box(&payload);
-            scratch[0] = 0x50;
-            scratch[1] = 0x92;
-            scratch[2] = 0x00;
-            scratch[3..3 + size].copy_from_slice(payload);
-            checksum += std::hint::black_box(scratch[3] as u64);
-        }
-        let copy = window.close();
-
-        std::hint::black_box(checksum);
-        let per_encode = encode.wall.as_secs_f64() * 1e9 / ITERATIONS as f64;
-        let per_copy = copy.wall.as_secs_f64() * 1e9 / ITERATIONS as f64;
-        println!(
-            "bench datagram_encode_{size}: {per_encode:.1} ns/call ({:.2} allocs/call), \
-             copy-only {per_copy:.1} ns/call, allocation costs {:.1} ns/packet",
-            encode.allocs as f64 / ITERATIONS as f64,
-            per_encode - per_copy,
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
