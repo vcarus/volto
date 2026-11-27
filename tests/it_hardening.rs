@@ -110,15 +110,19 @@ async fn spends_the_budget(client: &mut H3Client, request: Request, what: &str) 
     .await;
 }
 
-/// Past the cap, new connections are refused at the QUIC layer rather than
-/// accepted and served.
+/// At the cap, with every connection authenticated, a new connection is
+/// refused at the QUIC layer rather than accepted and served.
+///
+/// A full roster evicts its oldest unauthenticated connection to make room, so
+/// refusal is the answer only when there is nothing to evict.
 #[tokio::test]
-async fn the_connection_cap_refuses_further_connections() {
+async fn a_full_roster_of_authenticated_connections_refuses_the_next() {
     let server =
         TestServer::start_with(&format!("[limits]\nmax_connections = 2\n{ALLOW_PRIVATE}")).await;
     let target = spawn_echo_target().await;
 
-    // Two connections, both usable.
+    // Two connections, each authenticated by the tunnel it opens, which is
+    // what leaves nothing to evict.
     let mut first = H3Client::connect(&server).await;
     let mut second = H3Client::connect(&server).await;
     for client in [&mut first, &mut second] {
@@ -183,8 +187,8 @@ async fn a_closed_connection_frees_its_slot() {
 /// zero -- and an operator who asked for no limit would get a server that refuses
 /// every connection it is offered.
 ///
-/// Three unauthenticated peers, which is one more than the smallest cap that
-/// would let all three coexist, and none of them is disturbed by the next.
+/// Three unauthenticated peers, one more than the largest cap (2) that would
+/// evict one of them, and none of them is disturbed by the next.
 #[tokio::test]
 async fn a_zero_connection_cap_admits_everyone_and_evicts_nobody() {
     let server =
