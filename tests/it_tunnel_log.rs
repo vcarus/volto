@@ -1,27 +1,21 @@
-//! The three tunnel log lines whose *level* and *wording* are the product.
+//! Two tunnel log lines whose *level* and *wording* are the product.
 //!
-//! Each of these lines is read by something other than a person debugging: the
-//! DNS-blackhole line was demoted to INFO so that `journalctl -p warning` means
-//! something again (D44, 89% of a day's warnings were that one line), the policy
-//! refusal is INFO since the 2026-11-12 user ruling (D111) because it is the
-//! intended answer to a client that names a private target, and the
-//! oversized-datagram line is the only sentinel watching whether the peer has
-//! lowered `max_datagram_frame_size` under us (D48 §3).
+//! The blackhole line is INFO (D44, D49), and the oversize line is the sentinel
+//! for the peer's `max_datagram_frame_size` (D48 §3). The policy refusal, INFO
+//! by D111, is held by `it_log_amplification`.
 //!
 //! None of that is visible to a test that only checks the response: the decision
 //! functions behind these lines (`policy::is_dns_blackhole`, `tunnel::udp::path::grade`)
 //! are unit-tested and stay green if the line they feed is renamed, demoted, or
 //! bypassed entirely. That last hop is what this binary drives.
 //!
-//! One test function, because `tracing_subscriber::fmt().init()` may run once per
-//! process. The scenarios are attributed to each other by taking a mark into the
-//! shared buffer before each one and only reading the lines logged after it.
+//! One test function, for the reason `SharedBuffer::shared` gives.
 
 mod common;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, field_text,
-    numeric_field, open_udp_session, respond_to, send_udp_payload, spawn_udp_target,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, field_text, numeric_field,
+    open_udp_session, respond_to, send_udp_payload, spawn_udp_target,
 };
 use volto::h3api::Status;
 
@@ -88,11 +82,8 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
 /// is demoted or the call site bypassed, the journal shows zero occurrences —
 /// byte for byte what "no drops are happening" looks like.
 ///
-/// The schedule replaced a plain "first only" flag (`logfmt::Sampler`, D97): the
-/// first drop is as immediate as it ever was, and what follows now says how far
-/// the count has got instead of nothing at all. Driven one packet at a time and
-/// asserted after each, so the test names the exact drop a report was owed for
-/// rather than counting lines at the end and hoping.
+/// Driven one packet at a time and asserted after each reported drop, so a
+/// failure names the drop.
 async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuffer) {
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     // Comfortably above any QUIC datagram limit on a 1200-1500 byte path.
@@ -108,16 +99,12 @@ async fn the_oversize_sentinel_reports_on_a_doubling_schedule(buffer: &SharedBuf
         .expect("the server must accept datagrams");
     assert!(limit < 8000, "the reply must not fit in a datagram");
 
-    let send_one = |nth: u8| {
-        send_udp_payload(&client.quic, qsid, &[nth]);
-    };
-
     // Eight drops on the one session, one packet at a time. `owed` is what the
     // schedule has promised so far: a report on the 1st, 2nd, 4th and 8th drop,
     // and nothing for the drops between them.
     let mut owed = 0usize;
     for nth in 1..=8u8 {
-        send_one(nth);
+        send_udp_payload(&client.quic, qsid, &[nth]);
 
         if nth.is_power_of_two() {
             owed += 1;
