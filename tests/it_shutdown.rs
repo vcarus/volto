@@ -20,11 +20,19 @@ use common::{
 /// (RFC 9000 §2.1), and so between one request and the next.
 const REQUEST_STREAM_STEP: u64 = 4;
 
-/// A tunnel that is in use when the signal arrives keeps working, and the server
-/// waits for it rather than dropping it.
+/// How long a server whose drain has nothing left to wait for may take to
+/// stop: far below the 300 s grace the tests that use it configure.
+const PROMPT_STOP: Duration = Duration::from_secs(15);
+
+/// A tunnel that is in use when the signal arrives keeps working, the server
+/// waits for it rather than dropping it, and the drain ends when it ends.
+///
+/// The grace period is 300 s and the stop is allowed 15 s, so a drain that
+/// waited out the grace instead of noticing the last tunnel end fails here.
 #[tokio::test]
 async fn an_established_tunnel_survives_goaway_and_finishes() {
-    let mut server = TestServer::start().await;
+    let mut server =
+        TestServer::start_with(&format!("shutdown_grace = 300\n{ALLOW_PRIVATE}")).await;
     let target = spawn_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -38,17 +46,18 @@ async fn an_established_tunnel_survives_goaway_and_finishes() {
     // directions afterwards.
     echoes(&mut stream, b"after!").await;
 
-    // Once the client is done, the server should finish its side and stop —
-    // well inside the default grace period.
+    // Once the client is done, the server finishes its side and stops.
     close_and_drain(&mut stream).await;
 
-    server.wait_until_stopped(STOP_TIMEOUT).await;
+    server.wait_until_stopped(PROMPT_STOP).await;
 }
 
-/// A UDP session is drained on the same terms as a TCP tunnel.
+/// A UDP session is drained on the same terms as a TCP tunnel, and ends the
+/// drain the same way.
 #[tokio::test]
 async fn an_established_udp_session_survives_goaway() {
-    let mut server = TestServer::start().await;
+    let mut server =
+        TestServer::start_with(&format!("shutdown_grace = 300\n{ALLOW_PRIVATE}")).await;
     let target = spawn_udp_echo_target().await;
     let mut client = H3Client::connect(&server).await;
 
@@ -67,7 +76,7 @@ async fn an_established_udp_session_survives_goaway() {
 
     // Closing the stream ends the session, which lets the server finish.
     stream.finish().expect("finish the request stream");
-    server.wait_until_stopped(STOP_TIMEOUT).await;
+    server.wait_until_stopped(PROMPT_STOP).await;
 }
 
 /// The GOAWAY names the first request the server will not serve, and a stream
