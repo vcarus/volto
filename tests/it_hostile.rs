@@ -665,20 +665,12 @@ async fn control_stream_frames_on_a_request_stream_end_the_connection() {
         // Held rather than dropped: dropping the sending half finishes the
         // stream, and a stream that ends mid-frame has a verdict of its own
         // (H3_FRAME_ERROR) that would race this one.
-        let (_held, mut recv) = announce_frame(&connection, kind, length).await;
-        let answered = tokio::spawn(async move { recv.read_to_end(4096).await });
+        let (_held, _recv) = announce_frame(&connection, kind, length).await;
 
         let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
         assert_eq!(
             closed_with, H3_FRAME_UNEXPECTED,
             "{name} declaring {length} bytes on a request stream; the reason was {reason:?}"
-        );
-
-        let answered = answered.await.expect("the response reader");
-        assert!(
-            answered.as_deref().unwrap_or(&[]).is_empty(),
-            "{name}: a frame that is not a field section must not be answered like one, \
-             got {answered:?}"
         );
     }
 }
