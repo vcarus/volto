@@ -73,6 +73,8 @@
 //! | `VOLTO_BENCH_CONCURRENT` | 500 | tunnels opened at once |
 //! | `VOLTO_BENCH_REPS` | 3 | measured repetitions after the warm-up |
 //! | `VOLTO_BENCH_SECONDS` | 0 | if set, UDP repetitions run for this long instead of a packet count (for profiling) |
+//! | `VOLTO_BENCH_FLIGHTS` | 20000 | first flights per gate-cost measurement |
+//! | `VOLTO_BENCH_HANDSHAKES` | 2000 | TLS handshakes per gate-cost comparison |
 
 // An argued exception to the package's `unsafe_code = "deny"`: `getrusage` is
 // raw libc FFI because rustix wraps no equivalent, and it only fills a struct
@@ -903,7 +905,7 @@ async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
         );
     }
 
-    // Drain: the last `IN_FLIGHT` packets are still in the pipeline. The end
+    // Drain: the last `UPLINK_IN_FLIGHT` packets are still in the pipeline. The end
     // instant is when the target stopped making progress, so a lossy run is not
     // charged for the time it spent waiting for packets that will never arrive.
     let mut seen = delivered.load(Ordering::Relaxed);
