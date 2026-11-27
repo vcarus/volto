@@ -799,11 +799,7 @@ itself.
 Every hand-written parser that reads bytes a peer chose also has a
 coverage-guided fuzz target under `fuzz/`. A scheduled workflow,
 `.github/workflows/fuzz.yml`, runs each target for ten minutes a day on a
-nightly toolchain and keeps the corpus between runs. The CI run of a pull
-request only type-checks them: `fuzz/` is a workspace of its own and its
-targets use items that are public only for them, so a
-rename in `src/` would otherwise break the fuzzers until the next scheduled
-run. `fuzz/README.md` maps each target to the parser
+nightly toolchain and keeps the corpus between runs. A pull request that changes `fuzz/` or that workflow also runs each target for a minute. Every pull request type-checks them (`ci.yml`'s `fuzz` job): `fuzz/` is a workspace of its own and its targets use items that are public only for them, so a rename in `src/` would otherwise break the fuzzers until the next scheduled run. `fuzz/README.md` maps each target to the parser
 it covers and has the invocation. There are eleven. Beside the five codecs
 (the frame state machine, QPACK, Huffman, the capsule parser and the datagram
 codec), they cover the request validator that reaches RFC 9114 §4.1.2's
