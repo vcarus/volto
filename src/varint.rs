@@ -197,7 +197,7 @@ mod tests {
         }
     }
 
-    /// The examples given in RFC 9000 §16.
+    /// The examples given in RFC 9000 Appendix A.1.
     #[test]
     fn varint_matches_the_rfc_examples() {
         let cases: [(u64, &[u8]); 4] = [
