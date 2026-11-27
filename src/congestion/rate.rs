@@ -1,4 +1,15 @@
 //! The delivery rate, measured once per round trip, and its max filter.
+//!
+//! A sample is bounded by the send interval of its packets as well as by its
+//! ACK interval, because ACKs that arrive together, as they do after a fall in
+//! RTT, would otherwise give a sample far above what the path carries, and
+//! quinn's app-limited report for a flow-control-blocked sender would keep the
+//! lower samples that follow out of the estimate. One limit remains: quinn's
+//! app-limited flag is the connection's state when the ACK arrives, not when
+//! the packet was sent, so the first sample stored after [`SAMPLES`] or more
+//! unstored intervals, which replaces the whole estimate, can measure packets
+//! sent while the sender was app-limited and put the window about one round
+//! trip low until the next sample.
 
 use std::time::{Duration, Instant};
 

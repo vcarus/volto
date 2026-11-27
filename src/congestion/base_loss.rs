@@ -1,5 +1,127 @@
 //! The path's base loss: the share of packets it drops whatever the sender
-//! sends, and the factor by which the window covers it.
+//! sends, and the factor by which the window covers it. The reasoning and the
+//! measurements behind every rule here are in D117. The rules are ours.
+//!
+//! quinn takes an acknowledged packet out of in-flight data one round trip
+//! after it was sent, and a lost one only when it declares it lost, 1.25
+//! round trips after it was sent ([`super::LOSS_TIME_THRESHOLD`], D116). With
+//! a base loss p, a window of 1.25 times the bandwidth-delay product therefore
+//! delivers 1.25 (1 - p) / (1 + 0.25 p) times the estimate. Above about one
+//! sixth lost that is under one, each sample is lower than the estimate, and
+//! the window falls to its floor however much the path carries. So outside the
+//! startup and a probe the window is multiplied by (1 + t p) / (1 - p), where
+//! t is the time threshold minus one and p is the base loss, at most
+//! [`BOUND_PPM`].
+//!
+//! # Where the base loss is read
+//!
+//! Loss the sender causes by sending above a rate limit or a queue is not base
+//! loss, and the window does not cover it. A window that grew with that loss
+//! would grow without end at a limiter, because what it adds is lost and
+//! covered again. So the base loss is read only where the sender's rate cannot
+//! cause it: during a probe, whose window is half the estimated
+//! bandwidth-delay product. The startup is no such place. It sends above the
+//! path by design. Behind a buffer of under ten packets the probe's own
+//! sending causes loss too, because quinn's pacer sends at least ten packets
+//! at once and those bursts overflow such a buffer at any rate. This is a
+//! known limit.
+//!
+//! A reading counts the bytes acknowledged and the bytes lost of the packets
+//! sent from the moment in-flight data has fallen to the probe window until
+//! the probe ends. quinn reports a loss detection pass as one congestion event
+//! with the send time of the newest packet it found lost, so a pass counts
+//! whole when that packet was sent in the span. The reading closes
+//! [`CLOSE_RTTS`] smoothed RTTs after the probe ended, and the next probe waits
+//! for it to close. [`Closed`] lists what a closed reading can come to.
+//!
+//! A probe that counted fewer than [`READING_PACKETS`] is not dropped: its
+//! bytes are carried into the next probe's, and the reading completes at the
+//! probe where the sum reaches them. A probe at half the window counts about
+//! the estimate times 200 ms or one smoothed RTT, whichever is longer, over
+//! 2 (1 + p / 4), so a sender at the 240 kB floor on an RTT of 200 ms or more
+//! counts under 100 packets in one probe. A probe or a completed reading that
+//! lost [`OUTAGE_PPM`] or more fell mostly into an outage and is dropped. A
+//! partial outage in the only reading can still raise the base loss until the
+//! next probe, and a probe can read the loss of an episode; that tail is
+//! accepted. A probe during a change of path can read too much loss, because
+//! quinn does not call `Controller::on_ack` while it validates a new path
+//! (quinn-proto `src/connection/mod.rs`, `Connection::on_packet_acked`) and
+//! still reports the losses. This is a known limit.
+//!
+//! The base loss is the lowest of the last [`READINGS`] readings. Loss that
+//! comes in episodes is missing from some probes, and loss that is steady
+//! shows in all of them. So a rise in the path's loss takes effect once every
+//! kept reading has risen, which is up to four probes. A single reading acts:
+//! waiting for a second one cost more than it saved. [`EMPTY_PROBES`] probes in
+//! a row that complete no kept reading clear the kept readings and the carry.
+//!
+//! # A reading tests its own premise
+//!
+//! A probe is under the path's rate only if half the estimate is, and right
+//! after a startup behind a policer with a large burst allowance it is not:
+//! the allowance lets the startup measure several times the token rate. On a
+//! path that delivers 1 - p of what is sent up to a limit, sending less makes
+//! less arrive only under the limit. So the reading compares the arrival rate
+//! of the packets sent while the probe held its window with the arrival rate
+//! of the packets sent in the round trip before the probe was entered, counted
+//! the same way by send time over the minimum RTT before entry, and is kept
+//! only when the ratio is at most [`VERIFY_PPM`]. The minimum RTT is the
+//! highest of three low arrivals within a second, so a single round trip can
+//! be shorter than it by up to the spread of those arrivals, and a packet of
+//! that round trip that was acknowledged before entry is missed. That lowers
+//! the arrival rate before entry by the share missed and raises the ratio.
+//!
+//! A reading that fails is judged by what was sent in the two spans,
+//! acknowledged and lost, counted the same way. When the probe did not lower
+//! the sending to [`VERIFY_PPM`] of the round trip before it either, as when a
+//! client holds the sender, it says nothing about the path
+//! ([`Closed::Unverified`]). When it did lower the sending and the arrivals
+//! stayed, the sender was above the path's rate even at the probe's, and a
+//! base loss in force is what put it there or keeps it there
+//! ([`Closed::Cleared`]). That inference is wrong in two cases, where a base
+//! loss that was right is cleared until the next kept reading: a lossy path
+//! behind a policer whose burst allowance is half a second to two seconds of
+//! its rate, where the confirming probe falls above the limit; and an episode
+//! or a partial outage in the round trip before a probe, which lowers the
+//! arrivals before it. The two rules are kept for what they prevent at a
+//! limit. A probe whose rate stays above a limit while the allowance that fed
+//! the arrivals before it runs out inside it could pass; `line_sim` did not
+//! reproduce that case.
+//!
+//! # The probes a reading needs
+//!
+//! [`Bbr`](super::Bbr) brings probes forward for the readings. The first
+//! regular probe would come when the minimum RTT expires, 10 s after it was
+//! last taken. So when a startup ends having lost [`EARLY_PROBE_PPM`] or more
+//! of its bytes, and no reading is kept, the minimum RTT's lifetime is treated
+//! as over, and the probe starts at the next ACK that does not find the sender
+//! app-limited. Nothing else about the probe changes. After a startup that
+//! lost that much, the path either drops a share of everything or the startup
+//! overshot a limit, and only a reading below the path's rate tells the two
+//! apart. Under that share the factor is under 1.07, and waiting costs little.
+//!
+//! While no reading is kept after such a startup, a probe whose reading closes
+//! short makes the next one due at once, provided it counted at least a
+//! quarter of [`READING_PACKETS`] and the bytes carried so far, its own
+//! included, lost [`EARLY_PROBE_PPM`] or more. Four such probes complete a
+//! reading, so the early probes are at most four. Under a quarter four probes
+//! cannot complete a reading, and a short probe that lost less has shown that
+//! the startup's loss was its own; either ends the repeat, and the bytes stay
+//! carried for the regular probes. An unverified or a cleared reading ends it
+//! too, because arrivals that did not fall mean that the startup's loss was a
+//! limit's. On a path with a clean limit the rule therefore costs one probe
+//! about a second into the connection: half the window for 200 ms or one
+//! smoothed RTT.
+//!
+//! The first reading can be an episode's or an outage's. So a reading that
+//! brings the base loss from zero to [`EARLY_PROBE_PPM`] or more acts at once
+//! and is confirmed: a further probe is due ten sample intervals later, the
+//! estimate's window, and its reading enters the lowest of four like any
+//! other, or clears the base loss. This happens each time a reading takes the
+//! base loss up from zero, so again after a clearing. A reading taken in an
+//! outage or an episode then acts until that probe has closed, about thirteen
+//! round trips, not until the next regular probe 10 s or more later. It costs
+//! one probe and the lower of two readings.
 
 use std::time::{Duration, Instant};
 
@@ -27,7 +149,7 @@ const EMPTY_PROBES: u8 = 4;
 /// The highest base loss the window covers, in parts per million: 40
 /// percent, where the window is 1.83 times what it is without loss. Our own
 /// value.
-pub(super) const BOUND_PPM: u64 = 400_000;
+const BOUND_PPM: u64 = 400_000;
 
 /// A reading of this share or more is dropped, in parts per million: 75
 /// percent. Most of such a probe fell into an outage. Our own value. A reading
@@ -43,7 +165,7 @@ const OUTAGE_PPM: u64 = 750_000;
 /// rate delivers about half of what the round trip before it delivered. A probe
 /// still above a rate limit delivers as much, a ratio near 1, and its loss is
 /// the sender's own.
-pub(super) const VERIFY_PPM: u64 = 750_000;
+const VERIFY_PPM: u64 = 750_000;
 
 /// The share of its bytes a startup must have lost, in parts per million, for
 /// the first probe to start when it ends rather than when the minimum RTT
@@ -53,7 +175,7 @@ pub(super) const EARLY_PROBE_PPM: u64 = 50_000;
 
 /// The loss share of `lost` bytes among `acked + lost`, in parts per million;
 /// `None` when the two are fewer than `least` bytes.
-pub(super) fn share_ppm(acked: u64, lost: u64, least: u64) -> Option<u64> {
+fn share_ppm(acked: u64, lost: u64, least: u64) -> Option<u64> {
     let bytes = acked.saturating_add(lost);
     if bytes == 0 || bytes < least {
         return None;
@@ -302,20 +424,7 @@ impl BaseLoss {
     }
 
     /// Closes the reading [`CLOSE_RTTS`] smoothed RTTs after the probe ended.
-    ///
-    /// A probe that lost [`OUTAGE_PPM`] or more of its own bytes fell mostly
-    /// into an outage and is dropped. A probe whose arrival rate is above
-    /// [`VERIFY_PPM`] of the arrival rate of the round trip before it was not
-    /// under the path's rate. If its sending rate fell to [`VERIFY_PPM`] of
-    /// that round trip's or less, the kept readings and the carry are cleared;
-    /// otherwise its bytes are dropped, not carried, and it does not count as
-    /// a probe without a reading. Otherwise its bytes are added
-    /// to the bytes carried from earlier probes. When the sum is `least` bytes
-    /// or more, the reading completes: it is kept unless its share is
-    /// [`OUTAGE_PPM`] or more, and the carry starts again from zero. When the
-    /// sum is less, it is carried into the next probe. The [`EMPTY_PROBES`]-th
-    /// probe in a row that completed no kept reading clears the kept readings
-    /// and the carry.
+    /// A reading completes at `least` bytes. [`Closed`] lists the outcomes.
     pub(super) fn close(&mut self, now: Instant, srtt: Duration, least: u64) -> Closed {
         let Some(reading) = self.reading else {
             return Closed::No;

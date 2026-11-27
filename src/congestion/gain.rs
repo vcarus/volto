@@ -1,7 +1,67 @@
 //! The steady gain between 1.05 and 1.25, and the loss windows that move it.
 //!
-//! A loss window's share is its loss above the path's base loss (see
-//! `base_loss.rs`): the gain rule acts on the loss a lower gain can remove.
+//! With the window at a gain g, in-flight data is g times what the path
+//! carries in transit, and what the bottleneck queue cannot hold of the rest
+//! is lost. A path that loses packets at random needs the higher gain, because
+//! each loss holds in-flight data for a round trip and at 1.05 the window has
+//! no room to bring the delivery rate back. The two kinds of loss differ in
+//! one thing the sender can see. A lower gain removes the loss of a queue and
+//! leaves random loss as it is. The rule below is ours.
+//!
+//! The controller counts the bytes acknowledged and the bytes lost over loss
+//! windows of at least [`WINDOW_INTERVALS`] sample intervals and
+//! [`WINDOW_PACKETS`] packets. The loss share of a window is its loss above
+//! the path's base loss ([`super::base_loss`]): the base loss times the
+//! window's bytes is taken off its lost bytes, not below zero. Loss at the
+//! base loss is not the queue's, and a lower gain does not remove it. When the
+//! last four windows at the present gain each lost something and the mean of
+//! their loss shares is one percent or more, a trial of a lower gain starts:
+//! the gain times the share delivered, which is the in-flight data the path
+//! carried, and never under the floor. Windows that lost so much that the path
+//! carried under 0.9 bandwidth-delay products start no trial, because a queue
+//! loses at most what the window holds above one. If the loss was the queue's,
+//! the loss at the lower gain is the part of the same in-flight data that the
+//! lower window still exceeds, often none.
+//!
+//! The first two windows of a trial are left out. The lower gain is kept when
+//! each of the next four lost less than the lowest of the four before the
+//! trial, and their mean is at or under the middle between the loss before and
+//! that prediction. The first of them that does not lose less ends the trial:
+//! the old gain returns, and the wait before the next trial doubles, from 16
+//! windows up to 256. This is a rank test; [`TRIAL_WINDOWS`] gives its odds.
+//! Under random loss a trial lowers the gain by the loss share, 1.25 to 1.225
+//! at 2 percent.
+//!
+//! A lowered gain is tried one step of 0.05 higher after 16 windows. The
+//! middle alone judges it, in one window: when the loss is at or past the
+//! middle between the loss before and the loss predicted for the higher gain,
+//! the queue is still that short, the lowered gain returns and the wait
+//! doubles. A gain that has come down after a loss burst or on a path that has
+//! changed goes back up this way.
+//!
+//! A lowered gain is given up for 1.25 when the bandwidth estimate falls under
+//! three quarters of the highest one since the gain was last 1.25. The wait
+//! before the next trial of a lower gain doubles as after a refusal, and that
+//! trial does not go as low as the gain given up: the floor is 0.05 above it,
+//! and comes down by 0.05 every 256 windows. This guards a path with a short
+//! queue and random loss, where a low gain passes the loss test and then does
+//! not hold the rate.
+//!
+//! A window in which more than half of the intervals were app-limited did not
+//! fill the queue. It counts for lowering the gain, because behind a short
+//! queue the retransmissions stall the sender on flow control in nearly half
+//! of all intervals. It does not count towards the 16 windows, and it can
+//! refuse a higher gain on trial and cannot keep one. Otherwise a stream that
+//! sends less than the path carries would take a lowered gain back to 1.25
+//! step by step, and the next download would lose to the queue again.
+//!
+//! A connection that sends too little for a loss window within 32 intervals
+//! has its trial dropped and its gain set back to 1.25, and the gain starts
+//! again when the startup gain returns. Probe intervals and the two intervals
+//! after a probe or a change of gain are left out of the loss windows, and so
+//! are the interval that ends a startup and the seven after it. A startup ends
+//! with more in flight than the path holds, and that loss is not the steady
+//! gain's.
 
 /// The window as a multiple of the estimated bandwidth-delay product, in per
 /// mille, once the startup has ended: the steady gain a connection starts with

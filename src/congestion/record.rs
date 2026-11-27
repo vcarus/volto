@@ -11,9 +11,7 @@ use std::time::Duration;
 /// window for as long as it is in flight. When that is more than 1.25 minimum
 /// RTTs, because the round trip has risen or because acknowledgements arrive
 /// in clumps, the window carries less than the estimate, the estimate falls,
-/// and at the floor the same condition keeps it there. In `line_sim` a clean
-/// path that carries 150 Mbit/s delivers 17 to 26 when acknowledgements reach
-/// the sender half a round trip apart or more, and loses nothing.
+/// and at the floor the same condition keeps it there.
 ///
 /// The two cases look alike from the sender, so these counts do not tell them
 /// apart. They say how long a connection sat at the floor without loss while
@@ -50,7 +48,7 @@ pub struct Record {
     pub peak: u64,
     /// The highest base loss in force when a counted interval closed, in
     /// parts per million.
-    pub base_loss_peak: u64,
+    pub(super) base_loss_peak: u64,
     /// The bytes acknowledged in counted intervals, and the sum over those
     /// bytes of their time in flight in per mille of the minimum RTT in force
     /// when their interval closed.

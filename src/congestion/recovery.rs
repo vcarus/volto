@@ -1,4 +1,19 @@
 //! The recovery window after a loss.
+//!
+//! A loss holds in-flight data for one round trip, by BBR's packet
+//! conservation. The form here is ours, and it has the effect of the recovery
+//! window of quinn's BBR. quinn reports a loss after the ACK batch that found
+//! it, so the rule acts at the next batch. That batch sets a recovery window
+//! of in-flight data plus the bytes it acknowledged, and never less than
+//! [`MIN_WINDOW_PACKETS`] packets. Each later batch takes the bytes lost since
+//! the previous one off the recovery window. Once a packet sent after the
+//! recovery began has been acknowledged, each batch also adds the bytes it
+//! acknowledged. In-flight data plus the bytes the batch acknowledged stays
+//! the recovery window's lower bound. The recovery ends at the first batch
+//! without a loss that acknowledges a packet sent after the last batch with
+//! one. The recovery window limits the window only after the startup has
+//! ended, as quinn's BBR applies its own only outside its Startup. An ECN mark
+//! loses no bytes and starts no recovery.
 
 use std::time::Instant;
 

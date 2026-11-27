@@ -2,401 +2,55 @@
 //! bandwidth-delay product it measures, plus what the path's own loss takes
 //! out of it.
 //!
-//! It is the default (D108). The type is [`Bbr`].
-//!
-//! quinn-proto 0.11's BBR estimates the bottleneck bandwidth several times too
-//! high, so its window never limits in-flight data, and a bulk download loses
-//! what the bottleneck queue cannot hold. This controller uses no part of
-//! quinn's BBR. It measures its own delivery rate and minimum RTT, and its
-//! window is computed from them alone (D108).
+//! It is the default (D108). The type is [`Bbr`]. It uses no part of quinn's
+//! BBR, whose estimate is too high for its window to limit in-flight data. It
+//! measures its own delivery rate and minimum RTT, and computes its window
+//! from them alone (D108).
 //!
 //! The window is a gain times the delivery rate measured once per round trip
-//! (see `DeliveryRate`) times the minimum RTT. The gain is 1.25 unless the
-//! path's loss has lowered it, as described below. Outside a recovery and a
-//! probe the window is never below the initial window, 240 kB: 200 packets of
-//! 1200 bytes, the default initial window of the BBR in quinn-proto 0.11
-//! (`quinn::congestion::BbrConfig`). So on a path whose bandwidth-delay product is under 192 kB,
-//! the window can be 240 kB. Until there is a delivery-rate sample and a
-//! minimum RTT, the window is the initial window.
+//! (see [`rate`]) times the minimum RTT (see [`min_rtt`]). The gain is 1.25
+//! unless the path's loss has lowered it.
 //!
 //! quinn paces from the window (quinn-proto `src/connection/pacing.rs`,
 //! `Pacer::delay`, which adds 1.25 windows of tokens per smoothed RTT), so the
 //! window also sets the pacing rate. In-flight data sits at the window, and at
 //! 1.25 a quarter of a bandwidth-delay product stands in the bottleneck queue
-//! when the queue can hold it. 1.25 is
-//! the highest pacing gain of BBR's ProbeBW cycle. BBR's window gain of two is a
-//! ceiling above a sender that paces at the estimated rate. In quinn the window
-//! is what the sender sends, so a gain of two keeps a whole bandwidth-delay
-//! product queued and loses packets wherever the queue is shorter than that.
+//! when the queue can hold it. 1.25 is the highest pacing gain of BBR's
+//! ProbeBW cycle. BBR's window gain of two is a ceiling above a sender that
+//! paces at the estimated rate. In quinn the window is what the sender sends,
+//! so a gain of two keeps a whole bandwidth-delay product queued and loses
+//! packets wherever the queue is shorter than that.
 //!
-//! The gain follows the path between 1.05 and 1.25. With the window at a gain
-//! g, in-flight data is g times what the path carries in transit, and what the
-//! bottleneck queue cannot hold of the rest is lost. In the lab a queue of
-//! 0.04 bandwidth-delay products lost 19 percent of the packets at 1.25 and
-//! 0.9 percent at 1.05. A path that loses packets at random needs the higher gain:
-//! with 2 percent of them lost, a fixed 1.05 carried a third of what 1.25
-//! carried, because each loss holds in-flight data for a round trip and at
-//! 1.05 the window has no room to bring the delivery rate back. The two kinds
-//! of loss differ in one thing the sender can see. A lower gain removes the
-//! loss of a queue and leaves random loss as it is. The rule below is ours.
+//! # States
 //!
-//! The controller counts the bytes acknowledged and the bytes lost over loss
-//! windows of at least four sample intervals and 2000 packets. The loss share
-//! of a window is its loss above the path's base loss, described below: the
-//! base loss times the window's bytes is taken off its lost bytes, not below
-//! zero. Loss at the base loss is not the queue's, and a lower gain does not
-//! remove it. When the last four windows at the present gain each lost
-//! something and the mean of their loss shares is one percent or more, a trial
-//! of a lower gain starts: the gain times the share delivered, which is the
-//! in-flight data the path carried, and never under the floor. Windows that
-//! lost so much that the path carried under 0.9 bandwidth-delay products start
-//! no trial, because a queue loses at most what the window holds above one. If
-//! the loss was the queue's, the loss at the lower gain is the part of the same
-//! in-flight data that the lower window still exceeds, often none.
+//! - The startup ([`startup`]): the startup gain of about 2.89 until the
+//!   estimate stops growing or an interval loses more than the base loss
+//!   explains. It returns when the estimate climbs back after a fall. Until
+//!   the first startup has ended, the window is at most the initial window
+//!   plus the bytes acknowledged so far.
+//! - The steady state: the steady gain between 1.05 and 1.25 ([`gain`]),
+//!   times the factor that covers the path's base loss ([`base_loss`]).
+//! - A probe ([`min_rtt`]): half the estimated bandwidth-delay product, and at
+//!   least four packets, while the minimum RTT is measured again and the base
+//!   loss is read.
+//! - A recovery ([`recovery`]), beside the other states: after a loss,
+//!   in-flight data is held for a round trip.
 //!
-//! The first two windows of a trial are left out. The lower gain is kept when
-//! each of the next four lost less than the lowest of the four before the
-//! trial, and their mean is at or under the middle between the loss before and
-//! that prediction. The first of them that does not lose less ends the trial:
-//! the old gain returns, and the wait before the next trial doubles, from 16
-//! windows up to 256. This is a rank test. Eight windows whose loss does not
-//! depend on the gain come in any order with the same chance, and the four
-//! after the change are all below the four before it in 1 of 70 orders. The
-//! chance here is higher than that, because a trial starts only after four
-//! windows that all lost something, and windows without loss pass: loss series
-//! recorded in the lab at a fixed gain passed in 2 to 3 of 100 places. Through
-//! 1.8.0 one window of eight at or under the middle kept the gain, and after a
-//! burst of loss the next window is at or under it at any gain. On a path with
-//! loss in bursts every trial was kept, the gain stayed near the floor, and the
-//! path carried 4 to 5 percent less than at 1.25. Under random loss a trial
-//! lowers the gain by the loss share, 1.25 to 1.225 at 2 percent.
+//! # Invariants
 //!
-//! A lowered gain is tried one step of 0.05 higher after 16 windows. The
-//! middle alone judges it, in one window: when the loss is at or past the middle
-//! between the loss before and the loss predicted for the higher gain, the
-//! queue is still that short, the lowered gain returns and the wait doubles.
-//! A gain that has come down after a loss burst or on a path that has changed
-//! goes back up this way.
-//!
-//! A lowered gain is given up for 1.25 when the bandwidth estimate falls
-//! under three quarters of the highest one since the gain was last 1.25. The
-//! wait before the next trial of a lower gain doubles as after a refusal, and
-//! that trial does not go as low as the gain given up: the floor is 0.05 above
-//! it, and comes down by 0.05 every 256 windows. This guards a path with a
-//! short queue and random loss, where a low gain passes the loss test and then
-//! does not hold the rate.
-//!
-//! A window in which more than half of the intervals were app-limited did not
-//! fill the queue. It counts for lowering the gain, because behind a short
-//! queue the retransmissions stall the sender on flow control in nearly half
-//! of all intervals. It does not count towards the 16 windows, and it can
-//! refuse a higher gain on trial and cannot keep one. Otherwise a stream that
-//! sends less than the path carries would take a lowered gain back to 1.25
-//! step by step, and the next download would lose to the queue again.
-//!
-//! A connection that sends too little for a loss window within 32 intervals
-//! has its trial dropped and its gain set back to 1.25, and the gain starts
-//! again when the startup gain returns. Probe intervals and the two intervals
-//! after a probe or a change of gain are left out of the loss windows, and so
-//! are the interval that ends a startup and the seven after it. A startup ends
-//! with more in flight than the path holds, and that loss is not the steady
-//! gain's.
-//!
-//! A path can drop a share of all packets whatever the sender sends: its base
-//! loss. quinn takes an acknowledged packet out of in-flight data one round
-//! trip after it was sent, and a lost one only when it declares it lost, 1.25
-//! round trips after it was sent (`LOSS_TIME_THRESHOLD` below,
-//! D116). With a base loss p, a window of 1.25 times
-//! the bandwidth-delay product therefore delivers 1.25 (1 - p) / (1 + 0.25 p)
-//! times the estimate. Above about one sixth lost that is under one, each
-//! sample is lower than the estimate, and the window falls to its floor
-//! however much the path carries. In the lab, on a path that carried 115
-//! Mbit/s with 23 percent lost, each of three releases sent 21 to 22 Mbit/s
-//! and delivered 16 to 17.
-//!
-//! So outside the startup and a probe the window is multiplied by
-//! (1 + t p) / (1 - p), where t is the time threshold minus one and p is the
-//! base loss, at most 40 percent. The rule is ours.
-//!
-//! Loss the sender causes by sending above a rate limit or a queue is not base
-//! loss, and the window does not cover it. A window that grew with that loss
-//! would grow without end at a limiter, because what it adds is lost and
-//! covered again. So the base loss is read only where the sender's rate cannot
-//! cause it: during a probe, whose window is half the estimated
-//! bandwidth-delay product. Behind a buffer of under ten packets the probe's
-//! own sending causes loss too, because quinn's pacer sends at least ten
-//! packets at once and those bursts overflow such a buffer at any rate; in
-//! `line_sim` behind a 20 Mbit/s queue of 10 kB the sent rate rose from 20.4 to
-//! 23.5 Mbit/s for 19.4 delivered. This is a known limit. The startup is no
-//! such place. It sends above the path by design, and in `line_sim` each of
-//! three ways of reading the base loss from it read the sender's own loss
-//! behind some limit. A reading counts the bytes acknowledged and the bytes
-//! lost of the packets sent from the moment in-flight data has fallen to the
-//! probe window until the probe ends. quinn reports a loss detection pass as
-//! one congestion event with the send time of the newest packet it found lost,
-//! so a pass counts whole when that packet was sent in the span. The reading
-//! closes two smoothed RTTs after the probe ended. A probe that lost 75 percent
-//! or more of its packets fell mostly into an outage and is dropped. A reading
-//! needs 100 packets, and a probe that counted fewer is not dropped: its bytes
-//! are carried into the next probe's, and the reading completes at the probe
-//! where the sum reaches 100 packets. A probe at half the window counts about
-//! the estimate times 200 ms or one smoothed RTT, whichever is longer, over 2
-//! (1 + p / 4), so a sender at the 240 kB floor on an RTT of 200 ms or more
-//! counts under 100 packets in one probe: in `line_sim` 45 to 62 at 200 and 250
-//! ms with 30 and 40 percent lost. A completed reading of 75 percent or more is
-//! dropped too. A reading between the bound of 40 percent and 75 percent is
-//! kept, and the base loss is held at the bound where it is used. A partial
-//! outage in the only reading can still raise the base loss until the next
-//! probe. The fourth probe in a row that completes no kept reading clears the
-//! kept readings and the carried bytes, and the base loss is zero until a new
-//! reading. On a path where four probes together count under 100 packets, a
-//! base loss once read would otherwise last for the whole connection. A probe
-//! during a change of path can read too much loss, because quinn does not call
-//! `Controller::on_ack` while it validates a new path (quinn-proto
-//! `src/connection/mod.rs`, `Connection::on_packet_acked`) and still reports
-//! the losses. This is a known limit. On the production limiter's evening
-//! captures a window of 200 ms read 10 percent or more in 6 to 24 percent of
-//! the cases and 25 percent or more in 1 to 3 percent, so a probe there can
-//! read an episode's loss; this tail is accepted, at a mean cost of about 1
-//! percent of the bytes sent on that line's shape. The base loss is the lowest
-//! of the last four readings. Loss that comes in episodes is missing from some
-//! probes, and loss that is steady shows in all of them. A single reading acts.
-//! On a limiter line with loss in episodes calibrated to production captures,
-//! waiting for a second reading did not lower sent over delivered in `line_sim`
-//! (1.28 either way) and cost 9 to 14 percent of a 5 s transfer on a lossy
-//! path, so it is not done. The first reading can therefore be an episode's or
-//! an outage's. So a reading that brings the base loss from zero to 5 percent
-//! or more acts at once and is confirmed: a further probe is due ten sample
-//! intervals later, the estimate's window, and its reading enters the lowest of
-//! four like any other, or clears the base loss by the rule of the next
-//! paragraph. This happens each time a reading takes the base loss up from
-//! zero, so again after a clearing. A reading taken in an outage or an episode
-//! then acts until that probe has closed, about thirteen round trips, not
-//! until the next regular probe 10 s or more later.
-//! In `line_sim` the review's sweep of partial outages inside the early probe
-//! behind clean policers had 68 of 144 runs more than 0.3 above 1.8.2's sent
-//! over delivered over the first 12 s without the confirming probe and 1 with
-//! it. It costs one probe and the lower of two readings: 5 to 6 percent of a 5
-//! s transfer at 85 ms with 15 and 23 percent dropped, and 0.5 to 3 s more to
-//! the full window at 151 to 250 ms. The base loss is to loss what the minimum
-//! RTT is to delay. A rise in the path's loss therefore takes effect once every
-//! kept reading has risen, which is up to four probes. The lag is a known
-//! property. On the one production path it was measured on, the base loss moved
-//! over hours. The rules of this paragraph are ours.
-//!
-//! A probe is under the path's rate only if half the estimate is, and right
-//! after a startup behind a policer with a large burst allowance it is not:
-//! the allowance lets the startup measure several times the token rate. So a
-//! reading verifies its own premise. On a path that delivers 1 - p of what is
-//! sent up to a limit, sending less makes less arrive only under the limit.
-//! The reading compares the arrival rate of the packets sent while the probe
-//! held its window with the arrival rate of the packets sent in the round trip
-//! before the probe was entered, counted the same way by send time over the
-//! minimum RTT before entry. The minimum RTT is the highest of three low
-//! arrivals within a second, so a single round trip can be shorter than it by
-//! up to the spread of those arrivals, and a packet of that round trip that
-//! was acknowledged before entry is missed. That lowers the arrival rate before
-//! entry by the share missed and raises the ratio; in `line_sim` the share
-//! missed at entry was 0.000 in all 1403 entries. The reading is kept only when
-//! the probe's arrival rate is at most 0.75 of the one before it. In `line_sim`
-//! a probe under the path's rate gave 0.12 to 0.73 on every path with base
-//! loss, and up to 0.90 behind clean limits, where a reading reads zero and
-//! rejecting it costs nothing while no base loss is in force. The early probe
-//! behind clean policers with burst allowances of 1 to 8 MB gave 1.10 to 1.40;
-//! without the rule it read 0.23 to 0.64 of the sender's own loss. A reading
-//! that fails is judged by what was sent in the two spans, acknowledged and
-//! lost, counted the same way. When the probe did not lower the sending to 0.75
-//! of the round trip before it either, as when a client holds the sender, it
-//! says nothing about the path: it is unverified, dropped, not carried, and
-//! does not count as a probe without a reading. When it did lower the sending
-//! and the arrivals stayed, the sender was above the path's rate even at the
-//! probe's, and a base loss in force is what put it there or keeps it there:
-//! the kept readings and the carry are cleared, and the base loss is zero until
-//! a new reading. That inference is too strong in two cases, which a second
-//! review found in `line_sim`, and in both a base loss that was right is
-//! cleared and the transfer runs as it did through 1.8.2 until the next kept
-//! reading. First, a lossy path behind a policer whose burst allowance is half
-//! a second to two seconds of its rate: when the factor comes into force the
-//! estimate grows on the allowance to two or three times the token rate, the
-//! confirming probe falls there, and it is above the limit. In a sweep of 96
-//! such runs 16 cleared, and on one line (30 Mbit/s, 100 ms, a fifth dropped)
-//! the base loss was zero for 74 of 90 s: 18.8 Mbit/s delivered, against 23 to
-//! 24 without the clearing or without the confirming probe, and 14.7 for
-//! 1.8.2. Second, an episode or a partial outage in the round trip before a
-//! probe: the arrivals before the probe are low while lost bytes count as
-//! sent, so the arrival ratio is high and the sending ratio low. 14 of 48 runs
-//! with episodes behind a queue cleared once, and over 144 lossy lines the sum
-//! delivered was 1.6 percent under that without the clearing. On no lossy line
-//! did the controller deliver less than 1.8.2 does. The two rules are kept for
-//! what they prevent at a limit: of the outage sweep above, 68 runs without
-//! the confirming probe, 26 without the clearing, 1 with both. Both outcomes
-//! end the early probe's repeat, because arrivals that did not fall mean that
-//! the startup's loss was a limit's. A probe whose rate stays above a limit
-//! while the allowance that fed the arrivals before it runs out inside it could
-//! pass; `line_sim` did not reproduce that case. The rule is ours.
-//!
-//! The first probe would come when the minimum RTT expires, 10 s after it was
-//! last taken, and in production it came 14 to 45 s after the start. So when a
-//! startup ends having lost 5 percent or more of its bytes, and no reading is
-//! kept, the minimum RTT's lifetime is treated as over, and the probe starts at
-//! the next ACK that does not find the sender app-limited. Nothing else about
-//! the probe changes. After a startup that lost that much, the path either
-//! drops a share of everything or the startup overshot a limit, and only a
-//! reading below the path's rate tells the two apart. Under 5 percent the
-//! factor is under 1.07, and waiting costs little. While no reading is kept
-//! after such a startup, a probe whose reading closes short makes the next one
-//! due at once, provided it counted at least 25 packets, a quarter of a
-//! reading, and the bytes carried so far, its own included, lost 5 percent or
-//! more. Four such probes complete a reading, so the early probes are at most
-//! four. Under 25 packets four probes cannot complete a reading, and a short
-//! probe that lost under 5 percent has shown that the startup's loss was its
-//! own; either ends the repeat, and the bytes stay carried for the regular
-//! probes. On a path with a clean limit the rule therefore costs one probe
-//! about a second into the connection: half the window for 200 ms or one
-//! smoothed RTT. The rules of this paragraph are ours.
-//!
-//! A new connection also starts as slow start does. Until its first startup has
-//! ended, the window is at most the initial window plus the bytes acknowledged
-//! so far, so it doubles per round trip at most. The startup gain alone would
-//! let the first samples open the window to 2.89 times a bandwidth-delay
-//! product at once. The controller had this limit through the window of
-//! quinn's BBR while it was built around it, and keeps it as a rule of its
-//! own. The limit does not come back when the startup gain does.
-//!
-//! A new connection uses a higher gain until its estimate stops growing. With
-//! the window at 1.25 times the estimate, each sample can only show the rate
-//! that window allows, so the estimate grows by at most 1.25 times per sample.
-//! The startup gain is BBR's Startup gain, 2/ln 2, about 2.89. The estimate has
-//! stopped growing when three samples in a row from intervals that were not
-//! app-limited have not raised it by 25 percent since it last did. This is
-//! BBR's full-bandwidth test. A congestion event also ends the startup when the
-//! sample interval it falls in does not raise the estimate by 25 percent and
-//! lost a share of its bytes above 1.5 times the base loss, whether or not
-//! that interval was app-limited. An ECN mark ends it in such an interval at
-//! any loss. With a base loss of zero that is any lost byte. Either applies
-//! only once the startup has counted 100 packets of the current MTU,
-//! acknowledged and lost, which departs from the exit as it was through 1.8.2.
-//! Before that count the startup has measured nothing of the path: a handshake
-//! is a few packets per round trip, app-limited, and one that lost a packet in
-//! each of two round trips ended the startup on a dozen packets, so the
-//! connection never ran one. On a path that drops a quarter of its packets
-//! such a start is common, and in `line_sim` it then sent at its floor until a
-//! regular probe 10 s or more later. The count cannot let a first startup
-//! overshoot: 100 packets are at most 147 kB, under the initial window, and
-//! until the first startup has ended the window is at most the initial window
-//! plus the bytes acknowledged, so within those packets the startup gain sets
-//! nothing. A startup that returns counts again from zero, but its window is
-//! never below the initial window and no recovery limits it, so it counts 100
-//! packets within its first sample interval unless the sender is held under
-//! 100 packets in flight; in `line_sim` no returned startup reached its exit
-//! under the count. Beyond the count, a first startup, which comes before the
-//! first probe, and every startup on a path without base loss end as they did
-//! before the base loss was read. On a path with base loss, a startup that
-//! returns would otherwise end at its first interval without growth, far below
-//! the path's rate. quinn reports a sender blocked by the peer's flow control
-//! as app-limited. Behind a flow-control window smaller than the startup window
-//! the full-bandwidth test therefore never runs, and without the congestion
-//! exit the startup gain would stay. On a path with base loss such a sender
-//! keeps the startup gain until an interval loses more than 1.5 times the base
-//! loss.
-//!
-//! The startup gain returns when the estimate climbs back after a fall. The
-//! estimate keeps a sample for ten intervals, so a loss episode longer than that
-//! leaves only samples from the episode in it, and the window starts again from
-//! its floor. At 1.25 the estimate then grows by about 12 percent per sample,
-//! not 25, because a raised window shows in the sample about two round trips
-//! later. So three samples in a row from intervals that were not app-limited,
-//! each raising the estimate from below half of the highest estimate the
-//! connection has had, bring the startup gain back, and the two rules above end
-//! it again. Any rise counts, so a climb at 1.25 meets the rule within a few
-//! samples. The rule is ours. The highest estimate does not expire, so on a
-//! path whose rate has fallen for good, a later climb from below half of the
-//! old rate also uses the startup gain, until the same two rules end it.
-//!
-//! A loss holds in-flight data for one round trip, by BBR's packet
-//! conservation. The form here is ours, and it has the effect of the recovery
-//! window of quinn's BBR. quinn reports a loss after the ACK batch that found
-//! it, so the rule acts at the next batch. That batch sets a recovery window
-//! of in-flight data plus the bytes it acknowledged, and never less than four
-//! packets. Each later batch takes the bytes lost since the previous one off
-//! the recovery window. Once a packet sent after the recovery began has been
-//! acknowledged, each batch also adds the bytes it acknowledged. In-flight data
-//! plus the bytes the batch acknowledged stays the recovery window's lower
-//! bound. The recovery ends at the first batch without a loss that
-//! acknowledges a packet sent after the last batch with one. The recovery
-//! window limits the window only after the startup has ended, as quinn's BBR
-//! applies its own only outside its Startup. An ECN mark loses no bytes and
-//! starts no recovery.
-//!
-//! The minimum RTT expires. quinn's `RttEstimator::min` never does within a
-//! path, so with it a lasting RTT rise would leave the window below the new
-//! bandwidth-delay product, each delivery-rate sample would come out lower than
-//! the last, and the window would fall to its floor. Expiry alone would not fix
-//! that. A minimum measured again with the standing queue in it would raise the
-//! window, and with it the queue, each time. So the controller empties the
-//! queue before it measures, the way BBR's ProbeRTT does.
-//!
-//! A sample is the `now - sent` of an acknowledged packet. The peer's ACK
-//! delay is part of it, which can only make it larger. The `now` can make it
-//! smaller: quinn reads the clock once per endpoint poll and hands every ACK
-//! of that poll the same value, so a poll that is held up between the clock
-//! read and the socket read gives samples that are too short by the delay. One
-//! such sample taken as the minimum holds the window under the
-//! bandwidth-delay product for the 10 s it lasts, each delivery-rate sample
-//! then comes out lower than the last, and nothing raises the estimate again:
-//! in the lab a 60 ms path read as 37 ms once every 7 s carried 50 to 81
-//! Mbit/s of 144. So the samples of one `now` count once. A sample under the
-//! minimum lowers it when three values of `now` within a second have given
-//! one, and the new minimum is the highest of the three lowest. A fall in the
-//! path's RTT meets this with the third socket poll that reads an ACK. A
-//! connection whose ACKs arrive less often than three polls in a second keeps
-//! its minimum through such a fall; it sends too little for the window to
-//! limit it, and the first bulk transfer confirms the lower minimum at once.
-//! The rule is ours; BBR takes the
-//! plain minimum, under a window gain of two that a short sample does not
-//! bring under the bandwidth-delay product.
-//!
-//! A sample equal to the minimum restarts its 10 s lifetime, BBR's
-//! MinRTTFilterLen. The first ACK after the lifetime ends that does not find
-//! the sender app-limited starts a probe: the window is held at half the
-//! estimated bandwidth-delay product, the target of BBRv2's ProbeRTT, and at
-//! least four packets. Once in-flight data has fallen to that window, the probe
-//! lasts 200 ms or one smoothed RTT, whichever is longer. The new minimum is
-//! then taken from the samples since the probe started: the highest of the
-//! lowest samples of the three values of `now` that gave the lowest ones,
-//! without the limit of a second, or the lowest sample when the probe saw
-//! fewer than three values of `now`. While the sender
-//! is app-limited the probe does not start, because the window does not limit
-//! an app-limited sender. Nor does it start while the base-loss reading of the
-//! previous probe is still open. ACKs that arrive during a probe count as app-limited
-//! for the delivery rate, so the probe's own low samples do not lower the
-//! estimate. Linux BBR does the same during ProbeRTT (`bbr_update_min_rtt` in
-//! `net/ipv4/tcp_bbr.c`).
-//!
-//! A lasting RTT rise therefore lowers throughput until the next probe, which
-//! starts 10 s after the minimum was last taken, or later while the sender is
-//! app-limited. By then the estimate has fallen to what the floor carries, so
-//! once the probe has taken the new minimum, the climb back to the new
-//! bandwidth-delay product brings the startup gain back. A fall in RTT takes
-//! effect with the third arrival that shows it. Each probe holds the window low for
-//! about a quarter of a second.
-//!
-//! A delivery-rate sample is bounded by the send interval of its packets as
-//! well as by its ACK interval (see `DeliveryRate`), because ACKs that arrive
-//! together, as they do after a fall in RTT, would otherwise give a sample far
-//! above what the path carries, and quinn's app-limited report for a
-//! flow-control-blocked sender would keep the lower samples that follow out of
-//! the estimate. One limit remains: quinn's app-limited flag is the
-//! connection's state when the ACK arrives, not when the packet was sent, so
-//! the first sample stored after ten or more unstored intervals, which replaces
-//! the whole estimate, can measure packets sent while the sender was
-//! app-limited and put the window about one round trip low until the next
-//! sample.
-//!
-//! The window is computed when one of its inputs changes and stored, because
-//! quinn reads it before every packet it sends. The inputs are the estimate,
-//! the minimum RTT, the probe, the startup with its slow-start limit, the
-//! steady gain, the base loss, the recovery window and the MTU.
+//! - Outside a recovery and a probe the window is never below
+//!   [`INITIAL_WINDOW`] (D121). Until there is a delivery-rate sample and a
+//!   minimum RTT, the window is the initial window.
+//! - The steady gain is at most 1.25, so what is in flight and will arrive is
+//!   at most 1.25 bandwidth-delay products. The base-loss factor adds only
+//!   what the path drops.
+//! - The startup gain and the probe window do not take the base-loss factor.
+//! - The recovery window limits the window only after the startup has ended.
+//! - The window is computed when one of its inputs changes and stored,
+//!   because quinn reads it before every packet it sends. The inputs are the
+//!   estimate, the minimum RTT, the probe, the startup with its slow-start
+//!   limit, the steady gain, the base loss, the recovery window and the MTU.
+//! - What the connection's close line reports is counted in [`record`].
 //!
 //! Lab measurements are in `docs/configuration.md`.
 
@@ -429,9 +83,11 @@ use recovery::Recovery;
 use startup::Startup;
 
 /// The window a connection starts with, and the floor of the window outside a
-/// probe: 200 packets of 1200 bytes, the default initial window of the BBR in
-/// quinn-proto 0.11 (`quinn::congestion::BbrConfig::default()`), which this
-/// controller replaced.
+/// probe and a recovery: 200 packets of 1200 bytes, the default initial window
+/// of the BBR in quinn-proto 0.11 (`quinn::congestion::BbrConfig::default()`),
+/// which this controller replaced. On a path whose bandwidth-delay product is
+/// under 192 kB the window is therefore above 1.25 of it. The floor was
+/// measured against larger, smaller and adaptive ones and kept (D121).
 const INITIAL_WINDOW: u64 = 200 * 1200;
 
 /// The probe window as a multiple of the estimated bandwidth-delay product, in
@@ -451,7 +107,7 @@ const MIN_RTT_LIFETIME: Duration = Duration::from_secs(10);
 
 /// How many sample intervals after a first reading of 5 percent or more the
 /// probe that confirms it is due: the estimate's window, so that the reading
-/// acts for about as long as the estimate holds a sample. Our own value.
+/// acts for about as long as the estimate holds a sample. Our own value (D117).
 const CONFIRM_INTERVALS: usize = rate::SAMPLES;
 
 /// The shortest time a probe holds its window once in-flight data has fallen
@@ -475,24 +131,10 @@ const MIN_WINDOW_PACKETS: u64 = 4;
 ///
 /// The round-trip time quinn multiplies is the larger of the smoothed one and
 /// the latest sample, so the allowance for a late packet is a quarter of it:
-/// 15 ms on a 60 ms path. On the path that `LOSS_PACKET_THRESHOLD` in
-/// `src/quic/transport.rs` describes, 57 to 67 percent of the late packets
-/// were under an eighth of the round-trip time late and 82 to 85 percent under
-/// a quarter, which is why 9/8 left 43 to 46 percent of them declared lost and
-/// 5/4 leaves 13 to 28. The price is that a packet that really was lost is
-/// sent again an eighth of a round trip later than with 9/8.
-///
-/// That delay matters where flow control is tight. Data sent after a lost
-/// packet counts against the peer's connection window, and against
-/// `SEND_WINDOW` in `src/quic/transport.rs`, until the packet has been sent
-/// again and acknowledged, about 2.25 round trips after it was first sent
-/// where the defaults take about 2. In the lab at 150 Mbit/s over 60 ms with 2
-/// or 5 percent of the packets dropped and nothing reordered, a client with a
-/// 4 MiB connection window received 6 to 8 percent less with these values than
-/// with quinn's defaults, and a client with a 16 MiB window, which is what
-/// Surge advertises, received the same. With reordering as on the production
-/// path, the lab carried 128 to 135 Mbit/s where the defaults carried 91 to
-/// 92.
+/// 15 ms on a 60 ms path. On the reordering path of D116 it declares far fewer
+/// late packets lost than 9/8. A packet that really was lost is sent again an
+/// eighth of a round trip later, which costs throughput where the client's
+/// connection window is tight (D116).
 ///
 /// `src/quic/transport.rs` gives this value to quinn. The congestion
 /// controller reads it too: a lost packet stays in flight for this many round
@@ -592,7 +234,8 @@ pub struct Bbr {
     /// starts at the next ACK that does not find the sender app-limited: set
     /// when a startup that lost [`base_loss::EARLY_PROBE_PPM`] of its bytes
     /// or more ends with no reading kept, again for `repeat`, and when
-    /// `confirm` runs out.
+    /// `confirm` runs out. The rules of these three fields are in the
+    /// [`base_loss`] documentation (D117).
     probe_due: bool,
     /// Whether the early probe repeats: set with `probe_due` at the end of a
     /// startup. Cleared once a reading is kept, when a probe closes short
@@ -785,7 +428,7 @@ impl Bbr {
     /// from: the steady gain times the bandwidth-delay product, the startup
     /// gain times it until the startup has ended, or half of it during a probe.
     /// The steady window also covers the base loss `p`: it is multiplied by
-    /// (1 + t p) / (1 - p), where t is [`LOSS_DELAY_EXTRA_PERMILLE`].
+    /// (1 + t p) / (1 - p), where t is [`LOSS_DELAY_EXTRA_PERMILLE`] (D117).
     ///
     /// Outside a probe the limit is never below [`INITIAL_WINDOW`], so a
     /// connection that has measured a low rate is never slower to send than a

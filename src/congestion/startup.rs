@@ -1,5 +1,69 @@
 //! BBR's full-bandwidth test, which ends the startup gain, the congestion
 //! exit, and the rule that brings the startup back.
+//!
+//! A new connection uses a higher gain until its estimate stops growing. With
+//! the window at 1.25 times the estimate, each sample can only show the rate
+//! that window allows, so the estimate grows by at most 1.25 times per sample.
+//! The startup gain is BBR's Startup gain, 2/ln 2, about 2.89. The estimate
+//! has stopped growing when [`SAMPLES_WITHOUT_GROWTH`] samples in a row from
+//! intervals that were not app-limited have not raised it by
+//! [`GROWTH_PERCENT`] since it last did. This is BBR's full-bandwidth test.
+//!
+//! A new connection also starts as slow start does. Until its first startup
+//! has ended, the window is at most the initial window plus the bytes
+//! acknowledged so far, so it doubles per round trip at most. The startup gain
+//! alone would let the first samples open the window to 2.89 times a
+//! bandwidth-delay product at once. The rule is ours. The limit does not come
+//! back when the startup gain does.
+//!
+//! # The congestion exit
+//!
+//! A congestion event also ends the startup when the sample interval it falls
+//! in does not raise the estimate by [`GROWTH_PERCENT`] and lost a share of its
+//! bytes above 1.5 times the base loss, whether or not that interval was
+//! app-limited. An ECN mark ends it in such an interval at any loss. With a
+//! base loss of zero that is any lost byte. Either applies only once the
+//! startup has counted [`super::base_loss::READING_PACKETS`] packets of the current MTU,
+//! acknowledged and lost (D117). Before that count the startup has measured
+//! nothing of the path: a handshake is a few packets per round trip,
+//! app-limited, and one that lost a packet in each of two round trips ended the
+//! startup on a dozen packets, so the connection never ran one. On a path that
+//! drops a quarter of its packets such a start is common, and the connection
+//! then sent at its floor until a regular probe. The count cannot let a first
+//! startup overshoot: 100 packets are at most 147 kB, under the initial window,
+//! and until the first startup has ended the window is at most the initial
+//! window plus the bytes acknowledged, so within those packets the startup gain
+//! sets nothing. A startup that returns counts again from zero, but its window
+//! is never below the initial window and no recovery limits it, so it counts
+//! 100 packets within its first sample interval unless the sender is held
+//! under 100 packets in flight.
+//!
+//! Beyond the count, a first startup, which comes before the first probe, and
+//! every startup on a path without base loss end on any lost byte in an
+//! interval without growth. On a path with base loss, a startup that returns
+//! would otherwise end at its first interval without growth, far below the
+//! path's rate. quinn reports a sender blocked by the peer's flow control as
+//! app-limited. Behind a flow-control window smaller than the startup window
+//! the full-bandwidth test therefore never runs, and without the congestion
+//! exit the startup gain would stay. On a path with base loss such a sender
+//! keeps the startup gain until an interval loses more than 1.5 times the base
+//! loss.
+//!
+//! # The startup's return
+//!
+//! The startup gain returns when the estimate climbs back after a fall. The
+//! estimate keeps a sample for ten intervals, so a loss episode longer than
+//! that leaves only samples from the episode in it, and the window starts
+//! again from its floor. At 1.25 the estimate then grows by about 12 percent
+//! per sample, not 25, because a raised window shows in the sample about two
+//! round trips later. So [`RISES_TO_RESTART`] samples in a row from intervals
+//! that were not app-limited, each raising the estimate from below
+//! [`FALLEN_PERCENT`] of the highest estimate the connection has had, bring the
+//! startup gain back, and the two rules above end it again. Any rise counts,
+//! so a climb at 1.25 meets the rule within a few samples. The rule is ours.
+//! The highest estimate does not expire, so on a path whose rate has fallen
+//! for good, a later climb from below half of the old rate also uses the
+//! startup gain, until the same two rules end it.
 
 /// How much the estimate has to rise, in percent of its value when it last
 /// rose, to count as growth: BBR's full-bandwidth test.
@@ -15,10 +79,8 @@ const FALLEN_PERCENT: u128 = 50;
 
 /// How many samples in a row, each raising the estimate from below
 /// [`FALLEN_PERCENT`] of its highest value, bring the startup back. The same
-/// count as [`SAMPLES_WITHOUT_GROWTH`]; the rule is ours. Any rise counts, not
-/// only one of [`GROWTH_PERCENT`]: with the window at 1.25 times the estimate,
-/// a raised window shows in the sample about two round trips later, so the
-/// estimate grows by about 12 percent per sample.
+/// count as [`SAMPLES_WITHOUT_GROWTH`]; the rule is ours. Any rise counts; the
+/// module documentation says why.
 const RISES_TO_RESTART: u8 = 3;
 
 /// The state of BBR's full-bandwidth test, which ends the startup gain, and
