@@ -25,29 +25,17 @@
 //! and it is exercised on every connection: clients send reserved "grease"
 //! types precisely to catch a peer that cannot skip them.
 //!
-//! A frame's *type* is judged before its length, and the verdict depends on the
-//! stream it arrived on. SETTINGS on a request stream is a connection error at
-//! any size, so refusing it for being large would report the wrong fault.
-//! Charging the buffering budget for a frame that is not allowed there would
-//! let a peer hold the budget with frames it may not send at all.
-//!
 //! The decoder is pure: it holds every byte of state, and [`FrameReader`]
 //! feeds it from a QUIC stream. That split makes the frame layer testable a
-//! byte at a time, and makes [`FrameReader`] cancel-safe: the only await is
-//! the read, and nothing it produces is lost by dropping the future.
-//! `tunnel::udp` reads request streams inside a `select!` with a timeout, so
-//! that property is required.
+//! byte at a time, and keeps every await in [`FrameReader`], whose rustdoc says
+//! why it must be cancel-safe.
 //!
 //! # The one read-ahead
 //!
-//! "DATA must not be buffered" above means that DATA payload is never copied
-//! and never accumulated without a bound. One bounded exception is this
-//! server's own rule, not anything RFC 9114 asks for: once a request stream
-//! carries a tunnel, [`FrameReader`] takes up to [`READ_AHEAD_CHUNKS`] chunks
-//! from quinn in one read and feeds them to the decoder one at a time. The
-//! chunks are the same `Bytes` quinn delivered, so nothing is copied.
-//! [`READ_AHEAD_CHUNKS`] states why it exists, what it holds and why it is
-//! limited to tunnels.
+//! DATA payload is never copied. Once a request stream carries a tunnel,
+//! [`FrameReader`] holds up to [`READ_AHEAD_CHUNKS`] of quinn's own chunks
+//! between reads; that constant says what this holds and why only a tunnel
+//! gets it.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -161,14 +149,10 @@ const RESERVED_HTTP2_TYPES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
 /// Its value is [`MAX_FIELD_SECTION_SIZE`], the same number as the advertised
 /// field-section limit but not the same *rule*. RFC 9114 §4.2.2 sizes a field
 /// section by the uncompressed name and value plus 32 bytes per field, while
-/// this counts the octets that arrived. The static table and Huffman coding
-/// usually make the encoded form the smaller one, but not always. A Huffman
-/// code is up to 30 bits wide (RFC 7541 Appendix B), so a literal made of bytes
-/// the table codes poorly can grow by up to 3.75x, and such a section can be
-/// inside the advertised limit and still refused here. No encoder produces
-/// one, because Huffman coding is optional per field and an encoder sends a
-/// literal unencoded when coding would grow it. This bounds what a peer that is
-/// *not* a real encoder can make an unauthenticated connection hold.
+/// this counts the octets that arrived. So a section inside the advertised
+/// limit can be refused here, but only one whose Huffman-coded literals are
+/// longer than the literals themselves. No encoder sends that, because Huffman
+/// coding is optional per field.
 const MAX_BUFFERED_FRAME: u64 = MAX_FIELD_SECTION_SIZE;
 
 // D77's boundary, written as arithmetic rather than only as prose: the
@@ -700,15 +684,8 @@ impl FrameDecoder {
     /// Counts one skipped frame against [`MAX_SKIPPED_FRAMES`], reporting a
     /// stream error once a request stream is past it (RFC 9114 §10.5).
     ///
-    /// Only a request stream is counted (the `skipped` field says why). Called
-    /// as each skip *completes*, which is reached whatever the payload length,
-    /// so a frame that declares no payload still advances the count.
-    ///
-    /// The verdict is the plain `Violation::stream(H3_EXCESSIVE_LOAD, ..)`, not
-    /// the `Violation::field_section_too_large` the field-section bounds use:
-    /// this is not a field section that was too large, so the 431 that answers
-    /// those would be the wrong thing to tell the peer. It is answered with a
-    /// bare reset and STOP_SENDING instead ([`super::stream::Resolver::resolve`]).
+    /// A plain stream error, so it gets a bare reset and not the 431
+    /// ([`Violation::field_section_too_large`] says why).
     fn count_skip(&mut self) -> Result<(), Violation> {
         if self.stream == StreamKind::Request {
             self.skipped = self.skipped.saturating_add(1);
@@ -1394,24 +1371,9 @@ mod tests {
         }
     }
 
-    /// The control stream's header-decidable rules, and where they stop.
-    ///
-    /// Before SETTINGS, §6.2.1's first-frame rule is decided from the header at
-    /// every length for every type but SETTINGS: HEADERS, PUSH_PROMISE, GOAWAY,
-    /// CANCEL_PUSH and MAX_PUSH_ID are H3_MISSING_SETTINGS whatever their
-    /// payload, as DATA and unknown types are
-    /// (`a_first_frame_that_is_not_settings_is_refused_from_its_header`). The first
-    /// SETTINGS is the frame the stream waits for, so it is exempt: under the
-    /// cap it is buffered and parsed and a malformed one keeps its payload
-    /// verdict; over the cap it keeps the load answer. Once SETTINGS has opened
-    /// the stream, HEADERS and PUSH_PROMISE are H3_FRAME_UNEXPECTED from the
-    /// header at every length (RFC 9114 §7.2.2, §7.2.5), and so is a second
-    /// SETTINGS (§7.2.4), before its payload is parsed; GOAWAY, CANCEL_PUSH and
-    /// MAX_PUSH_ID belong there, so under the cap they are buffered and parsed,
-    /// with a payload error able to precede the state rules because RFC 9114
-    /// ranks neither (the ordering `it_frameseq` models), and past the cap
-    /// the cap answers. The permissive kind applies none of these rules: the
-    /// suite's client builds it for its own response stream.
+    /// The control stream's rules that `misplaced` decides from the header, at
+    /// every length, and where the cap takes over. The comments in the body
+    /// name each case.
     #[test]
     fn control_stream_type_rules_are_decided_before_the_cap() {
         /// Nothing, one byte, and the largest buffered frame.
@@ -1475,7 +1437,8 @@ mod tests {
 
         // Once SETTINGS has opened the stream, those three belong there: under
         // the cap they are buffered and parsed, and past it the cap is their
-        // only bound.
+        // only bound. A payload error can then come before a state rule,
+        // because RFC 9114 ranks neither (the ordering `it_frameseq` models).
         for kind in [GOAWAY, CANCEL_PUSH, MAX_PUSH_ID] {
             for length in BUFFERED {
                 assert_matches!(
@@ -1736,18 +1699,9 @@ mod tests {
 
     /// The same bound when every stream announces at the same instant.
     ///
-    /// The test above walks the streams one at a time, which is the one order
-    /// that cannot show what [`BufferBudget::charge`] is written for: a peer
-    /// opens as many request streams as it likes and their HEADERS frames arrive
-    /// together, so the charges really do contend. `try_update` is what makes a
-    /// refused charge leave the counter alone. An add-then-check would let two
-    /// streams failing at once each subtract the other's rolled-back bytes, and
-    /// the bound would then hold on average rather than at every instant.
-    ///
-    /// Four times as many streams as there is room for, all released from a
-    /// barrier, so the answer has to be exactly the number that fits however the
-    /// threads interleave. Bounded by construction: every thread does one charge
-    /// and stops.
+    /// Every stream announces at once from a barrier, four times as many as
+    /// fit, so the count must be exact however the threads interleave;
+    /// `BufferBudget::charge` says why `try_update`.
     #[test]
     fn concurrent_charges_hold_the_budget_exactly() {
         let budget = Arc::new(BufferBudget::default());
@@ -1807,22 +1761,9 @@ mod tests {
 
     /// The counter the bound is read off is never seen above the bound.
     ///
-    /// The other half of the same claim, and the half a barrier cannot show. A
-    /// charge and its refusal are three instructions apart, so streams released
-    /// together mostly still take the counter in turn; what really contends is a
-    /// connection whose streams are announcing and ending continuously, which is
-    /// what a peer opening request streams in a loop produces.
-    ///
-    /// An add-then-check charge is wrong there in a way that is invisible to the
-    /// arithmetic afterwards: the counter goes over the bound for as long as it
-    /// takes to roll the refused bytes back, and any stream that reads it in that
-    /// window is refused a frame the connection had room for: a 431 to a client
-    /// that broke no rule. `try_update` never publishes the rejected value at
-    /// all, so a reader cannot see one.
-    ///
-    /// Bounded by construction twice over: every worker does a fixed number of
-    /// rounds, and the sampler stops on their last one or on its own deadline,
-    /// whichever comes first.
+    /// A sampler watches the counter while workers announce and drop frames at
+    /// the boundary. An add-then-check charge would show a value past the bound
+    /// for the instant before its rollback; `try_update` never publishes one.
     #[test]
     fn a_refused_charge_is_never_visible_to_another_stream() {
         /// Announces a full-sized frame, then lets the decoder go.
