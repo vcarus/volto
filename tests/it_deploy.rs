@@ -18,8 +18,8 @@
 //! `curl` first on `PATH`, and serves a local archive in place of the release
 //! page. It installs a release from before signing with `--allow-unsigned`,
 //! because no test holds the release key. The signed half of `verify_release`
-//! therefore runs on its own, with a test key, as do `put_back`,
-//! `acquire_lock` and `refuse_automatic_downgrade`.
+//! therefore runs on its own, with a test key, as do `acquire_lock` and
+//! `refuse_automatic_downgrade`.
 
 #[path = "common/scripts.rs"]
 mod scripts;
@@ -693,78 +693,6 @@ fn run_shell_call(script: &str, name: &str, then: &str, path: &OsStr, prelude: &
             .env("PATH", path)
             .stdin(Stdio::null()),
     )
-}
-
-/// The rollback puts the previous files back, reloads systemd, and starts the
-/// service without restarting it.
-///
-/// `put_back start` is the ERR trap of the swap window. A failure before the
-/// restart, in the binary or unit `install` or in `daemon-reload`, leaves the
-/// old process running and serving its tunnels. A failure of the restart itself
-/// can leave the unit inactive. `systemctl start` covers both: it does nothing
-/// to an active unit and starts an inactive one. A `restart` here would drop
-/// every live tunnel for a failure that had cost nothing. `daemon-reload` comes
-/// before the start, or systemd starts the service under the unit it parsed
-/// last, which is the one being rolled back.
-///
-/// The real `install` runs, so the files are read back afterwards: a copy in
-/// the wrong direction overwrites the only previous binary and still reports a
-/// restore. The run that arms the trap over a whole update is
-/// `a_failure_inside_the_swap_window_restores_both_files`.
-#[test]
-fn restoring_the_previous_files_starts_rather_than_restarts_the_service() {
-    let dir = scratch_tree("deploy", "restore-previous", &["stubs", "bin", "unit"]);
-    let stubs = dir.join("stubs");
-    let log = dir.join("systemctl.log");
-
-    write_executable(
-        &stubs.join("systemctl"),
-        &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-    );
-
-    let bin = dir.join("bin/volto");
-    let unit = dir.join("unit/volto.service");
-    fs::write(&bin, "the failed binary\n").expect("plant the failed binary");
-    fs::write(bin.with_extension("prev"), "the previous binary\n")
-        .expect("plant the previous binary");
-    fs::write(&unit, "the failed unit\n").expect("plant the failed unit");
-    fs::write(unit.with_extension("service.prev"), "the previous unit\n")
-        .expect("plant the previous unit");
-
-    let prelude = format!(
-        "BIN='{}'; UNIT='{}'; SERVICE_NAME=volto; VERSION=9.9.9",
-        bin.display(),
-        unit.display()
-    );
-    let output = run_shell_call(
-        "script/deploy.sh",
-        "put_back",
-        "start",
-        &path_with_stubs(&stubs),
-        &prelude,
-    );
-
-    let stderr = stderr_of(&output);
-    assert!(
-        !output.status.success() && stderr.contains("restored the previous binary and unit"),
-        "put_back start must report what it restored and fail the run: {stderr}"
-    );
-    assert_eq!(
-        fs::read_to_string(&bin).ok().as_deref(),
-        Some("the previous binary\n"),
-        "put_back start must copy the previous binary over the failed one: {stderr}"
-    );
-    assert_eq!(
-        fs::read_to_string(&unit).ok().as_deref(),
-        Some("the previous unit\n"),
-        "put_back start must copy the previous unit over the failed one: {stderr}"
-    );
-    let calls = fs::read_to_string(&log).unwrap_or_default();
-    assert_eq!(
-        calls, "daemon-reload\nstart volto\n",
-        "put_back start must reload systemd and then start the service, never \
-         restart it: systemctl saw\n{calls}"
-    );
 }
 
 /// Opens the RUST_LOG reader both scripts carry.
@@ -2318,6 +2246,12 @@ fn an_unsigned_release_does_not_replace_the_installed_script() {
 /// Here the restart fails after the new binary and unit are in place, which
 /// leaves the old files as the only ones that can serve. Without the trap,
 /// `set -e` ends the run with the new files installed and the service down.
+///
+/// `start` does nothing to an active unit and starts an inactive one, so after
+/// a failure before the restart the old process keeps its tunnels, where a
+/// `restart` would drop them. `daemon-reload` comes first, or systemd starts
+/// the service under the unit it parsed last, the one being rolled back. The
+/// files are read back, so a copy in the wrong direction is caught.
 #[test]
 fn a_failure_inside_the_swap_window_restores_both_files() {
     let host = Host::new("swap-window", Service::RestartFails);
