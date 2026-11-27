@@ -283,7 +283,7 @@ fn burst<'a>(
 
 #[tokio::test]
 async fn the_operating_system_refusing_a_descriptor_costs_one_request() {
-    let log = SharedBuffer::install("volto=debug");
+    let log = SharedBuffer::shared("volto=debug");
 
     let server = TestServer::start_with(&format!(
         "[limits]\nmax_targets_per_conn = {SLOTS}\n{ALLOW_PRIVATE}"

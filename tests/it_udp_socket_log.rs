@@ -45,7 +45,7 @@ const BURST: usize = 8192;
 
 #[tokio::test]
 async fn a_socket_the_os_reported_broken_is_not_logged_as_a_dropped_packet() {
-    let buffer = SharedBuffer::install("volto=debug");
+    let buffer = SharedBuffer::shared("volto=debug");
 
     let server = TestServer::start_with(UNCAPPED).await;
     // Nothing is bound here, so every packet draws an ICMP port-unreachable,

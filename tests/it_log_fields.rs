@@ -31,7 +31,7 @@ use volto::h3api::Status;
 /// splitting these would race over installing it.
 #[tokio::test]
 async fn operator_facing_fields_print_values_not_options() {
-    let buffer = SharedBuffer::install("volto=info");
+    let buffer = SharedBuffer::shared("volto=info");
 
     let server = TestServer::start_with(ALLOW_PRIVATE).await;
     let target = spawn_echo_target().await;

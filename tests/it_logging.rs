@@ -26,7 +26,7 @@ use common::{
 
 #[tokio::test]
 async fn inbound_requests_are_logged_with_every_header() {
-    let buffer = SharedBuffer::install("volto=debug");
+    let buffer = SharedBuffer::shared("volto=debug");
 
     let server = TestServer::start().await;
     // Nothing needs to be listening: the request is logged before we dial out.

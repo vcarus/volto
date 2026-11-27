@@ -38,7 +38,7 @@ const PROHIBITED: &str = "127.0.0.1:443";
 
 #[tokio::test]
 async fn tunnel_refusals_and_drops_are_logged_at_the_level_they_were_graded() {
-    let buffer = SharedBuffer::install("volto=info");
+    let buffer = SharedBuffer::shared("volto=info");
 
     blackhole_is_information(&buffer).await;
     policy_refusal_is_information(&buffer).await;

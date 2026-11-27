@@ -29,7 +29,7 @@ const PASSWORD: &str = "unlikely-plaintext-password";
 
 #[tokio::test]
 async fn the_authentication_path_never_puts_a_credential_in_the_log() {
-    let buffer = SharedBuffer::install("volto=debug");
+    let buffer = SharedBuffer::shared("volto=debug");
 
     a_rejected_password_is_never_logged(&buffer).await;
     credentials_padded_with_whitespace_are_still_credentials().await;

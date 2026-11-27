@@ -38,7 +38,7 @@ use volto::h3api::{FieldValue, Status};
 /// Reloads the server with a subscriber of this test's own, and returns
 /// everything it logged.
 ///
-/// Scoped rather than process-wide (`SharedBuffer::install`) because this file
+/// Scoped rather than process-wide (`SharedBuffer::shared`) because this file
 /// is many `#[tokio::test]`s and `tracing_subscriber::fmt().init()` may run only
 /// once per process. `ReloadHandle::reload` is synchronous and runs on the
 /// caller's own thread, which is exactly what a thread-local default subscriber

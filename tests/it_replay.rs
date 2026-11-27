@@ -1321,7 +1321,7 @@ async fn production_shapes_are_replayed() {
     };
     let plan = shape::plan(&profile, scaling, settings.seed);
 
-    let buffer = SharedBuffer::install("info");
+    let buffer = SharedBuffer::shared("info");
     let server = Arc::new(TestServer::start_with(&settings.config()).await);
 
     // After the server has a port and before any client has used it. The guard

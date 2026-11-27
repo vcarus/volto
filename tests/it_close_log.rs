@@ -32,7 +32,7 @@ use volto::varint;
 /// scenarios into separate `#[tokio::test]`s would race over installing it.
 #[tokio::test]
 async fn close_logs_are_graded_by_how_the_connection_ended() {
-    let buffer = SharedBuffer::install("volto=info");
+    let buffer = SharedBuffer::shared("volto=info");
 
     let mut server = TestServer::start_with(&format!("{IMPATIENT}{ALLOW_PRIVATE}")).await;
     let echo = spawn_echo_target().await;

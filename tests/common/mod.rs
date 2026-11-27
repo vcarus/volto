@@ -1928,31 +1928,27 @@ pub async fn closed_address() -> SocketAddr {
 pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
 
 impl SharedBuffer {
-    /// Installs a process-wide subscriber at `filter`, writing into a new buffer.
+    /// The buffer of the process-wide subscriber, which the first call installs
+    /// at `filter`.
     ///
-    /// Once per test binary, because `init` panics on the second call in a
-    /// process -- which is why every binary that reads log lines runs all its
-    /// scenarios inside one `#[tokio::test]`.
-    pub fn install(filter: &str) -> Self {
-        let buffer = Self::default();
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_writer(buffer.clone())
-            .with_ansi(false)
-            .init();
-        buffer
-    }
-
-    /// [`Self::install`] for a binary in which more than one test reads the
-    /// log while the others run beside them.
-    ///
-    /// The first call installs the subscriber at `filter` and every call
-    /// returns that one buffer, so every caller in a binary passes the same
-    /// filter. Lines from every test of the binary land in it, so a test finds
-    /// its own by a field only its own server or client can produce.
+    /// `init` panics on a second call in a process, so every later call
+    /// returns that same buffer and its filter stays the first caller's. Every
+    /// caller in a binary passes the same filter. Lines from every test of the
+    /// binary land in it, so a test finds its own by a field only its own
+    /// server or client can produce.
     pub fn shared(filter: &str) -> Self {
         static SHARED: std::sync::OnceLock<SharedBuffer> = std::sync::OnceLock::new();
-        SHARED.get_or_init(|| Self::install(filter)).clone()
+        SHARED
+            .get_or_init(|| {
+                let buffer = Self::default();
+                tracing_subscriber::fmt()
+                    .with_env_filter(filter)
+                    .with_writer(buffer.clone())
+                    .with_ansi(false)
+                    .init();
+                buffer
+            })
+            .clone()
     }
 
     /// Everything logged so far.

@@ -93,7 +93,7 @@ const ONE_PACKET_BUDGET: &str = "unanswered_packet_budget = 1\n";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flooded_session_closes_once_the_flood_stops_and_the_flood_crosses_nothing() {
-    let buffer = SharedBuffer::install("volto=debug");
+    let buffer = SharedBuffer::shared("volto=debug");
 
     let server = TestServer::start_with(&format!(
         "[limits]\nudp_session_timeout = {}\n{ALLOW_PRIVATE}{ONE_PACKET_BUDGET}",

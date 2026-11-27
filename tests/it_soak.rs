@@ -297,7 +297,7 @@ fn use_and_close_tcp<'a>(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_mixed_run_leaks_nothing_and_counts_everything() {
-    let buffer = SharedBuffer::install("volto=info");
+    let buffer = SharedBuffer::shared("volto=info");
 
     let server = TestServer::start_with(&format!(
         "[limits]\n\

@@ -111,7 +111,7 @@ fn key_file(dir: &TempDir, name: &str, config_id: u8) -> (std::path::PathBuf, Ec
 
 #[tokio::test]
 async fn tunnels_run_over_the_servers_tls_with_and_without_ech() {
-    let buffer = SharedBuffer::install("volto=debug");
+    let buffer = SharedBuffer::shared("volto=debug");
 
     // Without ECH: plain TLS 1.3, and the startup line says so.
     let mark = buffer.mark();

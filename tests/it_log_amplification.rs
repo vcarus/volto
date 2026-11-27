@@ -59,7 +59,7 @@ const PASSWORD: &str = "s3cret-pa55word";
 
 #[tokio::test]
 async fn one_peer_cannot_buy_an_unbounded_number_of_production_log_lines() {
-    let buffer = SharedBuffer::install("volto=info,volto::quic=debug");
+    let buffer = SharedBuffer::shared("volto=info,volto::quic=debug");
 
     a_policy_refusal_storm_is_sampled(&buffer).await;
     a_tunnel_limit_storm_is_sampled(&buffer).await;
