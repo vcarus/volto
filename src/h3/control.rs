@@ -209,19 +209,10 @@ struct Control {
     /// Kept only to enforce that it never shrinks: this server never pushes,
     /// so the value itself is never consulted.
     max_push_id: Option<u64>,
-    /// Frames of an unknown type this stream has skipped, and when the next one
-    /// is worth a line.
-    ///
-    /// An unknown frame with a zero length is two bytes on the wire, and RFC
-    /// 9114 §9 says to ignore it. So a peer may send them back to back for as
-    /// long as the connection lives, and a log line apiece would be a large
-    /// amplification. The line is a `debug!`, so it only reaches an operator
-    /// who turned `debug` on to read what a client sends.
-    ///
-    /// The frames are not skipped silently, because greasing is how a peer
-    /// checks that this server skips what it does not know, and a debug trace
-    /// should show it. The doubling schedule keeps the first one and the size
-    /// of the flood, and drops the repetition.
+    /// Unknown frames skipped on this stream, logged on a doubling schedule. A
+    /// zero-length unknown frame is two bytes and RFC 9114 §9 says to ignore
+    /// it, so a line apiece would amplify a peer's bytes into the log; greasing
+    /// is still visible in a debug trace.
     skipped: crate::logfmt::Sampler,
 }
 
@@ -673,9 +664,7 @@ mod tests {
         );
     }
 
-    /// The whole reason the control stream is read in its own task: the flag
-    /// the sessions hold is written by whoever parsed the frame, so there is no
-    /// moment at which the peer's answer is known here but not there.
+    /// The frame's value reaches every holder of the flag.
     #[test]
     fn the_peers_settings_reach_the_shared_flag() {
         for datagrams in [true, false] {
