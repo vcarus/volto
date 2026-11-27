@@ -25,13 +25,25 @@ use super::{Policy, Screened};
 ///
 /// The packets of one first flight leave the client in one burst, so on any
 /// path they arrive within milliseconds of each other. The rest of the window
-/// is for loss: a client that hears nothing sends its flight again after one
-/// probe timeout, about one second for a client that starts from the 333 ms
-/// initial RTT quinn and this server default to, and two seconds lets that
-/// retransmission join the packets of the first attempt that did arrive. A
-/// flight that is still incomplete after this is dropped without a reply. Our
-/// own value.
-pub const HOLD_LIFETIME: Duration = Duration::from_secs(2);
+/// is for loss. The hold sends nothing back, so a client learns of no loss
+/// and sends at most two datagrams at each probe timeout, filled from its
+/// oldest packets that still carry data (RFC 9002 §6.2.4: "An endpoint MAY
+/// send up to two full-sized datagrams containing ack-eliciting packets to
+/// avoid an expensive consecutive PTO expiration due to a single lost
+/// datagram."). From the 333 ms initial RTT quinn and this server default to,
+/// the probe timeouts fall at about 1 s, 3 s and 7 s. A flight of three
+/// datagrams that loses its third gets the lost bytes back only at the
+/// second of them, 3 s after it began, and a flight of five or six, or a
+/// flight whose retransmission is lost once more, only at the third, 7 s
+/// after it began. So the window ends after the third probe timeout.
+/// `it_gate_shapes` drives the three-datagram case with a quinn client. A
+/// flight that is still incomplete after this is dropped without a reply.
+/// Our own value.
+///
+/// The lifetime is not a bound on what a flood can hold: [`HOLD_FLIGHTS`]
+/// and [`HOLD_TOTAL_BYTES`] are, and a new flight evicts the oldest whatever
+/// its age.
+pub const HOLD_LIFETIME: Duration = Duration::from_secs(8);
 
 /// How many first flights may be held at once.
 ///

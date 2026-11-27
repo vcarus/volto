@@ -823,7 +823,7 @@ Some details worth knowing before relying on it:
   The ClientHello split across packets is then judged at the socket like any
   other, and an Initial packet that carries no ClientHello at all is held and,
   when none follows, dropped, so the acknowledgements described below are not
-  sent. What is held is bounded in time (two seconds), in number (64 handshakes
+  sent. What is held is bounded in time (eight seconds), in number (64 handshakes
   at once, the oldest giving way to a new one) and in bytes (4 MiB in all).
 - **Reloadable.** `SIGHUP` applies a new list to handshakes from then on;
   connections already open are unaffected, exactly like the rest of the file.

@@ -48,9 +48,9 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use common::{
-    ALLOW_PRIVATE, GATE_LOCALHOST, Offer, SharedBuffer, TempDir, TestServer, bulk_alpn,
-    client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
-    rustls_client, udp_answer, udp_answers, udp_answers_on,
+    ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TempDir, TestServer,
+    bulk_alpn, client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
+    rustls_client, udp_answer, udp_answers, udp_answers_on, udp_relay,
 };
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
@@ -2326,7 +2326,7 @@ fn a_packet_whose_own_fragments_disagree_drops_its_flight_and_every_byte_of_it()
 /// the commit.
 #[test]
 fn the_hold_bounds_are_the_values_they_are_documented_as() {
-    assert_eq!(HOLD_LIFETIME, Duration::from_secs(2));
+    assert_eq!(HOLD_LIFETIME, Duration::from_secs(8));
     assert_eq!(HOLD_FLIGHTS, 64);
     assert_eq!(HOLD_HELLO_BYTES, 16 * 1024);
     assert_eq!(HOLD_FLIGHT_BYTES, 64 * 1024);
@@ -2968,6 +2968,79 @@ async fn a_flight_that_never_completes_draws_nothing() {
     all_silent(server.addr, shapes).await;
 }
 
+/// A first flight of three datagrams whose third is lost completes through
+/// the hold.
+///
+/// The client is quinn, with an ECH ClientHello padded by a long ALPN list
+/// until it takes three Initial datagrams. A relay drops the client's third
+/// datagram and carries everything else. The hold sends nothing back, so the
+/// client learns of no loss and sends two datagrams at each probe timeout
+/// (RFC 9002 §6.2.4: "An endpoint MAY send up to two full-sized datagrams
+/// containing ack-eliciting packets to avoid an expensive consecutive PTO
+/// expiration due to a single lost datagram."). quinn fills them from its
+/// oldest packets that still carry data, so the first probe repeats the
+/// first two datagrams and the lost bytes come only with the second probe,
+/// about three seconds after the flight began. The flight has to be held
+/// that long.
+#[tokio::test]
+async fn a_three_datagram_first_flight_that_loses_its_third_completes_through_the_hold() {
+    let key = ech_key(44);
+    let (server, _keys) = ech_server(&key, false, &[]).await;
+    let begun = std::time::Instant::now();
+    let sent = Arc::new(std::sync::Mutex::new(Vec::<Duration>::new()));
+    let relay = udp_relay(server.addr, {
+        let sent = sent.clone();
+        move |leg, _| {
+            if leg != Leg::FromClient {
+                return Relayed::Forward;
+            }
+            let mut sent = sent.lock().expect("the send times");
+            sent.push(begun.elapsed());
+            if sent.len() == 3 {
+                Relayed::Drop
+            } else {
+                Relayed::Forward
+            }
+        }
+    })
+    .await;
+
+    let mut alpn = vec!["h3".to_owned()];
+    alpn.extend((0..4).map(|i| format!("{i}{}", "padding-".repeat(31))));
+    let alpn: Vec<&str> = alpn.iter().map(String::as_str).collect();
+    let crypto = rustls_client(
+        &Offer::Ech(key.config_list()),
+        Some(&surge_groups()),
+        roots_of(&server.ca),
+        &alpn,
+    );
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        Duration::from_secs(10)
+            .try_into()
+            .expect("a legal idle timeout"),
+    ));
+    let endpoint = endpoint_from(crypto, Some(transport));
+    let connecting = endpoint
+        .connect(relay.addr, "localhost")
+        .expect("start connecting");
+    let outcome = tokio::time::timeout(Duration::from_secs(12), connecting)
+        .await
+        .expect("a handshake ends one way or the other");
+
+    let sent = sent.lock().expect("the send times").clone();
+    let first = sent
+        .iter()
+        .take_while(|at| **at < Duration::from_millis(500))
+        .count();
+    assert_eq!(first, 3, "the first flight takes three datagrams: {sent:?}");
+    let connection = outcome.unwrap_or_else(|error| {
+        panic!("the handshake failed with {error:?}; client datagrams at {sent:?}")
+    });
+    drop(connection);
+    relay.task.abort();
+}
+
 /// A quinn client on rustls with `offer`, `groups` in that order, and an idle
 /// timeout of two seconds, so that silence is a fast `TimedOut`.
 fn quick_client(
@@ -3321,6 +3394,13 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
         steps: 0,
         body: Body::Reload(policy),
     };
+    // An empty datagram, which never reaches the hold: a record that only
+    // moves the clock, 100 ms a step.
+    let pause = |steps: u8| Record {
+        source: 0,
+        steps,
+        body: Body::Raw(Vec::new()),
+    };
     // `hello` in two packets of one CRYPTO frame each, as frames to seal, to
     // the first connection ID with packet numbers 0 and 1.
     let sealed_two = |source: u8, hello: &[u8]| -> Vec<Record> {
@@ -3408,7 +3488,15 @@ fn the_hold_fuzz_seed_corpus_is_written_with_the_outcomes_it_was_built_for() {
         ),
         (
             "a-first-packet-that-expires",
-            hold_input(0x00, &[record(0, 0, &two[0]), record(0, 31, &two[1])]),
+            hold_input(
+                0x00,
+                &[
+                    record(0, 0, &two[0]),
+                    pause(31),
+                    pause(31),
+                    record(0, 31, &two[1]),
+                ],
+            ),
             Screened::Held,
         ),
         (
