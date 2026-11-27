@@ -411,6 +411,14 @@ async fn a_session_waits_for_the_peer_settings_until_the_bound() {
         "the session was set up {answered:?} after the client began to connect, with no \
          SETTINGS read and the bound of {PEER_SETTINGS_WAIT:?} not yet passed"
     );
+    // And not long after it: the bound ends the wait, so a session is not left
+    // waiting for SETTINGS that never come. Two seconds is room for a loaded
+    // machine and far less than the read timeout of ten.
+    assert!(
+        answered < PEER_SETTINGS_WAIT + Duration::from_secs(2),
+        "the session was set up only {answered:?} after the client began to connect, \
+         long past the bound of {PEER_SETTINGS_WAIT:?}"
+    );
 }
 
 /// How often [`a_session_set_up_once_the_settings_are_read_answers_on_datagrams`]
