@@ -23,8 +23,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, open_udp_session,
-    respond_to, send_udp_payload, spawn_udp_target,
+    ALLOW_PRIVATE, H3Client, SharedBuffer, TestServer, connect_request, field_text,
+    numeric_field, open_udp_session, respond_to, send_udp_payload, spawn_udp_target,
 };
 use volto::h3api::Status;
 
@@ -70,8 +70,9 @@ async fn blackhole_is_information(buffer: &SharedBuffer) {
             &[" INFO ", "every address of the target is a DNS blackhole"],
         )
         .await;
-    assert!(
-        line.contains(BLACKHOLED),
+    assert_eq!(
+        (field_text(&line, "host"), numeric_field(&line, "port")),
+        ("\"0.0.0.0\"", 443),
         "the line must name the authority it is about: {line}"
     );
 
@@ -111,8 +112,9 @@ async fn policy_refusal_is_information(buffer: &SharedBuffer) {
             ],
         )
         .await;
-    assert!(
-        line.contains(PROHIBITED),
+    assert_eq!(
+        (field_text(&line, "host"), numeric_field(&line, "port")),
+        ("\"127.0.0.1\"", 443),
         "the line must name the authority it is about: {line}"
     );
 
