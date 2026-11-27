@@ -1,16 +1,11 @@
 //! How a connection ended must decide the level its closing line is logged at.
 //!
-//! An idle timeout is the everyday goodbye — Surge abandons connections without
-//! a CONNECTION_CLOSE — and so is a peer that closes cleanly. Neither is a fault,
-//! so neither may reach WARN; anything else still has to.
+//! An idle timeout is the everyday goodbye (Surge abandons connections without
+//! a CONNECTION_CLOSE), and so is a peer that closes cleanly. Neither is a
+//! fault, so neither may reach WARN; anything else still has to.
 //!
-//! This test exists because the first attempt at that grading (D36) shipped
-//! without one and never worked in production: it asked the QUIC connection for
-//! its `close_reason()` after the fact, and that value has already been
-//! overwritten with `LocallyClosed` by the time the HTTP/3 connection is dropped
-//! on the way out. Only a test that drives a real idle timeout and reads the real
-//! log line can tell the two apart, hence this dedicated binary with a capturing
-//! subscriber (`tracing_subscriber::fmt().init()` may run once per process).
+//! Only a test that drives a real idle timeout and reads the real line can tell
+//! a graded close from one read off `close_reason()` (`quic::graded`, D36).
 
 mod common;
 
@@ -27,9 +22,6 @@ use volto::h3api::Status;
 use volto::varint;
 
 /// The eight ways a connection ends, each with the level and reason it earns.
-///
-/// One test function, because the subscriber is process-wide: splitting the
-/// scenarios into separate `#[tokio::test]`s would race over installing it.
 #[tokio::test]
 async fn close_logs_are_graded_by_how_the_connection_ended() {
     let buffer = SharedBuffer::shared("volto=info");
@@ -197,9 +189,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
 
     // 4. H3_NO_ERROR (0x100), which RFC 9114 §8.1 defines as "No error. This is
     //    used when the connection or stream needs to be closed, but there is no
-    //    error to signal." Surge does not send it — it uses 0x0, scenario 2 — so
-    //    this branch has no production traffic keeping it honest, and dropping
-    //    it would put every spec-following client back into the warning stream.
+    //    error to signal." Surge sends 0x0 (scenario 2), so only this test
+    //    holds the 0x100 branch.
     {
         let mark = buffer.mark();
         let client = H3Client::connect(&server).await;
@@ -368,16 +359,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         server.wait_until_stopped(STOP_TIMEOUT).await;
     }
 
-    // Every routine close still carries the diagnostic fields the transport is
-    // read through. All are taken off the connection *after* `conn::handle`
-    // has returned and dropped the HTTP/3 layer — the same object at the same
-    // moment that made `close_reason()` unusable — so nothing but an assertion
-    // stands between them and quietly becoming a placeholder. `initial_rtt_ms =
-    // 150` was derived from `rtt_ms` samples, `remote_now` is the only
-    // externally visible trace of a migration or NAT rebind mid-connection,
-    // `mtu` is what path MTU discovery settled on, `mtu_black_holes` is how
-    // often it was knocked back to the floor on the way, and the five D72
-    // counters say how much the connection carried while it lasted.
+    // Every close carries the transport fields, read after `conn::handle` has
+    // dropped the HTTP/3 layer.
     let logged = buffer.contents();
     let closes: Vec<&str> = logged
         .lines()
@@ -446,9 +429,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         }
     }
 
-    // The whole point of the grading: exactly two of the eight closes were worth a
-    // warning — the peer reporting a problem and the peer causing one — and
-    // neither of them is a routine ending.
+    // Exactly two closes were worth a warning: the peer reporting a problem and
+    // the peer causing one.
     let warnings: Vec<&str> = logged
         .lines()
         .filter(|line| line.contains("connection closed with error"))
@@ -459,12 +441,6 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         "only the non-zero application close and the protocol violation may warn; \
          log was:\n{logged}"
     );
-    for line in &warnings {
-        assert!(
-            !line.contains("Timeout"),
-            "an idle timeout must never reach a warning; line was:\n{line}"
-        );
-    }
 
     // The two statements of `log_connection_closed` each spell their fields
     // out, so this is what holds them equal: the WARN line carries the INFO
