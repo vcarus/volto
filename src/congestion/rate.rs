@@ -18,6 +18,8 @@ pub(super) const SAMPLES: usize = 10;
 /// first batch at least one smoothed RTT later. One smoothed RTT rather than
 /// the minimum, so that with a queue standing the interval still covers a whole
 /// window of acknowledgements and averages out how the peer bunches them.
+/// A time in which nothing was in flight is neither part of a stored sample
+/// nor time the window held the sender; see [`Self::resume`].
 ///
 /// The sample is the bytes acknowledged in between, over the longer of two
 /// times: the interval itself, and the send interval of the packets those bytes
@@ -138,6 +140,24 @@ impl DeliveryRate {
         self.earliest = self.sent;
         self.bytes = 0;
         self.app_limited = false;
+    }
+
+    /// Starts the interval in progress again at `now`, the first send after
+    /// in-flight data had fallen to zero, if it has acknowledged nothing yet.
+    /// Such an interval began at the ACK batch that emptied the flight, and
+    /// nothing between that batch and `now` was the path's. Every packet
+    /// acknowledged before was sent before `now`, so the send interval starts
+    /// at the earliest packet acknowledged in the interval.
+    ///
+    /// An interval that has acknowledged something is left as it is. The ACK
+    /// that emptied the flight is in it, and quinn reports a sender with
+    /// nothing to send as app-limited, so the interval is not stored unless it
+    /// is above the estimate, and the record leaves it out.
+    pub(super) fn resume(&mut self, now: Instant) {
+        if self.started.is_some() && self.bytes == 0 {
+            self.started = Some(now);
+            self.earliest = None;
+        }
     }
 
     /// The bandwidth estimate in bytes per second; `None` before any sample

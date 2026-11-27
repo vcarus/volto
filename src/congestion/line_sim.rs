@@ -2292,6 +2292,12 @@ fn an_idle_gap_between_two_transfers() {
                 let name = format!("gap {gap} s, {name}");
                 let r = run(&format!("idle {name}"), sc, false);
                 print_resumed(&name, &sc, &r);
+                let busy = Duration::from_secs(sc.seconds - gap);
+                assert!(
+                    r.record.window_limited < busy,
+                    "{name} seed {seed}: the idle span counted as window-limited: {:?}",
+                    r.record
+                );
             }
         }
     }

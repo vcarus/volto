@@ -549,6 +549,7 @@ impl ControllerFactory for BbrConfig {
             window: INITIAL_WINDOW,
             record: Record::default(),
             flight: (0, 0),
+            unsent: None,
         })
     }
 }
@@ -621,6 +622,11 @@ pub struct Bbr {
     /// The bytes acknowledged since the last sample interval closed, and the
     /// sum of their times in flight in byte-microseconds, for `record`.
     flight: (u64, u128),
+    /// In-flight data as the controller can count it since the last send: what
+    /// the last ACK batch left in flight, less the bytes declared lost since.
+    /// `None` once a packet has been sent after that batch. At zero, the next
+    /// send is the first after an idle period.
+    unsent: Option<u64>,
 }
 
 impl Bbr {
@@ -804,6 +810,15 @@ impl Bbr {
 }
 
 impl Controller for Bbr {
+    /// quinn calls this once per datagram batch, after its packets count as
+    /// in flight (quinn-proto `src/connection/mod.rs`,
+    /// `Connection::poll_transmit`).
+    fn on_sent(&mut self, now: Instant, _bytes: u64, _last_packet_number: u64) {
+        if self.unsent.take() == Some(0) {
+            self.rate.resume(now);
+        }
+    }
+
     fn on_ack(
         &mut self,
         now: Instant,
@@ -822,6 +837,9 @@ impl Controller for Bbr {
         app_limited: bool,
         _largest_packet_num_acked: Option<u64>,
     ) {
+        // After the acknowledged packets and before the lost ones, which
+        // `on_congestion_event` takes off.
+        self.unsent = Some(in_flight);
         let sample = self.rate.on_end_acks(now, app_limited, self.srtt);
         if let Some(sample) = &sample {
             let was_ended = self.startup.ended;
@@ -950,6 +968,11 @@ impl Controller for Bbr {
         _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
+        // quinn takes the same bytes out of in-flight data, except those of a
+        // lost MTU probe, which it does not report.
+        if let Some(unsent) = &mut self.unsent {
+            *unsent = unsent.saturating_sub(lost_bytes);
+        }
         self.startup.on_loss(lost_bytes);
         self.base.on_loss(sent, lost_bytes);
         self.lost = self.lost.saturating_add(lost_bytes);
@@ -2350,6 +2373,46 @@ mod tests {
         t = interval(&mut c, t, 10_000_000, false);
         interval(&mut c, t, 10_000_000, false);
         assert_eq!(floor_counts(&c), (5 * SRTT, 3 * SRTT, 2 * SRTT, 10_000_000));
+    }
+
+    /// A connection idle for 30 s and then held by its window again counts the
+    /// interval from its first send after the gap, not the gap, whether its
+    /// last ACK batch emptied the flight or the loss declared after it did.
+    /// That batch closed an interval, so the one after it holds no ACK that
+    /// found the sender app-limited.
+    #[test]
+    fn an_idle_gap_is_not_counted_as_time_the_window_held_the_sender() {
+        for left in [0, 2_400] {
+            let mut c = capped();
+            let mut t = Instant::now();
+            end_acks(&mut c, t, false);
+            t = interval(&mut c, t, 2_000_000, false);
+            ack(&mut c, t + SRTT, MIN_RTT, 200_000, false);
+            t += SRTT;
+            c.on_end_acks(t, left, false, None);
+            if left > 0 {
+                c.on_congestion_event(t, t - MIN_RTT, false, left);
+            }
+            assert_eq!(c.record().window_limited, 2 * SRTT);
+
+            let resumed = t + Duration::from_secs(30);
+            c.on_sent(resumed, 1200, 1000);
+            let first = resumed + MIN_RTT;
+            ack(&mut c, first, MIN_RTT, 24_000, false);
+            c.on_end_acks(first, 200_000, false, None);
+            interval(&mut c, first, 2_000_000, false);
+            let r = c.record();
+            assert_eq!(
+                r.window_limited,
+                3 * SRTT + MIN_RTT,
+                "{left} bytes left: from the send after the gap: {r:?}"
+            );
+            assert_eq!(
+                c.rate.max(),
+                Some(2_000_000),
+                "{left} bytes left: no sample over the gap"
+            );
+        }
     }
 
     /// The means of [`Record`], over the same intervals.
