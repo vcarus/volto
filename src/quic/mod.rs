@@ -457,7 +457,7 @@ impl Server {
     ///
     /// Below the cap this is a configuration read and a length read and
     /// nothing else: every branch past the first belongs to a full server.
-    fn admit(&self, mut incoming: quinn::Incoming) -> Option<quinn::Incoming> {
+    fn admit(&self, incoming: quinn::Incoming) -> Option<quinn::Incoming> {
         // Read per accepted connection rather than snapshotted before the
         // loop: `docs/deployment.md#reloading` promises a reload applies to
         // connections accepted from then on, and lowering this cap during an
@@ -495,76 +495,17 @@ impl Server {
             return Some(incoming);
         }
 
-        // Read before `retry()` or `refuse()` consumes the `Incoming`, so
-        // either branch can still name the peer.
-        let remote = incoming.remote_address();
-
         // Taking somebody else's slot is a privilege, and a source address
-        // that has proved nothing does not have it. Otherwise one spoofed
-        // Initial per datagram, from addresses that never have to receive
-        // anything, could evict every connection on the roster, and every one
-        // of those datagrams would start a TLS server flight, since `serve`
-        // accepts the connection eagerly. So at the cap the unvalidated
-        // newcomer is asked to come back with a token instead, which costs
-        // this server no crypto and no slot, and is what QUIC provides for the
-        // purpose.
-        //
-        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
-        //# A server might wish to validate the client address
-        //# before starting the cryptographic handshake.  QUIC
-        //# uses a token in the Initial packet to provide
-        //# address validation prior to completing the
-        //# handshake.  This token is delivered to the client
-        //# during connection establishment with a Retry packet
-        //# (see Section 8.1.2) or in a previous connection
-        //# using the NEW_TOKEN frame (see Section 8.1.3).
-        //
-        // With quinn's `bloom` feature (on, see `Cargo.toml`) the server sends
-        // two NEW_TOKEN frames per validated connection, so a returning client
-        // arrives validated and evicts without a Retry. The round trip falls on
-        // first contacts and on expired or foreign tokens, and only while the
-        // server is full. A Retry that crosses a `SIGHUP` fails to decode,
-        // because `with_crypto` draws a fresh token key per configuration
-        // (D31).
+        // that has proved nothing does not have it; [`retry_or_refuse`] says
+        // why.
         if !incoming.remote_address_validated() {
-            match incoming.retry() {
-                Ok(()) => {
-                    // DEBUG for the same reason the refusal below is: a flood
-                    // is exactly when this fires.
-                    debug!(
-                        %remote,
-                        live,
-                        max_connections,
-                        "the server is full: asking an unvalidated address \
-                         to prove itself before it may take a slot"
-                    );
-                    return None;
-                }
-                // Unreachable as quinn stands: `retry` fails only when
-                // `may_retry()` is false, and quinn documents `may_retry()` as
-                // true whenever the address is unvalidated. Handled rather
-                // than unwrapped because the fallback is the safe one either
-                // way.
-                //
-                //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
-                //# In response to processing an Initial packet
-                //# containing a token that was provided in a Retry
-                //# packet, a server cannot send another Retry
-                //# packet; it can only refuse the connection or
-                //# permit it to proceed.
-                Err(error) => incoming = error.into_incoming(),
-            }
-
-            debug!(
-                %remote,
-                live,
-                max_connections,
-                "refusing a connection: the server is full and this address \
-                 cannot be asked to validate itself"
-            );
-            incoming.refuse();
+            retry_or_refuse(incoming, live, max_connections);
             return None;
         }
+
+        // Read before `refuse()` consumes the `Incoming`, so the lines below
+        // can still name the peer.
+        let remote = incoming.remote_address();
 
         // Evict the oldest connections that have never authenticated;
         // [`Roster::evict_until_below`] says why it loops.
@@ -867,6 +808,77 @@ impl Server {
         let _ =
             tokio::time::timeout(shutdown::CLOSE_FLUSH_TIMEOUT, self.endpoint.wait_idle()).await;
     }
+}
+
+/// Answers an unvalidated arrival at a full server: a Retry, or a refusal
+/// when quinn cannot send one.
+///
+/// An unvalidated address may not evict. Otherwise one spoofed Initial per
+/// datagram, from addresses that never have to receive anything, could evict
+/// every connection on the roster, and every one of those datagrams would
+/// start a TLS server flight, since [`Server::serve`] accepts the connection
+/// eagerly. So the newcomer is asked to come back with a token instead, which
+/// costs this server no crypto and no slot, and is what QUIC provides for the
+/// purpose.
+///
+/// `live` and `max_connections` are for the log lines.
+fn retry_or_refuse(incoming: quinn::Incoming, live: usize, max_connections: u32) {
+    //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1
+    //# A server might wish to validate the client address
+    //# before starting the cryptographic handshake.  QUIC
+    //# uses a token in the Initial packet to provide
+    //# address validation prior to completing the
+    //# handshake.  This token is delivered to the client
+    //# during connection establishment with a Retry packet
+    //# (see Section 8.1.2) or in a previous connection
+    //# using the NEW_TOKEN frame (see Section 8.1.3).
+    //
+    // With quinn's `bloom` feature (on, see `Cargo.toml`) the server sends
+    // two NEW_TOKEN frames per validated connection, so a returning client
+    // arrives validated and evicts without a Retry. The round trip falls on
+    // first contacts and on expired or foreign tokens, and only while the
+    // server is full. A Retry that crosses a `SIGHUP` fails to decode,
+    // because `with_crypto` draws a fresh token key per configuration (D31).
+
+    // Read before `retry()` or `refuse()` consumes the `Incoming`, so either
+    // branch can still name the peer.
+    let remote = incoming.remote_address();
+
+    let incoming = match incoming.retry() {
+        Ok(()) => {
+            // DEBUG for the same reason the refusal below is: a flood is
+            // exactly when this fires.
+            debug!(
+                %remote,
+                live,
+                max_connections,
+                "the server is full: asking an unvalidated address \
+                 to prove itself before it may take a slot"
+            );
+            return;
+        }
+        // Unreachable as quinn stands: `retry` fails only when `may_retry()`
+        // is false, and quinn documents `may_retry()` as true whenever the
+        // address is unvalidated. Handled rather than unwrapped because the
+        // fallback is the safe one either way.
+        //
+        //= https://www.rfc-editor.org/rfc/rfc9000#section-8.1.2
+        //# In response to processing an Initial packet
+        //# containing a token that was provided in a Retry
+        //# packet, a server cannot send another Retry
+        //# packet; it can only refuse the connection or
+        //# permit it to proceed.
+        Err(error) => error.into_incoming(),
+    };
+
+    debug!(
+        %remote,
+        live,
+        max_connections,
+        "refusing a connection: the server is full and this address \
+         cannot be asked to validate itself"
+    );
+    incoming.refuse();
 }
 
 /// Why a connection ended without an error, as the closing line reports it.
