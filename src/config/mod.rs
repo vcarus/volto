@@ -36,10 +36,10 @@ pub use validate::{FilterRefusal, filter_refusal, normalise_filter};
 ///
 /// Surge speaks HTTP/3, so `h3` is the only default. It stays configurable
 /// because interop debugging occasionally needs a draft identifier.
-pub const DEFAULT_ALPN: &[&str] = &["h3"];
+const DEFAULT_ALPN: &[&str] = &["h3"];
 
 /// Log level used when `[log].level` is absent.
-pub const DEFAULT_LOG_LEVEL: &str = "info";
+const DEFAULT_LOG_LEVEL: &str = "info";
 
 /// Default grace period for a graceful shutdown, in seconds.
 ///
@@ -86,13 +86,13 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 256;
 pub const DEFAULT_CONNECT_TIMEOUT: u64 = 10;
 
 /// Default number of authentication failures tolerated on one connection.
-pub const DEFAULT_MAX_AUTH_FAILURES: u32 = 5;
+const DEFAULT_MAX_AUTH_FAILURES: u32 = 5;
 
 /// Default concurrent client-initiated bidirectional streams per connection.
 ///
 /// One stream per tunnel: Surge multiplexes every proxied TCP connection onto one
 /// QUIC connection, so quinn's default of 100 runs out during ordinary browsing.
-pub const DEFAULT_MAX_STREAMS_BIDI: u32 = 1024;
+const DEFAULT_MAX_STREAMS_BIDI: u32 = 1024;
 
 /// Default QUIC idle timeout, in seconds.
 ///
@@ -129,7 +129,7 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL: u64 = 20;
 pub const DEFAULT_INITIAL_MTU: u16 = 1200;
 
 /// The smallest `initial_mtu` QUIC permits (RFC 9000 §14).
-pub const MIN_INITIAL_MTU: u16 = 1200;
+const MIN_INITIAL_MTU: u16 = 1200;
 
 /// The largest `initial_mtu` this server accepts, in bytes.
 ///
@@ -259,14 +259,14 @@ pub const MAX_SOCKET_BUFFER: usize = i32::MAX as usize;
 ///
 /// Every tunnel costs one file descriptor, so this is also the per-connection
 /// share of the process fd budget (see [`crate::net::fd_limits`]).
-pub const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
+const DEFAULT_MAX_TARGETS_PER_CONN: u32 = 256;
 
 /// Ports no target may be reached on unless the operator says otherwise.
 ///
 /// 25 is the classic open-relay abuse vector. 53 and 123 are deliberately *not*
 /// here. Denying 53 refuses every DNS query a client sends through the tunnel.
 /// Surge's UDP availability test is an NTP query to port 123 through the tunnel.
-pub const DEFAULT_DENIED_PORTS: &[u16] = &[25];
+const DEFAULT_DENIED_PORTS: &[u16] = &[25];
 
 /// Default number of packets a UDP session may send before the target answers.
 ///
@@ -778,7 +778,7 @@ const MAX_STREAMS_BIDI_CEILING: u32 = MAX_TARGETS_PER_CONN_CEILING;
 /// length byte takes the place of a dot), leaving 253 for the presentation
 /// form. A configured name longer than that could never be matched,
 /// because no client could have asked for it.
-pub const MAX_EXPECTED_SNI: usize = 253;
+const MAX_EXPECTED_SNI: usize = 253;
 
 impl Server {
     /// The ALPN identifiers as byte vectors, the form the TLS provider takes.
