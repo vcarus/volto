@@ -19,9 +19,7 @@
 //! * [`hello`]: the ClientHello parser the gate, the TLS provider and the
 //!   tests share.
 //! * [`quic`]: the QUIC endpoint, transport parameters and the accept loop.
-//! * [`congestion`]: the default `bbr` controller, volto's own, whose window is
-//!   at most 1.25 times the bandwidth-delay product it measures, plus what the
-//!   path's own loss takes out of it.
+//! * [`congestion`]: the default `bbr` controller, volto's own.
 //! * [`shutdown`]: the graceful-shutdown signal shared by endpoint and connections.
 //! * [`systemd`]: the service manager's notification protocol: readiness and
 //!   the watchdog's keep-alive.
@@ -63,14 +61,8 @@
 // a change to this paragraph, and `tests/it_release_assets.rs` holds the crate
 // to it. `main.rs` keeps `forbid`, since the binary calls the library only.
 #![deny(unsafe_code)]
-// Every public item carries a doc comment, and this lint enforces it.
-// `cargo doc` is published for this crate, so a `pub` item without a doc comment
-// leaves the published page incomplete. `warn` here rather than `deny`,
-// because CI already runs clippy with `-D warnings` and rustdoc with
-// `RUSTDOCFLAGS=-D warnings`, so the lint is an error in CI and a warning
-// while somebody is mid-edit. Deliberately not `[lints]` in `Cargo.toml`:
-// that would reach `tests/` and `fuzz/`, whose items are scaffolding rather
-// than a published surface.
+// `warn`, not `deny`: CI runs clippy and rustdoc with `-D warnings`. Not
+// `[lints]` in `Cargo.toml`, which would reach `tests/` and `fuzz/`.
 #![warn(missing_docs)]
 #![doc(html_logo_url = "https://vcarus.github.io/volto/assets/logo.png")]
 #![doc(html_favicon_url = "https://vcarus.github.io/volto/theme/favicon.png")]
