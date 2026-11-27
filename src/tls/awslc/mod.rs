@@ -1171,14 +1171,16 @@ impl crypto::Session for Session {
         }
 
         if !self.got_handshake_data {
+            // The handshake data is ready once libssl has processed the first
+            // ClientHello. Under QUIC that always leaves a protocol selected:
+            // libssl negotiates ALPN before it can next wait for input, and a
+            // ClientHello without a protocol in common fails above. The server
+            // name is set earlier in the same step, so it never decides.
             let mut protocol = std::ptr::null();
             let mut len = 0u32;
             // SAFETY: as in `handshake_data`; only the length is read.
-            let ready = unsafe {
-                sys::SSL_get0_alpn_selected(self.ssl.as_ptr(), &mut protocol, &mut len);
-                len > 0 || server_name(self.ssl.as_ptr()).is_some()
-            };
-            if ready || !self.handshaking {
+            unsafe { sys::SSL_get0_alpn_selected(self.ssl.as_ptr(), &mut protocol, &mut len) };
+            if len > 0 || !self.handshaking {
                 self.got_handshake_data = true;
                 return Ok(true);
             }

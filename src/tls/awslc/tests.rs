@@ -1547,6 +1547,21 @@ fn the_server_flight_is_handed_over_without_a_copy() {
     assert_eq!(capacities, [0; 4]);
 }
 
+/// The handshake data is reported ready by the read that completes the first
+/// ClientHello, and by no read before it.
+#[test]
+fn the_handshake_data_is_ready_after_the_first_client_hello() {
+    let id = identity();
+    let mut session =
+        Session::new(server(&id, None, &GROUPS, &[]), Version::V1, &PARAMS).expect("a session");
+    let hello = client_hello();
+    let (head, tail) = hello.split_at(hello.len() / 2);
+    assert_eq!(session.read_handshake(head).ok(), Some(false));
+    assert!(session.handshake_data().is_none());
+    assert_eq!(session.read_handshake(tail).ok(), Some(true));
+    assert!(session.handshake_data().is_some());
+}
+
 /// The outer ClientHello is copied only when the debug line that reports it
 /// is enabled, which it is not in production.
 #[test]
