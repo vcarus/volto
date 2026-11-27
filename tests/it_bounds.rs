@@ -105,15 +105,8 @@ static GLOBAL: alloc::PassThrough<Tallying> = alloc::PassThrough::new();
 /// this file takes it, through [`on_the_scales`] or [`take_the_scales`].
 ///
 /// A test holds it from before its runtime is built until after that runtime
-/// has been dropped. With `#[tokio::test]` the guard was dropped inside the
-/// async body, so the next test took the scales while the previous runtime was
-/// still dropping the server's tasks and ending its threads. On the dev host, a
-/// probe that read the tally for 200 ms right after a test took the scales saw
-/// it move in 62 of 90 readings over 30 runs, by as much as -6.8 MiB. With the
-/// runtime dropped first, the largest movement in 90 readings was 2 KiB, and
-/// never below zero. The three tests below that run a server measured the same
-/// figures both ways, because their server start and handshake took longer
-/// than the teardown; this arrangement removes the dependence on that timing.
+/// has been dropped. Dropping the runtime first matters: otherwise the previous
+/// test's server tasks are still freeing memory inside the next test's window.
 ///
 /// The standard library's mutex rather than `tokio`'s, because it is held
 /// outside any runtime.
@@ -179,11 +172,6 @@ fn while_holding_here<T>(body: impl FnOnce() -> T) -> (T, i64) {
     (out, held)
 }
 
-/// The live tally right now, for the waits that have to watch it move.
-fn live_now() -> i64 {
-    LIVE.load(Ordering::Relaxed)
-}
-
 /// Waits until the tally satisfies `settled`, or [`TIMEOUT`] passes.
 ///
 /// The server side of every measurement here finishes without saying so on the
@@ -193,7 +181,7 @@ fn live_now() -> i64 {
 /// asserts the outcome itself. Bounded and self-terminating either way.
 async fn settle(settled: impl Fn(i64) -> bool) {
     let deadline = Instant::now() + TIMEOUT;
-    while !settled(live_now()) && Instant::now() < deadline {
+    while !settled(LIVE.load(Ordering::Relaxed)) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -205,13 +193,11 @@ async fn settle(settled: impl Fn(i64) -> bool) {
 /// Octets in the one padded field value of the widest request.
 ///
 /// The width that matters here is the *wire*, not only the RFC 9114 §4.2.2 size:
-/// nothing this server sends or receives is Huffman-encoded, so a value this
-/// long is a literal of about the same length and the encoded HEADERS frame
-/// lands just under `MAX_BUFFERED_FRAME`, which is the most the frame decoder
-/// will buffer for one frame. That is what makes the decoder's own payload
-/// buffer visible to the scales: at 1900 short fields the request was under
-/// 6 KiB on the wire, so a decoder holding its whole buffer for the life of the
-/// tunnel cost about 8 KiB and hid inside the ceiling below (audit L1).
+/// the client of [`H3Client::connect`] sends no Huffman-coded literal, so a
+/// value this long is a literal of the same length on the wire and the encoded HEADERS frame lands
+/// just under `MAX_BUFFERED_FRAME`, which is the most the frame decoder will
+/// buffer for one frame. That is what makes the decoder's own payload buffer
+/// visible to the scales.
 ///
 /// The §4.2.2 size stays inside the advertised limit at the same time, which is
 /// what makes the request one the server is obliged to accept: (32+7+7) for
@@ -227,10 +213,8 @@ const TUNNELS: usize = 64;
 /// Live bytes one tunnel's held request may cost, at the widest field section
 /// this server accepts.
 ///
-/// The measured figure on the dev host is about 65 KiB, and it is about the same
-/// however the section is spent: 66933 bytes for the one long value below and
-/// 67517 for the 1900 one-byte fields this probe used to send. That is roughly
-/// the advertised 64 KiB section size over again, which is no accident --
+/// The measured figure on the dev host is 66933 bytes. That is roughly the
+/// advertised 64 KiB section size over again, which is no accident --
 /// RFC 9114 §4.2.2's 32-byte-per-field charge exists to model exactly the
 /// per-field cost of a `Fields`, a vector of 32-byte entries with an allocation
 /// per name.
@@ -239,8 +223,8 @@ const TUNNELS: usize = 64;
 /// container that pads differently does not make this flap, and low enough that
 /// a field section held in some *third* form as well -- the decoded
 /// `Vec<Field>` kept alongside the `Fields` it was moved into, say -- fails it.
-/// The frame decoder's own payload buffer was such a third form until audit L1,
-/// and against that code this measures 157531 bytes per tunnel.
+/// A frame decoder that also kept its payload buffer is such a third form, and
+/// against it this measures 157531 bytes per tunnel.
 const HELD_PER_TUNNEL_CEILING: i64 = 128 * 1024;
 
 /// A CONNECT request as wide as the advertised field-section limit allows.
@@ -317,9 +301,8 @@ fn a_tunnel_holds_its_requests_field_section_for_its_whole_life() {
 
         // The floor is what keeps this about anything at all: a server that did not
         // keep the section would pass the ceiling trivially, and so would a phase
-        // that failed to open its tunnels. A quarter of the arithmetic -- 1900
-        // entries of 32 bytes is 59 KiB before a single name is allocated -- is
-        // clear of any noise between two otherwise identical phases.
+        // that failed to open its tunnels. A quarter of the ~65 KiB measured per
+        // tunnel is clear of any noise between two otherwise identical phases.
         assert!(
             per_tunnel > 16 * 1024,
             "padded tunnels held only {per_tunnel} bytes more each than bare ones \
@@ -393,8 +376,7 @@ fn datagram_capsule_header(length: u64) -> Bytes {
 ///
 /// On the dev host (macOS, debug build), 16 sessions: 1.02 MiB of growth, about
 /// 65 KiB apiece, which is the value buffer allocated once at the declared
-/// length. While the decoder grew its buffer by doubling, this was about
-/// 78 KiB apiece.
+/// length.
 #[test]
 fn a_session_holds_one_unfinished_capsule_and_no_more() {
     on_the_scales(async {
@@ -491,10 +473,7 @@ const LARGE_CHUNK: usize = 2 * 1024 * 1024;
 ///
 /// This test has no runtime and runs on one thread, so it weighs only that
 /// thread: see [`while_holding_here`]. It still takes [`SCALES`], because the
-/// process-wide tally of another test would count this thread too. Before
-/// [`on_the_scales`] it also needed the per-thread tally to keep out the frees
-/// of a runtime still being torn down, which measured between -0.6 and
-/// -1.06 MiB of growth here.
+/// process-wide tally of another test would count this thread too.
 ///
 /// # Measured
 ///
@@ -575,10 +554,6 @@ const KEPT_PER_CLOSED_SESSION: i64 = 8 * 1024;
 /// session, and the session ending finishes the server's. So the FIN that comes
 /// back is the signal that the session loop has returned -- which is where
 /// everything it held goes.
-///
-/// `close_and_drain` is that pair, and bounding it here is strictly stronger
-/// than the loop this replaced: `read_to_end` bounds each individual read at
-/// `TIMEOUT` as well, where the hand-written loop bounded only the whole drain.
 async fn close_session(session: &mut ClientStream) {
     tokio::time::timeout(TIMEOUT, close_and_drain(session))
         .await
@@ -605,8 +580,7 @@ async fn close_session(session: &mut ClientStream) {
 /// closed one after another leave 220 to 290 KiB behind in total when the tally
 /// is first read under the allowance: 3.5 to 4.6 KiB a session, against the
 /// ~108 KiB each of them held while it was live. Left open instead of closed,
-/// the same run leaves 1.9 MiB behind (4.5 MiB while a session still read its
-/// target into a 64 KiB buffer), so the allowance below is about twice the
+/// the same run leaves 1.9 MiB behind, so the allowance below is about twice the
 /// measurement and a quarter of a leak.
 #[test]
 fn a_connection_keeps_nothing_for_the_sessions_it_has_closed() {
