@@ -8,10 +8,10 @@
 //! [`volto::logfmt::Sampler`]'s doubling schedule, or is deliberately unsampled
 //! for a reason somebody wrote down.
 //!
-//! `it_log_amplification` is the *behavioural* half of that rule: it drives five
+//! `it_log_amplification` is the *behavioural* half of that rule: it drives its
 //! scenarios and counts what reaches a capturing subscriber. What it cannot see
-//! is a sixth one — a `warn!` added tomorrow, on a path no probe walks, reaching
-//! production with nobody having asked the question. This is the other half:
+//! is a `warn!` added tomorrow, on a path no probe walks, reaching production
+//! with nobody having asked the question. This is the other half:
 //! every `info!`, `warn!` and `error!` in `src/` has to appear in the table
 //! below, saying what bounds it and why. Adding a production log line is then a
 //! deliberate act with a diff, and so is deleting one.
@@ -419,7 +419,7 @@ const ACCOUNTED: &[Accounted] = &[
         bound: Bound::Sampled,
         reason: "The cheapest production line in the server -- an IP literal takes \
                  no resolver slot and holds no socket -- so a port scan is 65535 of \
-                 them. `Context::policy_refusals` turns that into 17.",
+                 them. `Context::policy_refusals` turns that into 16.",
     },
     Accounted {
         id: "rr3u3t70",
@@ -428,7 +428,7 @@ const ACCOUNTED: &[Accounted] = &[
         bound: Bound::PerTunnel,
         reason: "D97's exemption: this is the access log, and an access log that \
                  drops records is not an access log. One line per tunnel is the \
-                 floor `it_log_amplification` pins.",
+                 same floor `it_log_amplification` pins for a UDP session.",
     },
     Accounted {
         id: "uemzs420",
