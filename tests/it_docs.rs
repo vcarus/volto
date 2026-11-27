@@ -122,9 +122,9 @@ const DOC_PAGES: [&str; 4] = [
 
 /// Keys the example must document and the page must carry, at the very least.
 ///
-/// Today both sides hold 27. The floor is what stops a parser that quietly
-/// stops matching -- a heading convention changed, a table reflowed -- from
-/// comparing two empty sets and calling them equal.
+/// The floor is what stops a parser that quietly stops matching -- a heading
+/// convention changed, a table reflowed -- from comparing two empty sets and
+/// calling them equal.
 const KEY_FLOOR: usize = 25;
 
 /// Distinct constants the pages must be quoting, at the very least.
@@ -1253,10 +1253,9 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
 
 /// Keys whose default is written in both places, at the very least.
 ///
-/// Today 23 of the 25 page keys that print a default: the three required
-/// `[server]` keys print none, and `users` and `initial_rtt_ms` are live in the
-/// example rather than commented with a `# Default:` line, so the gate never
-/// reaches those two.
+/// Below the number of keys, because the three required `[server]` keys print
+/// no default and a key the example sets with no `# Default:` line above it,
+/// such as `users`, is never read by this gate.
 const DEFAULT_FLOOR: usize = 20;
 
 /// The `# Default: …` text the example writes above each key, as `(table, key)`.
