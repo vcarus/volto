@@ -61,6 +61,7 @@ use proptest::prelude::*;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
+use common::rawstream::RESERVED_HTTP2_TYPES;
 use props::{config, pattern, payload, put_varint_in};
 
 use volto::capsule::{self, CapsuleDecoder};
@@ -301,9 +302,6 @@ const KNOWN_TYPES: [u64; 7] = [
     frame::GOAWAY,
     frame::MAX_PUSH_ID,
 ];
-
-/// Frame types RFC 9114 §11.2.1 reserves because HTTP/2 used them.
-const RESERVED_TYPES: [u64; 4] = [0x02, 0x06, 0x08, 0x09];
 
 /// The types `begin` buffers, and so the ones a declared length can be refused
 /// for.
@@ -783,7 +781,7 @@ fn any_unknown_type() -> impl Strategy<Value = u64> {
         3 => any_varint(),
     ]
     .prop_filter("a type this server knows", |kind| {
-        !KNOWN_TYPES.contains(kind) && !RESERVED_TYPES.contains(kind)
+        !KNOWN_TYPES.contains(kind) && !RESERVED_HTTP2_TYPES.contains(kind)
     })
 }
 
@@ -848,7 +846,7 @@ fn any_frame_spec() -> impl Strategy<Value = FrameSpec> {
             .prop_flat_map(|kind| well_formed_payload(kind).prop_map(move |payload| FrameSpec { kind, payload })),
         3 => any_unknown_type()
             .prop_flat_map(|kind| payload(128).prop_map(move |payload| FrameSpec { kind, payload })),
-        1 => prop::sample::select(RESERVED_TYPES.to_vec())
+        1 => prop::sample::select(RESERVED_HTTP2_TYPES.to_vec())
             .prop_flat_map(|kind| payload(32).prop_map(move |payload| FrameSpec { kind, payload })),
     ]
 }
@@ -979,7 +977,7 @@ proptest! {
     /// written, so the refusal cannot have depended on it.
     #[test]
     fn a_reserved_http2_frame_type_is_a_connection_error(
-        kind in prop::sample::select(RESERVED_TYPES.to_vec()),
+        kind in prop::sample::select(RESERVED_HTTP2_TYPES.to_vec()),
         length in any_varint(),
         before in payload(48),
         cuts in prop::collection::vec(any::<u16>(), 0..4),
