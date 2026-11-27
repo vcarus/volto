@@ -1,9 +1,6 @@
 //! The shutdown signal, from the process down to each connection.
 //!
-//! Graceful shutdown of a proxy is not "stop the process": every open tunnel is
-//! somebody's TCP connection or UDP flow, and dropping them all at once is
-//! visible to the user as a burst of broken pages and dead calls. RFC 9114 §5.2
-//! provides the polite version, and the sequence the server implements is:
+//! The sequence the server implements (RFC 9114 §5.2):
 //!
 //! 1. stop accepting new QUIC connections;
 //! 2. send a GOAWAY on every live HTTP/3 connection, which tells the client to
