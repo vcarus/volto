@@ -36,7 +36,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, EchConfigListBytes, PrivatePkcs8KeyDer, ServerName, UnixTime,
 };
-use rustls::quic::{ClientConnection, KeyChange, Version};
+use rustls::quic::{ClientConnection, Version};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use volto::tls::{EchKey, PROBE_HELD_LIMIT, ProbeSession, ServerConfig, probe_server_config};
 
@@ -333,9 +333,6 @@ fn complete(f: &Fixture) -> (Checked, bool) {
                 let empty = buf.is_empty();
                 to_server.extend_from_slice(&buf);
                 if change.is_none() && empty {
-                    break;
-                }
-                if matches!(change, Some(KeyChange::OneRtt { .. })) && empty {
                     break;
                 }
             }
