@@ -288,7 +288,7 @@ fn one_family_list(
 ///
 /// The number this bounds is threads, not queries: a lookup holds a thread of
 /// the runtime's *blocking* pool until `getaddrinfo` returns, whatever the
-/// client does meanwhile ([`System::spawn`]). So an unbounded proxy
+/// client does meanwhile (`System::spawn`). So an unbounded proxy
 /// converts one client's black-holed names directly into parked threads, and the
 /// pool is process-wide: with the default `max_connections` x
 /// `max_targets_per_conn` at 65 536 in-flight requests against tokio's 512
