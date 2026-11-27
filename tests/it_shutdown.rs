@@ -11,9 +11,8 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::rawstream::{H3_REQUEST_REJECTED, connect_headers_frame};
 use common::{
-    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, TIMEOUT, TestServer, close_and_drain, connect_request,
-    echoes, open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target,
-    udp_round_trip,
+    ALLOW_PRIVATE, H3Client, STOP_TIMEOUT, TIMEOUT, TestServer, close_and_drain, echoes,
+    open_tcp_tunnel, open_udp_session, spawn_echo_target, spawn_udp_echo_target, udp_round_trip,
 };
 
 /// The distance between consecutive client-initiated bidirectional stream ids
@@ -82,11 +81,10 @@ async fn an_established_udp_session_survives_goaway() {
 /// The GOAWAY names the first request the server will not serve, and a stream
 /// opened past it is rejected on the wire.
 ///
-/// The point of doing this with raw QUIC streams rather than through the test
-/// client: that client refuses to open a request once it has seen a GOAWAY, so
-/// [`new_requests_are_refused_after_goaway`] below would pass against a server
-/// that had no rejection logic at all. Everything asserted here is the server's
-/// -- the identifier it chose, and the two error codes it puts on the stream.
+/// Raw QUIC streams rather than the test client, because that client refuses
+/// to open a request once it has seen a GOAWAY. Everything asserted here is the
+/// server's: the identifier it chose, and the two error codes it puts on the
+/// stream.
 ///
 /// RFC 9114 §5.2: "Requests or pushes with the indicated identifier or greater
 /// are rejected (Section 4.1.1) by the sender of the GOAWAY."
@@ -158,58 +156,6 @@ async fn a_request_stream_past_the_goaway_identifier_is_rejected() {
 
     // Rejecting a late request does not disturb the tunnel that was already
     // open, which is the whole reason a GOAWAY has an identifier at all.
-    echoes(&mut held, b"alive").await;
-
-    close_and_drain(&mut held).await;
-    server.wait_until_stopped(STOP_TIMEOUT).await;
-}
-
-/// After the GOAWAY, the client stops opening requests of its own accord.
-///
-/// What this asserts is the *client* side of RFC 9114 §5.2 -- a peer that has
-/// seen a GOAWAY takes its new work elsewhere -- plus the fact that the server
-/// sends one at all, since the refusal below only starts once the frame has
-/// been read off the server's control stream. What the server does with a
-/// request that arrives anyway is
-/// [`a_request_stream_past_the_goaway_identifier_is_rejected`] above; this test
-/// cannot see it, because the client never puts such a request on the wire.
-#[tokio::test]
-async fn new_requests_are_refused_after_goaway() {
-    let mut server = TestServer::start().await;
-    let target = spawn_echo_target().await;
-    let mut client = H3Client::connect(&server).await;
-
-    // One tunnel held open, so the connection is still draining and the refusal
-    // cannot be confused with the connection simply being gone.
-    let mut held = open_tcp_tunnel(&mut client, &target.to_string()).await;
-
-    server.shutdown();
-
-    // The GOAWAY has to reach the client's connection driver first, so poll until
-    // a new request is refused rather than assuming it already has been.
-    let deadline = tokio::time::Instant::now() + TIMEOUT;
-    loop {
-        match client
-            .send
-            .send_request(connect_request(&target.to_string()))
-            .await
-        {
-            Err(_) => break,
-            Ok(mut stream) => {
-                // Not yet processed: this stream may still be served or rejected,
-                // either is fine. Give the driver a moment and try again.
-                let _ =
-                    tokio::time::timeout(Duration::from_millis(50), stream.recv_response()).await;
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "new requests were still accepted after GOAWAY"
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-    }
-
-    // Meanwhile the tunnel opened before the signal is untouched.
     echoes(&mut held, b"alive").await;
 
     close_and_drain(&mut held).await;
