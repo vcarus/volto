@@ -582,29 +582,30 @@ fn the_timer_copy_is_installed_once_and_then_left_alone() {
 
 /// A dry run must not rewrite the root-owned installed copy of this script.
 ///
-/// The timer branch used to call `refresh_self` before the dry-run exit, and
 /// `refresh_self` installs the running copy over `/usr/local/sbin/volto-deploy`.
 /// The help text and docs/deployment.md promise a dry run changes nothing, and
 /// that path is a root-owned system file.
 ///
-/// The stubs make the assertion meaningful on any host. `install` records its
-/// arguments and fails, so a regression cannot reach the real `/usr/local/sbin`.
-/// `cmp` fails, so the "already equal" early return cannot let the run pass for
+/// The stubs make the assertion meaningful on any host. `install`, `cp` and
+/// `mv` record their arguments and fail, so a regression cannot reach the real
+/// `/usr/local/sbin` whichever of them it writes with. `cmp` fails, so the "already equal" early return cannot let the run pass for
 /// the wrong reason. `readlink` resolves the script, which is what
 /// `refresh_self` needs to see a file.
 #[test]
 fn a_dry_run_does_not_rewrite_the_installed_script() {
     let dir = scratch_tree("deploy", "dry-run-timer", &["stubs"]);
     let stubs = dir.join("stubs");
-    let marker = stubs.join("install-called");
+    let marker = stubs.join("writes");
 
-    write_executable(
-        &stubs.join("install"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 1\n",
-            marker.display()
-        ),
-    );
+    for tool in ["install", "cp", "mv"] {
+        write_executable(
+            &stubs.join(tool),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"{tool} $*\" >> '{}'\nexit 1\n",
+                marker.display()
+            ),
+        );
+    }
     write_executable(&stubs.join("cmp"), "#!/bin/sh\nexit 1\n");
     write_executable(
         &stubs.join("readlink"),
@@ -631,8 +632,8 @@ fn a_dry_run_does_not_rewrite_the_installed_script() {
         "the timer decision must be the last thing printed: {stdout}"
     );
     assert!(
-        !marker.exists(),
-        "a dry run installed the script over the system path; the stub recorded:\n{}",
+        !marker.exists() && !stdout.contains("installed this script as"),
+        "a dry run tried to write the script over the system path; the stubs recorded:\n{}",
         fs::read_to_string(&marker).unwrap_or_default()
     );
 }
