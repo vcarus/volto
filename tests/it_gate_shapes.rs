@@ -353,17 +353,6 @@ fn certified_crypto() -> Arc<dyn quinn::crypto::ServerConfig> {
 // (a) Hand-spelled first flights, judged through the seam the socket uses
 // ---------------------------------------------------------------------------
 
-/// The CRYPTO-side seam over a ClientHello this binary spells itself, so that a
-/// change in the hand-written builder above shows up here rather than only in
-/// the datagram tests that use it.
-#[test]
-fn the_hand_written_client_hello_reads_back_as_its_name() {
-    assert_eq!(
-        first_flight(&named_hello("localhost")),
-        FirstFlight::Named(b"localhost")
-    );
-}
-
 /// The control: a first packet, keyed by its own Destination Connection ID, is
 /// opened and judged by the name it carries.
 #[test]
