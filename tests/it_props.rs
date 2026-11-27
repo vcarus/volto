@@ -8,10 +8,11 @@
 //! human thought of; these pin the shape of the answer for every input in a
 //! range, which is where a truncation or an off-by-one hides.
 //!
-//! This is a stand-in for coverage-guided fuzzing. `cargo fuzz` needs a nightly
-//! toolchain, the development host has stable Rust only, and the parsers are
-//! small and pure, so a generator plus a shrinker reaches the same corners.
-//! Run the file as a fuzzer with:
+//! The `datagram`, `capsule` and `authority` fuzz targets under `fuzz/` reach
+//! the same parsers and run once a day. This file states properties those
+//! targets do not assert, such as decoding that does not depend on chunking,
+//! runs them on stable Rust in every CI run, and shrinks a failure to a minimal
+//! case. The destination policy has no fuzz target. Run more cases with:
 //!
 //! ```sh
 //! PROPTEST_CASES=100000 cargo test --release --test it_props
@@ -589,8 +590,7 @@ proptest! {
     /// its Context ID is malformed rather than pending. That case is pinned by
     /// `capsule::tests::a_datagram_capsule_without_a_context_id_is_malformed`
     /// and used again in `the_decoder_resumes_at_the_next_capsule_after_an_error`
-    /// below. (Found by this property at 100000 cases, which shrank straight to
-    /// `length = 0`.)
+    /// below.
     #[test]
     fn a_datagram_capsule_within_the_maximum_is_accepted(
         length in 1..=MAX_DATAGRAM_CAPSULE_VALUE,
@@ -897,12 +897,6 @@ proptest! {
 ///
 /// None of it is a defect: percent-encoding applies to the whole template, the
 /// port segment included.
-///
-/// A leading `+` used to be on this list, because `u16::from_str` takes a sign,
-/// and so did a leading zero. Both are refused now, and
-/// `a_signed_port_is_refused` and `a_port_with_a_leading_zero_is_refused` above
-/// are where that lives. So did a decoded host that is not a host, which
-/// `tunnel::parse_host` now refuses on both routes.
 #[test]
 fn the_template_accepts_more_spellings_than_it_advertises() {
     // Percent-encoding applies to the port segment too.
@@ -1012,7 +1006,7 @@ proptest! {
 
     /// The IPv4-mapped form and the well-known NAT64 prefix get exactly the
     /// verdict of the IPv4 address they carry, under both settings. Both lie
-    /// inside `::/8`, and its row must not shadow either (R6-L5).
+    /// inside `::/8`, and its row must not shadow either.
     #[test]
     fn the_mapped_form_and_nat64_are_judged_as_their_ipv4(octets in any::<[u8; 4]>()) {
         let v4 = Ipv4Addr::from(octets);
@@ -1029,7 +1023,7 @@ proptest! {
 
     /// The IPv4-translated form of RFC 2765, `::ffff:0:a.b.c.d`, is refused by
     /// default whatever it carries, and with private space open it is refused
-    /// exactly when what it carries is never a destination (R6-L5).
+    /// exactly when what it carries is never a destination.
     #[test]
     fn the_translated_form_is_private_and_keeps_the_never_bucket(octets in any::<[u8; 4]>()) {
         let v4 = Ipv4Addr::from(octets);
