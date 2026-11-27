@@ -319,7 +319,10 @@ pub fn run_within(command: &mut Command, limit: Duration) -> Output {
     let deadline = Instant::now() + limit;
     let mut pause = Duration::from_millis(1);
     let status = loop {
-        if let Some(status) = child.try_wait().expect("the child's status must be readable") {
+        if let Some(status) = child
+            .try_wait()
+            .expect("the child's status must be readable")
+        {
             break status;
         }
         if Instant::now() >= deadline {

@@ -86,8 +86,15 @@ fn is_cjk(ch: char) -> bool {
 #[test]
 fn the_cjk_ranges_cover_the_blocks_around_the_ideographs() {
     for ch in [
-        '\u{2e80}', '\u{2f00}', '\u{2ff0}', '\u{a960}', '\u{d7b0}', '\u{fe10}', '\u{fe30}',
-        '\u{1f200}', '\u{30000}',
+        '\u{2e80}',
+        '\u{2f00}',
+        '\u{2ff0}',
+        '\u{a960}',
+        '\u{d7b0}',
+        '\u{fe10}',
+        '\u{fe30}',
+        '\u{1f200}',
+        '\u{30000}',
     ] {
         assert!(is_cjk(ch), "U+{:04X} must count as CJK", u32::from(ch));
     }
@@ -224,7 +231,13 @@ fn listing(gate: &Gate) -> Result<Option<Vec<Listed>>, String> {
     };
     let listed = git(
         gate.root,
-        &["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
     );
     let changed = git(gate.root, &["diff", "--name-only", "-z"]);
     let (paths, changed) = match (listed, changed) {
@@ -317,11 +330,16 @@ fn scrub_patterns(gate: &Gate) -> Result<Vec<String>, String> {
     }
 
     if patterns.is_empty() && gate.canonical_push {
-        return Err("no scrub patterns on a push to the canonical repository: the \
+        return Err(
+            "no scrub patterns on a push to the canonical repository: the \
                     VOLTO_SCRUB_PATTERNS secret is missing or empty"
-            .to_owned());
+                .to_owned(),
+        );
     }
-    Ok(patterns.iter().map(|pattern| pattern.to_lowercase()).collect())
+    Ok(patterns
+        .iter()
+        .map(|pattern| pattern.to_lowercase())
+        .collect())
 }
 
 /// Every CJK character in a path or in the text of a file, and every file that
@@ -548,7 +566,11 @@ fn the_gate_scans_what_the_next_commit_can_carry() {
     )
     .expect("write the word list");
     fs::write(root.join("untracked.txt"), format!("a {MADE_UP_LITERAL}\n")).expect("untracked");
-    fs::write(root.join("staged.txt"), format!("x\nthe {MADE_UP_LITERAL}\n")).expect("staged");
+    fs::write(
+        root.join("staged.txt"),
+        format!("x\nthe {MADE_UP_LITERAL}\n"),
+    )
+    .expect("staged");
     git(&root, &["add", "staged.txt"]).expect("git add");
     fs::write(root.join("staged.txt"), "x\nedited away\n").expect("edit the staged file");
     fs::write(root.join("ignored.txt"), MADE_UP_LITERAL).expect("ignored");
@@ -599,15 +621,16 @@ fn on_the_dev_host_the_gate_fails_rather_than_skips() {
 
     let locked = root.join("locked.txt");
     fs::write(&locked, "text\n").expect("write");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
-        .expect("chmod 000");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
     // Root reads a file of mode 000, so this case has nothing to show there.
     if fs::read(&locked).is_err() {
         let unreadable = listing(&gate).err().expect("an unreadable file must fail");
-        assert!(unreadable.contains("locked.txt cannot be read"), "{unreadable}");
+        assert!(
+            unreadable.contains("locked.txt cannot be read"),
+            "{unreadable}"
+        );
     }
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644))
-        .expect("chmod 644");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).expect("chmod 644");
 
     let not_a_repository = scratch_tree("scrub", "dev-host-no-git", &["dev_docs"]);
     let failed = listing(&scratch_gate(&not_a_repository))
@@ -656,11 +679,8 @@ fn the_gate_reads_what_git_would_publish() {
         format!("{MADE_UP_LITERAL}\nSm\u{f8}rgaflux\n"),
     )
     .expect("write the word list");
-    std::os::unix::fs::symlink(
-        format!("/nowhere/{MADE_UP_LITERAL}"),
-        root.join("link.md"),
-    )
-    .expect("plant a dangling link");
+    std::os::unix::fs::symlink(format!("/nowhere/{MADE_UP_LITERAL}"), root.join("link.md"))
+        .expect("plant a dangling link");
     fs::write(root.join("upper.md"), "SM\u{d8}RGAFLUX\n").expect("write");
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend_from_slice(&5u32.to_be_bytes());
