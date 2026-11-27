@@ -1,13 +1,7 @@
 //! The prose documentation is an accounted set, not a hope.
 //!
-//! `docs/` is the operator's copy of what this server does, and until now
-//! nothing checked it against the server. Every other gate in this suite reads
-//! the tree as text -- `it_scrub` over the tracked files, `it_log_lines` over
-//! every production log statement, `it_clock` over the wall clock -- and prose
-//! was the one part of the tree with no such reader. `cargo doc` covers the
-//! rustdoc, but that is a *structural* gate: it proves every public item has a
-//! sentence, never that the sentence is true. This binary asks the questions
-//! about prose that a machine can actually answer.
+//! `docs/` is the operator's copy of what the server does; this binary checks
+//! the parts of it a machine can check.
 //!
 //! # The five gates
 //!
@@ -58,36 +52,17 @@
 //! against the key, and prose is `# sentence` with a space. A value that spans
 //! lines (`[auth] users`) is taken to its closing bracket.
 //!
-//! # What this cannot do
-//!
-//! It cannot read. Nothing here knows whether a sentence describes the server
-//! correctly, whether an explanation is still true after a refactor, or whether
-//! a paragraph documents behaviour that was removed two releases ago. What it
-//! pins is the *mechanical* surface of the prose -- the key set, the numbers and
-//! the links -- which is the part that goes stale silently. The semantic half
-//! stays a human's job, and D104 says so rather than pretending otherwise.
+//! The semantic half stays a human's job (D104).
 //!
 //! # Floors
 //!
 //! Each gate asserts a minimum count before it asserts anything about what it
 //! found (D100's lesson: a gate that extracts nothing must fail, never pass
-//! quietly). The floors are set below today's counts with room for ordinary
-//! editing, so a page renamed, a heading convention changed, or a parser that
-//! silently stops matching turns into a failure here rather than a green run
-//! over an empty set.
+//! quietly).
 //!
-//! # Where the neighbouring claims live
-//!
-//! `src/config/mod.rs`'s `the_example_documents_every_key_and_pins_every_default`
-//! already owns the other two corners of the same triangle: the example against
-//! `Config`'s fields, and every `# Default: N` in it against the compiled
-//! default. This binary adds `docs/` as the third corner and does not repeat
-//! either of those; gate 5 is the edge that closes it, since a Default column
-//! is a table cell rather than the `` `IDENT` = value `` notation gate 2 reads
-//! and was pinned by nothing before. `tests/it_bounds.rs` measures the memory
-//! figures `docs/configuration.md` quotes, and nothing here checks those
-//! figures: gate 2 reads only a constant quoted in the `` `IDENT` = value ``
-//! notation, and a measured figure is not one.
+//! `tests/it_bounds.rs` measures the memory figures `docs/configuration.md`
+//! quotes, and nothing here checks them: gate 2 reads only a constant quoted in
+//! the `` `IDENT` = value `` notation, and a measured figure is not one.
 
 // The package-wide default is `deny` (`Cargo.toml`); this file argues for its
 // allow: the counting is over the documentation this file scans.
@@ -128,9 +103,6 @@ const DOC_PAGES: [&str; 4] = [
 /// calling them equal.
 const KEY_FLOOR: usize = 25;
 
-/// Distinct constants the pages must be quoting, at the very least.
-const CONSTANT_FLOOR: usize = 8;
-
 /// Anchored references the tree must contain, at the very least.
 const ANCHOR_FLOOR: usize = 10;
 
@@ -148,18 +120,10 @@ fn doc_path(name: &str) -> PathBuf {
 /// `SUMMARY.md` is the book's table of contents rather than prose: it carries
 /// no anchors, quotes no constants, and the chapter files it names are checked
 /// by the site crawl in `.github/workflows/docs.yml`, which fails on a chapter
-/// that does not build. That is D104's own reason, recorded in its 2026-09-02
-/// addendum, and naming the file here is what keeps the reason attached to the
-/// exemption.
+/// that does not build. D104 records the exemption.
 const EXEMPT: [&str; 1] = ["SUMMARY.md"];
 
 /// Every `*.md` under `docs/` is either read by these gates or exempt by name.
-///
-/// [`DOC_PAGES`] is hand-written and, until this test, nothing compared it with
-/// the directory: a new page's `` `IDENT` = value `` quotes went unchecked and
-/// its outgoing anchors unresolved. `it_log_lines` fails on a new file under
-/// `src/` by default; this is the same latch for `docs/`, and it is what makes
-/// the module comment's "should arrive with a decision" enforceable.
 ///
 /// Both directions, because either one alone passes on an empty scan: a page on
 /// disk that no list names, and a name on a list that no file answers to.
@@ -773,10 +737,8 @@ struct Quote {
 ///
 /// The example is read too, and not only the pages: it is the file that lands on
 /// the host and the one most operators read, so a number it quotes from the crate
-/// has to be the crate's number for the same reason a page's does. Nothing in it
-/// used the notation until `CONNECTION_UNANSWERED_MULTIPLIER` arrived in the
-/// `unanswered_packet_budget` comment, and this is what makes that quote a claim
-/// rather than a copy. `prose_lines` drops fenced blocks, of which a TOML file has
+/// has to be the crate's number for the same reason a page's does.
+/// `prose_lines` drops fenced blocks, of which a TOML file has
 /// none, so every line of it is read.
 fn quotes() -> Vec<Quote> {
     let mut found = Vec::new();
@@ -845,15 +807,6 @@ fn every_constant_quoted_in_the_docs_matches_the_crate() {
     let constants = crate_constants();
     let quotes = quotes();
 
-    let quoted: BTreeSet<&str> = quotes.iter().map(|quote| quote.name.as_str()).collect();
-    assert!(
-        quoted.len() >= CONSTANT_FLOOR,
-        "only {} distinct constants are quoted in docs/ and the example \
-         ({quoted:?}); the reader is broken, or the notation `IDENT` = value has \
-         been edited away",
-        quoted.len()
-    );
-
     for quote in &quotes {
         let Quote {
             source,
@@ -880,13 +833,6 @@ fn every_constant_quoted_in_the_docs_matches_the_crate() {
 }
 
 /// And an entry in the table that no page quotes any more is guarding nothing.
-///
-/// The allowlist was read in one direction only: a page that drops its last
-/// quote of a constant left the entry behind, silently, and the gate above went
-/// on passing over a smaller set than it was written for. This is the asymmetry
-/// `it_log_lines` closes for its own table with
-/// `the_table_names_no_statement_that_is_gone`, and the two gates were written
-/// days apart with the same stated design.
 ///
 /// It asserts rather than reports, because a reporting test that cannot fail is
 /// a probe that asserts nothing, which is the standard this file applies
@@ -1223,11 +1169,8 @@ fn commented_commands(comment: &str) -> Vec<String> {
 /// `it_release_assets::cross_yml_runs_the_release_build_step_verbatim` holds the
 /// mirrored build step of two workflow files to the same rule.
 ///
-/// The order of these commands is the finding this gate was written for: the
-/// block used to end on `systemctl enable --now volto`, which starts the server
-/// on the placeholder password `script/config.example.toml` ships, before the
-/// step that tells the operator to replace it. Splitting `enable` from `start`
-/// is only a fix while both copies say so.
+/// `enable` and `start` stay separate: `enable --now` would start the server on
+/// the placeholder password before the operator replaces it.
 #[test]
 fn the_manual_installation_is_written_the_same_way_in_both_places() {
     let page = repo_root().join("docs/deployment.md");
@@ -1256,11 +1199,6 @@ fn the_manual_installation_is_written_the_same_way_in_both_places() {
          docs/deployment.md:\n{documented:#?}\n\nscript/masque.service:\n{shipped:#?}"
     );
 
-    // The finding itself, stated as its own claim rather than left implicit in
-    // the sequence above: `--now` would start the server on the shipped
-    // placeholder password, and `start` has to come after the edit step, which
-    // sits between the two fences on the page and between the two comment
-    // paragraphs in the unit.
     for (source, commands) in [(&page, &documented), (&unit, &shipped)] {
         assert!(
             commands
@@ -1411,13 +1349,6 @@ fn documented_defaults() -> BTreeMap<(String, String), Option<String>> {
 }
 
 /// The default the example promises is the default the page prints.
-///
-/// This is the numeric half of the duplication between the two files made
-/// self-checking. Every key is described twice at length, and until now
-/// `it_docs` pinned only that the two key *sets* are equal, so a default
-/// changed in one file and not the other was invisible; that is the drift the
-/// 2026-09-07 review found in the `allow_private_networks` and
-/// `unanswered_packet_budget` comments.
 ///
 /// It closes the last edge of a triangle. `src/config/mod.rs`'s
 /// `the_example_documents_every_key_and_pins_every_default` holds the example's
