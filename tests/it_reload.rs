@@ -641,8 +641,8 @@ async fn reloading_swaps_the_certificate() {
 // a client's departure and its reaping, or across a session's idle timeout.
 // ---------------------------------------------------------------------------
 
-/// How many reloads a storm fires. Even rounds re-apply the text already in
-/// force, odd ones move a live-reloadable transport parameter.
+/// How many reloads a storm fires. Even rounds move a live-reloadable
+/// transport parameter, odd ones re-apply the text already in force.
 const STORM_ROUNDS: u32 = 24;
 
 /// A burst of reloads while both tunnel types are carrying data.
