@@ -37,6 +37,7 @@ use super::{
     ServerConfig, Session, Version, keys,
 };
 use crate::hello::{self, EXT_ECH};
+use crate::varint::peek_varint;
 
 /// A certificate for `localhost` and its key, as DER.
 struct Identity {
@@ -1616,19 +1617,6 @@ fn a_failed_ex_data_index_is_an_error_and_not_an_abort() {
     assert!(Session::new(config, Version::V1, &PARAMS).is_ok());
 }
 
-/// QUIC varint (RFC 9000 §16).
-fn varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
-    let first = *bytes.get(*at)?;
-    let len = 1usize << (first >> 6);
-    let raw = bytes.get(*at..*at + len)?;
-    *at += len;
-    let mut value = u64::from(raw[0] & 0x3f);
-    for byte in &raw[1..] {
-        value = value << 8 | u64::from(*byte);
-    }
-    Some(value)
-}
-
 /// One client Initial, decrypted: the CRYPTO ranges it carried.
 fn crypto_ranges(datagram: &[u8], dcid_keys: &quinn_proto::crypto::Keys) -> Vec<(u64, Vec<u8>)> {
     let mut packet = datagram.to_vec();
@@ -1637,9 +1625,11 @@ fn crypto_ranges(datagram: &[u8], dcid_keys: &quinn_proto::crypto::Keys) -> Vec<
     at += 1 + dcid_len;
     let scid_len = usize::from(packet[at]);
     at += 1 + scid_len;
-    let token_len = usize::try_from(varint(&packet, &mut at).expect("token length")).expect("len");
-    at += token_len;
-    let length = usize::try_from(varint(&packet, &mut at).expect("length")).expect("len");
+    let (token_len, n) = peek_varint(&packet[at..]).expect("token length");
+    at += n + usize::try_from(token_len).expect("len");
+    let (length, n) = peek_varint(&packet[at..]).expect("length");
+    at += n;
+    let length = usize::try_from(length).expect("len");
     let pn_offset = at;
     let end = pn_offset + length;
     dcid_keys
@@ -1665,8 +1655,11 @@ fn crypto_ranges(datagram: &[u8], dcid_keys: &quinn_proto::crypto::Keys) -> Vec<
             0x00 | 0x01 => at += 1,
             0x06 => {
                 at += 1;
-                let offset = varint(&payload, &mut at).expect("offset");
-                let len = usize::try_from(varint(&payload, &mut at).expect("len")).expect("len");
+                let (offset, n) = peek_varint(&payload[at..]).expect("offset");
+                at += n;
+                let (len, n) = peek_varint(&payload[at..]).expect("len");
+                at += n;
+                let len = usize::try_from(len).expect("len");
                 out.push((offset, payload[at..at + len].to_vec()));
                 at += len;
             }
