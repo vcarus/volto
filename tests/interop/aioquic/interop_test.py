@@ -567,6 +567,9 @@ def check_tests_are_accounted_for():
 
 
 async def main():
+    # Every verdict here is an assert, and -O or PYTHONOPTIMIZE removes them.
+    if not __debug__:
+        sys.exit("run this suite without -O: its checks are assert statements")
     check_tests_are_accounted_for()
     failures = 0
     for test in TESTS:
