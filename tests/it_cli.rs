@@ -1384,11 +1384,13 @@ struct Serving {
 }
 
 impl Serving {
-    /// Starts the binary on a configuration written into `dir`, with both of
-    /// its output streams piped and nothing reading them yet. Returns the
-    /// child, the address it listens on and its certificate.
+    /// Starts the binary on a configuration written into `dir`, with `body`
+    /// appended to it and both of its output streams piped and nothing reading
+    /// them yet. Returns the child, the address it listens on and its
+    /// certificate.
     fn spawn(
         dir: &Path,
+        body: &str,
         env: &[(&str, &std::ffi::OsStr)],
     ) -> (
         Reaped,
@@ -1410,7 +1412,7 @@ impl Serving {
         let path = dir.join("config.toml");
         write_private(
             &path,
-            &loadable_config_text(&cert, &key, &addr.to_string(), SECRET, ""),
+            &loadable_config_text(&cert, &key, &addr.to_string(), SECRET, body),
         );
 
         let child = Command::new(real_binary())
@@ -1432,10 +1434,10 @@ impl Serving {
     }
 
     /// Starts the binary as [`Self::spawn`] does and reads its stdout.
-    fn start(dir: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Self {
+    fn start(dir: &Path, body: &str, env: &[(&str, &std::ffi::OsStr)]) -> Self {
         use std::io::{BufRead, BufReader};
 
-        let (mut child, addr, ca) = Self::spawn(dir, env);
+        let (mut child, addr, ca) = Self::spawn(dir, body, env);
         let (sender, lines) = std::sync::mpsc::channel();
         let stdout = child.0.stdout.take().expect("stdout is piped");
         std::thread::spawn(move || {
@@ -1543,7 +1545,8 @@ fn a_server_that_cannot_write_its_log_still_starts_and_stops() {
     receiver
         .set_read_timeout(Some(Duration::from_secs(20)))
         .expect("a read timeout");
-    let (mut child, _addr, _ca) = Serving::spawn(&dir, &[("NOTIFY_SOCKET", socket.as_os_str())]);
+    let (mut child, _addr, _ca) =
+        Serving::spawn(&dir, "", &[("NOTIFY_SOCKET", socket.as_os_str())]);
     drop(child.0.stdout.take());
     drop(child.0.stderr.take());
 
@@ -1593,6 +1596,7 @@ fn readiness_is_sent_once_the_listener_is_bound_and_keep_alives_follow() {
         .expect("a read timeout");
     let serving = Serving::start(
         &dir,
+        "",
         &[
             ("NOTIFY_SOCKET", socket.as_os_str()),
             ("WATCHDOG_USEC", std::ffi::OsStr::new("200000")),
@@ -1633,6 +1637,7 @@ fn a_notification_socket_nobody_listens_on_is_one_warning_and_no_outage() {
     let socket = dir.join("nobody");
     let mut serving = Serving::start(
         &dir,
+        "",
         &[
             ("NOTIFY_SOCKET", socket.as_os_str()),
             ("WATCHDOG_USEC", std::ffi::OsStr::new("200000")),
@@ -1677,4 +1682,73 @@ fn a_notification_socket_nobody_listens_on_is_one_warning_and_no_outage() {
         "the line is the WARN for a socket that cannot be reached: {}",
         warnings[0]
     );
+}
+
+/// A filter that hides WARN for this server still lets the configuration
+/// warnings reach the operator: they are written to stderr as well, once each.
+///
+/// `log.level = "error"` is an accepted value, and the configuration warnings
+/// are WARN lines, so without the copy a server whose file switches
+/// authentication off would start with no line about it. The copy carries the
+/// warning priority when journald reads stderr. Where the filter shows WARN,
+/// stderr stays empty and the warning is the log line alone. `READY=1` comes
+/// after the warnings, so the server is stopped only once they are written.
+#[test]
+fn a_filter_that_hides_warnings_does_not_hide_the_configuration_warnings() {
+    use std::os::unix::net::UnixDatagram;
+
+    const WARNING: &str = "security.allow_private_networks is on";
+
+    for (name, level, journal, copy) in [
+        ("error", "error", None, Some("warning: ")),
+        (
+            "error-journal",
+            "warn,volto=error",
+            Some("8:12345"),
+            Some("<4>warning: "),
+        ),
+        ("info", "info", None, None),
+    ] {
+        let dir = scratch_tree("cli", &format!("hidden-warnings-{name}"), &[]);
+        let socket = dir.join("notify");
+        let receiver = UnixDatagram::bind(&socket).expect("the notification socket must bind");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("a read timeout");
+        let mut env = vec![("NOTIFY_SOCKET", socket.as_os_str())];
+        if let Some(value) = journal {
+            env.push(("JOURNAL_STREAM", std::ffi::OsStr::new(value)));
+        }
+        let serving = Serving::start(
+            &dir,
+            &format!("[security]\nallow_private_networks = true\n[log]\nlevel = \"{level}\"\n"),
+            &env,
+        );
+
+        let mut buf = [0u8; 64];
+        let len = receiver
+            .recv(&mut buf)
+            .unwrap_or_else(|error| panic!("{name}: READY=1 must arrive within 20 s: {error}"));
+        assert_eq!(&buf[..len], b"READY=1", "{name}");
+
+        let (status, lines, stderr) = serving.stop();
+        assert!(status.success(), "{name}: {status} {stderr}");
+        let copies: Vec<&str> = stderr.lines().filter(|l| l.contains(WARNING)).collect();
+        let logged = lines.iter().filter(|l| l.contains(WARNING)).count();
+        match copy {
+            Some(prefix) => {
+                assert_eq!(copies.len(), 1, "{name}: one copy on stderr:\n{stderr}");
+                assert!(
+                    copies[0].starts_with(&format!("{prefix}{WARNING}")),
+                    "{name}: the copy starts with {prefix:?}: {:?}",
+                    copies[0]
+                );
+                assert_eq!(logged, 0, "{name}: the filter hides the log line");
+            }
+            None => {
+                assert!(copies.is_empty(), "{name}: no copy on stderr:\n{stderr}");
+                assert_eq!(logged, 1, "{name}: the log line:\n{}", lines.join("\n"));
+            }
+        }
+    }
 }

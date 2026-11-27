@@ -152,6 +152,22 @@ fn failure_report(error: &anyhow::Error, journal: bool) -> String {
     })
 }
 
+/// The configuration warnings as [`run`] writes them to stderr when the log
+/// filter hides them: one line each, `warning: ` first as `--check-config`
+/// writes them, and the warning priority `<4>` before that when `journal` is
+/// true.
+fn hidden_warnings_report(warnings: &[String], journal: bool) -> String {
+    let prefix = if journal {
+        syslog_prefix(&Level::WARN)
+    } else {
+        ""
+    };
+    warnings
+        .iter()
+        .map(|warning| format!("{prefix}warning: {warning}\n"))
+        .collect()
+}
+
 /// Everything `main` does, with its error returned for [`main`] to report.
 fn start() -> Result<()> {
     let cli = Cli::parse();
@@ -544,8 +560,21 @@ async fn run(path: PathBuf, config: Config) -> Result<Duration> {
     // Only now that a subscriber exists: settings that are legal but risky
     // ("authentication is off" above all) are useless if they are logged into a
     // subscriber that has not been installed yet.
-    for warning in config.warnings() {
+    let warnings = config.warnings();
+    for warning in &warnings {
         tracing::warn!(log_id = "f9be058r", "{warning}");
+    }
+    // An accepted filter can still hide WARN at this target (`log.level =
+    // "error"`), and the warnings say things such as "authentication is
+    // DISABLED". So they are written to stderr as well whenever the filter
+    // hides them.
+    if !tracing::enabled!(target: "volto", Level::WARN) {
+        let journal = logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref());
+        // Not `eprint!`, which panics when stderr cannot be written.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            hidden_warnings_report(&warnings, journal).as_bytes(),
+        );
     }
     #[cfg(debug_assertions)]
     pause_after_the_warnings();
