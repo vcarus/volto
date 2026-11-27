@@ -67,8 +67,10 @@ pub struct EchKey {
     hpke: HpkeKey,
     /// The raw private key, kept only to write the file again.
     private: Zeroizing<[u8; X25519_KEY_LEN]>,
-    /// One serialized ECHConfig (version, length, contents).
-    config: Vec<u8>,
+    /// The HPKE `info` of RFC 9849 §7.1: [`INFO_LABEL`] and then the one
+    /// serialized ECHConfig (version, length, contents), which
+    /// [`EchKey::config`] returns. Kept whole, so `opens` builds nothing.
+    info: Vec<u8>,
     config_id: u8,
     public_name: String,
     max_name_length: u8,
@@ -129,7 +131,7 @@ impl EchKey {
         let key = Self {
             hpke,
             private: Zeroizing::new(*private),
-            config,
+            info: [INFO_LABEL.as_slice(), &config].concat(),
             config_id,
             public_name: public_name.to_owned(),
             max_name_length,
@@ -193,8 +195,8 @@ impl EchKey {
         let key_der = key_der.context("it holds no PRIVATE KEY block")?;
         let list = list.context("it holds no ECHCONFIG block")?;
 
-        let config = single_config(&list)?.to_vec();
-        let fields = ConfigFields::parse(&config)?;
+        let config = single_config(&list)?;
+        let fields = ConfigFields::parse(config)?;
         check_public_name(&fields.public_name)?;
 
         let private = x25519_from_pkcs8(&key_der)?;
@@ -203,7 +205,7 @@ impl EchKey {
         let key = Self {
             hpke,
             private,
-            config,
+            info: [INFO_LABEL.as_slice(), config].concat(),
             config_id: fields.config_id,
             public_name: fields.public_name,
             max_name_length: fields.max_name_length,
@@ -241,11 +243,12 @@ impl EchKey {
     /// ECHConfig. RFC 9849 §4 defines the ECHConfig; the list is the
     /// `ECHConfig ECHConfigList<4..2^16-1>` its DNS and TLS uses carry.
     pub fn config_list(&self) -> Vec<u8> {
-        let len = u16::try_from(self.config.len())
+        let config = self.config();
+        let len = u16::try_from(config.len())
             .expect("SSL_marshal_ech_config wrote an ECHConfig under 64 KiB");
-        let mut list = Vec::with_capacity(2 + self.config.len());
+        let mut list = Vec::with_capacity(2 + config.len());
         list.extend_from_slice(&len.to_be_bytes());
-        list.extend_from_slice(&self.config);
+        list.extend_from_slice(config);
         list
     }
 
@@ -253,6 +256,11 @@ impl EchKey {
     /// the form Surge's `ech-config` takes.
     pub fn config_list_base64(&self) -> String {
         base64(&self.config_list())
+    }
+
+    /// The one serialized ECHConfig.
+    fn config(&self) -> &[u8] {
+        &self.info[INFO_LABEL.len()..]
     }
 
     /// The ECHConfig's config_id.
@@ -324,9 +332,6 @@ impl EchKey {
 
         let mut aad = body.to_vec();
         aad[ech.payload.clone()].fill(0);
-        let mut info = Vec::with_capacity(INFO_LABEL.len() + self.config.len());
-        info.extend_from_slice(INFO_LABEL);
-        info.extend_from_slice(&self.config);
 
         // SAFETY: EVP_HPKE_CTX_new takes no arguments and returns a new context
         // or null, which `from_ptr` turns into an error.
@@ -338,7 +343,7 @@ impl EchKey {
         let mut written = 0usize;
         // SAFETY: `ctx` is a fresh context owned here; `self.hpke` is an
         // initialised key that AWS-LC only reads; `kdf` and `aead` are static
-        // tables; `enc`, `info`, `payload` and `aad` are readable for the
+        // tables; `enc`, `self.info`, `payload` and `aad` are readable for the
         // lengths passed beside them, and `inner` is writable for its length,
         // which is the `max_out_len` passed. `written` receives the length
         // AWS-LC wrote. The context is freed on drop on every path.
@@ -350,8 +355,8 @@ impl EchKey {
                 aead,
                 enc.as_ptr(),
                 enc.len(),
-                info.as_ptr(),
-                info.len(),
+                self.info.as_ptr(),
+                self.info.len(),
             ) == 1
                 && sys::EVP_HPKE_CTX_open(
                     ctx.as_ptr(),
@@ -396,8 +401,8 @@ impl EchKey {
             sys::SSL_ECH_KEYS_add(
                 keys.as_ptr(),
                 std::ffi::c_int::from(retry),
-                self.config.as_ptr(),
-                self.config.len(),
+                self.config().as_ptr(),
+                self.config().len(),
                 self.hpke.as_ptr(),
             )
         };
@@ -980,8 +985,8 @@ mod tests {
         let mut list = key.config_list();
         list[1] ^= 1;
         refused(&file_with(&key, &list), "length field does not match");
-        let mut two = key.config.clone();
-        two.extend_from_slice(&key.config);
+        let mut two = key.config().to_vec();
+        two.extend_from_slice(key.config());
         let mut list = u16::try_from(two.len())
             .expect("short")
             .to_be_bytes()
@@ -990,7 +995,7 @@ mod tests {
         refused(&file_with(&key, &list), "more than one ECHConfig");
 
         // A version this server does not read.
-        let mut config = key.config.clone();
+        let mut config = key.config().to_vec();
         config[1] = 0x0c;
         let mut list = u16::try_from(config.len())
             .expect("short")
