@@ -1524,7 +1524,9 @@ fn the_release_build_compiles_no_rustls() {
 ///
 /// `RestrictAddressFamilies=AF_INET AF_INET6` covered the sockets volto opens
 /// itself and nothing else. The own-address check is one of those: it binds an
-/// AF_INET or AF_INET6 socket and needs neither extra family. In a glibc build
+/// AF_INET or AF_INET6 socket and needs neither extra family. Every build also
+/// sends READY=1 and WATCHDOG=1 on an AF_UNIX datagram socket, so a unit
+/// without AF_UNIX fails every start at `TimeoutStartSec`. In a glibc build
 /// getaddrinfo resolves through NSS modules, and on a host whose nsswitch.conf
 /// names `resolve` or `myhostname` those modules open AF_UNIX and AF_NETLINK
 /// sockets. A denied family can fail the lookup and the tunnel with it. The
