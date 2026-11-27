@@ -92,7 +92,6 @@
 //! which runs only after the gathered write has completed.
 
 use std::io::{self, IoSlice};
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -217,7 +216,7 @@ impl Teardown {
 
 /// Where a TCP tunnel stands, on the one `watch` channel both pumps share.
 ///
-/// The sender lives in [`run`] and outlives both pumps, so a value stays
+/// The sender lives in [`relay`] and outlives both pumps, so a value stays
 /// readable after the pump that wrote it has returned: the client pump returns
 /// right after its FIN, and the other pump's bound still has to see it.
 ///
@@ -291,6 +290,18 @@ async fn stalled(rx: &mut watch::Receiver<State>, other: State, budget: Duration
 
 /// Establishes a TCP tunnel to `authority` and relays until both directions end.
 pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
+    let Some(tcp) = establish(authority, &mut stream, ctx).await else {
+        return;
+    };
+    relay(authority, stream, tcp, ctx).await;
+}
+
+/// Parses and admits the target, connects to it and answers the 200, or
+/// answers the refusal and returns `None`.
+///
+/// A step of its own so that what the setup holds (the host, the address
+/// lists, the other family's lookup) is dropped before the relay starts.
+async fn establish(authority: &str, stream: &mut Stream, ctx: &Context) -> Option<TcpStream> {
     let stream_id = stream.id();
     // The start of what the established line reports as `setup_ms`.
     let started = tokio::time::Instant::now();
@@ -299,8 +310,8 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         Ok(target) => target,
         Err(reason) => {
             debug!(stream_id, authority, reason, "malformed CONNECT authority");
-            tunnel::refuse(&mut stream, Status::BAD_REQUEST).await;
-            return;
+            tunnel::refuse(stream, Status::BAD_REQUEST).await;
+            return None;
         }
     };
 
@@ -308,10 +319,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     // every refusal already answered by the time this returns; see
     // [`tunnel::admit_target`]. An accepted TCP tunnel carries no response
     // fields of its own, so the 200-then-close path is handed an empty list.
-    let Some(admitted) = tunnel::admit_target(&host, port, ctx, &mut stream, Fields::new).await
-    else {
-        return;
-    };
+    let admitted = tunnel::admit_target(&host, port, ctx, stream, Fields::new).await?;
     let tunnel::Admitted {
         addresses: first,
         mut later,
@@ -324,7 +332,18 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         })
     });
 
-    let (walk, walked) = tunnel::timed(connect_any(first, later, ctx.connect_timeout)).await;
+    // Bounded because the slot and the descriptor are held for the walk, and
+    // a target that drops SYNs would hold them for the kernel's two minutes of
+    // retries. A client reset mid-connect is not noticed; the bound makes that
+    // acceptable.
+    let (walk, walked) = tunnel::timed(tunnel::first_reachable_then(
+        first,
+        later,
+        ctx.connect_timeout,
+        TcpStream::connect,
+        CONNECT_FAILED,
+    ))
+    .await;
     // A wait for the other family's lookup with no attempt in flight is lookup
     // time, so it moves from `connect_ms` to `resolve_ms`.
     let resolve = resolve + walk.waited;
@@ -346,8 +365,8 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
                 error = %failure.error,
                 "failed to connect to target"
             );
-            tunnel::refuse_unreachable(&mut stream, &failure).await;
-            return;
+            tunnel::refuse_unreachable(stream, &failure).await;
+            return None;
         }
     };
 
@@ -359,9 +378,9 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     let target = tcp.peer_addr().ok();
 
     // Bounded as every refusal is, for the reason [`tunnel::respond`] gives:
-    // the pumps below do not exist until this write returns.
+    // the pumps do not exist until this write returns.
     let sent = tunnel::respond(
-        &mut stream,
+        stream,
         Status::OK,
         Fields::new(),
         "failed to send 200 for CONNECT",
@@ -377,7 +396,7 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     // close abortive. One check covers both cases, so they cannot differ.
     if !sent {
         abort_target(&tcp);
-        return;
+        return None;
     }
 
     // The three times are what the client waited for on this side, beyond its
@@ -397,7 +416,12 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
         setup_ms = started.elapsed().as_millis(),
         "tcp tunnel established"
     );
+    Some(tcp)
+}
 
+/// Relays between the request stream and `tcp` until both directions end.
+async fn relay(authority: &str, stream: Stream, tcp: TcpStream, ctx: &Context) {
+    let stream_id = stream.id();
     let (writer, reader) = stream.split();
     let (tcp_read, tcp_write) = tcp.into_split();
 
@@ -411,35 +435,6 @@ pub async fn run(authority: &str, mut stream: Stream, ctx: &Context) {
     );
 
     debug!(stream_id, authority, "tcp tunnel closed");
-}
-
-/// Connects to the first address that accepts, reporting the last failure.
-///
-/// Trying every address matters for dual-stack targets, where the AAAA record
-/// may be unreachable while the A record works. [`tunnel::first_reachable_then`]
-/// walks `first`, then the other family's addresses that `later` gives, and
-/// shares `budget` out among the attempts by the rule it states.
-///
-/// Why the walk is bounded at all: the tunnel slot and the file descriptor
-/// behind it are held for the length of this call, and a target that silently
-/// drops SYNs otherwise holds them for as long as the operating system
-/// retries, around two minutes on Linux. No attacker is needed for that; a
-/// handful of black-holed addresses during ordinary browsing is enough to
-/// spend a connection's whole `max_targets_per_conn` on tunnels that will
-/// never open.
-///
-/// One thing this deliberately does not do is notice the client giving up: a
-/// request stream reset mid-connect leaves the attempt running until it finishes
-/// or the budget expires. Bounding it is what makes that acceptable.
-async fn connect_any<L>(
-    first: Vec<SocketAddr>,
-    later: Option<tunnel::Later<L>>,
-    budget: Option<Duration>,
-) -> tunnel::Walk<TcpStream>
-where
-    L: std::future::Future<Output = Vec<SocketAddr>>,
-{
-    tunnel::first_reachable_then(first, later, budget, TcpStream::connect, CONNECT_FAILED).await
 }
 
 /// The debug line for one address that did not accept.
@@ -938,7 +933,7 @@ fn ensure_window(buf: &mut BytesMut) {
 /// **Every ending but a clean one resets.** `UploadHalf`'s drop arms it for
 /// every ending of the upload pump but the client's FIN (D45). The three arms
 /// of `target_to_client` that see a client abort arm it for the case where
-/// the upload pump has already finished, and `run` arms it for a 200 that did
+/// the upload pump has already finished, and `establish` arms it for a 200 that did
 /// not land. A clean client FIN and a target EOF keep their FIN semantics: the
 /// half-close table at the top of this module is the behaviour this proxy
 /// exists to get right, and a reset is not a substitute for any of it. The
@@ -1055,7 +1050,7 @@ mod tests {
         literal.parse().expect("socket address")
     }
 
-    /// The walk [`super::connect_any`] makes, with the connect step supplied
+    /// The walk [`super::establish`] makes, with the connect step supplied
     /// by the test so the budget can be held against one that never completes.
     async fn connect_any_with<C, F>(
         addresses: &[SocketAddr],
@@ -1108,7 +1103,7 @@ mod tests {
 
     /// A first address that never answers leaves the next one time to connect.
     ///
-    /// The dual-stack case `connect_any` tries every address for: a name whose
+    /// The dual-stack case the walk tries every address for: a name whose
     /// first address drops SYNs and whose second works. Each attempt gets an
     /// equal share of what is left of the budget, so the first is given up on
     /// at half of it and the second connects at once. With one deadline for
@@ -1367,7 +1362,7 @@ mod tests {
     // budget after the *later* of the other direction ending and this write
     // starting. On a paused clock both are exact.
 
-    /// The channel as [`run`] creates it, and a receiver of it for the bound
+    /// The channel as [`relay`] creates it, and a receiver of it for the bound
     /// under test.
     ///
     /// Every test here holds the client → target pump's bound, which waits for
@@ -1700,7 +1695,7 @@ mod tests {
         )
     }
 
-    /// Runs the two pumps as `run` does, to their end, and returns the state
+    /// Runs the two pumps as `relay` does, to their end, and returns the state
     /// they left.
     async fn pump(
         (writer, reader): (crate::h3api::Writer, crate::h3api::Reader),
