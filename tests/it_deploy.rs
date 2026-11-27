@@ -2647,55 +2647,17 @@ fn a_stale_prev_from_an_earlier_update_is_never_restored() {
     );
 }
 
-/// The binary is replaced by a rename, so its name never holds a partial copy
-/// (R8-L7).
+/// The binary, the unit and the two timer units are replaced by a rename, on
+/// the update and on the rollback, so no name ever holds a partial copy.
 ///
 /// `install` writes under the name it is given. Over `/usr/local/bin/volto`
-/// that left the name missing or partial until it finished, which a restart
-/// under `Restart=on-failure` in that moment would execute.
+/// that would leave the name missing or partial until it finished, which a
+/// restart under `Restart=on-failure` in that moment would execute. A unit
+/// written straight to its name by a full `/etc` or a crash in mid-write would
+/// be parsed truncated at `daemon-reload`. The stand-in `install` and `mv`
+/// record their arguments and run the host's own.
 #[test]
-fn the_binary_is_replaced_by_a_rename() {
-    let host = Host::new("atomic-swap", Service::ComesUp);
-    host.plant_install();
-    let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
-    write_executable(
-        &host.stubs.join("install"),
-        &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
-            host.logs.join("install").display(),
-            real_tool("install").display()
-        ),
-    );
-
-    let output = host.run(&["--allow-unsigned", "--tag", UNSIGNED_TAG]);
-
-    assert!(output.status.success(), "{}", stderr_of(&output));
-    assert_eq!(fs::read_to_string(host.bin()).ok(), Some(candidate));
-    let bin = host.bin().display().to_string();
-    let installs = host.calls("install");
-    assert!(
-        installs
-            .lines()
-            .all(|line| !line.ends_with(&format!(" {bin}"))),
-        "nothing may be installed straight over {bin}: {installs}"
-    );
-    assert!(
-        installs
-            .lines()
-            .any(|line| line.ends_with(&format!(" {bin}.new"))),
-        "the new binary is written beside the old one: {installs}"
-    );
-}
-
-/// The unit and the two timer units are replaced by a rename too, on the update
-/// and on the rollback (S9-L8).
-///
-/// Written straight to their names, a full `/etc` or a crash in mid-write left
-/// a truncated unit that systemd then parsed at `daemon-reload`, and the
-/// rollback's own copy of the unit failed the same way. The stand-in `install`
-/// and `mv` record their arguments and run the host's own.
-#[test]
-fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
+fn the_binary_the_unit_and_the_timer_units_are_replaced_by_a_rename() {
     let (real_install, real_mv) = (real_tool("install"), real_tool("mv"));
 
     for (name, service, args) in [
@@ -2712,7 +2674,7 @@ fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
     ] {
         let host = Host::new(name, service);
         host.plant_install();
-        host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
+        let candidate = host.publish(UNSIGNED_TAG, Candidate::LoadsTheConfig);
         let previous_unit = fs::read_to_string(host.unit()).expect("the planted unit");
         for (tool, path) in [("install", &real_install), ("mv", &real_mv)] {
             write_executable(
@@ -2729,18 +2691,26 @@ fn the_unit_and_the_timer_units_are_replaced_by_a_rename() {
 
         let stderr = stderr_of(&output);
         let (installs, moves) = (host.calls("install"), host.calls("mv"));
-        let unit = host.unit().display().to_string();
-        assert!(
-            installs
-                .lines()
-                .all(|line| !line.ends_with(&format!(" {unit}"))),
-            "{name}: nothing may be installed straight over {unit}: {installs}"
+        let (bin, unit) = (
+            host.bin().display().to_string(),
+            host.unit().display().to_string(),
         );
-        // The rollback renames the unit a second time, back to the previous one.
+        for path in [&bin, &unit] {
+            assert!(
+                installs
+                    .lines()
+                    .all(|line| !line.ends_with(&format!(" {path}"))),
+                "{name}: nothing may be installed straight over {path}: {installs}"
+            );
+        }
+        // The rollback renames the binary and the unit a second time, back to
+        // the previous ones.
         let rollback = name == "atomic-unit-rollback";
-        let mut renamed = vec![(unit, if rollback { 2 } else { 1 })];
+        let times = if rollback { 2 } else { 1 };
+        let mut renamed = vec![(bin, times), (unit, times)];
         if !rollback {
             assert!(output.status.success(), "{name}: {stderr}");
+            assert_eq!(fs::read_to_string(host.bin()).ok(), Some(candidate));
             assert_eq!(
                 fs::read_to_string(host.unit()).ok().as_deref(),
                 Some("# the unit inside the release archive\n"),
