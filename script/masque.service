@@ -51,7 +51,7 @@ TimeoutStartSec=15
 ExecReload=/bin/kill -HUP $MAINPID
 
 # SIGTERM starts the graceful shutdown. The exit takes at most
-# 2 * server.shutdown_grace + 3 seconds, 13 at the default grace of 5. Keep
+# server.shutdown_grace + 2 seconds, 7 at the default grace of 5. Keep
 # TimeoutStopSec above that bound if you raise shutdown_grace, or systemd sends
 # SIGKILL during the drain. docs/deployment.md#graceful-shutdown
 KillSignal=SIGTERM
