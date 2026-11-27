@@ -216,18 +216,11 @@ impl Notifier {
         }
     }
 
-    /// Sends one message as one datagram.
+    /// Sends one message as one datagram. A datagram socket sends the whole
+    /// datagram or fails, so the count is not checked.
     #[cfg(unix)]
     fn send(&self, message: &[u8]) -> std::io::Result<()> {
-        let sent = self.socket.send(message)?;
-        if sent == message.len() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
-                "sent {sent} of the {} bytes",
-                message.len()
-            )))
-        }
+        self.socket.send(message).map(drop)
     }
 }
 
