@@ -1300,8 +1300,11 @@ async fn interleaved_requests_delivered_a_byte_at_a_time_are_both_served() {
         (b":authority", authority.as_bytes()),
         (b"x-volto-probe", padding.as_bytes()),
     ]);
-    assert!(
-        request.len() > 0x40,
+    // The type 0x01 is one byte, so `request[1]` opens the length varint, and
+    // the prefix 0b01 is the two-byte form (RFC 9000 §16).
+    assert_eq!(
+        request[1] & 0xc0,
+        0x40,
         "the field section must be long enough to need a two-byte length varint"
     );
 
