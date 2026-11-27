@@ -98,11 +98,7 @@ impl EchKey {
         // Any 32 bytes are an X25519 private key, because AWS-LC clamps the
         // scalar where it is used (`x25519_public_from_private_nohw` and the
         // s2n-bignum path alike): it clears the three low bits of byte 0 and
-        // the top bit of byte 31, and sets bit 6 of byte 31. Its own
-        // `X25519_keypair` draws the 32 bytes from the same `RAND_bytes` and
-        // then does the opposite to those five bits (sets the three low bits
-        // and the top bit, clears bit 6), so every bit it changes is one that
-        // clamping overwrites (aws-lc-sys 0.47.0, `curve25519.c`).
+        // the top bit of byte 31, and sets bit 6 of byte 31.
         let mut private = Zeroizing::new([0u8; X25519_KEY_LEN]);
         crate::tls::random_bytes(&mut private[..])?;
         Self::from_private_bytes(&private, public_name, config_id, max_name_length)
@@ -307,13 +303,9 @@ impl EchKey {
     /// payload field of the "encrypted_client_hello" is replaced with a byte
     /// string of the same length but whose contents are zeros. This value does
     /// not include the Handshake structure's four-byte header in TLS nor the
-    /// twelve-byte header in DTLS." AWS-LC builds both the same way:
-    /// `ECHServerConfig::SetupContext` writes the label with its NUL and then
-    /// the raw ECHConfig as `info`, and `ssl_client_hello_decrypt` copies the
-    /// ClientHello body and zeroes the payload span for the AAD
-    /// (`ssl/encrypted_client_hello.cc`). The serialized ECHConfig here is the
-    /// one the key file holds, version and length included, which is the
-    /// `raw` AWS-LC keeps for the same key.
+    /// twelve-byte header in DTLS." These are the bytes libssl uses
+    /// (`ECHServerConfig::SetupContext`, `ssl_client_hello_decrypt`);
+    /// `ech_opens_exactly_when_libssl_accepts_it` pins the agreement.
     ///
     /// The inner ClientHello is decrypted into a buffer that is cleared on
     /// drop and is not returned: what the gate needs is whether the client
@@ -504,12 +496,10 @@ impl EchKeySet {
     /// The current key is added first. `ssl.h`, `SSL_ECH_KEYS_add`: "This
     /// function should be called successively to register each ECHConfig in
     /// decreasing order of preference." The previous key is added with
-    /// `is_retry_config = 0`, because a retry config is the list "returned to
-    /// the client on configuration mismatch" (the same comment), and the list
-    /// a client is to move to is the current one. `SSL_CTX_set1_ech_keys`
-    /// refuses a set without a retry config: "If |keys| does not contain any
-    /// retry configs, this function will fail." The current key is always one,
-    /// and RFC 9849 §7.1 requires it: "If the server is configured with any
+    /// `is_retry_config = 0`: the list a client is to move to is the current
+    /// one. `SSL_CTX_set1_ech_keys` refuses a set without a retry config: "If
+    /// |keys| does not contain any retry configs, this function will fail."
+    /// The current key is always one, and RFC 9849 §7.1 requires it: "If the server is configured with any
     /// ECHConfigs, it MUST include the "encrypted_client_hello" extension in
     /// its EncryptedExtensions with the "retry_configs" field set to one or
     /// more ECHConfig structures with up-to-date keys." So libssl on its own
