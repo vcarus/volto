@@ -57,6 +57,9 @@
 //!   its state. They belong to a flight that was judged when it started; a
 //!   forgery that is not one of them fails quinn's own decryption and is
 //!   dropped there without a reply.
+//! * **An Initial whose frames do not parse, or carry a type no Initial
+//!   packet may carry** (RFC 9000 §17.2.2): refused. quinn closes the
+//!   connection over it with a CONNECTION_CLOSE, and no client sends it.
 //! * **An Initial with no CRYPTO frame at offset 0**: passes. It is an
 //!   acknowledgement or a later fragment of a handshake already in progress, and
 //!   the flight it belongs to was judged when it started. Without a key the gate
@@ -606,6 +609,10 @@ fn log_refusal(remote: SocketAddr, refusal: &Refusal) {
             "dropping an Initial packet: its destination connection ID is shorter than \
              eight bytes"
         ),
+        Refusal::Frames => debug!(
+            %remote,
+            "dropping an Initial packet: it carries frames an Initial packet may not"
+        ),
         Refusal::NotClientHello => debug!(
             %remote,
             "dropping an Initial packet: its first handshake message is not a ClientHello"
@@ -851,6 +858,12 @@ fn judge(datagram: &[u8], expected: &Names) -> Verdict {
         Classified::Opened { frames, .. } => frames,
     };
 
+    // quinn closes a connection over a frame it cannot parse or one no
+    // Initial may carry, which is a reply. The hold drops the same shape.
+    if !crypto_frames(&frames).is_some_and(|walk| walk.whole) {
+        return Verdict::Refuse(Refusal::Frames);
+    }
+
     let Some(crypto) = crypto_stream_prefix(&frames) else {
         // No CRYPTO frame at offset 0: an acknowledgement, or a later
         // fragment of a first flight whose beginning was already judged.
@@ -987,6 +1000,9 @@ pub enum Refusal {
     /// An Initial whose Destination Connection ID is under
     /// [`MIN_CLIENT_CONNECTION_ID`] bytes, carrying the length it had.
     ShortConnectionId(usize),
+    /// A first Initial whose frames do not parse, or carry a type no Initial
+    /// packet may carry.
+    Frames,
     /// A first flight that does not begin with a ClientHello.
     NotClientHello,
     /// A complete ClientHello with no `server_name` extension.

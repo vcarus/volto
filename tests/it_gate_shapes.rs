@@ -1614,6 +1614,55 @@ async fn an_initial_carrying_only_a_ping_is_silent() {
     draws_no_reply("a PING-only Initial, DCID 8 bytes", &[0x55; 8], &[0x01]).await;
 }
 
+/// An Initial carrying a STREAM frame, a type no Initial packet may carry.
+///
+/// quinn closes such a connection with a CONNECTION_CLOSE, which the gate-off
+/// half of this probe records. No client sends this shape, so the gate
+/// refuses it, as the hold does.
+#[tokio::test]
+async fn an_initial_carrying_a_frame_no_initial_may_carry_is_silent() {
+    draws_no_reply(
+        "a STREAM frame in an Initial, DCID 8 bytes",
+        &[0x56; 8],
+        &[0x08, 0x00, 0x00],
+    )
+    .await;
+}
+
+/// Without a key, a first Initial whose frames do not parse, or carry a type
+/// no Initial packet may carry, is refused whatever else it holds: alone, and
+/// beside a ClientHello naming a listed host. The hold drops the same shapes
+/// as `Dropped::Frames`.
+#[test]
+fn a_first_initial_whose_frames_no_initial_may_carry_is_refused() {
+    let crypto = nameless_crypto();
+    let names = Names::new(&[LISTED.to_owned()]);
+    let named = crypto_frame_at(0, &named_hello(LISTED));
+    assert_eq!(
+        judgement(&initial(&*crypto, &CLIENT_CID, &named), &names),
+        Verdict::Pass,
+        "the ClientHello alone passes"
+    );
+
+    let mut beside = named.clone();
+    // STREAM with its LEN bit (0x0a): stream 0, one byte of data.
+    beside.extend_from_slice(&[0x0a, 0x00, 0x01, 0x5a]);
+    // A CRYPTO frame whose length runs past the payload.
+    let mut overrun = named.clone();
+    overrun.extend_from_slice(&[0x06, 0x00, 0x80, 0x01, 0x00, 0x00]);
+    for (what, frames) in [
+        ("a STREAM frame alone", vec![0x08, 0x00, 0x00]),
+        ("a STREAM frame beside a listed name", beside),
+        ("a CRYPTO frame that runs past the payload", overrun),
+    ] {
+        assert_eq!(
+            judgement(&initial(&*crypto, &CLIENT_CID, &frames), &names),
+            Verdict::Refuse(Refusal::Frames),
+            "{what}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // (e) The hold, with an ECH key (D115, batch 2)
 // ---------------------------------------------------------------------------
