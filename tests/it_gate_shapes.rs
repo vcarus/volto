@@ -21,19 +21,20 @@
 //! pinned here as bytes.
 //!
 //! **What still answers a stranger with the gate on?** The gate judges a
-//! datagram's first packet, and one thing it refuses is decided without a name:
-//! since only a first Initial is keyed by the connection ID written in it, a
-//! Destination Connection ID shorter than the eight bytes RFC 9000 §7.2
+//! datagram's first packet, and some of what it refuses is decided without a
+//! name: since only a first Initial is keyed by the connection ID written in
+//! it, a Destination Connection ID shorter than the eight bytes RFC 9000 §7.2
 //! requires, which quinn answers with a CONNECTION_CLOSE before a single frame
-//! is read. (The other nameless refusal, a version in the long header, is probed
-//! in `it_sni_gate`.) Everything else it passes reaches quinn, and an Initial
+//! is read, and a frame no Initial may carry, which quinn closes over. (The
+//! other nameless refusal, a version in the long header, is probed in
+//! `it_sni_gate`.) Everything else it passes reaches quinn, and an Initial
 //! carrying an ack-eliciting frame draws an acknowledgement whether or not it
-//! names anybody. The probes below send each of those shapes at a server with
-//! the gate on and record what comes back; the ones still answered are
-//! `#[ignore]`d rather than deleted, so the shape and its evidence stay in the
-//! tree. Every probe is paired with the same datagram sent at a server with the
-//! gate *off*, which is what proves the probe is well formed enough to be
-//! answered at all: a probe that draws nothing either way has tested nothing.
+//! names anybody. The probes below send the refused shapes at a server with
+//! the gate on and assert silence, each paired with the same datagram sent at
+//! a server with the gate *off*, which is what proves the probe is well formed
+//! enough to be answered at all: a probe that draws nothing either way has
+//! tested nothing. The three nameless shapes still answered without an ECH
+//! key, the residue D106 accepts, are pinned as answered.
 //!
 //! The seed corpus of `fuzz/fuzz_targets/gate.rs` is written from here too,
 //! with the same builders, so that a verdict a seed was built for is a red test
@@ -49,8 +50,8 @@ use std::time::Duration;
 use bytes::BytesMut;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TIMEOUT, TempDir, TestServer,
-    bulk_alpn, client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
-    rustls_client, udp_answer, udp_answers, udp_relay,
+    bulk_alpn, client_endpoint, endpoint_from, nameless_crypto, roots_of, rustls_client, udp_answer,
+    udp_answers, udp_relay,
 };
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
@@ -62,7 +63,7 @@ use volto::gate::{
     sealed_initial,
 };
 use volto::tls::{EchKey, EchKeySet};
-use volto::varint::{peek_varint, put_varint};
+use volto::varint::put_varint;
 
 /// How long a server is given to prove it is not answering.
 ///
@@ -1461,142 +1462,32 @@ fn the_fuzz_seed_corpus_is_written_with_the_verdicts_it_was_built_for() {
 // (d) Shapes with no name in them at all, sent at a running server
 // ---------------------------------------------------------------------------
 
-/// What a reply is, in as much detail as the Initial keys allow.
-///
-/// The keys a server uses to answer come from the Destination Connection ID the
-/// probe chose (RFC 9001 §5.2), so a probe can read its own answers: an Initial
-/// is opened and its first frame named, which is what turns "the server said
-/// something" into "the server said PROTOCOL_VIOLATION" in the log. Nothing is
-/// asserted on the description; it is the evidence a probe leaves behind.
-fn describe(crypto: &dyn quinn::crypto::ServerConfig, reply: &[u8], dcid: &[u8]) -> String {
-    let Some(&first) = reply.first() else {
-        return "an empty datagram".to_owned();
-    };
-    if first & LONG_HEADER_FORM == 0 {
-        return format!("a short-header packet of {} bytes", reply.len());
-    }
-    if reply.len() < 5 {
-        return format!("a long header of {} bytes, cut short", reply.len());
-    }
-    if is_version_negotiation(reply) {
-        return format!("a Version Negotiation packet of {} bytes", reply.len());
-    }
-    let kind = match first & 0x30 {
-        0x00 => "Initial",
-        0x10 => "0-RTT",
-        0x20 => "Handshake",
-        _ => "Retry",
-    };
-    if kind != "Initial" {
-        return format!("a {kind} packet of {} bytes", reply.len());
-    }
-
-    match first_frame(crypto, reply, dcid) {
-        Some(frame) => format!("an Initial of {} bytes opening with {frame}", reply.len()),
-        None => format!("an Initial of {} bytes this probe cannot open", reply.len()),
-    }
-}
-
-/// Opens a server's Initial packet and names the first frame in it that is not
-/// PADDING.
-fn first_frame(
-    crypto: &dyn quinn::crypto::ServerConfig,
-    reply: &[u8],
-    dcid: &[u8],
-) -> Option<String> {
-    let keys = crypto
-        .initial_keys(QUIC_V1, &ConnectionId::new(dcid))
-        .ok()?;
-
-    let mut at = 5usize;
-    let dcid_length = usize::from(*reply.get(at)?);
-    at = at.checked_add(1 + dcid_length)?;
-    let scid_length = usize::from(*reply.get(at)?);
-    at = at.checked_add(1 + scid_length)?;
-    let (token, read) = peek_varint(reply.get(at..)?)?;
-    at = at
-        .checked_add(read)?
-        .checked_add(usize::try_from(token).ok()?)?;
-    let (length, read) = peek_varint(reply.get(at..)?)?;
-    let number_offset = at.checked_add(read)?;
-    let packet_end = number_offset.checked_add(usize::try_from(length).ok()?)?;
-    if packet_end > reply.len() {
-        return None;
-    }
-
-    // The server writes with the `local` half of the key pair; a probe reading
-    // its answers is the peer that half is written for.
-    let mut packet = reply[..packet_end].to_vec();
-    if number_offset + 4 + keys.header.local.sample_size() > packet_end {
-        return None;
-    }
-    keys.header.local.decrypt(number_offset, &mut packet);
-    let number_length = usize::from(packet[0] & 0x03) + 1;
-    let number_end = number_offset.checked_add(number_length)?;
-    let mut number = 0u64;
-    for byte in packet.get(number_offset..number_end)? {
-        number = (number << 8) | u64::from(*byte);
-    }
-    let mut frames = BytesMut::from(packet.get(number_end..)?);
-    keys.packet
-        .local
-        .decrypt(number, packet.get(..number_end)?, &mut frames)
-        .ok()?;
-
-    let mut at = 0usize;
-    while at < frames.len() {
-        let (kind, read) = peek_varint(&frames[at..])?;
-        at += read;
-        if kind == 0x00 {
-            continue;
-        }
-        return Some(match kind {
-            0x01 => "PING".to_owned(),
-            0x02 | 0x03 => "ACK".to_owned(),
-            0x06 => "CRYPTO".to_owned(),
-            0x1c | 0x1d => {
-                let (code, _) = peek_varint(&frames[at..])?;
-                format!("CONNECTION_CLOSE({code:#x})")
-            }
-            other => format!("a frame of type {other:#x}"),
-        });
-    }
-    Some("PADDING only".to_owned())
-}
-
 /// Sends a first Initial addressed to `dcid` and carrying `frames` at a server
 /// with the gate off, then at one with it on, and asserts the second one says
 /// nothing.
 ///
 /// The control is part of the probe rather than a separate test that could rot
 /// away from it: a probe nobody answers proves nothing, so the gate-off server
-/// has to answer. Its first reply is enough for that and is described into the
-/// log; the gate-on server gets the whole of [`PATIENCE`], because proving
-/// silence takes the full wait.
+/// has to answer. Its first reply is enough for that; the gate-on server gets
+/// the whole of [`PATIENCE`], because proving silence takes the full wait.
 async fn draws_no_reply(what: &str, dcid: &[u8], frames: &[u8]) {
     let crypto = nameless_crypto();
     let shape = initial(&*crypto, dcid, frames);
 
     let off = TestServer::start_with(ALLOW_PRIVATE).await;
-    let control = udp_answer(off.addr, &shape, PATIENCE)
-        .await
-        .unwrap_or_else(|| {
-            panic!("{what}: with the gate off this shape must draw a reply, or it tests nothing")
-        });
-    eprintln!(
-        "{what}: with the gate off, the server sent {}",
-        describe(&*crypto, &control, dcid)
+    assert!(
+        udp_answer(off.addr, &shape, PATIENCE).await.is_some(),
+        "{what}: with the gate off this shape must draw a reply, or it tests nothing"
     );
 
     let on = TestServer::start_with(GATE_LOCALHOST).await;
     let heard = udp_answers(on.addr, std::slice::from_ref(&shape), PATIENCE).await;
-    let described: Vec<String> = heard
-        .iter()
-        .map(|reply| describe(&*crypto, reply, dcid))
-        .collect();
     assert!(
         heard.is_empty(),
-        "{what}: with the gate on, a datagram carrying no name must draw no reply, not {described:?}"
+        "{what}: with the gate on, a datagram carrying no name must draw no reply, and drew {} \
+         datagrams, the first of {} bytes",
+        heard.len(),
+        heard.first().map_or(0, Vec::len)
     );
 }
 
@@ -1614,64 +1505,54 @@ async fn a_padding_only_initial_with_a_short_connection_id_is_silent() {
     draws_no_reply("a PADDING-only Initial, DCID 4 bytes", &[0x11; 4], &[]).await;
 }
 
-/// An Initial carrying the first half of a ClientHello, cut before its
-/// extensions.
-///
-/// This is the fail-open branch reached deliberately: the gate cannot tell a
-/// first flight that is merely large from one that is hiding its name, so it
-/// passes both, and a CRYPTO frame is ack-eliciting.
-///
-/// FAILS: this shape is answered with the gate on. Left `#[ignore]`d so the
-/// probe and its evidence stay in the tree; see the report on this branch.
-#[tokio::test]
-#[ignore = "the shape is answered: a truncated ClientHello is ack-eliciting and draws an Initial"]
-async fn an_initial_carrying_half_a_client_hello_is_silent() {
-    let hello = named_hello("localhost");
-    // Cut inside the message, before the extensions block the name lives in.
-    let half = &hello[..hello.len() / 2];
-    assert_eq!(
-        first_flight(half),
-        FirstFlight::Truncated,
-        "the probe must be the fail-open shape, not a complete hello"
-    );
-
-    draws_no_reply("half a ClientHello", &[0x33; 8], &crypto_frame_at(0, half)).await;
+/// The three nameless shapes the stateless gate passes, each under a
+/// connection ID of its own: a PING alone, a ClientHello cut inside its
+/// fixed fields, before the extensions the name lives in, and a CRYPTO frame
+/// that starts past offset 0.
+fn nameless_residue(crypto: &dyn quinn::crypto::ServerConfig) -> Vec<(&'static str, Vec<u8>)> {
+    let named = named_hello("localhost");
+    vec![
+        (
+            "a PING and nothing else",
+            initial(crypto, &[0x55; 8], &[0x01]),
+        ),
+        (
+            "half a ClientHello",
+            initial(
+                crypto,
+                &[0x33; 8],
+                &crypto_frame_at(0, &named[..named.len() / 2]),
+            ),
+        ),
+        (
+            "a CRYPTO frame at offset 64",
+            initial(crypto, &[0x44; 8], &crypto_frame_at(64, &named)),
+        ),
+    ]
 }
 
-/// An Initial whose only CRYPTO frame starts past the beginning of the stream.
+/// Without an ECH key, the shapes of [`nameless_residue`] are answered with
+/// the gate on. This is the residue D106 accepts.
 ///
-/// The gate reads this as a later fragment of a flight it already judged and
-/// passes it; to quinn it is a new connection whose handshake stream has a hole
-/// at the front, and it is ack-eliciting all the same.
-///
-/// FAILS: this shape is answered with the gate on. Left `#[ignore]`d so the
-/// probe and its evidence stay in the tree; see the report on this branch.
+/// The stateless gate cannot tell them from what a client sends: a PING alone
+/// or a CRYPTO frame past offset 0 is what a later packet of an admitted flight
+/// looks like, and a ClientHello cut short is what the first packet of a large
+/// one looks like. So each is passed, and quinn acknowledges it because it is
+/// ack-eliciting. Each costs its sender the public Initial AEAD. With an ECH
+/// key the hold keeps them, and `a_flight_that_never_completes_draws_nothing`
+/// shows them silent. This test turns red when the stateless gate starts to
+/// drop one of them, and D106 and the gate's module documentation then change
+/// with it.
 #[tokio::test]
-#[ignore = "the shape is answered: a CRYPTO frame at a non-zero offset is ack-eliciting"]
-async fn an_initial_whose_crypto_starts_past_the_beginning_is_silent() {
-    draws_no_reply(
-        "a CRYPTO frame at offset 64",
-        &[0x44; 8],
-        &crypto_frame_at(64, &named_hello("localhost")),
-    )
-    .await;
-}
-
-/// An Initial carrying one PING frame and nothing else.
-///
-/// The cheapest of these shapes and the one that says most about the gate's
-/// reach: no ClientHello, no name, no truncation argument — just the smallest
-/// ack-eliciting frame there is, behind a Destination Connection ID long enough
-/// for quinn to accept. The gate finds no CRYPTO frame at offset 0 and passes
-/// it, because from the socket that is indistinguishable from a later packet of
-/// a flight already admitted, and quinn acknowledges it.
-///
-/// FAILS: this shape is answered with the gate on. Left `#[ignore]`d so the
-/// probe and its evidence stay in the tree; see the report on this branch.
-#[tokio::test]
-#[ignore = "the shape is answered: a PING-only Initial draws an ACK with no name anywhere in it"]
-async fn an_initial_carrying_only_a_ping_is_silent() {
-    draws_no_reply("a PING-only Initial, DCID 8 bytes", &[0x55; 8], &[0x01]).await;
+async fn the_stateless_gate_still_answers_three_nameless_shapes() {
+    let crypto = nameless_crypto();
+    let on = TestServer::start_with(GATE_LOCALHOST).await;
+    for (what, datagram) in nameless_residue(&*crypto) {
+        assert!(
+            udp_answer(on.addr, &datagram, PATIENCE).await.is_some(),
+            "{what}: the stateless gate passes it and quinn acknowledges it"
+        );
+    }
 }
 
 /// An Initial carrying a STREAM frame, a type no Initial packet may carry.
@@ -3167,32 +3048,17 @@ async fn a_flight_that_never_completes_draws_nothing() {
     let crypto = nameless_crypto();
     let key = ech_key(7);
     let hello = rustls_hello(&Offer::Ech(key.config_list()), &surge_groups(), "localhost");
-    let named = named_hello("localhost");
     let residue = || {
-        vec![
-            (
-                "a PING and nothing else",
-                vec![initial(&*crypto, &[0x55; 8], &[0x01])],
-            ),
-            (
-                "half a ClientHello",
-                vec![initial(
-                    &*crypto,
-                    &[0x33; 8],
-                    &crypto_frame_at(0, &named[..named.len() / 2]),
-                )],
-            ),
-            (
-                "a CRYPTO frame at offset 64",
-                vec![initial(&*crypto, &[0x44; 8], &crypto_frame_at(64, &named))],
-            ),
-        ]
+        nameless_residue(&*crypto)
+            .into_iter()
+            .map(|(what, datagram)| (what, vec![datagram]))
+            .collect::<Vec<_>>()
     };
 
     let off = TestServer::start_with(ALLOW_PRIVATE).await;
-    for (what, datagrams) in residue() {
+    for (what, datagram) in nameless_residue(&*crypto) {
         assert!(
-            !udp_answers(off.addr, &datagrams, PATIENCE).await.is_empty(),
+            udp_answer(off.addr, &datagram, PATIENCE).await.is_some(),
             "{what}: without the gate this draws a reply, or it tests nothing"
         );
     }
