@@ -33,7 +33,7 @@
 //! | i3 | Opens a second QPACK encoder or decoder stream | RFC 9204 §4.2: one of each per endpoint (`serve_qpack`) | CONNECTION_CLOSE H3_STREAM_CREATION_ERROR (0x103) | [`a_second_qpack_stream_of_either_kind_ends_the_connection`] |
 //! | j | Sends a frame type reserved for HTTP/2 (0x02, 0x06, 0x08, 0x09) | `RESERVED_HTTP2_TYPES` (`src/h3/frame.rs`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), whatever stream it arrives on | [`frame_types_reserved_for_http2_end_the_connection`] |
 //! | j2 | Puts an unknown or empty frame before SETTINGS on the control stream, or announces an oversized HEADERS/PUSH_PROMISE first | RFC 9114 §6.2.1 first-frame rule: a frame type other than SETTINGS is missing settings at every length (`frame::misplaced` decides every type but SETTINGS from the header at every length) | CONNECTION_CLOSE H3_MISSING_SETTINGS (0x10a), never a 431 | `it_settings::a_frame_before_settings_ends_the_connection`, [`an_oversized_frame_before_settings_is_still_missing_settings`] |
-//! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431, and nothing charged to the buffering budget on the way | [`control_stream_frames_on_a_request_stream_end_the_connection`], [`a_frame_refused_for_its_type_is_never_charged_for`] |
+//! | j5 | Sends a frame that belongs on the control stream -- SETTINGS, GOAWAY, CANCEL_PUSH, MAX_PUSH_ID, PUSH_PROMISE -- on a request stream, declaring a length past what one frame may be, or a PUSH_PROMISE inside that length | RFC 9114 §7.2.3-§7.2.7 and §4.1, applied to the frame *type* before its length (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105) from the frame header, never a 431 | [`control_stream_frames_on_a_request_stream_end_the_connection`] |
 //! | j6 | Announces a HEADERS frame on a tunnel whose CONNECT has been answered, and never finishes it | RFC 9114 §4.4, decided from the frame header rather than after the payload (`frame::misplaced`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105); the announcement never reaches the budget, so tunnels cannot pin it between them | [`a_field_section_on_an_established_tunnel_ends_the_connection`] |
 //! | j7 | Opens a request stream with a DATA frame, before any HEADERS | RFC 9114 §4.1's rule about the *order* of a request's frames, which `frame::misplaced` leaves to the reader of the request (`Resolver::resolve`) | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105) | [`a_data_frame_before_any_headers_ends_the_connection`] |
 //! | j3 | Sends a second SETTINGS, or HEADERS/PUSH_PROMISE/DATA, on the control stream after SETTINGS, declaring any length | DATA, HEADERS, PUSH_PROMISE and a second SETTINGS are refused from the header at every length (`frame::misplaced`); the matching arms of `Control::accept` are defensive and unreachable | CONNECTION_CLOSE H3_FRAME_UNEXPECTED (0x105), never a 431 | [`frames_the_control_stream_may_not_carry_end_the_connection`], [`oversized_control_stream_frames_are_refused_by_type`] |
@@ -632,7 +632,10 @@ async fn an_oversized_frame_before_settings_is_still_missing_settings() {
 /// stream reset a field section too large to hold gets -- a nonsensical reply to
 /// a frame that is not a field section at all, and one that leaves the
 /// connection running after a MUST-close. Not a byte of payload is sent, so the
-/// verdict cannot have waited for one.
+/// verdict cannot have waited for one. The rows inside the cap show the verdict
+/// is the same there; for the PUSH_PROMISE at the largest length the cap allows,
+/// a decoder that charged the budget and judged the type once the payload was
+/// complete would never answer.
 #[tokio::test]
 async fn control_stream_frames_on_a_request_stream_end_the_connection() {
     /// Past the largest frame this server will buffer, so the per-frame cap
@@ -648,6 +651,13 @@ async fn control_stream_frames_on_a_request_stream_end_the_connection() {
         // The same verdict at a length the cap allows: what is judged is the
         // type, and it is judged the same way on either side of the bound.
         ("SETTINGS", FRAME_SETTINGS, 0),
+        // Inside the per-frame cap: a decoder that charged the budget for it
+        // and waited for the payload would never answer.
+        (
+            "PUSH_PROMISE",
+            FRAME_PUSH_PROMISE,
+            volto::h3::MAX_FIELD_SECTION_SIZE,
+        ),
     ] {
         let server = TestServer::start().await;
         let (_endpoint, connection) = connect_quic(&server).await;
@@ -669,63 +679,6 @@ async fn control_stream_frames_on_a_request_stream_end_the_connection() {
             answered.as_deref().unwrap_or(&[]).is_empty(),
             "{name}: a frame that is not a field section must not be answered like one, \
              got {answered:?}"
-        );
-    }
-}
-
-/// A frame refused for its type is refused before the connection is charged for
-/// it.
-///
-/// Seventeen full-sized announcements is one past the connection's whole HEADERS
-/// budget (D77), so a decoder that charged a PUSH_PROMISE the way it charges a
-/// HEADERS would answer the last of them with a 431 and carry on. None of them
-/// is charged: the first is a connection error the moment its header lands, and
-/// no answer of any kind reaches the peer.
-///
-/// Seventeen streams is also one past what an unauthenticated connection may
-/// have open at once (`quic::INITIAL_BIDI_STREAMS`), so the door is walked
-/// through first. It changes nothing about the subject: what is on trial is the
-/// decoder's judgement of a frame type, which is the same judgement either side
-/// of the credentials check.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_frame_refused_for_its_type_is_never_charged_for() {
-    let server = TestServer::start().await;
-    let (_endpoint, connection) = connect_quic(&server).await;
-
-    authenticate(&connection, None).await;
-
-    // Every stream is opened before any of them says anything: the first
-    // announcement ends the connection, and `open_bi` with it.
-    let mut streams = Vec::new();
-    for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-        streams.push(connection.open_bi().await.expect("open a request stream"));
-    }
-
-    let mut announcement = BytesMut::new();
-    varint::put_varint(&mut announcement, FRAME_PUSH_PROMISE);
-    varint::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
-
-    let mut announced = Vec::new();
-    for (mut send, recv) in streams {
-        // A write that fails is the connection already ended, which is the
-        // answer this test is waiting for.
-        let _ = send.write_all(&announcement).await;
-        announced.push((send, recv));
-    }
-    let mut batch = collect_refusals(announced, FULL_SIZED_FRAMES_THAT_FIT + 1);
-
-    let (closed_with, reason) = application_close(&connection, TIMEOUT).await;
-    assert_eq!(
-        closed_with, H3_FRAME_UNEXPECTED,
-        "a PUSH_PROMISE on a request stream; the reason was {reason:?}"
-    );
-
-    while let Some((_, response)) = batch.answers.recv().await {
-        assert!(
-            response.is_empty(),
-            "a frame refused for its type must not be charged for: one announcement was \
-             answered {}",
-            status_of_response(&response)
         );
     }
 }
