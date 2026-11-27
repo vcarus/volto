@@ -908,6 +908,10 @@ unit needs no extra setting (`SyslogLevelPrefix=` already defaults to true). The
 reason a start failed is printed to stderr rather than logged, and under the same
 condition each of its lines carries `<3>`, so it is filed at `err` as well.
 
+A log line that cannot be written is dropped without a message, for example
+when the reading end of stdout has been closed. The server goes on serving and
+still stops on `SIGTERM`.
+
 Every line at `info` or above carries a `log_id` field, eight lowercase letters
 and digits. It names one statement in the source, is assigned once and is never
 reused, and it stays the same when that line is reworded, so it is what a

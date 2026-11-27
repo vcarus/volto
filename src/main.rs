@@ -845,7 +845,16 @@ const JOURNAL_STREAM: &str = "JOURNAL_STREAM";
 fn init_tracing(level: &str) -> Result<()> {
     let (filter, invalid_rust_log) = chosen_filter(std::env::var_os("RUST_LOG").as_deref(), level)?;
 
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    // A log line that cannot be written is dropped and nothing is said about
+    // it. tracing-subscriber's default reports the failed write with
+    // `eprintln!`, which panics when stderr cannot be written either, and the
+    // panic ends the task that logged. Under systemd both streams are the one
+    // journal connection, so they fail together. The main future would end the
+    // process at its next line, and the signal watcher would end before it
+    // fires the shutdown trigger, which leaves a server that ignores `SIGTERM`.
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .log_internal_errors(false);
 
     if logs_to_journal(std::env::var_os(JOURNAL_STREAM).as_deref()) {
         builder
