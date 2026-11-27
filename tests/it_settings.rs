@@ -1,4 +1,4 @@
-//! M0: the server must advertise extended CONNECT and HTTP Datagrams.
+//! The server must advertise extended CONNECT and HTTP Datagrams.
 //!
 //! Surge validates the server's SETTINGS frame during connection setup and
 //! disconnects if either capability is missing, so this is asserted on the wire
@@ -162,8 +162,7 @@ async fn server_negotiates_the_h3_alpn() {
 /// The QUIC transport parameter behind HTTP Datagrams must be advertised too.
 ///
 /// `max_datagram_size` reports what the *peer* is willing to receive, so a
-/// `Some` here means the server sent `max_datagram_frame_size`. CONNECT-UDP in
-/// M2 depends on it.
+/// `Some` here means the server sent `max_datagram_frame_size`.
 #[tokio::test]
 async fn server_advertises_max_datagram_frame_size() {
     let server = TestServer::start().await;
@@ -178,17 +177,10 @@ async fn server_advertises_max_datagram_frame_size() {
 /// The control stream must *open* with SETTINGS — a frame the server skips is
 /// still a frame, and so is one that carries nothing.
 ///
-/// Both shapes used to slip through, because neither produced anything for the
-/// control stream's rules to be applied to: an unknown type was discarded inside
-/// the frame decoder, and a zero-length DATA frame left no payload behind. A
-/// peer greasing its control stream is testing exactly this rule, so the two
-/// cases that escaped it are the two a greasing peer is most likely to send.
+/// These are the two a greasing peer is most likely to send first, and neither
+/// leaves a payload for the control-stream rules to judge.
 #[tokio::test]
 async fn a_frame_before_settings_ends_the_connection() {
-    /// A reserved "grease" frame type of the form 0x1f * N + 0x21 (RFC 9114 §9).
-    ///
-    /// N is arbitrary; this one differs from the server's and the test client's
-    /// only so that the three greases can be told apart in a packet capture.
     const GREASE: u64 = rawstream::grease_type(4);
 
     for (name, first) in [
@@ -499,17 +491,8 @@ async fn a_session_set_up_once_the_settings_are_read_answers_on_datagrams() {
 /// the server reads the client's SETTINGS: before that moment the fallback was
 /// already correct, and it is the packets after it that used to disappear.
 ///
-/// What the repetition costs is nothing but the round trips. The client's
-/// control stream is opened and written before the request, `serve_peer` has
-/// been reading it since before the CONNECT arrived, and the flag it writes is
-/// the very one each reply reads (`volto::h3::connection`'s module
-/// documentation), so round 0's answer -- which comes back only after a full
-/// round trip out to the target and home -- is already on the far side of that
-/// moment. The rounds stay five because nothing on the wire tells the two
-/// states apart: both send the payload back as a DATAGRAM capsule, so no single
-/// round can be shown to be the one that matters and the exchange is repeated
-/// instead. There was a 100 ms sleep at the end of each round with no comment
-/// on it; it held no window open that the round trip does not.
+/// Five rounds, because nothing on the wire tells the states before and after
+/// the server reads the SETTINGS apart.
 #[tokio::test]
 async fn a_peer_without_max_datagram_frame_size_is_answered_with_capsules() {
     let server = TestServer::start().await;
