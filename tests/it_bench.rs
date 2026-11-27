@@ -11,10 +11,8 @@
 //!
 //! Set `TOKIO_WORKER_THREADS` to half the CPU count for a run whose figures
 //! are to be compared. The proxy runtime and the test runtime each start that
-//! many workers, so the default starts two workers per CPU, and on 8 CPUs that
-//! raised the proxy's CPU per unit by 9 to 43 percent on the musl target
-//! against the gnu one. With 4 workers each the two targets read within 8
-//! percent of each other on every path.
+//! many workers, so the default starts two workers per CPU, which inflates the
+//! per-unit CPU.
 //!
 //! # What the numbers mean, and what they do not
 //!
@@ -841,8 +839,7 @@ const IN_FLIGHT: usize = 256;
 /// per-session channel the connection's datagram router `try_send`s into. That queue is the real
 /// bound on this direction: the router drops rather than blocks, by design, so
 /// letting more than 64 packets pile up in front of one session measures the
-/// drop policy instead of the forwarding cost. Measured at a 256-packet window,
-/// this path loses about 4% of its packets for exactly that reason.
+/// drop policy instead of the forwarding cost.
 const UPLINK_IN_FLIGHT: usize = 48;
 
 async fn udp_uplink(size: usize, count: u64, budget: Option<Duration>) -> Rep {
@@ -1303,8 +1300,7 @@ fn rustls_quic_session(config: &Arc<rustls::ClientConfig>) -> rustls::quic::Clie
 }
 
 /// The CPU one unauthenticated first flight costs the gate, by kind, beside
-/// the CPU the server's TLS spends on one whole handshake (D115 review,
-/// finding L1 of the gate half).
+/// the CPU the server's TLS spends on one whole handshake (D115).
 ///
 /// Single-threaded and in memory, so wall time is CPU time. The gate's work
 /// runs through `gate::Screening`, which is the receive path's own
@@ -1450,8 +1446,7 @@ fn bench_gate_cost_per_first_flight() {
         );
     }
 
-    // One Initial key derivation on its own, which is what a datagram with
-    // bytes after its first packet used to cost a second time.
+    // One Initial key derivation on its own.
     let crypto = common::nameless_crypto();
     let derive = |count: u64| {
         for _ in 0..count {
