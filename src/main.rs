@@ -3,7 +3,6 @@
 // As in `lib.rs`: the binary crate is assembly over the library, and there is
 // nothing here that could need `unsafe` either.
 #![forbid(unsafe_code)]
-// And, as in `lib.rs`, every item here is documented; this keeps it that way.
 #![warn(missing_docs)]
 
 use std::ffi::OsStr;
@@ -326,11 +325,8 @@ fn report_config_check(path: &Path, config: &Config, rust_log_ignored: Option<&s
 
 /// Prints the support bundle `--diagnostics` promises.
 ///
-/// One question: what would an operator have to be asked for, one message at a
-/// time, before an issue about this host could be read at all. The answer is
-/// the version, the file as this binary parsed it, the two host limits that
-/// decide whether the configured quotas are reachable, and what kernel this is.
-/// Printing it in one go turns that exchange into a paste.
+/// The version, the file as this binary parsed it, the descriptor limits, the
+/// UDP buffer sysctls and the kernel, in one paste.
 ///
 /// What it deliberately does not do bounds the trust it needs. Nothing is bound,
 /// connected or resolved, no journal is read, and nothing goes through
@@ -352,7 +348,6 @@ fn report_diagnostics(path: &Path, config: &Config) {
     println!();
     println!("[server]\n{:#?}", config.server);
     println!();
-    // The passwords are `<redacted>` here, by `Debug for config::User`.
     println!("[auth]\n{:#?}", config.auth);
     println!();
     // After serde's defaults, so these are the values the server would run on
@@ -690,13 +685,8 @@ impl Signals {
 /// old one is still valid for the session that negotiated it), and for credentials
 /// it means a revoked user keeps their current tunnels until they reconnect.
 ///
-/// The reload itself runs on the blocking pool rather than on the async task.
-/// It reads the configuration file and parses the certificate and key, which is
-/// file I/O and CPU work. On a host whose runtime has one worker thread, such as
-/// a one-vCPU VPS, that worker also drives the endpoint and every connection.
-/// Running it inline would stop every packet and timer for the length of the
-/// parse; `spawn_blocking` uses the pool `main` already sizes for this kind of
-/// work.
+/// The reload runs on the blocking pool: it reads and parses files, and on a
+/// one-worker runtime an inline parse would stop every packet and timer.
 #[cfg(unix)]
 async fn watch_for_reload(
     hangup: std::io::Result<tokio::signal::unix::Signal>,
@@ -722,9 +712,6 @@ async fn watch_for_reload(
             "received SIGHUP, reloading configuration"
         );
 
-        // Both cloned because the blocking task takes ownership. The handle is
-        // a set of `Arc`s and the path one allocation, so the copy costs
-        // nothing next to the parse it feeds.
         let reload = handle.clone();
         let reloading = path.clone();
         let result = tokio::task::spawn_blocking(move || reload.reload(&reloading)).await;
@@ -1147,9 +1134,7 @@ mod tests {
     /// The error is what takes the process to a non-zero exit: `start` returns
     /// it, and `main` maps every error `start` returns to
     /// `ExitCode::FAILURE`, the path `tests/it_cli.rs` already holds to exit
-    /// status 1 for a failed start. Before D124 the accept loop's end was not
-    /// told apart, `run` returned the grace for both, and the process exited
-    /// with status 0.
+    /// status 1 for a failed start.
     #[test]
     fn a_lost_endpoint_is_an_error_and_a_shutdown_is_not() {
         served(Stopped::Shutdown).expect("a shutdown is a clean stop");
