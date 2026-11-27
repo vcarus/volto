@@ -1,24 +1,23 @@
 //! The self-signed installer must generate a configuration volto accepts.
 //!
 //! `script/install-selfsigned.sh` builds `/etc/volto/config.toml` by substituting
-//! four values into the shipped example. That is exactly the kind of text munging
-//! that rots silently: rename a key, reflow the example, and the script keeps
-//! "working" while installing a config the server rejects — or, worse, one that
-//! still carries the example's placeholder password.
+//! four values into the shipped example. A renamed key or a reflowed example
+//! would let the script install a config the server rejects, or one that still
+//! carries the example's placeholder password.
 //!
 //! The script's `--print-config` flag exists for this test: it runs the real
 //! generation path, touches nothing, and needs no root. The rest of the script
-//! needs root, a Debian host and systemd. Six tests, starting with
-//! `a_certificate_swap_that_fails_partway_puts_the_previous_pair_back`, run that
-//! install path by putting stand-ins for those commands in front of `PATH`
-//! (`plant_root_stubs`), with the real `install`, `mv` and `openssl`. What the
-//! stand-ins replace, the user creation and the package install among them, is
-//! covered by shellcheck plus review.
+//! needs root, a Debian host and systemd. The tests that run that install path
+//! put stand-ins in front of `PATH` (`plant_root_stubs`): `id`, `apt-get`,
+//! `systemctl` and `chown` answer for the host, and `install` and `mv` record
+//! their calls, or fail on purpose, and run the host's own. `openssl` is the
+//! host's. What the stand-ins replace, the user creation and the package
+//! install among them, is covered by shellcheck plus review.
 //!
 //! `--check-config` is the second seam, and it closes the other half of the same
 //! hazard: parsing the generated text here proves this crate can read it, which
 //! is not the same question as whether the binary about to be installed can.
-//! That one is only answerable by running it, so the script runs it — `volto
+//! That one is only answerable by running it, so the script runs `volto
 //! --check-config`, the same flag `script/deploy.sh` puts to a release before it
 //! swaps a binary (D93, D94). `VOLTO_INSTALL_ROOT` relocates the installer's
 //! paths the way `VOLTO_DEPLOY_ROOT` does for `deploy.sh`, so a temporary
@@ -93,21 +92,18 @@ fn host_root(name: &str) -> Scratch {
     )
 }
 
-/// Copies the four sibling deployment assets into `root/script` and appends
-/// `example_suffix` to the example config, returning the installer's new path.
+/// Copies the installer, the example config and the unit into `root/script`
+/// and appends `example_suffix` to the example config, returning the
+/// installer's new path.
 ///
 /// They travel together because the installer resolves the unit and the example
 /// through `SCRIPT_DIR`, which is wherever the copy of the script being run sits.
-/// Copying all four rather than the two this reads is the point: a test that
-/// silently worked with a broken sibling set would stop noticing when that
-/// contract is what breaks.
 fn plant_script_dir(root: &Path, example_suffix: &str) -> PathBuf {
     let dir = root.join("script");
     fs::create_dir_all(&dir).expect("the script directory must be creatable");
 
     for asset in [
         "install-selfsigned.sh",
-        "deploy.sh",
         "config.example.toml",
         "masque.service",
     ] {
@@ -231,7 +227,7 @@ fn the_placeholder_password_never_survives() {
         stderr_of(&output)
     );
 
-    // With no password given, one is generated -- and it is not empty or trivial.
+    // With no password given, one is generated, and it is not empty or trivial.
     let config: Config = toml::from_str(&text).expect("parses");
     assert_eq!(config.auth.users.len(), 1);
     let password = &config.auth.users[0].password;
@@ -603,8 +599,7 @@ fn credentials_the_surge_policy_line_cannot_carry_are_refused() {
 
 /// A port the install path would refuse must be refused before the print and
 /// check flags return, because those flags print or load the config that names
-/// it. `--print-config --port 99999` used to print a configuration the install
-/// path would then reject.
+/// it.
 #[test]
 fn an_unusable_port_is_refused_before_the_print_and_check_flags() {
     let (ok, stdout, stderr) = print_config(&["-p", "99999"]);
@@ -633,9 +628,9 @@ fn an_unusable_port_is_refused_before_the_print_and_check_flags() {
 
 /// The question this crate cannot answer for itself: parsing the generated text
 /// here proves *this* build reads it, and the host runs the binary the installer
-/// was handed. So the script asks that binary, and this is the end-to-end shape
-/// of the answer — the generator, the shipped example and a real volto agreeing
-/// that what a first install writes is a file the service can start on.
+/// was handed. So the script asks that binary. This is the end-to-end shape of
+/// the answer: the generator, the shipped example and a real volto agree that
+/// what a first install writes is a file the service can start on.
 #[test]
 fn the_generated_configuration_is_one_the_binary_can_load() {
     let root = install_root("accepts");
@@ -650,11 +645,9 @@ fn the_generated_configuration_is_one_the_binary_can_load() {
     );
 }
 
-/// The drift this closes: the generated config is the shipped example with four
-/// values substituted, every table in it is `deny_unknown_fields`, and one key
-/// the binary does not know refuses the whole file rather than the key. Before
-/// the check, that reached the host as a service looping under
-/// `Restart=on-failure` with the answer only in the journal.
+/// The generated config is the shipped example with four values substituted,
+/// every table in it is `deny_unknown_fields`, and one key the binary does not
+/// know refuses the whole file rather than the key.
 ///
 /// The example is corrupted in a copy of the whole `script/` directory, not in
 /// the checkout: the installer resolves its siblings through `SCRIPT_DIR`, so
@@ -695,9 +688,8 @@ fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
 /// it, not only with the advice to build one.
 ///
 /// The default `./target/release/volto` is a checkout's path. Run out of an
-/// unpacked release tarball, where nothing has been built and the binary is
-/// already sitting there, "build it first" was the whole message and it was the
-/// wrong advice — the fix is `--binary ./volto`, which the message never named.
+/// unpacked release tarball, the binary is `./volto` and the way out is
+/// `--binary ./volto`, so the message must name the flag.
 /// The same text guards the install path a few lines further down, which needs
 /// root and so cannot be reached from here; this covers the wording for both.
 #[test]
@@ -726,9 +718,9 @@ fn a_missing_binary_is_refused_with_the_flag_that_points_at_another_one() {
 ///
 /// Such a volto answers `--check-config` with clap's usage error, and reading
 /// that as "your configuration is broken" would turn every install with an older
-/// binary into a failure — a new failure mode where there was none. So the flag
-/// is looked for by name in the binary's own `--help` before it is used, and a
-/// binary without it leaves the run exactly as it was before any of this existed.
+/// binary into a failure. So the flag is looked for by name in the binary's own
+/// `--help` before it is used, and a binary without it leaves the config
+/// unchecked.
 ///
 /// The example carries the same unknown key as the test above, so a probe that
 /// silently stopped working would show up here as a refusal rather than as a
@@ -920,8 +912,9 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
 /// backup. The service keeps the pair it loaded, so the next restart is the one
 /// that fails.
 ///
-/// The counter is asserted because a run that stopped before the swap would
-/// leave the old pair in place too, and would pass for the wrong reason.
+/// The stand-in's own failure line is asserted because a run that stopped
+/// before the swap would leave the old pair in place too, and would pass for
+/// the wrong reason.
 #[test]
 fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
     let script = installer_script();
@@ -962,14 +955,10 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
             !output.status.success(),
             "rename {fail_at} failed, so the run must fail: {stderr}"
         );
-        let calls: usize = fs::read_to_string(stubs.join("mv-calls"))
-            .unwrap_or_else(|error| panic!("the run never reached the swap: {error}\n{stderr}"))
-            .trim()
-            .parse()
-            .expect("the call count must be a number");
+        fs::read_to_string(stubs.join("mv-calls"))
+            .unwrap_or_else(|error| panic!("the run never reached the swap: {error}\n{stderr}"));
         assert!(
-            calls >= fail_at
-                && stderr.contains(&format!("mv stub: forced failure on call {fail_at}")),
+            stderr.contains(&format!("mv stub: forced failure on call {fail_at}")),
             "the forced failure must be the one at rename {fail_at}: {stderr}"
         );
 
@@ -1011,12 +1000,12 @@ fn backup_leftovers(dir: &Path) -> Vec<String> {
 }
 
 /// A signal during the certificate swap puts the previous pair back, as a
-/// failed rename does (S9-M1).
+/// failed rename does.
 ///
 /// The stand-in `mv` makes its rename and then sends the signal to the script,
 /// on the call each case names. A Ctrl-C, the SIGHUP of a dropped session and a
-/// SIGTERM all ended the run there with the pair split, since only ERR was
-/// trapped. The rollback's own renames come later and are not signalled. The
+/// SIGTERM would otherwise end the run there with the pair split. The
+/// rollback's own renames come later and are not signalled. The
 /// exit status is the rollback's, not a death by the signal.
 #[test]
 fn a_signal_during_the_certificate_swap_puts_the_previous_pair_back() {
@@ -1104,10 +1093,9 @@ const CHOWN_FAILS_ON_THE_PAIR: &str =
 
 /// A failure at the ownership change must also put the previous pair back.
 ///
-/// The ERR trap covered the four renames and was disarmed before `chown`. A
-/// failure there ended the run with the new pair in place, owned by root with
-/// the key at mode 0640, which the service user cannot read; the next restart
-/// fails. The transaction now covers ownership and mode.
+/// A failure at `chown` or `chmod` would otherwise leave the new pair in place
+/// with the key still root's at mode 0600, which the service user cannot read,
+/// so the next restart fails.
 #[test]
 fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
     let root = host_root("chown-fails");
@@ -1243,8 +1231,7 @@ fn run_full_install_with_stubs(root: &Path, stubs: &Path, extra_args: &[&str]) -
 
 /// A service that failed to start must turn the install into a failure.
 ///
-/// The installer read `systemctl is-active` with `|| true`, printed the status
-/// and exited 0 even when the service failed to start. A port already bound
+/// A port already bound
 /// leaves the host without a proxy while the installer reports success. The
 /// report and the security notes still print, so the operator has the
 /// fingerprint and the policy line before the refusal.
@@ -1273,12 +1260,12 @@ fn an_install_whose_service_failed_is_not_reported_as_success() {
 }
 
 /// A first install whose `systemctl start` fails still prints the report
-/// before it fails (F3-L1).
+/// before it fails.
 ///
 /// Under `Type=notify` the start fails at once when the binary cannot be
 /// executed, and after `TimeoutStartSec=` when the server never reports ready.
-/// Without a guard on that call `set -e` ended the run there, and the operator
-/// got neither the fingerprint nor the policy line.
+/// Without a guard on that call `set -e` would end the run there, and the
+/// operator would get neither the fingerprint nor the policy line.
 #[test]
 fn a_first_install_whose_start_fails_still_prints_the_report() {
     let root = host_root("start-fails");
@@ -1375,12 +1362,9 @@ fn systemctl_calls(stubs: &Path) -> String {
 }
 
 /// A re-run on a host that already has a config leaves the binary and the unit
-/// alone and does not restart the service (R8-M2).
-///
-/// The installer used to install `--binary` over `/usr/local/bin/volto` and the
-/// unit over the installed one on every run, with no config check and no
-/// `.prev`, and then restart. A re-run to regenerate a certificate from a
-/// checkout holding an older build downgraded the binary. With `--force` the
+/// alone and does not restart the service, so a re-run to regenerate a
+/// certificate from a checkout holding an older build cannot downgrade the
+/// binary. With `--force` the
 /// certificate is regenerated and the running service reloaded, which keeps
 /// its tunnels.
 #[test]
@@ -1472,7 +1456,7 @@ fn replacing_the_binary_is_refused_when_it_cannot_load_the_existing_config() {
 
 /// `--replace-binary` asks the new binary with the `RUST_LOG` the installed
 /// unit sets, as `deploy.sh` does, so a value the binary refuses at startup
-/// stops the run before anything moves, and one it accepts does not (F3-M2).
+/// stops the run before anything moves, and one it accepts does not.
 /// The binary is the real one, so its own rule judges the value.
 #[test]
 fn replacing_the_binary_is_checked_with_the_units_rust_log() {
@@ -1627,10 +1611,10 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
 }
 
 /// The unit is written beside its target and renamed over it, on a first
-/// install, on `--replace-binary` and on its rollback (S9-L8).
+/// install, on `--replace-binary` and on its rollback.
 ///
-/// Written straight to its name, a full `/etc` or a crash in mid-write left a
-/// truncated unit that systemd then parsed at `daemon-reload`. The stand-in
+/// Written straight to its name, a full `/etc` or a crash in mid-write would
+/// leave a truncated unit that systemd then parses at `daemon-reload`. The stand-in
 /// `install` records its arguments already; the stand-in `mv` here records its
 /// own and runs the host's.
 #[test]
@@ -1701,7 +1685,7 @@ fn the_unit_is_replaced_by_a_rename() {
 }
 
 /// A signal while `--replace-binary` swaps the binary and unit rolls them back
-/// as a failure there does (S9-M1).
+/// as a failure there does.
 ///
 /// The stand-in `systemctl` sends the signal to the script on the first
 /// `daemon-reload`, before the restart is issued, or on every `restart volto`,
@@ -1794,7 +1778,7 @@ fn a_signal_while_replacing_the_binary_rolls_it_back() {
 }
 
 /// A rollback after `--replace-binary` puts the unit back only together with
-/// the binary, as `deploy.sh` does (F3-L2).
+/// the binary, as `deploy.sh` does.
 ///
 /// The installed binary here is not executable, so no `volto.prev` is made,
 /// while `volto.service.prev` is. Restoring that unit alone would put the new
@@ -1836,12 +1820,10 @@ fn a_rollback_without_a_previous_binary_leaves_the_new_pair() {
 }
 
 /// A first install writes the root-owned layout: `/etc/volto` root:volto 0750,
-/// the config and the key root:volto 0640, the certificate root:volto 0644
-/// (R8-M3).
+/// the config and the key root:volto 0640, the certificate root:volto 0644.
 ///
-/// The installer used to give the directory and every file in it to the
-/// service user, and then wrote, renamed, chowned and chmodded by name inside
-/// a directory that user could change. The stand-in `chown` and `install`
+/// Root writes, renames, chowns and chmods by name inside the directory, which
+/// is safe only while the service user cannot change it. The stand-in `chown` and `install`
 /// record what they were asked, since this host has no `volto` group.
 #[test]
 fn a_first_install_writes_the_root_owned_layout() {
@@ -1893,12 +1875,11 @@ fn a_first_install_writes_the_root_owned_layout() {
 }
 
 /// A symbolic link where the key belongs is refused, and the file it points at
-/// is not changed (R8-M3).
+/// is not changed.
 ///
-/// While the service user owned `/etc/volto` it could replace `key.pem` with a
-/// link to a file of root's and delete `config.toml`; the next run took the
-/// first-install path, kept the "existing" pair because `test -f` follows the
-/// link, and its `chown` and `chmod` then acted on the link's target.
+/// A host on the old layout, where the service user owned `/etc/volto`, may
+/// hold such a link to a file of root's. `test -f` follows the link, and the
+/// run's `chown` and `chmod` would then act on the link's target.
 #[test]
 fn a_symbolic_link_in_place_of_the_key_is_refused() {
     let root = scratch_tree(
@@ -1947,12 +1928,11 @@ fn a_symbolic_link_in_place_of_the_key_is_refused() {
     );
 }
 
-/// The certificate name must be a host name before it reaches openssl
-/// (R8-L8).
+/// The certificate name must be a host name before it reaches openssl.
 ///
-/// `--sni 'a.example,IP:192.0.2.1'` put an IP address into the certificate's
-/// subjectAltName, a `/` added subject fields to `-subj`, and either went into
-/// the printed policy line as well.
+/// `--sni 'a.example,IP:192.0.2.1'` would put an IP address into the
+/// certificate's subjectAltName, a `/` would add subject fields to `-subj`, and
+/// either would go into the printed policy line as well.
 #[test]
 fn a_certificate_name_that_is_not_a_host_name_is_refused() {
     let long_label = format!("{}.example", "a".repeat(64));
@@ -2000,7 +1980,7 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
 }
 
 /// The generated EC certificate asserts digitalSignature and not
-/// keyEncipherment (R8-L9).
+/// keyEncipherment.
 ///
 /// RFC 8446 section 4.4.2.2 asks that "the digitalSignature bit MUST be set if
 /// the Key Usage extension is present". keyEncipherment is the RSA key
@@ -2044,14 +2024,14 @@ fn run_install_generating_the_password(root: &Path, stubs: &Path) -> Output {
     )
 }
 
-/// A generated password is printed only to a terminal (R8-L10).
+/// A generated password is not printed when stdout is not a terminal.
 ///
 /// The update timer runs a first install when the config is missing, and its
 /// output goes to the journal of `volto-deploy.service`, which the `adm` and
 /// `systemd-journal` groups read. The policy line then names the config file
 /// in place of the password.
 #[test]
-fn a_generated_password_is_printed_only_to_a_terminal() {
+fn a_generated_password_is_not_printed_without_a_terminal() {
     let root = host_root("password-pipe");
     let stubs = plant_root_stubs(&root, 0, "active");
 
@@ -2075,13 +2055,12 @@ fn a_generated_password_is_printed_only_to_a_terminal() {
 }
 
 /// A run without a terminal does not replace the password of a host that
-/// already has an install (R8-L10).
+/// already has an install.
 ///
 /// Deleting `config.toml` and re-running regenerates the config. When the
-/// re-run was the timer's, the installer generated a new password, every
-/// client's credential stopped working, and the new one was only in the
-/// journal. Such a run now stops before anything changes; with the password
-/// given it goes ahead.
+/// re-run is the timer's, a generated password would replace every client's
+/// credential and be printed only to the journal, so such a run stops before
+/// anything changes; with the password given it goes ahead.
 #[test]
 fn a_run_without_a_terminal_does_not_replace_the_password_silently() {
     let root = host_root("password-silent");
