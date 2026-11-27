@@ -840,8 +840,8 @@ async fn a_datagram_capsule_without_a_context_id_is_a_malformed_message() {
 
     // Type DATAGRAM, length 0: the value holds no Context ID.
     let mut wire = bytes::BytesMut::new();
-    datagram::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
-    datagram::put_varint(&mut wire, 0);
+    varint::put_varint(&mut wire, capsule::CAPSULE_TYPE_DATAGRAM);
+    varint::put_varint(&mut wire, 0);
     stream
         .send_data(wire.freeze())
         .await
