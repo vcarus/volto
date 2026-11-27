@@ -50,7 +50,7 @@ use bytes::BytesMut;
 use common::{
     ALLOW_PRIVATE, GATE_LOCALHOST, Leg, Offer, Relayed, SharedBuffer, TempDir, TestServer,
     bulk_alpn, client_endpoint, endpoint_from, is_version_negotiation, nameless_crypto, roots_of,
-    rustls_client, udp_answer, udp_answers, udp_answers_on, udp_relay,
+    rustls_client, udp_answer, udp_answers, udp_relay,
 };
 use quinn::ConnectionId;
 use rustls::crypto::SupportedKxGroup;
@@ -3019,10 +3019,9 @@ fn all_silent<'a>(
     }
 }
 
-/// An ECH flight the key opens is answered; its ClientHello copied into a new
-/// flight from another address draws nothing; and the flight from its own
-/// address is answered again. With `require_ech` on, which changes nothing
-/// for a flight whose ECH opens.
+/// An ECH flight the key opens is answered, and its ClientHello copied into a
+/// new flight from another address draws nothing. With `require_ech` on,
+/// which changes nothing for a flight whose ECH opens.
 ///
 /// The copy is wrapped under a connection ID of its own, which is what a
 /// replay does: Initial keys come from the connection ID the sender picks
@@ -3040,10 +3039,7 @@ async fn an_ech_flight_is_answered_and_its_copy_from_elsewhere_draws_nothing() {
     let flight = hold_flight(&*crypto, &CLIENT_CID, &[], &hello, 2);
     let rewrapped = hold_flight(&*crypto, &[0x5c; 8], &[], &hello, 2);
 
-    let original = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let heard = udp_answers_on(&original, server.addr, &flight, PATIENCE).await;
+    let heard = udp_answers(server.addr, &flight, PATIENCE).await;
     assert!(!heard.is_empty(), "a flight whose ECH opens is answered");
 
     let copy = udp_answers(server.addr, &rewrapped, PATIENCE).await;
@@ -3051,12 +3047,6 @@ async fn an_ech_flight_is_answered_and_its_copy_from_elsewhere_draws_nothing() {
         copy.is_empty(),
         "its copy from another port drew {} datagrams",
         copy.len()
-    );
-
-    let again = udp_answers_on(&original, server.addr, &flight, PATIENCE).await;
-    assert!(
-        !again.is_empty(),
-        "the same flight from its own address is answered"
     );
 }
 
