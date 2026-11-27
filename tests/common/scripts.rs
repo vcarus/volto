@@ -21,9 +21,11 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// The root of the checkout, wherever cargo ran from.
 ///
@@ -279,6 +281,94 @@ pub fn stdout_of(output: &Output) -> String {
 /// A process's standard error as text, with anything invalid replaced.
 pub fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// How long one run of a script may take before [`run_within_deadline`] kills
+/// it. The slowest run in these tests, a full install with its sleeps, takes a
+/// few seconds.
+pub const SCRIPT_DEADLINE: Duration = Duration::from_secs(120);
+
+/// [`run_within`] with [`SCRIPT_DEADLINE`].
+pub fn run_within_deadline(command: &mut Command) -> Output {
+    run_within(command, SCRIPT_DEADLINE)
+}
+
+/// Runs `command` to its end, as [`Command::output`] does, and kills it and
+/// panics when it is still running after `limit`.
+///
+/// A script that loops, or waits on a `read`, would otherwise hold the test
+/// binary until CI's job timeout, and forever on the dev host. Standard input
+/// is the caller's to set: the runners give it a null stdin, as
+/// [`Command::output`] does, or a file to pipe the script from.
+pub fn run_within(command: &mut Command, limit: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("{command:?} must be runnable: {error}"));
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+
+    let deadline = Instant::now() + limit;
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's status must be readable") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{command:?} was still running after {limit:?}, so it was killed");
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: stdout.join().expect("the stdout reader must not panic"),
+        stderr: stderr.join().expect("the stderr reader must not panic"),
+    }
+}
+
+/// The body of the shell function `name` in `script` (a path under the
+/// checkout), from its first line to the line before the closing brace at
+/// column zero. A caller appends the brace.
+///
+/// The braces bound the function, so a test runs exactly that function and
+/// none of the script around it.
+pub fn shell_function_body(script: &str, name: &str) -> String {
+    let text = read_text(&repo_root().join(script));
+    let start = text
+        .find(&format!("\n{name}() {{"))
+        .unwrap_or_else(|| panic!("{script} carries no `{name}()` function"));
+    let rest = &text[start + 1..];
+    let end = rest
+        .find("\n}")
+        .unwrap_or_else(|| panic!("`{name}()` in {script} is never closed"));
+    rest[..end].to_owned()
+}
+
+/// The first executable called `name` on the inherited `PATH`.
+///
+/// Resolved from the test's own `PATH`, before any stand-in goes in front of
+/// it, so a stand-in can hand its arguments to the real tool by absolute path.
+pub fn real_tool(name: &str) -> PathBuf {
+    try_real_tool(name).unwrap_or_else(|| panic!("no {name} on PATH"))
+}
+
+/// [`real_tool`], or `None` when the host has no such tool.
+pub fn try_real_tool(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").expect("PATH must be set");
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// A scratch directory tree, removed when this value is dropped on a green run

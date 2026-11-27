@@ -30,14 +30,46 @@ mod scripts;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 use scripts::{
     Scratch, loadable_config_text, path_with_stubs, plant_binary_without_the_flag,
-    plant_placeholder_certificates, real_binary, repo_root, scratch_tree, stderr_of, stdout_of,
-    write_executable,
+    plant_placeholder_certificates, real_binary, real_tool, repo_root, run_within_deadline,
+    scratch_tree, stderr_of, stdout_of, try_real_tool, write_executable,
 };
 use volto::config::{Config, EXAMPLE_PLACEHOLDER_PASSWORD};
+
+/// The installer in the checkout.
+fn installer_script() -> PathBuf {
+    repo_root().join("script/install-selfsigned.sh")
+}
+
+/// `bash script`, run from the checkout with a null stdin and without any
+/// variable the installer reads from its environment.
+///
+/// The installer takes `BINARY`, `SNI`, `PORT`, `USERNAME` and `PASSWORD` from
+/// the environment, and `VOLTO_INSTALL_ROOT` relocates it, so a shell that
+/// exports one of them would change every run. A caller sets what it means.
+fn installer(script: &Path) -> Command {
+    let mut command = Command::new("bash");
+    command
+        .arg(script)
+        .current_dir(repo_root())
+        .stdin(Stdio::null());
+    for variable in [
+        "BINARY",
+        "SNI",
+        "PORT",
+        "USERNAME",
+        "PASSWORD",
+        "VOLTO_INSTALL_ROOT",
+        "RUST_LOG",
+        "JOURNAL_STREAM",
+    ] {
+        command.env_remove(variable);
+    }
+    command
+}
 
 /// A stand-in for the host filesystem the installer writes into, carrying the
 /// certificate and key the generated config names.
@@ -88,21 +120,19 @@ fn plant_script_dir(root: &Path, example_suffix: &str) -> PathBuf {
 /// the config the generator produces and the binary asked about it, and a value
 /// that changes with neither would only be noise in the failure message.
 fn run_check_config(root: &Path, script: &Path, binary: &Path) -> (bool, String, String) {
-    let output = Command::new("bash")
-        .arg(script)
-        .args([
-            "--check-config",
-            "--binary",
-            binary.to_str().expect("a UTF-8 path to the binary"),
-            "-u",
-            "alice",
-            "-w",
-            "correct-horse-battery",
-        ])
-        .current_dir(repo_root())
-        .env("VOLTO_INSTALL_ROOT", root)
-        .output()
-        .expect("the installer script must be runnable");
+    let output = run_within_deadline(
+        installer(script)
+            .args([
+                "--check-config",
+                "--binary",
+                binary.to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+                "-w",
+                "correct-horse-battery",
+            ])
+            .env("VOLTO_INSTALL_ROOT", root),
+    );
 
     (
         output.status.success(),
@@ -114,15 +144,11 @@ fn run_check_config(root: &Path, script: &Path, binary: &Path) -> (bool, String,
 /// Runs `--print-config` with the given arguments, returning its exit status,
 /// standard output and standard error.
 fn print_config(args: &[&str]) -> (bool, String, String) {
-    let script = repo_root().join("script/install-selfsigned.sh");
-
-    let output = Command::new("bash")
-        .arg(&script)
-        .arg("--print-config")
-        .args(args)
-        .current_dir(repo_root())
-        .output()
-        .expect("the installer script must be runnable");
+    let output = run_within_deadline(
+        installer(&installer_script())
+            .arg("--print-config")
+            .args(args),
+    );
 
     let ok = output.status.success();
     let stderr = stderr_of(&output);
@@ -375,17 +401,15 @@ const INSTALLER_TOOLS: &[&str] = &[
 #[test]
 fn the_password_is_on_no_command_line_the_installer_runs() {
     const SECRET: &str = "argv-canary-4f1e9";
-    let script = repo_root().join("script/install-selfsigned.sh");
+    let script = installer_script();
 
     let print_root = scratch_tree("install", "argv-print", &[]);
     let recorders = plant_argv_recorders(&print_root.join("recorders"), None, INSTALLER_TOOLS);
-    let output = Command::new("bash")
-        .arg(&script)
-        .args(["--print-config", "-u", "alice", "-w", SECRET])
-        .current_dir(repo_root())
-        .env("PATH", path_with_stubs(&recorders))
-        .output()
-        .expect("the installer script must be runnable");
+    let output = run_within_deadline(
+        installer(&script)
+            .args(["--print-config", "-u", "alice", "-w", SECRET])
+            .env("PATH", path_with_stubs(&recorders)),
+    );
     assert!(output.status.success(), "{}", stderr_of(&output));
     assert!(
         stdout_of(&output).contains(SECRET),
@@ -404,20 +428,18 @@ fn the_password_is_on_no_command_line_the_installer_runs() {
     );
     let stubs = plant_root_stubs(&root, 0, "active");
     let recorders = plant_argv_recorders(&root.join("recorders"), Some(&stubs), INSTALLER_TOOLS);
-    let output = Command::new("bash")
-        .arg(&script)
-        .args([
-            "--binary",
-            real_binary().to_str().expect("a UTF-8 path to the binary"),
-            "-u",
-            "alice",
-        ])
-        .current_dir(repo_root())
-        .env("VOLTO_INSTALL_ROOT", &root)
-        .env("PASSWORD", SECRET)
-        .env("PATH", path_with_stubs(&recorders))
-        .output()
-        .expect("the installer script must be runnable");
+    let output = run_within_deadline(
+        installer(&script)
+            .args([
+                "--binary",
+                real_binary().to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+            ])
+            .env("VOLTO_INSTALL_ROOT", &root)
+            .env("PASSWORD", SECRET)
+            .env("PATH", path_with_stubs(&recorders)),
+    );
     assert!(output.status.success(), "{}", stderr_of(&output));
     let config = fs::read_to_string(root.join("etc/volto/config.toml"))
         .expect("the install must have written a config");
@@ -526,7 +548,7 @@ fn an_unusable_port_is_refused_before_the_print_and_check_flags() {
 #[test]
 fn the_generated_configuration_is_one_the_binary_can_load() {
     let root = install_root("accepts");
-    let script = repo_root().join("script/install-selfsigned.sh");
+    let script = installer_script();
 
     let (ok, stdout, stderr) = run_check_config(&root, &script, &real_binary());
 
@@ -590,7 +612,7 @@ fn an_example_the_binary_cannot_load_is_refused_in_the_binarys_own_words() {
 #[test]
 fn a_missing_binary_is_refused_with_the_flag_that_points_at_another_one() {
     let root = install_root("no-binary");
-    let script = repo_root().join("script/install-selfsigned.sh");
+    let script = installer_script();
 
     let (ok, stdout, stderr) = run_check_config(&root, &script, &root.join("nowhere/volto"));
 
@@ -705,22 +727,6 @@ fn server_accepts_username(name: &str) -> bool {
     }
 }
 
-/// The first executable called `name` on the inherited `PATH`.
-///
-/// Resolved before the stubs below go in front of it, so a wrapper can hand its
-/// arguments to the real tool by absolute path.
-fn real_tool(name: &str) -> PathBuf {
-    try_real_tool(name).unwrap_or_else(|| panic!("no {name} on PATH"))
-}
-
-/// [`real_tool`], or `None` when the host has no such tool.
-fn try_real_tool(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH").expect("PATH must be set");
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
 /// Writes stand-ins for the commands the install path needs root or a Debian
 /// host for, and an `mv` that fails on its `fail_at`-th call. Returns the
 /// directory to put in front of `PATH`.
@@ -827,7 +833,7 @@ fn plant_root_stubs(root: &Path, fail_at: usize, service_status: &str) -> PathBu
 /// leave the old pair in place too, and would pass for the wrong reason.
 #[test]
 fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
-    let script = repo_root().join("script/install-selfsigned.sh");
+    let script = installer_script();
 
     for fail_at in 1..=4 {
         let root = scratch_tree(
@@ -843,24 +849,22 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
         let binary = plant_binary_without_the_flag(&root, "volto-stub");
         let stubs = plant_root_stubs(&root, fail_at, "active");
 
-        let output = Command::new("bash")
-            .arg(&script)
-            .args([
-                "--force",
-                "--sni",
-                "volto.test",
-                "--binary",
-                binary.to_str().expect("a UTF-8 path to the binary"),
-                "-u",
-                "alice",
-                "-w",
-                "correct-horse-battery",
-            ])
-            .current_dir(repo_root())
-            .env("VOLTO_INSTALL_ROOT", &root)
-            .env("PATH", path_with_stubs(&stubs))
-            .output()
-            .expect("the installer script must be runnable");
+        let output = run_within_deadline(
+            installer(&script)
+                .args([
+                    "--force",
+                    "--sni",
+                    "volto.test",
+                    "--binary",
+                    binary.to_str().expect("a UTF-8 path to the binary"),
+                    "-u",
+                    "alice",
+                    "-w",
+                    "correct-horse-battery",
+                ])
+                .env("VOLTO_INSTALL_ROOT", &root)
+                .env("PATH", path_with_stubs(&stubs)),
+        );
         let stderr = stderr_of(&output);
 
         assert!(
@@ -919,7 +923,7 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
 /// exit status is the rollback's, not a death by the signal.
 #[test]
 fn a_signal_during_the_certificate_swap_puts_the_previous_pair_back() {
-    let script = repo_root().join("script/install-selfsigned.sh");
+    let script = installer_script();
 
     for (signal_at, signal) in [(1, "TERM"), (2, "HUP"), (3, "INT"), (4, "TERM")] {
         let root = scratch_tree(
@@ -950,24 +954,22 @@ fn a_signal_during_the_certificate_swap_puts_the_previous_pair_back() {
             ),
         );
 
-        let output = Command::new("bash")
-            .arg(&script)
-            .args([
-                "--force",
-                "--sni",
-                "volto.test",
-                "--binary",
-                binary.to_str().expect("a UTF-8 path to the binary"),
-                "-u",
-                "alice",
-                "-w",
-                "correct-horse-battery",
-            ])
-            .current_dir(repo_root())
-            .env("VOLTO_INSTALL_ROOT", &root)
-            .env("PATH", path_with_stubs(&stubs))
-            .output()
-            .expect("the installer script must be runnable");
+        let output = run_within_deadline(
+            installer(&script)
+                .args([
+                    "--force",
+                    "--sni",
+                    "volto.test",
+                    "--binary",
+                    binary.to_str().expect("a UTF-8 path to the binary"),
+                    "-u",
+                    "alice",
+                    "-w",
+                    "correct-horse-battery",
+                ])
+                .env("VOLTO_INSTALL_ROOT", &root)
+                .env("PATH", path_with_stubs(&stubs)),
+        );
         let stderr = stderr_of(&output);
 
         assert_eq!(
@@ -1137,7 +1139,7 @@ fn a_failed_ownership_change_removes_a_new_key_with_no_previous_one() {
 /// The real binary is installed and asked whether it can load the generated
 /// config, so this exercises the generator, the certificate, the unit install
 /// and the service check as one run.
-fn run_full_install(root: &Path, service_status: &str) -> std::process::Output {
+fn run_full_install(root: &Path, service_status: &str) -> Output {
     let stubs = plant_root_stubs(root, 0, service_status);
     run_full_install_with_stubs(root, &stubs, &[])
 }
@@ -1148,25 +1150,21 @@ fn run_full_install_with_stubs(
     root: &Path,
     stubs: &Path,
     extra_args: &[&str],
-) -> std::process::Output {
-    let script = repo_root().join("script/install-selfsigned.sh");
-
-    Command::new("bash")
-        .arg(&script)
-        .args([
-            "--binary",
-            real_binary().to_str().expect("a UTF-8 path to the binary"),
-            "-u",
-            "alice",
-            "-w",
-            "correct-horse-battery",
-        ])
-        .args(extra_args)
-        .current_dir(repo_root())
-        .env("VOLTO_INSTALL_ROOT", root)
-        .env("PATH", path_with_stubs(stubs))
-        .output()
-        .expect("the installer script must be runnable")
+) -> Output {
+    run_within_deadline(
+        installer(&installer_script())
+            .args([
+                "--binary",
+                real_binary().to_str().expect("a UTF-8 path to the binary"),
+                "-u",
+                "alice",
+                "-w",
+                "correct-horse-battery",
+            ])
+            .args(extra_args)
+            .env("VOLTO_INSTALL_ROOT", root)
+            .env("PATH", path_with_stubs(stubs)),
+    )
 }
 
 /// A service that failed to start must turn the install into a failure.
@@ -1982,21 +1980,18 @@ fn the_generated_certificate_asserts_only_digital_signature() {
 
 /// Runs the full install path with no password given, so the installer
 /// generates one, with stdout a pipe as under the update timer.
-fn run_install_generating_the_password(root: &Path, stubs: &Path) -> std::process::Output {
-    Command::new("bash")
-        .arg(repo_root().join("script/install-selfsigned.sh"))
-        .args([
-            "--binary",
-            real_binary().to_str().expect("a UTF-8 path to the binary"),
-            "--sni",
-            "volto.test",
-        ])
-        .current_dir(repo_root())
-        .env("VOLTO_INSTALL_ROOT", root)
-        .env("PATH", path_with_stubs(stubs))
-        .env_remove("PASSWORD")
-        .output()
-        .expect("the installer script must be runnable")
+fn run_install_generating_the_password(root: &Path, stubs: &Path) -> Output {
+    run_within_deadline(
+        installer(&installer_script())
+            .args([
+                "--binary",
+                real_binary().to_str().expect("a UTF-8 path to the binary"),
+                "--sni",
+                "volto.test",
+            ])
+            .env("VOLTO_INSTALL_ROOT", root)
+            .env("PATH", path_with_stubs(stubs)),
+    )
 }
 
 /// A generated password is printed only to a terminal (R8-L10).
@@ -2119,15 +2114,33 @@ fn an_unreadable_certificate_still_prints_the_report() {
     );
 }
 
+/// A run that does not end is killed at its deadline and fails the test,
+/// rather than holding the test binary. Every runner here goes through
+/// [`run_within_deadline`], which is this with a longer limit.
+#[test]
+fn a_run_that_does_not_end_is_killed_at_its_deadline() {
+    let started = std::time::Instant::now();
+    let outcome = std::panic::catch_unwind(|| {
+        scripts::run_within(
+            Command::new("bash")
+                .args(["-c", "while :; do :; done"])
+                .stdin(Stdio::null()),
+            std::time::Duration::from_secs(1),
+        )
+    });
+    let message = outcome
+        .expect_err("a run past its deadline must panic")
+        .downcast::<String>()
+        .map(|message| *message)
+        .unwrap_or_default();
+    assert!(message.contains("was still running after 1s"), "{message}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
 /// `-h` must work and describe the safety-relevant flags.
 #[test]
 fn the_script_documents_itself() {
-    let script = repo_root().join("script/install-selfsigned.sh");
-    let output = Command::new("bash")
-        .arg(&script)
-        .arg("-h")
-        .output()
-        .expect("the script must run");
+    let output = run_within_deadline(installer(&installer_script()).arg("-h"));
 
     assert!(output.status.success());
     let usage = stdout_of(&output);
