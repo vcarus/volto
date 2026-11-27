@@ -956,9 +956,7 @@ async fn headers_buffered_across_a_connection_are_bounded() {
     // asserted.
     let mut streams = Vec::new();
     for _ in 0..streams_past_the_budget() {
-        streams.push(
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
-        );
+        streams.push(announce_full_sized_headers(&connection).await);
     }
     let mut batch = collect_refusals(streams, streams_past_the_budget());
 

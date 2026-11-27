@@ -385,8 +385,8 @@ pub async fn open_uni_stream(
     stream
 }
 
-/// Opens a request stream, announces a HEADERS frame of `declared` bytes and
-/// sends one byte of it.
+/// Opens a request stream, announces a HEADERS frame of
+/// `volto::h3::MAX_FIELD_SECTION_SIZE` bytes and sends one byte of it.
 ///
 /// One byte rather than none so the stream is genuinely mid-frame rather than
 /// merely announced, and both halves are handed back rather than dropped:
@@ -395,24 +395,18 @@ pub async fn open_uni_stream(
 /// these open depend on both of those, because a finished stream gives its share
 /// of the buffering budget back.
 ///
-/// `declared` is a parameter rather than `volto::h3::MAX_FIELD_SECTION_SIZE`
-/// written in here, so the number a test drives the server to remains at the
-/// test, which is where the arithmetic around it is argued. Both callers pass
-/// exactly the maximum today.
-///
 /// The write is expected to succeed, which is what tells this apart from
 /// `it_hostile::announce_frame`: that one sends a frame header alone, of any
 /// type, and tolerates a write failing because the connection going away is one
 /// of the answers it waits for.
 pub async fn announce_full_sized_headers(
     connection: &quinn::Connection,
-    declared: u64,
 ) -> (quinn::SendStream, quinn::RecvStream) {
     let (mut send, recv) = connection.open_bi().await.expect("open a request stream");
 
     let mut announcement = BytesMut::new();
     varint::put_varint(&mut announcement, FRAME_HEADERS);
-    varint::put_varint(&mut announcement, declared);
+    varint::put_varint(&mut announcement, volto::h3::MAX_FIELD_SECTION_SIZE);
     announcement.extend_from_slice(b"\x00");
     send.write_all(&announcement)
         .await

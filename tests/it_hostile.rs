@@ -849,9 +849,7 @@ async fn the_control_stream_does_not_share_the_request_buffering_budget() {
 
     let mut streams = Vec::new();
     for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-        streams.push(
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
-        );
+        streams.push(announce_full_sized_headers(&connection).await);
     }
     // The batch holds the sending halves for the rest of the test, which is what
     // keeps the budget full while the control stream is judged.
@@ -1020,9 +1018,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
     for _ in 0..ROUNDS {
         let mut streams = Vec::new();
         for _ in 0..=FULL_SIZED_FRAMES_THAT_FIT {
-            streams.push(
-                announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
-            );
+            streams.push(announce_full_sized_headers(&connection).await);
         }
         let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT + 1);
 
@@ -1047,9 +1043,7 @@ async fn a_storm_of_reset_requests_leaves_the_budget_where_it_was() {
     // refused, and a leaked charge is what would refuse one.
     let mut streams = Vec::new();
     for _ in 0..FULL_SIZED_FRAMES_THAT_FIT {
-        streams.push(
-            announce_full_sized_headers(&connection, volto::h3::MAX_FIELD_SECTION_SIZE).await,
-        );
+        streams.push(announce_full_sized_headers(&connection).await);
     }
     let mut batch = collect_refusals(streams, FULL_SIZED_FRAMES_THAT_FIT);
 
