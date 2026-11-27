@@ -83,6 +83,16 @@ fn install_root(name: &str) -> Scratch {
     root
 }
 
+/// A stand-in for a host before its first install: the directories the
+/// installer writes into, under a scratch tree of this test's own.
+fn host_root(name: &str) -> Scratch {
+    scratch_tree(
+        "install",
+        name,
+        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
+    )
+}
+
 /// Copies the four sibling deployment assets into `root/script` and appends
 /// `example_suffix` to the example config, returning the installer's new path.
 ///
@@ -276,42 +286,21 @@ fn the_shipped_config_seeds_a_long_haul_initial_rtt() {
     assert_eq!(volto::config::DEFAULT_INITIAL_RTT_MS, 333);
 }
 
-/// A hand-picked password full of regular-expression metacharacters must reach
-/// the config unchanged.
+/// Credentials full of characters that mean something to a regular expression,
+/// to `sed` or to a shell must reach the config unchanged.
 ///
 /// The generated default is base64, so only an operator who chooses their own
-/// password ever exercises this — and every one of these characters is ordinary
-/// in a password. `*` is the one that used to matter most: the config came out
-/// perfectly correct, and then the script's own verification, a basic regular
-/// expression, failed to find the line it had just written and aborted the
-/// install with "failed to set the user in the config".
+/// credentials ever exercises this, and every one of these characters is
+/// ordinary in a password. `generate_config` writes each value with `printf`
+/// as data, and `verify_config` must then find the line it just wrote as text,
+/// not as a pattern: `*` is the character that would break a pattern match.
 #[test]
-fn a_password_full_of_metacharacters_survives_verbatim() {
-    for password in ["Pa*ss.w0rd", "a+b.c*d", "^start$", "[brackets]"] {
-        let text = generated_config(&["-u", "alice", "-w", password]);
-        let config: Config = toml::from_str(&text).unwrap_or_else(|error| {
-            panic!("{password} produced a config volto cannot parse: {error}\n{text}")
-        });
-
-        assert_eq!(config.auth.users.len(), 1, "{text}");
-        assert_eq!(config.auth.users[0].username, "alice");
-        assert_eq!(
-            config.auth.users[0].password, password,
-            "the password must reach the config verbatim:\n{text}"
-        );
-    }
-}
-
-/// `|` and `&` reach the config exactly as given, in the username and in the
-/// password (R8-M1, R8-D2).
-///
-/// They were refused while the config was written by `sed`, where `|` was the
-/// delimiter of the substitution and `&` expanded to the matched line. The
-/// config is now written with `printf`, which takes a value as data, so both
-/// are ordinary characters.
-#[test]
-fn credentials_with_a_pipe_or_an_ampersand_reach_the_config_verbatim() {
+fn credentials_with_metacharacters_reach_the_config_verbatim() {
     for (username, password) in [
+        ("alice", "Pa*ss.w0rd"),
+        ("alice", "a+b.c*d"),
+        ("alice", "^start$"),
+        ("alice", "[brackets]"),
         ("a|b", "hunter2"),
         ("p&ul", "hunter2"),
         ("alice", "a|b|c"),
@@ -413,11 +402,7 @@ fn record_missing_commands<'a>(command: &'a mut Command, log: &Path) -> &'a mut 
 #[test]
 fn the_password_is_on_no_command_line_the_installer_runs() {
     const SECRET: &str = "argv-canary-4f1e9";
-    let root = scratch_tree(
-        "install",
-        "argv",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("argv");
     let stubs = plant_root_stubs(&root, 0, "active");
     // An active firewall, so the run takes the branch that opens the port.
     write_executable(
@@ -1001,13 +986,7 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
             key.display()
         );
 
-        let mut leftovers: Vec<String> = fs::read_dir(&conf_dir)
-            .expect("the configuration directory must be readable")
-            .map(|entry| entry.expect("directory entry").file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
-            .collect();
-        leftovers.sort();
+        let leftovers = backup_leftovers(&conf_dir);
         assert!(
             leftovers.is_empty(),
             "after a failure at rename {fail_at} no new or backup file may stay behind, found {leftovers:?}: {stderr}"
@@ -1017,6 +996,18 @@ fn a_certificate_swap_that_fails_partway_puts_the_previous_pair_back() {
             "the run must say the swap failed: {stderr}"
         );
     }
+}
+
+/// The new and backup files of a certificate swap left in `dir`, sorted.
+fn backup_leftovers(dir: &Path) -> Vec<String> {
+    let mut leftovers: Vec<String> = fs::read_dir(dir)
+        .expect("the configuration directory must be readable")
+        .map(|entry| entry.expect("directory entry").file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
+        .collect();
+    leftovers.sort();
+    leftovers
 }
 
 /// A signal during the certificate swap puts the previous pair back, as a
@@ -1093,12 +1084,7 @@ fn a_signal_during_the_certificate_swap_puts_the_previous_pair_back() {
             Some(old_key),
             "after SIG{signal} at rename {signal_at} the old key must be back: {stderr}"
         );
-        let leftovers: Vec<String> = fs::read_dir(&conf_dir)
-            .expect("the configuration directory must be readable")
-            .map(|entry| entry.expect("directory entry").file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
-            .collect();
+        let leftovers = backup_leftovers(&conf_dir);
         assert!(
             leftovers.is_empty(),
             "after SIG{signal} at rename {signal_at} no new or backup file may stay, found {leftovers:?}: {stderr}"
@@ -1124,11 +1110,7 @@ const CHOWN_FAILS_ON_THE_PAIR: &str =
 /// fails. The transaction now covers ownership and mode.
 #[test]
 fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
-    let root = scratch_tree(
-        "install",
-        "chown-fails",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("chown-fails");
     let conf_dir = root.join("etc/volto");
     let (cert, key) = plant_placeholder_certificates(&conf_dir);
     let old_cert = fs::read(&cert).expect("the old certificate must be readable");
@@ -1161,13 +1143,7 @@ fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
         key.display()
     );
 
-    let mut leftovers: Vec<String> = fs::read_dir(&conf_dir)
-        .expect("the configuration directory must be readable")
-        .map(|entry| entry.expect("directory entry").file_name())
-        .map(|name| name.to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".new") || name.ends_with(".bak"))
-        .collect();
-    leftovers.sort();
+    let leftovers = backup_leftovers(&conf_dir);
     assert!(
         leftovers.is_empty(),
         "after a failed chown no new or backup file may stay behind, found {leftovers:?}: {stderr}"
@@ -1185,11 +1161,7 @@ fn a_failed_ownership_change_restores_the_previous_certificate_pair() {
 #[test]
 fn a_failed_ownership_change_removes_a_new_key_with_no_previous_one() {
     for (name, plant_cert) in [("chown-fails-first", false), ("chown-fails-no-key", true)] {
-        let root = scratch_tree(
-            "install",
-            name,
-            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-        );
+        let root = host_root(name);
         let conf_dir = root.join("etc/volto");
         let cert = conf_dir.join("cert.pem");
         let key = conf_dir.join("key.pem");
@@ -1278,11 +1250,7 @@ fn run_full_install_with_stubs(root: &Path, stubs: &Path, extra_args: &[&str]) -
 /// fingerprint and the policy line before the refusal.
 #[test]
 fn an_install_whose_service_failed_is_not_reported_as_success() {
-    let root = scratch_tree(
-        "install",
-        "service-failed",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("service-failed");
 
     let output = run_full_install(&root, "failed");
 
@@ -1313,11 +1281,7 @@ fn an_install_whose_service_failed_is_not_reported_as_success() {
 /// got neither the fingerprint nor the policy line.
 #[test]
 fn a_first_install_whose_start_fails_still_prints_the_report() {
-    let root = scratch_tree(
-        "install",
-        "start-fails",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("start-fails");
     let stubs = plant_root_stubs(&root, 0, "failed");
     write_executable(
         &stubs.join("systemctl"),
@@ -1355,11 +1319,7 @@ fn a_first_install_whose_start_fails_still_prints_the_report() {
 /// binary and the unit installed and the service enabled before it starts.
 #[test]
 fn an_install_whose_service_is_active_reports_success() {
-    let root = scratch_tree(
-        "install",
-        "service-active",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("service-active");
     let stubs = plant_root_stubs(&root, 0, "active");
 
     let output = run_full_install_with_stubs(&root, &stubs, &[]);
@@ -1391,11 +1351,7 @@ fn an_install_whose_service_is_active_reports_success() {
 /// `body` appended, its certificate pair, an installed binary that reports an
 /// old version, and an installed unit.
 fn configured_root(name: &str, body: &str) -> Scratch {
-    let root = scratch_tree(
-        "install",
-        name,
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root(name);
     let dir = root.join("etc/volto");
     let (cert, key) = plant_placeholder_certificates(&dir);
     fs::write(
@@ -1614,12 +1570,10 @@ fn replacing_the_binary_keeps_the_previous_one_and_restarts() {
     );
 }
 
-/// A failed restart after `--replace-binary` puts the previous binary and unit
-/// back and starts the service on them.
-#[test]
-fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
-    let root = configured_root("replace-rollback", "");
-    let stubs = plant_root_stubs(&root, 0, "active");
+/// Replaces the stand-in `systemctl` in `stubs` with one whose `restart volto`
+/// fails and whose `is-active volto` prints `active`. It records every call in
+/// `systemctl.log`, `show` included, and succeeds otherwise.
+fn restart_fails(stubs: &Path) {
     write_executable(
         &stubs.join("systemctl"),
         &format!(
@@ -1633,6 +1587,15 @@ fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
             stubs.join("systemctl.log").display()
         ),
     );
+}
+
+/// A failed restart after `--replace-binary` puts the previous binary and unit
+/// back and starts the service on them.
+#[test]
+fn a_replaced_binary_that_fails_to_restart_is_rolled_back() {
+    let root = configured_root("replace-rollback", "");
+    let stubs = plant_root_stubs(&root, 0, "active");
+    restart_fails(&stubs);
 
     let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
 
@@ -1676,11 +1639,7 @@ fn the_unit_is_replaced_by_a_rename() {
         let root = if rollback {
             configured_root(name, "")
         } else {
-            scratch_tree(
-                "install",
-                name,
-                &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-            )
+            host_root(name)
         };
         let stubs = plant_root_stubs(&root, 0, "active");
         write_executable(
@@ -1849,19 +1808,7 @@ fn a_rollback_without_a_previous_binary_leaves_the_new_pair() {
     )
     .expect("the installed binary's mode must be settable");
     let stubs = plant_root_stubs(&root, 0, "active");
-    write_executable(
-        &stubs.join("systemctl"),
-        &format!(
-            "#!/bin/sh\n\
-             printf '%s\\n' \"$*\" >> '{}'\n\
-             case \"$*\" in\n\
-             \x20 'restart volto') exit 1 ;;\n\
-             \x20 'is-active volto') echo active ;;\n\
-             esac\n\
-             exit 0\n",
-            stubs.join("systemctl.log").display()
-        ),
-    );
+    restart_fails(&stubs);
 
     let output = run_full_install_with_stubs(&root, &stubs, &["--replace-binary"]);
 
@@ -1898,11 +1845,7 @@ fn a_rollback_without_a_previous_binary_leaves_the_new_pair() {
 /// record what they were asked, since this host has no `volto` group.
 #[test]
 fn a_first_install_writes_the_root_owned_layout() {
-    let root = scratch_tree(
-        "install",
-        "layout",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("layout");
     let stubs = plant_root_stubs(&root, 0, "active");
 
     let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
@@ -2028,11 +1971,7 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
         long_label.as_str(),
         too_long.as_str(),
     ] {
-        let root = scratch_tree(
-            "install",
-            "bad-sni",
-            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-        );
+        let root = host_root("bad-sni");
         let stubs = plant_root_stubs(&root, 0, "active");
         let output = run_full_install_with_stubs(&root, &stubs, &["--sni", name]);
 
@@ -2053,11 +1992,7 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
     }
 
     for name in ["volto.test", "a-b.example", "x", "A1.example.org"] {
-        let root = scratch_tree(
-            "install",
-            "good-sni",
-            &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-        );
+        let root = host_root("good-sni");
         let stubs = plant_root_stubs(&root, 0, "active");
         let output = run_full_install_with_stubs(&root, &stubs, &["--sni", name]);
         assert!(output.status.success(), "{name:?}: {}", stderr_of(&output));
@@ -2072,11 +2007,7 @@ fn a_certificate_name_that_is_not_a_host_name_is_refused() {
 /// transport bit, which a P-256 key cannot perform.
 #[test]
 fn the_generated_certificate_asserts_only_digital_signature() {
-    let root = scratch_tree(
-        "install",
-        "key-usage",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("key-usage");
     let stubs = plant_root_stubs(&root, 0, "active");
     let output = run_full_install_with_stubs(&root, &stubs, &["--sni", "volto.test"]);
     assert!(output.status.success(), "{}", stderr_of(&output));
@@ -2121,11 +2052,7 @@ fn run_install_generating_the_password(root: &Path, stubs: &Path) -> Output {
 /// in place of the password.
 #[test]
 fn a_generated_password_is_printed_only_to_a_terminal() {
-    let root = scratch_tree(
-        "install",
-        "password-pipe",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("password-pipe");
     let stubs = plant_root_stubs(&root, 0, "active");
 
     let output = run_install_generating_the_password(&root, &stubs);
@@ -2157,11 +2084,7 @@ fn a_generated_password_is_printed_only_to_a_terminal() {
 /// given it goes ahead.
 #[test]
 fn a_run_without_a_terminal_does_not_replace_the_password_silently() {
-    let root = scratch_tree(
-        "install",
-        "password-silent",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("password-silent");
     write_executable(&root.join("usr/local/bin/volto"), OLD_BINARY);
     let stubs = plant_root_stubs(&root, 0, "active");
 
@@ -2206,11 +2129,7 @@ fn a_run_without_a_terminal_does_not_replace_the_password_silently() {
 /// pinned fingerprint has just gone stale. The report is the point of a re-run.
 #[test]
 fn an_unreadable_certificate_still_prints_the_report() {
-    let root = scratch_tree(
-        "install",
-        "corrupt-certificate",
-        &["etc/volto", "usr/local/bin", "etc/systemd/system"],
-    );
+    let root = host_root("corrupt-certificate");
     let conf_dir = root.join("etc/volto");
     fs::write(conf_dir.join("cert.pem"), "not a certificate\n").expect("cert must be writable");
     fs::write(conf_dir.join("key.pem"), "not a key\n").expect("key must be writable");
