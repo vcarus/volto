@@ -618,6 +618,11 @@ impl Drop for H3Client {
         if !std::thread::panicking() {
             self.send.peer.check();
         }
+        // Closed before `_streams` drops: a dropped `quinn::SendStream`
+        // finishes, and a control stream finished on a live connection is
+        // H3_CLOSED_CRITICAL_STREAM (RFC 9114 §6.2.1). Code 0 is the plain
+        // ending [`abandon`] also uses.
+        self.quic.close(quinn::VarInt::from_u32(0), b"");
         self.driver.abort();
     }
 }

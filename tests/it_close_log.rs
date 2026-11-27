@@ -329,6 +329,26 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         );
     }
 
+    // 7b. A client that is dropped after a request ends as scenario 2 does. The
+    //     drop finishes the client's control stream, so the test client has to
+    //     close the connection first, or the server would rightly close it with
+    //     H3_CLOSED_CRITICAL_STREAM and warn.
+    {
+        let mark = buffer.mark();
+        let mut client = H3Client::connect(&server).await;
+        let mut tunnel = open_tcp_tunnel(&mut client, &echo.to_string()).await;
+        echoes(&mut tunnel, b"payload").await;
+        drop(tunnel);
+        drop(client);
+
+        buffer
+            .wait_for_line(
+                mark,
+                &[" INFO ", "connection closed", "reason=\"peer_close\""],
+            )
+            .await;
+    }
+
     // 8. The server shuts down: GOAWAY goes out, there is nothing to drain, and
     //    the accept loop returns `Ok(())` on its own terms rather than through an
     //    error. Last, because it stops the server.
@@ -365,8 +385,8 @@ async fn close_logs_are_graded_by_how_the_connection_ended() {
         .collect();
     assert_eq!(
         closes.len(),
-        7,
-        "six of the eight ways to end are routine, and scenario 2b ends as \
+        8,
+        "six of the eight ways to end are routine, and scenarios 2b and 7b end as \
          scenario 2 does; log was:\n{logged}"
     );
     for line in &closes {
