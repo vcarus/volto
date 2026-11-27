@@ -739,13 +739,12 @@ pub fn client_endpoint_with_transport(
 
 /// Transport parameters for a peer that leaves no room for an answer.
 ///
-/// 24 bytes of connection-level allowance is over the 19-byte SETTINGS frame
-/// the handshake needs and under what the handshake plus any response costs. A
-/// short response would fit in any per-stream window big enough for that
-/// SETTINGS frame, so what has to be exhausted is the *connection* window:
-/// nothing in a test reaching for this reads the server's control stream, so
-/// those 19 bytes stay charged to that window and leave less than a response
-/// behind them.
+/// 24 bytes of connection-level allowance. The server's control stream takes
+/// 19 of them (its type byte and an 18-byte SETTINGS frame), and its two QPACK
+/// streams take one type byte each, so 3 are left, less than any response.
+/// Nothing that uses this reads the server's unidirectional streams, so those
+/// 21 bytes are never credited back. One more SETTINGS pair would leave no
+/// room for the QPACK stream types.
 ///
 /// The keep-alive is what makes such a test about the application's deadline:
 /// with it, the transport's own idle timeout can never be the thing that ends
