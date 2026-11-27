@@ -1388,6 +1388,10 @@ async fn judge(
     }
 }
 
+/// One poll on a no-op waker, for the tests of other modules.
+#[cfg(test)]
+pub(crate) use tests::poll_once;
+
 #[cfg(test)]
 mod tests {
     use super::*;

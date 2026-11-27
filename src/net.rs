@@ -334,17 +334,11 @@ pub const RESERVED_LOOKUP_CEILING: usize = 1024;
 /// of these as well as its connection's own slot and gives both back in the
 /// blocking thread, so connection turnover cannot hand out more reserved slots
 /// than the pool has threads for (D90).
-///
-/// Read from `max_connections` once, at startup, like [`blocking_pool_size`],
-/// because it is the pool's number. A `SIGHUP` that changes `max_connections`
-/// changes neither.
 // A `u32` is always a `usize` on both supported targets, and a `const fn` may
 // not call `TryFrom` to say so.
 #[allow(clippy::as_conversions)]
 pub const fn reserved_lookups(max_connections: u32) -> usize {
-    // `0` is "uncapped", so there is nothing to size against and the ceiling is
-    // the answer. Written out rather than as `min` because a `const fn` may not
-    // call `Ord::min`, and this is a constant in the tests that check it.
+    // `0` is "uncapped", so the ceiling is the answer.
     if max_connections == 0 || max_connections as usize > RESERVED_LOOKUP_CEILING {
         RESERVED_LOOKUP_CEILING
     } else {
@@ -503,7 +497,7 @@ impl ConnectionResolver {
     ///
     /// `other` is borrowed rather than returned so that it keeps its lookup
     /// when the caller stops waiting for this one, which is what a
-    /// `connect_timeout` that expires does.
+    /// `connect_timeout` that expires does. The caller answers IP literals.
     pub async fn lookup_family(
         &self,
         host: &str,
@@ -511,10 +505,6 @@ impl ConnectionResolver {
         family: Family,
         other: &mut OtherFamily,
     ) -> io::Result<Vec<SocketAddr>> {
-        if let Some(address) = literal(host, port) {
-            return Ok(vec![address]);
-        }
-
         let slot = self.acquire().await;
         let mut lookup = self.system.spawn(host, port, Some(family), slot);
         other.start_if_spare(self);
@@ -667,11 +657,6 @@ impl OtherFamily {
             family,
             state: OtherState::NotStarted,
         }
-    }
-
-    /// The family this lookup asks for.
-    pub fn family(&self) -> Family {
-        self.family
     }
 
     /// Whether the lookup has been started.
@@ -902,7 +887,7 @@ mod tests {
     ///
     /// Nothing here resolves a name. What the rule has to survive is a
     /// connection that never gives its slots back, and that is a resolver no
-    /// test can conjure on demand — a real one always answers eventually. So
+    /// test can conjure on demand: a real one always answers eventually. So
     /// the permits are held directly and the questions asked of them are the
     /// two the design makes: can one connection take everything, and is a
     /// connection that arrives after it has tried still able to resolve
@@ -911,24 +896,11 @@ mod tests {
     mod resolver_budget {
         use super::*;
 
-        use std::task::{Context as TaskContext, Poll};
-
-        /// The value `future` has *without waiting*, or `None` if it would wait.
-        ///
-        /// One poll is the whole question here: an acquire is either satisfied
-        /// from a permit that is free right now or it parks itself in the
-        /// semaphore's queue, and those are exactly the two answers the
-        /// assertions below are about. Dropping the future on `None` releases
-        /// whatever it took on the way, which is what makes a would-wait probe
-        /// safe to repeat.
+        /// The value `future` has *without waiting*, or `None` if it would
+        /// wait. Dropping the future on `None` releases whatever it took on
+        /// the way, which is what makes a would-wait probe safe to repeat.
         fn ready<F: Future>(future: F) -> Option<F::Output> {
-            let mut future = Box::pin(future);
-            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
-
-            match future.as_mut().poll(&mut cx) {
-                Poll::Ready(value) => Some(value),
-                Poll::Pending => None,
-            }
+            crate::tunnel::poll_once(std::pin::pin!(future))
         }
 
         /// Holds `count` lookup slots on `resolver`, asserting it could.
@@ -959,25 +931,13 @@ mod tests {
         ///
         /// The shared allowance is drained by connections that never let go,
         /// which is what a client aiming at black-holed names does to the
-        /// blocking pool. A connection arriving after that still resolves —
+        /// blocking pool. A connection arriving after that still resolves,
         /// serially, on the slot that was never theirs to take.
         #[test]
         fn a_new_connection_still_has_a_slot_when_the_shared_allowance_is_gone() {
             let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
 
-            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
-                .map(|_| budget.per_connection())
-                .collect();
-            let _held: Vec<_> = hostile
-                .iter()
-                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
-                .collect();
-
-            assert_eq!(
-                budget.shared.available_permits(),
-                0,
-                "the shared allowance was not actually exhausted"
-            );
+            let _held = drain_shared(&budget);
 
             let victim = budget.per_connection();
             let slot = ready(victim.acquire());
@@ -995,20 +955,14 @@ mod tests {
         ///
         /// The case an entry-time check alone cannot cover: during an attack
         /// the shared allowance never comes back, and a connection's second
-        /// concurrent lookup parks while its first — on the reserved slot —
+        /// concurrent lookup parks while its first, on the reserved slot,
         /// finishes in milliseconds. "Serial at worst" means the parked lookup
         /// runs then, on the slot its own connection just freed, not that it
         /// waits out `connect_timeout` beside an idle slot.
         #[test]
         fn a_parked_lookup_takes_the_reserved_slot_when_it_frees() {
             let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
-            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
-                .map(|_| budget.per_connection())
-                .collect();
-            let _held: Vec<_> = hostile
-                .iter()
-                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
-                .collect();
+            let _held = drain_shared(&budget);
             assert_eq!(
                 budget.shared.available_permits(),
                 0,
@@ -1019,15 +973,14 @@ mod tests {
             let first = ready(victim.acquire()).expect("the reserved slot starts free");
 
             let mut second = Box::pin(victim.acquire());
-            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
             assert!(
-                second.as_mut().poll(&mut cx).is_pending(),
+                crate::tunnel::poll_once(second.as_mut()).is_none(),
                 "a second lookup had a slot with the allowance gone and the reserved slot held"
             );
 
             drop(first);
             assert!(
-                second.as_mut().poll(&mut cx).is_ready(),
+                crate::tunnel::poll_once(second.as_mut()).is_some(),
                 "a parked lookup did not take the reserved slot its own connection freed"
             );
         }
@@ -1057,7 +1010,7 @@ mod tests {
         /// Asserted without a runtime at all: [`System::spawn`] would
         /// reach the blocking pool, and reaching it from here panics. So a literal
         /// answered by a single poll is a literal that never went near a
-        /// thread — with every slot this connection has already held.
+        /// thread, with every slot this connection has already held.
         #[test]
         fn an_ip_literal_needs_no_slot() {
             let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
@@ -1078,9 +1031,9 @@ mod tests {
         /// a test of its own: on a live migration every `connect_timeout` in
         /// the process expires in the same instant, so every parked
         /// [`ConnectionResolver::acquire`] is dropped together rather than one
-        /// at a time. A parked one is not empty-handed — it holds a burst
+        /// at a time. A parked one is not empty-handed: it holds a burst
         /// permit while it queues on the shared allowance, and it is
-        /// simultaneously queued on the reserved slot — so a drop that gave
+        /// simultaneously queued on the reserved slot. So a drop that gave
         /// back only part of that would erode the budget one mass expiry at a
         /// time until no connection could resolve anything.
         ///
@@ -1092,27 +1045,19 @@ mod tests {
             let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
 
             // The shared allowance gone, the way an attack leaves it.
-            let hostile: Vec<_> = (0..SHARED_LOOKUPS.div_ceil(BURST_LOOKUPS))
-                .map(|_| budget.per_connection())
-                .collect();
-            let _held: Vec<_> = hostile
-                .iter()
-                .map(|resolver| hold(resolver, BURST_LOOKUPS + 1))
-                .collect();
-            assert_eq!(budget.shared.available_permits(), 0);
+            let _held = drain_shared(&budget);
 
             let victim = budget.per_connection();
             // The reserved slot is taken, so everything below has to queue.
             let reserved = ready(victim.acquire()).expect("the reserved slot starts free");
             assert_eq!(victim.burst.available_permits(), BURST_LOOKUPS);
 
-            let mut cx = TaskContext::from_waker(std::task::Waker::noop());
             let mut parked: Vec<_> = (0..BURST_LOOKUPS)
                 .map(|_| Box::pin(victim.acquire()))
                 .collect();
             for (nth, lookup) in parked.iter_mut().enumerate() {
                 assert!(
-                    lookup.as_mut().poll(&mut cx).is_pending(),
+                    crate::tunnel::poll_once(lookup.as_mut()).is_none(),
                     "lookup {nth} had a slot with the allowance gone and the reserved slot held"
                 );
             }
@@ -1224,8 +1169,8 @@ mod tests {
             );
         }
 
-        /// The shared allowance, all of it held, the way the hostile
-        /// connections of the tests above leave it. Taken in one call rather
+        /// The shared allowance, all of it held, the way hostile connections
+        /// that never let go leave it. Taken in one call rather
         /// than through [`hold`], because inside a runtime tokio's cooperative
         /// budget makes the hundred and twenty-ninth acquire wait.
         fn drain_shared(budget: &ResolverBudget) -> OwnedSemaphorePermit {
@@ -1441,24 +1386,6 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             panic!("the slot did not come back when the lookup returned");
-        }
-
-        /// An IP literal of either family is answered with no lookup at all.
-        #[tokio::test]
-        async fn a_family_lookup_answers_a_literal_without_a_lookup() {
-            let budget = ResolverBudget::new(crate::config::DEFAULT_MAX_CONNECTIONS);
-            let asked = Asked::default();
-            let resolver = budget.per_connection_with(stand_in(&asked, both_answer));
-            let mut other = OtherFamily::new("2001:db8::1", 443, Family::Ipv6);
-
-            let addresses = resolver
-                .lookup_family("2001:db8::1", 443, Family::Ipv4, &mut other)
-                .await
-                .expect("a literal resolves");
-
-            assert_eq!(addresses, vec!["[2001:db8::1]:443".parse().unwrap()]);
-            assert!(asked.lock().unwrap().is_empty());
-            assert!(!other.is_started());
         }
     }
 
