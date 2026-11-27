@@ -804,7 +804,7 @@ impl JointTable {
 fn ending_of(outcome: &str) -> Ending {
     match outcome {
         "protocol_violation" => Ending::ProtocolViolation,
-        "peer_close" | "server_shutdown" | "other_error" => Ending::PeerClose,
+        "peer_close" | "server_shutdown" | "server_violation" | "other_error" => Ending::PeerClose,
         "drained" => Ending::Outlive,
         _ => Ending::Idle,
     }

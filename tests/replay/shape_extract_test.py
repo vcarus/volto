@@ -47,6 +47,10 @@ class CurrentLogShape(unittest.TestCase):
         kinds = [tunnel["kind"] for tunnel in reconstructed()["tunnels"]]
         self.assertEqual(kinds, ["policy_denied"])
 
+    def test_a_close_this_server_decided_is_not_one_the_peer_reported(self):
+        outcomes = [c.outcome for c in reconstructed()["connections"]]
+        self.assertEqual(outcomes, ["server_violation", "protocol_violation"])
+
 
 if __name__ == "__main__":
     unittest.main()

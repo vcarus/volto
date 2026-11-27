@@ -210,15 +210,17 @@ TUNNEL_MESSAGES = {
 def close_outcome(fields: dict[str, str]) -> str:
     """Names how a connection ended, across every release in the capture.
 
-    The `reason=` field is what current releases log; older ones logged only the
-    `ConnectionError`, whose `Display` says the same things in other words, and
-    in three different vocabularies as the HTTP/3 layer was rewritten under it.
-    All of them are folded into one set of names here, so a capture spanning
-    several releases aggregates instead of splitting into eras:
+    The `reason=` field is what the current INFO closing line logs. The WARN
+    one, and every line of older releases, logs the `ConnectionError`, whose
+    `Display` says the same things in other words, and in three different
+    vocabularies as the HTTP/3 layer was rewritten under it. All of them are
+    folded into one set of names here, so a capture spanning several releases
+    aggregates instead of splitting into eras:
 
     * The current layer prints the code by name: `ApplicationClose:
       H3_GENERAL_PROTOCOL_ERROR`, or `ApplicationClose: 0x0` for a code it has
-      no name for.
+      no name for. A close this server decided on reads `closed by this server:`
+      followed by the code and the detail, and is `server_violation`.
     * The release before it printed quinn's own text, which is `aborted by
       peer:` followed by the reason string the peer sent -- and the client in
       this capture sends RFC 9114's own description of the code, so a protocol
@@ -245,6 +247,11 @@ def close_outcome(fields: dict[str, str]) -> str:
         return "unrecorded"
 
     error = fields["error"]
+    # A close this server decided on, read first as `tests/it_replay.rs` reads
+    # it: its text names the code too, and it is not a violation the peer
+    # reported.
+    if error.startswith("closed by this server:"):
+        return "server_violation"
     if "H3_GENERAL_PROTOCOL_ERROR" in error or "protocol compliance" in error:
         return "protocol_violation"
     if error.endswith("Timeout"):

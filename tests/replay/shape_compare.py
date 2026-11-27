@@ -35,6 +35,7 @@ ROWS = [
     ("close: idle", "connections/outcome_share/idle", "{:.4f}"),
     ("close: peer_close", "connections/outcome_share/peer_close", "{:.4f}"),
     ("close: protocol_violation", "connections/outcome_share/protocol_violation", "{:.4f}"),
+    ("close: server_violation", "connections/outcome_share/server_violation", "{:.4f}"),
     ("close: drained", "connections/outcome_share/drained", "{:.4f}"),
     ("close: other_error", "connections/outcome_share/other_error", "{:.4f}"),
     ("concurrency mean", "connections/concurrency/mean", "{:.2f}"),
