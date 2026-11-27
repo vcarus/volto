@@ -17,11 +17,9 @@ use super::qpack::Field;
 /// placement and identity (§4.3), then the per-method shape (§4.3.1, §4.4,
 /// RFC 8441 §4).
 ///
-/// Public, though [`Resolver::resolve`](super::stream::Resolver::resolve) is the only caller the server has and
-/// `crate::h3api` re-exports neither. It needs nothing but a decoded field
-/// section, so `tests/it_fuzz.rs` states properties over arbitrary
-/// pseudo-header *combinations* against it without one QUIC connection per
-/// combination.
+/// Public for `tests/it_fuzz.rs`, `tests/it_diff_oracle.rs` and the `request`
+/// fuzz target, which state properties over pseudo-header combinations without
+/// a QUIC connection.
 pub fn build_request(section: Vec<Field>) -> Result<Request, Violation> {
     let mut method = None;
     let mut scheme = None;
@@ -352,8 +350,9 @@ fn percent_encoding_is_complete(component: &[u8]) -> bool {
 /// Adds one regular field, applying RFC 9114 §4.2's rules on the way.
 ///
 /// Takes the decoded name and value by value. A literal that `qpack::decode`
-/// allocated becomes the stored name or value with no copy; only a static-table
-/// entry, a few bytes, is copied.
+/// allocated becomes the stored name or value without a copy of its own; one
+/// with spare capacity, such as a Huffman decoder's output, is shrunk, which
+/// can reallocate. A static-table entry, a few bytes, is copied.
 fn add_field(
     fields: &mut Fields,
     name: Cow<'static, [u8]>,
@@ -437,10 +436,7 @@ fn add_field(
 /// A value that is nothing but whitespace becomes the empty string, which is a
 /// field value like any other.
 fn trim_optional_whitespace(mut value: &[u8]) -> &[u8] {
-    // Slice patterns rather than a pair of index searches: SP and HTAB are the
-    // only two octets `[u8]::trim_ascii` would go beyond, and peeling them off
-    // each end leaves the all-whitespace case as the empty slice with no arm of
-    // its own.
+    // Not `trim_ascii`, which would also strip CR, LF and FF (see `add_field`).
     while let [b' ' | b'\t', rest @ ..] = value {
         value = rest;
     }
@@ -473,8 +469,8 @@ fn trim_optional_whitespace_in_place(value: &mut Vec<u8>) {
 
 /// The name of one decoded field line, if [`message::field_name`] accepts it.
 ///
-/// An owned name becomes the stored name with no copy. A static-table name is
-/// copied, which is a few bytes.
+/// An owned name becomes the stored name, shrunk to its length, which can
+/// reallocate. A static-table name is copied, which is a few bytes.
 fn owned_field_name(name: Cow<'static, [u8]>) -> Option<Box<str>> {
     match name {
         Cow::Borrowed(name) => message::field_name(name).map(Box::from),
@@ -491,8 +487,9 @@ fn owned_field_name(name: Cow<'static, [u8]>) -> Option<Box<str>> {
 /// The value of one decoded field line with RFC 9110 §5.5's whitespace
 /// excluded, if [`FieldValue::parse`] accepts what is left.
 ///
-/// An owned value is trimmed in place and becomes the stored value with no
-/// copy. A static-table value is copied, which is a few bytes.
+/// An owned value is trimmed in place and becomes the stored value, shrunk as
+/// [`FieldValue::from_vec`] says. A static-table value is copied, which is a
+/// few bytes.
 fn owned_field_value(value: Cow<'static, [u8]>) -> Option<FieldValue> {
     match value {
         Cow::Borrowed(value) => FieldValue::parse(trim_optional_whitespace(value)),
