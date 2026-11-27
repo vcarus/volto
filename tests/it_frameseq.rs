@@ -1515,3 +1515,37 @@ fn every_request_fatal_draws_its_modelled_code() {
         });
     }
 }
+
+/// The raw-stream reader refuses a frame length past its limit before it
+/// allocates, so a server that announces 2^62 - 1 bytes fails one test rather
+/// than aborting the binary on an allocation that cannot succeed.
+#[tokio::test]
+#[should_panic(expected = "read_frame will allocate")]
+async fn read_frame_refuses_a_length_past_its_limit() {
+    let (endpoint, ca) = common::h3_server_endpoint();
+    let addr = endpoint.local_addr().expect("server address");
+
+    let server = tokio::spawn(async move {
+        let connection = endpoint
+            .accept()
+            .await
+            .expect("an incoming connection")
+            .await
+            .expect("the QUIC handshake");
+        let mut send = connection.open_uni().await.expect("open a stream");
+        // A DATA frame type, then the largest length a varint can carry.
+        send.write_all(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+            .await
+            .expect("send the frame header");
+        // Held, so the stream is still open when the client reads it.
+        (endpoint, connection, send)
+    });
+
+    let client = common::client_endpoint(&ca, &["h3"]);
+    let connection = common::finish_connect(&client, addr)
+        .await
+        .expect("the QUIC handshake");
+    let mut recv = connection.accept_uni().await.expect("the server's stream");
+    let _held = server.await.expect("the server task");
+    read_frame(&mut recv).await;
+}

@@ -492,9 +492,18 @@ pub fn collect_refusals(
 }
 
 /// Reads one HTTP/3 frame from a raw stream: type, length, payload.
+///
+/// A declared length past [`READ_FRAME_LIMIT`] panics before anything is
+/// allocated, so a server bug that announces an enormous frame fails the test
+/// that read it instead of aborting the whole binary.
 pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
     let frame_type = read_varint(recv).await;
     let length = read_varint(recv).await;
+    assert!(
+        length <= READ_FRAME_LIMIT,
+        "a {length}-byte frame of type {frame_type:#x} is past the {READ_FRAME_LIMIT} bytes \
+         read_frame will allocate"
+    );
 
     let mut payload = vec![0u8; usize::try_from(length).expect("frame length")];
     tokio::time::timeout(TIMEOUT, recv.read_exact(&mut payload))
@@ -504,6 +513,10 @@ pub async fn read_frame(recv: &mut quinn::RecvStream) -> (u64, Vec<u8>) {
 
     (frame_type, payload)
 }
+
+/// The longest frame [`read_frame`] will read: 1 MiB, sixteen times the 64 KiB
+/// that bounds both a field section and a relayed DATA frame from the server.
+pub const READ_FRAME_LIMIT: u64 = 1 << 20;
 
 /// Reads one QUIC variable-length integer from a stream (RFC 9000 §16).
 ///
