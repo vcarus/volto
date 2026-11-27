@@ -10,8 +10,7 @@
 //! * the per-connection datagram router (`h3::connection::serve_peer`), the one
 //!   task that decodes and routes inbound HTTP Datagrams for every CONNECT-UDP
 //!   session on the connection (D79) --
-//!   [`a_session_that_never_drains_its_queue_does_not_stall_the_router`] and
-//!   [`a_session_that_never_drains_its_queue_does_not_stall_the_accept_loop`];
+//!   [`a_session_that_never_drains_its_queue_does_not_stall_the_router`];
 //! * the accept loop (`conn::handle`), the one task that turns request streams
 //!   into tunnels --
 //!   [`a_request_whose_headers_never_arrive_does_not_delay_other_requests`];
@@ -32,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
+use common::rawstream::H3_REQUEST_CANCELLED;
 use common::{
     ClientStream, H3Client, TIMEOUT, TestServer, echoes, open_tcp_tunnel, open_udp_session,
     send_udp_payload, spawn_echo_target, spawn_flooding_udp_target, spawn_udp_echo_target,
@@ -130,24 +130,34 @@ fn capsule_reply_is<'a>(
 /// queue, and `INBOUND_QUEUE_DEPTH` datagrams are enough to fill it.
 ///
 /// The neighbour is an ordinary echo session on the same connection, asked for
-/// an ordinary round trip.
+/// an ordinary round trip. Then a session opened after the flood must be
+/// established and usable as well, which is the accept loop's work
+/// (`conn::handle`) rather than the router's (`serve_peer`): a session could
+/// not be opened at all if the two were ever folded together.
 ///
-/// Red check: making `Router::deliver` await `Sender::send` instead of
-/// `try_send` fails this and the test below, and nothing else in the suite.
+/// Red check: making the router wait for room in a full queue rather than drop
+/// the packet fails this, and nothing else in the suite.
 #[tokio::test]
 async fn a_session_that_never_drains_its_queue_does_not_stall_the_router() {
     let server = TestServer::start().await;
     let live_target = spawn_udp_echo_target().await;
+    let echo = spawn_udp_echo_target().await;
 
     let (mut client, stalled_qsid, _stalled) = a_session_with_a_full_queue(&server).await;
     let (live_qsid, mut live) = open_udp_session(&mut client, &server, live_target).await;
 
     fill_inbound_queue(&client, stalled_qsid);
 
-    // The whole test: a neighbour's round trip, through the router that is now
-    // holding a full queue it cannot deliver to.
+    // A neighbour's round trip, through the router that is now holding a full
+    // queue it cannot deliver to.
     send_udp_payload(&client.quic, live_qsid, b"neighbour");
     capsule_reply_is(&mut live, b"neighbour").await;
+
+    // A session opened after the flood, end to end rather than merely
+    // answered.
+    let (fresh_qsid, mut fresh) = open_udp_session(&mut client, &server, echo).await;
+    send_udp_payload(&client.quic, fresh_qsid, b"fresh");
+    capsule_reply_is(&mut fresh, b"fresh").await;
 
     // Waited for rather than read once: a close sent a moment after the
     // neighbour's reply would still be in flight when the reply arrived.
@@ -156,28 +166,6 @@ async fn a_session_that_never_drains_its_queue_does_not_stall_the_router() {
         closed.is_err(),
         "a full queue on one session is met with drops, never with a close: {closed:?}"
     );
-}
-
-/// The same isolation asked of the *accept* path: a session opened after the
-/// flood must still be established and usable.
-///
-/// Distinct from the round trip above because a different task answers for it.
-/// The router is `serve_peer`; accepting a request stream is `conn::handle`'s
-/// loop, and a session could not be opened at all if the two were ever folded
-/// together.
-#[tokio::test]
-async fn a_session_that_never_drains_its_queue_does_not_stall_the_accept_loop() {
-    let server = TestServer::start().await;
-    let echo = spawn_udp_echo_target().await;
-
-    let (mut client, stalled_qsid, _stalled) = a_session_with_a_full_queue(&server).await;
-    fill_inbound_queue(&client, stalled_qsid);
-
-    // Opened *after* the flood, and it has to work end to end rather than
-    // merely be answered.
-    let (fresh_qsid, mut fresh) = open_udp_session(&mut client, &server, echo).await;
-    send_udp_payload(&client.quic, fresh_qsid, b"fresh");
-    capsule_reply_is(&mut fresh, b"fresh").await;
 }
 
 /// A client, and a CONNECT-UDP session on it whose task is parked in its write
@@ -231,7 +219,7 @@ fn fill_inbound_queue(client: &H3Client, quarter_stream_id: u64) {
 /// minute" is what makes this a verdict rather than a timing measurement, and no
 /// scheduling noise fills it.
 ///
-/// Red check: replacing the `tokio::spawn` in `conn::handle` with an inline
+/// Red check: replacing `requests.spawn` in `conn::handle` with an inline
 /// `handle_request(..).await` fails this and nothing else here.
 #[tokio::test]
 async fn a_request_whose_headers_never_arrive_does_not_delay_other_requests() {
@@ -549,8 +537,8 @@ async fn stall_the_connection(client: &mut H3Client, deaf: SocketAddr) -> Vec<Cl
 ///
 /// Asked on a stream of its own, because a stream that is already blocked on its
 /// *own* window would answer the wrong question. The few bytes written are a
-/// HEADERS frame the peer will wait out and then reset (D76); a probe that found
-/// credit has spent none of it beyond those bytes.
+/// partial HEADERS frame, and the probe resets its stream at once; a probe that
+/// found credit has spent none of it beyond those bytes.
 async fn out_of_stream_credit(client: &H3Client) -> bool {
     /// Long enough that a connection with credit answers, short enough that the
     /// walk up to the crossover stays quick.
@@ -560,8 +548,6 @@ async fn out_of_stream_credit(client: &H3Client) -> bool {
     let blocked = tokio::time::timeout(PROBE, send.write_all(&PARTIAL_HEADERS))
         .await
         .is_err();
-    // H3_REQUEST_CANCELLED (RFC 9114 §8.1): this probe's request is going
-    // nowhere, and the code says so rather than leaving the peer to time it out.
-    let _ = send.reset(quinn::VarInt::from_u32(0x10c));
+    let _ = send.reset(quinn::VarInt::from_u64(H3_REQUEST_CANCELLED).expect("a valid code"));
     blocked
 }
