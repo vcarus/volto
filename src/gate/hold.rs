@@ -70,7 +70,7 @@ pub const HOLD_HELLO_BYTES: usize = hello::MAX_INITIAL_FLIGHT;
 /// each by its length.
 ///
 /// The largest ClientHello the hold reassembles ([`HOLD_HELLO_BYTES`]) takes
-/// about fifteen Initial packets of 1500 bytes, which with its reassembly
+/// about fifteen Initial packets of 1200 bytes, which with its reassembly
 /// buffer is about 40 KiB; this leaves room above that for duplicates. A
 /// ClientHello of a client this server serves is under 2 KiB in two packets.
 /// A flight that would grow past it is dropped. Our own value. The heap behind
