@@ -281,7 +281,11 @@ initial_rtt_ms = 150
 # 100::/64, the dummy prefix 100:0:0:1::/64, the SRv6 SID block (5f00::/16), the
 # local-use NAT64 prefix 64:ff9b:1::/48, the deprecated IPv4-compatible ::/96
 # (stacks that still honour it route ::127.0.0.1 to loopback), the
-# IPv4-translated ::ffff:0:0:0/96 and the rest of the IETF-reserved ::/8.
+# IPv4-translated ::ffff:0:0:0/96, the rest of the IETF-reserved ::/8, and the
+# other IPv6 blocks the IANA registry reserves (100::/8, 200::/7, 400::/6,
+# 800::/5, 1000::/4, 4000::/3, 6000::/3, 8000::/3, a000::/3, c000::/3,
+# e000::/4, f000::/5, f800::/6 and fe00::/9). So every IPv6 address outside
+# global unicast 2000::/3 is refused, multicast included.
 #
 # Off by default, and it should stay off on a public deployment: the proxy's own
 # source address is inside your perimeter, and plenty of services trust

@@ -26,7 +26,8 @@
 //!   all multicast. These are not unicast targets at all; sending to them is an
 //!   amplification primitive, so `allow_private_networks` does not unlock them.
 //! * **Private**: the special-purpose space this proxy might actually reach,
-//!   drawn from the IANA registries that RFC 6890 set up. The list is one table,
+//!   drawn from the IANA registries that RFC 6890 set up, and the IPv6 space
+//!   the IANA address space registry reserves. The list is one table,
 //!   `PRIVATE_PREFIXES`: each row is a prefix with its name, its source and, in
 //!   the comment above it, the reason it is refused. Denied by default, unlocked
 //!   by `allow_private_networks`.
@@ -304,7 +305,8 @@ const fn v6(leading: &[u16], len: u32, name: &'static str, source: &'static str)
 /// The special-purpose prefixes in the private bucket, in both families.
 ///
 /// The list is drawn from the IANA special-purpose address registries that
-/// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed.
+/// RFC 6890 set up, minus the entries [`is_never_allowed`] has already claimed,
+/// and from the IPv6 address space registry's "Reserved by IETF" blocks.
 /// Everything on it is either not globally reachable or not a destination an
 /// internet-facing proxy has any business dialling, and every one of them is a
 /// way past `allow_private_networks = false` if it is missing: `100.64.0.0/10` is where a
@@ -525,6 +527,30 @@ const PRIVATE_PREFIXES: &[Prefix] = &[
     // so this row never meets them. The rest is unallocated, and nothing
     // routes it.
     v6(&[], 8, "Reserved by IETF", "RFC 4291"),
+    // The other blocks the IANA IPv6 address space registry lists as
+    // "Reserved by IETF", one row per registry entry. With `::/8` above and
+    // `fec0::/10` they are every such entry, so outside global unicast
+    // `2000::/3` only `fc00::/7`, `fe80::/10` and multicast `ff00::/8` are
+    // not one of these rows. Nothing on the public internet routes them. They
+    // are refused for the reason `240.0.0.0/4` is: a host whose own network
+    // routes unallocated space reaches whatever that network put there.
+    // `100::/8` holds the `100::/64` and `100:0:0:1::/64` rows and `4000::/3`
+    // the `5f00::/16` row, which come first for that reason. `200::/7` was the
+    // OSI NSAP-mapped prefix until RFC 4048 deprecated it.
+    v6(&[0x0100], 8, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x0200], 7, "Reserved by IETF", "RFC 4048"),
+    v6(&[0x0400], 6, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x0800], 5, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x1000], 4, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x4000], 3, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x6000], 3, "Reserved by IETF", "RFC 4291"),
+    v6(&[0x8000], 3, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xa000], 3, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xc000], 3, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xe000], 4, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xf000], 5, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xf800], 6, "Reserved by IETF", "RFC 4291"),
+    v6(&[0xfe00], 9, "Reserved by IETF", "RFC 4291"),
 ];
 
 /// The IPv4 address an IPv6 transition address carries, if it carries one.
@@ -1255,6 +1281,58 @@ mod tests {
                     "{address} carries an address that is never a destination"
                 );
             }
+        }
+    }
+
+    /// Every block the IANA IPv6 address space registry lists as "Reserved by
+    /// IETF" is private, and global unicast `2000::/3` outside the special
+    /// rows is not.
+    ///
+    /// One address per reserved block, chosen outside every more specific row,
+    /// so the block's own row is the only rule that refuses it.
+    #[test]
+    fn the_ipv6_space_reserved_by_ietf_is_private() {
+        let strict = policy(false, &[]);
+        let permissive = policy(true, &[]);
+
+        for (address, block) in [
+            ("180::1", "100::/8"),
+            ("200::1", "200::/7"),
+            ("400::1", "400::/6"),
+            ("800::1", "800::/5"),
+            ("1000::1", "1000::/4"),
+            ("1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "1000::/4"),
+            ("4000::1", "4000::/3"),
+            ("6000::1", "6000::/3"),
+            ("8000::1", "8000::/3"),
+            ("a000::1", "a000::/3"),
+            ("c000::1", "c000::/3"),
+            ("e000::1", "e000::/4"),
+            ("f000::1", "f000::/5"),
+            ("f800::1", "f800::/6"),
+            ("fe00::1", "fe00::/9"),
+            ("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff", "fe00::/9"),
+        ] {
+            assert!(
+                !strict.allows_address(ip(address)),
+                "{address} is inside {block}, reserved by IETF, and must be refused by default"
+            );
+            assert!(
+                permissive.allows_address(ip(address)),
+                "{address} must follow allow_private_networks"
+            );
+        }
+
+        for address in [
+            "2000::1",
+            "2001:4860:4860::8888",
+            "3fff:1000::1",
+            "3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ] {
+            assert!(
+                strict.allows_address(ip(address)),
+                "{address} is global unicast and stays public"
+            );
         }
     }
 

@@ -780,6 +780,7 @@ Each range is refused with a 403 while `allow_private_networks` is `false`. An I
 | `::/96` | IPv4-compatible, deprecated | RFC 4291 | Stacks that still honour it route `::127.0.0.1` to loopback, which would otherwise be a second way around the IPv4 rules |
 | `::ffff:0:0:0/96` | IPv4-translated | RFC 2765 | `::ffff:0:a.b.c.d`, one segment along from the IPv4-mapped form. Refused whole, whatever it carries; with `allow_private_networks` on, one that carries an unspecified, broadcast or multicast address is still refused |
 | `::/8` | Reserved by IETF | RFC 4291 | The rest of the block, after the rows above and the transition forms that are judged as IPv4 |
+| `100::/8`, `200::/7`, `400::/6`, `800::/5`, `1000::/4`, `4000::/3`, `6000::/3`, `8000::/3`, `a000::/3`, `c000::/3`, `e000::/4`, `f000::/5`, `f800::/6`, `fe00::/9` | Reserved by IETF | RFC 4291, RFC 4048 | Every other block the IANA IPv6 address space registry reserves. With them every IPv6 address outside global unicast `2000::/3` is refused while `allow_private_networks` is off, and multicast `ff00::/8` under any setting. Refused for the reason `240.0.0.0/4` is: a network may route unallocated space internally. The `100::/64`, `100:0:0:1::/64` and `5f00::/16` rows lie inside these blocks |
 
 ### The SNI gate
 
