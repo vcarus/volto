@@ -9,9 +9,10 @@ name: Docs
 #     crate page itself rather than a redirect into `/api/volto/`.
 #
 # A pull request builds and checks the site but does not publish it, so a
-# broken link or anchor is found before it reaches `main`. Only a push to `main`
-# or a manual run uploads the artifact and deploys. The build job needs no more
-# than read access to the repository.
+# broken link or anchor is found before it reaches `main`. Only a run on `main`,
+# a push or a manual one, uploads the artifact and deploys; a manual run from
+# another branch builds and checks only, whatever the Pages environment allows.
+# The build job needs no more than read access to the repository.
 
 on:
   push:
@@ -332,14 +333,14 @@ jobs:
           PY
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
-        if: github.event_name != 'pull_request'
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           path: site
 
   deploy:
     name: deploy
     needs: build
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The only write this workflow performs, scoped to the job that performs it.
